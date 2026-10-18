@@ -282,7 +282,7 @@ WITH candidates AS (
    AND interface_declaration.type_id=interface_owner.type_id AND interface_declaration.file_scope=1
   LEFT JOIN temp.selected_go_transient_placements placed ON placed.mount_ordinal=mount.mount_ordinal
   CROSS JOIN main.go_package_files method_file INDEXED BY idx_go_package_files_file_role
-    ON method_file.file_version_id=coalesce(mount.file_version_id,placed.file_version_id)
+    ON method_file.file_version_id=coalesce(mount.file_version_id,placed.file_version_id) AND method_file.source_role<>'ignored'
   CROSS JOIN main.go_package_instances package
     ON package.package_id=method_file.package_id AND package.complete=1
   CROSS JOIN main.go_context_publications publication ON publication.context_id=package.context_id

@@ -1197,6 +1197,231 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
         assert!(adapted.incomplete_reasons.is_empty(), "{domain:?}");
     }
 
+    // Exercise public reference projection as well as the complete persisted
+    // unit boundary. The terminal deliberately removes signature endpoints.
+    use brokk_bifrost_rql::structural::search::{
+        CodeQueryFile, CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryResultRef,
+        UnitExecutionResult, UnitRow, UnitRowProvenanceStep,
+    };
+    for (domain, coverages) in [
+        (
+            DetailedCodeQueryDomain::CallableSignature,
+            &["exact", "arity_unrecorded", "unrecorded", "incomplete"][..],
+        ),
+        (DetailedCodeQueryDomain::SignatureParameter, &["exact"][..]),
+    ] {
+        for &coverage in coverages {
+            let (source_item, source_evidence) = row(domain);
+            let range = source_item.range.unwrap();
+            let reference = if domain == DetailedCodeQueryDomain::CallableSignature {
+                CodeQueryResultRef::CallableSignature {
+                    id: "signature-1".into(),
+                    declaration_id: Some("declaration-1".into()),
+                    site_id: "site-1".into(),
+                    path: "app.py".into(),
+                    range,
+                    role: "method",
+                    coverage,
+                }
+            } else {
+                CodeQueryResultRef::SignatureParameter {
+                    id: "parameter-1".into(),
+                    signature_id: "signature-1".into(),
+                    path: "app.py".into(),
+                    range,
+                    parameter_index: 7,
+                }
+            };
+            let kind = reference.kind_label();
+            let item = UnitRowItem::project(&CodeQueryResultItem {
+                value: CodeQueryResultValue::File {
+                    value: CodeQueryFile {
+                        path: "app.py".into(),
+                        language: "python",
+                        package_fq: None,
+                        package_syntactic: None,
+                    },
+                },
+                provenance: vec![CodeQueryProvenance {
+                    branch: Vec::new(),
+                    seed: CodeQueryResultRef::File {
+                        path: "app.py".into(),
+                    },
+                    steps: vec![CodeQueryProvenanceStep {
+                        op: kind,
+                        result: reference,
+                        via: None,
+                    }],
+                }],
+                provenance_truncated: false,
+                row_projection: Vec::new(),
+            });
+            let file_ref = UnitRowProvenanceRef {
+                domain: DetailedCodeQueryDomain::File,
+                key: DetailedCodeQueryKey::File,
+                rel_path: "app.py".into(),
+                byte_span: None,
+                display_range: None,
+                identities: UnitRowIdentities::None,
+                source_slice_sha256: None,
+            };
+            let step_ref = UnitRowProvenanceRef {
+                domain,
+                key: source_evidence.key,
+                rel_path: "app.py".into(),
+                byte_span: Some(0..5),
+                display_range: Some(range),
+                identities: UnitRowIdentities::None,
+                source_slice_sha256: Some([0x42; 32]),
+            };
+            let evidence = UnitRowEvidence {
+                domain: DetailedCodeQueryDomain::File,
+                key: DetailedCodeQueryKey::File,
+                rel_path: "app.py".into(),
+                byte_span: None,
+                stable_owner_candidate: None,
+                identities: UnitRowIdentities::None,
+                source_slice_sha256: None,
+                provenance: vec![UnitRowProvenance {
+                    branch: Vec::new(),
+                    seed: file_ref,
+                    steps: vec![UnitRowProvenanceStep {
+                        op: kind.into(),
+                        result: step_ref,
+                        via: None,
+                    }],
+                }],
+            };
+            let unit = UnitExecutionResult {
+                rows: vec![UnitRow {
+                    item,
+                    evidence,
+                    key: serde_json::from_value(json!({"arm":"file", "parts":["app.py"]})).unwrap(),
+                }],
+                work: Default::default(),
+                budgeted_work: Default::default(),
+                completion: CodeQueryCompletion::Complete,
+                diagnostics: Vec::new(),
+                truncated: false,
+            };
+            let encoded = serde_json::to_vec(&unit).unwrap();
+            let unit: UnitExecutionResult = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(serde_json::to_vec(&unit).unwrap(), encoded);
+            let [unit_row] = unit.rows.as_slice() else {
+                unreachable!()
+            };
+            let item = &unit_row.item;
+            let evidence = &unit_row.evidence;
+            let projected = &item.provenance[0].steps[0].result;
+            match &projected.value {
+                UnitRowItemRefValue::CallableSignature {
+                    role,
+                    coverage: actual,
+                    ..
+                } => {
+                    assert_eq!(role.as_ref(), "method");
+                    assert_eq!(actual.as_ref(), coverage);
+                }
+                UnitRowItemRefValue::SignatureParameter {
+                    parameter_index, ..
+                } => assert_eq!(*parameter_index, 7),
+                other => panic!("typed callable reference: {other:?}"),
+            }
+            let candidate = adapt_match_candidate(
+                &policy_id,
+                item.clone(),
+                evidence.clone(),
+                &[],
+                &mut HashMap::new(),
+            )
+            .unwrap();
+            assert!(matches!(
+                candidate.evidence.terminal(),
+                PolicyQueryResultRef::File { .. }
+            ));
+            assert_eq!(
+                candidate.evidence.provenance_truncated(),
+                coverage != "exact"
+            );
+            assert!(
+                matches!(candidate.evidence.provenance()[0].steps()[0].result(),
+                    PolicyQueryResultRef::StructuralMatch { kind: actual, location, identity }
+                    if actual == kind && identity.is_none() && location.path() == "app.py"
+                        && location.region().is_some_and(|region| region.start_line() == 1)
+                )
+            );
+            let mut unavailable = evidence.clone();
+            unavailable.provenance[0].steps[0]
+                .result
+                .source_slice_sha256 = None;
+            let partial = adapt_match_candidate(
+                &policy_id,
+                item.clone(),
+                unavailable,
+                &[],
+                &mut HashMap::new(),
+            )
+            .unwrap();
+            assert!(
+                partial.evidence.provenance_truncated(),
+                "missing source proof stays partial"
+            );
+            // Independently poison either half after serialization, including
+            // IDs on each side. Matching rendered text alone is insufficient.
+            let mut corruptions = vec![
+                (true, "/kind", json!("other")),
+                (true, "/path", json!("other.py")),
+                (true, "/value/id", json!("other-id")),
+                (true, "/value/range/start_column", json!(2)),
+                (false, "/domain", json!("file")),
+                (false, "/key/id", json!("other-id")),
+                (false, "/byte_span", json!({"start":5, "end":0})),
+                (false, "/rel_path", json!("other.py")),
+                (false, "/display_range/start_column", json!(2)),
+            ];
+            if domain == DetailedCodeQueryDomain::CallableSignature {
+                corruptions.extend([
+                    (true, "/value/declaration_id", json!("other-declaration")),
+                    (true, "/value/declaration_id", json!(null)),
+                    (true, "/value/site_id", json!("other-site")),
+                    (false, "/key/declaration_id", json!("other-declaration")),
+                    (false, "/key/site_id", json!("other-site")),
+                ]);
+            } else {
+                corruptions.extend([
+                    (true, "/value/signature_id", json!("other-signature")),
+                    (false, "/key/signature_id", json!("other-signature")),
+                ]);
+            }
+            for (public, pointer, replacement) in corruptions {
+                let mut bad_item = item.clone();
+                let mut bad_evidence = evidence.clone();
+                if public {
+                    let target = &mut bad_item.provenance[0].steps[0].result;
+                    let mut value = serde_json::to_value(&*target).unwrap();
+                    *value.pointer_mut(pointer).unwrap() = replacement;
+                    *target = serde_json::from_value(value).unwrap();
+                } else {
+                    let target = &mut bad_evidence.provenance[0].steps[0].result;
+                    let mut value = serde_json::to_value(&*target).unwrap();
+                    *value.pointer_mut(pointer).unwrap() = replacement;
+                    *target = serde_json::from_value(value).unwrap();
+                }
+                assert!(
+                    adapt_match_candidate(
+                        &policy_id,
+                        bad_item,
+                        bad_evidence,
+                        &[],
+                        &mut HashMap::new()
+                    )
+                    .is_err(),
+                    "reject {kind} public={public} {pointer}"
+                );
+            }
+        }
+    }
+
     let (item, evidence) = row(DetailedCodeQueryDomain::CallableSignature);
     for (item, evidence) in [
         (
@@ -1859,5 +2084,415 @@ fn configuration_fact_near_miss_axes_stay_clean_zeroes() {
             evaluated.candidates.is_empty(),
             "axis {axis} must not match: {evaluated:#?}"
         );
+    }
+}
+
+#[test]
+fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection() {
+    use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonAncestryBasis;
+    use brokk_bifrost_rql::structural::search::{
+        UnitRowField, UnitRowItemProvenance, UnitRowItemProvenanceStep, UnitRowItemRef,
+        UnitRowProvenanceStep, UnitRowScalar,
+    };
+
+    // Transport data only, not an activated runtime/member catalog. Both
+    // records explicitly attest the same empty root; neither may disappear.
+    let claim = |record: &str| {
+        json!({
+            "declared_class": {"symbol_id":"fixture-root", "qualified_name":"fixture.Root"},
+            "class": {"symbol_id":"fixture-root", "qualified_name":"fixture.Root"},
+            "declared_bases": [], "bases": [],
+            "provenance": {
+                "active_model_set_hash":"a".repeat(64), "pack_digest":"b".repeat(64),
+                "pack_id":"test.transport", "pack_version":"1.0.0", "producer":"test-transport",
+                "producer_version":"1.0.0", "record_id":record, "origin":"declarative_model",
+                "activation":{"status":"active", "reason":"test-only transport", "source_kind":"session",
+                    "source_id":"test:transport", "matched_evidence":{"language":"python", "ecosystem":"python",
+                        "toolchain":{"name":"cpython", "version":"3.13.5"}}},
+                "proof":"pack_fact", "completeness":"partial", "ambiguous":false
+            }
+        })
+    };
+    let mut full: PythonAncestryBasis =
+        serde_json::from_value(json!({"claims":[claim("first"),claim("second")]})).unwrap();
+    // Partial authored claims and ambiguity must survive transport unchanged.
+    full.claims[1].provenance.ambiguous = true;
+    let range = CodeQueryRange {
+        start_line: 1,
+        start_column: 1,
+        end_line: 1,
+        end_column: 6,
+    };
+    for basis in [PythonAncestryBasis::default(), full] {
+        for project_to_file in [false, true] {
+            for deriving_rule_fact in [false, true] {
+                let (fact_kind, outcome) = if deriving_rule_fact {
+                    ("override", "overrides")
+                } else {
+                    ("hierarchy", "complete")
+                };
+                let source_id = |name: &str| deriving_rule_fact.then(|| name.to_owned());
+                let hierarchy_key = DetailedCodeQueryKey::PythonHierarchyFact {
+                    id: "fact-1".to_owned(),
+                    root_id: "root-1".to_owned(),
+                    declaration_id: source_id("source-declaration"),
+                    owner_id: source_id("source-owner"),
+                    target_id: source_id("source-target"),
+                    target_owner_id: source_id("source-target_owner"),
+                    fact_kind: fact_kind.to_owned(),
+                    outcome: outcome.to_owned(),
+                    coverage: "complete".to_owned(),
+                    reason: None,
+                    ancestry_basis: basis.clone(),
+                };
+                let public_ref = UnitRowItemRef {
+                    kind: "python_hierarchy_fact".into(),
+                    path: "app.py".into(),
+                    value: UnitRowItemRefValue::PythonHierarchyFact {
+                        id: "fact-1".into(),
+                        root_id: "root-1".into(),
+                        declaration_id: source_id("source-declaration"),
+                        owner_id: source_id("source-owner"),
+                        target_id: source_id("source-target"),
+                        target_owner_id: source_id("source-target_owner"),
+                        fact_kind: fact_kind.into(),
+                        outcome: outcome.into(),
+                        coverage: "complete".into(),
+                        reason: None,
+                        range,
+                        ancestry_basis: basis.clone(),
+                    },
+                };
+                let detailed_ref = UnitRowProvenanceRef {
+                    domain: DetailedCodeQueryDomain::PythonHierarchyFact,
+                    key: hierarchy_key.clone(),
+                    rel_path: "app.py".into(),
+                    byte_span: Some(0..5),
+                    display_range: Some(range),
+                    identities: UnitRowIdentities::None,
+                    source_slice_sha256: Some([7; 32]),
+                };
+                let (domain, key, terminal) = if project_to_file {
+                    (
+                        DetailedCodeQueryDomain::File,
+                        DetailedCodeQueryKey::File,
+                        UnitRowItemTerminal::File,
+                    )
+                } else if deriving_rule_fact {
+                    (
+                        DetailedCodeQueryDomain::PythonRuleFact,
+                        DetailedCodeQueryKey::PythonRuleFact {
+                            id: "documentation-1".into(),
+                            relation: "documentation".into(),
+                        },
+                        UnitRowItemTerminal::SourcePosition,
+                    )
+                } else {
+                    (
+                        DetailedCodeQueryDomain::PythonHierarchyFact,
+                        hierarchy_key,
+                        UnitRowItemTerminal::PythonHierarchyFact {
+                            id: "fact-1".into(),
+                            root_id: "root-1".into(),
+                            declaration_id: source_id("source-declaration"),
+                            owner_id: source_id("source-owner"),
+                            target_id: source_id("source-target"),
+                            target_owner_id: source_id("source-target_owner"),
+                            fact_kind: fact_kind.into(),
+                            outcome: outcome.into(),
+                            coverage: "complete".into(),
+                            reason: None,
+                            ancestry_basis: basis.clone(),
+                        },
+                    )
+                };
+                let item = UnitRowItem {
+                    domain,
+                    path: "app.py".into(),
+                    range: if project_to_file { None } else { Some(range) },
+                    evidence: None,
+                    coverage: None,
+                    fields: if deriving_rule_fact && !project_to_file {
+                        ["proof", "completeness"]
+                            .into_iter()
+                            .zip(["proven", "complete"])
+                            .map(|(name, value)| UnitRowField {
+                                name: name.into(),
+                                value: UnitRowScalar::ConstrainedEnum(value.into()),
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    projected_field_names: Vec::new(),
+                    unknown_fields: Vec::new(),
+                    terminal: Some(terminal),
+                    provenance: vec![UnitRowItemProvenance {
+                        branch: Vec::new(),
+                        seed: public_ref.clone(),
+                        steps: if deriving_rule_fact {
+                            vec![UnitRowItemProvenanceStep {
+                                op: "python_documentation".into(),
+                                result: public_ref,
+                                via: None,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                    }],
+                    provenance_truncated: false,
+                };
+                let detailed = UnitRowEvidence {
+                    domain,
+                    key,
+                    rel_path: "app.py".into(),
+                    byte_span: if project_to_file { None } else { Some(0..5) },
+                    stable_owner_candidate: None,
+                    identities: UnitRowIdentities::None,
+                    source_slice_sha256: Some([7; 32]),
+                    provenance: vec![UnitRowProvenance {
+                        branch: Vec::new(),
+                        seed: detailed_ref.clone(),
+                        steps: if deriving_rule_fact {
+                            vec![UnitRowProvenanceStep {
+                                op: "python_documentation".into(),
+                                result: detailed_ref,
+                                via: None,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                    }],
+                };
+                // This is the actual reusable-unit serde boundary, with all scalar
+                // projections removed and no external endpoint left on the terminal.
+                let (item, detailed): (UnitRowItem, UnitRowEvidence) =
+                    serde_json::from_slice(&serde_json::to_vec(&(item, detailed)).unwrap())
+                        .unwrap();
+                if !basis.claims.is_empty() {
+                    let mut tampered = detailed.clone();
+                    let DetailedCodeQueryKey::PythonHierarchyFact { ancestry_basis, .. } =
+                        &mut tampered.provenance[0].seed.key
+                    else {
+                        unreachable!()
+                    };
+                    ancestry_basis.claims[0]
+                        .provenance
+                        .record_id
+                        .push_str("-other");
+                    assert!(
+                        adapt_match_candidate(
+                            &PolicyId::new("test.modeled-ancestry").unwrap(),
+                            item.clone(),
+                            tampered,
+                            &[],
+                            &mut HashMap::new()
+                        )
+                        .is_err(),
+                        "public and detailed contributors must agree"
+                    );
+                }
+                // In this matrix cell no terminal/step has a second basis:
+                // corrupt BOTH paired representations, so equality alone cannot
+                // reject the record and the typed identity validator must do so.
+                if project_to_file && !deriving_rule_fact && !basis.claims.is_empty() {
+                    for (pointer, replacement) in [
+                        ("/active_model_set_hash", ""),
+                        ("/pack_digest", ""),
+                        ("/pack_id", ""),
+                        ("/pack_version", ""),
+                        ("/producer", ""),
+                        ("/producer_version", ""),
+                        ("/record_id", ""),
+                        ("/activation/source_kind", ""),
+                        ("/activation/source_id", ""),
+                        ("/activation/matched_evidence/language", ""),
+                        ("/activation/matched_evidence/ecosystem", ""),
+                        ("/activation/matched_evidence/toolchain/name", ""),
+                        ("/activation/matched_evidence/toolchain/version", ""),
+                        ("/activation/status", ""),
+                        ("/activation/status", "inactive"),
+                        (
+                            "/activation/matched_evidence/toolchain/version",
+                            "not-a-version",
+                        ),
+                        ("/active_model_set_hash", "not-a-sha256"),
+                        ("/pack_digest", "not-a-sha256"),
+                        ("/pack_id", "invalid\0identity"),
+                        (
+                            "/activation/matched_evidence/toolchain/name",
+                            "invalid\0name",
+                        ),
+                    ] {
+                        let mut invalid = serde_json::to_value(&basis).unwrap();
+                        *invalid
+                            .pointer_mut(&format!("/claims/0/provenance{pointer}"))
+                            .unwrap() = json!(replacement);
+                        let invalid: PythonAncestryBasis = serde_json::from_value(invalid).unwrap();
+                        let mut invalid_item = item.clone();
+                        let mut invalid_detailed = detailed.clone();
+                        let UnitRowItemRefValue::PythonHierarchyFact { ancestry_basis, .. } =
+                            &mut invalid_item.provenance[0].seed.value
+                        else {
+                            unreachable!()
+                        };
+                        *ancestry_basis = invalid.clone();
+                        let DetailedCodeQueryKey::PythonHierarchyFact { ancestry_basis, .. } =
+                            &mut invalid_detailed.provenance[0].seed.key
+                        else {
+                            unreachable!()
+                        };
+                        *ancestry_basis = invalid;
+                        assert!(
+                            adapt_match_candidate(
+                                &PolicyId::new("test.modeled-ancestry").unwrap(),
+                                invalid_item,
+                                invalid_detailed,
+                                &[],
+                                &mut HashMap::new()
+                            )
+                            .is_err(),
+                            "matching invalid active contributor must be rejected: {pointer}={replacement:?}"
+                        );
+                    }
+                }
+                let mut wrong_endpoint = detailed.clone();
+                let DetailedCodeQueryKey::PythonHierarchyFact { target_id, .. } =
+                    &mut wrong_endpoint.provenance[0].seed.key
+                else {
+                    unreachable!()
+                };
+                *target_id = Some("unrelated-source-target".into());
+                assert!(
+                    adapt_match_candidate(
+                        &PolicyId::new("test.modeled-ancestry").unwrap(),
+                        item.clone(),
+                        wrong_endpoint,
+                        &[],
+                        &mut HashMap::new()
+                    )
+                    .is_err(),
+                    "canonical endpoint identities must agree across the unit boundary"
+                );
+                let mut truncated = item.clone();
+                truncated.provenance_truncated = true;
+                let partial = adapt_match_candidate(
+                    &PolicyId::new("test.modeled-ancestry").unwrap(),
+                    truncated,
+                    detailed.clone(),
+                    &[],
+                    &mut HashMap::new(),
+                )
+                .unwrap();
+                assert!(
+                    !partial.completeness.is_complete(),
+                    "truncated premises cannot qualify"
+                );
+                let mut open_item = item.clone();
+                let mut open_detailed = detailed.clone();
+                let UnitRowItemRefValue::PythonHierarchyFact {
+                    outcome,
+                    coverage,
+                    reason,
+                    ..
+                } = &mut open_item.provenance[0].seed.value
+                else {
+                    unreachable!()
+                };
+                *outcome = "incomplete".into();
+                *coverage = "open".into();
+                *reason = Some("unknown_member_surface".into());
+                let DetailedCodeQueryKey::PythonHierarchyFact {
+                    outcome,
+                    coverage,
+                    reason,
+                    ..
+                } = &mut open_detailed.provenance[0].seed.key
+                else {
+                    unreachable!()
+                };
+                *outcome = "incomplete".into();
+                *coverage = "open".into();
+                *reason = Some("unknown_member_surface".into());
+                let open = adapt_match_candidate(
+                    &PolicyId::new("test.modeled-ancestry").unwrap(),
+                    open_item,
+                    open_detailed,
+                    &[],
+                    &mut HashMap::new(),
+                )
+                .unwrap();
+                assert!(
+                    !open.completeness.is_complete(),
+                    "open premises survive every terminal/projection"
+                );
+                assert!(
+                    matches!(open.evidence.provenance()[0].seed(), PolicyQueryResultRef::PythonHierarchyFact { coverage, reason, .. } if coverage == "open" && reason.as_deref() == Some("unknown_member_surface"))
+                );
+                let candidate = adapt_match_candidate(
+                    &PolicyId::new("test.modeled-ancestry").unwrap(),
+                    item,
+                    detailed,
+                    &[],
+                    &mut HashMap::new(),
+                )
+                .unwrap();
+                let PolicyQueryResultRef::PythonHierarchyFact { ancestry_basis, .. } =
+                    candidate.evidence.provenance()[0].seed()
+                else {
+                    panic!("projected finding retains typed hierarchy premises")
+                };
+                assert_eq!(ancestry_basis, &basis);
+                let replayed: MatchFindingEvidence =
+                    serde_json::from_slice(&serde_json::to_vec(&candidate.evidence).unwrap())
+                        .unwrap();
+                assert_eq!(
+                    replayed.provenance()[0].seed(),
+                    candidate.evidence.provenance()[0].seed()
+                );
+                if !basis.claims.is_empty() {
+                    let mut malformed = candidate.evidence.provenance()[0].seed().clone();
+                    let PolicyQueryResultRef::PythonHierarchyFact { ancestry_basis, .. } =
+                        &mut malformed
+                    else {
+                        unreachable!()
+                    };
+                    ancestry_basis.claims[0].bases.push(None);
+                    assert!(
+                        malformed.validate().is_err(),
+                        "aligned unresolved slots are part of the contract"
+                    );
+                    let mut overallocated = candidate.evidence.provenance()[0].seed().clone();
+                    let PolicyQueryResultRef::PythonHierarchyFact { ancestry_basis, .. } =
+                        &mut overallocated
+                    else {
+                        unreachable!()
+                    };
+                    ancestry_basis.claims[0]
+                        .provenance
+                        .record_id
+                        .reserve(128 * 1024);
+                    assert!(
+                        overallocated.validate().is_err(),
+                        "retained capacities, not just serialized lengths, consume the evidence budget"
+                    );
+                }
+                assert_eq!(
+                    candidate
+                        .proof
+                        .reasons()
+                        .iter()
+                        .any(|reason| reason.label() == "python_modeled_runtime_c3"),
+                    !basis.claims.is_empty()
+                );
+                assert_eq!(
+                    candidate
+                        .proof
+                        .reasons()
+                        .contains(&ProofReason::DirectStructuralMatch),
+                    basis.claims.is_empty()
+                );
+            }
+        }
     }
 }

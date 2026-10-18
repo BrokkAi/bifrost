@@ -9,6 +9,8 @@ use crate::analyzer::lexical_definitions::{
     parameter_owner_for_range, resolve_lexical_binding,
 };
 use crate::analyzer::multi_analyzer::resolve_analyzer;
+#[cfg(any(test, feature = "test-support"))]
+use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic::StableDigest;
 use crate::analyzer::semantic_model::TypeRef;
 use crate::analyzer::usages::call_conversion::{
@@ -78,7 +80,7 @@ enum JavaConversionType {
     Array(Box<JavaConversionType>),
 }
 
-const JAVA_EXPRESSION_DEPTH_LIMIT: usize = 8;
+pub(super) const JAVA_EXPRESSION_DEPTH_LIMIT: usize = 8;
 const JAVA_ARRAY_RANK_LIMIT: usize = 32;
 
 /// Prove the conversion for one Java actual/formal pair.
@@ -705,6 +707,54 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         }
     }
 
+    fn select_model_invocation(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actuals: &[Node<'_>],
+        source: &str,
+        signatures: &[crate::analyzer::semantic_model::Signature],
+    ) -> Option<Result<(usize, Vec<TypeRef>), ConversionUnknown>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            return Some((|| {
+                let java = resolve_analyzer::<JavaAnalyzer>(analyzer)
+                    .ok_or(ConversionUnknown::UnsupportedLanguage)?;
+                let actuals = actuals
+                    .iter()
+                    .map(|actual| {
+                        super::native_points::java_native_model_argument_type(
+                            analyzer, file, *actual, source,
+                        )
+                        .unwrap_or(TypeRef::Unknown)
+                    })
+                    .collect::<Vec<_>>();
+                let packs = analyzer.semantic_model_overlay();
+                let selected = java.selected_jdk_home_for_file(file).ok().and_then(|home| {
+                    analyzer
+                        .active_semantic_model_snapshot()?
+                        .jdk_artifact_for_home(home)
+                        .cloned()
+                });
+                let surface = match selected
+                    .as_ref()
+                    .and_then(|evidence| evidence.artifact_sha256.as_deref())
+                {
+                    Some(digest) => java.external_declarations_for_source_jdk(packs, digest),
+                    None => java.external_declarations(packs),
+                };
+                crate::analyzer::jvm::external::select_java_external_model_invocation(
+                    &actuals, signatures, &surface,
+                )
+                .ok_or(ConversionUnknown::SignatureApplicability)
+            })());
+        }
+        // The incumbent path and the other JVM languages keep their existing
+        // conversion contracts during this Java-only invocation rollout.
+        let _ = (analyzer, file, actuals, source, signatures);
+        None
+    }
+
     fn model_argument_applicability(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -719,6 +769,17 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
             return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
         };
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+            return native_model_argument_applicability(
+                analyzer,
+                java,
+                file,
+                actual,
+                source,
+                formal_type,
+            );
+        }
         let scope = AnalyzerQueryScope::new(java);
         let token = scope.token();
         let packs = analyzer.semantic_model_overlay();
@@ -755,6 +816,88 @@ fn resolve_formal_type(
     }
     resolve_type_node(java, token, packs, file, type_node, source)
         .map_err(TypeResolutionFailure::target)
+}
+
+/// Read static types through the incumbent's existing structured conversion
+/// resolver. Exact external return selection needs no conversion proof, but
+/// unknown, generic or unindexed declarations must remain unknown.
+pub(crate) fn legacy_static_argument_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    actual: Node<'_>,
+    source: &str,
+) -> Option<TypeRef> {
+    if let Some(intrinsic) = intrinsic_argument_type(actual, source) {
+        return Some(intrinsic);
+    }
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
+    let packs = analyzer.semantic_model_overlay();
+    let scope = AnalyzerQueryScope::with_semantic_model_overlay(java, packs.clone());
+    let mut ty = resolve_actual_type(java, scope.token(), packs, file, actual, source).ok()?;
+    let mut rank = 0;
+    while let JavaConversionType::Array(element) = ty {
+        rank += 1;
+        ty = *element;
+    }
+    let JavaConversionType::Value(value) = ty else {
+        unreachable!("array traversal ends at its value type")
+    };
+    let mut term = match value {
+        ResolvedConversionType::JavaPrimitive(primitive) => primitive_type_ref(primitive),
+        ResolvedConversionType::Declaration(unit) => TypeRef::Declared {
+            id: unit.declaration_id().as_str().to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        },
+        ResolvedConversionType::External { identity } => TypeRef::named(identity.fqn()),
+        _ => return None,
+    };
+    for _ in 0..rank {
+        term = TypeRef::Array {
+            element: Box::new(term),
+        };
+    }
+    Some(term)
+}
+
+/// Java intrinsic expression types do not require an indexed platform class.
+/// The declaration/slot resolver supplies every other static type.
+pub(super) fn intrinsic_argument_type(mut expression: Node<'_>, source: &str) -> Option<TypeRef> {
+    if expression.has_error() || expression.is_missing() {
+        return None;
+    }
+    while expression.kind() == "parenthesized_expression" {
+        expression = expression.named_child(0)?;
+    }
+    if let Some(primitive) = primitive_actual_type_from_syntax(expression, source) {
+        return Some(primitive_type_ref(primitive));
+    }
+    match expression.kind() {
+        "string_literal" | "text_block" => Some(TypeRef::named("java.lang.String")),
+        "null_literal" => Some(TypeRef::named("<null>")),
+        _ => None,
+    }
+}
+
+fn primitive_type_ref(
+    primitive: crate::analyzer::usages::call_conversion::JavaPrimitive,
+) -> TypeRef {
+    use crate::analyzer::usages::call_conversion::JavaPrimitive;
+    let name = match primitive {
+        JavaPrimitive::Boolean => "boolean",
+        JavaPrimitive::Byte => "byte",
+        JavaPrimitive::Short => "short",
+        JavaPrimitive::Char => "char",
+        JavaPrimitive::Int => "int",
+        JavaPrimitive::Long => "long",
+        JavaPrimitive::Float => "float",
+        JavaPrimitive::Double => "double",
+    };
+    TypeRef::Named {
+        name: name.into(),
+        arguments: Vec::new(),
+        nullable: false,
+    }
 }
 
 fn resolve_actual_type(
@@ -1937,6 +2080,123 @@ pub(crate) fn declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
         }
         current = parent;
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn native_model_argument_applicability(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    actual: Node<'_>,
+    source: &str,
+    formal_type: &TypeRef,
+) -> ModelArgumentApplicability {
+    use crate::analyzer::jvm::external::{
+        JavaExternalConversion, java_external_conversion_in, java_external_same_static_type,
+        normalize_jvm_model_type_ref,
+    };
+    let Some(actual_type) =
+        super::native_points::java_native_model_argument_type(analyzer, file, actual, source)
+    else {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::UnresolvedSourceType);
+    };
+    let packs = analyzer.semantic_model_overlay();
+    let formal_type = normalize_jvm_model_type_ref(packs.as_deref(), formal_type);
+    let selected = java.selected_jdk_home_for_file(file).ok().and_then(|home| {
+        analyzer
+            .active_semantic_model_snapshot()?
+            .jdk_artifact_for_home(home)
+            .cloned()
+    });
+    let surface = match selected
+        .as_ref()
+        .and_then(|evidence| evidence.artifact_sha256.as_deref())
+    {
+        Some(digest) => java.external_declarations_for_source_jdk(packs.clone(), digest),
+        None => java.external_declarations(packs.clone()),
+    };
+    let kind = match java_external_conversion_in(&actual_type, &formal_type, Some(&surface)) {
+        JavaExternalConversion::Inapplicable => return ModelArgumentApplicability::Inapplicable,
+        JavaExternalConversion::Unknown => {
+            return ModelArgumentApplicability::Unknown(ConversionUnknown::IncompleteHierarchy);
+        }
+        JavaExternalConversion::Strict
+            if java_external_same_static_type(&actual_type, &formal_type) =>
+        {
+            ConversionKind::JavaIdentity
+        }
+        JavaExternalConversion::Strict if matches!((&actual_type, &formal_type), (TypeRef::Named { name: left, .. }, TypeRef::Named { name: right, .. }) if primitive_for_name(left).is_some() && primitive_for_name(right).is_some()) => {
+            ConversionKind::JavaPrimitiveWidening
+        }
+        JavaExternalConversion::Strict => ConversionKind::JavaReferenceWidening,
+        JavaExternalConversion::Loose if matches!(&actual_type, TypeRef::Named { name, .. } if primitive_for_name(name).is_some()) => {
+            ConversionKind::JavaBoxing
+        }
+        JavaExternalConversion::Loose => ConversionKind::JavaUnboxing,
+    };
+    let Some(scope_identity) = analyzer
+        .workspace_content_identities()
+        .and_then(|identities| {
+            identities.scope(|language| {
+                matches!(
+                    language,
+                    Language::Java | Language::Kotlin | Language::Scala
+                )
+            })
+        })
+    else {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::UnresolvedSourceType);
+    };
+    let mut scope_digest = LengthDelimitedDigest::new(b"bifrost.java.native-static-type-scope.v1");
+    scope_digest.push(scope_identity.as_bytes());
+    match selected
+        .as_ref()
+        .and_then(|evidence| evidence.artifact_sha256.as_deref())
+    {
+        Some(artifact) => scope_digest.push(artifact.as_bytes()),
+        None => scope_digest.push(b"no-selected-jdk-artifact"),
+    }
+    let scope_identity = scope_digest.finish();
+    let identity = |term: TypeRef| {
+        if let TypeRef::Named {
+            name, arguments, ..
+        } = &term
+            && arguments.is_empty()
+            && let Some(primitive) = primitive_for_name(name)
+        {
+            // Preserve the shared scalar domain so widening still records
+            // precision-changing int/long-to-floating-point transfers.
+            return ResolvedConversionType::JavaPrimitive(primitive);
+        }
+        let fqn = match &term {
+            TypeRef::Named { name, .. } => name.clone(),
+            TypeRef::Declared { id, .. } => id.clone(),
+            TypeRef::Array { .. } => "<array>".to_owned(),
+            _ => unreachable!("conversion admitted only ground static type terms"),
+        };
+        ResolvedConversionType::External {
+            identity: ExternalConversionIdentity::from_provenance(
+                fqn,
+                ExternalConversionProvenance::NativeStaticType {
+                    term,
+                    scope_identity,
+                },
+                false,
+                java.external_declaration_index()
+                    .dispatch_behavior_identity(),
+                packs.as_ref().map(|overlay| {
+                    StableDigest::sha256(overlay.active_model_set_hash().as_bytes())
+                }),
+            )
+            .expect("native static evidence has no model-declaration provenance prerequisite"),
+        }
+    };
+    ModelArgumentApplicability::Applicable(Box::new(ArgumentTypeConversion {
+        source: identity(actual_type),
+        target: identity(formal_type),
+        kind,
+        hierarchy: None,
+    }))
 }
 
 #[cfg(test)]

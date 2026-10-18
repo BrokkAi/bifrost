@@ -31,9 +31,9 @@ pub(crate) const REFERENCE_LOOKUP_SPELLING_SQL: &str = "SELECT p.start_node, i.s
 pub(crate) const DEFINITION_SOURCE_SITE_SQL: &str =
     "SELECT site FROM resolution_sites WHERE blob_id=?1 AND site=?2 AND role=1";
 
-pub(crate) const ROOT_EXPORT_HALVES_SQL: &str = "SELECT i.semantic_language, i.namespace, i.spelling, (json_array_length(p.body,'$[0]')=2 AND json_array_length(p.body,'$[4]')=0 AND json_type(p.body,'$[1]')='integer' AND json_extract(p.body,'$[1]')=json_extract(p.body,'$[5]')) FROM resolution_paths p JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.end_node AND s.role=1 JOIN resolution_identities i ON i.id=p.start_lead_identity WHERE p.blob_id=?1 AND p.end_node=?2 AND p.start_node=-1 AND i.namespace IS NOT NULL ORDER BY p.path";
+pub(crate) const ROOT_EXPORT_HALVES_SQL: &str = "SELECT i.semantic_language, i.namespace, i.spelling, (json_array_length(p.body,'$[0]')=2 AND json_array_length(p.body,'$[4]')=0 AND json_type(p.body,'$[1]')='integer' AND json_extract(p.body,'$[1]')=json_extract(p.body,'$[5]')), i.identity_digest FROM resolution_paths p JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.end_node AND s.role=1 JOIN resolution_identities i ON i.id=p.start_lead_identity WHERE p.blob_id=?1 AND p.end_node=?2 AND p.start_node=-1 AND i.namespace IS NOT NULL ORDER BY p.path";
 
-pub(crate) const LOOKUP_RECIPES_SQL: &str = "SELECT i.semantic_language, i.namespace, i.spelling FROM resolution_semantic_catalog c JOIN resolution_identities i ON i.id=c.shared_identity WHERE c.blob_id=?1 AND i.namespace IS NOT NULL ORDER BY c.local_key";
+pub(crate) const LOOKUP_RECIPES_SQL: &str = "SELECT i.semantic_language, i.namespace, i.spelling, i.identity_digest FROM resolution_semantic_catalog c JOIN resolution_identities i ON i.id=c.shared_identity WHERE c.blob_id=?1 AND i.namespace IS NOT NULL ORDER BY c.local_key";
 
 pub(crate) const UNSUPPORTED_GAP_REASONS_SQL: &str = "SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin=?3 UNION ALL SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin=?4 UNION ALL SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin=?5 ORDER BY reason";
 

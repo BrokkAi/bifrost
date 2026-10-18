@@ -2023,7 +2023,7 @@ pub(crate) fn read_rust_macro_input_rows(
 {
     let mut macro_inputs = Vec::new();
     let mut macro_input_indices = HashMap::default();
-    let mut statement = tx.prepare_cached("SELECT invocation_occurrence_id, start_byte, source, native_gap_site, native_scope FROM source_rust_macro_inputs WHERE blob_id = ?1 ORDER BY invocation_occurrence_id")?;
+    let mut statement = tx.prepare_cached("SELECT invocation_occurrence_id, start_byte, source, native_gap_site, native_scope, cfg_condition FROM source_rust_macro_inputs WHERE blob_id = ?1 ORDER BY invocation_occurrence_id")?;
     let mut rows = statement.query(params![blob_id])?;
     while let Some(row) = rows.next()? {
         if !keep_going() {
@@ -2052,6 +2052,10 @@ pub(crate) fn read_rust_macro_input_rows(
         macro_inputs.push(
             brokk_bifrost_core::analyzer::rust_facts::RustMacroInvocationInputSourceFact {
                 invocation,
+                cfg_condition: brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition(
+                    &row.get::<_, String>(5)?,
+                )
+                .ok_or_else(|| StoreError::corrupt("invalid macro input cfg condition"))?,
                 native_frontier,
                 occurrences: Vec::new(),
                 tree: brokk_bifrost_core::analyzer::rust_facts::RustMacroTokenTree {

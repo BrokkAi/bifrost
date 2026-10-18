@@ -1436,6 +1436,7 @@ fn class_identity_heap_bytes(class: &ClassIdentity) -> usize {
             qualified_name,
             symbol_id,
         } => qualified_name.len().saturating_add(symbol_id.len()),
+        ClassIdentity::Intrinsic { qualified_name } => qualified_name.len(),
     }
 }
 
@@ -1600,6 +1601,7 @@ fn persist_class(class: &ClassIdentity) -> Option<ClassSetFieldSlotClassRow> {
             fq_name: qualified_name.to_string(),
             symbol_id: symbol_id.to_string(),
         }),
+        ClassIdentity::Intrinsic { .. } => None,
     }
 }
 
@@ -2188,10 +2190,28 @@ pub(super) fn class_order(left: &ClassIdentity, right: &ClassIdentity) -> std::c
             .cmp(right.fq_name_str())
             .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
             .then_with(|| left.declaration_id().cmp(&right.declaration_id())),
-        (ClassIdentity::Workspace(_), ClassIdentity::External { .. }) => std::cmp::Ordering::Less,
-        (ClassIdentity::External { .. }, ClassIdentity::Workspace(_)) => {
+        (
+            ClassIdentity::Workspace(_),
+            ClassIdentity::External { .. } | ClassIdentity::Intrinsic { .. },
+        ) => std::cmp::Ordering::Less,
+        (
+            ClassIdentity::External { .. } | ClassIdentity::Intrinsic { .. },
+            ClassIdentity::Workspace(_),
+        ) => std::cmp::Ordering::Greater,
+        (ClassIdentity::External { .. }, ClassIdentity::Intrinsic { .. }) => {
+            std::cmp::Ordering::Less
+        }
+        (ClassIdentity::Intrinsic { .. }, ClassIdentity::External { .. }) => {
             std::cmp::Ordering::Greater
         }
+        (
+            ClassIdentity::Intrinsic {
+                qualified_name: left_name,
+            },
+            ClassIdentity::Intrinsic {
+                qualified_name: right_name,
+            },
+        ) => left_name.cmp(right_name),
         (
             ClassIdentity::External {
                 qualified_name: left_name,
@@ -2365,6 +2385,10 @@ fn push_class(digest: &mut LengthDelimitedDigest, class: &ClassIdentity) {
             digest.push(b"external");
             digest.push(qualified_name.as_bytes());
             digest.push(symbol_id.as_bytes());
+        }
+        ClassIdentity::Intrinsic { qualified_name } => {
+            digest.push(b"intrinsic");
+            digest.push(qualified_name.as_bytes());
         }
     }
 }

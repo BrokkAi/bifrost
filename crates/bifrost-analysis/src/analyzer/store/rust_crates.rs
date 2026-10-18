@@ -1,7 +1,7 @@
-//! Content-addressed Cargo crate reconciliation. All Rust collections below
-//! belong to this reconcile request; only SQLite rows survive its return.
+//! Content-addressed Cargo crate reconciliation with query-local SQL scheduling.
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 use brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition;
 use brokk_bifrost_rust::cargo_config::{
@@ -16,12 +16,9 @@ use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, functions::FunctionFlags, params};
 use sha2::{Digest, Sha256};
 
+use super::unit_schedule;
 use super::{AnalyzerStore, Result, StoreError, WorkspaceSnapshotId, WorkspaceSnapshots};
 use crate::analyzer::pool_memo::install_on_dedicated_build_pool;
-use crate::analyzer::semantic::CancellationToken;
-use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmRequest, DenseUsizeGraph, strongly_connected_components,
-};
 
 pub(super) const REPLACED_BLOB_ID_SQL: &str = "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3 AND (EXISTS(SELECT 1 FROM rust_crate_container_sources WHERE blob_id = blobs.id) OR EXISTS(SELECT 1 FROM rust_crate_exports WHERE declaration_blob_id = blobs.id))";
 pub(super) const REINSERT_BLOB_SQL: &str =
@@ -56,7 +53,7 @@ type CrateKey = [u8; 32];
 /// per-blob payloads the derivation reads. Keeping the two apart is the point:
 /// rotating the epoch for a consumer-side change would make every Rust blob
 /// dirty and force a full reparse of a warm store.
-const RUST_CRATE_DERIVATION_VERSION: &str = "4460-2026-10-07-module-self-imports-target-has-atomic-cfg-attr-derived-surface-generated-attribute-boundary-fact-enum-variant-export-set-2026-10-08-cycle-only-forced-wave-2026-10-09-primitive-shadowing-5235-2026-10-14-item-macro-guess-scope-5375-2026-10-15-reverse-inventory-5375-2026-10-16-v2-composite-primitive-shadowing-5243-2026-10-15-reverse-inventory-5375-2026-10-16-v3-enumerated-inputs-5517";
+const RUST_CRATE_DERIVATION_VERSION: &str = "4460-2026-10-07-module-self-imports-target-has-atomic-cfg-attr-derived-surface-generated-attribute-boundary-fact-enum-variant-export-set-2026-10-08-cycle-only-forced-wave-2026-10-09-primitive-shadowing-5235-2026-10-14-item-macro-guess-scope-5375-2026-10-15-reverse-inventory-5375-2026-10-16-v2-composite-primitive-shadowing-5243-2026-10-15-reverse-inventory-5375-2026-10-16-v3-enumerated-inputs-5517-cfg-if-ordered-items-and-conditional-imports-5172-2026-10-17-conditional-macro-frontiers-constructor-visibility-5133-2026-10-15-forwarded-public-surface-5133-2026-10-17";
 
 /// Set by `crate_topology_digests_follow_the_derivation_version` and
 /// `warm_derivation_version_rotation_replaces_same_revision_versions` so that a
@@ -98,6 +95,160 @@ struct Gap {
     subject: String,
     detail: String,
 }
+// The configuration values are JSON arrays of scalar strings. Targets,
+// dependency kinds, identity, availability and prior outputs are separate rows.
+const STAGED_TARGET_SQL: &str = "SELECT crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,manifest_version FROM temp.rust_schedule_targets WHERE unit_id = ?1";
+const STAGED_DEPENDENCIES_SQL: &str = "SELECT extern_name,kind,dependency_key FROM temp.rust_schedule_dependencies WHERE crate_key = ?1 ORDER BY ordinal";
+const WAVE_UNIT_SQL: &str = "SELECT wave.unit_id, wave.forced
+                                FROM temp.rust_schedule_wave_order AS ordered
+                                JOIN temp.rust_schedule_wave AS wave USING(unit_id)
+                                WHERE ordered.ordinal = ?1";
+const LIVE_SURFACE_SQL: &str = "SELECT surface FROM temp.rust_schedule_live WHERE crate_key = ?1";
+
+const RUST_SCHEDULE_SCHEMA_SQL: &str = "
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_targets(
+ unit_id INTEGER PRIMARY KEY, crate_key BLOB NOT NULL UNIQUE,
+ manifest_path TEXT NOT NULL, root_path TEXT NOT NULL, target_kind TEXT NOT NULL,
+ crate_name TEXT NOT NULL, edition TEXT NOT NULL,
+ cfg TEXT NOT NULL CHECK(json_valid(cfg)), features TEXT NOT NULL CHECK(json_valid(features)),
+ inventory_complete INTEGER NOT NULL, manifest_version INTEGER,
+ reached INTEGER NOT NULL DEFAULT 0, pending INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE INDEX IF NOT EXISTS temp.rust_schedule_targets_pending ON rust_schedule_targets(pending, unit_id);
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_dependencies(
+ crate_key BLOB NOT NULL, ordinal INTEGER NOT NULL, extern_name TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('normal','dev','build')), dependency_key BLOB,
+ PRIMARY KEY(crate_key, ordinal)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS temp.rust_schedule_dependencies_dependency ON rust_schedule_dependencies(dependency_key);
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_previous(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_live(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_reached(crate_key BLOB PRIMARY KEY) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_detached(topology_id INTEGER PRIMARY KEY) STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_blocked(crate_key BLOB PRIMARY KEY) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_wave(unit_id INTEGER PRIMARY KEY, forced INTEGER NOT NULL) STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_wave_order(ordinal INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL) STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_outputs(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_moved(crate_key BLOB PRIMARY KEY) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_next(ordinal INTEGER PRIMARY KEY, crate_key BLOB NOT NULL UNIQUE) STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_pending_order(ordinal INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL UNIQUE) STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_retire(crate_key BLOB PRIMARY KEY, opened INTEGER NOT NULL) WITHOUT ROWID, STRICT;";
+
+const RUST_READY_WAVE_SQL: &str = "INSERT INTO temp.rust_schedule_wave
+ SELECT target.unit_id, 0 FROM temp.rust_schedule_targets AS target
+ WHERE target.pending = 1
+   AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_blocked AS blocked WHERE blocked.crate_key = target.crate_key)
+   AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_dependencies AS edge
+       WHERE edge.crate_key = target.crate_key AND edge.dependency_key IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_live AS live WHERE live.crate_key = edge.dependency_key))";
+
+const RUST_FORCE_COMPONENT_SQL: &str = "SELECT component.component_id
+ FROM temp.rust_schedule_targets AS target
+ JOIN temp.unit_schedule_components AS component USING(unit_id)
+ WHERE target.pending = 1 AND NOT EXISTS (
+   SELECT 1 FROM temp.unit_schedule_components AS member
+   JOIN temp.rust_schedule_targets AS peer USING(unit_id)
+   WHERE member.component_id = component.component_id AND (
+     EXISTS (SELECT 1 FROM temp.rust_schedule_blocked AS blocked WHERE blocked.crate_key = peer.crate_key)
+     OR EXISTS (
+       SELECT 1 FROM temp.rust_schedule_dependencies AS edge
+       JOIN temp.rust_schedule_targets AS dependency ON dependency.crate_key = edge.dependency_key
+       JOIN temp.unit_schedule_components AS dependency_component ON dependency_component.unit_id = dependency.unit_id
+       WHERE edge.crate_key = peer.crate_key AND dependency.pending = 1
+         AND dependency_component.component_id <> component.component_id
+         AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_live AS live WHERE live.crate_key = edge.dependency_key))))
+ ORDER BY (SELECT ordinal FROM temp.rust_schedule_pending_order WHERE unit_id = target.unit_id) LIMIT 1";
+
+fn stage_crate(conn: &Connection, ordinal: i64, item: &PreparedCrate) -> Result<()> {
+    let target = &item.target;
+    conn.execute("INSERT INTO temp.rust_schedule_targets
+        (unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,manifest_version)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![ordinal, item.key.as_slice(), stable_path(&target.manifest_path), stable_path(&target.root_path), target_kind(target.kind), target.name, edition(target.edition), serde_json::to_string(&target.cfg_atoms).expect("cfg string sets serialize"), serde_json::to_string(&target.features).expect("feature string sets serialize"), target.inventory_complete, item.manifest_version])?;
+    for (ordinal, (name, kind, dependency)) in item.dependencies.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO temp.rust_schedule_dependencies VALUES(?1,?2,?3,?4,?5)",
+            params![
+                item.key.as_slice(),
+                ordinal as i64,
+                name,
+                kind,
+                dependency.as_ref().map(|key| key.as_slice())
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn read_staged_crate(conn: &Connection, id: i64, forced: bool) -> Result<PreparedCrate> {
+    let (key, manifest, root, kind, name, edition_value, cfg, features, complete, version) =
+        conn.query_row(STAGED_TARGET_SQL, [id], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, bool>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })?;
+    let key = crate_key_from_row(key)?;
+    let dependencies = conn
+        .prepare(STAGED_DEPENDENCIES_SQL)?
+        .query_map([key.as_slice()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        })?
+        .map(|row| {
+            let (name, kind, key) = row?;
+            let kind = match kind.as_str() {
+                "normal" => "normal",
+                "dev" => "dev",
+                "build" => "build",
+                _ => unreachable!("staged dependency kind is checked"),
+            };
+            Ok((name, kind, key.map(crate_key_from_row).transpose()?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PreparedCrate {
+        key,
+        manifest_version: version,
+        inventory_error: None,
+        dependencies,
+        target: RustCrateTarget {
+            manifest_path: PathBuf::from(manifest),
+            root_path: PathBuf::from(root),
+            kind: match kind.as_str() {
+                "lib" => RustCallerTargetKind::Library,
+                "bin" => RustCallerTargetKind::Binary,
+                "test" => RustCallerTargetKind::Test,
+                "example" => RustCallerTargetKind::Example,
+                "bench" => RustCallerTargetKind::Bench,
+                "build" => RustCallerTargetKind::Build,
+                _ => unreachable!("only Cargo targets are staged"),
+            },
+            name,
+            edition: match edition_value.as_str() {
+                "2015" => RustCargoEdition::Rust2015,
+                "2018" => RustCargoEdition::Rust2018,
+                "2021" => RustCargoEdition::Rust2021,
+                "2024" => RustCargoEdition::Rust2024,
+                _ => unreachable!("only supported editions are staged"),
+            },
+            cfg_atoms: serde_json::from_str(&cfg).expect("staged cfg string arrays decode"),
+            features: serde_json::from_str(&features).expect("staged feature string arrays decode"),
+            dependencies: Vec::new(),
+            inventory_complete: complete && !forced,
+        },
+    })
+}
+
 struct PreparedCrate {
     target: RustCrateTarget,
     key: CrateKey,
@@ -293,6 +444,44 @@ impl AnalyzerStore {
         Ok(())
     }
 
+    /// Check the complete topology/summary differential for current Rust heads.
+    /// Integration tests use the same member, export and dependency assertions
+    /// as the automatic unit-test check after reconciliation.
+    #[cfg(feature = "test-support")]
+    pub fn assert_rust_summary_differential_for_test(&self) {
+        let conn = self
+            .read_conn()
+            .expect("open the Rust summary differential reader");
+        let snapshots = conn
+            .prepare(
+                "SELECT heads.workspace_id, heads.generation, heads.revision
+                 FROM workspace_heads AS heads
+                 LEFT JOIN analysis_epochs AS epochs ON epochs.lang = heads.lang
+                 WHERE heads.lang = 'rust'
+                   AND heads.generation = COALESCE(epochs.generation, 0)
+                 ORDER BY heads.workspace_id",
+            )
+            .expect("prepare current Rust workspace heads")
+            .query_map([], |row| {
+                Ok(WorkspaceSnapshotId {
+                    workspace_id: super::WorkspaceId(row.get(0)?),
+                    lang: "rust".into(),
+                    generation: super::GenerationId::from_persisted(row.get(1)?),
+                    revision: row.get(2)?,
+                })
+            })
+            .expect("read current Rust workspace heads")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect current Rust workspace heads");
+        assert!(
+            !snapshots.is_empty(),
+            "the Rust differential requires a published workspace head"
+        );
+        for snapshot in snapshots {
+            super::rust_unit_summaries::assert_differential(&conn, &snapshot);
+        }
+    }
+
     /// Reconcile the crates a set of changed paths reached.
     ///
     /// One changed file costs its own crates and, when its export surface
@@ -385,60 +574,6 @@ impl AnalyzerStore {
         })
     }
 
-    /// The topology and export surface this generation already derived for
-    /// every live crate.
-    fn live_rust_crate_topologies(
-        &self,
-        snapshots: &WorkspaceSnapshots,
-        snapshot: &WorkspaceSnapshotId,
-    ) -> Result<HashMap<CrateKey, DerivedCrate>> {
-        let conn = self.read_conn_for_workspace(snapshots)?;
-        let mut live = HashMap::new();
-        for row in conn.prepare(SQL_RUST_CRATE_LIVE_TOPOLOGIES)?.query_map(
-            params![snapshot.workspace_id.as_str(), snapshot.generation.0],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            },
-        )? {
-            let (key, topology_id, surface) = row?;
-            let key = crate_key_from_row(key)?;
-            live.insert(
-                key,
-                DerivedCrate {
-                    key,
-                    topology_id,
-                    surface: crate_key_from_row(surface)?,
-                },
-            );
-        }
-        Ok(live)
-    }
-
-    /// The live crates that name one crate as a dependency.
-    fn live_rust_crate_dependents(
-        &self,
-        snapshots: &WorkspaceSnapshots,
-        snapshot: &WorkspaceSnapshotId,
-        dependency: CrateKey,
-    ) -> Result<Vec<CrateKey>> {
-        let conn = self.read_conn_for_workspace(snapshots)?;
-        conn.prepare(SQL_RUST_CRATE_DEPENDENTS)?
-            .query_map(
-                params![
-                    snapshot.workspace_id.as_str(),
-                    snapshot.generation.0,
-                    dependency.as_slice()
-                ],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?
-            .map(|key| crate_key_from_row(key?))
-            .collect()
-    }
-
     fn reconcile_rust_crates_in_scope(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -454,7 +589,7 @@ impl AnalyzerStore {
         };
         let snapshots = WorkspaceSnapshots::from_iter([("rust".to_string(), snapshot.clone())]);
         let prelude_timing = crate::profiling::scope("rust_crates.reconcile.inputs");
-        let (mut crates, paths, epoch, inventory_errors, naming, configuration) = {
+        let (crates, paths, epoch, inventory_errors, naming, configuration) = {
             let conn = self.read_conn_for_workspace(&snapshots)?;
             #[cfg(test)]
             let _trace =
@@ -521,6 +656,7 @@ impl AnalyzerStore {
                 )
                 .map_err(StoreError::new)?;
             let configuration = RustCargoConfiguration::from_files(configuration_files);
+            let epoch: String = conn.query_row(SQL_ANALYSIS_EPOCHS_4, [], |row| row.get(0))?;
             let targets = rust_crate_targets(
                 paths
                     .iter()
@@ -569,7 +705,6 @@ impl AnalyzerStore {
                     }
                 })
                 .collect::<Vec<_>>();
-            let epoch: String = conn.query_row(SQL_ANALYSIS_EPOCHS_4, [], |row| row.get(0))?;
             (
                 crates,
                 paths,
@@ -581,211 +716,250 @@ impl AnalyzerStore {
         };
         drop(prelude_timing);
         let waves_timing = crate::profiling::scope("rust_crates.reconcile.waves");
-        // The dependency cycles among this generation's Cargo targets: each
-        // strongly connected component of more than one crate, and each crate
-        // that names itself (a library with a dev-dependency on its own
-        // package). Lib targets carry their dev-dependencies, so a
-        // dev-dependency back onto a crate's dependent closes a cycle.
-        let cycles: Vec<Vec<CrateKey>> = {
-            let index: HashMap<CrateKey, usize> = crates
-                .iter()
-                .enumerate()
-                .map(|(position, item)| (item.key, position))
-                .collect();
-            assert_eq!(index.len(), crates.len(), "crate keys are unique");
-            let edges: HashSet<(usize, usize)> = crates
-                .iter()
-                .enumerate()
-                .flat_map(|(from, item)| {
-                    item.dependencies
-                        .iter()
-                        .filter_map(|(_, _, key)| key.and_then(|key| index.get(&key)))
-                        .map(move |&to| (from, to))
-                })
-                .collect();
-            let graph = DenseUsizeGraph::new(crates.len(), edges.iter().copied());
-            let cancellation = CancellationToken::new();
-            let mut budget = CfgAlgorithmBudget::default();
-            strongly_connected_components(
-                &graph,
-                &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
-            )
-            .expect("an unbounded, uncancelled component pass completes")
-            .components
-            .iter()
-            .filter(|members| members.len() > 1 || edges.contains(&(members[0], members[0])))
-            .map(|members| members.iter().map(|&member| crates[member].key).collect())
-            .collect()
-        };
-        let cycle_of: HashMap<CrateKey, usize> = cycles
-            .iter()
-            .enumerate()
-            .flat_map(|(cycle, members)| members.iter().map(move |&key| (key, cycle)))
-            .collect();
-        let mut forced_cycles = Vec::new();
-        let mut forced_unavailable = Vec::new();
-        let mut complete = HashMap::<CrateKey, DerivedCrate>::new();
-        // Crates this pass actually walked, as opposed to the live set it
-        // publishes. The two differ exactly by what scoping saved.
-        let mut derived_count = 0_usize;
-        // A scoped pass publishes the whole live crate set: the crates it does
-        // not derive keep the topology the last pass gave them, read back by
-        // key. Seeding them here is what lets the version-closing pass below
-        // stay exactly as the from-scratch pass leaves it, and what lets a
-        // derived crate fold an undisturbed dependency's surface.
-        let (previous, mut reached, mut unreached, from_revision, reached_detached) = match scope {
-            CrateReconcileScope::Everything => (HashMap::new(), None, Vec::new(), None, None),
+        let schedule = Connection::open_in_memory()?;
+        schedule.execute_batch(unit_schedule::SCHEMA_SQL)?;
+        schedule.execute_batch(RUST_SCHEDULE_SCHEMA_SQL)?;
+        // Targets are an input query result only until their normalized rows
+        // have been staged. No target or topology arena survives into waves.
+        for (ordinal, item) in crates.into_iter().enumerate() {
+            stage_crate(&schedule, ordinal as i64, &item)?;
+        }
+        schedule.execute_batch("INSERT INTO temp.unit_schedule_units SELECT unit_id FROM temp.rust_schedule_targets;
+            INSERT INTO temp.unit_schedule_edges
+            SELECT DISTINCT owner.unit_id, dependency.unit_id, 1
+            FROM temp.rust_schedule_dependencies AS edges
+            JOIN temp.rust_schedule_targets AS owner ON owner.crate_key = edges.crate_key
+            JOIN temp.rust_schedule_targets AS dependency ON dependency.crate_key = edges.dependency_key;")?;
+        unit_schedule::build(&schedule)?;
+        let from_revision = match scope {
+            CrateReconcileScope::Everything => {
+                schedule.execute(
+                    "UPDATE temp.rust_schedule_targets SET reached = 1, pending = 1",
+                    [],
+                )?;
+                None
+            }
             CrateReconcileScope::Reached {
-                crates: mut keys,
+                crates,
                 from_revision,
             } => {
-                let reached_cycles: Vec<usize> = keys
-                    .iter()
-                    .filter_map(|key| cycle_of.get(key).copied())
-                    .collect();
-                for cycle in reached_cycles {
-                    keys.extend(cycles[cycle].iter().copied());
+                for key in crates {
+                    schedule.execute(
+                        "INSERT INTO temp.rust_schedule_reached VALUES(?1)",
+                        [key.as_slice()],
+                    )?;
                 }
-                let previous = self.live_rust_crate_topologies(&snapshots, snapshot)?;
-                // A reached crate the Cargo targets do not prepare is one no
-                // Cargo target places: a detached crate. It is not derived by
-                // the wave loop below, so its file is handed to the detached
-                // pass. Carrying it forward instead would keep the topology the
-                // change invalidated, and closing its version row would drop
-                // the file from every summary reader.
-                let prepared: HashSet<CrateKey> = crates.iter().map(|item| item.key).collect();
-                let mut detached = Vec::new();
-                for (key, derived) in &previous {
-                    if keys.contains(key) {
-                        if !prepared.contains(key) {
-                            detached.push(derived.topology_id);
-                        }
-                    } else {
-                        complete.insert(*key, *derived);
+                schedule.execute_batch("INSERT OR IGNORE INTO temp.rust_schedule_reached
+                    SELECT peers.crate_key FROM temp.rust_schedule_reached AS seeds
+                    JOIN temp.rust_schedule_targets AS target ON target.crate_key = seeds.crate_key
+                    JOIN temp.unit_schedule_components AS component ON component.unit_id = target.unit_id
+                    JOIN temp.unit_schedule_components AS member ON member.component_id = component.component_id
+                    JOIN temp.rust_schedule_targets AS peers ON peers.unit_id = member.unit_id;
+                    UPDATE temp.rust_schedule_targets SET reached = 1, pending = 1
+                    WHERE crate_key IN (SELECT crate_key FROM temp.rust_schedule_reached);")?;
+                {
+                    let source = self.read_conn_for_workspace(&snapshots)?;
+                    let mut query = source.prepare(SQL_RUST_CRATE_LIVE_TOPOLOGIES)?;
+                    let mut rows = query.query(params![
+                        snapshot.workspace_id.as_str(),
+                        snapshot.generation.0
+                    ])?;
+                    while let Some(row) = rows.next()? {
+                        schedule.execute(
+                            "INSERT INTO temp.rust_schedule_previous VALUES(?1,?2,?3)",
+                            params![
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Vec<u8>>(2)?
+                            ],
+                        )?;
                     }
                 }
-                let (wanted, rest): (Vec<_>, Vec<_>) = crates
-                    .into_iter()
-                    .partition(|item| keys.contains(&item.key));
-                crates = wanted;
-                (
-                    previous,
-                    Some(keys),
-                    rest,
-                    Some(from_revision),
-                    Some(detached),
-                )
+                schedule.execute_batch("INSERT INTO temp.rust_schedule_live
+                    SELECT * FROM temp.rust_schedule_previous WHERE crate_key NOT IN (SELECT crate_key FROM temp.rust_schedule_reached);
+                    INSERT INTO temp.rust_schedule_detached
+                    SELECT previous.topology_id FROM temp.rust_schedule_previous AS previous
+                    JOIN temp.rust_schedule_reached USING(crate_key)
+                    WHERE NOT EXISTS (SELECT 1 FROM temp.rust_schedule_targets AS targets WHERE targets.crate_key = previous.crate_key);")?;
+                Some(from_revision)
             }
         };
-        while !crates.is_empty() {
-            let (mut wave, mut pending): (Vec<_>, Vec<_>) = crates.into_iter().partition(|item| {
-                item.dependencies
-                    .iter()
-                    .all(|(_, _, key)| key.is_none_or(|key| complete.contains_key(&key)))
-            });
-            if wave.is_empty() {
-                // No crate is ready, so either a dependency cycle blocks or a
-                // crate names a workspace dependency that no pending or
-                // derived crate provides. Force one strongly connected
-                // component whose dependencies outside itself are all derived
-                // or unavailable: the members of a cycle are derived without
-                // each other, and an unavailable dependency becomes the
-                // crate's `unsupported_manifest` gap. Every other pending crate
-                // waits for its dependencies as usual, so a crate that depends
-                // on a cycle is derived with the cycle present.
-                let by_key: HashMap<CrateKey, &PreparedCrate> =
-                    pending.iter().map(|item| (item.key, item)).collect();
-                let forced = pending
-                    .iter()
-                    .map(|item| match cycle_of.get(&item.key) {
-                        Some(&cycle) => cycles[cycle].as_slice(),
-                        None => std::slice::from_ref(&item.key),
-                    })
-                    .find(|members| {
-                        members.iter().all(|member| {
-                            by_key[member].dependencies.iter().all(|(_, _, key)| {
-                                key.is_none_or(|key| {
-                                    complete.contains_key(&key)
-                                        || members.contains(&key)
-                                        || !by_key.contains_key(&key)
-                                })
-                            })
-                        })
-                    })
-                    .expect("the pending crates' dependency components have a sink")
-                    .to_vec();
-                let names = forced
-                    .iter()
-                    .map(|key| {
-                        let target = &by_key[key].target;
-                        format!("{}:{}", target.name, target_kind(target.kind))
-                    })
-                    .collect::<Vec<_>>();
-                if cycle_of.contains_key(&forced[0]) {
-                    forced_cycles.push(names);
-                } else {
-                    forced_unavailable.extend(names);
+        schedule.execute("INSERT INTO temp.rust_schedule_pending_order(unit_id) SELECT unit_id FROM temp.rust_schedule_targets WHERE pending = 1 ORDER BY unit_id", [])?;
+        let schedule = Mutex::new(schedule);
+        let mut forced_cycles = Vec::new();
+        let mut forced_unavailable = Vec::new();
+        let mut derived_count = 0;
+        loop {
+            let wave_count = {
+                let conn = schedule.lock().unwrap();
+                if conn.query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM temp.rust_schedule_targets WHERE pending = 1)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )? {
+                    break;
                 }
-                (wave, pending) = pending
-                    .into_iter()
-                    .partition(|item| forced.contains(&item.key));
-                for item in &mut wave {
-                    item.target.inventory_complete = false;
+                conn.execute_batch(
+                    "DELETE FROM temp.rust_schedule_blocked; DELETE FROM temp.rust_schedule_wave;",
+                )?;
+                if from_revision.is_some() {
+                    let source_conn = self.read_conn_for_workspace(&snapshots)?;
+                    let source = source_conn.unchecked_transaction()?;
+                    source.execute_batch(CREATE_PENDING_CRATES_SQL)?;
+                    source.execute("DELETE FROM temp.rust_crate_pending_keys", [])?;
+                    {
+                        let mut query = conn.prepare(
+                            "SELECT targets.crate_key, leader.crate_key
+                        FROM temp.rust_schedule_targets AS targets
+                        JOIN temp.unit_schedule_components AS component USING(unit_id)
+                        JOIN temp.rust_schedule_targets AS leader ON leader.unit_id = (
+                            SELECT min(member.unit_id) FROM temp.unit_schedule_components AS member
+                            WHERE member.component_id = component.component_id)
+                        WHERE targets.pending = 1",
+                        )?;
+                        let mut rows = query.query([])?;
+                        while let Some(row) = rows.next()? {
+                            source.execute(
+                                INSERT_PENDING_CRATE_SQL,
+                                params![row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?],
+                            )?;
+                        }
+                        let mut blocked = source.prepare(SQL_RUST_CRATE_PENDING_ANCESTORS)?;
+                        let rows = blocked.query_map(
+                            params![
+                                snapshot.workspace_id.as_str(),
+                                snapshot.generation.0,
+                                snapshot.revision
+                            ],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )?;
+                        for key in rows {
+                            conn.execute(
+                                "INSERT INTO temp.rust_schedule_blocked VALUES(?1)",
+                                [key?],
+                            )?;
+                        }
+                    }
+                    source.rollback()?;
                 }
-            }
-            let results = install_on_dedicated_build_pool(|| {
-                wave.par_iter()
-                    .map(|item| {
-                        self.derive_rust_crate(item, &snapshots, &epoch, &complete, &naming)
+                let ready = conn.execute(RUST_READY_WAVE_SQL, [])?;
+                if ready == 0 {
+                    // Rust forces exactly one dependency-ready component once.
+                    // Its members cannot consume each other's outputs.
+                    let component: i64 =
+                        conn.query_row(RUST_FORCE_COMPONENT_SQL, [], |row| row.get(0))?;
+                    conn.execute(
+                        "INSERT INTO temp.rust_schedule_wave
+                        SELECT targets.unit_id, 1 FROM temp.rust_schedule_targets AS targets
+                        JOIN temp.unit_schedule_components AS component USING(unit_id)
+                        WHERE targets.pending = 1 AND component.component_id = ?1",
+                        [component],
+                    )?;
+                    let names = conn.prepare("SELECT targets.crate_name || ':' || targets.target_kind
+                        FROM temp.rust_schedule_wave AS wave JOIN temp.rust_schedule_targets AS targets USING(unit_id)
+                        ORDER BY targets.unit_id")?.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let cyclic: bool = conn.query_row("SELECT cyclic FROM temp.unit_schedule_components WHERE component_id = ?1 LIMIT 1", [component], |row| row.get(0))?;
+                    if cyclic {
+                        forced_cycles.push(names);
+                    } else {
+                        forced_unavailable.extend(names);
+                    }
+                }
+                conn.execute_batch("DELETE FROM temp.rust_schedule_wave_order;
+                    DELETE FROM temp.rust_schedule_outputs;
+                    INSERT INTO temp.rust_schedule_wave_order(unit_id)
+                    SELECT wave.unit_id FROM temp.rust_schedule_wave AS wave
+                    JOIN temp.rust_schedule_pending_order AS pending USING(unit_id) ORDER BY pending.ordinal;")?;
+                conn.query_row("SELECT count(*) FROM temp.rust_schedule_wave", [], |row| {
+                    row.get::<_, usize>(0)
+                })?
+            };
+            // Each worker loads one target and streams settled rows into its
+            // own TEMP schema. Results stay private until the whole wave ends.
+            let failures = install_on_dedicated_build_pool(|| {
+                (1..=wave_count)
+                    .into_par_iter()
+                    .filter_map(|ordinal| {
+                        let derive = || -> Result<()> {
+                            let item = {
+                                let conn = schedule.lock().unwrap();
+                                let (id, forced) =
+                                    conn.query_row(WAVE_UNIT_SQL, [ordinal as i64], |row| {
+                                        Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+                                    })?;
+                                read_staged_crate(&conn, id, forced)?
+                            };
+                            let derived = self.derive_rust_crate(
+                                &item,
+                                &snapshots,
+                                &epoch,
+                                Some(&schedule),
+                                &naming,
+                            )?;
+                            schedule.lock().unwrap().execute(
+                                "INSERT INTO temp.rust_schedule_outputs VALUES(?1,?2,?3)",
+                                params![
+                                    derived.key.as_slice(),
+                                    derived.topology_id,
+                                    derived.surface.as_slice()
+                                ],
+                            )?;
+                            Ok(())
+                        };
+                        derive().err()
                     })
                     .collect::<Vec<_>>()
             });
-            let mut failures = Vec::new();
-            let mut moved_surfaces = Vec::new();
-            derived_count += wave.len();
-            for result in results {
-                match result {
-                    Ok(derived) => {
-                        // Only a crate whose export surface actually moved can
-                        // change a dependent's digest. A body edit moves none,
-                        // and reaches no dependent.
-                        if previous
-                            .get(&derived.key)
-                            .is_none_or(|before| before.surface != derived.surface)
-                        {
-                            moved_surfaces.push(derived.key);
-                        }
-                        complete.insert(derived.key, derived);
-                    }
-                    Err(error) => failures.push(error),
-                }
-            }
+            derived_count += wave_count;
+            let conn = schedule.lock().unwrap();
+            conn.execute_batch("DELETE FROM temp.rust_schedule_moved;
+                INSERT INTO temp.rust_schedule_moved
+                SELECT outputs.crate_key FROM temp.rust_schedule_outputs AS outputs
+                WHERE NOT EXISTS (SELECT 1 FROM temp.rust_schedule_previous AS previous
+                    WHERE previous.crate_key = outputs.crate_key AND previous.surface = outputs.surface);
+                INSERT OR REPLACE INTO temp.rust_schedule_live SELECT * FROM temp.rust_schedule_outputs;")?;
             if !failures.is_empty() {
                 return Err(StoreError::new(format!(
                     "crate derivation wave failed: {failures:?}"
                 )));
             }
-            crates = pending;
-            if let Some(reached) = reached.as_mut() {
-                for key in moved_surfaces {
-                    let mut dependents =
-                        self.live_rust_crate_dependents(&snapshots, snapshot, key)?;
-                    let peers = dependents
-                        .iter()
-                        .filter_map(|dependent| cycle_of.get(dependent))
-                        .flat_map(|&cycle| cycles[cycle].iter().copied())
-                        .collect::<Vec<_>>();
-                    dependents.extend(peers);
-                    for dependent in dependents {
-                        if !reached.insert(dependent) {
-                            continue;
+            conn.execute_batch("UPDATE temp.rust_schedule_targets SET pending = 0 WHERE unit_id IN (SELECT unit_id FROM temp.rust_schedule_wave);")?;
+            if from_revision.is_some() {
+                // Only moved public surfaces reach consumers. Expand reached
+                // consumers to their components before removing carried rows.
+                {
+                    let source = self.read_conn_for_workspace(&snapshots)?;
+                    let mut moved =
+                        conn.prepare("SELECT crate_key FROM temp.rust_schedule_moved")?;
+                    let mut keys = moved.query([])?;
+                    while let Some(row) = keys.next()? {
+                        let key: Vec<u8> = row.get(0)?;
+                        let mut query = source.prepare(SQL_RUST_CRATE_DEPENDENTS)?;
+                        for key in query.query_map(
+                            params![snapshot.workspace_id.as_str(), snapshot.generation.0, key],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )? {
+                            conn.execute(
+                                "INSERT OR IGNORE INTO temp.rust_schedule_next(crate_key) VALUES(?1)",
+                                [key?],
+                            )?;
                         }
-                        complete.remove(&dependent);
-                        if let Some(position) =
-                            unreached.iter().position(|item| item.key == dependent)
-                        {
-                            crates.push(unreached.swap_remove(position));
-                        }
+                        conn.execute_batch("INSERT OR IGNORE INTO temp.rust_schedule_next(crate_key)
+                    SELECT peers.crate_key FROM temp.rust_schedule_next AS next
+                    JOIN temp.rust_schedule_targets AS target USING(crate_key)
+                    JOIN temp.unit_schedule_components AS component USING(unit_id)
+                    JOIN temp.unit_schedule_components AS member ON member.component_id = component.component_id
+                    JOIN temp.rust_schedule_targets AS peers ON peers.unit_id = member.unit_id
+                    ORDER BY next.ordinal, peers.unit_id;
+                    DELETE FROM temp.rust_schedule_next WHERE crate_key IN (SELECT crate_key FROM temp.rust_schedule_reached);
+                    DELETE FROM temp.rust_schedule_live WHERE crate_key IN (SELECT crate_key FROM temp.rust_schedule_next);
+                    UPDATE temp.rust_schedule_targets SET reached = 1, pending = 1
+                    WHERE crate_key IN (SELECT crate_key FROM temp.rust_schedule_next);
+                    INSERT INTO temp.rust_schedule_reached SELECT crate_key FROM temp.rust_schedule_next;
+                    INSERT OR IGNORE INTO temp.rust_schedule_pending_order(unit_id)
+                    SELECT targets.unit_id FROM temp.rust_schedule_next AS next
+                    JOIN temp.rust_schedule_targets AS targets USING(crate_key) ORDER BY next.ordinal;
+                    DELETE FROM temp.rust_schedule_next;")?;
                     }
                 }
             }
@@ -798,58 +972,47 @@ impl AnalyzerStore {
         // have lost are the reached ones its Cargo targets did not prepare;
         // those are re-derived from the files their topology placed, minus any
         // path a prepared crate of this same pass already covers.
-        let detached_paths: Vec<String> = match reached_detached {
-            None => {
-                let conn = self.read_conn_for_workspace(&snapshots)?;
-                #[cfg(test)]
-                let _trace = StatementTrace::new(
-                    &conn,
-                    self.crate_statement_counter.lock().unwrap().clone(),
-                );
-                let mut reached = HashSet::new();
-                for item in complete.values() {
-                    let mut statement = conn.prepare(SQL_RUST_CRATE_MODULES_5)?;
-                    for path in
-                        statement.query_map([item.topology_id], |row| row.get::<_, String>(0))?
+        let detached_paths = {
+            let conn = schedule.lock().unwrap();
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS rust_schedule_paths(path TEXT PRIMARY KEY) WITHOUT ROWID", [])?;
+            conn.execute("DELETE FROM temp.rust_schedule_paths", [])?;
+            if from_revision.is_none() {
+                for (path, _) in paths {
+                    conn.execute("INSERT INTO temp.rust_schedule_paths VALUES(?1)", [path])?;
+                }
+            } else {
+                let source = self.read_conn_for_workspace(&snapshots)?;
+                let mut query =
+                    conn.prepare("SELECT topology_id FROM temp.rust_schedule_detached")?;
+                for id in query.query_map([], |row| row.get::<_, i64>(0))? {
+                    for path in source
+                        .prepare(SQL_RUST_CRATE_MODULES_5)?
+                        .query_map([id?], |row| row.get::<_, String>(0))?
                     {
-                        reached.insert(path?);
+                        conn.execute(
+                            "INSERT OR IGNORE INTO temp.rust_schedule_paths VALUES(?1)",
+                            [path?],
+                        )?;
                     }
                 }
-                paths
-                    .into_iter()
-                    .filter(|(path, _)| !reached.contains(path))
-                    .map(|(path, _)| path)
-                    .collect()
             }
-            Some(topology_ids) if topology_ids.is_empty() => Vec::new(),
-            Some(topology_ids) => {
-                let conn = self.read_conn_for_workspace(&snapshots)?;
-                let mut placed = HashSet::new();
-                for item in complete.values() {
-                    let mut statement = conn.prepare(SQL_RUST_CRATE_MODULES_5)?;
-                    for path in
-                        statement.query_map([item.topology_id], |row| row.get::<_, String>(0))?
-                    {
-                        placed.insert(path?);
-                    }
+            let source = self.read_conn_for_workspace(&snapshots)?;
+            let mut query = conn.prepare("SELECT topology_id FROM temp.rust_schedule_live")?;
+            for id in query.query_map([], |row| row.get::<_, i64>(0))? {
+                for path in source
+                    .prepare(SQL_RUST_CRATE_MODULES_5)?
+                    .query_map([id?], |row| row.get::<_, String>(0))?
+                {
+                    conn.execute(
+                        "DELETE FROM temp.rust_schedule_paths WHERE path = ?1",
+                        [path?],
+                    )?;
                 }
-                let mut candidates = Vec::new();
-                for topology_id in topology_ids {
-                    let mut statement = conn.prepare(SQL_RUST_CRATE_MODULES_5)?;
-                    for path in statement.query_map([topology_id], |row| row.get::<_, String>(0))? {
-                        candidates.push(path?);
-                    }
-                }
-                candidates.sort();
-                candidates.dedup();
-                candidates.retain(|path| !placed.contains(path));
-                candidates
             }
+            conn.prepare("SELECT path FROM temp.rust_schedule_paths ORDER BY path")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        // Detached crates have no workspace dependencies. Previously derived
-        // topologies cannot be referenced here and must not be rescanned for
-        // every detached file.
-        let detached_dependencies = HashMap::new();
         for path in detached_paths {
             let root_path = PathBuf::from(&path);
             // No Cargo workspace owns the file, so the configuration of a
@@ -875,31 +1038,61 @@ impl AnalyzerStore {
                 dependencies: Vec::new(),
                 target,
             };
-            let result =
-                self.derive_rust_crate(&item, &snapshots, &epoch, &detached_dependencies, &naming)?;
+            let result = self.derive_rust_crate(&item, &snapshots, &epoch, None, &naming)?;
             derived_count += 1;
-            complete.insert(result.key, result);
+            schedule.lock().unwrap().execute(
+                "INSERT OR REPLACE INTO temp.rust_schedule_live VALUES(?1,?2,?3)",
+                params![
+                    result.key.as_slice(),
+                    result.topology_id,
+                    result.surface.as_slice()
+                ],
+            )?;
         }
         drop(detached_timing);
         let close_timing = crate::profiling::scope("rust_crates.reconcile.close_versions");
         let summary_snapshot = snapshot.clone();
         let snapshot = snapshot.clone();
-        let keys: HashSet<Vec<u8>> = complete.keys().map(|key| key.to_vec()).collect();
+        {
+            let conn = schedule.lock().unwrap();
+            let source = self.read_conn_for_workspace(&snapshots)?;
+            let mut query = source.prepare(SQL_RUST_CRATE_VERSIONS_6)?;
+            for row in query.query_map(
+                params![snapshot.workspace_id.as_str(), snapshot.generation.0],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )? {
+                let (key, opened) = row?;
+                if !conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM temp.rust_schedule_live WHERE crate_key = ?1)",
+                    [&key],
+                    |row| row.get::<_, bool>(0),
+                )? {
+                    conn.execute(
+                        "INSERT INTO temp.rust_schedule_retire VALUES(?1,?2)",
+                        params![key, opened],
+                    )?;
+                }
+            }
+        }
+        let live_count: usize = schedule.lock().unwrap().query_row(
+            "SELECT count(*) FROM temp.rust_schedule_live",
+            [],
+            |row| row.get(0),
+        )?;
         #[cfg(test)]
         let counter = self.crate_statement_counter.lock().unwrap().clone();
         self.execute_selection_publication(move |conn| -> Result<()> {
             let tx = conn.transaction()?;
             #[cfg(test)]
             let trace = StatementTrace::new(&tx, counter);
-            let open = tx
-                .prepare(SQL_RUST_CRATE_VERSIONS_6)?
-                .query_map(
-                    params![snapshot.workspace_id.as_str(), snapshot.generation.0],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for (key, opened) in open {
-                if !keys.contains(&key) {
+            let schedule = schedule.into_inner().unwrap();
+            {
+                let mut query =
+                    schedule.prepare("SELECT crate_key,opened FROM temp.rust_schedule_retire")?;
+                for row in query.query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                })? {
+                    let (key, opened) = row?;
                     end_open_crate_version(&tx, &snapshot, &key, opened)?;
                 }
             }
@@ -937,7 +1130,7 @@ impl AnalyzerStore {
                 "rust_crates.reconcile: {:.1} ms, scope {scope_kind}, {} crates, {} derived, \
                  forced_cycles={forced_cycles:?}, forced_unavailable={forced_unavailable:?}",
                 started.elapsed().as_secs_f64() * 1000.0,
-                complete.len(),
+                live_count,
                 derived_count
             )
         });
@@ -1037,7 +1230,7 @@ impl AnalyzerStore {
         item: &PreparedCrate,
         snapshots: &WorkspaceSnapshots,
         epoch: &str,
-        complete: &HashMap<CrateKey, DerivedCrate>,
+        schedule: Option<&Mutex<Connection>>,
         naming: &brokk_bifrost_rust::crate_naming::RustSelectedCargoNaming,
     ) -> Result<DerivedCrate> {
         let _crate_timing = crate::profiling::scope_with(|| {
@@ -1048,10 +1241,35 @@ impl AnalyzerStore {
                 stable_path(&item.target.root_path)
             )
         });
-        let conn = self.read_conn_for_workspace(snapshots)?;
+        let mut conn = self.read_conn_for_workspace(snapshots)?;
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS rust_schedule_live(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
+            DELETE FROM temp.rust_schedule_live;")?;
+        conn.cleanup_before_checkin("DELETE FROM temp.rust_schedule_live");
+        if let Some(schedule) = schedule {
+            let schedule = schedule.lock().unwrap();
+            let mut query = schedule
+                .prepare("SELECT crate_key, topology_id, surface FROM temp.rust_schedule_live")?;
+            let mut rows = query.query([])?;
+            while let Some(row) = rows.next()? {
+                conn.execute(
+                    "INSERT INTO temp.rust_schedule_live VALUES(?1,?2,?3)",
+                    params![
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?
+                    ],
+                )?;
+            }
+        }
         #[cfg(test)]
         let trace =
             StatementTrace::new(&conn, self.crate_statement_counter.lock().unwrap().clone());
+        debug_assert!(
+            conn.query_row(LIVE_SURFACE_SQL, [item.key.as_slice()], |_| Ok(()))
+                .optional()?
+                .is_none(),
+            "a crate is published only after its own derivation returns"
+        );
         debug_assert_crate_functions(&conn);
         let mut atoms = item.target.cfg_atoms.clone();
         atoms.extend(
@@ -1169,8 +1387,13 @@ impl AnalyzerStore {
             hash_cell(&mut digest, kind.as_bytes());
             if let Some(key) = key {
                 hash_cell(&mut digest, key);
-                if let Some(dependency) = complete.get(key) {
-                    hash_cell(&mut digest, &dependency.surface);
+                if let Some(surface) = conn
+                    .query_row(LIVE_SURFACE_SQL, [key.as_slice()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .optional()?
+                {
+                    hash_cell(&mut digest, &surface);
                 } else {
                     hash_cell(&mut digest, b"unsupported_manifest");
                     gaps.push(Gap {
@@ -1247,12 +1470,11 @@ impl AnalyzerStore {
             .optional()?;
         let derived = existing
             .is_none()
-            .then(|| {
-                derivation::derive_exports(&conn, item, &modules, &gate_decisions, &cfg, complete)
-            })
+            .then(|| derivation::derive_exports(&conn, item, &modules, &gate_decisions, &cfg))
             .transpose()?;
         #[cfg(test)]
         drop(trace);
+        conn.execute("DELETE FROM temp.rust_schedule_live", [])?;
         drop(conn);
         let snapshot = snapshots["rust"].clone();
         let key = item.key;
@@ -1722,6 +1944,15 @@ pub(super) const SQL_RUST_CRATE_DEPENDENTS: &str = "SELECT DISTINCT versions.cra
        AND versions.lang = 'rust' AND versions.generation = ?2
        AND versions.valid_until IS NULL";
 
+const CREATE_PENDING_CRATES_SQL: &str = "CREATE TEMP TABLE IF NOT EXISTS rust_crate_pending_keys(
+    crate_key BLOB NOT NULL PRIMARY KEY,
+    component_key BLOB NOT NULL
+) WITHOUT ROWID, STRICT";
+const INSERT_PENDING_CRATE_SQL: &str =
+    "INSERT INTO temp.rust_crate_pending_keys(crate_key, component_key) VALUES(?1, ?2)";
+pub(super) const SQL_RUST_CRATE_PENDING_ANCESTORS: &str =
+    include_str!("rust_crate_pending_ancestors.sql");
+
 pub(super) const SQL_RUST_CRATE_VERSIONS_6: &str = "SELECT crate_key, valid_from FROM rust_crate_versions WHERE workspace_id = ?1 AND lang = 'rust' AND generation = ?2 AND valid_until IS NULL";
 pub(super) const SQL_BLOBS_8: &str = "SELECT blob_oid FROM blobs WHERE id = ?1";
 pub(super) const SQL_RUST_CRATE_TOPOLOGIES_9: &str = "SELECT topology_id, export_surface_digest FROM rust_crate_topologies WHERE topology_digest = ?1 AND publication_state = 'complete'";
@@ -1750,6 +1981,12 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
     let mut pins = vec![
         ("rust_crate_insert_module", INSERT_MODULE_SQL, 3),
         ("rust_crate_insert_naming", INSERT_NAMING_SQL, 4),
+        ("rust_crate_insert_pending_key", INSERT_PENDING_CRATE_SQL, 2),
+        (
+            "rust_crate_pending_ancestors",
+            SQL_RUST_CRATE_PENDING_ANCESTORS,
+            3,
+        ),
         (
             "rust_crate_reconcile_sql_rust_crate_topologies_1",
             DELETE_UNBOUND_TOPOLOGIES_SQL,
@@ -1850,6 +2087,19 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ),
     ];
     pins.extend(derivation::sql_pins());
+    pins.extend(unit_schedule::sql_pins());
+    pins.extend([
+        ("rust_crate_schedule_ready", RUST_READY_WAVE_SQL, 0),
+        ("rust_crate_schedule_force", RUST_FORCE_COMPONENT_SQL, 0),
+        ("rust_crate_schedule_staged_target", STAGED_TARGET_SQL, 1),
+        (
+            "rust_crate_schedule_staged_dependencies",
+            STAGED_DEPENDENCIES_SQL,
+            1,
+        ),
+        ("rust_crate_schedule_wave_unit", WAVE_UNIT_SQL, 1),
+        ("rust_crate_schedule_live_surface", LIVE_SURFACE_SQL, 1),
+    ]);
     pins.extend([
         (
             "rust_crate_export_source_edges",
@@ -1873,6 +2123,10 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn prepare_pin_context(conn: &Connection) -> Result<()> {
     register_point_export_functions(conn)?;
+    conn.execute_batch(unit_schedule::SCHEMA_SQL)?;
+    conn.execute_batch(RUST_SCHEDULE_SCHEMA_SQL)?;
+    conn.execute_batch(CREATE_PENDING_CRATES_SQL)?;
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS rust_schedule_live(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT")?;
     derivation::prepare_tables(conn)
 }
 
@@ -2951,7 +3205,8 @@ mod tests {
     }
 
     /// Two files under one module path is the ambiguity the crate rows cannot
-    /// hold, and it stays a `duplicate_placement` gap.
+    /// hold. It remains a `duplicate_placement` gap and also keeps the public
+    /// module surface inventory open because that module cannot be inventoried.
     ///
     /// `mod harness;` in a `mod.rs` looks for `harness.rs` and `harness/mod.rs`
     /// alike. rustc rejects a crate that offers both; the walk reaches the one
@@ -2973,6 +3228,13 @@ mod tests {
         let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
         let store = analyzer.store().unwrap();
         let conn = store.read_conn().unwrap();
+        let crate_key: String = conn
+            .query_row(
+                "SELECT hex(crate_key) FROM rust_crate_topologies WHERE crate_name='ambiguous_file'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let gaps = conn
             .prepare("SELECT gap_kind, subject FROM rust_crate_gaps ORDER BY 1, 2")
             .unwrap()
@@ -2984,11 +3246,28 @@ mod tests {
             .unwrap();
         assert_eq!(
             gaps,
-            vec![(
-                "duplicate_placement".to_string(),
-                "crate::harness".to_string()
-            )]
+            vec![
+                (
+                    "duplicate_placement".to_string(),
+                    "crate::harness".to_string()
+                ),
+                (
+                    "open_export_inventory".to_string(),
+                    format!("public-module-surface:{crate_key}:crate:type:harness")
+                ),
+            ]
         );
+        let falsely_reachable: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM rust_crate_public_module_reachability AS reachability \
+                 JOIN rust_crate_topologies AS topology USING (topology_id) \
+                 WHERE topology.crate_key = reachability.target_crate_key \
+                   AND reachability.target_module_path = 'crate::harness'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(falsely_reachable, 0);
     }
 
     #[test]
@@ -3399,6 +3678,121 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#5133: pending ancestors behind complete facades must respect revisions and SCC forcing"
+    )]
+    fn pending_ancestor_readiness_is_revision_scoped_and_cycle_safe() {
+        use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(CREATE_PENDING_CRATES_SQL).unwrap();
+        let workspace = "a".repeat(64);
+        let other_workspace = "b".repeat(64);
+        // consumer -> facade -> (core <-> peer). Decoy is pending but has no
+        // selected edge; only historical/future/foreign versions reach it.
+        for (topology, key) in [(1_u8, 1_u8), (2, 2), (3, 3), (4, 4), (5, 5), (6, 3)] {
+            conn.execute(
+                "INSERT INTO rust_crate_topologies VALUES(?1, ?2, ?3, 'test',
+                 'lib', 'sample', '2021', 'std', jsonb('[]'), 1, zeroblob(32), 'complete')",
+                params![
+                    i64::from(topology),
+                    [topology; 32].as_slice(),
+                    [key; 32].as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        for (topology, dependency) in [(1, 2_u8), (2, 3), (3, 4), (4, 3), (6, 5)] {
+            conn.execute(
+                SQL_RUST_CRATE_DEPENDENCIES_12,
+                params![
+                    topology,
+                    "dep",
+                    "workspace",
+                    [dependency; 32].as_slice(),
+                    "normal"
+                ],
+            )
+            .unwrap();
+        }
+        for (owner, lang, generation, key, from, until, topology) in [
+            (&workspace, "rust", 0, 1_u8, 1, None, 1),
+            (&workspace, "rust", 0, 2, 1, None, 2),
+            (&workspace, "rust", 0, 3, 2, Some(3), 3),
+            (&workspace, "rust", 0, 4, 1, None, 4),
+            (&workspace, "rust", 0, 5, 1, None, 5),
+            (&workspace, "rust", 0, 3, 1, Some(2), 6),
+            (&workspace, "rust", 0, 3, 3, None, 6),
+            (&other_workspace, "rust", 0, 3, 1, None, 6),
+            (&workspace, "rust", 1, 3, 1, None, 6),
+            (&workspace, "go", 0, 3, 1, None, 6),
+        ] {
+            conn.execute(
+                "INSERT INTO rust_crate_versions VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+                params![
+                    owner,
+                    lang,
+                    generation,
+                    [key; 32].as_slice(),
+                    from,
+                    until,
+                    topology
+                ],
+            )
+            .unwrap();
+        }
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for (key, component) in [(1_u8, 1_u8), (3, 3), (4, 3), (5, 5)] {
+                conn.execute(
+                    INSERT_PENDING_CRATE_SQL,
+                    params![[key; 32].as_slice(), [component; 32].as_slice()],
+                )
+                .unwrap();
+            }
+            let blocked = |revision| {
+                conn.prepare(SQL_RUST_CRATE_PENDING_ANCESTORS)
+                    .unwrap()
+                    .query_map(params![workspace, 0, revision], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .unwrap()
+                    .map(|row| crate_key_from_row(row.unwrap()).unwrap())
+                    .collect::<HashSet<_>>()
+            };
+            assert_eq!(blocked(2), HashSet::from([[1; 32]]), "{state:?}");
+            for revision in [1, 3] {
+                assert_eq!(
+                    blocked(revision),
+                    HashSet::from([[1; 32], [3; 32], [4; 32]]),
+                    "{state:?} revision {revision}"
+                );
+            }
+            // Equal producer output leaves the facade complete. Once the SCC
+            // finishes, the consumer is ready without enqueueing that facade.
+            for key in [3_u8, 4] {
+                conn.execute(
+                    "DELETE FROM temp.rust_crate_pending_keys WHERE crate_key=?1",
+                    [[key; 32].as_slice()],
+                )
+                .unwrap();
+            }
+            assert_eq!(blocked(2), HashSet::new(), "{state:?}");
+            // Changed producer output enqueues the facade, blocking consumer
+            // directly until that facade has published its new surface.
+            conn.execute(
+                INSERT_PENDING_CRATE_SQL,
+                params![[2_u8; 32].as_slice(), [2_u8; 32].as_slice()],
+            )
+            .unwrap();
+            assert_eq!(blocked(2), HashSet::from([[1; 32]]), "{state:?}");
+            conn.execute("DELETE FROM temp.rust_crate_pending_keys", [])
+                .unwrap();
+        }
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#4460: module-self route views added an automatic covering index"
     )]
@@ -3514,12 +3908,42 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        for pending in [&key, &dependency, &helper] {
+            conn.execute(INSERT_PENDING_CRATE_SQL, params![pending, pending])
+                .unwrap();
+        }
+        conn.execute_batch("INSERT INTO temp.rust_schedule_targets
+            (unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,pending)
+            SELECT topology_id,crate_key,'','',target_kind,crate_name,edition,json(cfg_atoms),'[]',inventory_complete,1
+            FROM rust_crate_topologies WHERE topology_id IN (SELECT topology_id FROM rust_crate_versions WHERE valid_until IS NULL);
+            INSERT INTO temp.rust_schedule_dependencies
+            SELECT targets.crate_key, row_number() OVER (PARTITION BY targets.crate_key ORDER BY deps.extern_name), deps.extern_name, deps.dependency_kind, deps.dependency_crate_key
+            FROM temp.rust_schedule_targets AS targets JOIN rust_crate_dependencies AS deps ON deps.topology_id = targets.unit_id;
+            INSERT INTO temp.unit_schedule_units SELECT unit_id FROM temp.rust_schedule_targets;
+            INSERT INTO temp.unit_schedule_edges
+            SELECT DISTINCT owner.unit_id, dependency.unit_id, 1 FROM temp.rust_schedule_dependencies AS edges
+            JOIN temp.rust_schedule_targets AS owner ON owner.crate_key = edges.crate_key
+            JOIN temp.rust_schedule_targets AS dependency ON dependency.crate_key = edges.dependency_key;
+            INSERT INTO temp.rust_schedule_pending_order(unit_id) SELECT unit_id FROM temp.rust_schedule_targets ORDER BY unit_id;") .unwrap();
+        unit_schedule::build(&conn).unwrap();
+        conn.execute_batch("INSERT INTO temp.rust_schedule_live SELECT crate_key,topology_id,export_surface_digest FROM rust_crate_topologies WHERE topology_id IN (SELECT topology_id FROM rust_crate_versions WHERE valid_until IS NULL);
+            INSERT INTO temp.rust_schedule_wave SELECT unit_id,0 FROM temp.unit_schedule_units;
+            INSERT INTO temp.rust_schedule_wave_order(unit_id) SELECT unit_id FROM temp.unit_schedule_units ORDER BY unit_id;").unwrap();
         for state in PlannerStatisticsState::BOTH {
             state.install(&conn);
-            for mut pin in pinned_queries()
-                .into_iter()
-                .filter(|pin| pin.name.starts_with("rust_crate_"))
-            {
+            let blocked = conn
+                .prepare(SQL_RUST_CRATE_PENDING_ANCESTORS)
+                .unwrap()
+                .query_map(params![workspace, generation, revision], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(blocked.as_slice(), std::slice::from_ref(&key), "{state:?}");
+            for mut pin in pinned_queries().into_iter().filter(|pin| {
+                pin.name.starts_with("rust_crate_") || pin.name.starts_with("unit_schedule_")
+            }) {
                 use rusqlite::types::Value::{Blob, Integer, Null, Text};
                 let text = |s: &str| Text(s.to_owned());
                 if !pin.params.is_empty() {
@@ -3540,12 +3964,22 @@ mod tests {
                         "rust_crate_source_declarations"
                         | "rust_crate_macro_items"
                         | "rust_crate_derivation_sql_cr_source_imports_5"
+                        | "rust_crate_unknown_exports"
                         | "rust_crate_extern_crate_alias_dependencies" => vec![text(&cfg)],
                         "rust_crate_import_routes" => vec![Blob(key.clone()), text("2021")],
+                        "rust_crate_insert_pending_key" => {
+                            vec![Blob(key.clone()), Blob(key.clone())]
+                        }
+                        "rust_crate_pending_ancestors" => {
+                            vec![text(&workspace), Integer(generation), Integer(revision)]
+                        }
                         "rust_crate_export_fixpoint"
                         | "rust_crate_derivation_sql_cr_reexports_6"
                         | "rust_crate_dependency_exports"
                         | "rust_crate_insert_identity" => vec![Blob(key.clone())],
+                        "rust_crate_schedule_staged_target" => vec![Integer(id)],
+                        "rust_crate_schedule_staged_dependencies" | "rust_crate_schedule_live_surface" => vec![Blob(key.clone())],
+                        "rust_crate_schedule_wave_unit" => vec![Integer(1)],
                         "rust_crate_insert_foreign" => {
                             vec![Blob(dependency.clone()), Integer(dependency_id)]
                         }
@@ -3602,6 +4036,9 @@ mod tests {
                         ],
                         "rust_crate_insert_module" => {
                             vec![Integer(id), text("crate"), text("root")]
+                        }
+                        "rust_crate_public_module_reachability_insert" => {
+                            vec![Integer(id), Blob(dependency.clone()), text("crate")]
                         }
                         "rust_crate_reconcile_sql_rust_crate_containers_11" => vec![
                             Integer(id),
@@ -3714,7 +4151,7 @@ mod tests {
                                     brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedImplMacro,
                                 ),
                             ),
-                        )],
+                        ), text(&cfg)],
                         "rust_crate_trait_impl_subject_routes"
                         | "rust_crate_trait_impl_trait_routes" => {
                             vec![Blob(key.clone()), text("2018")]
@@ -3768,6 +4205,9 @@ mod tests {
                         "rust_crate_glob_reexport_routes_target" => {
                             vec![Blob(dependency.clone()), text("crate")]
                         }
+                        "rust_crate_named_reexport_targets" => {
+                            vec![Integer(id), text("crate"), text("value"), text("b")]
+                        }
                         "rust_crate_imports_binder" => vec![
                             Integer(id),
                             text("crate"),
@@ -3789,6 +4229,85 @@ mod tests {
                     };
                 }
                 let plan = explain_pin(&conn, &pin);
+                if pin.name == "unit_schedule_edges" {
+                    assert!(
+                        plan.iter()
+                            .any(|row| row.contains("SEARCH edges USING PRIMARY KEY (unit_id=?)")),
+                        "{state:?}: {plan:?}"
+                    );
+                    assert!(
+                        !plan
+                            .iter()
+                            .any(|row| row.contains("AUTOMATIC") || row.contains("SCAN edges")),
+                        "{state:?}: {plan:?}"
+                    );
+                }
+                if matches!(
+                    pin.name.as_str(),
+                    "rust_crate_schedule_ready" | "rust_crate_schedule_force"
+                ) {
+                    assert!(
+                        plan.iter()
+                            .any(|row| row.contains("rust_schedule_targets_pending")),
+                        "{state:?}: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter()
+                            .any(|row| row.contains("SEARCH edge USING PRIMARY KEY (crate_key=?)")),
+                        "{state:?}: {plan:?}"
+                    );
+                    assert!(
+                        !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                        "{state:?}: {plan:?}"
+                    );
+                }
+                let required_seek = match pin.name.as_str() {
+                    "rust_crate_schedule_staged_target" => {
+                        Some("SEARCH temp.rust_schedule_targets USING INTEGER PRIMARY KEY")
+                    }
+                    "rust_crate_schedule_staged_dependencies" => Some(
+                        "SEARCH temp.rust_schedule_dependencies USING PRIMARY KEY (crate_key=?)",
+                    ),
+                    "rust_crate_schedule_live_surface" => {
+                        Some("SEARCH temp.rust_schedule_live USING PRIMARY KEY (crate_key=?)")
+                    }
+                    "rust_crate_schedule_wave_unit" => {
+                        Some("SEARCH ordered USING INTEGER PRIMARY KEY")
+                    }
+                    "unit_schedule_order" => Some("unit_schedule_components_component"),
+                    _ => None,
+                };
+                if let Some(seek) = required_seek {
+                    assert!(
+                        plan.iter().any(|row| row.contains(seek)),
+                        "{state:?} {}: {plan:?}",
+                        pin.name
+                    );
+                    assert!(
+                        !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                        "{state:?} {}: {plan:?}",
+                        pin.name
+                    );
+                }
+                if pin.name == "rust_crate_pending_ancestors" {
+                    for access in [
+                        "SEARCH versions USING PRIMARY KEY (workspace_id=? AND lang=? AND generation=? AND crate_key=? AND valid_from<?)",
+                        "SEARCH dependencies USING PRIMARY KEY (topology_id=?)",
+                        "SEARCH origin USING PRIMARY KEY (crate_key=?)",
+                        "SEARCH pending USING PRIMARY KEY (crate_key=?)",
+                    ] {
+                        assert!(
+                            plan.iter().any(|row| row.contains(access)),
+                            "{state:?} {} must use {access}: {plan:?}",
+                            pin.name
+                        );
+                    }
+                    assert!(
+                        !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                        "{state:?} {}: {plan:?}",
+                        pin.name
+                    );
+                }
                 if pin.name == "rust_crate_derivation_sql_cr_source_imports_5" {
                     let members = plan
                         .iter()
@@ -4364,7 +4883,7 @@ mod outer {
         pub(in self) struct Same;
         pub(in super::super) struct Root;
         pub(in crate::absent) struct Missing;
-        pub(in super) use self::Here as Alias;
+        pub(in super) use self::Parent as Alias;
     }
 }
 "#,
@@ -6562,6 +7081,7 @@ pub mod second;
                 Value::Text(workspace_id.clone()),
                 Value::Text("rust".into()),
                 Value::Integer(generation),
+                Value::Blob(vec![0; 32]),
             ];
             let plan = explain_pin(&conn, &dependents);
             assert!(
@@ -6839,6 +7359,195 @@ pub mod second;
             versions,
             (before + 1, 1, 1),
             "a body edit closes one version and opens exactly one replacement"
+        );
+    }
+
+    #[test]
+    #[hardwon("#5172: a warm version-8 summary omitted conditional import activation gaps")]
+    fn cfg_if_warm_summary_rotation_preserves_unknown_imports() {
+        use super::super::rust_unit_summaries::RustUnitSummaries;
+        use super::super::unit_summaries::{
+            ConsumedDependency, UnitInputs, UnitOutputs, UnitSummaryLanguage,
+        };
+
+        // Reproduce the previous summary policy through the real producer.
+        // Keep the source facts and inputs; version 8 omitted import gaps.
+        struct PreviousCfgIfSummary;
+        impl UnitSummaryLanguage for PreviousCfgIfSummary {
+            fn lang(&self) -> &'static str {
+                "rust"
+            }
+            fn unit_kind(&self) -> &'static str {
+                "rust_crate"
+            }
+            fn derivation_version(&self) -> i64 {
+                8
+            }
+            fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+                RustUnitSummaries.stage(conn, snapshot)
+            }
+            fn clear_stage(&self, conn: &Connection) -> Result<()> {
+                RustUnitSummaries.clear_stage(conn)
+            }
+            fn inputs(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit_id: i64,
+            ) -> Result<UnitInputs> {
+                RustUnitSummaries.inputs(conn, snapshot, unit_id)
+            }
+            fn derive(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit: &UnitInputs,
+                dependencies: &[ConsumedDependency],
+                producer_epoch: &str,
+            ) -> Result<UnitOutputs> {
+                let mut outputs =
+                    RustUnitSummaries.derive(conn, snapshot, unit, dependencies, producer_epoch)?;
+                outputs.gaps.retain(|gap| {
+                    gap.kind != "unknown_activation" || gap.subject != "crate::selected"
+                });
+                Ok(outputs)
+            }
+            fn write_language_rows(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit: &UnitInputs,
+                dependencies: &[ConsumedDependency],
+                summary_id: i64,
+            ) -> Result<usize> {
+                let written = RustUnitSummaries.write_language_rows(
+                    conn,
+                    snapshot,
+                    unit,
+                    dependencies,
+                    summary_id,
+                )?;
+                let removed = conn.execute(
+                    "DELETE FROM rust_resolution_unit_summary_gaps
+                     WHERE summary_id=?1 AND gap_kind='unknown_activation'
+                       AND subject='crate::selected'",
+                    [summary_id],
+                )?;
+                Ok(written + removed)
+            }
+            fn write_language_version(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit: &UnitInputs,
+                summary_id: i64,
+            ) -> Result<usize> {
+                RustUnitSummaries.write_language_version(conn, snapshot, unit, summary_id)
+            }
+        }
+
+        let source = concat!(
+            "pub mod helpers { pub fn first() {} pub fn second() {} }\n",
+            "cfg_if::cfg_if! {\n",
+            "    if #[cfg(unknown_build_flag)] {\n",
+            "        pub fn only_first() {}\n",
+            "        pub use crate::helpers::first as selected;\n",
+            "    } else {\n",
+            "        pub fn only_second() {}\n",
+            "        pub use crate::helpers::second as selected;\n",
+            "    }\n",
+            "}\n",
+            "pub fn caller() { selected(); }\n",
+        );
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            )
+            .file("src/lib.rs", source)
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let snapshot = {
+            let conn = store.read_conn().unwrap();
+            conn.query_row(
+                "SELECT workspace_id, generation, revision FROM workspace_heads WHERE lang='rust'",
+                [],
+                |row| {
+                    Ok(WorkspaceSnapshotId {
+                        workspace_id: super::super::WorkspaceId(row.get(0)?),
+                        lang: "rust".into(),
+                        generation: super::super::GenerationId::from_persisted(row.get(1)?),
+                        revision: row.get(2)?,
+                    })
+                },
+            )
+            .unwrap()
+        };
+        // Start the retained cache with an actual version-8 input digest and
+        // normalized output, rather than editing a current digest's metadata.
+        store
+            .conn
+            .execute(|conn| {
+                conn.execute_batch(
+                    "DELETE FROM rust_resolution_unit_summary_versions;
+                     DELETE FROM resolution_unit_summary_versions WHERE lang='rust';
+                     DELETE FROM resolution_unit_summaries WHERE lang='rust';",
+                )
+            })
+            .unwrap();
+        let legacy = store
+            .reconcile_unit_summaries(
+                &snapshot,
+                PreviousCfgIfSummary,
+                &crate::CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(legacy.derived, 1, "{legacy:?}");
+        assert!(legacy.failed.is_empty(), "{legacy:?}");
+        let alias_gaps = || {
+            store
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM resolution_unit_summary_versions AS version
+                     JOIN rust_resolution_unit_summary_gaps AS gap USING(summary_id)
+                     WHERE version.valid_until IS NULL AND gap.gap_kind='unknown_activation'
+                       AND gap.subject='crate::selected'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(alias_gaps(), 0, "the old summary omitted this import");
+        store.reconcile_rust_unit_summaries(&snapshot).unwrap();
+        assert_eq!(
+            alias_gaps(),
+            1,
+            "the current producer must replace the old summary"
+        );
+
+        let lookup = |analyzer: &crate::analyzer::WorkspaceAnalyzer| {
+            let params = serde_json::from_value(serde_json::json!({
+                "references": [{
+                    "path": "src/lib.rs",
+                    "line": source.lines().count(),
+                    "column": source.lines().last().unwrap().find("selected").unwrap() + 1
+                }]
+            }))
+            .unwrap();
+            serde_json::to_value(crate::searchtools::get_definitions_by_location(
+                analyzer.analyzer(),
+                params,
+            ))
+            .unwrap()
+        };
+        let warm = lookup(&analyzer);
+        let fresh = lookup(&project.workspace_analyzer(AnalyzerConfig::default()));
+        assert_eq!(warm["results"][0]["status"], "incomplete", "{warm:#}");
+        assert_eq!(
+            warm["results"][0]["status"], fresh["results"][0]["status"],
+            "warm={warm:#}, fresh={fresh:#}"
         );
     }
 }

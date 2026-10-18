@@ -635,6 +635,7 @@ impl TypeFlowQueryState {
                 class_name: match &finding.class {
                     ClassIdentity::Workspace(unit) => unit.terminal_name().to_owned(),
                     ClassIdentity::External { qualified_name, .. } => qualified_name.to_string(),
+                    ClassIdentity::Intrinsic { qualified_name } => qualified_name.to_string(),
                 },
                 proof: finding.proof.clone(),
                 roots: vec![AbsentMemberRootEvidence {
@@ -1532,6 +1533,9 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
             let origin = match identity {
                 ClassIdentity::Workspace(_) => "workspace".to_string(),
                 ClassIdentity::External { .. } => "external".to_string(),
+                ClassIdentity::Intrinsic { .. } => {
+                    unreachable!("intrinsic language roots do not enter type inference")
+                }
             };
             rows.push(ClassSetRowValue {
                 id: class_set_row_id(

@@ -4804,6 +4804,8 @@ fn ensure_unambiguous_diff_attribution(analyzer: &dyn IAnalyzer, graph: &mut Usa
     if let Some(error) = query.store_error() {
         graph.complete = false;
         graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+            path: None,
+            module_path: None,
             code: "query_failed".into(),
             message: error.to_string(),
         });
@@ -4817,6 +4819,8 @@ fn ensure_unambiguous_diff_attribution(analyzer: &dyn IAnalyzer, graph: &mut Usa
     }
     graph.complete = false;
     graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+        path: None,
+        module_path: None,
         code: "ambiguous_diff_attribution".into(),
         message: format!("patch-symbol groups contain distinct declarations: {ambiguous:?}"),
     });
@@ -4855,6 +4859,7 @@ fn refuse_uncertain_moved_correspondence(
             }
             graph.complete = false;
             graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+            path: None, module_path: None,
                 code: "unknown_declaration_correspondence".into(),
                 message: format!("relocation does not prove correspondence between {:?} and {:?}; similarity={:?}; endpoint declarations={ids:?}", pair.before, pair.after, pair.similarity),
             });

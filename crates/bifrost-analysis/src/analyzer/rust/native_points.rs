@@ -3095,7 +3095,7 @@ fn rust_local_type_alias_display_fqn(
         .then(|| alias.fq_name().to_owned())
 }
 
-fn render_type_spelling(
+pub(crate) fn render_type_spelling(
     spelling: &str,
     value: ResolutionSlotValue,
     diagnostics: &mut Vec<TypeLookupDiagnostic>,

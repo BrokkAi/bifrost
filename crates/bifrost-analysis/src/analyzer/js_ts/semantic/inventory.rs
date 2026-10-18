@@ -351,8 +351,7 @@ fn populate_lexical_capture_specs<'tree>(
             let Some(text) = node_text(source, name) else {
                 return Ok(WalkControl::Continue);
             };
-            let active_ranges =
-                lexical_bindings.binding_identifier_ranges_at(text, name.start_byte());
+            let active_ranges = lexical_bindings.binding_identifier_ranges_for_binder(text, name);
             let Some(binding) = active_ranges.iter().copied().find(|range| {
                 range.start_byte == name.start_byte() && range.end_byte == name.end_byte()
             }) else {
@@ -454,7 +453,7 @@ fn populate_lexical_capture_specs<'tree>(
         let Some(text) = node_text(source, name) else {
             continue;
         };
-        let active_ranges = lexical_bindings.binding_identifier_ranges_at(text, name.start_byte());
+        let active_ranges = lexical_bindings.binding_identifier_ranges_for_binder(text, name);
         let Some(binding) = active_ranges.iter().copied().find(|range| {
             range.start_byte == name.start_byte() && range.end_byte == name.end_byte()
         }) else {
@@ -498,7 +497,7 @@ fn exact_binding_range(
 ) -> Option<Range> {
     let name = node_text(source, node)?;
     lexical_bindings
-        .binding_identifier_ranges_at(name, node.start_byte())
+        .binding_identifier_ranges_for_binder(name, node)
         .into_iter()
         .find(|range| range.start_byte == node.start_byte() && range.end_byte == node.end_byte())
 }

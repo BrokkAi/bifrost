@@ -156,3 +156,9 @@ slow-timeout = { period = "60s", terminate-after = 30 }
 [[profile.default.overrides]]
 filter = 'test(/^partial_flow_differential::/)'
 threads-required = "num-cpus"
+
+# The opt-in pinned Vector census uses the container's available runtime workers.
+# It preserves the complete archive and all member/dependency/export assertions.
+[[profile.default.overrides]]
+filter = 'test(vector_archive_rust_summary_differential_census)'
+threads-required = "num-cpus"

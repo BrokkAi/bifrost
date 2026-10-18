@@ -79,8 +79,8 @@ pub enum GoSourceTypeShape {
     },
     Negated(GoSourceTypeId),
     Struct {
-        /// Existing method-set comparison treats inline struct syntax as text.
-        /// It is retained only when that comparison demands it.
+        /// Presentation spelling when requested by source renderers.
+        /// Method sets compare the ordered GoSourceFacts::fields instead.
         text: Option<String>,
     },
     Interface {
@@ -127,6 +127,8 @@ pub struct GoFieldFact {
     /// An embedded field's derived terminal name is not a written binder.
     pub name: String,
     pub embedded: bool,
+    /// Decoded Go tag bytes; absent syntax is empty, failed decoding is unknown.
+    pub tag: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +193,12 @@ impl GoSourceFacts {
             + self.fields.capacity() * std::mem::size_of::<GoFieldFact>()
             + self.callables.capacity() * std::mem::size_of::<GoCallableFact>()
             + self.embeddings.capacity() * std::mem::size_of::<GoEmbeddingFact>();
+        bytes += self
+            .fields
+            .iter()
+            .filter_map(|field| field.tag.as_ref())
+            .map(Vec::capacity)
+            .sum::<usize>();
         for ty in &self.types {
             bytes = bytes.saturating_add(match &ty.shape {
                 GoSourceTypeShape::Named(name) => {

@@ -46,6 +46,7 @@ pub(crate) struct GoSourcePropertyCollector<'source> {
     type_ids: HashMap<usize, GoSourceTypeId>,
     embedded_type_ids: HashMap<usize, GoSourceTypeId>,
     identities: HashMap<GoSourceTypeId, Option<StructuredTypeIdentity>>,
+    captured_declarations: HashSet<usize>,
 }
 
 impl<'source> GoSourcePropertyCollector<'source> {
@@ -56,6 +57,7 @@ impl<'source> GoSourcePropertyCollector<'source> {
             type_ids: HashMap::default(),
             embedded_type_ids: HashMap::default(),
             identities: HashMap::default(),
+            captured_declarations: HashSet::default(),
         }
     }
 
@@ -91,6 +93,74 @@ impl<'source> GoSourcePropertyCollector<'source> {
                 }
             }
             _ => {}
+        }
+        if node.kind() == "struct_type"
+            && !node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "type_spec")
+            && self.captured_declarations.insert(node.id())
+        {
+            let declaration = source_collector.declare_node(node, None);
+            let ty = self.type_ids[&node.id()];
+            self.add_type_declaration(
+                declaration,
+                &format!("$anon${}", node.start_byte()),
+                ty,
+                false,
+            );
+        }
+        if node.kind() == "field_declaration" && self.captured_declarations.insert(node.id()) {
+            self.capture_field(node, source_collector);
+        }
+    }
+
+    fn capture_field(
+        &mut self,
+        node: Node<'_>,
+        source_collector: &mut PrimarySourceFactCollector<'source>,
+    ) {
+        let Some(container) = node.parent().and_then(|list| list.parent()) else {
+            return;
+        };
+        if container.kind() != "struct_type" {
+            return;
+        }
+        let owner = self
+            .type_id_for_node(container)
+            .expect("Go struct fields have an already captured container type");
+        let tag = node.child_by_field_name("tag").map_or_else(
+            || Some(Vec::new()),
+            |tag| crate::build_files::go_string_literal_bytes(go_node_text(tag, self.source)),
+        );
+        let names = crate::declarations::children_by_field(node, "name");
+        if names.is_empty() {
+            let Some((name, ty)) = crate::declarations::go_embedded_struct_field(node, self.source)
+            else {
+                return;
+            };
+            let type_id = self.capture_embedded_type(node, ty, source_collector);
+            let declaration = source_collector
+                .declare_node(node, crate::declarations::go_embedded_field_name_node(ty));
+            self.add_field(declaration, owner, type_id, &name, true, tag);
+            if let Some(type_id) = type_id {
+                let occurrence = source_collector.intern_node(ty);
+                self.add_embedding(owner, occurrence, type_id);
+            }
+        } else {
+            let ty = node
+                .child_by_field_name("type")
+                .and_then(|ty| self.capture_type(ty, source_collector));
+            for name in names {
+                let declaration = source_collector.declare_node(node, Some(name));
+                self.add_field(
+                    declaration,
+                    owner,
+                    ty,
+                    go_node_text(name, self.source),
+                    false,
+                    tag.clone(),
+                );
+            }
         }
     }
 
@@ -257,13 +327,15 @@ impl<'source> GoSourcePropertyCollector<'source> {
         });
     }
 
-    pub(crate) fn add_field(
+    #[allow(clippy::too_many_arguments)]
+    fn add_field(
         &mut self,
         declaration: SourceDeclarationId,
         owner: GoSourceTypeId,
         ty: Option<GoSourceTypeId>,
         name: &str,
         embedded: bool,
+        tag: Option<Vec<u8>>,
     ) {
         self.facts.fields.push(GoFieldFact {
             declaration,
@@ -271,6 +343,7 @@ impl<'source> GoSourcePropertyCollector<'source> {
             ty,
             name: name.to_string(),
             embedded,
+            tag,
         });
     }
 

@@ -75,7 +75,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 125;
 /// distinguishes nominal and receiver projection outputs on qualified routes.
 /// Once #2771 lands, this floor must not advance for compatible migrations.
 const FIRST_NATIVE_CACHE_VERSION: i64 = 125;
-const CURRENT_MIGRATION_VERSION: i64 = 181;
+const CURRENT_MIGRATION_VERSION: i64 = 188;
 const _: () = assert!(CURRENT_MIGRATION_VERSION >= FIRST_NATIVE_CACHE_VERSION);
 pub const OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
@@ -320,6 +320,34 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 181,
         sql: include_str!("../migrations/cache/0181-type-constructor-productions.sql"),
     },
+    CacheMigration {
+        version: 182,
+        sql: include_str!("../migrations/cache/0182-summary-profile-validity.sql"),
+    },
+    CacheMigration {
+        version: 183,
+        sql: include_str!("../migrations/cache/0183-go-struct-field-tags.sql"),
+    },
+    CacheMigration {
+        version: 184,
+        sql: include_str!("../migrations/cache/0184-rust-macro-input-cfg.sql"),
+    },
+    CacheMigration {
+        version: 185,
+        sql: include_str!("../migrations/cache/0185-static-type-object-transfers.sql"),
+    },
+    CacheMigration {
+        version: 186,
+        sql: include_str!("../migrations/cache/0186-jvm-alias-member-index.sql"),
+    },
+    CacheMigration {
+        version: 187,
+        sql: include_str!("../migrations/cache/0187-rust-crate-public-module-reachability.sql"),
+    },
+    CacheMigration {
+        version: 188,
+        sql: include_str!("../migrations/cache/0188-declaration-access-boundaries.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -339,13 +367,14 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
     schema_object_definitions(&conn).expect("read current schema objects")
 });
 // SHA-256 of `schema_object_definitions` for the schema produced by every
-// migration above. A current store validates its actual schema against this
+// migration above, after `normalize_schema_sql` removes SQL whitespace.
+// A current store validates its actual schema against this
 // pinned identity without rebuilding all historical schemas in a second,
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    253, 58, 181, 66, 68, 150, 141, 166, 29, 62, 213, 142, 251, 66, 104, 228, 239, 173, 1, 140,
-    117, 221, 53, 172, 15, 153, 253, 183, 54, 255, 191, 82,
+    232, 204, 74, 32, 172, 126, 19, 78, 136, 146, 50, 102, 33, 198, 24, 230, 14, 234, 234, 89, 97,
+    108, 23, 204, 162, 213, 112, 145, 207, 145, 252, 171,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -5668,7 +5697,7 @@ mod tests {
             .unwrap(),
             0
         );
-        for code in [4, 5, 6, 7] {
+        for code in [4, 5, 6, 7, 8] {
             conn.execute(
                 "INSERT INTO resolution_type_transfers VALUES(?1, 1, ?2, 3, 0, 0, 0, ?2, NULL)",
                 rusqlite::params![blob, code],
@@ -5677,7 +5706,7 @@ mod tests {
         }
         assert!(
             conn.execute(
-                "INSERT INTO resolution_type_transfers VALUES(?1, 1, 8, 3, 0, 0, 0, 8, NULL)",
+                "INSERT INTO resolution_type_transfers VALUES(?1, 1, 9, 3, 0, 0, 0, 9, NULL)",
                 [blob]
             )
             .is_err()

@@ -1,12 +1,18 @@
 //! Bounded Python lifecycle and superclass-call facts over exact call shapes.
 
 use super::super::occurrences::{OccurrenceClass, OccurrenceRole};
+use super::python_class_hierarchy::{
+    HierarchyDecision, attach_hierarchy_premises, hierarchy_premise, override_premise,
+};
 use super::python_rule_facts::{named_children, node_text, parse_python, python_range_for_unit};
 use super::*;
+use crate::analyzer::semantic::type_flow::ClassIdentity;
 use crate::analyzer::structural::occurrence_rows::OccurrenceTarget;
 use crate::analyzer::usages::call_shape::{CallShapeReport, call_shape_for_call};
+use crate::analyzer::usages::python_class_hierarchy::PythonAncestryBasis;
 use crate::analyzer::usages::python_class_hierarchy::{
-    PythonHierarchyOutcome, PythonHierarchyReason, PythonOverrideOutcome,
+    PythonClassHierarchyAnswer, PythonHierarchyOutcome, PythonHierarchyReason,
+    PythonOverrideOutcome,
 };
 use crate::analyzer::{CodeUnitType, DescendantIndexScope};
 use brokk_bifrost_core::analyzer::structural::callable::{ArgumentListKind, CallShapeCoverage};
@@ -36,6 +42,38 @@ struct ResolvedCall {
     target: CodeUnit,
     owner: CodeUnit,
     rank: usize,
+}
+
+/// Query-local topology and the exact member-selection prefix. Reaching the
+/// frontier means unknown member inventory, never a proved absence.
+struct LifecycleMroContext {
+    topology: PythonHierarchyOutcome,
+    source_prefix: Vec<CodeUnit>,
+    frontier: Option<ClassIdentity>,
+}
+
+impl LifecycleMroContext {
+    fn from_answer(answer: &PythonClassHierarchyAnswer) -> Self {
+        let source_prefix = source_mro_prefix(&answer.mro);
+        // The intrinsic object root is a language terminal with no source
+        // declarations; it does not leave the source member inventory open.
+        let frontier = answer.mro[source_prefix.len()..]
+            .iter()
+            .find(|identity| !matches!(identity, ClassIdentity::Intrinsic { .. }))
+            .cloned();
+        Self {
+            topology: answer.outcome,
+            source_prefix,
+            frontier,
+        }
+    }
+
+    fn topology_complete(&self) -> bool {
+        self.topology == PythonHierarchyOutcome::Complete
+    }
+    fn inventory_complete(&self) -> bool {
+        self.topology_complete() && self.frontier.is_none()
+    }
 }
 
 pub(super) fn unavailable_fact(
@@ -82,6 +120,8 @@ fn fact_expansion(
         PythonHierarchyFactValue {
             root: root.clone(),
             root_id: root_id.to_owned(),
+            ancestry_basis: PythonAncestryBasis::default(),
+            endpoint_ids: Default::default(),
             site_range,
             fact_kind,
             outcome,
@@ -90,10 +130,10 @@ fn fact_expansion(
             ordinal,
             base_spelling: None,
             base_resolution: None,
-            declaration,
-            owner,
-            target,
-            target_owner,
+            declaration: declaration.map(ClassIdentity::Workspace),
+            owner: owner.map(ClassIdentity::Workspace),
+            target: target.map(ClassIdentity::Workspace),
+            target_owner: target_owner.map(ClassIdentity::Workspace),
             member_name,
             mro_rank,
             target_non_trivial: None,
@@ -195,115 +235,163 @@ pub(super) fn expansions_for_declaration(
     let hierarchy_complete = hierarchy
         .as_ref()
         .is_some_and(|answer| answer.outcome == PythonHierarchyOutcome::Complete);
-    let hierarchy_units = hierarchy
+    let mro_context = hierarchy
         .as_ref()
-        .map(|answer| answer.mro.as_slice())
+        .map(LifecycleMroContext::from_answer)
+        .unwrap_or(LifecycleMroContext {
+            topology: PythonHierarchyOutcome::Unsupported,
+            source_prefix: Vec::new(),
+            frontier: None,
+        });
+    let root_premise = class_owner
+        .as_ref()
+        .zip(hierarchy.as_ref())
+        .and_then(|(owner, answer)| hierarchy_premise(analyzer, owner, answer));
+    let ancestry_basis = hierarchy
+        .as_ref()
+        .map(|answer| answer.ancestry_basis.clone())
         .unwrap_or_default();
-    let (call_sites, call_sites_truncated) =
-        call_sites_for_declaration(analyzer, declaration, facts);
-    let mut output = Vec::new();
-    if call_sites_truncated {
-        return vec![fact_expansion(
-            &root,
-            &root_id,
-            "call_lifecycle",
-            "incomplete",
-            Some("visit_limit"),
-            "open",
-            None,
-            Some(declaration.range),
-            Some(declaration.unit.clone()),
-            class_owner,
-            None,
-            None,
-            None,
-            None,
-        )];
-    }
-
-    if let Some(class) = &class_owner
-        && declaration.unit.kind() == CodeUnitType::Class
-    {
-        let mut environment_cache = super::environment::EnvironmentTraversalCache::default();
-        for name in ["__init__", "__del__"] {
-            output.extend(lifecycle_facts_for_name(
-                analyzer,
-                &root,
-                &root_id,
-                class,
-                hierarchy_units,
-                hierarchy_complete,
-                name,
-                semantic,
-                occurrence_cache,
-                &mut environment_cache,
-                cancellation,
-                diagnostics,
-            ));
-        }
-        if hierarchy_complete {
-            output.extend(init_calls_subclass_facts(
-                analyzer,
-                &root,
-                &root_id,
-                class,
-                facts,
-                &call_sites,
-                &occurrence_rows,
-                hierarchy_units,
-                semantic,
-                cancellation,
-            ));
-        } else {
-            output.push(fact_expansion(
+    let mut output = (|| {
+        let (call_sites, call_sites_truncated) =
+            call_sites_for_declaration(analyzer, declaration, facts);
+        let mut output = Vec::new();
+        if call_sites_truncated {
+            return vec![fact_expansion(
                 &root,
                 &root_id,
                 "call_lifecycle",
                 "incomplete",
-                Some("incomplete_hierarchy"),
+                Some("visit_limit"),
                 "open",
                 None,
-                Some(root.range),
+                Some(declaration.range),
+                Some(declaration.unit.clone()),
+                class_owner,
                 None,
-                Some(class.clone()),
                 None,
                 None,
-                Some("init_calls_subclass".to_owned()),
+                None,
+            )];
+        }
+
+        if let Some(class) = &class_owner
+            && declaration.unit.kind() == CodeUnitType::Class
+        {
+            let mut environment_cache = super::environment::EnvironmentTraversalCache::default();
+            for name in ["__init__", "__del__"] {
+                output.extend(lifecycle_facts_for_name(
+                    analyzer,
+                    &root,
+                    &root_id,
+                    class,
+                    &mro_context,
+                    name,
+                    semantic,
+                    occurrence_cache,
+                    &mut environment_cache,
+                    cancellation,
+                    diagnostics,
+                ));
+            }
+            if mro_context.topology_complete() {
+                output.extend(init_calls_subclass_facts(
+                    analyzer,
+                    &root,
+                    &root_id,
+                    class,
+                    facts,
+                    &call_sites,
+                    &occurrence_rows,
+                    &mro_context.source_prefix,
+                    semantic,
+                    cancellation,
+                ));
+            } else {
+                output.push(fact_expansion(
+                    &root,
+                    &root_id,
+                    "call_lifecycle",
+                    "incomplete",
+                    Some("incomplete_hierarchy"),
+                    "open",
+                    None,
+                    Some(root.range),
+                    None,
+                    Some(class.clone()),
+                    None,
+                    None,
+                    Some("init_calls_subclass".to_owned()),
+                    None,
+                ));
+            }
+        }
+
+        output.extend(context_facts(
+            analyzer,
+            &root,
+            &root_id,
+            facts,
+            &call_sites,
+            &occurrence_rows,
+            &mro_context.source_prefix,
+            hierarchy_complete,
+            semantic,
+        ));
+        if output.is_empty() {
+            output.push(fact_expansion(
+                &root,
+                &root_id,
+                "call_context",
+                "no_issue",
+                None,
+                "complete",
+                None,
+                Some(declaration.range),
+                Some(declaration.unit.clone()),
+                class_owner,
+                None,
+                None,
+                None,
                 None,
             ));
         }
-    }
-
-    output.extend(context_facts(
-        analyzer,
-        &root,
-        &root_id,
-        facts,
-        &call_sites,
-        &occurrence_rows,
-        hierarchy_units,
-        hierarchy_complete,
-        semantic,
-    ));
-    if output.is_empty() {
-        output.push(fact_expansion(
-            &root,
-            &root_id,
-            "call_context",
-            "no_issue",
-            None,
-            "complete",
-            None,
-            Some(declaration.range),
-            Some(declaration.unit.clone()),
-            class_owner,
-            None,
-            None,
-            None,
-            None,
-        ));
+        output
+    })();
+    for expansion in &mut output {
+        if let Some(premise) = &root_premise {
+            attach_hierarchy_premises(expansion, std::slice::from_ref(premise));
+        }
+        // Keep each actual helper relation in the trace and combine its full
+        // contributors into this derived fact, without replacing descendants'
+        // claims with the root owner's claims.
+        let mut claims = ancestry_basis.claims.clone();
+        for (premise, _) in &expansion.trace {
+            if let PipelineTraceValue::PythonHierarchyFact(premise) = premise {
+                for claim in &premise.ancestry_basis.claims {
+                    if !claims.contains(claim) {
+                        claims.push(claim.clone());
+                    }
+                }
+            }
+        }
+        if let PipelineValue::PythonHierarchyFact(value) = &mut expansion.value {
+            for claim in claims {
+                if !value.ancestry_basis.claims.contains(&claim) {
+                    value.ancestry_basis.claims.push(claim);
+                }
+            }
+        }
     }
     output
+}
+
+fn source_mro_prefix(mro: &[ClassIdentity]) -> Vec<CodeUnit> {
+    mro.iter()
+        .map_while(|identity| match identity {
+            ClassIdentity::Workspace(unit) => Some(unit.clone()),
+            ClassIdentity::External { .. } | ClassIdentity::Intrinsic { .. } => None,
+        })
+        .collect()
 }
 
 fn set_target_non_triviality(
@@ -362,15 +450,16 @@ fn set_target_non_triviality(
     }
 }
 
-#[derive(Default)]
 struct LifecycleTargetClosure {
     targets: HashSet<CodeUnit>,
     calls_unknown_class_with_self: bool,
+    member_outcome: PythonHierarchyOutcome,
 }
 
 enum LifecycleCallTarget {
     Target(ResolvedCall),
     UnknownClassWithSelf,
+    UnknownMemberSurface,
     None,
     Unavailable,
 }
@@ -382,8 +471,7 @@ fn lifecycle_facts_for_name(
     root: &DeclarationValue,
     root_id: &str,
     class: &CodeUnit,
-    class_mro: &[CodeUnit],
-    hierarchy_complete: bool,
+    mro_context: &LifecycleMroContext,
     name: &str,
     semantic: &mut super::semantic::SemanticQueryContext<'_>,
     occurrence_cache: &mut super::occurrences::OccurrenceTraversalCache,
@@ -391,149 +479,157 @@ fn lifecycle_facts_for_name(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
-    if !hierarchy_complete {
-        return vec![lifecycle_incomplete_fact(
-            root,
-            root_id,
-            class,
-            name,
-            None,
-            "incomplete_hierarchy",
-            root.range,
-        )];
-    }
-    let Some(inherited) = inherited_methods(analyzer, class_mro, name) else {
-        return vec![lifecycle_incomplete_fact(
-            root,
-            root_id,
-            class,
-            name,
-            None,
-            "visit_limit",
-            root.range,
-        )];
-    };
-    let direct = direct_methods(analyzer, class, name);
-    let Some(start_method) = direct
-        .first()
-        .or_else(|| inherited.first().map(|entry| &entry.0))
-    else {
-        return vec![fact_expansion(
-            root,
-            root_id,
-            "call_lifecycle",
-            "no_issue",
-            None,
-            "complete",
-            None,
-            Some(root.range),
-            None,
-            Some(class.clone()),
-            None,
-            None,
-            Some(name.to_owned()),
-            None,
-        )];
-    };
-
-    let closure = match transitive_lifecycle_targets(
-        analyzer,
-        class,
-        class_mro,
-        std::slice::from_ref(start_method),
-        name,
-        occurrence_cache,
-        environment_cache,
-        cancellation,
-        diagnostics,
-    ) {
-        Ok(closure) => closure,
-        Err((reason, range)) => {
+    let class_mro = &mro_context.source_prefix;
+    let mut premises = Vec::new();
+    let mut output = (|| {
+        if !mro_context.topology_complete() {
             return vec![lifecycle_incomplete_fact(
                 root,
                 root_id,
                 class,
                 name,
-                Some(start_method.clone()),
-                reason,
-                range,
+                None,
+                "incomplete_hierarchy",
+                root.range,
             )];
         }
-    };
-
-    let mut output = Vec::new();
-    if !closure.calls_unknown_class_with_self {
-        let mut missing = Vec::new();
-        for (target, owner, rank) in &inherited {
-            if closure.targets.contains(target) {
-                continue;
+        let Some(inherited) = inherited_methods(analyzer, class_mro, name) else {
+            return vec![lifecycle_incomplete_fact(
+                root,
+                root_id,
+                class,
+                name,
+                None,
+                "visit_limit",
+                root.range,
+            )];
+        };
+        let direct = direct_methods(analyzer, class, name);
+        let Some(start_method) = direct
+            .first()
+            .or_else(|| inherited.first().map(|entry| &entry.0))
+        else {
+            if !mro_context.inventory_complete() {
+                return vec![lifecycle_incomplete_fact(
+                    root,
+                    root_id,
+                    class,
+                    name,
+                    None,
+                    "unknown_member_surface",
+                    root.range,
+                )];
             }
-            let Some(non_trivial) = lifecycle_target_non_trivial(
-                analyzer,
-                semantic,
-                target,
-                occurrence_cache,
-                cancellation,
-                diagnostics,
-            ) else {
-                let range = python_range_for_unit(analyzer, target).unwrap_or(root.range);
-                output.push(lifecycle_incomplete_fact(
+            return vec![fact_expansion(
+                root,
+                root_id,
+                "call_lifecycle",
+                "no_issue",
+                None,
+                "complete",
+                None,
+                Some(root.range),
+                None,
+                Some(class.clone()),
+                None,
+                None,
+                Some(name.to_owned()),
+                None,
+            )];
+        };
+
+        let closure = transitive_lifecycle_targets(
+            analyzer,
+            class,
+            mro_context,
+            std::slice::from_ref(start_method),
+            name,
+            occurrence_cache,
+            environment_cache,
+            cancellation,
+            diagnostics,
+        );
+        premises.extend(closure.premises);
+        let closure = match closure.value {
+            Ok(closure) => closure,
+            Err((reason, range)) => {
+                return vec![lifecycle_incomplete_fact(
                     root,
                     root_id,
                     class,
                     name,
                     Some(start_method.clone()),
-                    "target_body_unavailable",
+                    reason,
                     range,
-                ));
-                continue;
-            };
-            if non_trivial {
-                missing.push((target.clone(), owner.clone(), *rank));
+                )];
             }
+        };
+
+        let mut output = Vec::new();
+        if !mro_context.inventory_complete()
+            || closure.member_outcome != PythonHierarchyOutcome::Complete
+        {
+            output.push(lifecycle_incomplete_fact(
+                root,
+                root_id,
+                class,
+                name,
+                Some(start_method.clone()),
+                "unknown_member_surface",
+                root.range,
+            ));
         }
-        let mut lowest_missing = Vec::new();
-        for (target, owner, rank) in &missing {
-            let mut shadowed = false;
-            let mut hierarchy_unknown = false;
-            for (more_derived, more_derived_owner, _) in &missing {
-                if more_derived == target {
+        if mro_context.inventory_complete()
+            && closure.member_outcome == PythonHierarchyOutcome::Complete
+            && !closure.calls_unknown_class_with_self
+        {
+            let mut missing = Vec::new();
+            for (target, owner, rank) in &inherited {
+                if closure.targets.contains(target) {
                     continue;
                 }
-                match class_is_strict_subclass(analyzer, more_derived_owner, owner, cancellation) {
-                    Some(true) => shadowed = true,
-                    Some(false) => {}
-                    None => hierarchy_unknown = true,
+                let Some(non_trivial) = lifecycle_target_non_trivial(
+                    analyzer,
+                    semantic,
+                    target,
+                    occurrence_cache,
+                    cancellation,
+                    diagnostics,
+                ) else {
+                    let range = python_range_for_unit(analyzer, target).unwrap_or(root.range);
+                    output.push(lifecycle_incomplete_fact(
+                        root,
+                        root_id,
+                        class,
+                        name,
+                        Some(start_method.clone()),
+                        "target_body_unavailable",
+                        range,
+                    ));
+                    continue;
+                };
+                if non_trivial {
+                    missing.push((target.clone(), owner.clone(), *rank));
                 }
             }
-            if hierarchy_unknown {
-                output.push(lifecycle_incomplete_fact(
-                    root,
-                    root_id,
-                    class,
-                    name,
-                    Some(start_method.clone()),
-                    "incomplete_hierarchy",
-                    root.range,
-                ));
-            } else if !shadowed {
-                lowest_missing.push((target.clone(), owner.clone(), *rank));
-            }
-        }
-        for (target, owner, rank) in lowest_missing {
-            match superclass_also_misses_call(
-                analyzer,
-                class_mro,
-                &target,
-                name,
-                occurrence_cache,
-                environment_cache,
-                cancellation,
-                diagnostics,
-            ) {
-                Some(true) => continue,
-                Some(false) => {}
-                None => {
+            let mut lowest_missing = Vec::new();
+            for (target, owner, rank) in &missing {
+                let mut shadowed = false;
+                let mut hierarchy_unknown = false;
+                for (more_derived, more_derived_owner, _) in &missing {
+                    if more_derived == target {
+                        continue;
+                    }
+                    let subclass =
+                        class_is_strict_subclass(analyzer, more_derived_owner, owner, cancellation);
+                    premises.extend(subclass.premises);
+                    match subclass.value {
+                        Some(true) => shadowed = true,
+                        Some(false) => {}
+                        None => hierarchy_unknown = true,
+                    }
+                }
+                if hierarchy_unknown {
                     output.push(lifecycle_incomplete_fact(
                         root,
                         root_id,
@@ -543,300 +639,386 @@ fn lifecycle_facts_for_name(
                         "incomplete_hierarchy",
                         root.range,
                     ));
-                    continue;
+                } else if !shadowed {
+                    lowest_missing.push((target.clone(), owner.clone(), *rank));
                 }
             }
-            let mut fact = fact_expansion(
-                root,
-                root_id,
-                "call_lifecycle",
-                "missing_call",
-                None,
-                "complete",
-                Some(rank),
-                Some(root.range),
-                Some(start_method.clone()),
-                Some(class.clone()),
-                Some(target.clone()),
-                Some(owner),
-                Some(name.to_owned()),
-                Some(rank),
-            );
-            set_target_non_triviality(
-                &mut fact,
-                analyzer,
-                semantic,
-                &target,
-                occurrence_cache,
-                cancellation,
-                diagnostics,
-            );
-            output.push(fact);
-        }
-    }
-    if direct.is_empty() {
-        // CodeQL evaluates the first inherited implementation when the class
-        // has no method of its own, but still anchors the finding on the class.
-        return if output.is_empty() {
-            vec![fact_expansion(
-                root,
-                root_id,
-                "call_lifecycle",
-                "no_issue",
-                None,
-                "complete",
-                None,
-                Some(root.range),
-                Some(start_method.clone()),
-                Some(class.clone()),
-                None,
-                None,
-                Some(name.to_owned()),
-                None,
-            )]
-        } else {
-            output
-        };
-    }
-
-    for (target, owner, rank) in &inherited {
-        if closure.targets.contains(target) {
-            output.push(fact_expansion(
-                root,
-                root_id,
-                "call_lifecycle",
-                "called",
-                None,
-                "complete",
-                Some(*rank),
-                Some(python_range_for_unit(analyzer, start_method).unwrap_or(root.range)),
-                Some(start_method.clone()),
-                Some(class.clone()),
-                Some(target.clone()),
-                Some(owner.clone()),
-                Some(name.to_owned()),
-                Some(*rank),
-            ));
-        }
-    }
-
-    for method in direct {
-        let method_range = python_range_for_unit(analyzer, &method).unwrap_or(root.range);
-        let Some(method_calls) = lifecycle_calls_for_method(
-            analyzer,
-            &method,
-            occurrence_cache,
-            environment_cache,
-            cancellation,
-            diagnostics,
-        ) else {
-            output.push(lifecycle_incomplete_fact(
-                root,
-                root_id,
-                class,
-                name,
-                Some(method),
-                "target_body_unavailable",
-                method_range,
-            ));
-            continue;
-        };
-        let LifecycleMethodCalls {
-            calls,
-            occurrences,
-            environment,
-            facts,
-            super_aliases,
-        } = method_calls;
-        let mut reached_by_call = Vec::new();
-        let mut incomplete = None;
-        for call in &calls {
-            let super_alias = lifecycle_super_alias_for_call(
-                &call.shape,
-                &occurrences,
-                &environment,
-                &super_aliases,
-            );
-            if call.shape.outcome.callee_name.as_deref() != Some(name) && super_alias != Some(name)
-            {
-                continue;
-            }
-            let target = if super_alias == Some(name) {
-                lifecycle_super_call_target(analyzer, &method, class_mro, name)
-            } else {
-                lifecycle_call_target(
+            for (target, owner, rank) in lowest_missing {
+                let superclass_misses = superclass_also_misses_call(
                     analyzer,
-                    &method,
                     class_mro,
-                    &call.shape,
-                    &occurrences,
-                    &facts,
+                    &target,
                     name,
+                    occurrence_cache,
+                    environment_cache,
                     cancellation,
-                )
-            };
-            match target {
-                LifecycleCallTarget::Target(target) => {
-                    match transitive_lifecycle_targets(
-                        analyzer,
-                        class,
-                        class_mro,
-                        std::slice::from_ref(&target.target),
-                        name,
-                        occurrence_cache,
-                        environment_cache,
-                        cancellation,
-                        diagnostics,
-                    ) {
-                        Ok(closure) => reached_by_call.push((
-                            target,
-                            closure.targets,
-                            call.shape.outcome.range,
-                        )),
-                        Err((reason, range)) => incomplete = Some((reason, range)),
+                    diagnostics,
+                );
+                premises.extend(superclass_misses.premises);
+                match superclass_misses.value {
+                    Some(true) => continue,
+                    Some(false) => {}
+                    None => {
+                        output.push(lifecycle_incomplete_fact(
+                            root,
+                            root_id,
+                            class,
+                            name,
+                            Some(start_method.clone()),
+                            "incomplete_hierarchy",
+                            root.range,
+                        ));
+                        continue;
                     }
                 }
-                LifecycleCallTarget::Unavailable => {
-                    incomplete = Some(("unsupported_call_shape", call.shape.outcome.range));
-                }
-                LifecycleCallTarget::UnknownClassWithSelf | LifecycleCallTarget::None => {}
+                let mut fact = fact_expansion(
+                    root,
+                    root_id,
+                    "call_lifecycle",
+                    "missing_call",
+                    None,
+                    "complete",
+                    Some(rank),
+                    Some(root.range),
+                    Some(start_method.clone()),
+                    Some(class.clone()),
+                    Some(target.clone()),
+                    Some(owner),
+                    Some(name.to_owned()),
+                    Some(rank),
+                );
+                set_target_non_triviality(
+                    &mut fact,
+                    analyzer,
+                    semantic,
+                    &target,
+                    occurrence_cache,
+                    cancellation,
+                    diagnostics,
+                );
+                output.push(fact);
             }
         }
-        if let Some((reason, range)) = incomplete {
-            output.push(lifecycle_incomplete_fact(
-                root,
-                root_id,
-                class,
-                name,
-                Some(method.clone()),
-                reason,
-                range,
-            ));
-            continue;
+        if direct.is_empty() {
+            // CodeQL evaluates the first inherited implementation when the class
+            // has no method of its own, but still anchors the finding on the class.
+            return if output.is_empty() {
+                vec![fact_expansion(
+                    root,
+                    root_id,
+                    "call_lifecycle",
+                    "no_issue",
+                    None,
+                    "complete",
+                    None,
+                    Some(root.range),
+                    Some(start_method.clone()),
+                    Some(class.clone()),
+                    None,
+                    None,
+                    Some(name.to_owned()),
+                    None,
+                )]
+            } else {
+                output
+            };
         }
-        let mut calls_by_target: HashMap<CodeUnit, Vec<(Range, ResolvedCall)>> = HashMap::default();
-        for (direct_target, targets, call_range) in reached_by_call {
-            for target in targets {
-                calls_by_target.entry(target.clone()).or_default().push((
-                    call_range,
-                    ResolvedCall {
-                        target: target.clone(),
-                        owner: analyzer
-                            .parent_of(&target)
-                            .unwrap_or_else(|| direct_target.owner.clone()),
-                        rank: class_mro
-                            .iter()
-                            .position(|owner| analyzer.parent_of(&target).as_ref() == Some(owner))
-                            .unwrap_or(direct_target.rank),
-                    },
+
+        for (target, owner, rank) in &inherited {
+            if closure.targets.contains(target) {
+                output.push(fact_expansion(
+                    root,
+                    root_id,
+                    "call_lifecycle",
+                    "called",
+                    None,
+                    "complete",
+                    Some(*rank),
+                    Some(python_range_for_unit(analyzer, start_method).unwrap_or(root.range)),
+                    Some(start_method.clone()),
+                    Some(class.clone()),
+                    Some(target.clone()),
+                    Some(owner.clone()),
+                    Some(name.to_owned()),
+                    Some(*rank),
                 ));
             }
         }
-        let mut all_targets = calls_by_target.keys().cloned().collect::<Vec<_>>();
-        all_targets.sort_by_key(|target| target.declaration_id().to_string());
-        let mut reported = false;
-        for calls in calls_by_target.values_mut() {
-            calls.sort_by_key(|(range, _)| (range.start_byte, range.end_byte));
-            calls.dedup_by(|left, right| {
-                left.0.start_byte == right.0.start_byte && left.0.end_byte == right.0.end_byte
-            });
-        }
-        let mut common_non_trivial = Vec::new();
-        for target in &all_targets {
-            let calls = calls_by_target
-                .get(target)
-                .expect("each lifecycle target retains its call sites");
-            if calls.len() < 2 {
-                continue;
-            }
-            match lifecycle_target_non_trivial(
+
+        for method in direct {
+            let method_range = python_range_for_unit(analyzer, &method).unwrap_or(root.range);
+            let Some(method_calls) = lifecycle_calls_for_method(
                 analyzer,
-                semantic,
-                target,
+                &method,
                 occurrence_cache,
+                environment_cache,
                 cancellation,
                 diagnostics,
-            ) {
-                Some(true) => common_non_trivial.push(target.clone()),
-                Some(false) => {}
-                None => {
-                    output.push(lifecycle_incomplete_fact(
-                        root,
-                        root_id,
-                        class,
-                        name,
-                        Some(method.clone()),
-                        "target_body_unavailable",
-                        method_range,
-                    ));
-                    reported = true;
-                }
-            }
-        }
-        for target in &common_non_trivial {
-            let calls = calls_by_target
-                .get(target)
-                .expect("each common lifecycle target retains its call sites");
-            let target_owner = calls[0].1.owner.clone();
-            let mut shadowed = false;
-            let mut hierarchy_unknown = false;
-            for other in common_non_trivial.iter().filter(|other| *other != target) {
-                let other_owner = analyzer
-                    .parent_of(other)
-                    .unwrap_or_else(|| target_owner.clone());
-                match class_is_strict_subclass(analyzer, &other_owner, &target_owner, cancellation)
+            ) else {
+                output.push(lifecycle_incomplete_fact(
+                    root,
+                    root_id,
+                    class,
+                    name,
+                    Some(method),
+                    "target_body_unavailable",
+                    method_range,
+                ));
+                continue;
+            };
+            let LifecycleMethodCalls {
+                calls,
+                occurrences,
+                environment,
+                facts,
+                super_aliases,
+            } = method_calls;
+            let mut reached_by_call = Vec::new();
+            let mut incomplete = None;
+            for call in &calls {
+                let super_alias = lifecycle_super_alias_for_call(
+                    &call.shape,
+                    &occurrences,
+                    &environment,
+                    &super_aliases,
+                );
+                if call.shape.outcome.callee_name.as_deref() != Some(name)
+                    && super_alias != Some(name)
                 {
-                    Some(true) => shadowed = true,
-                    Some(false) => {}
-                    None => hierarchy_unknown = true,
+                    continue;
+                }
+                let target = if super_alias == Some(name) {
+                    HierarchyDecision::plain(lifecycle_super_call_target(
+                        analyzer,
+                        &method,
+                        mro_context,
+                        name,
+                    ))
+                } else {
+                    lifecycle_call_target(
+                        analyzer,
+                        &method,
+                        mro_context,
+                        &call.shape,
+                        &occurrences,
+                        &facts,
+                        name,
+                        cancellation,
+                    )
+                };
+                premises.extend(target.premises);
+                match target.value {
+                    LifecycleCallTarget::Target(target) => {
+                        let reached = transitive_lifecycle_targets(
+                            analyzer,
+                            class,
+                            mro_context,
+                            std::slice::from_ref(&target.target),
+                            name,
+                            occurrence_cache,
+                            environment_cache,
+                            cancellation,
+                            diagnostics,
+                        );
+                        premises.extend(reached.premises);
+                        match reached.value {
+                            Ok(closure) => {
+                                if closure.member_outcome != PythonHierarchyOutcome::Complete {
+                                    incomplete =
+                                        Some(("unknown_member_surface", call.shape.outcome.range));
+                                }
+                                reached_by_call.push((
+                                    target,
+                                    closure.targets,
+                                    call.shape.outcome.range,
+                                ));
+                            }
+                            Err((reason, range)) => incomplete = Some((reason, range)),
+                        }
+                    }
+                    LifecycleCallTarget::Unavailable => {
+                        incomplete = Some(("unsupported_call_shape", call.shape.outcome.range));
+                    }
+                    LifecycleCallTarget::UnknownMemberSurface => {
+                        incomplete = Some(("unknown_member_surface", call.shape.outcome.range));
+                    }
+                    LifecycleCallTarget::UnknownClassWithSelf | LifecycleCallTarget::None => {}
                 }
             }
-            if hierarchy_unknown {
+            let resolution_complete = incomplete.is_none();
+            if let Some((reason, range)) = incomplete {
                 output.push(lifecycle_incomplete_fact(
                     root,
                     root_id,
                     class,
                     name,
                     Some(method.clone()),
-                    "incomplete_hierarchy",
-                    method_range,
+                    reason,
+                    range,
                 ));
+            }
+            let mut calls_by_target: HashMap<CodeUnit, Vec<(Range, ResolvedCall)>> =
+                HashMap::default();
+            for (direct_target, targets, call_range) in reached_by_call {
+                for target in targets {
+                    calls_by_target.entry(target.clone()).or_default().push((
+                        call_range,
+                        ResolvedCall {
+                            target: target.clone(),
+                            owner: analyzer
+                                .parent_of(&target)
+                                .unwrap_or_else(|| direct_target.owner.clone()),
+                            rank: class_mro
+                                .iter()
+                                .position(|owner| {
+                                    analyzer.parent_of(&target).as_ref() == Some(owner)
+                                })
+                                .unwrap_or(direct_target.rank),
+                        },
+                    ));
+                }
+            }
+            let mut all_targets = calls_by_target.keys().cloned().collect::<Vec<_>>();
+            all_targets.sort_by_key(|target| target.declaration_id().to_string());
+            let mut reported = false;
+            for calls in calls_by_target.values_mut() {
+                calls.sort_by_key(|(range, _)| (range.start_byte, range.end_byte));
+                calls.dedup_by(|left, right| {
+                    left.0.start_byte == right.0.start_byte && left.0.end_byte == right.0.end_byte
+                });
+            }
+            let mut common_non_trivial = Vec::new();
+            for target in &all_targets {
+                let calls = calls_by_target
+                    .get(target)
+                    .expect("each lifecycle target retains its call sites");
+                if calls.len() < 2 {
+                    continue;
+                }
+                match lifecycle_target_non_trivial(
+                    analyzer,
+                    semantic,
+                    target,
+                    occurrence_cache,
+                    cancellation,
+                    diagnostics,
+                ) {
+                    Some(true) => common_non_trivial.push(target.clone()),
+                    Some(false) => {}
+                    None => {
+                        output.push(lifecycle_incomplete_fact(
+                            root,
+                            root_id,
+                            class,
+                            name,
+                            Some(method.clone()),
+                            "target_body_unavailable",
+                            method_range,
+                        ));
+                        reported = true;
+                    }
+                }
+            }
+            for target in &common_non_trivial {
+                let calls = calls_by_target
+                    .get(target)
+                    .expect("each common lifecycle target retains its call sites");
+                let target_owner = calls[0].1.owner.clone();
+                let mut shadowed = false;
+                let mut hierarchy_unknown = false;
+                for other in common_non_trivial.iter().filter(|other| *other != target) {
+                    let other_owner = analyzer
+                        .parent_of(other)
+                        .unwrap_or_else(|| target_owner.clone());
+                    let subclass = class_is_strict_subclass(
+                        analyzer,
+                        &other_owner,
+                        &target_owner,
+                        cancellation,
+                    );
+                    premises.extend(subclass.premises);
+                    match subclass.value {
+                        Some(true) => shadowed = true,
+                        Some(false) => {}
+                        None => hierarchy_unknown = true,
+                    }
+                }
+                if hierarchy_unknown {
+                    output.push(lifecycle_incomplete_fact(
+                        root,
+                        root_id,
+                        class,
+                        name,
+                        Some(method.clone()),
+                        "incomplete_hierarchy",
+                        method_range,
+                    ));
+                    reported = true;
+                    continue;
+                }
+                if shadowed {
+                    continue;
+                }
+                let call = &calls[0].1;
+                let mut fact = fact_expansion(
+                    root,
+                    root_id,
+                    "call_lifecycle",
+                    "multiple_calls",
+                    None,
+                    "complete",
+                    Some(2),
+                    Some(method_range),
+                    Some(method.clone()),
+                    Some(class.clone()),
+                    Some(target.clone()),
+                    Some(call.owner.clone()),
+                    Some(name.to_owned()),
+                    Some(call.rank),
+                );
+                set_target_non_triviality(
+                    &mut fact,
+                    analyzer,
+                    semantic,
+                    target,
+                    occurrence_cache,
+                    cancellation,
+                    diagnostics,
+                );
+                output.push(fact);
                 reported = true;
-                continue;
             }
-            if shadowed {
-                continue;
+            if !reported && resolution_complete && mro_context.inventory_complete() {
+                output.push(fact_expansion(
+                    root,
+                    root_id,
+                    "call_lifecycle",
+                    "no_issue",
+                    None,
+                    "complete",
+                    None,
+                    Some(method_range),
+                    Some(method),
+                    Some(class.clone()),
+                    None,
+                    None,
+                    Some(name.to_owned()),
+                    None,
+                ));
             }
-            let call = &calls[0].1;
-            let mut fact = fact_expansion(
+        }
+        if output.is_empty() && !mro_context.inventory_complete() {
+            output.push(lifecycle_incomplete_fact(
                 root,
                 root_id,
-                "call_lifecycle",
-                "multiple_calls",
+                class,
+                name,
                 None,
-                "complete",
-                Some(2),
-                Some(method_range),
-                Some(method.clone()),
-                Some(class.clone()),
-                Some(target.clone()),
-                Some(call.owner.clone()),
-                Some(name.to_owned()),
-                Some(call.rank),
-            );
-            set_target_non_triviality(
-                &mut fact,
-                analyzer,
-                semantic,
-                target,
-                occurrence_cache,
-                cancellation,
-                diagnostics,
-            );
-            output.push(fact);
-            reported = true;
+                "unknown_member_surface",
+                root.range,
+            ));
         }
-        if !reported {
+        if output.is_empty() {
             output.push(fact_expansion(
                 root,
                 root_id,
@@ -845,8 +1027,8 @@ fn lifecycle_facts_for_name(
                 None,
                 "complete",
                 None,
-                Some(method_range),
-                Some(method),
+                Some(root.range),
+                None,
                 Some(class.clone()),
                 None,
                 None,
@@ -854,24 +1036,10 @@ fn lifecycle_facts_for_name(
                 None,
             ));
         }
-    }
-    if output.is_empty() {
-        output.push(fact_expansion(
-            root,
-            root_id,
-            "call_lifecycle",
-            "no_issue",
-            None,
-            "complete",
-            None,
-            Some(root.range),
-            None,
-            Some(class.clone()),
-            None,
-            None,
-            Some(name.to_owned()),
-            None,
-        ));
+        output
+    })();
+    for expansion in &mut output {
+        attach_hierarchy_premises(expansion, &premises);
     }
     output
 }
@@ -1078,92 +1246,107 @@ fn call_facts_for_method(
 fn transitive_lifecycle_targets(
     analyzer: &dyn IAnalyzer,
     mro_base: &CodeUnit,
-    mro: &[CodeUnit],
+    mro: &LifecycleMroContext,
     starts: &[CodeUnit],
     name: &str,
     occurrence_cache: &mut super::occurrences::OccurrenceTraversalCache,
     environment_cache: &mut super::environment::EnvironmentTraversalCache,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> Result<LifecycleTargetClosure, (&'static str, Range)> {
-    let mut closure = LifecycleTargetClosure::default();
-    let mut pending = starts.to_vec();
-    while let Some(method) = pending.pop() {
-        if !closure.targets.insert(method.clone()) {
-            continue;
-        }
-        if closure.targets.len() > CALL_VISIT_LIMIT {
-            return Err((
-                "visit_limit",
-                python_range_for_unit(analyzer, &method).unwrap_or_else(|| {
-                    analyzer
-                        .ranges(mro_base)
-                        .into_iter()
-                        .next()
-                        .expect("class range")
-                }),
-            ));
-        }
-        if method.package_name() == "builtins" {
-            continue;
-        }
-        let method_range = python_range_for_unit(analyzer, &method)
-            .ok_or_else(|| ("target_body_unavailable", analyzer.ranges(mro_base)[0]))?;
-        let Some(method_calls) = lifecycle_calls_for_method(
-            analyzer,
-            &method,
-            occurrence_cache,
-            environment_cache,
-            cancellation,
-            diagnostics,
-        ) else {
-            return Err(("target_body_unavailable", method_range));
+) -> HierarchyDecision<Result<LifecycleTargetClosure, (&'static str, Range)>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let mut closure = LifecycleTargetClosure {
+            targets: HashSet::default(),
+            calls_unknown_class_with_self: false,
+            member_outcome: PythonHierarchyOutcome::Complete,
         };
-        let LifecycleMethodCalls {
-            calls,
-            occurrences,
-            environment,
-            facts,
-            super_aliases,
-        } = method_calls;
-        for call in &calls {
-            let super_alias = lifecycle_super_alias_for_call(
-                &call.shape,
-                &occurrences,
-                &environment,
-                &super_aliases,
-            );
-            if call.shape.outcome.callee_name.as_deref() != Some(name) && super_alias != Some(name)
-            {
+        let mut pending = starts.to_vec();
+        while let Some(method) = pending.pop() {
+            if !closure.targets.insert(method.clone()) {
                 continue;
             }
-            let target = if super_alias == Some(name) {
-                lifecycle_super_call_target(analyzer, &method, mro, name)
-            } else {
-                lifecycle_call_target(
-                    analyzer,
-                    &method,
-                    mro,
+            if closure.targets.len() > CALL_VISIT_LIMIT {
+                return Err((
+                    "visit_limit",
+                    python_range_for_unit(analyzer, &method).unwrap_or_else(|| {
+                        analyzer
+                            .ranges(mro_base)
+                            .into_iter()
+                            .next()
+                            .expect("class range")
+                    }),
+                ));
+            }
+            if method.package_name() == "builtins" {
+                continue;
+            }
+            let method_range = python_range_for_unit(analyzer, &method)
+                .ok_or_else(|| ("target_body_unavailable", analyzer.ranges(mro_base)[0]))?;
+            let Some(method_calls) = lifecycle_calls_for_method(
+                analyzer,
+                &method,
+                occurrence_cache,
+                environment_cache,
+                cancellation,
+                diagnostics,
+            ) else {
+                return Err(("target_body_unavailable", method_range));
+            };
+            let LifecycleMethodCalls {
+                calls,
+                occurrences,
+                environment,
+                facts,
+                super_aliases,
+            } = method_calls;
+            for call in &calls {
+                let super_alias = lifecycle_super_alias_for_call(
                     &call.shape,
                     &occurrences,
-                    &facts,
-                    name,
-                    cancellation,
-                )
-            };
-            match target {
-                LifecycleCallTarget::Target(target) => pending.push(target.target),
-                LifecycleCallTarget::UnknownClassWithSelf => {
-                    closure.calls_unknown_class_with_self = true;
+                    &environment,
+                    &super_aliases,
+                );
+                if call.shape.outcome.callee_name.as_deref() != Some(name)
+                    && super_alias != Some(name)
+                {
+                    continue;
                 }
-                LifecycleCallTarget::None => {}
-                LifecycleCallTarget::Unavailable => {
-                    return Err(("unsupported_call_shape", call.shape.outcome.range));
+                let target = if super_alias == Some(name) {
+                    HierarchyDecision::plain(lifecycle_super_call_target(
+                        analyzer, &method, mro, name,
+                    ))
+                } else {
+                    lifecycle_call_target(
+                        analyzer,
+                        &method,
+                        mro,
+                        &call.shape,
+                        &occurrences,
+                        &facts,
+                        name,
+                        cancellation,
+                    )
+                };
+                premises.extend(target.premises);
+                match target.value {
+                    LifecycleCallTarget::Target(target) => pending.push(target.target),
+                    LifecycleCallTarget::UnknownClassWithSelf => {
+                        closure.calls_unknown_class_with_self = true;
+                    }
+                    LifecycleCallTarget::UnknownMemberSurface => {
+                        closure.member_outcome = PythonHierarchyOutcome::Incomplete
+                    }
+                    LifecycleCallTarget::None => {}
+                    LifecycleCallTarget::Unavailable => {
+                        return Err(("unsupported_call_shape", call.shape.outcome.range));
+                    }
                 }
             }
         }
-    }
-    Ok(closure)
+        Ok(closure)
+    })();
+    HierarchyDecision { value, premises }
 }
 
 // Keep call-site evidence and the owning method's MRO explicit at resolution.
@@ -1171,84 +1354,109 @@ fn transitive_lifecycle_targets(
 fn lifecycle_call_target(
     analyzer: &dyn IAnalyzer,
     method: &CodeUnit,
-    mro: &[CodeUnit],
+    mro: &LifecycleMroContext,
     shape: &CallShapeReport,
     occurrences: &[crate::analyzer::structural::occurrence_rows::OccurrenceRow],
     facts: &FileFacts,
     name: &str,
     cancellation: Option<&CancellationToken>,
-) -> LifecycleCallTarget {
-    let Some(receiver) = shape.outcome.receiver_range else {
-        return LifecycleCallTarget::None;
-    };
-    if shape.outcome.coverage != CallShapeCoverage::Exact {
-        return LifecycleCallTarget::Unavailable;
-    }
-    if let Some(super_shape) = super_call_receiver(facts, &shape.outcome.file, receiver) {
-        let Some(callee) = super_shape.outcome.callee_range else {
+) -> HierarchyDecision<LifecycleCallTarget> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let Some(receiver) = shape.outcome.receiver_range else {
+            return LifecycleCallTarget::None;
+        };
+        if shape.outcome.coverage != CallShapeCoverage::Exact {
+            return LifecycleCallTarget::Unavailable;
+        }
+        if let Some(super_shape) = super_call_receiver(facts, &shape.outcome.file, receiver) {
+            let Some(callee) = super_shape.outcome.callee_range else {
+                return LifecycleCallTarget::Unavailable;
+            };
+            match builtin_super_at(occurrences, callee) {
+                Some(true) => return lifecycle_super_call_target(analyzer, method, mro, name),
+                Some(false) => {}
+                None => return LifecycleCallTarget::Unavailable,
+            }
+        }
+        let Some(formal) = first_parameter_name(analyzer, facts, occurrences, method) else {
+            return LifecycleCallTarget::None;
+        };
+        let Some(group) = shape
+            .groups
+            .iter()
+            .find(|group| group.kind == ArgumentListKind::Ordinary && group.group_index == 0)
+        else {
+            return LifecycleCallTarget::None;
+        };
+        let Some(first_argument) = shape.arguments.iter().find(|argument| {
+            argument.group_id == group.id && argument.argument_index == 0 && argument.name.is_none()
+        }) else {
+            return LifecycleCallTarget::None;
+        };
+        if !occurrence_is_bound_to_formal(occurrences, first_argument.range, &formal) {
+            return LifecycleCallTarget::None;
+        }
+        let Some(target_class) = resolved_class_at(occurrences, receiver) else {
+            return LifecycleCallTarget::UnknownClassWithSelf;
+        };
+        let Some(provider) = analyzer.python_class_hierarchy_provider_for(&target_class) else {
             return LifecycleCallTarget::Unavailable;
         };
-        match builtin_super_at(occurrences, callee) {
-            Some(true) => return lifecycle_super_call_target(analyzer, method, mro, name),
-            Some(false) => {}
-            None => return LifecycleCallTarget::Unavailable,
+        let hierarchy = provider.class_hierarchy(&target_class, cancellation);
+        let Some(premise) = hierarchy_premise(analyzer, &target_class, &hierarchy) else {
+            return LifecycleCallTarget::Unavailable;
+        };
+        premises.push(premise);
+        if hierarchy.outcome != PythonHierarchyOutcome::Complete {
+            return LifecycleCallTarget::Unavailable;
         }
-    }
-    let Some(formal) = first_parameter_name(analyzer, facts, occurrences, method) else {
-        return LifecycleCallTarget::None;
-    };
-    let Some(group) = shape
-        .groups
-        .iter()
-        .find(|group| group.kind == ArgumentListKind::Ordinary && group.group_index == 0)
-    else {
-        return LifecycleCallTarget::None;
-    };
-    let Some(first_argument) = shape.arguments.iter().find(|argument| {
-        argument.group_id == group.id && argument.argument_index == 0 && argument.name.is_none()
-    }) else {
-        return LifecycleCallTarget::None;
-    };
-    if !occurrence_is_bound_to_formal(occurrences, first_argument.range, &formal) {
-        return LifecycleCallTarget::None;
-    }
-    let Some(target_class) = resolved_class_at(occurrences, receiver) else {
-        return LifecycleCallTarget::UnknownClassWithSelf;
-    };
-    let Some(provider) = analyzer.python_class_hierarchy_provider_for(&target_class) else {
-        return LifecycleCallTarget::Unavailable;
-    };
-    let hierarchy = provider.class_hierarchy(&target_class, cancellation);
-    if hierarchy.outcome != PythonHierarchyOutcome::Complete {
-        return LifecycleCallTarget::Unavailable;
-    }
-    let target = hierarchy.mro.iter().enumerate().find_map(|(rank, owner)| {
-        direct_methods(analyzer, owner, name)
-            .into_iter()
-            .next()
-            .map(|target| ResolvedCall {
-                target,
-                owner: owner.clone(),
-                rank: mro
-                    .iter()
-                    .position(|candidate| candidate == owner)
-                    .unwrap_or(rank),
-            })
-    });
-    target.map_or(LifecycleCallTarget::None, LifecycleCallTarget::Target)
+        let target_context = LifecycleMroContext::from_answer(&hierarchy);
+        let target = target_context
+            .source_prefix
+            .iter()
+            .enumerate()
+            .find_map(|(rank, owner)| {
+                direct_methods(analyzer, owner, name)
+                    .into_iter()
+                    .next()
+                    .map(|target| ResolvedCall {
+                        target,
+                        owner: owner.clone(),
+                        rank: mro
+                            .source_prefix
+                            .iter()
+                            .position(|candidate| candidate == owner)
+                            .unwrap_or(rank),
+                    })
+            });
+        match target {
+            Some(target) => LifecycleCallTarget::Target(target),
+            None if !target_context.inventory_complete() => {
+                LifecycleCallTarget::UnknownMemberSurface
+            }
+            None => LifecycleCallTarget::None,
+        }
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn lifecycle_super_call_target(
     analyzer: &dyn IAnalyzer,
     method: &CodeUnit,
-    mro: &[CodeUnit],
+    context: &LifecycleMroContext,
     name: &str,
 ) -> LifecycleCallTarget {
+    let mro = &context.source_prefix;
     let Some(owner) = analyzer.parent_of(method) else {
         return LifecycleCallTarget::None;
     };
     let Some(owner_rank) = mro.iter().position(|candidate| candidate == &owner) else {
-        return LifecycleCallTarget::None;
+        return if context.inventory_complete() {
+            LifecycleCallTarget::None
+        } else {
+            LifecycleCallTarget::UnknownMemberSurface
+        };
     };
     let target = mro
         .iter()
@@ -1264,7 +1472,11 @@ fn lifecycle_super_call_target(
                     rank,
                 })
         });
-    target.map_or(LifecycleCallTarget::None, LifecycleCallTarget::Target)
+    match target {
+        Some(target) => LifecycleCallTarget::Target(target),
+        None if !context.inventory_complete() => LifecycleCallTarget::UnknownMemberSurface,
+        None => LifecycleCallTarget::None,
+    }
 }
 
 fn lifecycle_target_non_trivial(
@@ -1310,19 +1522,23 @@ fn class_is_strict_subclass(
     subclass: &CodeUnit,
     superclass: &CodeUnit,
     cancellation: Option<&CancellationToken>,
-) -> Option<bool> {
-    if subclass == superclass {
-        return Some(false);
-    }
-    let provider = analyzer.python_class_hierarchy_provider_for(subclass)?;
-    let hierarchy = provider.class_hierarchy(subclass, cancellation);
-    (hierarchy.outcome == PythonHierarchyOutcome::Complete).then(|| {
-        hierarchy
-            .mro
-            .iter()
-            .skip(1)
-            .any(|class| class == superclass)
-    })
+) -> HierarchyDecision<Option<bool>> {
+    let mut premises = Vec::new();
+    let value =
+        (|| {
+            if subclass == superclass {
+                return Some(false);
+            }
+            let provider = analyzer.python_class_hierarchy_provider_for(subclass)?;
+            let hierarchy = provider.class_hierarchy(subclass, cancellation);
+            premises.push(hierarchy_premise(analyzer, subclass, &hierarchy)?);
+            (hierarchy.outcome == PythonHierarchyOutcome::Complete).then(|| {
+                hierarchy.mro.iter().skip(1).any(
+                    |class| matches!(class, ClassIdentity::Workspace(unit) if unit == superclass),
+                )
+            })
+        })();
+    HierarchyDecision { value, premises }
 }
 
 // These query-local caches and target identity remain explicit in the MRO walk.
@@ -1336,48 +1552,62 @@ fn superclass_also_misses_call(
     environment_cache: &mut super::environment::EnvironmentTraversalCache,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> Option<bool> {
-    for superclass in class_mro.iter().skip(1) {
-        let provider = analyzer.python_class_hierarchy_provider_for(superclass)?;
-        let hierarchy = provider.class_hierarchy(superclass, cancellation);
-        if hierarchy.outcome != PythonHierarchyOutcome::Complete {
-            return None;
+) -> HierarchyDecision<Option<bool>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        for superclass in class_mro.iter().skip(1) {
+            let provider = analyzer.python_class_hierarchy_provider_for(superclass)?;
+            let hierarchy = provider.class_hierarchy(superclass, cancellation);
+            premises.push(hierarchy_premise(analyzer, superclass, &hierarchy)?);
+            if hierarchy.outcome != PythonHierarchyOutcome::Complete {
+                return None;
+            }
+            let context = LifecycleMroContext::from_answer(&hierarchy);
+            let source_mro = &context.source_prefix;
+            if !context.inventory_complete() {
+                return None;
+            }
+            if !source_mro
+                .iter()
+                .skip(1)
+                .any(|ancestor| analyzer.parent_of(target).as_ref() == Some(ancestor))
+            {
+                continue;
+            }
+            let inherited = inherited_methods(analyzer, source_mro, name)?;
+            let start = direct_methods(analyzer, superclass, name)
+                .into_iter()
+                .next()
+                .or_else(|| inherited.first().map(|entry| entry.0.clone()));
+            let Some(start) = start else {
+                continue;
+            };
+            let closure = transitive_lifecycle_targets(
+                analyzer,
+                superclass,
+                &context,
+                std::slice::from_ref(&start),
+                name,
+                occurrence_cache,
+                environment_cache,
+                cancellation,
+                diagnostics,
+            );
+            premises.extend(closure.premises);
+            let closure = match closure.value {
+                Ok(closure) => closure,
+                Err(_) => return None,
+            };
+            if closure.member_outcome != PythonHierarchyOutcome::Complete {
+                return None;
+            }
+            if !closure.calls_unknown_class_with_self && !closure.targets.contains(target) {
+                return Some(true);
+            }
         }
-        if !hierarchy
-            .mro
-            .iter()
-            .skip(1)
-            .any(|ancestor| analyzer.parent_of(target).as_ref() == Some(ancestor))
-        {
-            continue;
-        }
-        let inherited = inherited_methods(analyzer, &hierarchy.mro, name)?;
-        let start = direct_methods(analyzer, superclass, name)
-            .into_iter()
-            .next()
-            .or_else(|| inherited.first().map(|entry| entry.0.clone()));
-        let Some(start) = start else {
-            continue;
-        };
-        let closure = match transitive_lifecycle_targets(
-            analyzer,
-            superclass,
-            &hierarchy.mro,
-            std::slice::from_ref(&start),
-            name,
-            occurrence_cache,
-            environment_cache,
-            cancellation,
-            diagnostics,
-        ) {
-            Ok(closure) => closure,
-            Err(_) => return None,
-        };
-        if !closure.calls_unknown_class_with_self && !closure.targets.contains(target) {
-            return Some(true);
-        }
-    }
-    Some(false)
+        Some(false)
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn set_target_reads_self(
@@ -2045,6 +2275,10 @@ fn init_calls_subclass_facts(
                     continue;
                 };
                 let answer = python_provider.method_override(&descendant_method, cancellation);
+                let Some(premise) = override_premise(analyzer, &descendant_method, &answer) else {
+                    output.push(unavailable_fact(analyzer, root, "incomplete_hierarchy"));
+                    continue;
+                };
                 if answer.outcome == PythonOverrideOutcome::Overrides
                     && answer.target_owner.as_ref() == Some(&called_owner)
                 {
@@ -2065,13 +2299,14 @@ fn init_calls_subclass_facts(
                         Some(called_rank),
                     );
                     set_target_reads_self(&mut fact, analyzer, &descendant_method);
+                    attach_hierarchy_premises(&mut fact, std::slice::from_ref(&premise));
                     output.push(fact);
                 }
                 if matches!(
                     answer.outcome,
                     PythonOverrideOutcome::Incomplete | PythonOverrideOutcome::Unsupported
                 ) {
-                    output.push(fact_expansion(
+                    let mut fact = fact_expansion(
                         root,
                         root_id,
                         "call_lifecycle",
@@ -2092,7 +2327,9 @@ fn init_calls_subclass_facts(
                         None,
                         Some("init_calls_subclass".to_owned()),
                         None,
-                    ));
+                    );
+                    attach_hierarchy_premises(&mut fact, std::slice::from_ref(&premise));
+                    output.push(fact);
                 }
             }
             if let Some(reason) = dispatch_reason {

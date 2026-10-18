@@ -30,7 +30,7 @@ use crate::hash::{HashMap, HashSet};
 
 const MODEL_URI_BASE: &str = "bifrost-model://v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelOriginKind {
     WorkspaceSource,
@@ -41,7 +41,7 @@ pub enum SemanticModelOriginKind {
     DeclarativeModel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelProof {
     AuthoredAnchor,
@@ -49,7 +49,7 @@ pub enum SemanticModelProof {
     PackFact,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelCompleteness {
     Partial,
@@ -95,7 +95,7 @@ impl SemanticModelSymbolKind {
     /// edge can cross to. Members and values never are, so a pack that
     /// publishes a constant beside a same-named class cannot answer a base
     /// clause with the constant.
-    fn is_type_declaration(self) -> bool {
+    pub(crate) fn is_type_declaration(self) -> bool {
         matches!(
             self,
             Self::Class
@@ -168,7 +168,7 @@ impl SemanticModelLocation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SemanticModelActivationProvenance {
     pub status: String,
     pub reason: String,
@@ -177,14 +177,14 @@ pub struct SemanticModelActivationProvenance {
     pub matched_evidence: SemanticModelMatchedEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SemanticModelMatchedCoordinate {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SemanticModelMatchedEvidence {
     pub language: String,
     pub ecosystem: String,
@@ -202,7 +202,7 @@ pub struct SemanticModelMatchedEvidence {
     pub artifact_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SemanticModelProvenance {
     pub active_model_set_hash: String,
     pub pack_digest: String,
@@ -229,6 +229,9 @@ pub(crate) struct GeneratedFunctionScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticModelSymbol {
+    /// Current activation authority, distinct from this positive declaration.
+    #[serde(skip)]
+    pub(crate) jvm_owner_family_enumerated: bool,
     #[serde(skip)]
     pub(crate) rust_generated_scope: Option<Box<GeneratedFunctionScope>>,
     pub id: String,
@@ -1041,8 +1044,17 @@ impl SemanticModelOverlay {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
             }
             let matched = active.types_with_id(&id);
-            let ambiguous = declaration_records_conflict(&matched);
-            for activated in matched.records {
+            let ambiguous = type_declaration_records_conflict(&matched);
+            for (index, activated) in matched.records.iter().enumerate() {
+                // Runtime claims are adjudicated by the ancestry consumer. Do
+                // not manufacture duplicate declaration identities from them.
+                // Raw active records remain available with their provenance.
+                if matched.records[..index].iter().any(|earlier| {
+                    earlier.record.runtime_bases != activated.record.runtime_bases
+                        && type_declarations_equivalent(earlier.record, activated.record)
+                }) {
+                    continue;
+                }
                 let symbol = type_symbol(
                     analyzer,
                     active,
@@ -1373,6 +1385,30 @@ impl SemanticModelOverlay {
 
     pub fn symbols_named(&self, name: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
         self.symbol_match(self.symbols_by_name.get(name))
+    }
+
+    /// Streaming access to existing unique postings. Callers with a query
+    /// ledger charge each candidate before retaining or selecting it.
+    pub(crate) fn symbol_candidates_named<'a>(
+        &'a self,
+        name: &str,
+    ) -> impl Iterator<Item = &'a SemanticModelSymbol> + 'a {
+        self.symbols_by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(move |index| &self.symbols[*index])
+    }
+
+    pub(crate) fn symbol_candidates_with_id<'a>(
+        &'a self,
+        id: &str,
+    ) -> impl Iterator<Item = &'a SemanticModelSymbol> + 'a {
+        self.symbols_by_id
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(move |index| &self.symbols[*index])
     }
 
     pub(crate) fn visible_public_symbol(
@@ -3154,6 +3190,29 @@ fn push_unique_posting(postings: &mut HashMap<String, Vec<usize>>, key: &str, in
     if posting.last() != Some(&index) {
         posting.push(index);
     }
+}
+
+/// Runtime ancestry is an independently adjudicated claim, not declaration
+/// identity. Keep TypeFact Eq, normalization, and artifact identities exact.
+pub(crate) fn type_declarations_equivalent(left: &TypeFact, right: &TypeFact) -> bool {
+    if left.runtime_bases == right.runtime_bases {
+        return left == right;
+    }
+    // Construction-time temporary, bounded by the validated declaration
+    // artifact. No serialized shape comparison or retained projection cache.
+    let mut declaration = left.clone();
+    declaration.runtime_bases.clone_from(&right.runtime_bases);
+    declaration == *right
+}
+
+fn type_declaration_records_conflict(matched: &SemanticModelMatch<'_, TypeFact>) -> bool {
+    declaration_records_conflict(matched)
+        && matched.records.first().is_some_and(|first| {
+            matched
+                .records
+                .iter()
+                .any(|candidate| !type_declarations_equivalent(first.record, candidate.record))
+        })
 }
 
 fn declaration_records_conflict<T>(matched: &SemanticModelMatch<'_, T>) -> bool {
@@ -5065,6 +5124,7 @@ fn emit_rule_match(
                         is_sealed,
                         ..
                     } => SemanticModelSymbol {
+                        jvm_owner_family_enumerated: false,
                         non_overridable: None,
                         ambient_use: None,
                         id,
@@ -5127,6 +5187,7 @@ fn emit_rule_match(
                             .as_ref()
                             .is_some_and(signature_has_complete_callable_shape);
                         SemanticModelSymbol {
+                            jvm_owner_family_enumerated: false,
                             non_overridable: None,
                             ambient_use: None,
                             id,
@@ -5550,6 +5611,7 @@ fn type_symbol(
         &record.id,
     );
     SemanticModelSymbol {
+        jvm_owner_family_enumerated: shard.independently_enumerates_jvm_owner(record),
         non_overridable: None,
         id: record.id.clone(),
         owner_id: None,
@@ -5619,6 +5681,7 @@ fn member_symbol(
         &record.id,
     );
     SemanticModelSymbol {
+        jvm_owner_family_enumerated: false,
         non_overridable: record.non_overridable,
         id: record.id.clone(),
         owner_id: Some(record.owner.clone()),
@@ -5889,6 +5952,26 @@ fn model_location(
     })
 }
 
+/// Preserve the declaration's own origin and activation for runtime ancestry.
+pub(crate) fn activated_type_provenance<E>(
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    record: &TypeFact,
+    ambiguous: bool,
+    visit: &mut impl FnMut() -> Result<(), E>,
+) -> Result<SemanticModelProvenance, E> {
+    let location = model_location(shard, "type", &record.id);
+    provenance_with_visits(
+        active,
+        shard,
+        &record.id,
+        &location,
+        Some(&record.locator),
+        ambiguous,
+        visit,
+    )
+}
+
 pub(super) fn activated_record_provenance(
     active: &ResolvedActiveSemanticModels,
     shard: &ActiveSemanticModelShard,
@@ -5902,22 +5985,45 @@ fn provenance(
     active: &ResolvedActiveSemanticModels,
     shard: &ActiveSemanticModelShard,
     record_id: &str,
-    _location: &SemanticModelLocation,
+    location: &SemanticModelLocation,
     locator: Option<&Locator>,
     ambiguous: bool,
 ) -> SemanticModelProvenance {
-    let activation = active
-        .activation_report()
-        .explanations
-        .iter()
-        .find(|explanation| {
-            explanation.status == SemanticModelActivationStatus::Active
-                && explanation.manifest_digest == shard.manifest.content_sha256
-                && explanation.shard_id == shard.shard.shard_id()
-                && explanation.source_kind == shard.source_kind
-                && explanation.source_id == shard.source_id
-        });
-    SemanticModelProvenance {
+    provenance_with_visits(
+        active,
+        shard,
+        record_id,
+        location,
+        locator,
+        ambiguous,
+        &mut || Ok::<_, std::convert::Infallible>(()),
+    )
+    .unwrap_or_else(|never| match never {})
+}
+
+fn provenance_with_visits<E>(
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    record_id: &str,
+    _location: &SemanticModelLocation,
+    locator: Option<&Locator>,
+    ambiguous: bool,
+    visit: &mut impl FnMut() -> Result<(), E>,
+) -> Result<SemanticModelProvenance, E> {
+    let mut activation = None;
+    for explanation in &active.activation_report().explanations {
+        visit()?;
+        if explanation.status == SemanticModelActivationStatus::Active
+            && explanation.manifest_digest == shard.manifest.content_sha256
+            && explanation.shard_id == shard.shard.shard_id()
+            && explanation.source_kind == shard.source_kind
+            && explanation.source_id == shard.source_id
+        {
+            activation = Some(explanation);
+            break;
+        }
+    }
+    Ok(SemanticModelProvenance {
         active_model_set_hash: active.active_model_set_hash().to_string(),
         pack_digest: shard.manifest.semantic_sha256.clone(),
         pack_id: shard.manifest.pack_id.clone(),
@@ -5946,7 +6052,7 @@ fn provenance(
             Completeness::Complete => SemanticModelCompleteness::Complete,
         },
         ambiguous,
-    }
+    })
 }
 
 fn origin(shard: &ActiveSemanticModelShard, locator: Option<&Locator>) -> SemanticModelOriginKind {
@@ -6522,6 +6628,7 @@ pub(crate) mod tests {
     /// name one.
     fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
         SemanticModelSymbol {
+            jvm_owner_family_enumerated: false,
             non_overridable: None,
             ambient_use: None,
             id: format!("type.{qualified_name}"),
@@ -6760,6 +6867,7 @@ pub(crate) mod tests {
         signature: Option<Signature>,
     ) -> SemanticModelSymbol {
         let mut symbol = SemanticModelSymbol {
+            jvm_owner_family_enumerated: false,
             non_overridable: None,
             ambient_use: None,
             id: id.to_string(),

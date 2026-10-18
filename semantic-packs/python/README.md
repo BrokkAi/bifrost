@@ -23,8 +23,12 @@ typeshed revision.
 ## The pinned slice
 
 `typeshed-stdlib-2026.8.31.json` pins typeshed revision
-`1620e225476597f34177351ef913dc8390dade30` and lists 63 stub files. The
-slice is deliberately bounded to common runtime and standard-library surfaces:
+`1620e225476597f34177351ef913dc8390dade30` and lists the 212-file local import
+closure of its original 63 seed stubs. This retained recipe mirrors the
+reviewed [public pack change](https://github.com/BrokkAi/bifrost-packs/pull/44);
+future product authoring belongs in that repository. Generation records every
+loaded input in the manifest. The original seed slice is deliberately bounded
+to the following common runtime and standard-library surfaces:
 
 | Module | Pinned stub files |
 | --- | --- |

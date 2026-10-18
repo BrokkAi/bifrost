@@ -18,6 +18,11 @@ python3 scripts/public/generate-cache-schema.py
 python3 scripts/public/generate-cache-schema.py --check
 ```
 
+Regeneration verifies the SQL artifacts; it does not update Rust's pinned
+`CURRENT_SCHEMA_OBJECTS_SHA256`. Move that constant with the migration and
+verify `cache_db::tests::current_schema_digest_matches_the_baseline_chain`
+as well, so fresh-store and upgrade validation accept the generated schema.
+
 Keep the generator's baseline and current version constants in sync with
 `cache_db.rs`. Never edit a released migration and never add a down migration.
 A comment-only edit to the baseline is the one exception (owner decision,
@@ -193,3 +198,41 @@ members without relying on a source CodeUnit's display name.
 Migration `0179-generic-formal-defaults.sql` adds owner/position/default-slot
 rows and their publication count. Rust impl patterns reuse ordinary written
 type-application argument rows, including pointer/reference deltas.
+
+Migration `0182-summary-profile-validity.sql` keys shared unit-summary intervals
+by context profile. Go reconciliation can now retain inventory and tool
+summaries at the same workspace revision. It invalidates pre-upgrade Go
+intervals for normal reconciliation to rebind, preserves other languages'
+intervals, and extends Rust's foreign key with its singleton zero profile.
+
+Migration `0183-go-struct-field-tags.sql` publishes byte-exact decoded Go struct
+tags beside ordered field names, types and embeddedness. The Go extraction,
+context and summary identities rebuild older field inventories. The nullable
+column preserves publication format 1 and its matching blob requirement.
+
+Migration `0184-rust-macro-input-cfg.sql` retains each macro input's effective
+source cfg predicate, including ordered cfg_if arm guards. Selected contexts
+discharge only proven-inactive frontiers; migrated inputs default to unknown
+until the Rust source epoch forces a fresh publication.
+
+Migration `0185-static-type-object-transfers.sql` preserves transfer rows and
+both indexes while admitting value-transform code 8. StaticTypeObject converts
+a runtime operand to the type object of its static type; Java qualified creation
+uses that qualifier separately from its enclosing runtime instance.
+
+Migration numbers are increasing, not necessarily contiguous. The generator
+permits gaps in its numbered forward files, matching the runtime registry, so
+an independently allocated later migration does not invent a placeholder for
+another lane. Register each file in `POST_BASELINE_MIGRATIONS` as usual; the
+cache schema parity tests compare that registry with the generated snapshot.
+
+Migration `0187-rust-crate-public-module-reachability.sql` records the
+canonical target modules exposed by a completed crate topology's fully public,
+unambiguous module paths. The composite primary key deduplicates multiple
+public aliases and supports exact membership proofs by topology, crate key,
+and module path.
+
+Migration `0188-declaration-access-boundaries.sql` stores explicit package and
+lexical-template access regions as normalized source declaration rows. The native
+bridge view exposes the canonical template owner, while publication manifests
+and validation retain the boundary family alongside coarse visibility.

@@ -1,5 +1,8 @@
 //! On-demand, typed Python rule facts projected from one exact query input.
 
+use super::python_class_hierarchy::{
+    HierarchyDecision, hierarchy_premise, member_premise, override_premise,
+};
 use super::*;
 use crate::analyzer::semantic::{
     CandidateCoverage, ControlEdgeKind, LengthDelimitedDigest, SemanticCapability, SemanticEffect,
@@ -47,6 +50,7 @@ const MAX_PYTHON_TUPLE_RETURN_ARITIES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub(super) struct PythonRuleFactValue {
+    pub(super) hierarchy_premises: Vec<PythonHierarchyFactValue>,
     pub(super) file: ProjectFile,
     pub(super) anchor: Range,
     pub(super) row: CodeQueryPythonRuleFact,
@@ -125,6 +129,7 @@ pub(super) fn make_row(
         digest.push(owner_id.as_bytes());
     }
     PythonRuleFactValue {
+        hierarchy_premises: Vec::new(),
         file: file.clone(),
         anchor: Range {
             start_byte: anchor.start,
@@ -371,55 +376,66 @@ fn python_class_test_scope(
     file: &ProjectFile,
     source: &str,
     class: Node<'_>,
-) -> PythonTestScope {
-    if python_class_directly_extends_unittest_test_case(class, source) {
-        return PythonTestScope::Yes;
-    }
-    let Some(name) = class.child_by_field_name("name") else {
-        return PythonTestScope::Unknown;
-    };
-    let Some(definition) = resolve_identifier(analyzer, file, source, name, None) else {
-        return PythonTestScope::Unknown;
-    };
-    if definition.status != DefinitionLookupStatus::Resolved {
-        return PythonTestScope::Unknown;
-    }
-    let [unit] = definition.definitions.as_slice() else {
-        return PythonTestScope::Unknown;
-    };
-    if !unit.is_class() {
-        return PythonTestScope::Unknown;
-    }
-    let Some(provider) = analyzer.python_class_hierarchy_provider_for(unit) else {
-        return PythonTestScope::Unknown;
-    };
-    let hierarchy = provider.class_hierarchy(unit, None);
-    if hierarchy.outcome != PythonHierarchyOutcome::Complete {
-        return PythonTestScope::Unknown;
-    }
-    for ancestor in &hierarchy.mro {
-        let fqn = ancestor.fq_name_str();
-        if matches!(fqn, "unittest.TestCase" | "unittest.case.TestCase") {
+) -> HierarchyDecision<PythonTestScope> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        if python_class_directly_extends_unittest_test_case(class, source) {
             return PythonTestScope::Yes;
         }
-        let Some(ancestor_source) =
-            analyzer.get_source(&CodeUnit::file_scope(ancestor.source().clone()), false)
-        else {
-            continue;
-        };
-        let Some(tree) =
-            parse_python(&ancestor_source).filter(|tree| !tree.root_node().has_error())
-        else {
+        let Some(name) = class.child_by_field_name("name") else {
             return PythonTestScope::Unknown;
         };
-        let Some(ancestor_class) = python_class_node_for_unit(analyzer, ancestor, &tree) else {
+        let Some(definition) = resolve_identifier(analyzer, file, source, name, None) else {
             return PythonTestScope::Unknown;
         };
-        if python_class_directly_extends_unittest_test_case(ancestor_class, &ancestor_source) {
-            return PythonTestScope::Yes;
+        if definition.status != DefinitionLookupStatus::Resolved {
+            return PythonTestScope::Unknown;
         }
-    }
-    PythonTestScope::No
+        let [unit] = definition.definitions.as_slice() else {
+            return PythonTestScope::Unknown;
+        };
+        if !unit.is_class() {
+            return PythonTestScope::Unknown;
+        }
+        let Some(provider) = analyzer.python_class_hierarchy_provider_for(unit) else {
+            return PythonTestScope::Unknown;
+        };
+        let hierarchy = provider.class_hierarchy(unit, None);
+        let Some(premise) = hierarchy_premise(analyzer, unit, &hierarchy) else {
+            return PythonTestScope::Unknown;
+        };
+        premises.push(premise);
+        if hierarchy.outcome != PythonHierarchyOutcome::Complete {
+            return PythonTestScope::Unknown;
+        }
+        for ancestor in &hierarchy.mro {
+            let fqn = ancestor.qualified_name();
+            if matches!(fqn, "unittest.TestCase" | "unittest.case.TestCase") {
+                return PythonTestScope::Yes;
+            }
+            let ClassIdentity::Workspace(ancestor) = ancestor else {
+                continue;
+            };
+            let Some(ancestor_source) =
+                analyzer.get_source(&CodeUnit::file_scope(ancestor.source().clone()), false)
+            else {
+                continue;
+            };
+            let Some(tree) =
+                parse_python(&ancestor_source).filter(|tree| !tree.root_node().has_error())
+            else {
+                return PythonTestScope::Unknown;
+            };
+            let Some(ancestor_class) = python_class_node_for_unit(analyzer, ancestor, &tree) else {
+                return PythonTestScope::Unknown;
+            };
+            if python_class_directly_extends_unittest_test_case(ancestor_class, &ancestor_source) {
+                return PythonTestScope::Yes;
+            }
+        }
+        PythonTestScope::No
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn python_function_is_test(function: Node<'_>, source: &str) -> bool {
@@ -435,37 +451,45 @@ fn python_assertion_test_scope(
     source: &str,
     root: Node<'_>,
     assertion: Node<'_>,
-) -> PythonTestScope {
-    let imports = python_test_imports(root, source);
-    let fallback_file = file
-        .rel_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("test_") && name.ends_with(".py"));
-    let mut current = Some(assertion);
-    let mut unknown_class = false;
-    while let Some(node) = current {
-        match node.kind() {
-            "class_definition" => match python_class_test_scope(analyzer, file, source, node) {
-                PythonTestScope::Yes => return PythonTestScope::Yes,
-                PythonTestScope::Unknown => unknown_class = true,
-                PythonTestScope::No => {}
-            },
-            "function_definition"
-                if python_function_is_test(node, source)
-                    && (imports.pytest_or_nose || fallback_file) =>
-            {
-                return PythonTestScope::Yes;
+) -> HierarchyDecision<PythonTestScope> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let imports = python_test_imports(root, source);
+        let fallback_file = file
+            .rel_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("test_") && name.ends_with(".py"));
+        let mut current = Some(assertion);
+        let mut unknown_class = false;
+        while let Some(node) = current {
+            match node.kind() {
+                "class_definition" => {
+                    let decision = python_class_test_scope(analyzer, file, source, node);
+                    premises.extend(decision.premises);
+                    match decision.value {
+                        PythonTestScope::Yes => return PythonTestScope::Yes,
+                        PythonTestScope::Unknown => unknown_class = true,
+                        PythonTestScope::No => {}
+                    }
+                }
+                "function_definition"
+                    if python_function_is_test(node, source)
+                        && (imports.pytest_or_nose || fallback_file) =>
+                {
+                    return PythonTestScope::Yes;
+                }
+                _ => {}
             }
-            _ => {}
+            current = node.parent();
         }
-        current = node.parent();
-    }
-    if unknown_class {
-        PythonTestScope::Unknown
-    } else {
-        PythonTestScope::No
-    }
+        if unknown_class {
+            PythonTestScope::Unknown
+        } else {
+            PythonTestScope::No
+        }
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn python_assertion_is_terminal_elif_else(assertion: Node<'_>) -> bool {
@@ -523,6 +547,8 @@ pub(super) fn python_assertion_context_expansions(
     if let Some(assertion) = assertion.filter(|_| !tree.root_node().has_error()) {
         let test_scope =
             python_assertion_test_scope(analyzer, &seed.file, source, tree.root_node(), assertion);
+        fact.hierarchy_premises.extend(test_scope.premises);
+        let test_scope = test_scope.value;
         fact.row.test_scope = Some(match test_scope {
             PythonTestScope::Yes => "yes",
             PythonTestScope::No => "no",
@@ -1352,69 +1378,87 @@ fn python_method_needs_docstring(
     analyzer: &dyn IAnalyzer,
     start: &CodeUnit,
     cancellation: Option<&CancellationToken>,
-) -> Result<bool, &'static str> {
-    let Some(provider) = analyzer.python_class_hierarchy_provider_for(start) else {
-        return Err("python_hierarchy_provider_unavailable");
-    };
-    let mut current = start.clone();
-    let mut visited = HashSet::default();
-    loop {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err("cancelled");
-        }
-        if !visited.insert(current.clone()) {
-            return Err("override_cycle");
-        }
-        let range =
-            python_range_for_unit(analyzer, &current).ok_or("override_range_unavailable")?;
-        let source = analyzer
-            .get_source(&CodeUnit::file_scope(current.source().clone()), false)
-            .ok_or("override_source_unavailable")?;
-        let tree = parse_python(&source).ok_or("override_syntax_unavailable")?;
-        if tree.root_node().has_error() {
-            return Err("override_syntax_recovered");
-        }
-        let definition = python_definition_node(&tree, &current, &range)
-            .ok_or("override_definition_unavailable")?;
-        let needs_docstring = python_function_intrinsic_needs_docstring(definition, &source)?;
-        if !needs_docstring {
-            return Ok(false);
-        }
-        let answer = provider.method_override(&current, cancellation);
-        match answer.outcome {
-            PythonOverrideOutcome::NoOverride => return Ok(true),
-            PythonOverrideOutcome::Overrides => {
-                let target = answer.target.ok_or("override_target_unavailable")?;
-                current = target;
+) -> HierarchyDecision<Result<bool, &'static str>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let Some(provider) = analyzer.python_class_hierarchy_provider_for(start) else {
+            return Err("python_hierarchy_provider_unavailable");
+        };
+        let mut current = start.clone();
+        let mut visited = HashSet::default();
+        loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err("cancelled");
             }
-            PythonOverrideOutcome::Incomplete | PythonOverrideOutcome::Unsupported => {
-                return Err("override_resolution_incomplete");
+            if !visited.insert(current.clone()) {
+                return Err("override_cycle");
+            }
+            let range =
+                python_range_for_unit(analyzer, &current).ok_or("override_range_unavailable")?;
+            let source = analyzer
+                .get_source(&CodeUnit::file_scope(current.source().clone()), false)
+                .ok_or("override_source_unavailable")?;
+            let tree = parse_python(&source).ok_or("override_syntax_unavailable")?;
+            if tree.root_node().has_error() {
+                return Err("override_syntax_recovered");
+            }
+            let definition = python_definition_node(&tree, &current, &range)
+                .ok_or("override_definition_unavailable")?;
+            let needs_docstring = python_function_intrinsic_needs_docstring(definition, &source)?;
+            if !needs_docstring {
+                return Ok(false);
+            }
+            let answer = provider.method_override(&current, cancellation);
+            premises.push(
+                override_premise(analyzer, &current, &answer)
+                    .ok_or("override_premise_anchor_unavailable")?,
+            );
+            match answer.outcome {
+                PythonOverrideOutcome::NoOverride => return Ok(true),
+                PythonOverrideOutcome::Overrides => {
+                    let target = answer.target.ok_or("override_target_unavailable")?;
+                    current = target;
+                }
+                PythonOverrideOutcome::Incomplete | PythonOverrideOutcome::Unsupported => {
+                    return Err("override_resolution_incomplete");
+                }
             }
         }
-    }
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn python_method_override_answer(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     cancellation: Option<&CancellationToken>,
-) -> Result<Option<PythonOverrideAnswer>, &'static str> {
-    if !analyzer
-        .parent_of(unit)
-        .is_some_and(|parent| parent.is_class())
-    {
-        return Ok(None);
-    }
-    let Some(provider) = analyzer.python_class_hierarchy_provider_for(unit) else {
-        return Err("python_hierarchy_provider_unavailable");
-    };
-    let answer = provider.method_override(unit, cancellation);
-    match answer.outcome {
-        PythonOverrideOutcome::Overrides | PythonOverrideOutcome::NoOverride => Ok(Some(answer)),
-        PythonOverrideOutcome::Incomplete | PythonOverrideOutcome::Unsupported => {
-            Err("override_resolution_incomplete")
+) -> HierarchyDecision<Result<Option<PythonOverrideAnswer>, &'static str>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        if !analyzer
+            .parent_of(unit)
+            .is_some_and(|parent| parent.is_class())
+        {
+            return Ok(None);
         }
-    }
+        let Some(provider) = analyzer.python_class_hierarchy_provider_for(unit) else {
+            return Err("python_hierarchy_provider_unavailable");
+        };
+        let answer = provider.method_override(unit, cancellation);
+        premises.push(
+            override_premise(analyzer, unit, &answer)
+                .ok_or("override_premise_anchor_unavailable")?,
+        );
+        match answer.outcome {
+            PythonOverrideOutcome::Overrides | PythonOverrideOutcome::NoOverride => {
+                Ok(Some(answer))
+            }
+            PythonOverrideOutcome::Incomplete | PythonOverrideOutcome::Unsupported => {
+                Err("override_resolution_incomplete")
+            }
+        }
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn report_rule_fact_incomplete(
@@ -1550,8 +1594,10 @@ pub(super) fn documentation_expansions(
     let override_answer = if unit.is_function() {
         python_method_override_answer(analyzer, unit, cancellation)
     } else {
-        Ok(None)
+        HierarchyDecision::plain(Ok(None))
     };
+    let mut hierarchy_premises = override_answer.premises;
+    let override_answer = override_answer.value;
     let is_override = if unit.is_function() {
         match &override_answer {
             Ok(Some(answer)) => Some(answer.outcome == PythonOverrideOutcome::Overrides),
@@ -1613,6 +1659,7 @@ pub(super) fn documentation_expansions(
                             false,
                             Some("override_target_unavailable".to_string()),
                         );
+                        fact.hierarchy_premises = hierarchy_premises;
                         fact.row.scope_is_public = Some(public);
                         fact.row.docstring_present = docstring_present;
                         fact.row.docstring_value = docstring_value;
@@ -1624,7 +1671,9 @@ pub(super) fn documentation_expansions(
                             fact,
                         )))];
                     };
-                    match python_method_needs_docstring(analyzer, target, cancellation) {
+                    let inherited = python_method_needs_docstring(analyzer, target, cancellation);
+                    hierarchy_premises.extend(inherited.premises);
+                    match inherited.value {
                         Ok(base_needs_docstring) => {
                             needs_docstring = base_needs_docstring;
                         }
@@ -1661,6 +1710,7 @@ pub(super) fn documentation_expansions(
         complete,
         reason.map(|reason| format!("{PYTHON_DOCUMENTATION_REASON}: {reason}")),
     );
+    fact.hierarchy_premises = hierarchy_premises;
     fact.row.scope_is_public = Some(public);
     fact.row.docstring_present = docstring_present;
     fact.row.docstring_value = docstring_value;
@@ -1954,6 +2004,7 @@ pub(super) fn overly_complex_delete_expansions(
     let anchor = declaration.range.start_byte..declaration.range.end_byte;
     let source = analyzer.get_source(&CodeUnit::file_scope(file.clone()), false);
     let mut reason = None;
+    let mut hierarchy_premises = Vec::new();
     let complexity = match source.as_deref() {
         None => {
             reason = Some("source_unavailable");
@@ -1986,7 +2037,7 @@ pub(super) fn overly_complex_delete_expansions(
                 reason = Some("recovered_python_syntax");
                 None
             } else if let Some(procedure) = procedures.first().filter(|_| procedures.len() == 1) {
-                match python_destructor_complexity(
+                let complexity = python_destructor_complexity(
                     analyzer,
                     environment_cache,
                     PythonDestructorComplexityInput {
@@ -2001,7 +2052,9 @@ pub(super) fn overly_complex_delete_expansions(
                         diagnostics,
                         cancellation,
                     },
-                ) {
+                );
+                hierarchy_premises.extend(complexity.premises);
+                match complexity.value {
                     Ok(complexity) => Some(complexity),
                     Err(incomplete_reason) => {
                         reason = Some(incomplete_reason);
@@ -2029,6 +2082,7 @@ pub(super) fn overly_complex_delete_expansions(
         complete,
         reason.map(|reason| format!("{PYTHON_COMPLEX_DELETE_REASON}_{reason}")),
     );
+    fact.hierarchy_premises = hierarchy_premises;
     fact.row.cyclomatic_complexity = complexity;
     if !complete {
         report_rule_fact_incomplete(
@@ -2060,197 +2114,204 @@ fn python_destructor_complexity<'a, 'workspace>(
     analyzer: &dyn IAnalyzer,
     environment_cache: &mut super::environment::EnvironmentTraversalCache,
     input: PythonDestructorComplexityInput<'a, 'workspace>,
-) -> Result<usize, &'static str> {
-    let PythonDestructorComplexityInput {
-        file,
-        source,
-        tree,
-        unit,
-        declaration_range,
-        procedure,
-        semantic,
-        bindings,
-        diagnostics,
-        cancellation,
-    } = input;
-    if procedure.exact_selection_incomplete_reason().is_some() {
-        return Err("procedure_selection_incomplete");
-    }
-    let semantics = procedure.handle.semantics();
-    let capabilities = procedure.handle.artifact().capabilities();
-    if !capabilities.is_complete(SemanticCapability::BasicBlocks)
-        || !capabilities.is_complete(SemanticCapability::ProgramPoints)
-        || !capabilities.is_complete(SemanticCapability::EntryBoundary)
-    {
-        return Err("cfg_structure_incomplete");
-    }
-    let method =
-        python_definition_node(tree, unit, declaration_range).ok_or("method_syntax_unavailable")?;
-    let pruned_edges = python_unlikely_exception_edges(
-        analyzer,
-        environment_cache,
-        file,
-        source,
-        method,
-        semantics,
-        cancellation,
-    )?;
-    let pruned_edges = python_unlikely_call_edges(
-        analyzer,
-        environment_cache,
-        semantic,
-        bindings,
-        file,
-        source,
-        method,
-        semantics,
-        cancellation,
-        diagnostics,
-        pruned_edges,
-    )?;
-    let constant_branches = python_constant_branch_edges(source, tree.root_node(), semantics);
+) -> HierarchyDecision<Result<usize, &'static str>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let PythonDestructorComplexityInput {
+            file,
+            source,
+            tree,
+            unit,
+            declaration_range,
+            procedure,
+            semantic,
+            bindings,
+            diagnostics,
+            cancellation,
+        } = input;
+        if procedure.exact_selection_incomplete_reason().is_some() {
+            return Err("procedure_selection_incomplete");
+        }
+        let semantics = procedure.handle.semantics();
+        let capabilities = procedure.handle.artifact().capabilities();
+        if !capabilities.is_complete(SemanticCapability::BasicBlocks)
+            || !capabilities.is_complete(SemanticCapability::ProgramPoints)
+            || !capabilities.is_complete(SemanticCapability::EntryBoundary)
+        {
+            return Err("cfg_structure_incomplete");
+        }
+        let method = python_definition_node(tree, unit, declaration_range)
+            .ok_or("method_syntax_unavailable")?;
+        let pruned_edges = python_unlikely_exception_edges(
+            analyzer,
+            environment_cache,
+            file,
+            source,
+            method,
+            semantics,
+            cancellation,
+        );
+        premises.extend(pruned_edges.premises);
+        let pruned_edges = pruned_edges.value?;
+        let pruned_edges = python_unlikely_call_edges(
+            analyzer,
+            environment_cache,
+            semantic,
+            bindings,
+            file,
+            source,
+            method,
+            semantics,
+            cancellation,
+            diagnostics,
+            pruned_edges,
+        )?;
+        let constant_branches = python_constant_branch_edges(source, tree.root_node(), semantics);
 
-    let blocks = semantics.blocks();
-    let points = semantics.points();
-    let Some(entry) = semantics.point(semantics.entry_point()) else {
-        return Err("entry_point_unavailable");
-    };
-    let mut reachable_blocks = vec![false; blocks.len()];
-    let mut reachable_points = vec![false; points.len()];
-    let mut pending = vec![entry.block.index()];
-    let mut edges = HashSet::default();
-    while let Some(block_index) = pending.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err("cancelled");
-        }
-        let Some(block) = blocks.get(block_index) else {
-            return Err("block_identity_unavailable");
+        let blocks = semantics.blocks();
+        let points = semantics.points();
+        let Some(entry) = semantics.point(semantics.entry_point()) else {
+            return Err("entry_point_unavailable");
         };
-        if std::mem::replace(&mut reachable_blocks[block_index], true) {
-            continue;
-        }
-        let Some(block_evidence) = semantics.evidence_row(block.evidence) else {
-            return Err("block_evidence_unavailable");
-        };
-        if !matches!(
-            block_evidence.proof,
-            crate::analyzer::semantic::ProofStatus::Proven
-        ) || !matches!(
-            block_evidence.completeness,
-            crate::analyzer::semantic::EvidenceCompleteness::Complete
-        ) {
-            return Err("block_evidence_incomplete");
-        }
-        for point_id in block.points.iter().copied() {
-            let Some(point) = semantics.point(point_id) else {
-                return Err("program_point_unavailable");
+        let mut reachable_blocks = vec![false; blocks.len()];
+        let mut reachable_points = vec![false; points.len()];
+        let mut pending = vec![entry.block.index()];
+        let mut edges = HashSet::default();
+        while let Some(block_index) = pending.pop() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err("cancelled");
+            }
+            let Some(block) = blocks.get(block_index) else {
+                return Err("block_identity_unavailable");
             };
-            reachable_points[point_id.index()] = true;
-            let Some(point_evidence) = semantics.evidence_row(point.evidence) else {
-                return Err("program_point_evidence_unavailable");
+            if std::mem::replace(&mut reachable_blocks[block_index], true) {
+                continue;
+            }
+            let Some(block_evidence) = semantics.evidence_row(block.evidence) else {
+                return Err("block_evidence_unavailable");
             };
             if !matches!(
-                point_evidence.proof,
+                block_evidence.proof,
                 crate::analyzer::semantic::ProofStatus::Proven
             ) || !matches!(
-                point_evidence.completeness,
+                block_evidence.completeness,
                 crate::analyzer::semantic::EvidenceCompleteness::Complete
             ) {
-                return Err("program_point_evidence_incomplete");
+                return Err("block_evidence_incomplete");
             }
-            for (_, edge) in semantics.successor_edges(point_id) {
-                let Some(edge_evidence) = semantics.evidence_row(edge.evidence) else {
-                    return Err("control_edge_evidence_unavailable");
+            for point_id in block.points.iter().copied() {
+                let Some(point) = semantics.point(point_id) else {
+                    return Err("program_point_unavailable");
+                };
+                reachable_points[point_id.index()] = true;
+                let Some(point_evidence) = semantics.evidence_row(point.evidence) else {
+                    return Err("program_point_evidence_unavailable");
                 };
                 if !matches!(
-                    edge_evidence.proof,
+                    point_evidence.proof,
                     crate::analyzer::semantic::ProofStatus::Proven
                 ) || !matches!(
-                    edge_evidence.completeness,
+                    point_evidence.completeness,
                     crate::analyzer::semantic::EvidenceCompleteness::Complete
                 ) {
-                    return Err("control_edge_evidence_incomplete");
+                    return Err("program_point_evidence_incomplete");
                 }
-                if edge.kind == ControlEdgeKind::Exceptional
-                    && edge.target_point == semantics.exceptional_exit_point()
-                {
-                    continue;
-                }
-                if pruned_edges.contains(&(
-                    edge.source_point.index(),
-                    edge.target_point.index(),
-                    edge.kind,
-                )) {
-                    continue;
-                }
-                if constant_branches.contains(&(
-                    edge.source_point.index(),
-                    edge.target_point.index(),
-                    edge.kind,
-                )) {
-                    continue;
-                }
-                let Some(target) = semantics.point(edge.target_point) else {
-                    return Err("control_edge_target_unavailable");
-                };
-                let target_block = target.block.index();
-                let sequential = target_block == block_index
-                    && block
-                        .points
-                        .windows(2)
-                        .any(|pair| pair[0] == edge.source_point && pair[1] == edge.target_point);
-                if !sequential {
-                    edges.insert((block_index, target_block));
-                    pending.push(target_block);
+                for (_, edge) in semantics.successor_edges(point_id) {
+                    let Some(edge_evidence) = semantics.evidence_row(edge.evidence) else {
+                        return Err("control_edge_evidence_unavailable");
+                    };
+                    if !matches!(
+                        edge_evidence.proof,
+                        crate::analyzer::semantic::ProofStatus::Proven
+                    ) || !matches!(
+                        edge_evidence.completeness,
+                        crate::analyzer::semantic::EvidenceCompleteness::Complete
+                    ) {
+                        return Err("control_edge_evidence_incomplete");
+                    }
+                    if edge.kind == ControlEdgeKind::Exceptional
+                        && edge.target_point == semantics.exceptional_exit_point()
+                    {
+                        continue;
+                    }
+                    if pruned_edges.contains(&(
+                        edge.source_point.index(),
+                        edge.target_point.index(),
+                        edge.kind,
+                    )) {
+                        continue;
+                    }
+                    if constant_branches.contains(&(
+                        edge.source_point.index(),
+                        edge.target_point.index(),
+                        edge.kind,
+                    )) {
+                        continue;
+                    }
+                    let Some(target) = semantics.point(edge.target_point) else {
+                        return Err("control_edge_target_unavailable");
+                    };
+                    let target_block = target.block.index();
+                    let sequential = target_block == block_index
+                        && block.points.windows(2).any(|pair| {
+                            pair[0] == edge.source_point && pair[1] == edge.target_point
+                        });
+                    if !sequential {
+                        edges.insert((block_index, target_block));
+                        pending.push(target_block);
+                    }
                 }
             }
         }
-    }
 
-    for gap in semantics.gaps() {
-        if !reachable_points
-            .get(gap.point.index())
-            .copied()
-            .unwrap_or(false)
-            || !matches!(
-                gap.capability,
-                SemanticCapability::NormalControlFlow
-                    | SemanticCapability::ExceptionalControlFlow
-                    | SemanticCapability::CleanupControlFlow
-                    | SemanticCapability::NonLocalControl
-                    | SemanticCapability::NormalCallContinuation
-                    | SemanticCapability::ExceptionalCallContinuation
-                    | SemanticCapability::GeneratorSuspension
-                    | SemanticCapability::AsyncSuspendResume
-                    | SemanticCapability::DeferredExecution
-            )
-        {
-            continue;
+        for gap in semantics.gaps() {
+            if !reachable_points
+                .get(gap.point.index())
+                .copied()
+                .unwrap_or(false)
+                || !matches!(
+                    gap.capability,
+                    SemanticCapability::NormalControlFlow
+                        | SemanticCapability::ExceptionalControlFlow
+                        | SemanticCapability::CleanupControlFlow
+                        | SemanticCapability::NonLocalControl
+                        | SemanticCapability::NormalCallContinuation
+                        | SemanticCapability::ExceptionalCallContinuation
+                        | SemanticCapability::GeneratorSuspension
+                        | SemanticCapability::AsyncSuspendResume
+                        | SemanticCapability::DeferredExecution
+                )
+            {
+                continue;
+            }
+            if gap.kind == SemanticGapKind::ExceededBudget
+                || gap.discharge != SemanticGapDischarge::RetainedControlTopology
+            {
+                return Err("control_flow_gap");
+            }
         }
-        if gap.kind == SemanticGapKind::ExceededBudget
-            || gap.discharge != SemanticGapDischarge::RetainedControlTopology
-        {
-            return Err("control_flow_gap");
-        }
-    }
 
-    let node_count = reachable_blocks
-        .iter()
-        .filter(|reachable| **reachable)
-        .count();
-    assert!(node_count > 0, "a procedure entry belongs to a basic block");
-    assert!(
-        edges.len().saturating_add(1) >= node_count,
-        "entry-reachable basic blocks form a connected control-flow graph"
-    );
-    Ok(edges.len().saturating_add(2).saturating_sub(node_count))
+        let node_count = reachable_blocks
+            .iter()
+            .filter(|reachable| **reachable)
+            .count();
+        assert!(node_count > 0, "a procedure entry belongs to a basic block");
+        assert!(
+            edges.len().saturating_add(1) >= node_count,
+            "entry-reachable basic blocks form a connected control-flow graph"
+        );
+        Ok(edges.len().saturating_add(2).saturating_sub(node_count))
+    })();
+    HierarchyDecision { value, premises }
 }
+
+type PrunedControlEdgeKey = (usize, usize, ControlEdgeKind);
 
 fn python_constant_branch_edges(
     source: &str,
     root: Node<'_>,
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
-) -> HashSet<(usize, usize, ControlEdgeKind)> {
+) -> HashSet<PrunedControlEdgeKey> {
     let mut pruned = HashSet::default();
     for point in semantics.points() {
         let Some(span) = semantic_mapping_span(semantics, point.source) else {
@@ -2367,163 +2428,176 @@ fn python_unlikely_exception_edges(
     method: Node<'_>,
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     cancellation: Option<&CancellationToken>,
-) -> Result<HashSet<(usize, usize, ControlEdgeKind)>, &'static str> {
-    let Some(body) = method.child_by_field_name("body") else {
-        return Ok(HashSet::default());
-    };
-    let mut pruned = HashSet::default();
-    let mut pending = vec![body];
-    while let Some(node) = pending.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err("cancelled");
-        }
-        if node.id() != body.id()
-            && matches!(
-                node.kind(),
-                "function_definition" | "lambda" | "class_definition"
-            )
-        {
-            continue;
-        }
-        if node.kind() == "try_statement" {
-            let clauses = named_children(node)
-                .into_iter()
-                .filter(|child| child.kind() == "except_clause")
-                .collect::<Vec<_>>();
-            if named_children(node)
-                .iter()
-                .any(|child| child.kind() == "except_group_clause")
-            {
-                return Err("exception_group_handler_unsupported");
+) -> HierarchyDecision<Result<HashSet<PrunedControlEdgeKey>, &'static str>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let Some(body) = method.child_by_field_name("body") else {
+            return Ok(HashSet::default());
+        };
+        let mut pruned = HashSet::default();
+        let mut pending = vec![body];
+        while let Some(node) = pending.pop() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err("cancelled");
             }
-            if !clauses.is_empty() {
-                let selected_handler = python_single_raise_try_body(node)
-                    .filter(|raise| python_raise_has_semantic_throw(*raise, semantics))
-                    .and_then(|raise| {
-                        python_legal_raised_class(
+            if node.id() != body.id()
+                && matches!(
+                    node.kind(),
+                    "function_definition" | "lambda" | "class_definition"
+                )
+            {
+                continue;
+            }
+            if node.kind() == "try_statement" {
+                let clauses = named_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() == "except_clause")
+                    .collect::<Vec<_>>();
+                if named_children(node)
+                    .iter()
+                    .any(|child| child.kind() == "except_group_clause")
+                {
+                    return Err("exception_group_handler_unsupported");
+                }
+                if !clauses.is_empty() {
+                    let selected_handler = if let Some(raise) = python_single_raise_try_body(node)
+                        .filter(|raise| python_raise_has_semantic_throw(*raise, semantics))
+                    {
+                        let raised = python_legal_raised_class(
                             analyzer,
                             environment_cache,
                             file,
                             source,
                             raise,
                             cancellation,
-                        )
-                    })
-                    .and_then(|raised_class| {
-                        python_first_matching_handler(
-                            analyzer,
-                            environment_cache,
-                            file,
-                            source,
-                            node,
-                            &raised_class,
-                            cancellation,
-                        )
-                    });
-                let try_span = (node.start_byte() as u32, node.end_byte() as u32);
-                for point in semantics.points() {
-                    if semantic_mapping_span(semantics, point.source) != Some(try_span) {
-                        continue;
-                    }
-                    let outgoing = semantics
-                        .successor_edges(point.id)
-                        .map(|(_, edge)| edge)
-                        .collect::<Vec<_>>();
-                    let switch_edges = outgoing
-                        .iter()
-                        .copied()
-                        .filter(|edge| edge.kind == ControlEdgeKind::SwitchCase)
-                        .collect::<Vec<_>>();
-                    let unmatched_edges = outgoing
-                        .iter()
-                        .copied()
-                        .filter(|edge| {
-                            edge.kind == ControlEdgeKind::Exceptional
-                                && semantic_mapping_span(
-                                    semantics,
-                                    semantics
-                                        .point(edge.target_point)
-                                        .expect("control edge target is validated")
-                                        .source,
-                                ) == Some(try_span)
-                        })
-                        .collect::<Vec<_>>();
-                    if switch_edges.is_empty() && unmatched_edges.is_empty() {
-                        continue;
-                    }
-                    if switch_edges.len() != clauses.len() || unmatched_edges.len() > 1 {
-                        return Err("exception_handler_topology_unavailable");
-                    }
-                    let mut case_ordinals = Vec::with_capacity(switch_edges.len());
-                    for edge in &switch_edges {
-                        let Some(target) = semantics.point(edge.target_point) else {
+                        );
+                        premises.extend(raised.premises);
+                        if let Some(raised_class) = raised.value {
+                            let handler = python_first_matching_handler(
+                                analyzer,
+                                environment_cache,
+                                file,
+                                source,
+                                node,
+                                &raised_class,
+                                cancellation,
+                            );
+                            premises.extend(handler.premises);
+                            handler.value
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let try_span = (node.start_byte() as u32, node.end_byte() as u32);
+                    for point in semantics.points() {
+                        if semantic_mapping_span(semantics, point.source) != Some(try_span) {
+                            continue;
+                        }
+                        let outgoing = semantics
+                            .successor_edges(point.id)
+                            .map(|(_, edge)| edge)
+                            .collect::<Vec<_>>();
+                        let switch_edges = outgoing
+                            .iter()
+                            .copied()
+                            .filter(|edge| edge.kind == ControlEdgeKind::SwitchCase)
+                            .collect::<Vec<_>>();
+                        let unmatched_edges = outgoing
+                            .iter()
+                            .copied()
+                            .filter(|edge| {
+                                edge.kind == ControlEdgeKind::Exceptional
+                                    && semantic_mapping_span(
+                                        semantics,
+                                        semantics
+                                            .point(edge.target_point)
+                                            .expect("control edge target is validated")
+                                            .source,
+                                    ) == Some(try_span)
+                            })
+                            .collect::<Vec<_>>();
+                        if switch_edges.is_empty() && unmatched_edges.is_empty() {
+                            continue;
+                        }
+                        if switch_edges.len() != clauses.len() || unmatched_edges.len() > 1 {
+                            return Err("exception_handler_topology_unavailable");
+                        }
+                        let mut case_ordinals = Vec::with_capacity(switch_edges.len());
+                        for edge in &switch_edges {
+                            let Some(target) = semantics.point(edge.target_point) else {
+                                return Err("exception_handler_mapping_unavailable");
+                            };
+                            let Some(span) = semantic_mapping_span(semantics, target.source) else {
+                                return Err("exception_handler_mapping_unavailable");
+                            };
+                            let Some(ordinal) = clauses.iter().position(|clause| {
+                                (clause.start_byte() as u32, clause.end_byte() as u32) == span
+                            }) else {
+                                return Err("exception_handler_mapping_unavailable");
+                            };
+                            case_ordinals.push(ordinal);
+                        }
+                        if case_ordinals.len() != clauses.len()
+                            || case_ordinals.iter().copied().collect::<HashSet<_>>().len()
+                                != clauses.len()
+                        {
                             return Err("exception_handler_mapping_unavailable");
-                        };
-                        let Some(span) = semantic_mapping_span(semantics, target.source) else {
-                            return Err("exception_handler_mapping_unavailable");
-                        };
-                        let Some(ordinal) = clauses.iter().position(|clause| {
-                            (clause.start_byte() as u32, clause.end_byte() as u32) == span
-                        }) else {
-                            return Err("exception_handler_mapping_unavailable");
-                        };
-                        case_ordinals.push(ordinal);
-                    }
-                    if case_ordinals.len() != clauses.len()
-                        || case_ordinals.iter().copied().collect::<HashSet<_>>().len()
-                            != clauses.len()
-                    {
-                        return Err("exception_handler_mapping_unavailable");
-                    }
-                    for (edge, ordinal) in switch_edges.iter().zip(case_ordinals) {
-                        if selected_handler.is_some_and(|handler| Some(ordinal) != handler) {
+                        }
+                        for (edge, ordinal) in switch_edges.iter().zip(case_ordinals) {
+                            if selected_handler.is_some_and(|handler| Some(ordinal) != handler) {
+                                pruned.insert((
+                                    edge.source_point.index(),
+                                    edge.target_point.index(),
+                                    edge.kind,
+                                ));
+                            }
+                        }
+                        for edge in unmatched_edges {
                             pruned.insert((
                                 edge.source_point.index(),
                                 edge.target_point.index(),
                                 edge.kind,
                             ));
                         }
-                    }
-                    for edge in unmatched_edges {
-                        pruned.insert((
-                            edge.source_point.index(),
-                            edge.target_point.index(),
-                            edge.kind,
-                        ));
-                    }
-                    if selected_handler == Some(None)
-                        && let Some(raise) = python_single_raise_try_body(node)
-                    {
-                        let raise_span = (raise.start_byte() as u32, raise.end_byte() as u32);
-                        for raising_point in semantics.points().iter().filter(|point| {
-                            point.events.iter().any(|event| {
-                                matches!(event.effect, SemanticEffect::Throw { .. })
-                                    && semantic_mapping_span(semantics, event.source)
-                                        == Some(raise_span)
-                            })
-                        }) {
-                            for (_, edge) in semantics.successor_edges(raising_point.id) {
-                                if edge.kind == ControlEdgeKind::Exceptional
-                                    && semantics.point(edge.target_point).is_some_and(|target| {
-                                        semantic_mapping_span(semantics, target.source)
-                                            == Some(try_span)
-                                    })
-                                {
-                                    pruned.insert((
-                                        edge.source_point.index(),
-                                        edge.target_point.index(),
-                                        edge.kind,
-                                    ));
+                        if selected_handler == Some(None)
+                            && let Some(raise) = python_single_raise_try_body(node)
+                        {
+                            let raise_span = (raise.start_byte() as u32, raise.end_byte() as u32);
+                            for raising_point in semantics.points().iter().filter(|point| {
+                                point.events.iter().any(|event| {
+                                    matches!(event.effect, SemanticEffect::Throw { .. })
+                                        && semantic_mapping_span(semantics, event.source)
+                                            == Some(raise_span)
+                                })
+                            }) {
+                                for (_, edge) in semantics.successor_edges(raising_point.id) {
+                                    if edge.kind == ControlEdgeKind::Exceptional
+                                        && semantics.point(edge.target_point).is_some_and(
+                                            |target| {
+                                                semantic_mapping_span(semantics, target.source)
+                                                    == Some(try_span)
+                                            },
+                                        )
+                                    {
+                                        pruned.insert((
+                                            edge.source_point.index(),
+                                            edge.target_point.index(),
+                                            edge.kind,
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            pending.extend(named_children(node).into_iter().rev());
         }
-        pending.extend(named_children(node).into_iter().rev());
-    }
-    Ok(pruned)
+        Ok(pruned)
+    })();
+    HierarchyDecision { value, premises }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2538,8 +2612,8 @@ fn python_unlikely_call_edges(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-    mut pruned: HashSet<(usize, usize, ControlEdgeKind)>,
-) -> Result<HashSet<(usize, usize, ControlEdgeKind)>, &'static str> {
+    mut pruned: HashSet<PrunedControlEdgeKey>,
+) -> Result<HashSet<PrunedControlEdgeKey>, &'static str> {
     for call in semantics.call_sites() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err("cancelled");
@@ -2699,34 +2773,37 @@ fn python_legal_raised_class(
     source: &str,
     raise: Node<'_>,
     cancellation: Option<&CancellationToken>,
-) -> Option<ResolvedExceptionClass> {
-    let operand = unwrap_parenthesized(raise_operand(raise)?)?;
-    let class_node = if operand.kind() == "call" {
-        operand.child_by_field_name("function")?
-    } else {
-        operand
-    };
-    if class_node.kind() != "identifier" {
-        return None;
-    }
-    let class = resolved_exception_class(
-        analyzer,
-        environment_cache,
-        file,
-        source,
-        class_node,
-        cancellation,
-    );
-    (resolved_class_subclass_of_builtin(
-        analyzer,
-        environment_cache,
-        &class,
-        "BaseException",
-        cancellation,
-    )
-    .relation
-        == ExceptionProof::Yes)
-        .then_some(class)
+) -> HierarchyDecision<Option<ResolvedExceptionClass>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let operand = unwrap_parenthesized(raise_operand(raise)?)?;
+        let class_node = if operand.kind() == "call" {
+            operand.child_by_field_name("function")?
+        } else {
+            operand
+        };
+        if class_node.kind() != "identifier" {
+            return None;
+        }
+        let class = resolved_exception_class(
+            analyzer,
+            environment_cache,
+            file,
+            source,
+            class_node,
+            cancellation,
+        );
+        let proof = resolved_class_subclass_of_builtin(
+            analyzer,
+            environment_cache,
+            &class,
+            "BaseException",
+            cancellation,
+        );
+        premises.extend(proof.premises);
+        (proof.relation == ExceptionProof::Yes).then_some(class)
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn python_first_matching_handler(
@@ -2737,60 +2814,65 @@ fn python_first_matching_handler(
     try_statement: Node<'_>,
     raised: &ResolvedExceptionClass,
     cancellation: Option<&CancellationToken>,
-) -> Option<Option<usize>> {
-    let clauses = named_children(try_statement)
-        .into_iter()
-        .filter(|child| child.kind() == "except_clause")
-        .collect::<Vec<_>>();
-    for (index, clause) in clauses.iter().copied().enumerate() {
-        let type_nodes = python_except_type_nodes(clause)?;
-        let Some(type_nodes) = type_nodes else {
-            return Some(Some(index));
-        };
-        let mut matches = false;
-        let mut open = false;
-        for type_node in type_nodes {
-            let caught = resolved_exception_class(
-                analyzer,
-                environment_cache,
-                file,
-                source,
-                type_node,
-                cancellation,
-            );
-            if resolved_class_subclass_of_builtin(
-                analyzer,
-                environment_cache,
-                &caught,
-                "BaseException",
-                cancellation,
-            )
-            .relation
-                != ExceptionProof::Yes
-            {
-                open = true;
-                continue;
+) -> HierarchyDecision<Option<Option<usize>>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let clauses = named_children(try_statement)
+            .into_iter()
+            .filter(|child| child.kind() == "except_clause")
+            .collect::<Vec<_>>();
+        for (index, clause) in clauses.iter().copied().enumerate() {
+            let type_nodes = python_except_type_nodes(clause)?;
+            let Some(type_nodes) = type_nodes else {
+                return Some(Some(index));
+            };
+            let mut matches = false;
+            let mut open = false;
+            for type_node in type_nodes {
+                let caught = resolved_exception_class(
+                    analyzer,
+                    environment_cache,
+                    file,
+                    source,
+                    type_node,
+                    cancellation,
+                );
+                let legality = resolved_class_subclass_of_builtin(
+                    analyzer,
+                    environment_cache,
+                    &caught,
+                    "BaseException",
+                    cancellation,
+                );
+                premises.extend(legality.premises);
+                if legality.relation != ExceptionProof::Yes {
+                    open = true;
+                    continue;
+                }
+                let subclass = python_exception_is_subclass(
+                    analyzer,
+                    environment_cache,
+                    raised,
+                    &caught,
+                    cancellation,
+                );
+                premises.extend(subclass.premises);
+                match subclass.value {
+                    Some(true) => matches = true,
+                    Some(false) => {}
+                    None => open = true,
+                }
             }
-            match python_exception_is_subclass(
-                analyzer,
-                environment_cache,
-                raised,
-                &caught,
-                cancellation,
-            ) {
-                Some(true) => matches = true,
-                Some(false) => {}
-                None => open = true,
+            if open {
+                return None;
+            }
+            if matches {
+                return Some(Some(index));
             }
         }
-        if open {
-            return None;
-        }
-        if matches {
-            return Some(Some(index));
-        }
-    }
-    Some(None)
+        Some(None)
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn python_except_type_nodes(clause: Node<'_>) -> Option<Option<Vec<Node<'_>>>> {
@@ -2860,8 +2942,9 @@ fn python_exception_is_subclass(
     raised: &ResolvedExceptionClass,
     caught: &ResolvedExceptionClass,
     cancellation: Option<&CancellationToken>,
-) -> Option<bool> {
-    match (raised, caught) {
+) -> HierarchyDecision<Option<bool>> {
+    let mut premises = Vec::new();
+    let value = (|| match (raised, caught) {
         (ResolvedExceptionClass::Builtin(raised), ResolvedExceptionClass::Builtin(caught)) => {
             python_builtin_exception_is_subclass(raised, caught)
         }
@@ -2871,19 +2954,23 @@ fn python_exception_is_subclass(
             }
             let provider = analyzer.python_class_hierarchy_provider_for(raised)?;
             let hierarchy = provider.class_hierarchy(raised, cancellation);
-            (hierarchy.outcome == PythonHierarchyOutcome::Complete)
-                .then(|| hierarchy.mro.contains(caught))
+            premises.push(hierarchy_premise(analyzer, raised, &hierarchy)?);
+            (hierarchy.outcome == PythonHierarchyOutcome::Complete).then(|| {
+                hierarchy
+                    .mro
+                    .contains(&ClassIdentity::Workspace(caught.clone()))
+            })
         }
         (ResolvedExceptionClass::Workspace(raised), ResolvedExceptionClass::Builtin(caught)) => {
-            match workspace_class_subclass_of_builtin(
+            let proof = workspace_class_subclass_of_builtin(
                 analyzer,
                 environment_cache,
                 raised,
                 caught,
                 cancellation,
-            )
-            .relation
-            {
+            );
+            premises.extend(proof.premises);
+            match proof.relation {
                 ExceptionProof::Yes => Some(true),
                 ExceptionProof::No => Some(false),
                 ExceptionProof::Open => None,
@@ -2891,7 +2978,8 @@ fn python_exception_is_subclass(
         }
         (ResolvedExceptionClass::Builtin(_), ResolvedExceptionClass::Workspace(_)) => Some(false),
         _ => None,
-    }
+    })();
+    HierarchyDecision { value, premises }
 }
 
 /// Classify the exact Python call parent used by both the generic
@@ -3461,53 +3549,63 @@ fn iterator_protocol_members(
     workspace: Option<&WorkspaceAnalyzer>,
     class: &ClassIdentity,
     cancellation: Option<&CancellationToken>,
-) -> Option<(bool, bool)> {
-    let unit = match class {
-        ClassIdentity::Workspace(unit) => unit,
-        ClassIdentity::External { .. } => {
-            let workspace = workspace?;
-            let adapter =
-                type_flow_adapter(Language::Python).expect("Python supports iterator type flow");
-            let lookup = |member| match adapter.member_lookup(
-                workspace,
-                MemberAccessKind::Load,
-                class,
-                member,
-            ) {
-                MemberLookup::Present(hit)
-                    if hit.dispatch_coverage == CandidateCoverage::Exhaustive =>
-                {
-                    Some(true)
-                }
-                MemberLookup::Absent => Some(false),
-                MemberLookup::Present(_)
-                | MemberLookup::DeclarationAbsent
-                | MemberLookup::Unknown(_) => None,
-            };
-            return Some((lookup("__iter__")?, lookup("__next__")?));
+) -> HierarchyDecision<Option<(bool, bool)>> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let unit = match class {
+            ClassIdentity::Workspace(unit) => unit,
+            ClassIdentity::External { .. } => {
+                let workspace = workspace?;
+                let adapter = type_flow_adapter(Language::Python)
+                    .expect("Python supports iterator type flow");
+                let lookup = |member| match adapter.member_lookup(
+                    workspace,
+                    MemberAccessKind::Load,
+                    class,
+                    member,
+                ) {
+                    MemberLookup::Present(hit)
+                        if hit.dispatch_coverage == CandidateCoverage::Exhaustive =>
+                    {
+                        Some(true)
+                    }
+                    MemberLookup::Absent => Some(false),
+                    MemberLookup::Present(_)
+                    | MemberLookup::DeclarationAbsent
+                    | MemberLookup::Unknown(_) => None,
+                };
+                return Some((lookup("__iter__")?, lookup("__next__")?));
+            }
+            ClassIdentity::Intrinsic { qualified_name } => {
+                // The sole intrinsic root is `builtins.object`, which
+                // implements neither iterator protocol member.
+                debug_assert_eq!(qualified_name.as_ref(), "builtins.object");
+                return Some((false, false));
+            }
+        };
+        let provider = analyzer.python_class_hierarchy_provider_for(unit)?;
+        let answer = provider.mro_members(unit, cancellation);
+        premises.push(member_premise(analyzer, unit, &answer)?);
+        let has_iter = answer
+            .members
+            .iter()
+            .any(|member| member.name == "__iter__");
+        let has_next = answer
+            .members
+            .iter()
+            .any(|member| member.name == "__next__");
+        let has_dynamic_hook = answer
+            .members
+            .iter()
+            .any(|member| matches!(member.name.as_str(), "__getattr__" | "__getattribute__"));
+        if !(has_iter && has_next)
+            && (has_dynamic_hook || answer.outcome != PythonHierarchyOutcome::Complete)
+        {
+            return None;
         }
-    };
-    let provider = analyzer.python_class_hierarchy_provider_for(unit)?;
-    let answer = provider.mro_members(unit, cancellation);
-    if answer.hierarchy.outcome != PythonHierarchyOutcome::Complete {
-        return None;
-    }
-    let has_iter = answer
-        .members
-        .iter()
-        .any(|member| member.name == "__iter__");
-    let has_next = answer
-        .members
-        .iter()
-        .any(|member| member.name == "__next__");
-    let has_dynamic_hook = answer
-        .members
-        .iter()
-        .any(|member| matches!(member.name.as_str(), "__getattr__" | "__getattribute__"));
-    if has_dynamic_hook && !(has_iter && has_next) {
-        return None;
-    }
-    Some((has_iter, has_next))
+        Some((has_iter, has_next))
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn builtin_iterator_protocol_members(name: &str) -> Option<(bool, bool)> {
@@ -3646,14 +3744,25 @@ pub(super) fn iterator_return_protocol_expansions(
             classes
                 .into_iter()
                 .map(|class| {
-                    iterator_protocol_members(analyzer, workspace, &class, cancellation)
-                        .map(|members| (class, members))
+                    let decision =
+                        iterator_protocol_members(analyzer, workspace, &class, cancellation);
+                    (class, decision)
                 })
-                .collect::<Option<Vec<_>>>()
+                .collect::<Vec<_>>()
         });
-        if let Some(Some(protocol_classes)) = protocol_classes {
-            for (class, (has_iter, has_next)) in protocol_classes {
-                let target_id = class.qualified_name().to_string();
+        let open_premises = protocol_classes
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .flat_map(|(_, decision)| decision.premises.iter().cloned())
+            .collect::<Vec<_>>();
+        if let Some(protocol_classes) = protocol_classes
+            .filter(|classes| classes.iter().all(|(_, decision)| decision.value.is_some()))
+        {
+            for (class, decision) in protocol_classes {
+                let (has_iter, has_next) =
+                    decision.value.expect("checked complete protocol decision");
+                let target_id = render::python_hierarchy_endpoint_id(analyzer, &class);
                 let is_iterator = has_iter && has_next;
                 let mut fact = if is_iterator {
                     make_row(
@@ -3714,6 +3823,7 @@ pub(super) fn iterator_return_protocol_expansions(
                         None,
                     )
                 };
+                fact.hierarchy_premises = decision.premises;
                 fact.row.target_id = Some(target_id.clone());
                 fact.row.returns_receiver = returns_receiver;
                 let mut digest = LengthDelimitedDigest::new(PYTHON_RULE_FACT_ID_DOMAIN);
@@ -3746,6 +3856,7 @@ pub(super) fn iterator_return_protocol_expansions(
                 false,
                 Some(reason),
             );
+            fact.hierarchy_premises = open_premises;
             fact.row.returns_receiver = returns_receiver;
             expansions.push(pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
                 fact,
@@ -5202,10 +5313,11 @@ enum ResolvedExceptionClass {
     Open,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WorkspaceClassProof {
     relation: ExceptionProof,
     default_metaclass: bool,
+    premises: Vec<PythonHierarchyFactValue>,
 }
 
 fn raise_operand(raise: Node<'_>) -> Option<Node<'_>> {
@@ -5446,211 +5558,234 @@ fn workspace_class_subclass_of_builtin(
     expected: &str,
     cancellation: Option<&CancellationToken>,
 ) -> WorkspaceClassProof {
-    let mut stack = vec![selected.clone()];
-    let mut visited = HashSet::<CodeUnit>::default();
-    let mut visits = 0usize;
-    let mut default_metaclass = true;
+    let mut premises = Vec::new();
+    let mut proof = (|| {
+        let mut stack = vec![selected.clone()];
+        let mut visited = HashSet::<CodeUnit>::default();
+        let mut visits = 0usize;
+        let mut default_metaclass = true;
 
-    while let Some(unit) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        }
-        if !visited.insert(unit.clone()) {
-            continue;
-        }
-        if visits == MAX_PYTHON_EXCEPTION_HIERARCHY_VISITS {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        }
-        visits += 1;
-
-        let Some(provider) = analyzer.python_class_hierarchy_provider_for(&unit) else {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        };
-        let hierarchy = provider.class_hierarchy(&unit, cancellation);
-        match hierarchy.outcome {
-            PythonHierarchyOutcome::Complete => {}
-            PythonHierarchyOutcome::Incomplete
-                if hierarchy.reason == Some(PythonHierarchyReason::UnresolvedBase) => {}
-            _ => {
+        while let Some(unit) = stack.pop() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return WorkspaceClassProof {
                     relation: ExceptionProof::Open,
                     default_metaclass,
+                    premises: Vec::new(),
                 };
             }
-        }
-
-        let Ok(source) = analyzer.project().read_source(unit.source()) else {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        };
-        let Some(tree) = parse_python(&source) else {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        };
-        if tree.root_node().has_error() {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        }
-        let Some(class) = python_class_node_for_unit(analyzer, &unit, &tree) else {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        };
-        default_metaclass &= !has_explicit_metaclass(class, &source);
-        let base_nodes = python_class_base_nodes(class);
-        if base_nodes.len() != hierarchy.bases.len()
-            || (hierarchy.outcome != PythonHierarchyOutcome::Complete && base_nodes.len() > 1)
-        {
-            return WorkspaceClassProof {
-                relation: ExceptionProof::Open,
-                default_metaclass,
-            };
-        }
-        if base_nodes.is_empty() {
-            continue;
-        }
-
-        for (ordinal, (base_node, base_fact)) in base_nodes.iter().zip(&hierarchy.bases).enumerate()
-        {
-            if base_fact.ordinal != ordinal {
+            if !visited.insert(unit.clone()) {
+                continue;
+            }
+            if visits == MAX_PYTHON_EXCEPTION_HIERARCHY_VISITS {
                 return WorkspaceClassProof {
                     relation: ExceptionProof::Open,
                     default_metaclass,
+                    premises: Vec::new(),
                 };
             }
-            match base_fact.resolution {
-                PythonBaseResolution::Resolved => {
-                    let Some(base) = &base_fact.target else {
-                        if base_node.kind() == "identifier" {
-                            let spelling = node_text(&source, *base_node).unwrap_or_default();
-                            let environment =
-                                environment_cache.environment_for(analyzer, unit.source());
-                            let definition = resolve_identifier(
-                                analyzer,
-                                unit.source(),
-                                &source,
-                                *base_node,
-                                cancellation,
-                            );
-                            match exception_class_from_builtin_identity(
-                                &environment,
-                                spelling,
-                                base_node.start_byte(),
-                                definition.as_ref(),
-                            ) {
-                                Some(ResolvedExceptionClass::Builtin(name)) => {
-                                    match python_builtin_exception_is_subclass(name, expected) {
-                                        Some(true) => {
-                                            return WorkspaceClassProof {
-                                                relation: ExceptionProof::Yes,
-                                                default_metaclass,
-                                            };
-                                        }
-                                        Some(false) => continue,
-                                        None => {
-                                            return WorkspaceClassProof {
-                                                relation: ExceptionProof::Open,
-                                                default_metaclass,
-                                            };
-                                        }
-                                    }
-                                }
-                                Some(ResolvedExceptionClass::OtherBuiltin(name))
-                                    if known_non_exception_builtin_class(&name) =>
-                                {
-                                    continue;
-                                }
-                                _ => {
-                                    return WorkspaceClassProof {
-                                        relation: ExceptionProof::Open,
-                                        default_metaclass,
-                                    };
-                                }
-                            }
-                        }
-                        return WorkspaceClassProof {
-                            relation: ExceptionProof::Open,
-                            default_metaclass,
-                        };
-                    };
-                    if !base.is_class() || base.is_synthetic() {
-                        return WorkspaceClassProof {
-                            relation: ExceptionProof::Open,
-                            default_metaclass,
-                        };
-                    }
-                    stack.push(base.clone());
-                }
-                PythonBaseResolution::Unresolved if base_node.kind() == "identifier" => {
-                    let spelling = node_text(&source, *base_node).unwrap_or_default();
-                    let environment = environment_cache.environment_for(analyzer, unit.source());
-                    let definition = resolve_identifier(
-                        analyzer,
-                        unit.source(),
-                        &source,
-                        *base_node,
-                        cancellation,
-                    );
-                    match exception_class_from_builtin_identity(
-                        &environment,
-                        spelling,
-                        base_node.start_byte(),
-                        definition.as_ref(),
-                    ) {
-                        Some(ResolvedExceptionClass::Builtin(name)) => {
-                            if python_builtin_exception_is_subclass(name, expected) == Some(true) {
-                                return WorkspaceClassProof {
-                                    relation: ExceptionProof::Yes,
-                                    default_metaclass,
-                                };
-                            }
-                            if python_builtin_exception_is_subclass(name, expected).is_none() {
-                                return WorkspaceClassProof {
-                                    relation: ExceptionProof::Open,
-                                    default_metaclass,
-                                };
-                            }
-                        }
-                        Some(ResolvedExceptionClass::OtherBuiltin(name))
-                            if known_non_exception_builtin_class(&name) => {}
-                        _ => {
-                            return WorkspaceClassProof {
-                                relation: ExceptionProof::Open,
-                                default_metaclass,
-                            };
-                        }
-                    }
-                }
+            visits += 1;
+
+            let Some(provider) = analyzer.python_class_hierarchy_provider_for(&unit) else {
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
+            };
+            let hierarchy = provider.class_hierarchy(&unit, cancellation);
+            let Some(premise) = hierarchy_premise(analyzer, &unit, &hierarchy) else {
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
+            };
+            premises.push(premise);
+            match hierarchy.outcome {
+                PythonHierarchyOutcome::Complete => {}
+                PythonHierarchyOutcome::Incomplete
+                    if hierarchy.reason == Some(PythonHierarchyReason::UnresolvedBase) => {}
                 _ => {
                     return WorkspaceClassProof {
                         relation: ExceptionProof::Open,
                         default_metaclass,
+                        premises: Vec::new(),
                     };
                 }
             }
-        }
-    }
 
-    WorkspaceClassProof {
-        relation: ExceptionProof::No,
-        default_metaclass,
-    }
+            let Ok(source) = analyzer.project().read_source(unit.source()) else {
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
+            };
+            let Some(tree) = parse_python(&source) else {
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
+            };
+            if tree.root_node().has_error() {
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
+            }
+            let Some(class) = python_class_node_for_unit(analyzer, &unit, &tree) else {
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
+            };
+            default_metaclass &= !has_explicit_metaclass(class, &source);
+            let base_nodes = python_class_base_nodes(class);
+            if base_nodes.is_empty() && hierarchy.outcome == PythonHierarchyOutcome::Complete {
+                continue;
+            }
+            if base_nodes.len() != hierarchy.bases.len()
+                || (hierarchy.outcome != PythonHierarchyOutcome::Complete && base_nodes.len() > 1)
+            {
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
+            }
+            if base_nodes.is_empty() {
+                continue;
+            }
+
+            for (ordinal, (base_node, base_fact)) in
+                base_nodes.iter().zip(&hierarchy.bases).enumerate()
+            {
+                if base_fact.ordinal != ordinal {
+                    return WorkspaceClassProof {
+                        relation: ExceptionProof::Open,
+                        default_metaclass,
+                        premises: Vec::new(),
+                    };
+                }
+                match base_fact.resolution {
+                    PythonBaseResolution::Resolved => {
+                        let Some(base) = &base_fact.target else {
+                            return WorkspaceClassProof {
+                                relation: ExceptionProof::Open,
+                                default_metaclass,
+                                premises: Vec::new(),
+                            };
+                        };
+                        let base = match base {
+                            ClassIdentity::Workspace(base) => base,
+                            ClassIdentity::External { qualified_name, .. }
+                            | ClassIdentity::Intrinsic { qualified_name } => {
+                                // The provider proved this canonical identity; never
+                                // reinterpret an unresolved source spelling as a builtin.
+                                let Some(name) = qualified_name.strip_prefix("builtins.") else {
+                                    return WorkspaceClassProof {
+                                        relation: ExceptionProof::Open,
+                                        default_metaclass,
+                                        premises: Vec::new(),
+                                    };
+                                };
+                                match python_builtin_exception_is_subclass(name, expected) {
+                                    Some(true) => {
+                                        return WorkspaceClassProof {
+                                            relation: ExceptionProof::Yes,
+                                            default_metaclass,
+                                            premises: Vec::new(),
+                                        };
+                                    }
+                                    Some(false) => continue,
+                                    None if known_non_exception_builtin_class(name) => continue,
+                                    None => {
+                                        return WorkspaceClassProof {
+                                            relation: ExceptionProof::Open,
+                                            default_metaclass,
+                                            premises: Vec::new(),
+                                        };
+                                    }
+                                }
+                            }
+                        };
+                        if !base.is_class() || base.is_synthetic() {
+                            return WorkspaceClassProof {
+                                relation: ExceptionProof::Open,
+                                default_metaclass,
+                                premises: Vec::new(),
+                            };
+                        }
+                        stack.push(base.clone());
+                    }
+                    PythonBaseResolution::Unresolved if base_node.kind() == "identifier" => {
+                        let spelling = node_text(&source, *base_node).unwrap_or_default();
+                        let environment =
+                            environment_cache.environment_for(analyzer, unit.source());
+                        let definition = resolve_identifier(
+                            analyzer,
+                            unit.source(),
+                            &source,
+                            *base_node,
+                            cancellation,
+                        );
+                        match exception_class_from_builtin_identity(
+                            &environment,
+                            spelling,
+                            base_node.start_byte(),
+                            definition.as_ref(),
+                        ) {
+                            Some(ResolvedExceptionClass::Builtin(name)) => {
+                                if python_builtin_exception_is_subclass(name, expected)
+                                    == Some(true)
+                                {
+                                    return WorkspaceClassProof {
+                                        relation: ExceptionProof::Yes,
+                                        default_metaclass,
+                                        premises: Vec::new(),
+                                    };
+                                }
+                                if python_builtin_exception_is_subclass(name, expected).is_none() {
+                                    return WorkspaceClassProof {
+                                        relation: ExceptionProof::Open,
+                                        default_metaclass,
+                                        premises: Vec::new(),
+                                    };
+                                }
+                            }
+                            Some(ResolvedExceptionClass::OtherBuiltin(name))
+                                if known_non_exception_builtin_class(&name) => {}
+                            _ => {
+                                return WorkspaceClassProof {
+                                    relation: ExceptionProof::Open,
+                                    default_metaclass,
+                                    premises: Vec::new(),
+                                };
+                            }
+                        }
+                    }
+                    _ => {
+                        return WorkspaceClassProof {
+                            relation: ExceptionProof::Open,
+                            default_metaclass,
+                            premises: Vec::new(),
+                        };
+                    }
+                }
+            }
+        }
+
+        WorkspaceClassProof {
+            relation: ExceptionProof::No,
+            default_metaclass,
+            premises: Vec::new(),
+        }
+    })();
+    proof.premises = premises;
+    proof
 }
 
 fn resolved_class_subclass_of_builtin(
@@ -5668,6 +5803,7 @@ fn resolved_class_subclass_of_builtin(
                 None => ExceptionProof::Open,
             },
             default_metaclass: true,
+            premises: Vec::new(),
         },
         ResolvedExceptionClass::Workspace(unit) => workspace_class_subclass_of_builtin(
             analyzer,
@@ -5680,6 +5816,7 @@ fn resolved_class_subclass_of_builtin(
             WorkspaceClassProof {
                 relation: ExceptionProof::No,
                 default_metaclass: true,
+                premises: Vec::new(),
             }
         }
         ResolvedExceptionClass::OtherBuiltin(_)
@@ -5687,6 +5824,7 @@ fn resolved_class_subclass_of_builtin(
         | ResolvedExceptionClass::Open => WorkspaceClassProof {
             relation: ExceptionProof::Open,
             default_metaclass: false,
+            premises: Vec::new(),
         },
     }
 }
@@ -5911,6 +6049,7 @@ fn python_raise_legality_fact(
                 "BaseException",
                 cancellation,
             );
+            value.hierarchy_premises.extend(proof.premises);
             if is_call && !proof.default_metaclass {
                 value.row.reason = Some("dynamic_exception_metaclass".to_string());
                 return value;
@@ -6421,6 +6560,7 @@ fn python_special_method_raise_fact(
         "BaseException",
         cancellation,
     );
+    value.hierarchy_premises.extend(proof.premises);
     if proof.relation == ExceptionProof::Open {
         value.row.reason = Some("special_method_exception_class_incomplete".to_string());
         return value;
@@ -6491,8 +6631,11 @@ fn python_special_method_raise_fact(
         WorkspaceClassProof {
             relation: ExceptionProof::No,
             default_metaclass: true,
+            premises: Vec::new(),
         }
     };
+    value.hierarchy_premises.extend(expected_proof.premises);
+    value.hierarchy_premises.extend(type_error_proof.premises);
     if (expected_proof.relation == ExceptionProof::Yes && !expected_proof.default_metaclass)
         || (type_error_proof.relation == ExceptionProof::Yes && !type_error_proof.default_metaclass)
     {

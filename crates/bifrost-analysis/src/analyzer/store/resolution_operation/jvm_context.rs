@@ -7,16 +7,16 @@ use super::package_context::{SelectedPackageRows, unique_package_references_by_t
 use super::*;
 use crate::analyzer::resolution::{
     BatchEndpointClassification, BindingOrigin, CanonicalIdentityDescriptor, CanonicalIdentityPart,
-    FactPageVisitor, FactReadOutcome, JvmImplicitRootProvider, LoweredPackageMember,
-    PrecedenceStep, ResolutionIdentityDigestKey, SelectedJvmBridgeEvidence,
-    SelectedJvmBridgeProvenance, SelectedJvmBridgeVisibility, SelectedPackageBridgeDescriptor,
-    SelectedResolutionMountContext, SelectedRootBridgeDescriptor, SelectedRootPathHalf,
-    SharedNameInterner, binding_origin_rank, language_callables_occupy_value_namespace,
-    language_implicit_root_member_names, language_implicit_root_providers,
-    language_import_owner_steps_bind_singletons, language_jvm_declaration_access_rules,
-    language_jvm_package_requires_directory_agreement, package_domain_semantic,
-    selected_identity_content_digest, visit_selected_root_export_half_pages,
-    visit_selected_root_import_half_pages,
+    FactPageVisitor, FactReadOutcome, JvmImplicitRootProvider,
+    LoweredDeclarationVisibilityProperty, LoweredPackageMember, PrecedenceStep,
+    ResolutionIdentityDigestKey, SelectedJvmBridgeEvidence, SelectedJvmBridgeProvenance,
+    SelectedJvmBridgeVisibility, SelectedPackageBridgeDescriptor, SelectedResolutionMountContext,
+    SelectedRootBridgeDescriptor, SelectedRootPathHalf, SharedNameInterner, binding_origin_rank,
+    language_callables_occupy_value_namespace, language_implicit_root_member_names,
+    language_implicit_root_providers, language_import_owner_steps_bind_singletons,
+    language_jvm_declaration_access_rules, language_jvm_package_requires_directory_agreement,
+    package_domain_semantic, selected_identity_content_digest,
+    visit_selected_root_export_half_pages, visit_selected_root_import_half_pages,
 };
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionConstructionRequirementKind, ResolutionGapKind, ResolutionImportRouteKind,
@@ -108,18 +108,43 @@ WHERE catalog.blob_id=?1 AND catalog.local_key=?2
   AND catalog.import_source_site IS NOT NULL
 "#;
 
-// Alias candidates are read for one exact selected blob. The alias table's
-// (blob_id, alias) primary key bounds the read to that fragment before the
-// imported JVM spelling is compared.
+// Alias candidates are read by the exact selected blob and imported JVM
+// member spelling. resolution_jvm_aliases_member_name bounds both predicates,
+// including the common empty result.
 pub(in crate::analyzer::store) const SELECTED_JVM_ALIAS_BY_BLOB_AND_MEMBER: &str = r#"
 SELECT alias.alias, alias.declaration_site, alias.status,
-       declaration.semantic_key, alias.kind
+       declaration.semantic_key, alias.kind, alias.is_static
 FROM main.resolution_jvm_aliases AS alias
 JOIN main.resolution_semantic_sites AS declaration
   ON declaration.blob_id=alias.blob_id
  AND declaration.source_site=alias.declaration_site
  AND declaration.semantic_role='definition'
 WHERE alias.blob_id=?1 AND alias.member_name=?2
+"#;
+
+// An exact alias endpoint bypasses lexical lookup. Reuse the persisted
+// omitted-binder frontiers: the declaration itself, and the scope checkpoints
+// of its authored binder paths. A named omitted declaration in that scope can
+// affect export authority too, so this read intentionally includes keyed gaps.
+// Reverse-only macro inventory and gaps in other scopes are not alias authority.
+pub(in crate::analyzer::store) const SELECTED_JVM_ALIAS_DECLARATION_GAPS: &str = r#"
+SELECT gap.reason
+FROM main.resolution_gaps AS gap
+JOIN main.resolution_gap_reasons AS reason
+  ON reason.blob_id=gap.blob_id AND reason.reason=gap.reason
+WHERE gap.blob_id=?1 AND gap.covers=6 AND gap.subject=?2 AND gap.lookup=0
+  AND reason.origin=?3
+UNION ALL
+SELECT gap.reason
+FROM main.resolution_paths AS binder INDEXED BY resolution_paths_reverse
+CROSS JOIN main.resolution_gaps AS gap
+  ON gap.blob_id=binder.blob_id AND gap.covers=5 AND gap.subject=binder.start_node
+JOIN main.resolution_gap_reasons AS reason
+  ON reason.blob_id=gap.blob_id AND reason.reason=gap.reason
+WHERE binder.blob_id=?1 AND binder.end_node=?2 AND binder.start_node<>-1
+  AND binder.start_lead_identity IS NOT NULL
+  AND binder.end_lead_identity IS NULL AND binder.end_lead_local IS NULL
+  AND reason.origin=?3
 "#;
 
 const SELECTED_JVM_ALIASES_BY_BLOB: &str = r#"
@@ -256,6 +281,47 @@ pub(super) struct JvmImportTargetRows {
 
 pub(super) type JvmImportTargetMemo = ExactReadMemo<JvmImportTargetKey, Arc<JvmImportTargetRows>>;
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct JvmAliasRowsKey {
+    blob: i64,
+    member: String,
+    scope: [u8; 32],
+    stage_epoch: (u64, u64),
+}
+
+pub(super) struct JvmAliasRow {
+    alias: u32,
+    declaration_site: u32,
+    status: String,
+    declaration_key: u32,
+    kind: String,
+    is_static: bool,
+}
+
+pub(super) type JvmAliasRowsMemo = ExactReadMemo<JvmAliasRowsKey, Arc<[JvmAliasRow]>>;
+
+pub(super) struct JvmGeneratedLookup {
+    recipe: ResolutionLookupSemanticRecipe,
+    semantic: std::sync::OnceLock<SemanticId>,
+}
+
+impl JvmGeneratedLookup {
+    fn semantic(&self, names: &dyn SharedNameInterner) -> SemanticId {
+        *self.semantic.get_or_init(|| self.recipe.semantic(names))
+    }
+}
+
+// A generated recipe depends only on these value inputs. Its shared ID is
+// minted by this operation's interner and never retained by another request.
+pub(super) type JvmGeneratedLookupMemo = ExactReadMemo<
+    (
+        crate::analyzer::resolution::ResolutionIdentityDomain,
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+        String,
+    ),
+    Arc<JvmGeneratedLookup>,
+>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct JvmPackageMemberKey {
     mount: SelectedResolutionMountOrdinal,
@@ -283,7 +349,8 @@ pub(super) struct JvmVisibilityKey {
     stage_epoch: (u64, u64),
 }
 
-pub(super) type JvmVisibilityMemo = ExactReadMemo<JvmVisibilityKey, Arc<[DeclaredVisibility]>>;
+pub(super) type JvmVisibilityMemo =
+    ExactReadMemo<JvmVisibilityKey, Arc<[LoweredDeclarationVisibilityProperty]>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct JvmRootExportKey {
@@ -341,6 +408,12 @@ struct JvmMemberCandidateRead {
     complete: bool,
 }
 
+struct JvmAliasImportBridges {
+    bridges: Vec<SelectedRootBridgeDescriptor>,
+    open_imports: Vec<String>,
+    found_alias: bool,
+}
+
 struct JvmImportContextGapSpec {
     context_id: i64,
     source: BindingFragmentId,
@@ -366,13 +439,46 @@ enum JvmPackageRelation {
     Different,
     Unknown,
 }
-impl JvmPackageRelation {
-    fn between(caller: Option<&str>, target: &str) -> Self {
-        match caller {
-            Some(package) if package == target => Self::Same,
-            Some(_) => Self::Different,
-            None => Self::Unknown,
+#[derive(Clone, Copy)]
+struct JvmDeclarationAccessContext<'a> {
+    relation: JvmPackageRelation,
+    caller_package: Option<&'a str>,
+    reference: Option<SemanticId>,
+    scope_head: Option<BindingNodeId>,
+    source_node: Option<BindingNodeId>,
+    import_token: Option<SemanticId>,
+}
+impl<'a> JvmDeclarationAccessContext<'a> {
+    fn between(caller_package: Option<&'a str>, target: &str) -> Self {
+        let relation = match caller_package {
+            Some(package) if package == target => JvmPackageRelation::Same,
+            Some(_) => JvmPackageRelation::Different,
+            None => JvmPackageRelation::Unknown,
+        };
+        Self {
+            relation,
+            caller_package,
+            reference: None,
+            scope_head: None,
+            source_node: None,
+            import_token: None,
         }
+    }
+    fn with_reference(mut self, reference: Option<SemanticId>) -> Self {
+        self.reference = reference;
+        self
+    }
+    fn with_source_node(mut self, source_node: BindingNodeId) -> Self {
+        self.source_node = Some(source_node);
+        self
+    }
+    fn with_import(mut self, token: SemanticId) -> Self {
+        self.import_token = Some(token);
+        self
+    }
+    fn with_scope(mut self, scope_head: Option<BindingNodeId>) -> Self {
+        self.scope_head = scope_head;
+        self
     }
 }
 
@@ -477,12 +583,12 @@ impl SelectedResolutionOperation<'_, '_> {
                     context,
                     external_static_imports,
                     inventory_reason,
-                    open_jvm_alias_imports: _,
+                    mut open_jvm_alias_imports,
                     scoped_gaps,
                 },
                 JvmImportContext::Ready {
                     context: peer_context,
-                    open_jvm_alias_imports,
+                    open_jvm_alias_imports: peer_open_jvm_alias_imports,
                     scoped_gaps: peer_scoped_gaps,
                     ..
                 },
@@ -499,6 +605,9 @@ impl SelectedResolutionOperation<'_, '_> {
                     return Ok(JvmImportContext::Cancelled);
                 };
                 let mut scoped_gaps = scoped_gaps;
+                open_jvm_alias_imports.extend(peer_open_jvm_alias_imports);
+                open_jvm_alias_imports.sort_unstable();
+                open_jvm_alias_imports.dedup();
                 scoped_gaps.extend(peer_scoped_gaps);
                 scoped_gaps.sort_by(|left, right| {
                     (&left.lookup, left.reason).cmp(&(&right.lookup, right.reason))
@@ -864,11 +973,10 @@ impl SelectedResolutionOperation<'_, '_> {
                 Some(ResolutionImportSelectorKind::Star) | None => demand_recipe.spelling(),
                 Some(ResolutionImportSelectorKind::ReceiverMember) => unreachable!(),
             };
-            let source_demand = ResolutionLookupSemanticRecipe::new(
-                source_language,
-                demand_recipe.namespace(),
-                local_name,
-            );
+            let source_demand = self
+                .jvm_generated_lookup(source_language, demand_recipe.namespace(), local_name)
+                .recipe
+                .clone();
             let bridges_before = root_bridges.len();
             if java_single_type {
                 let Some(open_owner_aliases) = self.jvm_open_owner_alias_imports(
@@ -975,25 +1083,45 @@ impl SelectedResolutionOperation<'_, '_> {
                         selector.kind == ResolutionImportSelectorKind::Named
                     })
                 {
-                    let Some((aliases, open_aliases)) = self.jvm_alias_import_bridges(
-                        identity.fragment(),
-                        source_language,
+                    let alias_import = JavaMemberImportDemand {
+                        import_kind: None,
+                        caller_package: source_package.as_deref(),
+                        source: identity.fragment(),
                         token,
+                        prefix_reference: None,
+                        scope_head: Some(source_scope_head),
                         anchor,
                         anchor_semantic,
+                        selector_kind: selector.as_ref().map(|selector| selector.kind),
+                        import_precedence: import_precedence
+                            .iter()
+                            .copied()
+                            .find(|step| step.tier != PrecedenceTier::CandidateOriginRank),
+                        candidate_origin_rank: import_precedence
+                            .iter()
+                            .find(|step| step.tier == PrecedenceTier::CandidateOriginRank)
+                            .map(|step| step.ordinal),
+                        route: &recipes,
+                        lookup_route,
+                        demand: &source_demand,
+                        language: source_language,
+                    };
+                    let Some(alias_import_bridges) = self.jvm_alias_import_bridges(
+                        &alias_import,
+                        source_name,
                         caller_version,
                         source.persisted_relative_path(),
-                        source_name,
-                        &recipes,
-                        lookup_route,
-                        &source_demand,
                         context_id,
-                        source_package.as_deref(),
                         cancellation,
                     )?
                     else {
                         return Ok(JvmImportContext::Cancelled);
                     };
+                    let JvmAliasImportBridges {
+                        bridges: aliases,
+                        open_imports: open_aliases,
+                        ..
+                    } = alias_import_bridges;
                     if matches!(source_language, Language::Kotlin | Language::Scala) {
                         for open_alias in &open_aliases {
                             scoped_gaps.push(self.jvm_import_context_gap(JvmImportContextGapSpec {
@@ -1059,7 +1187,10 @@ impl SelectedResolutionOperation<'_, '_> {
                     {
                         continue;
                     }
-                    let relation = JvmPackageRelation::between(source_package.as_deref(), &package);
+                    let relation =
+                        JvmDeclarationAccessContext::between(source_package.as_deref(), &package)
+                            .with_scope(Some(source_scope_head))
+                            .with_import(token);
                     let mut package_bridges = Vec::new();
                     for (target_ordinal, target_version) in targets.ordered.iter().copied() {
                         if cancellation.is_cancelled() {
@@ -1074,11 +1205,14 @@ impl SelectedResolutionOperation<'_, '_> {
                         {
                             continue;
                         }
-                        let target_demand = ResolutionLookupSemanticRecipe::new(
-                            target_language,
-                            demand_recipe.namespace(),
-                            source_name,
-                        );
+                        let target_demand = self
+                            .jvm_generated_lookup(
+                                target_language,
+                                demand_recipe.namespace(),
+                                source_name,
+                            )
+                            .recipe
+                            .clone();
                         let target_semantic = target_demand.semantic(&self.ready.shared_names());
                         let SelectedPackageRows::Ready(members) = self
                             .jvm_package_members_for_lookup(
@@ -1269,6 +1403,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             source: identity.fragment(),
                             token,
                             prefix_reference: None,
+                            scope_head: Some(source_scope_head),
                             anchor,
                             anchor_semantic,
                             selector_kind: selector.as_ref().map(|selector| selector.kind),
@@ -1379,11 +1514,15 @@ impl SelectedResolutionOperation<'_, '_> {
                 && root_bridges.len() > bridges_before
                 && let Some(mut resolved_route) = resolved_lookup_route
             {
-                resolved_route.push(ResolutionLookupSemanticRecipe::new(
-                    source_language,
-                    demand_recipe.namespace(),
-                    source_name,
-                ));
+                resolved_route.push(
+                    self.jvm_generated_lookup(
+                        source_language,
+                        demand_recipe.namespace(),
+                        source_name,
+                    )
+                    .recipe
+                    .clone(),
+                );
                 pending_scala_imports
                     .insert((source_scope_head, local_name.to_owned()), resolved_route);
             }
@@ -1659,7 +1798,7 @@ impl SelectedResolutionOperation<'_, '_> {
             },
         )?;
         let access_identity = self.ready.context_identities.named_semantic(
-            CanonicalHasher::new(b"jvm-selected-declaration-access:v1").finish(),
+            CanonicalHasher::new(b"jvm-selected-declaration-access:v2-lexical-regions").finish(),
             "jvm-selected-declaration-access",
             "JVM declaration visibility under exact selected package and lexical ownership",
         );
@@ -1766,6 +1905,75 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(gap)
     }
 
+    pub(super) fn jvm_generated_lookup(
+        &self,
+        language: Language,
+        namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+        spelling: &str,
+    ) -> Arc<JvmGeneratedLookup> {
+        let key = (
+            language_identity_domain(language),
+            namespace,
+            spelling.to_owned(),
+        );
+        if let Some(lookup) = self.jvm_generated_lookup_memo.borrow().get(&key) {
+            return Arc::clone(lookup);
+        }
+        let recipe = ResolutionLookupSemanticRecipe::new(language, namespace, spelling);
+        let lookup = Arc::new(JvmGeneratedLookup {
+            recipe,
+            semantic: std::sync::OnceLock::new(),
+        });
+        self.jvm_generated_lookup_memo
+            .borrow_mut()
+            .insert(key, Arc::clone(&lookup));
+        lookup
+    }
+
+    pub(super) fn jvm_alias_rows(
+        &self,
+        blob: i64,
+        member: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Arc<[JvmAliasRow]>>> {
+        let key = JvmAliasRowsKey {
+            blob,
+            member: member.to_owned(),
+            scope: self.ready.inventory.scope_identity(),
+            stage_epoch: self.ready.inventory.staged_read_epoch(),
+        };
+        self.profile_jvm_read("alias_rows", &key);
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(rows) = self.jvm_alias_rows_memo.borrow().get(&key) {
+            return Ok(Some(Arc::clone(rows)));
+        }
+        self.profile_jvm_read("derive_alias_rows", &key);
+        let connection = self.ready.inventory.connection();
+        let mut statement = connection.prepare_cached(SELECTED_JVM_ALIAS_BY_BLOB_AND_MEMBER)?;
+        let rows = statement
+            .query_map(rusqlite::params![blob, member], |row| {
+                Ok(JvmAliasRow {
+                    alias: row.get(0)?,
+                    declaration_site: row.get(1)?,
+                    status: row.get(2)?,
+                    declaration_key: row.get(3)?,
+                    kind: row.get(4)?,
+                    is_static: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let rows: Arc<[JvmAliasRow]> = Arc::from(rows);
+        self.jvm_alias_rows_memo
+            .borrow_mut()
+            .insert(key, Arc::clone(&rows));
+        Ok(Some(rows))
+    }
+
     /// The query's complete target rows have no caller or route completion.
     /// Keep both existing consumer orderings; callers retain their polling.
     pub(super) fn jvm_import_targets(
@@ -1837,12 +2045,13 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(rows))
     }
 
-    /// Package relation and incoming completion are applied by each caller.
+    /// Retain the modifier and lexical boundary together. Package relation and
+    /// incoming completion are applied by each caller; entries die with the query.
     pub(super) fn jvm_declaration_visibilities(
         &self,
         definition: SemanticId,
         cancellation: &CancellationToken,
-    ) -> Result<Option<Arc<[DeclaredVisibility]>>> {
+    ) -> Result<Option<Arc<[LoweredDeclarationVisibilityProperty]>>> {
         let key = JvmVisibilityKey {
             definition,
             scope: self.ready.inventory.scope_identity(),
@@ -1864,14 +2073,14 @@ impl SelectedResolutionOperation<'_, '_> {
                 TypedFactRequest::new(&[definition]),
                 cancellation,
                 &mut FactPageVisitor::new(&mut |page| {
-                    rows.extend(page.iter().map(|row| row.row().visibility()));
+                    rows.extend(page.iter().map(|row| row.row().clone()));
                     Ok(true)
                 }),
             )?;
         if outcome.is_cancelled() || cancellation.is_cancelled() {
             return Ok(None);
         }
-        let rows: Arc<[DeclaredVisibility]> = rows.into();
+        let rows: Arc<[LoweredDeclarationVisibilityProperty]> = rows.into();
         if outcome.is_exhausted() {
             self.jvm_visibility_memo
                 .borrow_mut()
@@ -2107,7 +2316,8 @@ impl SelectedResolutionOperation<'_, '_> {
                     return Ok(None);
                 }
                 let targets = self.jvm_import_targets(JVM_IMPORT_TARGET_MOUNTS, package)?;
-                let relation = JvmPackageRelation::between(caller_package, package);
+                let relation = JvmDeclarationAccessContext::between(caller_package, package)
+                    .with_reference(Some(reference.reference));
                 let is_default_import = implicit_root_providers.iter().any(|provider| {
                     matches!(provider, JvmImplicitRootProvider::Package(name) if *name == package.as_str())
                 });
@@ -2155,7 +2365,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         let requested = reference_recipes
                             .iter()
                             .map(|(reference, source_recipe)| {
-                                ResolutionLookupSemanticRecipe::new(
+                                self.jvm_generated_lookup(
                                     target_language,
                                     reference.namespace,
                                     source_recipe.spelling(),
@@ -2167,12 +2377,18 @@ impl SelectedResolutionOperation<'_, '_> {
                         entry.insert(grouped);
                     }
                     let members_by_lookup = &members_by_mount[&target_ordinal];
-                    let target_recipe = ResolutionLookupSemanticRecipe::new(
+                    let target = self.jvm_generated_lookup(
                         target_language,
                         reference.namespace,
                         source_recipe.spelling(),
                     );
-                    let target_lookup = target_recipe.semantic(&names);
+                    let target_recipe = &target.recipe;
+                    let target_lookup = target.semantic(&names);
+                    let Some(members) = members_by_lookup.get(&target_lookup) else {
+                        continue;
+                    };
+                    // An empty member inventory contributes no bridge or access
+                    // evidence. Check access only for actual candidate members.
                     let Some(access) = self.jvm_qualified_source_access_completion(
                         source_language,
                         context_id,
@@ -2185,7 +2401,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     else {
                         continue;
                     };
-                    for member in members_by_lookup.get(&target_lookup).into_iter().flatten() {
+                    for member in members {
                         if member.namespace != reference.namespace || member.lookup != target_lookup
                         {
                             continue;
@@ -2264,7 +2480,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 reference,
                                 member,
                                 source_recipe,
-                                &target_recipe,
+                                target_recipe,
                                 target_definition,
                                 route_identity,
                                 precedence.tier.map(|tier| PrecedenceStep {
@@ -2341,11 +2557,10 @@ impl SelectedResolutionOperation<'_, '_> {
             source_language,
             Language::Kotlin | Language::Scala
         ));
-        let predef = ResolutionLookupSemanticRecipe::new(
-            Language::Scala,
-            ResolutionNamespace::Value,
-            "Predef",
-        );
+        let predef = self
+            .jvm_generated_lookup(Language::Scala, ResolutionNamespace::Value, "Predef")
+            .recipe
+            .clone();
         let predef_lookup = predef.semantic(&names);
         let target_mounts = self.jvm_import_targets(JVM_IMPORT_TARGET_MOUNTS, "scala")?;
         let predef_root_unindexed = target_mounts.ordered.is_empty();
@@ -2377,7 +2592,7 @@ impl SelectedResolutionOperation<'_, '_> {
             else {
                 continue;
             };
-            let relation = JvmPackageRelation::between(caller_package, "scala");
+            let relation = JvmDeclarationAccessContext::between(caller_package, "scala");
             let target_record = self
                 .ready
                 .inventory
@@ -2475,11 +2690,14 @@ impl SelectedResolutionOperation<'_, '_> {
                         source_recipe.identity_domain(),
                         language_identity_domain(source_language)
                     );
-                    let target_recipe = ResolutionLookupSemanticRecipe::new(
-                        Language::Scala,
-                        reference.namespace,
-                        source_recipe.spelling(),
-                    );
+                    let target_recipe = self
+                        .jvm_generated_lookup(
+                            Language::Scala,
+                            reference.namespace,
+                            source_recipe.spelling(),
+                        )
+                        .recipe
+                        .clone();
                     for owner_member in owner_members.iter().filter(|owner_member| {
                         owner_member.definition() != predef_member.definition
                             && member_namespace(owner_member.kind()) == Some(reference.namespace)
@@ -2613,32 +2831,30 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok((!cancellation.is_cancelled()).then_some((bridges, gaps)))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn jvm_alias_import_bridges(
         &self,
-        source_fragment: BindingFragmentId,
-        source_language: Language,
-        import_token: SemanticId,
-        anchor: ResolutionRootImportAnchor,
-        anchor_semantic: SemanticId,
+        import: &JavaMemberImportDemand<'_>,
+        imported_name: &str,
         caller_version: Option<i64>,
         caller_path: &str,
-        imported_name: &str,
-        route: &[ResolutionLookupSemanticRecipe],
-        lookup_route: &[ResolutionLookupSemanticRecipe],
-        source_demand: &ResolutionLookupSemanticRecipe,
         context_id: i64,
-        caller_package: Option<&str>,
         cancellation: &CancellationToken,
-    ) -> Result<Option<(Vec<SelectedRootBridgeDescriptor>, Vec<String>)>> {
+    ) -> Result<Option<JvmAliasImportBridges>> {
         let connection = self.ready.inventory.connection();
         let mut bridges = Vec::new();
         let mut open_imports = Vec::new();
-        for prefix_length in (1..=lookup_route.len()).rev() {
+        let mut found_alias = false;
+        let static_alias_import = matches!(
+            import.import_kind,
+            Some(
+                ResolutionImportRouteKind::SingleStatic | ResolutionImportRouteKind::StaticOnDemand
+            )
+        );
+        for prefix_length in (1..=import.lookup_route.len()).rev() {
             if cancellation.is_cancelled() {
                 return Ok(None);
             }
-            let owner_recipes = &lookup_route[..prefix_length];
+            let owner_recipes = &import.lookup_route[..prefix_length];
             let package = owner_recipes
                 .iter()
                 .map(ResolutionLookupSemanticRecipe::spelling)
@@ -2648,11 +2864,22 @@ impl SelectedResolutionOperation<'_, '_> {
                 continue;
             }
             let targets = self.jvm_import_targets(JVM_IMPORT_TARGET_MOUNTS, &package)?;
-            let expected_owner = owner_recipes
-                .iter()
-                .map(|segment| segment.spelling())
-                .collect::<Vec<_>>();
-            let relation = JvmPackageRelation::between(caller_package, &package);
+            let expected_owner = if static_alias_import {
+                import
+                    .lookup_route
+                    .iter()
+                    .map(|segment| segment.spelling())
+                    .collect::<Vec<_>>()
+            } else {
+                owner_recipes
+                    .iter()
+                    .map(|segment| segment.spelling())
+                    .collect::<Vec<_>>()
+            };
+            let relation = JvmDeclarationAccessContext::between(import.caller_package, &package)
+                .with_reference(import.prefix_reference)
+                .with_scope(import.scope_head)
+                .with_import(import.token);
             for (target_ordinal, target_version) in targets.ordered.iter().copied() {
                 if cancellation.is_cancelled() {
                     return Ok(None);
@@ -2667,23 +2894,18 @@ impl SelectedResolutionOperation<'_, '_> {
                     .ready
                     .inventory
                     .mount_record_by_ordinal(target_ordinal)?;
-                let mut aliases =
-                    connection.prepare_cached(SELECTED_JVM_ALIAS_BY_BLOB_AND_MEMBER)?;
-                let aliases = aliases
-                    .query_map(
-                        rusqlite::params![target_record.blob_id(), imported_name],
-                        |row| {
-                            Ok((
-                                row.get::<_, u32>(0)?,
-                                row.get::<_, u32>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, u32>(3)?,
-                                row.get::<_, String>(4)?,
-                            ))
-                        },
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (alias_id, declaration_site, status, declaration_key, alias_kind) in aliases {
+                let Some(aliases) =
+                    self.jvm_alias_rows(target_record.blob_id(), imported_name, cancellation)?
+                else {
+                    return Ok(None);
+                };
+                for alias in aliases.iter() {
+                    let alias_id = alias.alias;
+                    let declaration_site = alias.declaration_site;
+                    let declaration_key = alias.declaration_key;
+                    let status = &alias.status;
+                    let alias_kind = &alias.kind;
+                    let is_static = alias.is_static;
                     let mut segments = connection.prepare_cached(
                         "SELECT spelling FROM main.resolution_jvm_alias_owner_segments
                          WHERE blob_id=?1 AND alias=?2 ORDER BY ordinal",
@@ -2697,6 +2919,21 @@ impl SelectedResolutionOperation<'_, '_> {
                     if owner != expected_owner {
                         continue;
                     }
+                    // Static callable imports must denote emitted methods, not
+                    // source properties or constructors. Getter/setter aliases
+                    // target Value declarations and need separate adaptation.
+                    let static_kind_matches = matches!(
+                        (alias_kind.as_str(), import.demand.namespace()),
+                        ("method", ResolutionNamespace::Callable)
+                            | (
+                                "field" | "companion_object" | "singleton_instance",
+                                ResolutionNamespace::Value
+                            )
+                    );
+                    if static_alias_import && !is_static {
+                        continue;
+                    }
+                    found_alias = true;
                     let alias_fqn = format!("{}.{}", owner.join("."), imported_name);
                     if status != "source_proven" {
                         open_imports.push(alias_fqn);
@@ -2740,7 +2977,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         ));
                     };
                     let Some(access) = self.jvm_qualified_source_access_completion(
-                        source_language,
+                        import.language,
                         context_id,
                         caller_version,
                         caller_path,
@@ -2761,13 +2998,36 @@ impl SelectedResolutionOperation<'_, '_> {
                         JvmDeclarationAccess::Excluded => continue,
                         JvmDeclarationAccess::Cancelled => return Ok(None),
                     };
-                    let Some(exports_read) = self.jvm_root_exports(target_ordinal, cancellation)?
-                    else {
-                        return Ok(None);
+                    let completion = if static_alias_import
+                        && import.language == Language::Java
+                        && target_language == Language::Kotlin
+                    {
+                        match self.jvm_static_alias_owner_access(
+                            declaration,
+                            &owner,
+                            relation,
+                            &completion,
+                            cancellation,
+                        )? {
+                            Some(JvmDeclarationAccess::Ready(completion)) => completion,
+                            Some(JvmDeclarationAccess::Excluded) => continue,
+                            Some(JvmDeclarationAccess::Cancelled) => return Ok(None),
+                            None => {
+                                open_imports.push(alias_fqn);
+                                continue;
+                            }
+                        }
+                    } else {
+                        completion
                     };
-                    let exports = exports_read.halves.iter()
-                        .filter(|half| matches!(half, SelectedRootPathHalf::Export { definition, .. } if *definition == target_definition))
-                        .cloned();
+                    // A static alias proves the binary owner/name even when
+                    // its declaration needs an unsupported namespace conversion.
+                    // Keep that route open instead of claiming an unindexed
+                    // owner or a complete absence of definitions.
+                    if static_alias_import && !static_kind_matches {
+                        open_imports.push(alias_fqn);
+                        continue;
+                    }
                     let mut alias_hash =
                         CanonicalIdentityDescriptor::new(b"bifrost-jvm-alias-fact:v1", |key| {
                             self.ready.identity_content_digest(key, cancellation)
@@ -2799,6 +3059,92 @@ impl SelectedResolutionOperation<'_, '_> {
                         "jvm-alias-fact",
                         "Selected JVM alias rows map this binary owner and member to an authored declaration",
                     );
+                    let Some(exports_read) = self.jvm_root_exports(target_ordinal, cancellation)?
+                    else {
+                        return Ok(None);
+                    };
+                    let exports = exports_read.halves.iter()
+                        .filter(|half| matches!(half, SelectedRootPathHalf::Export { definition, .. } if *definition == target_definition))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if static_alias_import {
+                        // Matching exports retain their completion even though
+                        // the bridge ends directly at the authored definition.
+                        // Members without root exports use the same persisted
+                        // declaration/scope omitted-binder authority instead.
+                        let mut alias_reasons = Vec::new();
+                        for export in &exports {
+                            let SelectedRootPathHalf::Export {
+                                incomplete_reasons, ..
+                            } = export
+                            else {
+                                unreachable!("export-only visitor")
+                            };
+                            alias_reasons.extend(incomplete_reasons.iter().copied());
+                        }
+                        let origin =
+                            super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                                crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                                    ResolutionGapKind::UnsupportedScopeOrBinder,
+                                ),
+                            );
+                        let mut gaps =
+                            connection.prepare_cached(SELECTED_JVM_ALIAS_DECLARATION_GAPS)?;
+                        let mut reasons = gaps.query(rusqlite::params![
+                            target_record.blob_id(),
+                            target_definition
+                                .local_key()
+                                .expect("alias definition is local"),
+                            origin,
+                        ])?;
+                        while let Some(row) = reasons.next()? {
+                            if cancellation.is_cancelled() {
+                                return Ok(None);
+                            }
+                            let reason =
+                                SemanticId::local(target_ordinal.get(), row.get::<_, u32>(0)?);
+                            alias_reasons
+                                .push(ResolutionIncompleteReason::UnsupportedSemantic(reason));
+                        }
+                        let completion = if alias_reasons.is_empty() {
+                            completion
+                        } else {
+                            completion.combine(&ResolutionCompletion::incomplete(alias_reasons))
+                        };
+                        let bridge = SelectedRootBridgeDescriptor::from_selected_path_tokens_with_jvm_evidence(
+                            import.source,
+                            import.language,
+                            import.token,
+                            import.anchor,
+                            import.anchor_semantic,
+                            target_mount.fragment(),
+                            target_language,
+                            declaration,
+                            None,
+                            import.route.to_vec(),
+                            import.demand.clone(),
+                            import.demand.clone(),
+                            SelectedJvmBridgeEvidence {
+                                provenance: SelectedJvmBridgeProvenance::AliasFact { alias: alias_identity },
+                                source_namespace: import.demand.namespace(),
+                                target_namespace: import.demand.namespace(),
+                                visibility: match self.jvm_bridge_visibility(declaration, relation, cancellation)? {
+                                    Some(visibility) => visibility,
+                                    None => return Ok(None),
+                                },
+                                dependency_identity: jvm_dependency_identity(context_id, caller_version, caller_path, target_version, target_mount.persisted_relative_path()),
+                                target_declaration: declaration,
+                                target_definition,
+                            },
+                            completion,
+                        );
+                        bridges.push(
+                            import
+                                .rank_bridge(bridge)
+                                .with_selected_member_definition(target_definition),
+                        );
+                        continue;
+                    }
                     for export in exports {
                         let SelectedRootPathHalf::Export {
                             identity,
@@ -2823,7 +3169,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 "selected JVM alias export lacks its lookup recipe",
                             ));
                         };
-                        if target_demand.namespace() != source_demand.namespace() {
+                        if target_demand.namespace() != import.demand.namespace() {
                             continue;
                         }
                         let bridge_completion = if incomplete_reasons.is_empty() {
@@ -2832,41 +3178,41 @@ impl SelectedResolutionOperation<'_, '_> {
                             completion
                                 .combine(&ResolutionCompletion::incomplete(incomplete_reasons))
                         };
-                        let bridge = if source_language == target_language {
+                        let bridge = if import.language == target_language {
                             SelectedRootBridgeDescriptor::from_selected_path_tokens(
-                                source_fragment,
-                                source_language,
-                                import_token,
-                                anchor,
-                                anchor_semantic,
+                                import.source,
+                                import.language,
+                                import.token,
+                                import.anchor,
+                                import.anchor_semantic,
                                 identity.fragment(),
                                 target_language,
                                 token,
-                                route.to_vec(),
-                                source_demand.clone(),
+                                import.route.to_vec(),
+                                import.demand.clone(),
                                 target_demand,
                                 bridge_completion,
                             )
                         } else {
                             SelectedRootBridgeDescriptor::from_selected_path_tokens_with_jvm_evidence(
-                                source_fragment,
-                                source_language,
-                                import_token,
-                                anchor,
-                                anchor_semantic,
+                                import.source,
+                                import.language,
+                                import.token,
+                                import.anchor,
+                                import.anchor_semantic,
                                 identity.fragment(),
                                 target_language,
                                 token,
                                 None,
-                                route.to_vec(),
-                                source_demand.clone(),
+                                import.route.to_vec(),
+                                import.demand.clone(),
                                 target_demand,
                                 SelectedJvmBridgeEvidence {
                                     provenance: SelectedJvmBridgeProvenance::AliasFact {
                                         alias: alias_identity,
                                     },
-                                    source_namespace: source_demand.namespace(),
-                                    target_namespace: source_demand.namespace(),
+                                    source_namespace: import.demand.namespace(),
+                                    target_namespace: import.demand.namespace(),
                                     visibility: match self.jvm_bridge_visibility(
                                         declaration,
                                         relation,
@@ -2895,7 +3241,113 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         open_imports.sort_unstable();
         open_imports.dedup();
-        Ok((!cancellation.is_cancelled()).then_some((bridges, open_imports)))
+        Ok(
+            (!cancellation.is_cancelled()).then_some(JvmAliasImportBridges {
+                bridges,
+                open_imports,
+                found_alias,
+            }),
+        )
+    }
+
+    /// Access follows the alias's binary owner, which can be an enclosing
+    /// class rather than the callable's lexical companion. None leaves the
+    /// alias route open when published ownership cannot establish that owner.
+    fn jvm_static_alias_owner_access(
+        &self,
+        declaration: SemanticId,
+        binary_owner: &[String],
+        package: JvmDeclarationAccessContext<'_>,
+        completion: &ResolutionCompletion,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<JvmDeclarationAccess>> {
+        let target = SelectedResolutionMountOrdinal::new(
+            declaration.ordinal().expect("a selected alias is local"),
+        );
+        let target_mount = self.mount_table().mount_by_ordinal(target)?;
+        let target_file = ProjectFile::new(
+            self.ready.project.root().to_path_buf(),
+            target_mount.persisted_relative_path(),
+        );
+        let typed = self.ready.typed_source();
+        let mut current = declaration;
+        let mut visited = HashSet::default();
+        let mut binary_owner_found = false;
+        let mut completion = completion.clone();
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(Some(JvmDeclarationAccess::Cancelled));
+            }
+            assert!(
+                visited.insert(current),
+                "selected declaration owners are acyclic"
+            );
+            let Some(unit) =
+                self.java_selected_type_unit(target, &target_file, current, cancellation)?
+            else {
+                return Ok(if cancellation.is_cancelled() {
+                    Some(JvmDeclarationAccess::Cancelled)
+                } else {
+                    None
+                });
+            };
+            let is_type = unit.kind() == brokk_bifrost_core::analyzer::model::CodeUnitType::Class;
+            if current != declaration && !is_type {
+                return Ok(None);
+            }
+            if is_type
+                && unit
+                    .fq()
+                    .resolved_segments()
+                    .map(|(spelling, _)| spelling)
+                    .eq(binary_owner.iter().map(String::as_str))
+            {
+                binary_owner_found = true;
+            }
+            if binary_owner_found {
+                completion = match self.jvm_declaration_access(
+                    current,
+                    package,
+                    &completion,
+                    cancellation,
+                )? {
+                    JvmDeclarationAccess::Ready(completion) => completion,
+                    decision => return Ok(Some(decision)),
+                };
+            }
+            let mut owners = Vec::new();
+            let outcome = typed.visit_member_owner_pages_for_definitions(
+                TypedFactRequest::new(&[current]),
+                cancellation,
+                &mut FactPageVisitor::new(&mut |page| {
+                    owners.extend(page.iter().map(|row| row.row().owner_definition()));
+                    Ok(true)
+                }),
+            )?;
+            if outcome.is_cancelled() {
+                return Ok(Some(JvmDeclarationAccess::Cancelled));
+            }
+            if !outcome.is_exhausted() || outcome.evidence() != &ResolutionCompletion::Complete {
+                return Ok(None);
+            }
+            owners.sort_unstable();
+            owners.dedup();
+            assert!(owners.len() <= 1, "one selected declaration has one owner");
+            match owners.pop() {
+                Some(owner) => current = owner,
+                None => {
+                    if unit.declaration_segment_count() != 1 {
+                        return Ok(None);
+                    }
+                    // A top-level callable or field has no declared source
+                    // owner. Its source-proven alias establishes the facade;
+                    // source-set and declaration access were checked above.
+                    let file_facade = current == declaration && !is_type;
+                    return Ok((binary_owner_found || file_facade)
+                        .then_some(JvmDeclarationAccess::Ready(completion)));
+                }
+            }
+        }
     }
 
     fn jvm_open_owner_alias_imports(
@@ -2987,7 +3439,7 @@ impl SelectedResolutionOperation<'_, '_> {
         caller_path: &str,
         target_version: Option<i64>,
         target_path: &str,
-        relation: JvmPackageRelation,
+        relation: JvmDeclarationAccessContext<'_>,
         candidate_origin_rank: Option<u32>,
         completion: ResolutionCompletion,
         cancellation: &CancellationToken,
@@ -3061,20 +3513,166 @@ impl SelectedResolutionOperation<'_, '_> {
         ))
     }
 
+    fn jvm_boundary_access(
+        &self,
+        boundary: &brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary<
+            SemanticId,
+        >,
+        caller: JvmDeclarationAccessContext<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::analyzer::resolution::DeclarationAccessDecision> {
+        use crate::analyzer::resolution::DeclarationAccessDecision;
+        use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+        let typed = self.ready.typed_source();
+        let lexical = self.ready.lexical_source();
+        let mut templates = Vec::new();
+        let mut known = false;
+        if let DeclarationAccessBoundary::Template(_) = boundary {
+            let mut reference = caller.reference;
+            if reference.is_none()
+                && let Some(node) = caller.source_node
+            {
+                let Some(rows) = self.jvm_endpoint_classifications(node, cancellation)? else {
+                    return Ok(DeclarationAccessDecision::Unknown);
+                };
+                reference = rows.iter().find_map(|row| row.reference());
+            }
+
+            if let Some(token) = caller.import_token
+                && let (Some(ordinal), Some(key)) = (token.ordinal(), token.local_key())
+            {
+                let mount = self
+                    .ready
+                    .inventory
+                    .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+                // Import-token positions and declaration spans are canonical
+                // source facts. Exact type-body ownership selects the authored
+                // template, including locals without an indexed CodeUnit.
+                let mut statement = self.ready.inventory.connection().prepare_cached(
+                        "SELECT semantic.semantic_key
+                         FROM main.resolution_semantic_catalog AS token
+                         CROSS JOIN main.source_declarations AS source ON source.blob_id=token.blob_id
+                         CROSS JOIN main.source_scala_declarations AS template
+                           ON template.blob_id=source.blob_id AND template.declaration_id=source.declaration_id AND template.kind IN (1,2,3,4)
+                         CROSS JOIN main.source_native_declaration_bridges AS bridge ON bridge.blob_id=source.blob_id AND bridge.declaration_id=source.declaration_id
+                         CROSS JOIN main.resolution_semantic_sites AS semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition'
+                         WHERE token.blob_id=?1 AND token.local_key=?2 AND token.import_start_byte IS NOT NULL
+                           AND source.name_occurrence_id IS NOT NULL
+                           AND source.start_byte <= token.import_start_byte AND source.end_byte >= token.import_end_byte
+                           AND EXISTS (SELECT 1 FROM main.resolution_member_scope_properties AS body
+                             WHERE body.blob_id=semantic.blob_id AND body.definition_semantic_key=semantic.semantic_key AND body.scope_kind='type_body')"
+                    )?;
+                let owners = statement
+                    .query_map(rusqlite::params![mount.blob_id(), key], |row| {
+                        row.get::<_, u32>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                known = true;
+                templates.extend(
+                    owners
+                        .into_iter()
+                        .map(|key| SemanticId::local(ordinal, key)),
+                );
+            } else if let Some(reference) = reference {
+                let Some(endpoints) = typed.jvm_access_endpoints(&[reference], cancellation)?
+                else {
+                    return Ok(DeclarationAccessDecision::Unknown);
+                };
+                for endpoint in endpoints {
+                    known = true;
+                    templates.extend(endpoint.enclosing_templates);
+                }
+            } else if let Some(scope_head) = caller.scope_head {
+                let owners = lexical.scope_owners_for_heads(&[scope_head], cancellation)?;
+                let definitions = owners
+                    .iter()
+                    .map(|owner| owner.definition())
+                    .collect::<Vec<_>>();
+                let Some(endpoints) = typed.jvm_access_endpoints(&definitions, cancellation)?
+                else {
+                    return Ok(DeclarationAccessDecision::Unknown);
+                };
+                for endpoint in endpoints {
+                    known = true;
+                    if owners.iter().any(|owner| {
+                        owner.definition() == endpoint.semantic && owner.is_type_body()
+                    }) {
+                        templates.push(endpoint.semantic);
+                    }
+                    templates.extend(endpoint.enclosing_templates);
+                }
+            }
+        }
+        let mut companions = crate::hash::HashSet::default();
+        if let DeclarationAccessBoundary::Template(owner) = boundary {
+            let requests = templates
+                .iter()
+                .copied()
+                .chain(std::iter::once(*owner))
+                .collect::<Vec<_>>();
+            for chunk in requests.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+                let outcome =
+                    typed.visit_companion_relation_pages_for_enclosing_types(
+                        TypedFactRequest::new(chunk),
+                        cancellation,
+                        &mut FactPageVisitor::new(&mut |page| {
+                            companions.extend(page.iter().map(|row| {
+                                (row.row().enclosing_type(), row.row().companion_type())
+                            }));
+                            Ok(true)
+                        }),
+                    )?;
+                if outcome.is_cancelled()
+                    || !outcome.is_exhausted()
+                    || outcome.evidence() != &ResolutionCompletion::Complete
+                {
+                    return Ok(DeclarationAccessDecision::Unknown);
+                }
+            }
+        }
+        Ok(super::java_access::boundary_access_decision(
+            boundary,
+            caller.caller_package,
+            known.then_some(templates.as_slice()),
+            &companions,
+        ))
+    }
+
     fn jvm_bridge_visibility(
         &self,
         definition: SemanticId,
-        package: JvmPackageRelation,
+        package: JvmDeclarationAccessContext<'_>,
         cancellation: &CancellationToken,
     ) -> Result<Option<SelectedJvmBridgeVisibility>> {
-        let Some(visibilities) = self.jvm_declaration_visibilities(definition, cancellation)?
-        else {
+        let Some(properties) = self.jvm_declaration_visibilities(definition, cancellation)? else {
             return Ok(None);
         };
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        Ok(match (visibilities.as_ref(), package) {
+        let visibilities = properties
+            .iter()
+            .map(|row| row.visibility())
+            .collect::<Vec<_>>();
+        let boundaries = properties
+            .iter()
+            .filter_map(|row| row.boundary())
+            .collect::<Vec<_>>();
+        if let [boundary] = boundaries.as_slice() {
+            use crate::analyzer::resolution::DeclarationAccessDecision;
+            return Ok(
+                match self.jvm_boundary_access(boundary, package, cancellation)? {
+                    DeclarationAccessDecision::Allowed => Some(SelectedJvmBridgeVisibility::Scoped),
+                    DeclarationAccessDecision::Denied
+                        if visibilities == [DeclaredVisibility::Private] =>
+                    {
+                        None
+                    }
+                    _ => Some(SelectedJvmBridgeVisibility::Open),
+                },
+            );
+        }
+        Ok(match (visibilities.as_slice(), package.relation) {
             ([DeclaredVisibility::Public], _) => Some(SelectedJvmBridgeVisibility::Public),
             ([DeclaredVisibility::Protected], JvmPackageRelation::Same) => {
                 Some(SelectedJvmBridgeVisibility::Protected)
@@ -3168,6 +3766,7 @@ impl SelectedResolutionOperation<'_, '_> {
             kind: ResolutionImportRouteKind,
         }
         let mut static_import_searches = BTreeMap::new();
+        let mut open_jvm_alias_imports = Vec::new();
         let mut scoped_gaps = Vec::new();
         for import in imports {
             let SelectedRootPathHalf::Import {
@@ -3229,25 +3828,27 @@ impl SelectedResolutionOperation<'_, '_> {
             }
             let demand_recipe = recipes.pop().expect("one import demand");
             let mut owner_found = false;
+            let member_import = JavaMemberImportDemand {
+                import_kind: Some(import_kind),
+                caller_package: source_package.as_deref(),
+                source: source.fragment(),
+                token,
+                prefix_reference: None,
+                scope_head: None,
+                anchor,
+                anchor_semantic,
+                selector_kind: None,
+                import_precedence: None,
+                candidate_origin_rank: None,
+                route: &recipes,
+                lookup_route: &recipes,
+                demand: &demand_recipe,
+                language: Language::Java,
+            };
             let Some(member_inventory) = self.jvm_type_member_import_candidates(
                 context_id,
                 file_version,
-                &JavaMemberImportDemand {
-                    import_kind: Some(import_kind),
-                    source: source.fragment(),
-                    caller_package: source_package.as_deref(),
-                    token,
-                    prefix_reference: None,
-                    anchor,
-                    anchor_semantic,
-                    selector_kind: None,
-                    import_precedence: None,
-                    candidate_origin_rank: None,
-                    route: &recipes,
-                    lookup_route: &recipes,
-                    demand: &demand_recipe,
-                    language: Language::Java,
-                },
+                &member_import,
                 &ResolutionCompletion::Complete,
                 cancellation,
                 &mut owner_found,
@@ -3284,7 +3885,23 @@ impl SelectedResolutionOperation<'_, '_> {
             match kind {
                 "single_static" | "static_on_demand" => {
                     let member = demand_recipe.spelling().to_string();
-                    if !owner_found {
+                    let Some(alias_import_bridges) = self.jvm_alias_import_bridges(
+                        &member_import,
+                        &member,
+                        file_version,
+                        source.persisted_relative_path(),
+                        context_id,
+                        cancellation,
+                    )?
+                    else {
+                        return Ok(JvmImportContext::Cancelled);
+                    };
+                    let JvmAliasImportBridges {
+                        bridges: alias_bridges,
+                        open_imports: open_aliases,
+                        found_alias: alias_route_found,
+                    } = alias_import_bridges;
+                    if !owner_found && !alias_route_found {
                         let owner = recipes
                             .iter()
                             .map(ResolutionLookupSemanticRecipe::spelling)
@@ -3301,8 +3918,10 @@ impl SelectedResolutionOperation<'_, '_> {
                         return Ok(JvmImportContext::Cancelled);
                     };
                     let search_complete = static_search_complete
+                        && open_aliases.is_empty()
                         && static_members
                             .iter()
+                            .chain(&alias_bridges)
                             .all(|bridge| bridge.completion() == &ResolutionCompletion::Complete);
                     let search = static_import_searches
                         .entry((import_route.source_site, import_route.staged))
@@ -3314,8 +3933,27 @@ impl SelectedResolutionOperation<'_, '_> {
                             kind: import_kind,
                         });
                     search.complete &= search_complete;
-                    search.found |= !static_members.is_empty();
+                    search.found |= !static_members.is_empty() || !alias_bridges.is_empty();
                     bridges.extend(static_members);
+                    bridges.extend(alias_bridges);
+                    for open_alias in &open_aliases {
+                        scoped_gaps.push(self.jvm_import_context_gap(
+                            JvmImportContextGapSpec {
+                                context_id,
+                                source: source.fragment(),
+                                source_token: token,
+                                source_reference: None,
+                                kind: "jvm-import-alias-route-open",
+                                owner: Some(open_alias.clone()),
+                                lookup: demand_recipe.clone(),
+                                detail: format!(
+                                    "Java static alias route `{open_alias}` has compiler-dependent or unsupported provenance"
+                                ),
+                            },
+                            cancellation,
+                        )?);
+                    }
+                    open_jvm_alias_imports.extend(open_aliases);
                     continue;
                 }
                 "single_type" => {
@@ -3333,6 +3971,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             caller_package: source_package.as_deref(),
                             token,
                             prefix_reference: None,
+                            scope_head: None,
                             anchor,
                             anchor_semantic,
                             selector_kind: None,
@@ -3510,6 +4149,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     caller_package: source_package.as_deref(),
                     token,
                     prefix_reference: None,
+                    scope_head: None,
                     anchor,
                     anchor_semantic,
                     selector_kind: None,
@@ -3575,7 +4215,10 @@ impl SelectedResolutionOperation<'_, '_> {
                             }
                             let access = match self.jvm_declaration_access(
                                 member.definition,
-                                JvmPackageRelation::Same,
+                                JvmDeclarationAccessContext::between(
+                                    source_package.as_deref(),
+                                    source_package.as_deref().unwrap_or(""),
+                                ),
                                 &access,
                                 cancellation,
                             )? {
@@ -3651,7 +4294,7 @@ impl SelectedResolutionOperation<'_, '_> {
             ))),
             external_static_imports,
             inventory_reason: Some(reason),
-            open_jvm_alias_imports: Vec::new(),
+            open_jvm_alias_imports,
             scoped_gaps,
         })
     }
@@ -3952,15 +4595,62 @@ impl SelectedResolutionOperation<'_, '_> {
     fn jvm_declaration_access(
         &self,
         definition: SemanticId,
-        package: JvmPackageRelation,
+        package: JvmDeclarationAccessContext<'_>,
         completion: &ResolutionCompletion,
         cancellation: &CancellationToken,
     ) -> Result<JvmDeclarationAccess> {
-        let Some(visibilities) = self.jvm_declaration_visibilities(definition, cancellation)?
-        else {
+        let Some(properties) = self.jvm_declaration_visibilities(definition, cancellation)? else {
             return Ok(JvmDeclarationAccess::Cancelled);
         };
-        let known = match (visibilities.as_ref(), package) {
+        if cancellation.is_cancelled() {
+            return Ok(JvmDeclarationAccess::Cancelled);
+        }
+        let mut visibilities = properties
+            .iter()
+            .map(|row| row.visibility())
+            .collect::<Vec<_>>();
+        let boundaries = properties
+            .iter()
+            .filter_map(|row| row.boundary())
+            .collect::<Vec<_>>();
+        if let [boundary] = boundaries.as_slice() {
+            use crate::analyzer::resolution::DeclarationAccessDecision;
+            match self.jvm_boundary_access(boundary, package, cancellation)? {
+                DeclarationAccessDecision::Allowed => {
+                    return Ok(JvmDeclarationAccess::Ready(completion.clone()));
+                }
+                DeclarationAccessDecision::Denied
+                    if visibilities == [DeclaredVisibility::Private] =>
+                {
+                    return Ok(JvmDeclarationAccess::Excluded);
+                }
+                _ if visibilities == [DeclaredVisibility::Protected] => {
+                    let caller_ordinal = package
+                        .reference
+                        .or(package.import_token)
+                        .and_then(SemanticId::ordinal)
+                        .or_else(|| package.source_node.and_then(BindingNodeId::ordinal))
+                        .or_else(|| package.scope_head.and_then(BindingNodeId::ordinal));
+                    if let Some(ordinal) = caller_ordinal
+                        && self
+                            .ready
+                            .inventory
+                            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?
+                            .semantic_language()
+                            == Language::Scala
+                    {
+                        // The Scala route remains subject to shared subclass
+                        // refinement. An unrelated import gap would survive
+                        // that exact access decision. Cross-language bridges
+                        // still carry open visibility evidence below.
+                        return Ok(JvmDeclarationAccess::Ready(completion.clone()));
+                    }
+                    visibilities.clear();
+                }
+                _ => visibilities.clear(),
+            }
+        }
+        let known = match (visibilities.as_slice(), package.relation) {
             ([DeclaredVisibility::Public], _) => true,
             // Imports are outside a subclass body, so protected access cannot
             // authorize a cross-package import even when a declared class in
@@ -4286,6 +4976,12 @@ fn package_path_agrees_with_file_path(package: &str, file_path: &str) -> bool {
             .all(|(component, segment)| component.as_os_str() == std::ffi::OsStr::new(segment))
 }
 
+/// JLS name classification does not select a member or close its hierarchy.
+/// Java's typed member resolver owns those independent claims.
+pub(super) const fn jvm_prefix_defers_member_selection(language: Language) -> bool {
+    matches!(language, Language::Java)
+}
+
 pub(super) fn is_jvm_language(language: Language) -> bool {
     matches!(
         language,
@@ -4608,6 +5304,15 @@ fn register_jvm_external_provider_type_identities(
             [owner] => identities.external_owner_semantic(owner, names),
             _ => jvm_external_provider_type_identity(&ordered_providers, lookup.spelling(), names),
         };
+        if source_language == Language::Java
+            && ordered_providers.as_slice() == [JvmImplicitRootProvider::Package("java.lang")]
+            && durable_matches.is_empty()
+        {
+            identities.record_jvm_unindexed_import_owner(
+                identity,
+                &format!("java.lang.{}", lookup.spelling()),
+            );
+        }
         let provider_names = ordered_providers
             .iter()
             .map(|provider| match provider {
@@ -4687,6 +5392,14 @@ fn register_jvm_external_provider_type_identities(
                     names,
                 ),
             };
+            if durable.is_empty() {
+                // This names the type selected by the implicit provider; it
+                // supplies no declaration, hierarchy or member inventory.
+                identities.record_jvm_unindexed_import_owner(
+                    identity,
+                    &format!("java.lang.{}", lookup.spelling()),
+                );
+            }
             let mut boundary_hash = CanonicalIdentityDescriptor::new(
                 b"bifrost-jvm-external-provider-enumeration-boundary:v1",
                 |key| selected_identity_content_digest(identities, lexical, key, cancellation),
@@ -4701,9 +5414,8 @@ fn register_jvm_external_provider_type_identities(
                 ),
             );
             for reference in references {
-                identities.record_jvm_external_provider_type_identity(
+                identities.record_jvm_implicit_nominal_fallback(
                     reference,
-                    enumeration_boundary,
                     identity,
                     enumeration_boundary,
                 );
@@ -4746,6 +5458,7 @@ pub(super) struct JvmMemberImportKey {
     source: BindingFragmentId,
     token: SemanticId,
     prefix_reference: Option<SemanticId>,
+    scope_head: Option<BindingNodeId>,
     anchor: ResolutionRootImportAnchor,
     anchor_semantic: SemanticId,
     selector_kind: Option<ResolutionImportSelectorKind>,
@@ -4770,6 +5483,7 @@ struct JavaMemberImportDemand<'a> {
     source: BindingFragmentId,
     token: SemanticId,
     prefix_reference: Option<SemanticId>,
+    scope_head: Option<BindingNodeId>,
     anchor: ResolutionRootImportAnchor,
     anchor_semantic: SemanticId,
     selector_kind: Option<ResolutionImportSelectorKind>,
@@ -4972,6 +5686,7 @@ impl SelectedResolutionOperation<'_, '_> {
     ) -> Result<Option<JvmRoutePublication>> {
         let SelectedRootPathHalf::Import {
             identity,
+            source_scope_head,
             token,
             route,
             demand,
@@ -5043,7 +5758,12 @@ impl SelectedResolutionOperation<'_, '_> {
             // check the selected member's declaration visibility below.
             let access = match self.jvm_declaration_access(
                 definition,
-                JvmPackageRelation::between(caller_package.as_deref(), unit.package_name()),
+                JvmDeclarationAccessContext::between(
+                    caller_package.as_deref(),
+                    unit.package_name(),
+                )
+                .with_scope(Some(*source_scope_head))
+                .with_import(*token),
                 completion,
                 cancellation,
             )? {
@@ -5070,6 +5790,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 source: identity.fragment(),
                 token: *token,
                 prefix_reference: None,
+                scope_head: Some(*source_scope_head),
                 anchor: *anchor,
                 anchor_semantic: *anchor_semantic,
                 selector_kind: selector.as_ref().map(|selector| selector.kind),
@@ -5259,11 +5980,13 @@ impl SelectedResolutionOperation<'_, '_> {
                     .segments
                     .iter()
                     .map(|(_, spelling)| {
-                        ResolutionLookupSemanticRecipe::new(
+                        self.jvm_generated_lookup(
                             Language::Scala,
                             ResolutionNamespace::Type,
                             spelling,
                         )
+                        .recipe
+                        .clone()
                     })
                     .collect::<Vec<_>>();
                 let package_segments = identity
@@ -5526,6 +6249,7 @@ impl SelectedResolutionOperation<'_, '_> {
             source: import.source,
             token: import.token,
             prefix_reference: import.prefix_reference,
+            scope_head: import.scope_head,
             anchor: import.anchor,
             anchor_semantic: import.anchor_semantic,
             selector_kind: import.selector_kind,
@@ -5623,7 +6347,10 @@ impl SelectedResolutionOperation<'_, '_> {
                     .expect("a type-member continuation runs only for an adopting language")
             };
             let targets = self.jvm_import_targets(mounts, &package)?;
-            let relation = JvmPackageRelation::between(import.caller_package, &package);
+            let relation = JvmDeclarationAccessContext::between(import.caller_package, &package)
+                .with_reference(import.prefix_reference)
+                .with_scope(import.scope_head)
+                .with_import(import.token);
             let caller_mount = self
                 .mount_table()
                 .mount_for_fragment(import.source)?
@@ -5648,12 +6375,15 @@ impl SelectedResolutionOperation<'_, '_> {
                         _ => ResolutionNamespace::Type,
                     }
                 };
-                let outer_lookup = ResolutionLookupSemanticRecipe::new(
-                    target_language,
-                    outer_namespace,
-                    import.lookup_route[package_length].spelling(),
-                )
-                .semantic(&names);
+                let outer_lookup = self
+                    .jvm_generated_lookup(
+                        target_language,
+                        outer_namespace,
+                        import.lookup_route[package_length].spelling(),
+                    )
+                    .recipe
+                    .clone()
+                    .semantic(&names);
                 // Classify the selected owner's declarations in its own
                 // language; Scala methods also occupy the term namespace.
                 let callables_in_value = language_callables_occupy_value_namespace(target_language);
@@ -6131,11 +6861,11 @@ impl SelectedResolutionOperation<'_, '_> {
                             )? else {
                                 return Ok(None);
                             };
-                            let target_demand = ResolutionLookupSemanticRecipe::new(
+                            let target_demand = self.jvm_generated_lookup(
                                 target_language,
                                 import.demand.namespace(),
                                 import.demand.spelling(),
-                            );
+                                ).recipe.clone();
                             let bridge = SelectedRootBridgeDescriptor::from_selected_path_tokens_with_jvm_evidence(
                                 import.source,
                                 import.language,
@@ -6475,7 +7205,11 @@ impl SelectedResolutionOperation<'_, '_> {
                         StoreError::corrupt("Java export lacks a declaration endpoint")
                     })?;
                 let bridge_completion = source_access.clone();
-                let relation = JvmPackageRelation::between(import.caller_package, &spelling);
+                let relation =
+                    JvmDeclarationAccessContext::between(import.caller_package, &spelling)
+                        .with_reference(import.prefix_reference)
+                        .with_scope(import.scope_head)
+                        .with_import(import.token);
                 let bridge_completion = match self.jvm_declaration_access(
                     definition_semantic,
                     relation,
@@ -6702,6 +7436,8 @@ impl SelectedResolutionOperation<'_, '_> {
         let SelectedRootPathHalf::Reference {
             identity,
             prefix_reference,
+            source_scope_head,
+            source_reference,
             route,
             token,
             anchor,
@@ -6783,7 +7519,10 @@ impl SelectedResolutionOperation<'_, '_> {
         let mut selected_targets = BTreeSet::new();
         let mut route_complete =
             completion == &ResolutionCompletion::Complete && !targets.ordered.is_empty();
-        let relation = JvmPackageRelation::between(caller_package.as_deref(), &package);
+        let relation = JvmDeclarationAccessContext::between(caller_package.as_deref(), &package)
+            .with_reference(*prefix_reference)
+            .with_scope(Some(*source_scope_head))
+            .with_source_node(*source_reference);
         for (ordinal, target_version) in targets.ordered.iter().copied() {
             if cancellation.is_cancelled() {
                 return Ok(None);
@@ -6809,11 +7548,10 @@ impl SelectedResolutionOperation<'_, '_> {
                 continue;
             };
             route_complete &= access == ResolutionCompletion::Complete;
-            let target_lookup = ResolutionLookupSemanticRecipe::new(
-                target_language,
-                source_namespace,
-                source_demand.spelling(),
-            );
+            let target_lookup = self
+                .jvm_generated_lookup(target_language, source_namespace, source_demand.spelling())
+                .recipe
+                .clone();
             let target_lookup_semantic = target_lookup.semantic(&names);
             let SelectedPackageRows::Ready(package_members) = self.jvm_package_members_for_lookup(
                 target_ordinal,
@@ -6981,6 +7719,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 source: identity.fragment(),
                 token: *token,
                 prefix_reference: *prefix_reference,
+                scope_head: Some(*source_scope_head),
                 anchor: *anchor,
                 anchor_semantic: *anchor_semantic,
                 selector_kind: None,
@@ -7032,6 +7771,8 @@ impl SelectedResolutionOperation<'_, '_> {
         let SelectedRootPathHalf::Reference {
             identity,
             prefix_reference: Some(prefix_reference),
+            source_scope_head,
+            source_reference,
             route,
             token,
             anchor,
@@ -7051,7 +7792,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .mount_for_fragment(identity.fragment())?
             .expect("selected source half has its mount");
         let source_language = source_mount.semantic_language();
-        if !matches!(source_language, Language::Kotlin | Language::Scala) {
+        if !is_jvm_language(source_language) {
             return Ok(Some(JvmRoutePublication {
                 bridges: Vec::new(),
                 selected_targets: BTreeSet::new(),
@@ -7084,13 +7825,17 @@ impl SelectedResolutionOperation<'_, '_> {
         let source_demand = recipes.pop().expect("qualified type demand");
         // The selected prefix may itself be the whole receiver, leaving only
         // the terminal member demand in this half's route.
-        if !matches!(
-            source_demand.namespace(),
-            ResolutionNamespace::Type
-                | ResolutionNamespace::Value
-                | ResolutionNamespace::Callable
-                | ResolutionNamespace::TypeOrValue
-        ) {
+        if (jvm_prefix_defers_member_selection(source_language)
+            && (source_demand.namespace() != ResolutionNamespace::Type
+                || prefix_targets.len() != 1))
+            || !matches!(
+                source_demand.namespace(),
+                ResolutionNamespace::Type
+                    | ResolutionNamespace::Value
+                    | ResolutionNamespace::Callable
+                    | ResolutionNamespace::TypeOrValue
+            )
+        {
             return Ok(Some(JvmRoutePublication {
                 bridges: Vec::new(),
                 selected_targets: BTreeSet::new(),
@@ -7205,7 +7950,9 @@ impl SelectedResolutionOperation<'_, '_> {
         // Member-owner pages enumerate direct declarations. An empty result
         // from another file cannot discharge the qualified path's hierarchy
         // placeholder because this route does not traverse that owner's bases.
-        if candidates.is_empty() && !owners_are_in_caller_file {
+        if candidates.is_empty()
+            && (jvm_prefix_defers_member_selection(source_language) || !owners_are_in_caller_file)
+        {
             route_complete = false;
         }
 
@@ -7226,8 +7973,13 @@ impl SelectedResolutionOperation<'_, '_> {
                 continue;
             }
             let target_record = self.ready.inventory.mount_record_by_ordinal(target_mount)?;
-            let relation =
-                JvmPackageRelation::between(caller_package.as_deref(), unit.package_name());
+            let relation = JvmDeclarationAccessContext::between(
+                caller_package.as_deref(),
+                unit.package_name(),
+            )
+            .with_reference(Some(*prefix_reference))
+            .with_scope(Some(*source_scope_head))
+            .with_source_node(*source_reference);
             let Some(access) = self.jvm_qualified_source_access_completion(
                 source_language,
                 context,
@@ -7623,6 +8375,7 @@ impl SelectedResolutionOperation<'_, '_> {
             source: identity.fragment(),
             token: *token,
             prefix_reference: *prefix_reference,
+            scope_head: None,
             anchor: *anchor,
             anchor_semantic: *anchor_semantic,
             selector_kind: None,
@@ -7668,6 +8421,7 @@ impl SelectedResolutionOperation<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -7984,6 +8738,83 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#5331: exact static alias endpoints dropped target scoped binder gaps")]
+    fn selected_jvm_alias_declaration_gaps_stay_scoped() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        // No root export is needed: these are the persisted lexical binder
+        // endpoints of a member and a declaration in an unrelated scope.
+        connection
+            .execute_batch(
+                "CREATE TABLE resolution_paths (
+                    blob_id INTEGER NOT NULL, path INTEGER NOT NULL,
+                    start_node INTEGER NOT NULL, end_node INTEGER NOT NULL,
+                    start_lead_identity INTEGER, end_lead_identity INTEGER,
+                    end_lead_local INTEGER,
+                    PRIMARY KEY(blob_id, path)
+                 ) STRICT;
+                 CREATE INDEX resolution_paths_reverse ON resolution_paths (
+                    blob_id, end_node, end_lead_identity, end_lead_local, path);
+                 CREATE TABLE resolution_gaps (
+                    blob_id INTEGER NOT NULL, covers INTEGER NOT NULL,
+                    subject INTEGER NOT NULL, lookup INTEGER NOT NULL,
+                    gap INTEGER NOT NULL, reason INTEGER NOT NULL,
+                    PRIMARY KEY(blob_id, covers, subject, lookup, gap)
+                 ) WITHOUT ROWID, STRICT;
+                 CREATE TABLE resolution_gap_reasons (
+                    blob_id INTEGER NOT NULL, reason INTEGER NOT NULL,
+                    origin INTEGER NOT NULL, PRIMARY KEY(blob_id, reason)
+                 ) WITHOUT ROWID, STRICT;
+                 INSERT INTO resolution_paths VALUES
+                    (7, 1, 100, 10, 5, NULL, NULL),
+                    (7, 2, 200, 20, 5, NULL, NULL),
+                    (7, 3, -1, 10, 5, NULL, NULL),
+                    (7, 4, 300, 10, 5, 5, NULL),
+                    (7, 5, 400, 10, NULL, NULL, NULL);
+                 INSERT INTO resolution_gaps VALUES
+                    (7, 6, 10, 0, 1, 1000),
+                    (7, 5, 100, 0, 2, 1001),
+                    (7, 5, 100, 17, 3, 1002),
+                    (7, 5, 200, 0, 4, 1003),
+                    (8, 5, 100, 0, 1, 1004),
+                    (7, 5, -1, 0, 5, 1005),
+                    (7, 6, 10, 0, 6, 1006),
+                    (7, 5, 300, 0, 7, 1007),
+                    (7, 5, 400, 0, 8, 1008);",
+            )
+            .unwrap();
+        let origin = super::super::super::resolution_prepare::resolution_rows::gap_origin_code(
+            crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                ResolutionGapKind::UnsupportedScopeOrBinder,
+            ),
+        );
+        let other_origin =
+            super::super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                    ResolutionGapKind::UnexpandedItemMacro,
+                ),
+            );
+        connection
+            .execute(
+                "INSERT INTO resolution_gap_reasons
+                 SELECT DISTINCT blob_id, reason,
+                    CASE WHEN reason=1006 THEN ?2 ELSE ?1 END
+                 FROM resolution_gaps",
+                rusqlite::params![origin, other_origin],
+            )
+            .unwrap();
+        let mut reasons = connection
+            .prepare(SELECTED_JVM_ALIAS_DECLARATION_GAPS)
+            .unwrap()
+            .query_map(rusqlite::params![7, 10, origin], |row| row.get::<_, u32>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        reasons.sort_unstable();
+        assert_eq!(reasons, [1000, 1001, 1002]);
+    }
+
+    #[test]
+    #[hardwon("#5331: Java static imports ignored persisted Kotlin JVM aliases")]
     fn selected_jvm_alias_reader_seeks_the_selected_blob_primary_key() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
@@ -7993,8 +8824,12 @@ mod tests {
                     alias INTEGER NOT NULL,
                     declaration_site INTEGER NOT NULL,
                     member_name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'source_proven', 'compiler_mode_dependent')),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'field', 'getter', 'setter', 'method', 'constructor',
+                        'companion_object', 'singleton_instance')),
+                    is_static INTEGER NOT NULL CHECK(is_static IN (0, 1)),
                     PRIMARY KEY(blob_id, alias)
                  ) STRICT;
                  CREATE TABLE resolution_semantic_sites (
@@ -8008,14 +8843,143 @@ mod tests {
                  WITH RECURSIVE blobs(blob_id) AS (
                     SELECT 1 UNION ALL SELECT blob_id + 1 FROM blobs WHERE blob_id < 2000
                  )
+                 , aliases(alias) AS (
+                    SELECT 1 UNION ALL SELECT alias + 1 FROM aliases WHERE alias < 32
+                 )
                  INSERT INTO resolution_jvm_aliases
                  SELECT blob_id, 1, 1,
                         CASE WHEN blob_id = 7 THEN 'member' ELSE 'other' END,
-                        'source_proven', 'field'
+                        'source_proven', 'method', 1
                  FROM blobs;
+                 INSERT INTO resolution_jvm_aliases
+                 VALUES (7, 2, 2, 'member', 'source_proven', 'method', 0),
+                        (7, 3, 3, 'member', 'compiler_mode_dependent', 'method', 1);
                  INSERT INTO resolution_semantic_sites
-                 SELECT blob_id, 1, 'definition', 1 FROM resolution_jvm_aliases;",
+                 SELECT blob_id, alias, 'definition', alias FROM resolution_jvm_aliases;",
             )
+            .unwrap();
+
+        let mut rows = connection
+            .prepare(SELECTED_JVM_ALIAS_BY_BLOB_AND_MEMBER)
+            .unwrap()
+            .query_map(rusqlite::params![7, "member"], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.sort_by_key(|row| row.0);
+        assert_eq!(
+            rows,
+            [
+                (
+                    1,
+                    1,
+                    "source_proven".to_owned(),
+                    1,
+                    "method".to_owned(),
+                    true
+                ),
+                (
+                    2,
+                    2,
+                    "source_proven".to_owned(),
+                    2,
+                    "method".to_owned(),
+                    false
+                ),
+                (
+                    3,
+                    3,
+                    "compiler_mode_dependent".to_owned(),
+                    3,
+                    "method".to_owned(),
+                    true
+                ),
+            ]
+        );
+
+        let pin = crate::analyzer::store::planner_statistics::pinned_plans::pinned(
+            "jvm_native_alias_member_by_blob",
+        );
+        for state in brokk_bifrost_core::cache_gc::PlannerStatisticsState::BOTH {
+            state.install(&connection);
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", pin.sql))
+                .unwrap();
+            let plan = statement
+                .query_map(rusqlite::params![7, "member"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| {
+                    step.contains("SEARCH alias USING") && step.contains("(blob_id=?)")
+                }),
+                "{state}: selected blob must bound the alias lookup: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("SCAN alias")),
+                "{state}: alias lookup must not scan the workspace table: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: KotlinPoet alias probes scanned every alias in a selected blob"
+    )]
+    fn selected_jvm_alias_reader_seeks_the_selected_blob_and_member() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE resolution_jvm_aliases (
+                    blob_id INTEGER NOT NULL,
+                    alias INTEGER NOT NULL,
+                    declaration_site INTEGER NOT NULL,
+                    member_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    is_static INTEGER NOT NULL CHECK(is_static IN (0, 1)),
+                    PRIMARY KEY(blob_id, alias)
+                 ) STRICT;
+                 CREATE TABLE resolution_semantic_sites (
+                    blob_id INTEGER NOT NULL,
+                    source_site INTEGER NOT NULL,
+                    semantic_role TEXT NOT NULL,
+                    semantic_key INTEGER NOT NULL,
+                    PRIMARY KEY(blob_id, source_site),
+                    UNIQUE(blob_id, semantic_role, semantic_key)
+                 ) WITHOUT ROWID;
+                 WITH RECURSIVE blobs(blob_id) AS (
+                    SELECT 1 UNION ALL SELECT blob_id + 1 FROM blobs WHERE blob_id < 2000
+                 )
+                 , aliases(alias) AS (
+                    SELECT 1 UNION ALL SELECT alias + 1 FROM aliases WHERE alias < 32
+                 )
+                 INSERT INTO resolution_jvm_aliases
+                 SELECT blob_id, alias, 1,
+                        CASE WHEN blob_id = 7 AND alias = 1 THEN 'member' ELSE 'other' END,
+                        'source_proven', 'field', 1
+                 FROM blobs CROSS JOIN aliases;
+                 INSERT INTO resolution_semantic_sites
+                 SELECT DISTINCT blob_id, 1, 'definition', 1 FROM resolution_jvm_aliases;",
+            )
+            .unwrap();
+
+        connection
+            .execute_batch(include_str!(
+                "../../../../../bifrost-core/migrations/cache/0186-jvm-alias-member-index.sql"
+            ))
             .unwrap();
 
         let rows = connection
@@ -8028,6 +8992,7 @@ mod tests {
                     row.get::<_, String>(2)?,
                     row.get::<_, u32>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
                 ))
             })
             .unwrap()
@@ -8035,30 +9000,41 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows,
-            [(1, 1, "source_proven".to_owned(), 1, "field".to_owned())]
+            [(
+                1,
+                1,
+                "source_proven".to_owned(),
+                1,
+                "field".to_owned(),
+                true
+            )]
         );
 
-        let mut statement = connection
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN {SELECTED_JVM_ALIAS_BY_BLOB_AND_MEMBER}"
-            ))
-            .unwrap();
-        let plan = statement
-            .query_map(rusqlite::params![7, "member"], |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            plan.iter().any(|step| {
-                step.contains("SEARCH alias USING") && step.contains("(blob_id=?)")
-            }),
-            "selected blob must bound the alias lookup: {plan:?}"
-        );
-        assert!(
-            plan.iter().all(|step| !step.contains("SCAN alias")),
-            "alias lookup must not scan the workspace table: {plan:?}"
-        );
+        for statistics in ["", "ANALYZE"] {
+            connection.execute_batch(statistics).unwrap();
+            let mut statement = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {SELECTED_JVM_ALIAS_BY_BLOB_AND_MEMBER}"
+                ))
+                .unwrap();
+            let plan = statement
+                .query_map(rusqlite::params![7, "member"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| {
+                    step.contains("resolution_jvm_aliases_member_name")
+                        && step.contains("(blob_id=? AND member_name=?)")
+                }),
+                "both predicates must bound the alias read: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("SCAN alias")),
+                "{plan:?}"
+            );
+        }
     }
 }

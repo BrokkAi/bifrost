@@ -25,11 +25,12 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionDeferredMemberOwnerFact, ResolutionDefinitionUnitFact,
     ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind, ResolutionGapFact,
     ResolutionGapKind, ResolutionGenericFormalDefaultFact, ResolutionGenericFormalFact,
-    ResolutionGenericTypeAliasParameterFact, ResolutionIdentifierRole, ResolutionMemberAccess,
-    ResolutionMemberKind, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
-    ResolutionNameId, ResolutionNamespace, ResolutionReferenceEnumerationGapFact,
-    ResolutionReferenceOwnerFact, ResolutionRelationMemberFact, ResolutionRootExportFact,
-    ResolutionRootImportAnchor, ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
+    ResolutionGenericTypeAliasParameterFact, ResolutionIdentifierRole, ResolutionLocalWriteFact,
+    ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberOwnerFact,
+    ResolutionMemberQualifierCompatibility, ResolutionNameId, ResolutionNamespace,
+    ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact,
+    ResolutionRelationMemberFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
+    ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
     ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
     ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
     ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
@@ -157,19 +158,33 @@ struct PendingScope {
     callable: Option<ResolutionSiteId>,
 }
 
-/// One `let` binding waiting for the typed slot that its initializer
-/// expression produces.
-///
-/// `unwrap_layers` counts the `?`, `.unwrap()` and `.expect(..)` layers written
-/// between that expression and the binding. Each layer discharges one unproven
-/// `Option`/`Result` indirection layer through its own intermediate call-result
-/// slot, and the zero-delta `Initialization` transfer then carries the last one
-/// into the binding unchanged.
+/// One runtime value waiting for its expression's typed slot. Initializers
+/// retain their inferred declared value separately from the observed assignment.
+#[derive(Debug)]
+struct PendingRuntimeValue {
+    site: ResolutionSiteId,
+    destination: RuntimeValueDestination,
+    adjustments: Vec<RuntimeValueAdjustment>,
+}
+
+#[derive(Debug)]
+struct RuntimeValueAdjustment {
+    site: ResolutionSiteId,
+    kind: RuntimeValueAdjustmentKind,
+}
+
 #[derive(Clone, Copy, Debug)]
-struct PendingCallInitialization {
-    declaration: ResolutionSiteId,
-    target: ResolutionTypeSlotId,
-    unwrap_layers: usize,
+enum RuntimeValueAdjustmentKind {
+    Borrow,
+    Unwrap,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeValueDestination {
+    Initializer {
+        inferred: Option<ResolutionTypeSlotId>,
+    },
+    LocalWrite,
 }
 
 /// One lowered ordinary parameter a callable-parameter row can name, with the
@@ -377,7 +392,7 @@ pub(crate) struct RustResolutionBuilder<'source> {
     /// first use so a trait whose body writes no `Self::` path publishes
     /// nothing extra.
     trait_self_lower_bounds: HashMap<usize, ResolutionTypeSlotId>,
-    pending_call_initializations: HashMap<usize, Vec<PendingCallInitialization>>,
+    pending_runtime_values: HashMap<usize, Vec<PendingRuntimeValue>>,
     pending_receiver_slots: HashMap<usize, Vec<ResolutionTypeSlotId>>,
     /// Per `?` operand still to be lowered, the call-result slots its value
     /// reaches with one `Option`/`Result` layer removed.
@@ -518,7 +533,7 @@ impl<'source> RustResolutionBuilder<'source> {
             self_type_frontiers: HashMap::new(),
             trait_self_bound_scopes: HashMap::new(),
             trait_self_lower_bounds: HashMap::new(),
-            pending_call_initializations: HashMap::new(),
+            pending_runtime_values: HashMap::new(),
             pending_receiver_slots: HashMap::new(),
             pending_unwrapped_receiver_slots: HashMap::new(),
             prelude_fall_throughs: Vec::new(),
@@ -605,9 +620,9 @@ impl<'source> RustResolutionBuilder<'source> {
         assert!(self.exits.is_empty());
         assert!(self.pending_scopes.is_empty());
         assert!(
-            self.pending_call_initializations.is_empty(),
-            "every let initializer's producing expression is lowered: {:?}",
-            self.pending_call_initializations
+            self.pending_runtime_values.is_empty(),
+            "every pending runtime value's producing expression is lowered: {:?}",
+            self.pending_runtime_values
         );
 
         assert!(
@@ -750,7 +765,8 @@ impl<'source> RustResolutionBuilder<'source> {
         declaration
     }
 
-    /// Lower the items of a proven-passthrough item-macro invocation against
+    /// Lower the items of a proven source-preserving item macro (a passthrough
+    /// or the documented cfg_if grammar) against
     /// the identity declaration replay already gave them.
     ///
     /// `tree` is a copy of the tree replay parsed for this invocation (it shares
@@ -766,17 +782,22 @@ impl<'source> RustResolutionBuilder<'source> {
     /// The caller is the source walker, which has replay's graph borrowed at
     /// this point and has already read the classifier's answer. This lowering
     /// does not re-decide it.
-    pub(crate) fn lower_passthrough_item_macro(
+    pub(crate) fn lower_replayed_item_macro(
         &mut self,
         invocation: Node<'_>,
         tree: tree_sitter::Tree,
-        map: crate::declarations::RustEmbeddedSourceMap,
+        mut map: crate::declarations::RustEmbeddedSourceMap,
     ) -> crate::declarations::RustEmbeddedSourceMap {
         assert!(
             self.embedded_identity.is_none(),
             "one embedded replay tree is lowered at a time"
         );
         self.discharged_item_macros.insert(invocation.id());
+        let host = crate::imports::rust_import_owner(invocation, self.source, "");
+        let host_scope = host
+            .owner_scope
+            .map(|scope| self.source_collector.intern_node(scope));
+        map.inherit_import_scope(host_scope, &host.owner);
         self.embedded_identity = Some(map);
         self.replayed_member_owner =
             rust_trait_or_impl_member_owner(invocation).map(|owner| MemberOwner {
@@ -792,9 +813,9 @@ impl<'source> RustResolutionBuilder<'source> {
             .expect("the embedded replay map is returned to its graph")
     }
 
-    /// The walk of [`Self::lower_passthrough_item_macro`] over replay's tree.
-    /// The root is the invocation's token-tree interior, not an item; its
-    /// named children are the items the expansion declares.
+    /// The walk of [`Self::lower_replayed_item_macro`] over replay's tree.
+    /// The root spans the replayed item interiors; its named children are
+    /// the ordinary items whose source-preserving structure was proved.
     fn lower_replayed_items(&mut self, root: Node<'_>) {
         let mut cursor = root.walk();
         let children = root.named_children(&mut cursor).collect::<Vec<_>>();
@@ -808,26 +829,54 @@ impl<'source> RustResolutionBuilder<'source> {
                 self.exit();
                 continue;
             }
-            self.macro_fragment_nodes.insert(node.id());
-            // The same authority refusals the fragment walk makes: an import,
-            // an `extern crate` and a `macro_rules!` are owned by the import
-            // projection and by declaration replay, and this walk has neither
-            // the projection nor that authority.
-            if matches!(
-                node.kind(),
-                "use_declaration" | "extern_crate_declaration" | "macro_definition"
-            ) {
+            // The replay map supplies provenance for these ordinary items.
+            // Macro definitions need their own captured definition authority.
+            if node.kind() == "macro_definition" {
                 self.add_local_gap(node, ResolutionGapKind::UnsupportedScopeOrBinder);
                 continue;
             }
-            // A nested invocation expands into its own replay tree with its own
-            // occurrence map, which this walk does not hold. Its items are that
-            // tree's to declare, so this one leaves the invocation alone rather
-            // than lowering a node whose identity belongs to another map.
+            // A nested expansion owns another occurrence map. Keep its item
+            // surface explicit rather than silently treating it as empty.
             if node.kind() == "macro_invocation" {
+                let enumerated = self.lower_definition_less_item_macro_arguments(node);
+                let site = self.add_site(
+                    node,
+                    ResolutionSiteKind::UnsupportedExpression,
+                    self.current_scope(),
+                );
+                self.add_semantic_gap_at_site(site, ResolutionGapKind::UnexpandedItemMacro);
+                if !enumerated {
+                    self.facts.reference_enumeration_gaps.push(
+                        ResolutionReferenceEnumerationGapFact {
+                            site,
+                            kind: ResolutionGapKind::UnsupportedExpression,
+                        },
+                    );
+                }
                 continue;
             }
-            let action = self.enter(node, None, None, None);
+            let imports = matches!(node.kind(), "use_declaration" | "extern_crate_declaration")
+                .then(|| {
+                    self.embedded_identity
+                        .as_mut()
+                        .expect("replay holds its source map")
+                        .take_projected_imports(node)
+                });
+            let action = self.enter(node, imports.as_deref(), None, None);
+            if let Some(imports) = imports {
+                self.embedded_identity
+                    .as_mut()
+                    .expect("replay holds its source map")
+                    .return_projected_imports(node, imports);
+            }
+            if node.kind() == "mod_item"
+                && let Some(scope) = self.module_body_scope(node)
+            {
+                self.embedded_identity
+                    .as_mut()
+                    .expect("replay holds its source map")
+                    .record_native_module_scope(node, scope);
+            }
             match action {
                 TreeWalkAction::Skip => continue,
                 TreeWalkAction::DescendWithExit => pending.push((node, true)),
@@ -1256,6 +1305,7 @@ impl<'source> RustResolutionBuilder<'source> {
                 return TreeWalkAction::Skip;
             }
             "let_declaration" => self.lower_let(node),
+            "assignment_expression" | "compound_assignment_expr" => self.lower_local_write(node),
             "closure_expression" => {
                 self.enter_closure_scope(node);
                 return TreeWalkAction::DescendWithExit;
@@ -2932,7 +2982,9 @@ impl<'source> RustResolutionBuilder<'source> {
                 // the initializer. Visiting the initializer here first marks
                 // its name handled before lower_let can register the pending
                 // initialization that the later visit is meant to discharge.
-                "let_declaration" => continue,
+                "let_declaration" | "assignment_expression" | "compound_assignment_expr" => {
+                    continue;
+                }
                 _ => {}
             }
             let mut cursor = node.walk();
@@ -3230,20 +3282,14 @@ impl<'source> RustResolutionBuilder<'source> {
         } else {
             RustVisibility::Private
         };
-        let mut visibility = default_visibility.clone();
-        let mut position = 0;
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment" => {
-                    continue;
-                }
-                "visibility_modifier" => {
-                    visibility = crate::imports::rust_visibility_from_modifier(child, self.source);
-                    continue;
-                }
-                _ => {}
-            }
+        for (position, (child, visibility_modifier)) in
+            crate::syntax::rust_positional_fields(node).enumerate()
+        {
+            let visibility = visibility_modifier
+                .map(|modifier| {
+                    crate::imports::rust_visibility_from_modifier(modifier, self.source)
+                })
+                .unwrap_or_else(|| default_visibility.clone());
             let source_declaration = self.declaration_properties.ensure_positional_field(
                 child,
                 visibility.clone(),
@@ -3273,8 +3319,6 @@ impl<'source> RustResolutionBuilder<'source> {
                 qualifier: None,
             });
             self.publish_field_declaration(child, declaration, owner, Some(child), visibility);
-            visibility = default_visibility.clone();
-            position += 1;
         }
     }
 
@@ -5853,6 +5897,13 @@ impl<'source> RustResolutionBuilder<'source> {
                 ResolutionNamespace::Macro,
             );
         }
+        // The source walker already lowered each ordinary cfg_if item with
+        // its ordered arm guard. No unknown transcriber remains at this site.
+        if self.discharged_item_macros.contains(&node.id())
+            && crate::cfg_if::is_cfg_if(node, self.source)
+        {
+            return;
+        }
         if let Some((matched, proofs, transcribed_paths)) =
             self.match_visible_macro_invocation(node, source_position)
         {
@@ -5906,10 +5957,11 @@ impl<'source> RustResolutionBuilder<'source> {
             source_position,
             RustItemMacroSourcePosition::DirectItem | RustItemMacroSourcePosition::ItemStatement
         );
-        let guessing = self.guessing_macro_references;
-        self.guessing_macro_references |= item_position;
-        let enumerated = self.lower_definition_less_macro_arguments(node);
-        self.guessing_macro_references = guessing;
+        let enumerated = if item_position {
+            self.lower_definition_less_item_macro_arguments(node)
+        } else {
+            self.lower_definition_less_macro_arguments(node)
+        };
         if item_position {
             // Like an unexpanded attribute (#5205), this expansion can add
             // names but cannot shadow an existing binding. Its impls keep
@@ -5944,6 +5996,17 @@ impl<'source> RustResolutionBuilder<'source> {
         }
     }
 
+    /// Item arguments are guesses about an unsupported input grammar, even
+    /// when their expressions parse. Both primary and replayed item streams
+    /// must retain that reference uncertainty.
+    fn lower_definition_less_item_macro_arguments(&mut self, node: Node<'_>) -> bool {
+        let guessing = self.guessing_macro_references;
+        self.guessing_macro_references = true;
+        let enumerated = self.lower_definition_less_macro_arguments(node);
+        self.guessing_macro_references = guessing;
+        enumerated
+    }
+
     /// Enumerate arguments of a macro invocation whose definition is not
     /// visible. Top-level comma- or semicolon-separated groups are expressions,
     /// except the second operand of unqualified `matches!`, which is a
@@ -5975,6 +6038,7 @@ impl<'source> RustResolutionBuilder<'source> {
             .map(|operand| (operand.binding, operand.tree))
             .collect::<Vec<_>>();
         let first_pattern_identifier = self.facts.identifiers.len();
+        let first_pattern_gap = self.facts.gaps.len();
         for (binding, tree) in &bindings {
             if binding.fragment != crate::macro_matcher::MacroFragmentKind::Pat {
                 continue;
@@ -6005,7 +6069,7 @@ impl<'source> RustResolutionBuilder<'source> {
             );
         }
         if self.guessing_macro_references {
-            self.mark_macro_argument_guesses(first_pattern_identifier);
+            self.mark_macro_argument_guesses(first_pattern_identifier, first_pattern_gap);
         }
         let owner = self.declaration_owners.last().copied();
         let self_owner = self.macro_fragment_self_owner(
@@ -6853,12 +6917,13 @@ impl<'source> RustResolutionBuilder<'source> {
             let guessing =
                 std::mem::replace(&mut self.guessing_macro_references, guessed_references);
             let first_identifier = self.facts.identifiers.len();
+            let first_gap = self.facts.gaps.len();
             self.lower_macro_fragment(&binding, tree, container, occurrence_provenance);
             if guessed_references {
                 // Keep uncertainty on the references we guessed, never on
                 // authored binders beside the invocation. Nested fragments
                 // inherit the provenance when they are queued.
-                self.mark_macro_argument_guesses(first_identifier);
+                self.mark_macro_argument_guesses(first_identifier, first_gap);
             }
             self.guessing_macro_references = guessing;
             assert_eq!(self.scopes, [scope]);
@@ -6870,11 +6935,21 @@ impl<'source> RustResolutionBuilder<'source> {
         self.lowering_macro_fragments = false;
     }
 
-    fn mark_macro_argument_guesses(&mut self, first_identifier: usize) {
+    fn mark_macro_argument_guesses(&mut self, first_identifier: usize, first_gap: usize) {
+        // Lowering a computed receiver (or a nested macro pattern) can already
+        // put this uncertainty on a new reference. The macro guess adds the
+        // same obligation only where absent; other gap kinds remain separate.
+        // Only this fragment's newly emitted facts can name its new sites.
+        let mut unsupported = self.facts.gaps[first_gap..]
+            .iter()
+            .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedExpression)
+            .map(|gap| gap.site)
+            .collect::<HashSet<_>>();
         self.facts.gaps.extend(
             self.facts.identifiers[first_identifier..]
                 .iter()
                 .filter(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
+                .filter(|identifier| unsupported.insert(identifier.site))
                 .map(|identifier| ResolutionGapFact {
                     site: identifier.site,
                     kind: ResolutionGapKind::UnsupportedExpression,
@@ -7729,107 +7804,270 @@ impl<'source> RustResolutionBuilder<'source> {
                     );
                 }
             }
-        } else if pattern.kind() == "identifier"
-            && let Some(initializer) = node.child_by_field_name("value")
-            && initializer.kind() == "struct_expression"
-        {
-            // `let value = Type { .. };` names the binding's type in the
-            // initializer's own `name` field, the same structured field the
-            // receiver path reads for `Type { .. }.member()`. Without this the
-            // binding has no declared value type at all, so every later
-            // `value.member()` reports an unsupported semantic instead of
-            // resolving.
-            self.lower_declared_value_types(
-                &declarations,
-                initializer.child_by_field_name("name"),
-                DeclarationTypeRole::Value,
+        }
+        // The grammar places `mut` beside the identifier in a let declaration;
+        // destructuring and ref patterns need component/reference projections,
+        // so they cannot take the initializer's value wholesale.
+        if pattern.kind() == "identifier" {
+            let [declaration] = declarations[..] else {
+                assert!(
+                    declarations.is_empty(),
+                    "one identifier declares one binding"
+                );
+                return;
+            };
+            // Keep the inferred value property even before the first write;
+            // an absent initializer contributes no input to that property.
+            let inferred = if node.child_by_field_name("type").is_none() {
+                let [(_, slot)] = self
+                    .allocate_declaration_type_slots(&[declaration], DeclarationTypeRole::Value)[..]
+                else {
+                    unreachable!("one declaration allocates one slot");
+                };
+                Some(slot)
+            } else {
+                None
+            };
+            if let Some(initializer) = node.child_by_field_name("value") {
+                self.queue_runtime_value(
+                    initializer,
+                    PendingRuntimeValue {
+                        site: declaration,
+                        destination: RuntimeValueDestination::Initializer { inferred },
+                        adjustments: Vec::new(),
+                    },
+                );
+            }
+        } else if node.child_by_field_name("value").is_some() {
+            self.lower_unknown_pattern_initializers(pattern, &declarations);
+        }
+    }
+
+    /// These binders receive runtime values, but component/reference projection
+    /// is not modeled. Retain that unknown input independently of any annotated
+    /// type so a later write cannot make the observed value appear complete.
+    fn lower_unknown_pattern_initializers(
+        &mut self,
+        pattern: Node<'_>,
+        declarations: &[ResolutionSiteId],
+    ) {
+        for &declaration in declarations {
+            assert_eq!(
+                self.facts.sites[declaration.index()].kind,
+                ResolutionSiteKind::ValueDeclaration
             );
-        } else if pattern.kind() == "identifier"
-            && let Some(initializer) = node.child_by_field_name("value")
-            && let Some((producer, unwrap_layers)) =
-                rust_initializer_producer(initializer, self.source)
-        {
-            let pending = self
-                .allocate_declaration_type_slots(&declarations, DeclarationTypeRole::Value)
-                .into_iter()
-                .map(|(declaration, target)| PendingCallInitialization {
-                    declaration,
-                    target,
-                    unwrap_layers,
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                self.pending_call_initializations
-                    .insert(producer.id(), pending)
-                    .is_none(),
-                "one direct call initializer belongs to one let declaration"
+            self.connect_runtime_value(
+                pattern,
+                PendingRuntimeValue {
+                    site: declaration,
+                    destination: RuntimeValueDestination::Initializer { inferred: None },
+                    adjustments: Vec::new(),
+                },
+                None,
             );
         }
     }
 
-    /// Connect the typed slot an initializer expression produced to the `let`
-    /// bindings that were waiting for it.
-    ///
-    /// Each recorded unwrap layer gets its own intermediate call-result slot,
-    /// owned by the declaration whose initialization it belongs to, and removes
-    /// one unproven `Option`/`Result` indirection layer. The binding's declared
-    /// value then comes from a zero-delta `Initialization` transfer, whose
-    /// input is a call result or the expression value of a runtime identifier;
-    /// nothing else produces a typed slot for a `let` to take.
-    fn discharge_pending_initializations(
+    fn lower_local_write(&mut self, node: Node<'_>) {
+        // A parsed token-tree fragment is reference evidence, not proof that
+        // `name = value` executes: it can be a macro's named option. Proven
+        // item passthrough replay has declaration authority and uses the
+        // ordinary statement semantics within its replayed item bodies.
+        if self.embedded_identity.is_none()
+            && (self.macro_fragment_nodes.contains(&node.id())
+                || self.explicit_source_fragment_nodes.contains(&node.id()))
+        {
+            return;
+        }
+        let Some(left) = node.child_by_field_name("left") else {
+            self.add_local_gap(node, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        if left.kind() != "identifier" || !name_node_has_spelling(left) {
+            // A field/index/dereference target does not rebind its receiver.
+            // Tuple and array targets rebind their bare names, but need
+            // component projections before any RHS values can be copied.
+            self.add_semantic_gap(left, ResolutionGapKind::UnsupportedExpression);
+            let mut targets = vec![left];
+            while let Some(target) = targets.pop() {
+                match target.kind() {
+                    "tuple_expression" | "array_expression" | "parenthesized_expression" => {
+                        let mut cursor = target.walk();
+                        let children = target.named_children(&mut cursor).collect::<Vec<_>>();
+                        targets.extend(children.into_iter().rev());
+                    }
+                    "identifier" if name_node_has_spelling(target) => {
+                        let output = self.lower_runtime_value_reference(target);
+                        let pending = PendingRuntimeValue {
+                            site: self.facts.type_slots[output.index()].site,
+                            destination: RuntimeValueDestination::LocalWrite,
+                            adjustments: Vec::new(),
+                        };
+                        self.connect_runtime_value(target, pending, None);
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        let output = self.lower_runtime_value_reference(left);
+        let target = self.facts.type_slots[output.index()].site;
+        let pending = PendingRuntimeValue {
+            site: target,
+            destination: RuntimeValueDestination::LocalWrite,
+            adjustments: Vec::new(),
+        };
+        if node.kind() == "assignment_expression"
+            && let Some(right) = node.child_by_field_name("right")
+        {
+            self.queue_runtime_value(right, pending);
+        } else {
+            // Compound operators compute a new value. Keep an unknown input
+            // rather than treating their RHS as the result of that operation.
+            self.connect_runtime_value(node, pending, None);
+        }
+    }
+
+    fn queue_runtime_value(&mut self, value: Node<'_>, mut pending: PendingRuntimeValue) {
+        if let Some((producer, adjustments)) = rust_runtime_value_producer(value, self.source) {
+            pending.adjustments = adjustments
+                .into_iter()
+                .map(|(wrapper, kind)| RuntimeValueAdjustment {
+                    site: self.add_site(
+                        wrapper,
+                        if wrapper.kind() == "call_expression" {
+                            ResolutionSiteKind::Call
+                        } else {
+                            ResolutionSiteKind::UnaryExpression
+                        },
+                        self.current_scope(),
+                    ),
+                    kind,
+                })
+                .collect();
+            self.pending_runtime_values
+                .entry(producer.id())
+                .or_default()
+                .push(pending);
+        } else {
+            self.connect_runtime_value(value, pending, None);
+        }
+    }
+
+    /// Connect an expression's produced value to every waiting initializer or
+    /// write, preserving the order of borrow and unwrap layers before recording
+    /// the observation.
+    fn discharge_pending_runtime_values(
         &mut self,
         node: Node<'_>,
         produced: Option<ResolutionTypeSlotId>,
-        produced_role: ResolutionTypeSlotRole,
     ) {
-        for initialization in self
-            .pending_call_initializations
+        for pending in self
+            .pending_runtime_values
             .remove(&node.id())
             .unwrap_or_default()
         {
-            let Some(produced) = produced else {
-                self.add_local_gap_at_site(
-                    initialization.declaration,
-                    ResolutionGapKind::UnsupportedExpression,
-                );
-                continue;
-            };
-            assert!(
-                initialization.unwrap_layers > 0
-                    || matches!(
-                        produced_role,
-                        ResolutionTypeSlotRole::CallResult
-                            | ResolutionTypeSlotRole::ExpressionValue
-                    ),
-                "a bare let initializer must produce a call result or an expression value, got {produced_role:?}"
+            self.connect_runtime_value(node, pending, produced);
+        }
+    }
+
+    fn connect_runtime_value(
+        &mut self,
+        node: Node<'_>,
+        pending: PendingRuntimeValue,
+        produced: Option<ResolutionTypeSlotId>,
+    ) {
+        let mut input = produced.unwrap_or_else(|| {
+            let site = self.add_site(
+                node,
+                ResolutionSiteKind::UnsupportedExpression,
+                self.current_scope(),
             );
-            let mut input = produced;
-            for _ in 0..initialization.unwrap_layers {
+            assert_ne!(site, pending.site, "unknown input owns a separate gap site");
+            let value = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
+                .expect("Rust resolution type-slot count exceeds u32");
+            self.facts.type_slots.push(ResolutionTypeSlotFact {
+                id: value,
+                site,
+                role: ResolutionTypeSlotRole::ExpressionValue,
+            });
+            self.add_semantic_gap_at_site(site, ResolutionGapKind::UnsupportedExpression);
+            value
+        });
+        assert!(matches!(
+            self.facts.type_slots[input.index()].role,
+            ResolutionTypeSlotRole::CallResult | ResolutionTypeSlotRole::ExpressionValue
+        ));
+        // Syntax was peeled outside-in; values flow from the leaf back out.
+        for adjustment in pending.adjustments.into_iter().rev() {
+            let (role, kind, indirection_delta, reference_indirection_delta, value_transform) =
+                match adjustment.kind {
+                    RuntimeValueAdjustmentKind::Borrow => (
+                        ResolutionTypeSlotRole::ExpressionValue,
+                        ResolutionTypeTransferKind::AddressOf,
+                        1,
+                        1,
+                        ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+                    ),
+                    RuntimeValueAdjustmentKind::Unwrap => (
+                        ResolutionTypeSlotRole::CallResult,
+                        ResolutionTypeTransferKind::Unwrap,
+                        -1,
+                        0,
+                        ResolutionTypeTransferValueTransform::Preserve,
+                    ),
+                };
+            let output = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
+                .expect("Rust resolution type-slot count exceeds u32");
+            self.facts.type_slots.push(ResolutionTypeSlotFact {
+                id: output,
+                site: adjustment.site,
+                role,
+            });
+            self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                input,
+                output,
+                kind,
+                indirection_delta,
+                reference_indirection_delta,
+                value_transform,
+            });
+            input = output;
+        }
+        match pending.destination {
+            RuntimeValueDestination::Initializer { inferred } => {
+                if let Some(output) = inferred {
+                    self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                        input,
+                        output,
+                        kind: ResolutionTypeTransferKind::Initialization,
+                        indirection_delta: 0,
+                        reference_indirection_delta: 0,
+                        value_transform: ResolutionTypeTransferValueTransform::Preserve,
+                    });
+                }
                 let output = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
                     .expect("Rust resolution type-slot count exceeds u32");
                 self.facts.type_slots.push(ResolutionTypeSlotFact {
                     id: output,
-                    site: initialization.declaration,
-                    role: ResolutionTypeSlotRole::CallResult,
+                    site: pending.site,
+                    role: ResolutionTypeSlotRole::AssignmentValue,
                 });
                 self.facts.type_transfers.push(ResolutionTypeTransferFact {
                     input,
                     output,
-                    kind: ResolutionTypeTransferKind::Unwrap,
-                    indirection_delta: -1,
+                    kind: ResolutionTypeTransferKind::Assignment,
+                    indirection_delta: 0,
                     reference_indirection_delta: 0,
                     value_transform: ResolutionTypeTransferValueTransform::Preserve,
                 });
-                input = output;
             }
-            self.facts.type_transfers.push(ResolutionTypeTransferFact {
-                input,
-                output: initialization.target,
-                kind: ResolutionTypeTransferKind::Initialization,
-                indirection_delta: 0,
-                reference_indirection_delta: 0,
-                value_transform: ResolutionTypeTransferValueTransform::Preserve,
-            });
+            RuntimeValueDestination::LocalWrite => {
+                self.facts.local_writes.push(ResolutionLocalWriteFact {
+                    target: pending.site,
+                    value: input,
+                });
+            }
         }
     }
 
@@ -7877,13 +8115,14 @@ impl<'source> RustResolutionBuilder<'source> {
         };
         let scope = self.allocate_node_scope(node, ResolutionScopeKind::Block, body.end_byte());
         if let Some(pattern) = node.child_by_field_name("pattern") {
-            let _ = self.lower_pattern_bindings(
+            let declarations = self.lower_pattern_bindings(
                 pattern,
                 scope,
                 ResolutionBinderKind::Pattern,
                 body.start_byte(),
                 RustPatternBindingPosition::Irrefutable,
             );
+            self.lower_unknown_pattern_initializers(pattern, &declarations);
         } else {
             self.add_local_gap(node, ResolutionGapKind::MalformedSyntax);
         }
@@ -7893,13 +8132,14 @@ impl<'source> RustResolutionBuilder<'source> {
     fn enter_match_arm_scope(&mut self, node: Node<'_>) {
         let scope = self.allocate_node_scope(node, ResolutionScopeKind::Block, node.end_byte());
         if let Some(pattern) = node.child_by_field_name("pattern") {
-            let _ = self.lower_pattern_bindings(
+            let declarations = self.lower_pattern_bindings(
                 pattern,
                 scope,
                 ResolutionBinderKind::Pattern,
                 pattern.end_byte(),
                 RustPatternBindingPosition::Refutable,
             );
+            self.lower_unknown_pattern_initializers(pattern, &declarations);
         } else {
             self.add_local_gap(node, ResolutionGapKind::MalformedSyntax);
         }
@@ -8006,13 +8246,14 @@ impl<'source> RustResolutionBuilder<'source> {
                 self.add_local_gap(condition, ResolutionGapKind::MalformedSyntax);
                 continue;
             };
-            let _ = self.lower_pattern_bindings(
+            let declarations = self.lower_pattern_bindings(
                 pattern,
                 scope,
                 ResolutionBinderKind::Pattern,
                 activation_start,
                 RustPatternBindingPosition::Refutable,
             );
+            self.lower_unknown_pattern_initializers(pattern, &declarations);
         }
         for (node, assertion_message) in pending_nodes {
             assert!(
@@ -8246,7 +8487,7 @@ impl<'source> RustResolutionBuilder<'source> {
             }
         }
         let result = lowered.map(|(_, result)| result);
-        self.discharge_pending_initializations(node, result, ResolutionTypeSlotRole::CallResult);
+        self.discharge_pending_runtime_values(node, result);
         self.discharge_pending_receivers(node, result);
         self.discharge_pending_argument(node, result);
     }
@@ -8625,15 +8866,17 @@ impl<'source> RustResolutionBuilder<'source> {
             });
             let mut operand = rust_receiver_operand(argument);
             let mut reference_layers = 0i8;
-            while operand.kind() == "reference_expression"
-                && let Some(layers) = reference_layers.checked_add(1)
-            {
+            while operand.kind() == "reference_expression" {
+                let Some(inner) = rust_borrow_operand(operand) else {
+                    break;
+                };
+                let Some(layers) = reference_layers.checked_add(1) else {
+                    // Leave the unsupported wrapper as the gap-fed operand;
+                    // do not truncate the depth and type its inner value.
+                    break;
+                };
                 reference_layers = layers;
-                operand = rust_receiver_operand(
-                    operand
-                        .child_by_field_name("value")
-                        .expect("Rust reference_expression has a value field"),
-                );
+                operand = rust_receiver_operand(inner);
             }
             let pending = PendingArgument {
                 argument: value,
@@ -8645,7 +8888,7 @@ impl<'source> RustResolutionBuilder<'source> {
                 // slot keyed on it would never discharge. Fall to the
                 // gap-feeding arm instead.
                 "identifier" | "self" | "call_expression" | "field_expression"
-                    if !operand.is_missing() =>
+                    if !operand.is_missing() && !operand.is_error() =>
                 {
                     assert!(
                         self.pending_argument_slots
@@ -8688,7 +8931,19 @@ impl<'source> RustResolutionBuilder<'source> {
         produced: Option<ResolutionTypeSlotId>,
     ) {
         let input = produced.unwrap_or_else(|| {
-            let literal = rust_literal_type(operand, self.source);
+            let mut literal = rust_literal_type(operand, self.source);
+            if let Some(RustLiteralType::Exact {
+                reference_layers, ..
+            }) = literal
+            {
+                match pending.reference_layers.checked_add(reference_layers) {
+                    Some(layers) => pending.reference_layers = layers,
+                    // A string already contributes one reference layer. Even
+                    // 127 written borrows must leave an unknown, not panic or
+                    // publish a truncated intrinsic type.
+                    None => literal = Some(RustLiteralType::Unsupported),
+                }
+            }
             let site = self.add_site(
                 operand,
                 if literal.is_some() {
@@ -8706,10 +8961,7 @@ impl<'source> RustResolutionBuilder<'source> {
                 role: ResolutionTypeSlotRole::ExpressionValue,
             });
             match literal {
-                Some(RustLiteralType::Exact {
-                    primitive,
-                    reference_layers,
-                }) => {
+                Some(RustLiteralType::Exact { primitive, .. }) => {
                     let name = self.intern_spelling(primitive);
                     self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
                         output: input,
@@ -8717,10 +8969,6 @@ impl<'source> RustResolutionBuilder<'source> {
                         kind: IntrinsicTypeKind::Primitive,
                         indirection: 0,
                     });
-                    pending.reference_layers = pending
-                        .reference_layers
-                        .checked_add(reference_layers)
-                        .expect("Rust argument reference layers fit i8");
                 }
                 Some(RustLiteralType::InferredNumeric) => {
                     self.add_semantic_gap_at_site(site, ResolutionGapKind::AmbiguousNumericLiteral);
@@ -8802,9 +9050,34 @@ impl<'source> RustResolutionBuilder<'source> {
             .filter(|name| name_node_has_spelling(*name))
         else {
             self.add_local_gap(node, ResolutionGapKind::MalformedSyntax);
+            self.discharge_pending_runtime_values(node, None);
             return;
         };
         let owner = self.lower_declared_type_identity(name);
+        if self.pending_runtime_values.contains_key(&node.id()) {
+            let produced = owner.map(|owner| {
+                let site = self.add_site(node, ResolutionSiteKind::Literal, self.current_scope());
+                let output = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
+                    .expect("Rust resolution type-slot count exceeds u32");
+                self.facts.type_slots.push(ResolutionTypeSlotFact {
+                    id: output,
+                    site,
+                    role: ResolutionTypeSlotRole::ExpressionValue,
+                });
+                self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                    input: owner.identity,
+                    output,
+                    kind: ResolutionTypeTransferKind::Construction,
+                    indirection_delta: owner.indirection,
+                    reference_indirection_delta: owner.reference_indirection,
+                    value_transform: ResolutionTypeTransferValueTransform::ToRuntime {
+                        addressable: false,
+                    },
+                });
+                output
+            });
+            self.discharge_pending_runtime_values(node, produced);
+        }
         let owner = self.project_struct_field_owner(owner);
         let body = node
             .child_by_field_name("body")
@@ -9242,11 +9515,7 @@ impl<'source> RustResolutionBuilder<'source> {
             .push(BindingProjectionFact::target_declared_value_type(
                 reference, output,
             ));
-        self.discharge_pending_initializations(
-            value,
-            Some(output),
-            ResolutionTypeSlotRole::ExpressionValue,
-        );
+        self.discharge_pending_runtime_values(value, Some(output));
         self.discharge_pending_argument(value, Some(output));
         output
     }
@@ -9586,31 +9855,45 @@ fn rust_tree_writes_self_path(tree: &tree_sitter::Tree, source: &str) -> bool {
     false
 }
 
-/// The innermost expression of a `let` initializer that produces a typed slot,
-/// with the number of unwrap layers written around it.
-///
-/// A bare initializer is a direct call or a plain runtime identifier: both
-/// publish a typed slot the zero-delta `Initialization` transfer can take as
-/// its input, a call result for the first and the referenced binding's declared
-/// value for the second. An unwrapped initializer also starts from one of
-/// those, with the `Unwrap` transfers between them removing one unproven
-/// indirection layer each.
-fn rust_initializer_producer<'tree>(
+/// The operand of one borrow, shared by argument and local-value lowering.
+/// Missing operands belong to parser recovery, never to pending value work.
+fn rust_borrow_operand(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "reference_expression" || node.is_missing() || node.is_error() {
+        return None;
+    }
+    node.child_by_field_name("value")
+        .filter(|operand| !operand.is_missing() && !operand.is_error())
+}
+
+/// The runtime producer beneath a local initializer or assignment RHS, with
+/// borrow and unwrap adjustments in outside-in syntax order. Calls, runtime
+/// identifiers and struct constructions publish runtime slots. Parentheses
+/// are transparent at every wrapper; unsupported leaves retain their gap.
+fn rust_runtime_value_producer<'tree>(
     initializer: Node<'tree>,
     source: &str,
-) -> Option<(Node<'tree>, usize)> {
-    let mut node = initializer;
-    let mut unwrap_layers = 0;
-    while let Some(operand) = rust_unwrap_operand(node, source) {
-        unwrap_layers += 1;
-        node = operand;
-    }
-    // Recovery can leave a zero-width missing or error node under the unwrap
-    // layers (`let a = ???;` parses as nested try_expressions over a missing
-    // identifier). The walk skips such nodes, so a pending initialization
-    // keyed on one would never discharge.
-    if node.is_missing() || node.is_error() {
-        return None;
+) -> Option<(Node<'tree>, Vec<(Node<'tree>, RuntimeValueAdjustmentKind)>)> {
+    let mut node = rust_receiver_operand(initializer);
+    let mut adjustments = Vec::new();
+    loop {
+        // Recovery can leave a missing identifier under wrappers (`???` is
+        // nested try_expressions). The walk skips missing/error nodes, so no
+        // pending value may be keyed on one.
+        if node.is_missing() || node.is_error() {
+            return None;
+        }
+        let (operand, kind) = if node.kind() == "reference_expression" {
+            (
+                rust_borrow_operand(node)?,
+                RuntimeValueAdjustmentKind::Borrow,
+            )
+        } else if let Some(operand) = rust_unwrap_operand(node, source) {
+            (operand, RuntimeValueAdjustmentKind::Unwrap)
+        } else {
+            break;
+        };
+        adjustments.push((node, kind));
+        node = rust_receiver_operand(operand);
     }
     match node.kind() {
         // A bare identifier initializer (`let inner = outer;`) takes the
@@ -9619,7 +9902,7 @@ fn rust_initializer_producer<'tree>(
         // the new binding has no declared value at all, so every later
         // `inner.member()` reports an unsupported semantic even where the
         // outer binding's type is known.
-        "call_expression" | "identifier" => Some((node, unwrap_layers)),
+        "call_expression" | "identifier" | "struct_expression" => Some((node, adjustments)),
         _ => None,
     }
 }
@@ -10879,6 +11162,668 @@ mod tests {
     use tree_sitter::{Node, Parser};
 
     use super::extract_rust_resolution_facts;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5015: writes hid unknown incoming values of initialized and implicit Rust pattern binders"
+    )]
+    fn pattern_initializers_keep_unknown_inputs_separate_from_static_types() {
+        let source = r#"
+struct Item;
+struct Pair { field: Item }
+fn run(input: (Item, Item), optional: Option<Item>, pairs: Vec<(Item, Item)>, named: Pair) {
+    let (mut tuple, mut sibling) = input;
+    tuple = Item {};
+    sibling = Item {};
+    tuple.summary();
+    let (mut annotated): Item = Item {};
+    annotated = Item {};
+    annotated.summary();
+    let Pair { field: mut field } = named;
+    field = Item {};
+    field.summary();
+    let mut plain;
+    plain = Item {};
+    let (mut absent, _);
+    absent = Item {};
+    for (mut looped, _) in pairs {
+        looped = Item {};
+        looped.summary();
+    }
+    match optional {
+        Some(mut arm) => { arm = Item {}; arm.summary(); }
+        None => {}
+    }
+    if let Some(mut conditional) = optional {
+        conditional = Item {};
+        conditional.summary();
+    }
+    while let Some(mut repeated) = optional {
+        repeated = Item {};
+        repeated.summary();
+        break;
+    }
+    if let Some(mut chained) = optional && let Some(mut chained_second) = optional {
+        chained = Item {};
+        chained_second = Item {};
+    }
+    let closure = |parameter: Item| parameter;
+}
+"#;
+        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        assert!(!tree.root_node().has_error());
+        let facts = extract_rust_resolution_facts(tree.root_node(), source);
+        for name in [
+            "tuple",
+            "sibling",
+            "annotated",
+            "field",
+            "looped",
+            "arm",
+            "conditional",
+            "repeated",
+            "chained",
+            "chained_second",
+            "plain",
+            "absent",
+            "input",
+            "parameter",
+        ] {
+            let declaration = facts
+                .binders
+                .iter()
+                .find(|binder| {
+                    source_text(&facts, source, binder.declaration) == name
+                        && matches!(
+                            binder.kind,
+                            ResolutionBinderKind::Pattern | ResolutionBinderKind::Parameter
+                        )
+                })
+                .expect("lexical binder")
+                .declaration;
+            let assignments = facts
+                .type_slots
+                .iter()
+                .filter(|slot| {
+                    slot.site == declaration && slot.role == ResolutionTypeSlotRole::AssignmentValue
+                })
+                .collect::<Vec<_>>();
+            if matches!(name, "plain" | "absent" | "input" | "parameter") {
+                assert!(assignments.is_empty(), "no implicit input for {name}");
+                continue;
+            }
+            assert_eq!(assignments.len(), 1, "one initializer for {name}");
+            let producers = facts
+                .type_transfers
+                .iter()
+                .filter(|transfer| transfer.output == assignments[0].id)
+                .collect::<Vec<_>>();
+            assert_eq!(producers.len(), 1, "one assignment producer for {name}");
+            assert_eq!(producers[0].kind, ResolutionTypeTransferKind::Assignment);
+            let unknown = facts.type_slots[producers[0].input.index()];
+            assert_eq!(unknown.role, ResolutionTypeSlotRole::ExpressionValue);
+            assert_ne!(unknown.site, declaration);
+            assert_eq!(
+                facts.sites[unknown.site.index()].kind,
+                ResolutionSiteKind::UnsupportedExpression
+            );
+            assert!(facts.gaps.iter().any(|gap| {
+                gap.site == unknown.site && gap.kind == ResolutionGapKind::UnsupportedExpression
+            }));
+            assert!(facts.gaps.iter().all(|gap| gap.site != declaration));
+            assert!(
+                facts
+                    .reference_enumeration_gaps
+                    .iter()
+                    .all(|gap| gap.site != unknown.site)
+            );
+            assert!(facts.type_transfers.iter().all(|transfer| {
+                transfer.output != unknown.id
+                    && (transfer.input != unknown.id
+                        || transfer.kind == ResolutionTypeTransferKind::Assignment)
+            }));
+            assert!(
+                facts
+                    .binding_projections
+                    .iter()
+                    .all(|projection| projection.output != unknown.id)
+            );
+            assert!(
+                facts
+                    .intrinsic_type_seeds
+                    .iter()
+                    .all(|seed| seed.output != unknown.id)
+            );
+            assert!(facts.type_slots.iter().all(|slot| {
+                slot.role != ResolutionTypeSlotRole::Receiver || slot.site != unknown.site
+            }));
+            let properties = facts
+                .declaration_type_slots
+                .iter()
+                .filter(|property| property.declaration == declaration)
+                .collect::<Vec<_>>();
+            if name == "annotated" {
+                assert_eq!(properties.len(), 1);
+                let declared = properties[0].slot;
+                let producer = facts
+                    .type_transfers
+                    .iter()
+                    .find(|transfer| transfer.output == declared)
+                    .expect("annotation's static type producer");
+                assert_eq!(producer.kind, ResolutionTypeTransferKind::DeclaredType);
+                assert_ne!(producer.input, unknown.id);
+                assert!(
+                    facts
+                        .gaps
+                        .iter()
+                        .all(|gap| gap.site != facts.type_slots[declared.index()].site)
+                );
+            } else {
+                assert!(properties.is_empty(), "no invented static type for {name}");
+            }
+            assert_eq!(
+                facts
+                    .local_writes
+                    .iter()
+                    .filter(|write| { source_text(&facts, source, write.target) == name })
+                    .count(),
+                1,
+                "one independent write for {name}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5015: mutable let patterns and assignment targets use positioned identifier fields"
+    )]
+    fn local_write_grammar_keeps_mutability_outside_the_binder() {
+        let source = "fn run() { let mut value: Item = make(); value = Item {}; value += make(); }";
+        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        assert!(!tree.root_node().has_error());
+        let binding = find_first_node(tree.root_node(), "let_declaration").expect("let");
+        let pattern = binding.child_by_field_name("pattern").expect("pattern");
+        assert_eq!(pattern.kind(), "identifier");
+        let mut cursor = binding.walk();
+        assert!(
+            binding
+                .named_children(&mut cursor)
+                .any(|child| child.kind() == "mutable_specifier")
+        );
+        assert_eq!(
+            binding
+                .child_by_field_name("type")
+                .expect("annotation")
+                .kind(),
+            "type_identifier"
+        );
+        for kind in ["assignment_expression", "compound_assignment_expr"] {
+            let assignment = find_first_node(tree.root_node(), kind).expect("assignment");
+            assert_eq!(
+                assignment
+                    .child_by_field_name("left")
+                    .expect("target")
+                    .kind(),
+                "identifier"
+            );
+            let right = assignment.child_by_field_name("right").expect("value");
+            assert!(matches!(
+                right.kind(),
+                "struct_expression" | "call_expression"
+            ));
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5015: borrowed initializer and write values lost their runtime producers and wrapper order"
+    )]
+    fn borrowed_local_values_preserve_wrapper_order_and_recovery() {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferValueTransform;
+
+        let source = concat!(
+            "fn run(body: Body, other: Other) {\n",
+            "    let mut value = (&(body));\n",
+            "    value = (&mut (other));\n",
+            "    let before = (&(make().unwrap()));\n",
+            "    let after = ((&(make())).unwrap());\n",
+            "    let tried = (&((make())?));\n",
+            "}\n",
+        );
+        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        assert!(!tree.root_node().has_error());
+        let facts = extract_rust_resolution_facts(tree.root_node(), source);
+        for transfer in facts
+            .type_transfers
+            .iter()
+            .filter(|transfer| transfer.kind == ResolutionTypeTransferKind::Initialization)
+        {
+            assert_eq!(
+                (
+                    transfer.indirection_delta,
+                    transfer.reference_indirection_delta,
+                    transfer.value_transform
+                ),
+                (0, 0, ResolutionTypeTransferValueTransform::Preserve)
+            );
+        }
+        let chain = |mut value| {
+            let mut wrappers = Vec::new();
+            while let Some(transfer) = facts.type_transfers.iter().find(|transfer| {
+                transfer.output == value
+                    && matches!(
+                        transfer.kind,
+                        ResolutionTypeTransferKind::AddressOf | ResolutionTypeTransferKind::Unwrap
+                    )
+            }) {
+                let output = facts.type_slots[value.index()];
+                assert_eq!(
+                    facts
+                        .type_transfers
+                        .iter()
+                        .filter(|producer| producer.output == value)
+                        .count(),
+                    1,
+                    "each wrapper has exactly one producer"
+                );
+                match transfer.kind {
+                    ResolutionTypeTransferKind::AddressOf => {
+                        assert_eq!(output.role, ResolutionTypeSlotRole::ExpressionValue);
+                        assert_eq!(
+                            (
+                                transfer.indirection_delta,
+                                transfer.reference_indirection_delta,
+                                transfer.value_transform
+                            ),
+                            (
+                                1,
+                                1,
+                                ResolutionTypeTransferValueTransform::ToRuntime {
+                                    addressable: false
+                                }
+                            )
+                        );
+                    }
+                    ResolutionTypeTransferKind::Unwrap => {
+                        assert_eq!(output.role, ResolutionTypeSlotRole::CallResult);
+                        assert_eq!(
+                            (
+                                transfer.indirection_delta,
+                                transfer.reference_indirection_delta,
+                                transfer.value_transform
+                            ),
+                            (-1, 0, ResolutionTypeTransferValueTransform::Preserve)
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(facts.gaps.iter().all(|gap| gap.site != output.site));
+                wrappers.push((transfer.kind, source_text(&facts, source, output.site)));
+                value = transfer.input;
+            }
+            (
+                wrappers,
+                source_text(&facts, source, facts.type_slots[value.index()].site),
+            )
+        };
+        let initializer = |name| {
+            let assignment = facts
+                .type_slots
+                .iter()
+                .find(|slot| {
+                    slot.role == ResolutionTypeSlotRole::AssignmentValue
+                        && source_text(&facts, source, slot.site) == name
+                })
+                .expect("observed initializer");
+            let transfer = facts
+                .type_transfers
+                .iter()
+                .find(|transfer| transfer.output == assignment.id)
+                .expect("initializer assignment producer");
+            assert_eq!(transfer.kind, ResolutionTypeTransferKind::Assignment);
+            assert_eq!(
+                (
+                    transfer.indirection_delta,
+                    transfer.reference_indirection_delta,
+                    transfer.value_transform
+                ),
+                (0, 0, ResolutionTypeTransferValueTransform::Preserve)
+            );
+            transfer.input
+        };
+        use ResolutionTypeTransferKind::{AddressOf, Unwrap};
+        assert_eq!(
+            chain(initializer("value")),
+            (vec![(AddressOf, "&(body)")], "body")
+        );
+        assert_eq!(facts.local_writes.len(), 1);
+        assert_eq!(
+            chain(facts.local_writes[0].value),
+            (vec![(AddressOf, "&mut (other)")], "other")
+        );
+        assert_eq!(
+            chain(initializer("before")),
+            (
+                vec![
+                    (AddressOf, "&(make().unwrap())"),
+                    (Unwrap, "make().unwrap()")
+                ],
+                "make()"
+            )
+        );
+        assert_eq!(
+            chain(initializer("after")),
+            (
+                vec![(Unwrap, "(&(make())).unwrap()"), (AddressOf, "&(make())")],
+                "make()"
+            )
+        );
+        assert_eq!(
+            chain(initializer("tried")),
+            (
+                vec![(AddressOf, "&((make())?)"), (Unwrap, "(make())?")],
+                "make()"
+            )
+        );
+
+        // Neither recovered missing operands nor unsupported leaves may leave
+        // pending producer slots that the extraction walk can never discharge.
+        for source in [
+            "fn f() { let mut value = &&; value = &&; take(&&); }",
+            "fn f() { let mut value = &([1u8]); value = &(opaque!()); }",
+        ] {
+            let facts = parse_and_extract(source);
+            assert!(facts.gaps.iter().any(|gap| matches!(
+                gap.kind,
+                ResolutionGapKind::MalformedSyntax | ResolutionGapKind::UnsupportedExpression
+            )));
+            for transfer in facts
+                .type_transfers
+                .iter()
+                .filter(|transfer| transfer.kind == ResolutionTypeTransferKind::Assignment)
+            {
+                let input = facts.type_slots[transfer.input.index()];
+                assert!(facts.gaps.iter().any(|gap| gap.site == input.site));
+            }
+            for write in &facts.local_writes {
+                let input = facts.type_slots[write.value.index()];
+                assert!(facts.gaps.iter().any(|gap| gap.site == input.site));
+            }
+        }
+
+        // Argument edges aggregate i8 depths; strings have an intrinsic
+        // reference layer as well. Runtime borrows instead keep one edge per
+        // wrapper, so they do not truncate at the argument representation cap.
+        let source = format!(
+            "fn f(body: Body) {{ let value = {}body; take({}\"text\"); take({}body); }}",
+            "&".repeat(128),
+            "&".repeat(127),
+            "&".repeat(128)
+        );
+        let facts = parse_and_extract(&source);
+        assert_eq!(
+            facts
+                .type_transfers
+                .iter()
+                .filter(|transfer| transfer.kind == AddressOf)
+                .count(),
+            128
+        );
+        assert_eq!(facts.call_arguments.len(), 2);
+        for argument in &facts.call_arguments {
+            let transfer = facts
+                .type_transfers
+                .iter()
+                .find(|transfer| transfer.output == argument.value)
+                .expect("gap-fed argument");
+            let input = facts.type_slots[transfer.input.index()];
+            assert!(facts.gaps.iter().any(|gap| gap.site == input.site
+                && gap.kind == ResolutionGapKind::UnsupportedExpression));
+            assert!(
+                facts
+                    .intrinsic_type_seeds
+                    .iter()
+                    .all(|seed| seed.output != input.id)
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5015: local writes retain RHS values without treating macro named options as assignments"
+    )]
+    fn local_writes_preserve_initial_values_macro_isolation_and_unknown_inputs() {
+        let source = r#"
+struct Item { field: u32 }
+fn run(other: u32) {
+    let mut actual = Item { field: other };
+    let mut annotated: Item = make();
+    let uninitialized: Item;
+    actual = make();
+    annotated = make().unwrap();
+    options!(actual = make());
+    let _ = format!("{actual:?}", actual = make());
+    actual += make();
+    actual = { make() };
+    actual.field = make();
+    (actual, annotated) = (make(), make());
+}
+"#;
+        let facts = parse_and_extract(source);
+        let writes = facts
+            .local_writes
+            .iter()
+            .map(|write| {
+                let target = facts.sites[write.target.index()];
+                (
+                    &source[target.start_byte..target.end_byte],
+                    target.start_byte,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            writes,
+            [
+                (
+                    "actual",
+                    source.find("actual = make();").expect("ordinary write")
+                ),
+                (
+                    "annotated",
+                    source
+                        .find("annotated = make().unwrap();")
+                        .expect("unwrapped write")
+                ),
+                (
+                    "actual",
+                    source.find("actual += make();").expect("compound write")
+                ),
+                (
+                    "actual",
+                    source
+                        .find("actual = { make() };")
+                        .expect("unsupported RHS")
+                ),
+                (
+                    "actual",
+                    source.find("(actual, annotated)").expect("tuple target") + 1
+                ),
+                (
+                    "annotated",
+                    source.find("(actual, annotated)").expect("tuple target") + 9
+                ),
+            ]
+        );
+        for write in &facts.local_writes[2..] {
+            let site = facts.type_slots[write.value.index()].site;
+            assert!(facts.gaps.iter().any(
+                |gap| gap.site == site && gap.kind == ResolutionGapKind::UnsupportedExpression
+            ));
+            assert!(
+                !facts
+                    .type_transfers
+                    .iter()
+                    .any(|transfer| transfer.output == write.value)
+            );
+            assert!(
+                !facts
+                    .binding_projections
+                    .iter()
+                    .any(|projection| projection.output == write.value)
+            );
+        }
+        let unwrapped = facts.local_writes[1].value;
+        assert!(
+            facts
+                .type_transfers
+                .iter()
+                .any(|transfer| transfer.output == unwrapped
+                    && transfer.kind == ResolutionTypeTransferKind::Unwrap)
+        );
+        for (name, expected_initializer) in [
+            ("actual", true),
+            ("annotated", true),
+            ("uninitialized", false),
+        ] {
+            let declaration = facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Declaration
+                        && facts.names[identifier.name.index()].spelling == name
+                })
+                .expect("local declaration")
+                .site;
+            let assignments = facts
+                .type_slots
+                .iter()
+                .filter(|slot| {
+                    slot.site == declaration && slot.role == ResolutionTypeSlotRole::AssignmentValue
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                assignments.len(),
+                usize::from(expected_initializer),
+                "{name}"
+            );
+            if let Some(assignment) = assignments.first() {
+                let observed = facts
+                    .type_transfers
+                    .iter()
+                    .find(|transfer| transfer.output == assignment.id)
+                    .expect("observed initializer");
+                assert_eq!(observed.kind, ResolutionTypeTransferKind::Assignment);
+                let declared = facts
+                    .declaration_type_slots
+                    .iter()
+                    .find(|slot| slot.declaration == declaration)
+                    .expect("declared value")
+                    .slot;
+                let inferred = facts
+                    .type_transfers
+                    .iter()
+                    .find(|transfer| transfer.output == declared)
+                    .expect("declared producer");
+                if name == "actual" {
+                    assert_eq!(inferred.kind, ResolutionTypeTransferKind::Initialization);
+                    assert_eq!(inferred.input, observed.input);
+                    assert!(
+                        facts
+                            .type_transfers
+                            .iter()
+                            .any(|transfer| transfer.output == observed.input
+                                && transfer.kind == ResolutionTypeTransferKind::Construction)
+                    );
+                } else {
+                    assert_eq!(inferred.kind, ResolutionTypeTransferKind::DeclaredType);
+                    assert_ne!(inferred.input, observed.input);
+                    assert!(
+                        facts
+                            .call_expected_results
+                            .iter()
+                            .any(|expected| expected.call
+                                == facts.type_slots[observed.input.index()].site)
+                    );
+                }
+            }
+        }
+        for target in ["actual.field", "(actual, annotated)"] {
+            assert!(
+                facts.gaps.iter().any(|gap| {
+                    let site = facts.sites[gap.site.index()];
+                    gap.kind == ResolutionGapKind::UnsupportedExpression
+                        && &source[site.start_byte..site.end_byte] == target
+                }),
+                "complex target {target} remains explicit"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5015: an inferred uninitialized let lacked a declaration value property for later writes"
+    )]
+    fn inferred_uninitialized_let_owns_an_empty_declaration_value_property() {
+        let source = "fn run() { let mut value; value = Item {}; value.summary(); }";
+        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        assert!(!tree.root_node().has_error());
+        let binding = find_first_node(tree.root_node(), "let_declaration").expect("let");
+        let pattern = binding.child_by_field_name("pattern").expect("pattern");
+        assert_eq!(pattern.kind(), "identifier");
+        assert!(binding.child_by_field_name("type").is_none());
+        assert!(binding.child_by_field_name("value").is_none());
+
+        let facts = extract_rust_resolution_facts(tree.root_node(), source);
+        let declaration = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && facts.sites[identifier.site.index()].start_byte == pattern.start_byte()
+            })
+            .expect("positioned binding")
+            .site;
+        let properties = facts
+            .declaration_type_slots
+            .iter()
+            .filter(|property| {
+                property.declaration == declaration && property.role == DeclarationTypeRole::Value
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(properties.len(), 1);
+        let value = properties[0].slot;
+        assert_eq!(
+            facts.type_slots[value.index()].role,
+            ResolutionTypeSlotRole::DeclaredValue
+        );
+        assert!(
+            !facts
+                .type_transfers
+                .iter()
+                .any(|transfer| transfer.output == value)
+        );
+        assert!(
+            !facts.type_slots.iter().any(|slot| {
+                slot.site == declaration && slot.role == ResolutionTypeSlotRole::AssignmentValue
+            }),
+            "an uninitialized let must not invent an initializer observation"
+        );
+        let [write] = facts.local_writes[..] else {
+            panic!("one structured write: {:?}", facts.local_writes);
+        };
+        assert!(facts.type_transfers.iter().any(|transfer| {
+            transfer.output == write.value
+                && transfer.kind == ResolutionTypeTransferKind::Construction
+        }));
+        assert!(
+            facts.binding_projections.iter().any(|projection| {
+                projection.kind == BindingProjectionKind::TargetDeclaredValueType
+                    && facts.type_slots[projection.output.index()].role
+                        == ResolutionTypeSlotRole::ExpressionValue
+            }),
+            "the later receiver reads the binding's value property"
+        );
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -13419,7 +14364,11 @@ fn caller() {
             .map(|identifier| facts.names[identifier.name.index()].spelling.as_str())
             .collect::<Vec<_>>();
         assert_eq!(references, ["READY", "COUNTER", "COUNTER", "COUNTER"]);
-        assert!(facts.gaps.is_empty());
+        assert_eq!(
+            gap_inventory(&facts, source),
+            [("COUNTER + 1", ResolutionGapKind::UnsupportedExpression)]
+        );
+        assert_eq!(facts.local_writes.len(), 1);
     }
 
     #[test]
@@ -14297,7 +15246,14 @@ fn caller(values: Vec<i32>) {
                 && &source[facts.sites[site.index()].start_byte..facts.sites[site.index()].end_byte]
                     == "i32"
         }));
-        assert!(gap_inventory(&facts, source).is_empty());
+        assert_eq!(
+            gap_inventory(&facts, source),
+            [
+                ("0", ResolutionGapKind::UnsupportedExpression),
+                ("|x| x", ResolutionGapKind::UnsupportedExpression),
+                ("x", ResolutionGapKind::UnsupportedExpression),
+            ]
+        );
     }
 
     #[test]
@@ -14373,10 +15329,13 @@ fn caller(value: Option<i32>) -> i32 {
             .find(|identifier| facts.sites[identifier.site.index()].start_byte == fallback_byte)
             .expect("fallback x reference");
         assert_ne!(facts.sites[fallback.site.index()].scope, pattern_scope);
-        assert!(
-            gap_inventory(&facts, source).is_empty(),
-            "an Option payload is projected, so its arguments record no gap: {:?}",
-            gap_inventory(&facts, source)
+        assert_eq!(
+            gap_inventory(&facts, source),
+            [
+                ("0", ResolutionGapKind::UnsupportedExpression),
+                ("Some(x) if x > 0", ResolutionGapKind::UnsupportedExpression),
+            ],
+            "the outer initializer and unmodeled pattern input stay explicit"
         );
     }
 
@@ -14471,10 +15430,14 @@ fn caller(first: Option<i32>, second: Option<i32>) {
             reference_scope_at(source.find("after = x").expect("after x") + 8),
             outer_scope
         );
-        assert!(
-            gap_inventory(&facts, source).is_empty(),
-            "an Option payload is projected, so its arguments record no gap: {:?}",
-            gap_inventory(&facts, source)
+        assert_eq!(
+            gap_inventory(&facts, source),
+            [
+                ("0", ResolutionGapKind::UnsupportedExpression),
+                ("Some(x)", ResolutionGapKind::UnsupportedExpression),
+                ("Some(x)", ResolutionGapKind::UnsupportedExpression),
+            ],
+            "the outer initializer and unmodeled pattern inputs stay explicit"
         );
     }
 
@@ -14679,7 +15642,17 @@ fn caller(x: Option<Option<i32>>, y: Option<Option<i32>>) {
             kind,
             ResolutionGapKind::UnsupportedCallApplicability
                 | ResolutionGapKind::UnsupportedTypeSyntax
+                | ResolutionGapKind::UnsupportedExpression
         )));
+        assert_eq!(
+            point_gaps
+                .iter()
+                .filter(|(_, kind)| *kind == ResolutionGapKind::UnsupportedExpression)
+                .map(|(spelling, _)| *spelling)
+                .collect::<Vec<_>>(),
+            ["Some(x)", "Some(y)", "Some(x)", "Some(y)"],
+            "each implicit pattern input remains unknown independently of its constructor path"
+        );
         assert!(
             facts.reference_enumeration_gaps.is_empty(),
             "pattern constructors are enumerated independently of receiver typing"
@@ -14737,10 +15710,10 @@ fn caller(value: Result<i32, i32>) -> i32 {
             gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder
                 && facts.sites[gap.site.index()].start_byte == pattern_start
         }));
-        assert!(
-            gap_inventory(&facts, source).is_empty(),
-            "a Result payload is projected, so its arguments record no gap: {:?}",
-            gap_inventory(&facts, source)
+        assert_eq!(
+            gap_inventory(&facts, source),
+            [("Ok(x) | Err(x)", ResolutionGapKind::UnsupportedExpression)],
+            "one semantic binder retains one unknown incoming value across its alternatives"
         );
     }
 
@@ -15561,6 +16534,53 @@ impl Service {
         None
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5133: a guessed macro operand inside cfg_if duplicated its computed receiver gap"
+    )]
+    fn guessed_macro_operand_preserves_one_computed_receiver_gap() {
+        // Reduced from the pinned Vector Windows event source. The coordinated
+        // parser replays cfg_if arms; the standalone native helper does not.
+        let source = r#"
+cfg_if::cfg_if! {
+    if #[cfg(windows)] {
+        fn query(error: Error) {
+            emit!(QueryError {
+                channel: "all".to_string(),
+                error: error.to_string(),
+            });
+        }
+    }
+}
+"#;
+        let facts = crate::test_helpers::parse_rust_fixture(source).resolution_facts;
+        let mut seen = std::collections::HashSet::new();
+        for gap in &facts.gaps {
+            assert!(seen.insert(*gap), "duplicate gap: {gap:?}");
+        }
+        let methods = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && facts.names[identifier.name.index()].spelling == "to_string"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(methods.len(), 2, "both authored method references survive");
+        for method in methods {
+            assert!(
+                facts.gaps.iter().any(|gap| gap.site == method.site
+                    && gap.kind == ResolutionGapKind::UnsupportedExpression),
+                "guessed macro references retain their uncertainty"
+            );
+            assert!(
+                facts.gaps.iter().any(|gap| gap.site == method.site
+                    && gap.kind == ResolutionGapKind::UnsupportedCallApplicability),
+                "independent call obligations remain present"
+            );
+        }
+    }
+
     fn parse_and_extract(source: &str) -> FileResolutionFacts {
         let mut parser = Parser::new();
         parser
@@ -15568,6 +16588,32 @@ impl Service {
             .expect("set Rust grammar");
         let tree = parser.parse(source, None).expect("parse fixture");
         extract_rust_resolution_facts(tree.root_node(), source)
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5133: grouped tuple-field attributes shifted native positional field identities"
+    )]
+    fn grouped_tuple_field_attributes_do_not_shift_native_ordinals() {
+        let source = "struct S(#[first] pub u8, #[second] u16); enum E { V(#[third] u32, u64) }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("set Rust grammar");
+        let tree = parser.parse(source, None).expect("parse fixture");
+        assert!(!tree.root_node().has_error(), "{source}");
+        let facts = extract_rust_resolution_facts(tree.root_node(), source);
+        let mut ordinals = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| identifier.role == ResolutionIdentifierRole::Declaration)
+            .filter_map(|identifier| {
+                let spelling = facts.names[identifier.name.index()].spelling.as_str();
+                spelling.parse::<u32>().is_ok().then_some(spelling)
+            })
+            .collect::<Vec<_>>();
+        ordinals.sort_unstable();
+        assert_eq!(ordinals, ["0", "0", "1", "1"]);
     }
 
     #[test]

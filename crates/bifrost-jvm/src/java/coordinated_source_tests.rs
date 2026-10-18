@@ -1,8 +1,9 @@
 use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole, ResolutionImportRouteKind,
-    ResolutionScopeKind, ResolutionSiteKind,
+    BindingProjectionKind, ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole,
+    ResolutionImportRouteKind, ResolutionNamespace, ResolutionScopeKind, ResolutionSiteKind,
+    ResolutionTypeTransferKind,
 };
 use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceProvenance};
 use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
@@ -24,6 +25,78 @@ fn parse(source: &str) -> (ParsedFile, Tree) {
     );
     let parsed = parse_java_file(&file, source, &tree);
     (parsed, tree)
+}
+
+#[test]
+#[hardwon(
+    "#5701: a suppressed cast or qualified assignment orphaned an anonymous allocation result"
+)]
+fn suppressed_anonymous_allocations_publish_their_synthetic_body_identities() {
+    let source = r#"
+class Holder {
+    Object value;
+    void assign() {
+        this.value = new Object() { int assigned() { return 1; } };
+    }
+    Object cast() {
+        return (Runnable) new Runnable() { public void run() {} };
+    }
+}
+"#;
+    let (parsed, _tree) = parse(source);
+    let facts = &parsed.resolution_facts;
+    let synthetic_declarations = facts
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Declaration
+                && identifier.namespace == ResolutionNamespace::Type
+                && facts.names[identifier.name.index()]
+                    .spelling
+                    .starts_with("$anon$")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        synthetic_declarations.len(),
+        2,
+        "a suppressed enclosing expression must still preserve each anonymous allocation identity: \
+         {synthetic_declarations:?}"
+    );
+    for declaration in synthetic_declarations {
+        let reference = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && identifier.namespace == ResolutionNamespace::Type
+                    && identifier.name == declaration.name
+                    && facts.reference_owners.iter().any(|owner| {
+                        owner.reference == identifier.site && owner.owner == Some(declaration.site)
+                    })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "anonymous allocation identity {:?} has no synthetic body reference",
+                    declaration
+                )
+            });
+        let identity = facts
+            .binding_projections
+            .iter()
+            .find(|projection| {
+                projection.reference == reference.site
+                    && projection.kind == BindingProjectionKind::TargetTypeIdentity
+            })
+            .map(|projection| projection.output)
+            .expect("anonymous allocation identity must bind a type slot");
+        assert!(
+            facts.type_transfers.iter().any(|transfer| {
+                transfer.input == identity
+                    && transfer.kind == ResolutionTypeTransferKind::Construction
+            }),
+            "anonymous allocation identity must supply the allocation result type"
+        );
+    }
 }
 
 fn named_node<'tree>(

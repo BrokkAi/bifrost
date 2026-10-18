@@ -3,6 +3,14 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::*;
+use crate::analyzer::semantic_model::{
+    SemanticModelActivationProvenance, SemanticModelCompleteness, SemanticModelMatchedCoordinate,
+    SemanticModelMatchedEvidence, SemanticModelOriginKind, SemanticModelProof,
+    SemanticModelProvenance, TypeRef,
+};
+use crate::analyzer::usages::python_class_hierarchy::{
+    PythonAncestryBasis, PythonModeledClassIdentity, PythonRuntimeBaseClaim,
+};
 
 impl Default for CodeQueryCandidateRef {
     fn default() -> Self {
@@ -39,6 +47,78 @@ impl Default for CodeQueryFlowCarrierSymbol {
 /// covering tags, omission/default behavior, diagnostics, and renamed fields.
 #[must_use]
 pub fn code_query_result_fixtures_json() -> Value {
+    // Test-only wire premises for class FixtureDict(dict): dict -> object -> [].
+    // Complete topology does not make the partial model a complete member inventory;
+    // these illustrative identities do not attest to a real catalog activation.
+    let object = PythonModeledClassIdentity {
+        qualified_name: "builtins.object".to_owned(),
+        symbol_id: "fixture-builtins-object".to_owned(),
+    };
+    let dict = PythonModeledClassIdentity {
+        qualified_name: "builtins.dict".to_owned(),
+        symbol_id: "fixture-builtins-dict".to_owned(),
+    };
+    let ancestry_basis = PythonAncestryBasis {
+        claims: [(dict.clone(), vec![object.clone()]), (object, Vec::new())]
+            .into_iter()
+            .map(|(class, bases)| PythonRuntimeBaseClaim {
+                declared_class: class.clone(),
+                class: Some(class.clone()),
+                declared_bases: bases
+                    .iter()
+                    .map(|base| TypeRef::Named {
+                        name: base.qualified_name.clone(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    })
+                    .collect(),
+                bases: bases.into_iter().map(Some).collect(),
+                provenance: SemanticModelProvenance {
+                    active_model_set_hash: "1".repeat(64),
+                    pack_digest: "2".repeat(64),
+                    pack_id: "test-only-python-runtime-bases".to_owned(),
+                    pack_version: "0.0.0".to_owned(),
+                    producer: "query-result-fixtures".to_owned(),
+                    producer_version: "1".to_owned(),
+                    record_id: class.symbol_id,
+                    rule_id: None,
+                    origin: SemanticModelOriginKind::DeclarativeModel,
+                    activation: SemanticModelActivationProvenance {
+                        status: "active".to_owned(),
+                        reason: "explicit test-only wire fixture".to_owned(),
+                        source_kind: "ephemeral_workspace".to_owned(),
+                        source_id: "fixture-python-runtime-bases".to_owned(),
+                        matched_evidence: SemanticModelMatchedEvidence {
+                            language: "python".to_owned(),
+                            ecosystem: "python".to_owned(),
+                            package: None,
+                            module: None,
+                            toolchain: Some(SemanticModelMatchedCoordinate {
+                                name: "CPython".to_owned(),
+                                version: Some("3.13.5".to_owned()),
+                            }),
+                            target: None,
+                            configuration: None,
+                            artifact_sha256: None,
+                        },
+                    },
+                    proof: SemanticModelProof::PackFact,
+                    completeness: SemanticModelCompleteness::Partial,
+                    ambiguous: false,
+                },
+            })
+            .collect(),
+    };
+    let root = CodeQueryDeclaration {
+        path: "fixture.py".to_owned(),
+        language: "python",
+        kind: "class_definition",
+        fq_name: "fixture.FixtureDict".to_owned(),
+        start_line: 1,
+        end_line: 2,
+        id: Some("fixture-dict-subclass".to_owned()),
+        ..Default::default()
+    };
     let values = vec![
         CodeQueryResultValue::StructuralMatch {
             value: Default::default(),
@@ -222,7 +302,32 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::PythonHierarchyFact {
-            value: Default::default(),
+            value: Box::new(CodeQueryPythonHierarchyFact {
+                id: "fixture-dict-mro-rank-1".to_owned(),
+                root_id: "fixture-dict-subclass".to_owned(),
+                ancestry_basis,
+                path: root.path.clone(),
+                language: "python",
+                range: CodeQueryRange {
+                    start_line: 1,
+                    start_column: 0,
+                    end_line: 2,
+                    end_column: 4,
+                },
+                root: Some(root),
+                root_declaration_id: Some("fixture-dict-subclass".to_owned()),
+                fact_kind: "mro",
+                outcome: "complete",
+                coverage: "complete",
+                ordinal: Some(1),
+                declaration: Some(CodeQueryPythonHierarchyEndpoint::ExternalClass {
+                    canonical_symbol_id: dict.symbol_id.clone(),
+                    qualified_name: dict.qualified_name,
+                }),
+                declaration_id: Some(dict.symbol_id),
+                mro_rank: Some(1),
+                ..Default::default()
+            }),
         },
         CodeQueryResultValue::Occurrence {
             value: Default::default(),

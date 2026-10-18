@@ -165,6 +165,28 @@ Properties assigned through a parameter or through a local that holds an
 object from elsewhere keep a file-scoped name, because that object can be
 shared with other functions.
 
+A bound CommonJS-shaped receiver (`exports` or `module.exports`) in a bundled
+module factory belongs to its lexical binding. Its members include that binding's
+structured scope segments, so independent factories assigning `exports.default`
+produce independent declarations. A closure using the same outer binding does
+not introduce another identity. Repeated assignments to the same member of that
+binding remain multiple sites of one declaration.
+
+The free `exports` object and the free `module.exports` object expose this file's
+exports. A factory parameter has that role only when direct argument-to-parameter
+evidence connects it to one of those objects. This includes a UMD callback passed
+to an immediately invoked wrapper, whose body calls that exact callback with the
+free exports object. Other UMD branches may call the same factory with a global
+object; they do not erase its CommonJS export surface. Shadowed, reassigned,
+spread, defaulted or otherwise unproved inputs do not establish this provenance.
+The extractor follows immutable local aliases and direct calls; it does not
+interpret arbitrary JavaScript. Unproved bound receivers retain lexical identity
+rather than claiming the file export surface.
+
+These distinctions use the existing structured qualified-name inputs to
+`DeclarationId` v1. They change extracted facts and therefore advance both
+language extraction epochs; they do not change the `decl:v1` digest recipe.
+
 ### Module and package source anchors
 
 A source-declared module uses its declaration item as its primary range.
@@ -261,6 +283,15 @@ Python module identities start at a supported packaging import root when one
 contains the source file. Bifrost searches ancestor directories, preferring the
 nearest project and the deepest containing root. It reads
 `tool.setuptools.packages.find.where` from `pyproject.toml`.
+
+Packaging declarations and `__init__.py` membership come from the selected
+project snapshot, including unsaved overlays. They determine mounted names;
+content-addressed declaration names retain only their tails. A change to these
+inputs reprojects package placement, while older snapshots keep their names.
+Retained naming and binding read the selected revision's configuration bytes
+from SQLite, including the absence of a manifest or marker. Later disk edits
+cannot change an older snapshot's exact lookup names; an explicit new logical
+project selects its own inputs when rebuilding.
 
 Legacy `setup.py` files can also establish a root. Bifrost parses the
 Python syntax without executing the script and recognizes a direct call to an

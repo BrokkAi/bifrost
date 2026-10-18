@@ -3076,6 +3076,10 @@ pub struct CallReceiverTypeFact {
 pub struct ProcedureSemanticsParts {
     pub id: ProcedureId,
     pub locator: SemanticLocator,
+    /// Query-time source regions this procedure does not lower. Nested
+    /// procedures can independently own source inside these holes. These
+    /// in-memory ownership facts are not part of the persisted IR row format.
+    pub source_range_holes: Vec<super::super::SourceSpan>,
     pub lexical_parent: Option<ProcedureId>,
     pub kind: ProcedureKind,
     pub properties: ProcedureProperties,
@@ -3124,6 +3128,7 @@ impl ProcedureSemanticsParts {
         Self {
             id,
             locator,
+            source_range_holes: Vec::new(),
             lexical_parent: None,
             kind,
             properties: ProcedureProperties::default(),

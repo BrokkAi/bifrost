@@ -933,6 +933,16 @@ impl EndpointRows<'_, '_, '_> {
                         continue;
                     }
                 }
+                let in_module_scope = lexical.node_is_scope_head_in(
+                    &scope_ordinals,
+                    scope,
+                    module.fragment,
+                    module.scope,
+                );
+                if is_import && targets.is_empty() && prefix.is_none() && in_module_scope {
+                    completion = completion
+                        .combine(&rows.crate_import_inventory_completion(module, &demand)?);
+                }
                 // An import with no route segments binds the path root itself,
                 // so the module it is written in is not a place to look:
                 // `use serde as s;` does not bind whatever `serde` names
@@ -943,12 +953,7 @@ impl EndpointRows<'_, '_, '_> {
                 if targets.is_empty()
                     && prefix.is_none()
                     && !(is_import && route.is_empty())
-                    && lexical.node_is_scope_head_in(
-                        &scope_ordinals,
-                        scope,
-                        module.fragment,
-                        module.scope,
-                    )
+                    && in_module_scope
                 {
                     for (id, path) in rows.crate_route(
                         module,

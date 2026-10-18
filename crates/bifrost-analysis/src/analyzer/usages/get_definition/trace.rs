@@ -2761,6 +2761,42 @@ mod boundary_evidence_tests {
         );
     }
 
+    #[test]
+    #[hardwon(
+        "0242909d77ed: Java census G13 (2026-10-15): inherited external members lost their declaring owner"
+    )]
+    fn inherited_external_routes_keep_the_same_declaring_identity_for_both_receiver_types() {
+        let jars = tempfile::tempdir().expect("jar dir");
+        let jar = jars.path().join("servlet-api.jar");
+        write_servlet_api_jar(&jar);
+        for receiver in [
+            "jakarta.servlet.ServletRequest",
+            "jakarta.servlet.http.HttpServletRequest",
+        ] {
+            let source = format!(
+                "class App {{ String read({receiver} request) {{ return request.getParameter(\"user\"); }} }}"
+            );
+            let fixture =
+                BoundaryFixture::with_config(Language::Java, "src/App.java", &source, |_| {
+                    jvm_config_with_artifact_jar(Some(jar.clone()))
+                });
+            let (outcome, trace) = fixture.trace("getParameter(\"user\")");
+            assert_eq!(
+                outcome.resolved_reference_target(),
+                Some("jakarta.servlet.ServletRequest.getParameter"),
+                "receiver {receiver}: {outcome:?}"
+            );
+            assert_eq!(
+                external_routes(&trace),
+                vec![(
+                    BoundaryStatus::ExternalIndexed,
+                    Some("jakarta.servlet.ServletRequest.getParameter".to_owned())
+                )],
+                "receiver {receiver}: {trace:?}"
+            );
+        }
+    }
+
     /// The decoy half of #3466: the workspace-local member of the same name is
     /// still an ordinary in-workspace resolution. Nothing about the external
     /// call makes a same-name workspace member a boundary.

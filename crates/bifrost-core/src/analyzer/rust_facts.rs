@@ -491,14 +491,14 @@ pub struct RustImportSourceOccurrences {
     pub alias: Option<SourceOccurrenceId>,
 }
 
-/// Rust-only interpretation attached to one primary-tree import declaration.
+/// Rust-only interpretation attached to one authoritative import declaration.
 ///
 /// The declaration occurrence is the source-owned identity shared by grouped
-/// import leaves.  Scope occurrences are interned from the same primary AST
+/// import leaves. Scope occurrences are interned from the same AST
 /// nodes used to calculate the native owner extents; `None` for `owner_scope`
 /// means the file root, whose extent is the complete canonical source bytes.
-/// Embedded macro imports do not receive this context because they have no
-/// primary Rust target authority.
+/// Speculative macro imports have no target authority. Proven source-preserving
+/// item macros retain the same context, with embedded occurrence identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustImportContextFact {
     pub declaration: SourceOccurrenceId,
@@ -1487,6 +1487,8 @@ impl RustMacroDefinitionSourceFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustMacroInvocationInputSourceFact {
     pub invocation: SourceOccurrenceId,
+    /// Effective source placement, including enclosing cfg_if arm predicates.
+    pub cfg_condition: RustCfgCondition,
     /// The exact native frontier withheld for this invocation, when present.
     /// Selected replay may close this frontier only after admitting its facts.
     pub native_frontier: Option<(
@@ -1555,6 +1557,7 @@ impl RustItemSourceFacts {
                             .tree
                             .source
                             .capacity()
+                            .saturating_add(input.cfg_condition.estimated_retained_bytes())
                             .saturating_add(
                                 input
                                     .occurrences

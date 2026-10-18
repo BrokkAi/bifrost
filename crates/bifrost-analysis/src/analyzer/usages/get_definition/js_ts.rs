@@ -832,12 +832,22 @@ pub(super) fn resolve_js_ts(
         return js_ts_candidates_outcome(analyzer, candidates);
     }
 
-    // AST path for an inline construction receiver `new Foo().member` — the
-    // text-split path below cannot express `new Foo()` as a qualifier.
-    if let Some(members) = jsts_construction_receiver_members(
-        analyzer, host, support, file, language, source, tree, site, imports, aliases,
+    // Calls and constructions have expression receivers rather than dotted
+    // identifier qualifiers. Resolve their exact owners from the AST.
+    if let Some(members) = jsts_expression_receiver_members(
+        analyzer,
+        host,
+        support,
+        file,
+        language,
+        source,
+        tree,
+        site,
+        imports,
+        aliases,
+        &lexical_bindings,
     ) {
-        return js_ts_candidates_outcome(analyzer, members);
+        return jsts_local_dotted_outcome(analyzer, reference, members);
     }
 
     if let Some(overlay) = analyzer.semantic_model_overlay()
@@ -3137,11 +3147,11 @@ fn jsts_import_member_expression_at_focus<'tree>(
     None
 }
 
-/// Resolve `new Foo().member` by typing the receiver as the constructed class.
-/// Returns the member candidates when the caret is on the property of a
-/// member-expression whose object is a `new_expression`.
+/// Resolve members of constructed values and indexed factory results through
+/// the same owner expansion. A bound member callee retains its lexical property
+/// proof, including incomplete reaching evidence, before its returns are read.
 #[allow(clippy::too_many_arguments)]
-fn jsts_construction_receiver_members(
+fn jsts_expression_receiver_members(
     analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
@@ -3152,7 +3162,8 @@ fn jsts_construction_receiver_members(
     site: &ResolvedReferenceSite,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
-) -> Option<Vec<CodeUnit>> {
+    lexical_bindings: &JsTsLexicalBindingIndex,
+) -> Option<JstsLocalDottedCandidates> {
     let node =
         smallest_named_node_covering(tree.root_node(), site.range.start_byte, site.range.end_byte)?;
     // The site may resolve to the property identifier or to the whole
@@ -3168,30 +3179,59 @@ fn jsts_construction_receiver_members(
         return None;
     };
     let object = member_expr.child_by_field_name("object")?;
-    if object.kind() != "new_expression" {
-        return None;
-    }
-    let constructor = object.child_by_field_name("constructor")?;
-    if constructor.kind() != "identifier" {
-        return None;
-    }
     let (_, member) = static_member_property(member_expr, source)?;
-    let class_name = &source[constructor.start_byte()..constructor.end_byte()];
-    let mut receiver_candidates = support.file_identifier(file, class_name);
-    receiver_candidates.extend(
-        resolve_js_ts_direct_import_candidates(
-            host,
-            support,
-            language,
-            file,
-            imports,
-            class_name,
-            Some(aliases),
-            true,
-        )
-        .unwrap_or_default(),
-    );
-    let receiver_candidates = jsts_value_space_candidates(host, receiver_candidates);
+    let (receiver_candidates, incomplete) = match object.kind() {
+        "new_expression" => {
+            let constructor = object.child_by_field_name("constructor")?;
+            if constructor.kind() != "identifier" {
+                return None;
+            }
+            let class_name = slice(constructor, source);
+            let mut candidates = support.file_identifier(file, class_name);
+            candidates.extend(
+                resolve_js_ts_direct_import_candidates(
+                    host,
+                    support,
+                    language,
+                    file,
+                    imports,
+                    class_name,
+                    Some(aliases),
+                    true,
+                )
+                .unwrap_or_default(),
+            );
+            (jsts_value_space_candidates(host, candidates), false)
+        }
+        "call_expression" => {
+            let function = object.child_by_field_name("function")?;
+            let receiver = brokk_bifrost_js_ts::syntax::static_member_receiver(function, source)
+                .filter(|receiver| !receiver.members.is_empty())?;
+            let reference = jsts_dotted_chain_text(function, source, language)?;
+            let local = jsts_exact_local_dotted_candidates(
+                JstsDottedLookup {
+                    analyzer,
+                    host,
+                    support,
+                    file,
+                    root: tree.root_node(),
+                    source,
+                    reference: &reference,
+                    receiver: slice(receiver.root, source),
+                    value_position: true,
+                    before_byte: function.start_byte(),
+                },
+                lexical_bindings,
+                function,
+                &[],
+            )?;
+            (
+                ts_expand_call_return_property_owners(host, support, local.candidates, 0),
+                local.incomplete,
+            )
+        }
+        _ => return None,
+    };
     let mut finds = JsTsMemberFinds::default();
     let members = if language == Language::TypeScript {
         ts_member_candidates(
@@ -3210,7 +3250,10 @@ fn jsts_construction_receiver_members(
         return None;
     }
     finds.stage();
-    Some(members)
+    Some(JstsLocalDottedCandidates {
+        candidates: members,
+        incomplete,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

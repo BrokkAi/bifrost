@@ -1012,15 +1012,37 @@ reached through a diamond counts once. They also expose class-level
 `has_strict_ordering` and `has_non_strict_ordering` booleans over the effective
 C3 member set, plus `total_ordering_decorator`, which is true only for a
 recognized `functools.total_ordering` import and absent when decorator identity
-is uncertain. `inherited_ne_present` distinguishes inherited `__ne__`
-declarations from Python's implicit equality delegation, while
-`inherited_ne_delegates` is true only when every inherited declaration has a
-recognized direct `not self.__eq__(other)` or equivalent comparison form. It
-is false when any inherited declaration is known not to delegate and absent
-when the declarations cannot be classified completely.
-An explicit bare `object` base with no local or imported binding is a resolved
-base fact without a `target` declaration; `class_mro` treats it as a leaf and
-omits it, matching the implicit root case.
+is uncertain. `inherited_ne_present` is true when the effective C3-selected
+`__ne__` is an inherited source function. `inherited_ne_delegates` is true for
+that function's recognized direct `not self.__eq__(other)` or equivalent
+comparison form, false for a known non-delegating body, and absent when its body
+cannot be classified. Masked ancestor declarations do not affect either field.
+A selected direct `__ne__` makes both fields false. An inherited
+non-function or an unknown selection leaves both fields absent. A known source
+selection before an unknown external member surface remains usable, while
+absence is reported as false only when member enumeration is complete. These
+facts do not make an open member row's coverage complete.
+An implicit `object` root is a language identity. Without an active runtime-base
+claim it is recorded as an intrinsic terminal `builtins.object` endpoint, so a
+class with no written bases has complete ancestry. An active claim refines that
+endpoint to the model's canonical external identity; `class_mro` retains it,
+including a root whose runtime-base claim is explicitly empty. An unshadowed
+explicit `object` base still requires active runtime-base model evidence for
+canonical `builtins.object` ancestry, and a missing declaration or claim keeps
+that explicit edge incomplete. Complete modeled ancestry does not imply a
+complete external member inventory.
+
+A complete modeled C3 result establishes an ordered ancestry under the selected
+source identities and applicable runtime-base claims; it does not establish
+successful Python class construction, layout compatibility, metaclass behavior,
+or decorator identity preservation. Each `ancestry_basis` retains the
+contributing ordered claims and their model provenance through query evidence,
+reusable unit rows, and policy references. An absent runtime-base claim makes no
+assertion; an explicitly empty claim asserts a root. Missing, ambiguous,
+conflicting, unsupported, exhausted, or cancelled derivations retain their typed
+outcome; incomplete ancestry emits no partial MRO. Model-backed ancestry remains
+model-derived evidence, including when its ordering is complete.
+
 Iterator return rows expose `returns_receiver` as `true` for a direct return of
 the first receiver parameter, `false` for another exact selected return
 expression, and omit it when receiver identity is unresolved.

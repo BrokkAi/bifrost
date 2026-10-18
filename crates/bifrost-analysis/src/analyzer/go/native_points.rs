@@ -14,6 +14,8 @@ use crate::analyzer::resolution::{
 };
 use crate::analyzer::resolve_analyzer;
 use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
+#[cfg(any(test, feature = "test-support"))]
+use crate::analyzer::store::resolution_operation::SelectedNativeAssignmentValue;
 use crate::analyzer::store::resolution_operation::{
     GoExternalPackageProvenance, GoPreparedImportContext, GoPreparedImportContextOutcome,
     GoSelectedExternalImport, SelectedResolutionContextMetrics, SelectedResolutionLocated,
@@ -1038,6 +1040,40 @@ impl<'a> GoNativePointRequest<'a> {
     #[cfg(test)]
     pub(crate) fn oracle_for_test(&self) -> (&SelectedResolutionOperation<'a, 'a>, i64) {
         (&self.operation, self.context_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_assignment_value_bounded(
+        &mut self,
+        path: &str,
+        locator: &SelectedSemanticLocator,
+        budget: crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        Option<
+            BoundedResolution<
+                SelectedResolutionOperationOutcome<
+                    SelectedResolutionLocated<SelectedNativeAssignmentValue>,
+                >,
+            >,
+        >,
+    > {
+        if cancellation.is_cancelled() {
+            return Ok(Some(BoundedResolution::Cancelled {
+                work: ReceiverAnalysisWork::default(),
+            }));
+        }
+        let Some(file_context) = self.file_context(path, cancellation)? else {
+            return Ok(None);
+        };
+        self.operation
+            .resolve_go_assignment_value_bounded(
+                file_context.context,
+                locator,
+                budget,
+                cancellation,
+            )
+            .map(Some)
     }
 
     fn file_context(

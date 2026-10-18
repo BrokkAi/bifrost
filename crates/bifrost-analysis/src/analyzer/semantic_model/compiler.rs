@@ -8,8 +8,8 @@ use super::artifact::{
     CompiledResultUseObligation, CompiledReturnedCallable, CompiledSemanticModelPack,
     CompiledShard, CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryExitKind,
     CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryTransfer, DecodeLimits,
-    canonical_json, content_digest, manifest_content_digest, manifest_semantic_digest,
-    routing_keys, semantic_digest, shard_inventory,
+    SourceInputFile, SourceSetInputs, canonical_json, content_digest, manifest_content_digest,
+    manifest_semantic_digest, routing_keys, semantic_digest, shard_inventory,
 };
 use super::conversion::{
     compile_concurrency_effect, compile_declared_effect, compile_result_predicate,
@@ -201,6 +201,7 @@ pub fn compile_pack(
         cpp_portability: normalized.cpp_portability,
         python_correspondence: normalized.python_correspondence,
         carried_sources: normalized.carried_sources,
+        source_inputs: None,
         semantic_sha256: String::new(),
         content_sha256: String::new(),
         shards: artifacts
@@ -210,7 +211,50 @@ pub fn compile_pack(
     };
     manifest.semantic_sha256 = manifest_semantic_digest(&manifest).map_err(artifact_diagnostic)?;
     manifest.content_sha256 = manifest_content_digest(&manifest).map_err(artifact_diagnostic)?;
-    let manifest_bytes = canonical_json(&manifest).map_err(artifact_diagnostic)?;
+    let manifest_bytes = encode_manifest(&manifest, options)?;
+    Ok(CompiledSemanticModelPack {
+        manifest,
+        manifest_bytes,
+        shards: artifacts,
+    })
+}
+
+impl CompiledSemanticModelPack {
+    /// Retain the exact acquired source snapshot in the manifest's content
+    /// identity. Input-only edits do not change the pack's semantic digest.
+    pub fn with_source_set_inputs(
+        mut self,
+        artifact: &super::ExactArtifact,
+        options: &CompilerOptions,
+    ) -> Result<Self, Vec<Diagnostic>> {
+        assert!(
+            !artifact.source_entries().is_empty(),
+            "source input provenance requires a source set"
+        );
+        self.manifest.source_inputs = Some(SourceSetInputs {
+            sha256: artifact.sha256().to_owned(),
+            files: artifact
+                .source_entries()
+                .iter()
+                .map(|entry| SourceInputFile {
+                    path: entry.relative_path().to_owned(),
+                    sha256: content_digest(entry.bytes()),
+                    bytes: entry.bytes().len() as u64,
+                })
+                .collect(),
+        });
+        self.manifest.content_sha256 =
+            manifest_content_digest(&self.manifest).map_err(artifact_diagnostic)?;
+        self.manifest_bytes = encode_manifest(&self.manifest, options)?;
+        Ok(self)
+    }
+}
+
+fn encode_manifest(
+    manifest: &CompiledPackManifest,
+    options: &CompilerOptions,
+) -> Result<Vec<u8>, Vec<Diagnostic>> {
+    let manifest_bytes = canonical_json(manifest).map_err(artifact_diagnostic)?;
     if manifest_bytes.len() > options.max_manifest_bytes {
         return Err(vec![Diagnostic::error(
             "limit.manifest_bytes",
@@ -221,11 +265,7 @@ pub fn compile_pack(
             ),
         )]);
     }
-    Ok(CompiledSemanticModelPack {
-        manifest,
-        manifest_bytes,
-        shards: artifacts,
-    })
+    Ok(manifest_bytes)
 }
 
 fn artifact_diagnostic(error: ArtifactError) -> Vec<Diagnostic> {

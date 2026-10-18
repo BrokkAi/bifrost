@@ -12,6 +12,7 @@
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::prepared_syntax::{IndexedFileFacts, PreparedSyntaxTree};
+use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
@@ -28,8 +29,8 @@ use tree_sitter::Node;
 use crate::bindings::{python_direct_scope_bindings_bounded, python_executable_scope_children};
 use crate::declarations::{
     collect_python_identifiers, module_code_unit, parse_python_tree, python_base_origin_node,
-    python_declared_import_root, python_import_root, python_module_name,
-    python_project_module_components, python_repeated_root_extension_dir,
+    python_declared_import_root, python_import_root, python_project_module_components,
+    python_repeated_root_extension_dir,
 };
 use crate::imports::{
     PythonImportDetails, python_import_details, python_namespace_binding_module,
@@ -131,6 +132,7 @@ pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
 /// whichever caller asked for a unique identity, rather than inventing a
 /// preference the workspace does not state.
 pub fn retain_modules_for_importer<T>(
+    project: &dyn Project,
     importer: &ProjectFile,
     candidates: &mut Vec<T>,
     source_of: impl Fn(&T) -> &ProjectFile,
@@ -142,7 +144,7 @@ pub fn retain_modules_for_importer<T>(
             source.root(),
             "one workspace's Python files share one project root"
         );
-        python_import_root(source)
+        python_import_root(project, source)
     });
 }
 
@@ -226,8 +228,9 @@ pub struct PythonSourceRootModule {
 /// below a packaging declaration is established by the one thing the listing
 /// cannot state -- the package marker's own `__path__` extension -- so those
 /// markers, and only the markers that could state one, are read.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PythonModuleSpellings {
+    project: Option<Arc<dyn Project>>,
     by_last_component: HashMap<String, Vec<ProjectRootModuleName>>,
     /// Every directory of the snapshot that holds an `__init__.py`, i.e. every
     /// package directory the workspace states.
@@ -246,17 +249,27 @@ pub struct PythonModuleSpellings {
     path_extensions: HashMap<PathBuf, HashSet<PathBuf>>,
 }
 
+impl std::fmt::Debug for PythonModuleSpellings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonModuleSpellings")
+            .field("by_last_component", &self.by_last_component)
+            .field("package_dirs", &self.package_dirs)
+            .field("path_extensions", &self.path_extensions)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PythonModuleSpellings {
+    pub(crate) fn project(&self) -> Option<&dyn Project> {
+        self.project.as_deref()
+    }
+
     /// Index the snapshot's Python files.
     ///
-    /// `read_source` answers a file's bytes from the same snapshot the listing
-    /// came from -- the project's own read, so an overlay's unsaved marker text
-    /// is what the evidence sees -- and is called only for markers that can
-    /// state a path extension.
-    pub fn build(
-        files: impl IntoIterator<Item = ProjectFile>,
-        mut read_source: impl FnMut(&ProjectFile) -> Option<String>,
-    ) -> Self {
+    /// `project` supplies the same snapshot as the listing, including unsaved
+    /// marker text and packaging declarations. Marker source is read only when
+    /// it can state a path extension. The retained handle owns no new index.
+    pub fn build(files: impl IntoIterator<Item = ProjectFile>, project: Arc<dyn Project>) -> Self {
         let mut by_last_component: HashMap<String, Vec<ProjectRootModuleName>> = HashMap::default();
         let mut package_dirs: HashSet<PathBuf> = HashSet::default();
         let mut package_markers: Vec<ProjectFile> = Vec::new();
@@ -284,7 +297,7 @@ impl PythonModuleSpellings {
             if !python_package_holds_a_repeat_of_itself(directory, &package_dirs) {
                 continue;
             }
-            let Some(source) = read_source(&marker) else {
+            let Ok(source) = project.read_source(&marker) else {
                 continue;
             };
             let extended = python_appended_path_dirs(&source, marker.rel_path());
@@ -296,6 +309,7 @@ impl PythonModuleSpellings {
             }
         }
         Self {
+            project: Some(project),
             by_last_component,
             package_dirs,
             path_extensions,
@@ -411,7 +425,11 @@ impl PythonModuleSpellings {
     /// project that declares no packages at all. A bare tail match with no
     /// chain behind it is not proof of a root and never binds (#3506).
     pub fn establishes_source_root(&self, candidate: &PythonSourceRootModule) -> bool {
-        if let Some(declared) = python_declared_import_root(&candidate.file) {
+        if let Some(declared) = python_declared_import_root(
+            self.project()
+                .expect("source-root candidates have a selected project"),
+            &candidate.file,
+        ) {
             if declared == candidate.source_root {
                 return true;
             }
@@ -804,8 +822,12 @@ pub fn resolve_module_code_unit(
     let indexed = match python.path_module_fqn(module_fq) {
         // A path lookup that succeeds but finds no module unit is an answer:
         // it does not fall through to the definition lookup.
-        Some(units) => indexed_module_for_importer(importer, units),
-        None => indexed_module_for_importer(importer, python.definition_fqn(module_fq)),
+        Some(units) => indexed_module_for_importer(python.project(), importer, units),
+        None => indexed_module_for_importer(
+            python.project(),
+            importer,
+            python.definition_fqn(module_fq),
+        ),
     };
     match indexed {
         IndexedModuleLookup::Unique(module) => Some(module),
@@ -835,6 +857,7 @@ enum IndexedModuleLookup {
 }
 
 fn indexed_module_for_importer(
+    project: &dyn Project,
     importer: Option<&ProjectFile>,
     units: Vec<CodeUnit>,
 ) -> IndexedModuleLookup {
@@ -843,7 +866,7 @@ fn indexed_module_for_importer(
         .filter(CodeUnit::is_module)
         .collect::<Vec<_>>();
     if let Some(importer) = importer {
-        retain_modules_for_importer(importer, &mut modules, CodeUnit::source);
+        retain_modules_for_importer(project, importer, &mut modules, CodeUnit::source);
     }
     match modules.len() {
         0 => IndexedModuleLookup::Missing,
@@ -911,7 +934,7 @@ fn module_under_source_root(
     module_fq: &str,
 ) -> Option<CodeUnit> {
     let file = python_module_file_under_source_root(spellings, importer, module_fq)?;
-    module_code_unit(&file, &python_module_name(&file))
+    module_code_unit(spellings.project()?, &file)
 }
 
 /// Batched sibling of `resolve_module_code_unit`: resolves every FQN's path-symbol lookup in one
@@ -929,7 +952,11 @@ pub fn resolve_module_code_units_batch(
     let mut needs_definition_fallback = Vec::new();
     for (i, units) in path_results.into_iter().enumerate() {
         match units {
-            Some(units) => lookups.push(indexed_module_for_importer(importer, units)),
+            Some(units) => lookups.push(indexed_module_for_importer(
+                python.project(),
+                importer,
+                units,
+            )),
             None => {
                 needs_definition_fallback.push(i);
                 // Placeholder, replaced by the definition lookup below.
@@ -938,7 +965,11 @@ pub fn resolve_module_code_units_batch(
         }
     }
     for i in needs_definition_fallback {
-        lookups[i] = indexed_module_for_importer(importer, python.definition_fqn(&module_fqs[i]));
+        lookups[i] = indexed_module_for_importer(
+            python.project(),
+            importer,
+            python.definition_fqn(&module_fqs[i]),
+        );
     }
     let mut results: Vec<Option<CodeUnit>> = vec![None; module_fqs.len()];
     let mut needs_source_root = Vec::new();
@@ -1108,7 +1139,7 @@ fn record_single_reexport_event(
         .map(|path| path.declaration_start_byte)
         .unwrap_or(usize::MAX);
     let resolved_module = if module.starts_with('.') {
-        resolve_python_relative_module(file, &module)
+        resolve_python_relative_module(python.project(), file, &module)
     } else {
         Some(module.clone())
     };
@@ -1200,7 +1231,7 @@ pub fn import_bindings_from_imports(
                 ..
             } => {
                 let resolved_module = if module.starts_with('.') {
-                    resolve_python_relative_module(file, &module)
+                    resolve_python_relative_module(python.project(), file, &module)
                 } else {
                     Some(module.clone())
                 };

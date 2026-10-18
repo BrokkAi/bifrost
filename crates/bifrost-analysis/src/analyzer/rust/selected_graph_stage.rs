@@ -1,8 +1,8 @@
 //! File-major native Rust graph projection inside one selected operation.
 
 use super::graph_stage::{
-    GraphStageAdapter, GraphStageGuard, GraphStageHelperTables, GraphStageMetrics,
-    GraphStageResult, run_graph_stages,
+    GraphStageAdapter, GraphStageAdmission, GraphStageGuard, GraphStageHelperTables,
+    GraphStageMetrics, GraphStageResult, run_graph_stages,
 };
 use super::*;
 use crate::analyzer::IAnalyzer;
@@ -32,7 +32,7 @@ impl GraphStageAdapter for RustGraphStageAdapter<'_> {
         operation: &SelectedResolutionOperation<'_, '_>,
         files: &[ProjectFile],
         cancellation: &CancellationToken,
-    ) -> Result<SelectedResolutionOperationOutcome<Vec<(Self::Unit, Vec<ProjectFile>)>>> {
+    ) -> Result<SelectedResolutionOperationOutcome<GraphStageAdmission<Self::Unit>>> {
         if cancellation.is_cancelled() {
             return Ok(SelectedResolutionOperationOutcome::Cancelled(
                 cancelled_completion(),
@@ -78,7 +78,12 @@ impl GraphStageAdapter for RustGraphStageAdapter<'_> {
                 outside_crates.into_iter().collect(),
             ));
         }
-        Ok(SelectedResolutionOperationOutcome::Native(groups))
+        Ok(SelectedResolutionOperationOutcome::Native(
+            GraphStageAdmission {
+                units: groups,
+                skipped: Default::default(),
+            },
+        ))
     }
 
     fn helper_tables<'stage>(

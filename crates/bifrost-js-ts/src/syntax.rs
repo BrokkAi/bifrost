@@ -223,12 +223,17 @@ impl JsTsImportBinder {
         for records in self.provenance_bindings.values_mut() {
             for record in records {
                 let binder_range = record.provenance.declaration_range;
-                let scope =
-                    lexical_bindings.binding_scope_at(&record.local_name, binder_range.start_byte);
-                let has_binder_range = scope.is_some_and(|_| {
+                let binder = root
+                    .descendant_for_byte_range(binder_range.start_byte, binder_range.end_byte)
+                    .filter(|node| {
+                        node.start_byte() == binder_range.start_byte
+                            && node.end_byte() == binder_range.end_byte
+                    });
+                let scope = binder.and_then(|node| lexical_bindings.binding_scope_for_binder(node));
+                let has_binder_range = binder.is_some_and(|node| {
                     lexical_bindings
-                        .binding_identifier_ranges_at(&record.local_name, binder_range.start_byte)
-                        .into_iter()
+                        .binding_identifier_ranges_for_binder(&record.local_name, node)
+                        .iter()
                         .any(|range| {
                             range.start_byte == binder_range.start_byte
                                 && range.end_byte == binder_range.end_byte
@@ -472,6 +477,9 @@ impl JsTsImportBinder {
         let Some(scope) = lexical_bindings.binding_scope_at(local_name, byte) else {
             return JsTsImportBindingResolution::Unresolved;
         };
+        if !scope.is_complete() {
+            return JsTsImportBindingResolution::Incomplete;
+        }
         let scoped = events
             .iter()
             .filter(|event| event.provenance.declaration_scope == Some(scope))
@@ -587,26 +595,68 @@ pub enum JsTsImportBindingResolution<'a> {
     Unresolved,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Semantic environments with the same AST owner are still distinct bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum JsTsBindingEnvironment {
+    NamedExpressionSelf,
+    FunctionParameters,
+    FunctionBody,
+    Ordinary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct JsTsLexicalBindingScope {
+    // These are the syntactic OWNER, not the reference visibility interval.
     pub(crate) start_byte: usize,
     pub(crate) end_byte: usize,
     pub(crate) node_id: usize,
+    pub(crate) environment: JsTsBindingEnvironment,
+    complete: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct JsTsBindingScopeState {
     scope: JsTsLexicalBindingScope,
     is_program: bool,
+    visibility_start: usize,
+    visibility_end: usize,
+    nesting_depth: usize,
+}
+
+impl JsTsBindingScopeState {
+    fn ordinary(node: Node<'_>, nesting_depth: usize) -> Self {
+        Self {
+            scope: node_scope(node),
+            is_program: node.kind() == "program",
+            visibility_start: node.start_byte(),
+            visibility_end: node.end_byte(),
+            nesting_depth,
+        }
+    }
 }
 
 impl JsTsLexicalBindingScope {
+    /// Whether the syntactic owner contains this byte. Reference selection
+    /// uses the separate visibility interval in the index's scope state.
     pub fn contains(&self, byte: usize) -> bool {
         brokk_bifrost_core::analyzer::model::byte_range_contains(
             self.start_byte,
             self.end_byte,
             byte,
         )
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn environment_component(&self) -> Option<&'static str> {
+        match self.environment {
+            JsTsBindingEnvironment::Ordinary => None,
+            JsTsBindingEnvironment::NamedExpressionSelf => Some("binding_self"),
+            JsTsBindingEnvironment::FunctionParameters => Some("binding_parameters"),
+            JsTsBindingEnvironment::FunctionBody => Some("binding_body"),
+        }
     }
 }
 
@@ -618,13 +668,22 @@ impl JsTsLexicalBindingScope {
 pub struct JsTsLexicalBindingIndex {
     scopes_by_name: HashMap<String, Vec<JsTsBindingScopeState>>,
     binding_ranges_by_name: HashMap<String, Vec<(JsTsLexicalBindingScope, Range)>>,
-    binding_program_by_id: HashMap<usize, bool>,
+    binding_state_by_id: HashMap<usize, JsTsBindingScopeState>,
+    incomplete_parameter_patterns: bool,
     /// Byte offsets of assignment targets, keyed by the assigned name. An
     /// assignment site whose name resolves to the program scope rebinds the
     /// program-level callable, so calls through that name stay ambiguous.
     assignments_by_name: HashMap<String, Vec<usize>>,
     /// Proven aliases of runtime-global roots, indexed by lexical scope.
     global_aliases: HashMap<String, Vec<(JsTsLexicalBindingScope, Range, String)>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsTsReceiverDeclarationKind {
+    DeclarationRoot,
+    LocalObject,
+    PlainLocal,
+    Unsupported,
 }
 
 /// A statically nameable runtime access key. Dynamic and unsupported forms are
@@ -825,28 +884,27 @@ impl JsTsLexicalBindingIndex {
         let mut index = Self {
             scopes_by_name: HashMap::default(),
             binding_ranges_by_name: HashMap::default(),
-            binding_program_by_id: HashMap::default(),
+            binding_state_by_id: HashMap::default(),
+            incomplete_parameter_patterns: false,
             assignments_by_name: HashMap::default(),
             global_aliases: HashMap::default(),
         };
-        let program_scope = node_scope(root);
         // Retain the scope from this walk. Resolve aliases after all bindings
         // are known so later declarations still shadow runtime globals.
         let mut pending_aliases = Vec::new();
         struct Frame<'tree> {
             node: Node<'tree>,
             parent_kind: Option<&'static str>,
+            depth: usize,
             lexical_scope: Option<JsTsBindingScopeState>,
             declaration_scope: Option<JsTsBindingScopeState>,
             var_scope: Option<JsTsBindingScopeState>,
         }
-        let program_state = JsTsBindingScopeState {
-            scope: program_scope,
-            is_program: true,
-        };
+        let program_state = JsTsBindingScopeState::ordinary(root, 0);
         let mut stack = vec![Frame {
             node: root,
             parent_kind: None,
+            depth: 0,
             lexical_scope: Some(program_state),
             declaration_scope: Some(program_state),
             var_scope: Some(program_state),
@@ -854,6 +912,7 @@ impl JsTsLexicalBindingIndex {
         while let Some(Frame {
             node,
             parent_kind,
+            depth,
             lexical_scope,
             declaration_scope,
             var_scope,
@@ -862,13 +921,30 @@ impl JsTsLexicalBindingIndex {
             if !budget.visit() {
                 break;
             }
+            let function_environments = is_function_like(node.kind()).then(|| {
+                let expressions = function_parameter_contains_expression(node, budget);
+                index.incomplete_parameter_patterns |= expressions.is_none();
+                let mut parameters = JsTsBindingScopeState::ordinary(node, depth);
+                let mut body = parameters;
+                if expressions != Some(false) {
+                    parameters.scope.environment = JsTsBindingEnvironment::FunctionParameters;
+                    body.scope.environment = JsTsBindingEnvironment::FunctionBody;
+                    if let Some(body_node) = node.child_by_field_name("body") {
+                        body.visibility_start = body_node.start_byte();
+                        body.visibility_end = body_node.end_byte();
+                    }
+                }
+                parameters.scope.complete = expressions.is_some();
+                body.scope.complete = expressions.is_some();
+                (parameters, body)
+            });
             match node.kind() {
                 "import_statement" => {
                     let mut binder = JsTsImportBinder::empty();
                     visit_import_statement(node, root, source, &mut binder);
-                    let scope = node_scope(root);
+                    let scope = JsTsBindingScopeState::ordinary(root, 0);
                     for name in binder.names() {
-                        index.insert(name, scope, true);
+                        index.insert(name, scope);
                     }
                     let imported_names: HashSet<_> = binder.names().collect();
                     let mut import_stack = vec![node];
@@ -881,7 +957,7 @@ impl JsTsLexicalBindingIndex {
                         {
                             let name = slice(import_node, source);
                             if imported_names.contains(name) {
-                                index.insert_binding(name, scope, true, import_node);
+                                index.insert_binding(name, scope, import_node);
                             }
                         }
                         for child_index in (0..import_node.named_child_count()).rev() {
@@ -899,7 +975,7 @@ impl JsTsLexicalBindingIndex {
                             lexical_scope
                         }
                     {
-                        index.insert_pattern(pattern, source, scope.scope, scope.is_program);
+                        index.insert_pattern(pattern, source, scope);
                         if let Some(value) = node.child_by_field_name("value")
                             && let Some(target) = direct_runtime_global_alias(value, source)
                             && let Some((value_root, _)) = runtime_path(value, source)
@@ -917,18 +993,10 @@ impl JsTsLexicalBindingIndex {
                             let scope = if declaration_kind == "var" {
                                 var_scope
                             } else {
-                                Some(JsTsBindingScopeState {
-                                    scope: node_scope(node),
-                                    is_program: false,
-                                })
+                                Some(JsTsBindingScopeState::ordinary(node, depth))
                             };
                             if let Some(scope) = scope {
-                                index.insert_pattern(
-                                    pattern,
-                                    source,
-                                    scope.scope,
-                                    scope.is_program,
-                                );
+                                index.insert_pattern(pattern, source, scope);
                             }
                         } else {
                             // `for (binding of values)` and `for (binding in
@@ -940,13 +1008,19 @@ impl JsTsLexicalBindingIndex {
                         }
                     }
                 }
-                "function_declaration" | "generator_function_declaration" | "class_declaration" => {
+                "function_declaration" | "generator_function_declaration" => {
                     if let Some(name) = node.child_by_field_name("name")
                         && let Some(scope) = declaration_scope
                     {
-                        index.insert_pattern(name, source, scope.scope, scope.is_program);
+                        index.insert_pattern(name, source, scope);
                     }
-                    index.insert_parameters(node, source);
+                }
+                "class_declaration" => {
+                    if let Some(name) = node.child_by_field_name("name")
+                        && let Some(scope) = lexical_scope
+                    {
+                        index.insert_pattern(name, source, scope);
+                    }
                 }
                 "function_expression"
                 | "generator_function"
@@ -955,18 +1029,25 @@ impl JsTsLexicalBindingIndex {
                     if matches!(node.kind(), "function_expression" | "generator_function")
                         && let Some(name) = node.child_by_field_name("name")
                     {
-                        index.insert_pattern(name, source, node_scope(node), false);
+                        let mut scope = JsTsBindingScopeState::ordinary(node, depth);
+                        scope.scope.environment = JsTsBindingEnvironment::NamedExpressionSelf;
+                        index.insert_pattern(name, source, scope);
                     }
-                    index.insert_parameters(node, source);
                 }
                 "class" => {
                     if let Some(name) = node.child_by_field_name("name") {
-                        index.insert_pattern(name, source, node_scope(node), false);
+                        let mut scope = JsTsBindingScopeState::ordinary(node, depth);
+                        scope.scope.environment = JsTsBindingEnvironment::NamedExpressionSelf;
+                        index.insert_pattern(name, source, scope);
                     }
                 }
                 "catch_clause" => {
                     if let Some(parameter) = node.child_by_field_name("parameter") {
-                        index.insert_pattern(parameter, source, node_scope(node), false);
+                        index.insert_pattern(
+                            parameter,
+                            source,
+                            JsTsBindingScopeState::ordinary(node, depth),
+                        );
                     }
                 }
                 "assignment_expression" | "augmented_assignment_expression" => {
@@ -982,7 +1063,9 @@ impl JsTsLexicalBindingIndex {
                 _ => {}
             }
 
-            let node_scope = node_scope(node);
+            if let Some((parameters, _)) = function_environments {
+                index.insert_parameters(node, source, parameters);
+            }
             let child_lexical_scope = if matches!(
                 node.kind(),
                 "program"
@@ -992,35 +1075,37 @@ impl JsTsLexicalBindingIndex {
                     | "switch_body"
                     | "catch_clause"
             ) {
-                Some(JsTsBindingScopeState {
-                    scope: node_scope,
-                    is_program: node.kind() == "program",
-                })
+                Some(JsTsBindingScopeState::ordinary(node, depth))
             } else {
                 lexical_scope
             };
-            let child_declaration_scope = if matches!(node.kind(), "program" | "statement_block") {
-                Some(JsTsBindingScopeState {
-                    scope: node_scope,
-                    is_program: node.kind() == "program",
-                })
+            let child_declaration_scope = if node.kind() == "statement_block"
+                && node.parent().is_some_and(|parent| {
+                    is_function_like(parent.kind())
+                        && parent.child_by_field_name("body") == Some(node)
+                }) {
+                // Direct body function declarations instantiate in the var
+                // environment. Nested block functions stay block lexical.
+                var_scope
+            } else if matches!(node.kind(), "program" | "statement_block") {
+                Some(JsTsBindingScopeState::ordinary(node, depth))
             } else {
                 declaration_scope
             };
-            let child_var_scope = if js_ts_is_var_scope_kind(node.kind()) {
-                Some(JsTsBindingScopeState {
-                    scope: node_scope,
-                    is_program: node.kind() == "program",
+            let child_var_scope = function_environments
+                .map(|(_, body)| body)
+                .or_else(|| {
+                    js_ts_is_var_scope_kind(node.kind())
+                        .then(|| JsTsBindingScopeState::ordinary(node, depth))
                 })
-            } else {
-                var_scope
-            };
+                .or(var_scope);
             let node_kind = node.kind();
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 stack.push(Frame {
                     node: child,
                     parent_kind: Some(node_kind),
+                    depth: depth + 1,
                     lexical_scope: child_lexical_scope,
                     declaration_scope: child_declaration_scope,
                     var_scope: child_var_scope,
@@ -1028,26 +1113,11 @@ impl JsTsLexicalBindingIndex {
             }
         }
         for scopes in index.scopes_by_name.values_mut() {
-            scopes.sort_unstable_by_key(|state| {
-                (
-                    state.scope.start_byte,
-                    state.scope.end_byte,
-                    state.is_program,
-                )
-            });
+            scopes.sort_unstable();
             scopes.dedup();
         }
         for ranges in index.binding_ranges_by_name.values_mut() {
-            ranges.sort_unstable_by_key(|(scope, range)| {
-                (
-                    scope.start_byte,
-                    scope.end_byte,
-                    range.start_byte,
-                    range.end_byte,
-                    range.start_line,
-                    range.end_line,
-                )
-            });
+            ranges.sort_unstable();
             ranges.dedup();
         }
         for (scope, binder, value_root, target) in pending_aliases {
@@ -1061,8 +1131,7 @@ impl JsTsLexicalBindingIndex {
                 continue;
             }
             let name = slice(binder, source);
-            if !name.is_empty() && index.binding_scope_at(name, binder.start_byte()) == Some(scope)
-            {
+            if !name.is_empty() && index.binding_scope_for_binder(binder) == Some(scope) {
                 index
                     .global_aliases
                     .entry(name.to_string())
@@ -1070,7 +1139,8 @@ impl JsTsLexicalBindingIndex {
                     .push((scope, node_source_range(binder), target.to_string()));
             }
         }
-        (index, !budget.exhausted)
+        let complete = !budget.exhausted && !index.incomplete_parameter_patterns;
+        (index, complete)
     }
 
     pub fn is_bound_at(&self, name: &str, byte: usize) -> bool {
@@ -1082,11 +1152,14 @@ impl JsTsLexicalBindingIndex {
             .get(name)?
             .iter()
             .copied()
-            .filter(|state| state.scope.start_byte <= byte && byte < state.scope.end_byte)
+            .filter(|state| state.visibility_start <= byte && byte < state.visibility_end)
             .min_by_key(|state| {
                 (
-                    state.scope.end_byte - state.scope.start_byte,
+                    state.visibility_end - state.visibility_start,
+                    std::cmp::Reverse(state.nesting_depth),
+                    std::cmp::Reverse(state.scope.environment),
                     state.is_program,
+                    state.scope,
                 )
             })
     }
@@ -1101,7 +1174,37 @@ impl JsTsLexicalBindingIndex {
     }
 
     pub(crate) fn binding_is_program_for_binder(&self, binder: Node<'_>) -> Option<bool> {
-        self.binding_program_by_id.get(&binder.id()).copied()
+        self.binding_state_by_id
+            .get(&binder.id())
+            .map(|state| state.is_program)
+    }
+
+    /// The environment DECLARED by this exact token, independently of what
+    /// a reference at the token's byte would select.
+    pub fn binding_scope_for_binder(&self, binder: Node<'_>) -> Option<JsTsLexicalBindingScope> {
+        self.binding_state_by_id
+            .get(&binder.id())
+            .map(|state| state.scope)
+    }
+
+    pub fn binding_identifier_ranges_for_binder(&self, name: &str, binder: Node<'_>) -> Vec<Range> {
+        self.binding_scope_for_binder(binder)
+            .filter(JsTsLexicalBindingScope::is_complete)
+            .map(|scope| self.binding_ranges_in_scope(name, scope))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn binding_ranges_in_scope(
+        &self,
+        name: &str,
+        scope: JsTsLexicalBindingScope,
+    ) -> Vec<Range> {
+        self.binding_ranges_by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|(candidate, range)| (*candidate == scope).then_some(*range))
+            .collect()
     }
 
     /// Declaration-token ranges for the active lexical binding. Consumers use
@@ -1111,12 +1214,79 @@ impl JsTsLexicalBindingIndex {
         let Some(scope) = self.binding_scope_at(name, byte) else {
             return Vec::new();
         };
-        self.binding_ranges_by_name
-            .get(name)
-            .into_iter()
-            .flatten()
-            .filter_map(|(binding_scope, range)| (*binding_scope == scope).then_some(*range))
-            .collect()
+        if !scope.is_complete() {
+            return Vec::new();
+        }
+        self.binding_ranges_in_scope(name, scope)
+    }
+
+    pub(crate) fn receiver_declaration_kind(
+        &self,
+        root: Node<'_>,
+        receiver: Node<'_>,
+        name: &str,
+        is_export_target: impl Fn(Node<'_>) -> bool,
+    ) -> Option<JsTsReceiverDeclarationKind> {
+        let Some(scope) = self.binding_scope_at(name, receiver.start_byte()) else {
+            // A body-only declaration is not visible in a default initializer.
+            // Do not promote an otherwise unbound header write to a declaration.
+            return self.scopes_by_name.get(name).and_then(|states| {
+                states
+                    .iter()
+                    .any(|state| {
+                        state.scope.environment == JsTsBindingEnvironment::FunctionBody
+                            && state.scope.contains(receiver.start_byte())
+                    })
+                    .then_some(JsTsReceiverDeclarationKind::Unsupported)
+            });
+        };
+        if !scope.is_complete() {
+            return Some(JsTsReceiverDeclarationKind::Unsupported);
+        }
+        let ranges = self.binding_ranges_in_scope(name, scope);
+        if ranges.is_empty() {
+            return None;
+        }
+        let mut established = None;
+        for range in ranges {
+            let binder = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            let parent = binder.parent()?;
+            let kind = match parent.kind() {
+                "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "class_declaration"
+                | "class" => JsTsReceiverDeclarationKind::DeclarationRoot,
+                "variable_declarator" if parent.child_by_field_name("name") == Some(binder) => {
+                    let Some(value) = parent.child_by_field_name("value") else {
+                        continue;
+                    };
+                    if matches!(
+                        value.kind(),
+                        "arrow_function" | "function_expression" | "generator_function" | "class"
+                    ) {
+                        JsTsReceiverDeclarationKind::DeclarationRoot
+                    } else if js_ts_assignment_chain_writes_export_target(value, &is_export_target)
+                    {
+                        // `var req = exports = module.exports = {}` binds `req`
+                        // to the exported object, so member writes through it
+                        // are declarations.
+                        JsTsReceiverDeclarationKind::DeclarationRoot
+                    } else if js_ts_object_literal_value(value).is_some() {
+                        JsTsReceiverDeclarationKind::LocalObject
+                    } else {
+                        JsTsReceiverDeclarationKind::PlainLocal
+                    }
+                }
+                _ => JsTsReceiverDeclarationKind::PlainLocal,
+            };
+            if established.is_some_and(|previous| previous != kind) {
+                return Some(JsTsReceiverDeclarationKind::Unsupported);
+            }
+            established = Some(kind);
+        }
+        Some(established.unwrap_or(JsTsReceiverDeclarationKind::PlainLocal))
     }
 
     pub fn is_program_binding_at(&self, name: &str, byte: usize, root: Node<'_>) -> bool {
@@ -1189,7 +1359,7 @@ impl JsTsLexicalBindingIndex {
     /// aliases are rejected.
     fn runtime_global_alias_at(&self, name: &str, byte: usize) -> Option<&str> {
         let scope = self.binding_scope_at(name, byte)?;
-        if self.is_binding_reassigned_at(name, byte) {
+        if !scope.is_complete() || self.is_binding_reassigned_at(name, byte) {
             return None;
         }
         let active_binder = self
@@ -1238,39 +1408,32 @@ impl JsTsLexicalBindingIndex {
         }
     }
 
-    fn insert_parameters(&mut self, function: Node<'_>, source: &str) {
+    fn insert_parameters(
+        &mut self,
+        function: Node<'_>,
+        source: &str,
+        scope: JsTsBindingScopeState,
+    ) {
         let Some(parameters) = function
             .child_by_field_name("parameters")
             .or_else(|| function.child_by_field_name("parameter"))
         else {
             return;
         };
-        self.insert_pattern(parameters, source, node_scope(function), false);
+        self.insert_pattern(parameters, source, scope);
     }
 
-    fn insert_pattern(
-        &mut self,
-        pattern: Node<'_>,
-        source: &str,
-        scope: JsTsLexicalBindingScope,
-        is_program: bool,
-    ) {
+    fn insert_pattern(&mut self, pattern: Node<'_>, source: &str, scope: JsTsBindingScopeState) {
         for binder in pattern_binder_identifiers(pattern) {
             let name = slice(binder, source);
             if !name.is_empty() {
-                self.insert_binding(name, scope, is_program, binder);
+                self.insert_binding(name, scope, binder);
             }
         }
     }
 
-    fn insert_binding(
-        &mut self,
-        name: &str,
-        scope: JsTsLexicalBindingScope,
-        is_program: bool,
-        binder: Node<'_>,
-    ) {
-        self.insert(name, scope, is_program);
+    fn insert_binding(&mut self, name: &str, state: JsTsBindingScopeState, binder: Node<'_>) {
+        self.insert(name, state);
         let range = Range {
             start_byte: binder.start_byte(),
             end_byte: binder.end_byte(),
@@ -1281,14 +1444,68 @@ impl JsTsLexicalBindingIndex {
             .binding_ranges_by_name
             .entry(name.to_string())
             .or_default();
-        ranges.push((scope, range));
-        self.binding_program_by_id.insert(binder.id(), is_program);
+        ranges.push((state.scope, range));
+        self.binding_state_by_id.insert(binder.id(), state);
     }
 
-    fn insert(&mut self, name: &str, scope: JsTsLexicalBindingScope, is_program: bool) {
+    fn insert(&mut self, name: &str, state: JsTsBindingScopeState) {
         let scopes = self.scopes_by_name.entry(name.to_string()).or_default();
-        scopes.push(JsTsBindingScopeState { scope, is_program });
+        scopes.push(state);
     }
+}
+
+/// FunctionDeclarationInstantiation's ContainsExpression on binding syntax.
+/// Destructuring/rest alone do not split parameter and var environments.
+/// Inspect pattern fields only; type annotations and default RHS expressions
+/// are not patterns and must not be traversed as such. None is an explicit
+/// recovery/unsupported-pattern/budget boundary, not a no-expression proof.
+fn function_parameter_contains_expression(
+    function: Node<'_>,
+    budget: &mut JsTsRuntimeTraversalBudget,
+) -> Option<bool> {
+    let Some(parameters) = function
+        .child_by_field_name("parameters")
+        .or_else(|| function.child_by_field_name("parameter"))
+    else {
+        return (!function.has_error() && !function.is_missing()).then_some(false);
+    };
+    let mut stack = vec![parameters];
+    let mut contains = false;
+    while let Some(node) = stack.pop() {
+        if !budget.visit() || node.has_error() || node.is_missing() {
+            return None;
+        }
+        if node.is_extra() {
+            continue;
+        }
+        match node.kind() {
+            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" | "this" => {
+            }
+            "required_parameter" | "optional_parameter" => {
+                contains |= node.child_by_field_name("value").is_some();
+                stack.push(
+                    node.child_by_field_name("pattern")
+                        .or_else(|| node.child_by_field_name("name"))?,
+                );
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                contains = true;
+                stack.push(node.child_by_field_name("left")?);
+            }
+            "pair_pattern" => {
+                contains |= node
+                    .child_by_field_name("key")
+                    .is_some_and(|key| key.kind() == "computed_property_name");
+                stack.push(node.child_by_field_name("value")?);
+            }
+            "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            _ => return None,
+        }
+    }
+    Some(contains)
 }
 
 /// Collects the binder identifier nodes of a binding pattern in source order:
@@ -2445,7 +2662,7 @@ fn module_member_writes(
             && let Some(value) = node.child_by_field_name("value")
             && let Some(specifier) = require_call_module_specifier(value, source)
             && module_matches(&specifier)
-            && let Some(scope) = variable_binding_scope(node)
+            && let Some(scope) = lexical.binding_scope_for_binder(name)
         {
             required
                 .entry(slice(name, source).to_string())
@@ -2668,7 +2885,7 @@ pub fn extract_js_ts_runtime_reads(
     // still poisons every read. The file-wide coverages above remain the
     // reported module summary.
     let (local_functions, local_functions_complete) =
-        local_function_bindings_bounded(root, source, &mut budget);
+        local_function_bindings_bounded(root, source, &bindings, &mut budget);
     let mut scope_hazards: HashMap<Option<usize>, Vec<JsTsRuntimeScopeHazard>> = HashMap::default();
     let mut scopes_complete = local_functions_complete;
     let mut reads = Vec::new();
@@ -2903,7 +3120,7 @@ fn runtime_effect_coverage_with_bindings_bounded(
     budget: &mut JsTsRuntimeTraversalBudget,
 ) -> (JsTsRuntimeEffectCoverage, bool) {
     let (local_functions, functions_complete) =
-        local_function_bindings_bounded(root, source, budget);
+        local_function_bindings_bounded(root, source, bindings, budget);
     if !functions_complete {
         return (JsTsRuntimeEffectCoverage::Unknown, false);
     }
@@ -3142,6 +3359,7 @@ struct JsTsLocalFunctionBinding {
 fn local_function_bindings_bounded(
     root: Node<'_>,
     source: &str,
+    lexical: &JsTsLexicalBindingIndex,
     budget: &mut JsTsRuntimeTraversalBudget,
 ) -> (Vec<JsTsLocalFunctionBinding>, bool) {
     let mut functions = Vec::new();
@@ -3153,7 +3371,7 @@ fn local_function_bindings_bounded(
         match node.kind() {
             "function_declaration" | "generator_function_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    let Some(scope) = enclosing_lexical_scope(node) else {
+                    let Some(scope) = lexical.binding_scope_for_binder(name) else {
                         continue;
                     };
                     functions.push(JsTsLocalFunctionBinding {
@@ -3172,7 +3390,7 @@ fn local_function_bindings_bounded(
                     && let Some(pattern) = node.child_by_field_name("name")
                     && let [binder] = pattern_binder_identifiers(pattern).as_slice()
                 {
-                    let Some(scope) = variable_binding_scope(node) else {
+                    let Some(scope) = lexical.binding_scope_for_binder(*binder) else {
                         continue;
                     };
                     functions.push(JsTsLocalFunctionBinding {
@@ -3322,22 +3540,9 @@ fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         node_id: node.id(),
+        environment: JsTsBindingEnvironment::Ordinary,
+        complete: true,
     }
-}
-
-fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(parent.kind(), "program" | "statement_block") {
-            return Some(node_scope(parent));
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
-    js_ts_variable_declarator_binding_scope(node).map(node_scope)
 }
 
 /// The lexical scope that owns a JavaScript or TypeScript variable declarator.
@@ -3481,6 +3686,29 @@ pub(crate) fn js_ts_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
         }
     }
     None
+}
+
+/// Whether an initializer's assignment chain writes an export target. The
+/// adapter supplies the CommonJS rule; the shared walk follows the right-hand
+/// side of each assignment, so `var req = exports = module.exports = {}`
+/// keeps `req` a declaration root like the legacy classifier did.
+fn js_ts_assignment_chain_writes_export_target(
+    mut value: Node<'_>,
+    is_export_target: &impl Fn(Node<'_>) -> bool,
+) -> bool {
+    while value.kind() == "assignment_expression" {
+        if value
+            .child_by_field_name("left")
+            .is_some_and(is_export_target)
+        {
+            return true;
+        }
+        let Some(right) = value.child_by_field_name("right") else {
+            return false;
+        };
+        value = right;
+    }
+    false
 }
 
 pub(crate) fn first_preserved_object_literal_call_argument<'tree>(
@@ -4308,7 +4536,7 @@ pub fn compute_import_binder_for_root(source: &str, root: Node<'_>) -> JsTsImpor
         if child.kind() == "import_statement" {
             visit_import_statement(child, root, source, &mut binder);
         } else if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
-            visit_commonjs_require_statement(child, root, source, &mut binder);
+            visit_commonjs_require_statement(child, source, &mut binder);
         }
     }
     // A module can also be bound by a call that states its own result type, and
@@ -4352,10 +4580,9 @@ fn bind_type_argument_module_values(root: Node<'_>, source: &str, binder: &mut J
                     if !local.is_empty() {
                         let provenance = JsTsImportBindingProvenance {
                             declaration_range: node_source_range(name),
-                            declaration_scope: Some(
-                                variable_binding_scope(declarator)
-                                    .unwrap_or_else(|| node_scope(root)),
-                            ),
+                            declaration_scope: binder
+                                .lexical_bindings()
+                                .and_then(|index| index.binding_scope_for_binder(name)),
                             initializer_range: Some(node_source_range(value)),
                             activation: JsTsImportBindingActivation::AfterInitializer,
                             is_complete: true,
@@ -4386,10 +4613,9 @@ fn bind_type_argument_module_values(root: Node<'_>, source: &str, binder: &mut J
                         }
                         let provenance = JsTsImportBindingProvenance {
                             declaration_range: node_source_range(local_node),
-                            declaration_scope: Some(
-                                variable_binding_scope(declarator)
-                                    .unwrap_or_else(|| node_scope(root)),
-                            ),
+                            declaration_scope: binder
+                                .lexical_bindings()
+                                .and_then(|index| index.binding_scope_for_binder(local_node)),
                             initializer_range: Some(node_source_range(value)),
                             activation: JsTsImportBindingActivation::AfterInitializer,
                             is_complete: true,
@@ -4417,12 +4643,7 @@ fn bind_type_argument_module_values(root: Node<'_>, source: &str, binder: &mut J
     }
 }
 
-fn visit_commonjs_require_statement(
-    node: Node<'_>,
-    root: Node<'_>,
-    source: &str,
-    binder: &mut JsTsImportBinder,
-) {
+fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
     for binding in parse_commonjs_require_bindings_from_node(node, source) {
         let (kind, imported_name) = match binding.kind {
             CommonJsRequireBindingKind::ModuleObject => (ImportKind::CommonJsRequire, None),
@@ -4448,9 +4669,11 @@ fn visit_commonjs_require_statement(
             declaration_range: binder_node
                 .map(node_source_range)
                 .unwrap_or_else(|| node_source_range(node)),
-            declaration_scope: declarator
-                .and_then(variable_binding_scope)
-                .map_or_else(|| Some(node_scope(root)), Some),
+            declaration_scope: binder_node.and_then(|node| {
+                binder
+                    .lexical_bindings()
+                    .and_then(|index| index.binding_scope_for_binder(node))
+            }),
             initializer_range: initializer.map(node_source_range),
             activation: JsTsImportBindingActivation::AfterInitializer,
             is_complete: binder_node.is_some() && initializer.is_some(),
@@ -5250,6 +5473,313 @@ relay();
             slice(name_node, source),
             "the `#` belongs to the name the class indexed it under"
         );
+    }
+
+    #[test]
+    #[hardwon("#5589: self names, parameters and body vars were merged by owner interval")]
+    fn lexical_binding_environment_boundary_matrix() {
+        // These are binding/grammar boundary assertions, not runtime claims.
+        // Parent's pinned Node controls independently confirmed the semantics.
+        // Binder ordinals and reference ordinals below are SOURCE ORDER.
+        struct Case {
+            label: &'static str,
+            source: &'static str,
+            typescript: bool,
+            // Every cohort lists the declaring-token ordinals for that binder.
+            cohorts: &'static [&'static [usize]],
+            references: &'static [&'static [usize]],
+        }
+        let cases = [
+            Case {
+                label: "function and program have equal spans",
+                source: "function X(X) { return X; }",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1]],
+            },
+            Case {
+                label: "self only",
+                source: "const f = function X() { return X; };",
+                typescript: false,
+                cohorts: &[&[0]],
+                references: &[&[0]],
+            },
+            Case {
+                label: "self and var",
+                source: "const f = function X() { var X; return X; };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1]],
+            },
+            Case {
+                label: "self and parameter",
+                source: "const f = function X(X) { return X; };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1]],
+            },
+            Case {
+                label: "body const",
+                source: "const f = function X() { const X = 1; return X; };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1]],
+            },
+            Case {
+                label: "body function and var",
+                source: "function f() { function X() {} var X; return X; }",
+                typescript: false,
+                cohorts: &[&[0, 1], &[0, 1]],
+                references: &[&[0, 1]],
+            },
+            Case {
+                label: "body function and var with parameter expressions",
+                source: "function f(arg = 0) { function X() {} var X; return X; }",
+                typescript: false,
+                cohorts: &[&[0, 1], &[0, 1]],
+                references: &[&[0, 1]],
+            },
+            Case {
+                label: "default reads self",
+                source: "const f = function X(value = X) { var X; return X; };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[0], &[1]],
+            },
+            Case {
+                label: "same-name parameter TDZ",
+                source: "const f = function X(X = X) { return X; };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1], &[1]],
+            },
+            Case {
+                label: "deferred default retains self",
+                source: "const f = function X(read = () => X) { var X; return X; };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[0], &[1]],
+            },
+            Case {
+                label: "destructuring alone shares var",
+                source: "function f({ X }) { var X; X = 2; return X; }",
+                typescript: false,
+                cohorts: &[&[0, 1], &[0, 1]],
+                references: &[&[0, 1], &[0, 1]],
+            },
+            Case {
+                label: "rest alone shares var",
+                source: "function f(...X) { var X; return X; }",
+                typescript: false,
+                cohorts: &[&[0, 1], &[0, 1]],
+                references: &[&[0, 1]],
+            },
+            Case {
+                label: "default alone splits var",
+                source: "function f(X = 1) { var X; return X; }",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1]],
+            },
+            Case {
+                label: "destructuring default splits var",
+                source: "function f({ X = 1 }) { var X; return X; }",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1]],
+            },
+            Case {
+                label: "default closure retains parameter",
+                source: "function f(X = 1, read = () => X) { var X; X = 2; return X; }",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[0], &[1], &[1]],
+            },
+            Case {
+                label: "computed key alone splits var",
+                source: "let read; function f({ [(read = () => X, 'value')]: X }) { var X; return X; }",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[0], &[1]],
+            },
+            Case {
+                label: "generator self",
+                source: "const f = function* X(read = () => X) { var X; yield X; };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[0], &[1]],
+            },
+            Case {
+                label: "class self and method parameter",
+                source: "const C = class X extends X { method(X) { return X; } self() { return X; } };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[0], &[1], &[0]],
+            },
+            Case {
+                label: "class method lexical shadow",
+                source: "const C = class X { method() { const X = 1; return X; } self() { return X; } };",
+                typescript: false,
+                cohorts: &[&[0], &[1]],
+                references: &[&[1], &[0]],
+            },
+            Case {
+                label: "TS types are not expressions",
+                source: "function f(X: (() => number)) { var X; return X; }",
+                typescript: true,
+                cohorts: &[&[0, 1], &[0, 1]],
+                references: &[&[0, 1]],
+            },
+            Case {
+                label: "TS destructuring and rest",
+                source: "function f({ X }: { X: number }, ...rest: number[]) { var X; return X; }",
+                typescript: true,
+                cohorts: &[&[0, 1], &[0, 1]],
+                references: &[&[0, 1]],
+            },
+            Case {
+                label: "TS wrapper default splits var",
+                source: "function f(X: number = 1, read = () => X) { var X; return X; }",
+                typescript: true,
+                cohorts: &[&[0], &[1]],
+                references: &[&[0], &[1]],
+            },
+        ];
+        for case in cases {
+            let tree = if case.typescript {
+                parse_typescript(case.source)
+            } else {
+                parse_javascript(case.source)
+            };
+            assert!(
+                !tree.root_node().has_error(),
+                "{}: recovered fixture",
+                case.label
+            );
+            let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), case.source);
+            assert!(!bindings.incomplete_parameter_patterns, "{}", case.label);
+            let mut binders = Vec::new();
+            let mut references = Vec::new();
+            walk_named_tree_preorder(tree.root_node(), true, |node| {
+                if slice(node, case.source) == "X" {
+                    if bindings.binding_scope_for_binder(node).is_some() {
+                        binders.push(node);
+                    } else if node.kind() == "identifier" {
+                        references.push(node);
+                    }
+                }
+                WalkControl::Continue
+            });
+            binders.sort_by_key(Node::start_byte);
+            references.sort_by_key(Node::start_byte);
+            assert_eq!(binders.len(), case.cohorts.len(), "{}: binders", case.label);
+            assert_eq!(
+                references.len(),
+                case.references.len(),
+                "{}: references",
+                case.label
+            );
+            let ranges = |ordinals: &[usize]| {
+                ordinals
+                    .iter()
+                    .map(|&ordinal| node_source_range(binders[ordinal]))
+                    .collect::<Vec<_>>()
+            };
+            for (binder, expected) in binders.iter().zip(case.cohorts) {
+                assert_eq!(
+                    bindings.binding_identifier_ranges_for_binder("X", *binder),
+                    ranges(expected),
+                    "{}: exact binder",
+                    case.label
+                );
+            }
+            for (reference, expected) in references.iter().zip(case.references) {
+                assert_eq!(
+                    bindings.binding_identifier_ranges_at("X", reference.start_byte()),
+                    ranges(expected),
+                    "{}: reference",
+                    case.label
+                );
+                assert_eq!(
+                    bindings.binding_scope_at("X", reference.start_byte()),
+                    bindings.binding_scope_for_binder(binders[expected[0]]),
+                    "{}: selected environment",
+                    case.label
+                );
+            }
+            for (reference, expected_cohort) in references.iter().zip(case.references) {
+                let mut expected_writes: Vec<_> = references
+                    .iter()
+                    .zip(case.references)
+                    .filter(|(node, cohort)| {
+                        *cohort == expected_cohort
+                            && node.parent().is_some_and(|parent| {
+                                parent.kind() == "assignment_expression"
+                                    && parent.child_by_field_name("left") == Some(**node)
+                            })
+                    })
+                    .map(|(node, _)| node.start_byte())
+                    .collect();
+                let mut actual_writes =
+                    bindings.binding_write_sites_at("X", reference.start_byte());
+                expected_writes.sort_unstable();
+                actual_writes.sort_unstable();
+                assert_eq!(
+                    actual_writes, expected_writes,
+                    "{}: environment-specific writes",
+                    case.label
+                );
+            }
+            for left in &binders {
+                for right in &binders {
+                    let left = bindings.binding_scope_for_binder(*left).unwrap();
+                    let right = bindings.binding_scope_for_binder(*right).unwrap();
+                    if left.node_id == right.node_id && left != right {
+                        assert_ne!(
+                            left.environment_component(),
+                            right.environment_component(),
+                            "{}: final FQ environment component",
+                            case.label
+                        );
+                    }
+                }
+            }
+            if case.label == "self and parameter" {
+                // A reference at the self token's byte selects the parameter;
+                // the exact-token API must STILL identify the self declaration.
+                assert_ne!(
+                    bindings.binding_scope_for_binder(binders[0]),
+                    bindings.binding_scope_at("X", binders[0].start_byte())
+                );
+            }
+        }
+        let recovered = "function f(X = missing +) { var X; }";
+        let tree = parse_javascript(recovered);
+        assert!(tree.root_node().has_error());
+        let mut budget = JsTsRuntimeTraversalBudget {
+            remaining: usize::MAX,
+            exhausted: false,
+            visited_nodes: 0,
+        };
+        let (bindings, complete) =
+            JsTsLexicalBindingIndex::build_bounded(tree.root_node(), recovered, &mut budget);
+        assert!(
+            !complete,
+            "recovered parameter syntax cannot prove a complete environment"
+        );
+        assert!(bindings.incomplete_parameter_patterns);
+        let mut budget = JsTsRuntimeTraversalBudget {
+            remaining: 1,
+            exhausted: false,
+            visited_nodes: 0,
+        };
+        let tree = parse_javascript("function f(X = 1) {}");
+        let function = tree.root_node().named_child(0).unwrap();
+        assert_eq!(
+            function_parameter_contains_expression(function, &mut budget),
+            None
+        );
+        assert!(budget.exhausted);
     }
 
     #[test]

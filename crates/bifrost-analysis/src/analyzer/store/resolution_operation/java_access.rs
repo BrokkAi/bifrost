@@ -11,6 +11,47 @@ use crate::analyzer::resolution::{
 };
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
+/// One shared lexical-region membership check. Package strings are structured
+/// package values, compared segment by segment rather than by a text prefix.
+pub(super) fn boundary_access_decision(
+    boundary: &brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary<SemanticId>,
+    caller_package: Option<&str>,
+    caller_templates: Option<&[SemanticId]>,
+    companions: &HashSet<(SemanticId, SemanticId)>,
+) -> DeclarationAccessDecision {
+    use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+    match boundary {
+        DeclarationAccessBoundary::Package(region) => {
+            let Some(package) = caller_package else {
+                return DeclarationAccessDecision::Unknown;
+            };
+            let mut caller = package.split('.');
+            if region
+                .split('.')
+                .all(|segment| caller.next() == Some(segment))
+            {
+                DeclarationAccessDecision::Allowed
+            } else {
+                DeclarationAccessDecision::Denied
+            }
+        }
+        DeclarationAccessBoundary::Template(owner) => {
+            let Some(templates) = caller_templates else {
+                return DeclarationAccessDecision::Unknown;
+            };
+            if templates.iter().any(|caller| {
+                caller == owner
+                    || companions.contains(&(*owner, *caller))
+                    || companions.contains(&(*caller, *owner))
+            }) {
+                DeclarationAccessDecision::Allowed
+            } else {
+                DeclarationAccessDecision::Denied
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct JvmAccessPolicy {
     pub(super) identity: SemanticId,
@@ -87,7 +128,7 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
                 for row in rows {
                     assert!(
                         visibilities
-                            .insert(row.row().definition(), row.row().visibility())
+                            .insert(row.row().definition(), row.row().clone())
                             .is_none()
                     );
                 }
@@ -123,6 +164,12 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
         let templates = endpoints
             .values()
             .flat_map(|endpoint| endpoint.enclosing_templates.iter().copied())
+            .chain(visibilities.values().filter_map(|property| {
+                match property.boundary() {
+                    Some(brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary::Template(owner)) => Some(*owner),
+                    _ => None,
+                }
+            }))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -172,7 +219,8 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
             }
             let reference = endpoints.get(&request.reference);
             let target = endpoints.get(&request.definition);
-            let visibility = visibilities.get(&request.definition).copied();
+            let property = visibilities.get(&request.definition);
+            let visibility = property.map(|property| property.visibility());
             let rules = target
                 .and_then(|endpoint| language_jvm_declaration_access_rules(endpoint.language));
             let mut visibility_applies = false;
@@ -214,18 +262,27 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
                     Some(JvmDeclarationAccessRules::Scala),
                 ) => {
                     visibility_applies = true;
-                    match target.enclosing_templates.first().copied() {
-                        Some(owner)
-                            if reference.enclosing_templates.iter().any(|caller| {
-                                *caller == owner
-                                    || companions.contains(&(owner, *caller))
-                                    || companions.contains(&(*caller, owner))
-                            }) =>
-                        {
-                            DeclarationAccessDecision::Allowed
+                    if let Some(boundary) = property.and_then(|property| property.boundary()) {
+                        boundary_access_decision(
+                            boundary,
+                            reference.package.as_deref(),
+                            Some(&reference.enclosing_templates),
+                            &companions,
+                        )
+                    } else {
+                        match target.enclosing_templates.first().copied() {
+                            Some(owner)
+                                if reference.enclosing_templates.iter().any(|caller| {
+                                    *caller == owner
+                                        || companions.contains(&(owner, *caller))
+                                        || companions.contains(&(*caller, owner))
+                                }) =>
+                            {
+                                DeclarationAccessDecision::Allowed
+                            }
+                            Some(_) => DeclarationAccessDecision::Denied,
+                            None => DeclarationAccessDecision::Unknown,
                         }
-                        Some(_) => DeclarationAccessDecision::Denied,
-                        None => DeclarationAccessDecision::Unknown,
                     }
                 }
                 (
@@ -235,13 +292,29 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
                     Some(JvmDeclarationAccessRules::Scala),
                 ) => {
                     visibility_applies = true;
-                    if let Some(owner) = target.enclosing_templates.first().copied() {
+                    let boundary_allowed = property
+                        .and_then(|property| property.boundary())
+                        .is_some_and(|boundary| {
+                            boundary_access_decision(
+                                boundary,
+                                reference.package.as_deref(),
+                                Some(&reference.enclosing_templates),
+                                &companions,
+                            ) == DeclarationAccessDecision::Allowed
+                        });
+                    if !boundary_allowed
+                        && let Some(owner) = target.enclosing_templates.first().copied()
+                    {
                         subclass_access = Some(SubclassAccessContext {
                             enclosing_templates: reference.enclosing_templates.clone(),
                             declaration_template: owner,
                         });
                     }
-                    DeclarationAccessDecision::Unknown
+                    if boundary_allowed {
+                        DeclarationAccessDecision::Allowed
+                    } else {
+                        DeclarationAccessDecision::Unknown
+                    }
                 }
                 (
                     Some(_),

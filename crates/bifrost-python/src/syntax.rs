@@ -5,23 +5,53 @@ use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
 pub(crate) fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" => Some(node_text(node, source).trim().to_string()),
-        "typed_parameter"
-        | "typed_default_parameter"
-        | "default_parameter"
-        | "list_splat_pattern"
-        | "dictionary_splat_pattern" => node
-            .child_by_field_name("name")
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find(|child| child.kind() == "identifier")
-            })
-            .and_then(|name| python_parameter_name(name, source)),
-        _ => None,
+    python_parameter_name_bounded(node, source, || true)
+        .expect("unbounded parameter name lookup completes")
+}
+
+pub(crate) fn python_parameter_name_bounded(
+    mut node: Node<'_>,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Option<String>> {
+    loop {
+        if !scope_step() {
+            return None;
+        }
+        match node.kind() {
+            "identifier" => {
+                let name = node_text(node, source).trim();
+                return Some((!name.is_empty()).then(|| name.to_string()));
+            }
+            "typed_parameter"
+            | "typed_default_parameter"
+            | "default_parameter"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern" => {
+                let name = if let Some(name) = node.child_by_field_name("name") {
+                    Some(name)
+                } else {
+                    let mut selected = None;
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        if !scope_step() {
+                            return None;
+                        }
+                        if child.kind() == "identifier" {
+                            selected = Some(child);
+                            break;
+                        }
+                    }
+                    selected
+                };
+                let Some(name) = name else {
+                    return Some(None);
+                };
+                node = name;
+            }
+            _ => return Some(None),
+        }
     }
-    .filter(|name| !name.is_empty())
 }
 
 pub fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -77,6 +107,15 @@ pub fn python_static_attribute_path<'tree>(node: Node<'tree>) -> Option<Vec<Node
         .expect("unbounded static path lookup completes")
 }
 
+/// The strict static attribute path proof, charging traversal and reversal.
+/// Parentheses remain outside this API's admitted grammar.
+pub fn python_static_attribute_path_bounded<'tree>(
+    node: Node<'tree>,
+    scope_step: impl FnMut() -> bool,
+) -> Option<Vec<Node<'tree>>> {
+    python_static_value_path_with(node, scope_step, |_| None).flatten()
+}
+
 /// A metered static value path, including transparent parentheses. The outer
 /// `None` means exhaustion; `Some(None)` means the receiver is not static.
 pub fn python_static_value_path_bounded<'tree>(
@@ -125,6 +164,11 @@ fn python_static_value_path_with<'tree>(
                 node = child;
             }
             _ => return Some(None),
+        }
+    }
+    for _ in 0..path.len() {
+        if !scope_step() {
+            return None;
         }
     }
     path.reverse();

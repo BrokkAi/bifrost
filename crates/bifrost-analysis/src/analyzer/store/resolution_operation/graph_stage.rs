@@ -21,7 +21,48 @@ use crate::analyzer::store::resolution_lexical::{
 /// requests; readers split those requests into this bounded chunk size.
 pub(crate) const MAX_GRAPH_STAGE_READ_BATCH_SIZE: usize = 64;
 
-pub(crate) type GraphStageUnits<U> = Vec<(U, Vec<ProjectFile>)>;
+/// Why a requested caller does not participate in the selected graph.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum GraphFileSkipReason {
+    ExcludedBuildSelection,
+    OutsideSelectedModules { module_path: String },
+    Unplaced,
+}
+
+impl GraphFileSkipReason {
+    pub(crate) fn opens_incompleteness(&self) -> bool {
+        !matches!(self, Self::ExcludedBuildSelection)
+    }
+}
+
+pub(crate) type GraphSkippedCallers = std::collections::BTreeMap<ProjectFile, GraphFileSkipReason>;
+
+pub(crate) struct GraphStageAdmission<U> {
+    pub(crate) units: Vec<(U, Vec<ProjectFile>)>,
+    pub(crate) skipped: GraphSkippedCallers,
+}
+
+/// Every requested file is accounted for, including empty and skipped files.
+pub(crate) fn certify_graph_callers(
+    requested: &crate::hash::HashSet<ProjectFile>,
+    admitted: &crate::hash::HashSet<ProjectFile>,
+    skipped: &GraphSkippedCallers,
+) {
+    assert!(
+        skipped.keys().all(|file| !admitted.contains(file)),
+        "admitted and skipped graph callers must be disjoint"
+    );
+    let accounted = admitted
+        .iter()
+        .chain(skipped.keys())
+        .cloned()
+        .collect::<crate::hash::HashSet<_>>();
+    assert_eq!(
+        &accounted, requested,
+        "graph admission must account for every requested caller"
+    );
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GraphStageMemoStats {
@@ -64,6 +105,7 @@ pub(crate) struct GraphStageMetrics {
 pub(crate) struct GraphStageResult {
     pub(crate) summary: FactResolutionBatchSummary,
     pub(crate) metrics: GraphStageMetrics,
+    pub(crate) skipped: GraphSkippedCallers,
 }
 
 /// Language-specific graph stage contract.
@@ -81,7 +123,7 @@ pub(crate) trait GraphStageAdapter {
         operation: &SelectedResolutionOperation<'_, '_>,
         files: &[ProjectFile],
         cancellation: &CancellationToken,
-    ) -> Result<SelectedResolutionOperationOutcome<GraphStageUnits<Self::Unit>>>;
+    ) -> Result<SelectedResolutionOperationOutcome<GraphStageAdmission<Self::Unit>>>;
 
     fn helper_tables<'stage>(
         &self,
@@ -229,7 +271,7 @@ pub(crate) fn run_graph_stages<Adapter: GraphStageAdapter>(
         (1..=MAX_REFERENCE_SEEDS_PER_BATCH).contains(&maximum_batch_size),
         "reference batch size must be in 1..={MAX_REFERENCE_SEEDS_PER_BATCH}"
     );
-    let mut groups = match adapter.units(operation, files, cancellation)? {
+    let admission = match adapter.units(operation, files, cancellation)? {
         SelectedResolutionOperationOutcome::Native(groups) => groups,
         SelectedResolutionOperationOutcome::Cancelled(completion) => {
             return Ok(SelectedResolutionOperationOutcome::Cancelled(completion));
@@ -241,6 +283,16 @@ pub(crate) fn run_graph_stages<Adapter: GraphStageAdapter>(
             return Ok(SelectedResolutionOperationOutcome::Unavailable(reason));
         }
     };
+    let GraphStageAdmission {
+        units: mut groups,
+        skipped,
+    } = admission;
+    let requested = files.iter().cloned().collect();
+    let admitted = groups
+        .iter()
+        .flat_map(|(_, files)| files.iter().cloned())
+        .collect();
+    certify_graph_callers(&requested, &admitted, &skipped);
     groups.sort_by(|left, right| left.0.cmp(&right.0));
     let mut summary = FactResolutionBatchSummary::empty();
     let mut metrics = GraphStageMetrics::default();
@@ -326,6 +378,10 @@ pub(crate) fn run_graph_stages<Adapter: GraphStageAdapter>(
         ));
     }
     Ok(SelectedResolutionOperationOutcome::Native(
-        GraphStageResult { summary, metrics },
+        GraphStageResult {
+            summary,
+            metrics,
+            skipped,
+        },
     ))
 }

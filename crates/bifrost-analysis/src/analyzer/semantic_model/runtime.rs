@@ -325,6 +325,14 @@ pub struct ActiveSemanticModelShard {
 }
 
 impl ActiveSemanticModelShard {
+    /// A positive declaration does not assert that its source enumerates the
+    /// owner's complete member family. Behavior payloads have no TypeFact and
+    /// cannot enter this declaration inventory.
+    pub(crate) fn admits_jvm_owner_declaration(&self, owner: &TypeFact) -> bool {
+        owner.guard.is_none()
+            && matches!(self.manifest.language.as_str(), "java" | "kotlin" | "scala")
+    }
+
     pub(crate) fn independently_enumerates_jvm_owner(&self, owner: &TypeFact) -> bool {
         owner.guard.is_none()
             && (matches!(
@@ -573,6 +581,71 @@ impl ResolvedActiveSemanticModels {
 
     pub fn types_named(&self, name: &str) -> SemanticModelMatch<'_, TypeFact> {
         self.type_match(self.indexes.types_by_name.get(name))
+    }
+
+    /// All active postings, without rank selection or value deduplication.
+    /// Exhaustive runtime claims must retain each contributor's provenance.
+    /// The caller charges its query budget before retaining each record.
+    pub(crate) fn all_type_records_named<'a>(
+        &'a self,
+        name: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
+        self.all_type_records(self.indexes.types_by_name.get(name))
+    }
+
+    pub(crate) fn all_type_records_with_id<'a>(
+        &'a self,
+        id: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
+        self.all_type_records(self.indexes.types_by_id.get(id))
+    }
+
+    fn all_type_records<'a>(
+        &'a self,
+        posting: Option<&'a Vec<RecordAddress>>,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
+        // Each record's aliases are indexed together, so duplicate addresses
+        // in one posting are adjacent. Distinct addresses, even equal values
+        // in different shards, are distinct contributors.
+        posting
+            .into_iter()
+            .flat_map(|posting| {
+                posting
+                    .iter()
+                    .enumerate()
+                    .filter(move |(index, address)| *index == 0 || **address != posting[*index - 1])
+                    .map(|(_, address)| address)
+            })
+            .map(move |address| {
+                let shard = &self.shards[address.shard as usize];
+                let record = &shard
+                    .shard
+                    .payload()
+                    .declaration_facts()
+                    .expect("type posting addresses declarations")
+                    .0[address.record as usize];
+                ActivatedSemanticModelRecord { record, shard }
+            })
+    }
+
+    /// Whether this raw contributor agrees with the normally selected type
+    /// declaration. Lower-ranked runtime claims are not silently discarded;
+    /// their owner must still bind to an admitted declaration.
+    pub(crate) fn type_declaration_admitted<E>(
+        &self,
+        record: &TypeFact,
+        visit: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let mut selected = None;
+        for candidate in self.all_type_records_with_id(&record.id) {
+            visit()?;
+            let rank = (candidate.shard.evidence_rank, candidate.shard.source_rank);
+            if selected.as_ref().is_none_or(|(best, _)| rank > *best) {
+                selected = Some((rank, candidate.record));
+            }
+        }
+        Ok(selected
+            .is_some_and(|(_, selected)| super::type_declarations_equivalent(record, selected)))
     }
 
     pub fn members_with_id(&self, id: &str) -> SemanticModelMatch<'_, MemberFact> {
@@ -1649,7 +1722,7 @@ pub enum RuleTriggerKey<'a> {
     ResolvedCall { owner: &'a str, name: &'a str },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordAddress {
     shard: u32,
     record: u32,

@@ -86,7 +86,11 @@ impl ProcedureCfgBuilder {
                 .evidence_rows
                 .iter()
                 .map(|evidence| evidence.sources.len()),
-        );
+        )
+        .conservative_add(SemanticWork {
+            nested_entries: parts.source_range_holes.len(),
+            ..SemanticWork::default()
+        });
         budget.check(prospective_work)?;
         parts.points.clear();
         Ok(Self {

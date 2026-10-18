@@ -46,7 +46,8 @@ CROSS JOIN source_rust_item_macro_expansions AS invocation
 LEFT JOIN source_rust_macro_inputs AS input
  ON input.blob_id=invocation.blob_id
  AND input.invocation_occurrence_id=invocation.invocation_occurrence_id
-WHERE invocation.invocation_start_byte >= member.start_byte AND invocation.invocation_end_byte <= member.end_byte
+WHERE COALESCE(cr_cfg(input.cfg_condition, ?2), -1)<>0
+ AND invocation.invocation_start_byte >= member.start_byte AND invocation.invocation_end_byte <= member.end_byte
  AND NOT EXISTS (SELECT 1 FROM cr_item_macro_no_routes AS no_route
                  WHERE no_route.blob_id=invocation.blob_id
                    AND no_route.invocation_occurrence_id=invocation.invocation_occurrence_id)
@@ -103,7 +104,8 @@ CROSS JOIN source_rust_item_macro_expansions AS invocation
 CROSS JOIN source_rust_macro_inputs AS input
  ON input.blob_id=invocation.blob_id
  AND input.invocation_occurrence_id=invocation.invocation_occurrence_id
-WHERE invocation.expansion_kind = 0 AND input.native_gap_site IS NOT NULL
+WHERE cr_cfg(input.cfg_condition, ?2)<>0
+ AND invocation.expansion_kind = 0 AND input.native_gap_site IS NOT NULL
  AND NOT EXISTS (SELECT 1 FROM cr_item_macro_no_routes AS no_route
                  WHERE no_route.blob_id=invocation.blob_id
                    AND no_route.invocation_occurrence_id=invocation.invocation_occurrence_id)

@@ -224,7 +224,7 @@ impl<'source> RustModuleSourceCollector<'source> {
         node: Node<'_>,
         collector: &mut PrimarySourceFactCollector<'source>,
     ) -> Option<SourceOccurrenceId> {
-        let name = rust_unqualified_macro_invocation_name(node, self.source)?;
+        let name = crate::declarations::rust_item_macro_invocation_name(node, self.source)?;
         if let Some(occurrence) = self.primary_invocations.get(&node.id()).copied() {
             return Some(occurrence);
         }
@@ -242,7 +242,7 @@ impl<'source> RustModuleSourceCollector<'source> {
         collector: &mut PrimarySourceFactCollector<'source>,
         source_maps: &mut [RustEmbeddedSourceMap],
     ) -> Option<SourceOccurrenceId> {
-        let name = rust_unqualified_macro_invocation_name(node, self.source)?;
+        let name = crate::declarations::rust_item_macro_invocation_name(node, self.source)?;
         let occurrence = source_maps[tree_id].intern_node(node, collector);
         if !self.invocation_occurrences.insert(occurrence) {
             return Some(occurrence);
@@ -652,7 +652,9 @@ impl<'source> RustUsageFactCollector<'source> {
                     if trees[child_tree].root().has_error() {
                         continue;
                     }
-                    let Some(_) = rust_unqualified_macro_invocation_name(node, self.source) else {
+                    let Some(_) =
+                        crate::declarations::rust_item_macro_invocation_name(node, self.source)
+                    else {
                         continue;
                     };
                     let child_batch = self.route_batches.len();
@@ -671,7 +673,7 @@ impl<'source> RustUsageFactCollector<'source> {
                     let mut child_gates = gates.clone();
                     let child_gate = module_sources
                         .ensure_embedded_invocation(tree_id, node, source_collector, source_maps)
-                        .expect("qualified macro routes are not admitted");
+                        .expect("a route-capable macro has a source invocation");
                     child_gates.push(child_gate);
                     work.push_back((child_batch, child_tree, child_gates));
                     continue;
@@ -712,6 +714,7 @@ impl<'source> RustUsageFactCollector<'source> {
                     let imports_macros = self.batch_scope_imports_macros(batch_id, scope_local)
                         && crate::imports::rust_item_has_attribute(node, self.source, "macro_use");
                     if let Some(body) = node.child_by_field_name("body") {
+                        let native_scope = source_maps[tree_id].native_module_scope(node);
                         let child_scope = self.route_batches[batch_id].scopes.len() + 1;
                         self.route_batches[batch_id]
                             .scopes
@@ -724,13 +727,13 @@ impl<'source> RustUsageFactCollector<'source> {
                                 name.to_string(),
                                 property,
                                 imports_macros,
-                                None,
+                                native_scope,
                             ));
                         self.route_batches[batch_id].source_scopes.push(
                             RustModuleScopeSourceFact {
                                 parent: Some(scope_local),
                                 declaration: Some(declaration),
-                                resolution_scope: None,
+                                resolution_scope: native_scope,
                             },
                         );
                         pending.push((body, child_scope));
@@ -853,7 +856,11 @@ impl<'source> RustUsageFactCollector<'source> {
         for projected in self
             .imports
             .into_iter()
-            .filter(|projected| matches!(projected.owner, RustImportOwner::Module { .. }))
+            .filter(|projected| {
+                matches!(projected.owner, RustImportOwner::Module { .. })
+                    && source_facts.occurrence(projected.source_occurrences.expect("an authoritative import has source identity").declaration).provenance
+                        == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode
+            })
         {
             if let Some(source_import_id) = projected.source_import_id {
                 module_import_ids.push(source_import_id);
@@ -923,6 +930,10 @@ impl<'source> RustUsageFactCollector<'source> {
             "token_tree" => self.token_tree_depth += 1,
             _ => {}
         }
+    }
+
+    pub(crate) fn collect_replayed_imports(&mut self, imports: Vec<RustProjectedImport>) {
+        self.imports.extend(imports);
     }
 
     fn collect_import_event(

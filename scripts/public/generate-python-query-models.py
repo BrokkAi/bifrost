@@ -16,6 +16,10 @@ from typing import Any
 
 SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
+# Object-property defaults are local metadata, even when their type plan is shared.
+# A sentinel keeps an absent default distinct from an explicit JSON null.
+NO_DEFAULT = object()
+
 ROOT_SCHEMA_KEYS = frozenset(
     {
         "$schema",
@@ -617,32 +621,31 @@ class CodeGenerator:
                 f"{class_name}{pascal_name(property_name)}",
             )
             required_property = property_name in required
-            has_default = "default" in property_schema
-            if not required_property and not has_default and "null" != property_plan.kind:
+            default = property_schema.get(
+                "default", property_plan.schema.get("default", NO_DEFAULT)
+            )
+            if not required_property and default is NO_DEFAULT and "null" != property_plan.kind:
                 nullable_type = "None" in property_plan.type_expression.split(" | ")
                 if not nullable_type:
-                    inferred_default: Any
                     if property_plan.kind in {"array", "tuple"}:
-                        inferred_default = []
+                        default = []
                     elif property_plan.kind == "map":
-                        inferred_default = {}
+                        default = {}
                     elif property_plan.kind == "primitive" and property_plan.type_expression == "bool":
-                        inferred_default = False
+                        default = False
                     else:
                         raise schema_error(
                             property_pointer,
                             "optional property is neither nullable nor has an unambiguous wire default",
                         )
-                    property_plan.schema["default"] = inferred_default
-                    has_default = True
             field_name = python_field_name(property_name, used_field_names)
             fields.append(
                 (
                     property_name,
                     field_name,
                     property_plan.type_expression,
-                    required_property or has_default,
-                    property_schema.get("default"),
+                    required_property,
+                    default,
                 )
             )
         object_plan = TypePlan(
@@ -817,8 +820,7 @@ def emit_object(plan: TypePlan, generator: "CodeGenerator") -> str:
     required_fields = [
         field
         for field in plan.fields
-        if field[3]
-        and "default" not in generator.plans[f"{plan.pointer}/properties/{field[0]}"].schema
+        if field[3] and field[4] is NO_DEFAULT
     ]
     if required_fields:
         lines.append("    required = {")
@@ -833,10 +835,10 @@ def emit_object(plan: TypePlan, generator: "CodeGenerator") -> str:
     arguments = []
     for property_name, field_name, _, required, default in plan.fields:
         property_plan = generator.plans[f"{plan.pointer}/properties/{property_name}"]
-        if required and "default" not in property_plan.schema:
+        if required and default is NO_DEFAULT:
             lines.append(f"    {field_name}_value = {property_plan.decoder_name}(value[{property_name!r}], f\"{{prefix}}.{property_name}\")")
-        elif "default" in property_plan.schema:
-            default = python_literal(property_plan.schema["default"])
+        elif default is not NO_DEFAULT:
+            default = python_literal(default)
             lines.append(f"    if {property_name!r} in value:")
             lines.append(f"        {field_name}_value = {property_plan.decoder_name}(value[{property_name!r}], f\"{{prefix}}.{property_name}\")")
             lines.append("    else:")

@@ -1624,7 +1624,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         let owner = value
                             .owner
                             .as_ref()
-                            .map_or("unknown owner", |owner| owner.fq_name.as_str());
+                            .map_or("unknown owner", |owner| owner.display_name());
                         out.push_str(&format!(
                             "  member: {} on {} at MRO rank {:?}\n",
                             sanitize_terminal_text(member),
@@ -1635,7 +1635,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     if let Some(target) = &value.target {
                         out.push_str(&format!(
                             "  target: {}\n",
-                            sanitize_terminal_text(&target.fq_name)
+                            sanitize_terminal_text(target.display_name())
                         ));
                     }
                 }

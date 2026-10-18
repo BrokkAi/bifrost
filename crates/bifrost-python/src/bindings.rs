@@ -28,38 +28,69 @@ pub enum PythonDirectScopeBindingKind {
 /// iterables use comprehension-local names, including not-yet-bound targets.
 /// This structured walk models those scopes without source-text parsing.
 pub fn python_comprehension_binds_name_at(name: &str, reference: Node<'_>, source: &str) -> bool {
+    python_comprehension_binds_name_at_bounded(name, reference, source, || true)
+        .expect("unbounded comprehension binding lookup completes")
+}
+
+/// The same scope proof under the caller's work/cancellation ledger.
+/// An interrupted walk must not be interpreted as an unbound name.
+pub fn python_comprehension_binds_name_at_bounded(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
+    if !scope_step() {
+        return None;
+    }
     let mut current = reference;
     while let Some(parent) = current.parent() {
+        if !scope_step() {
+            return None;
+        }
         if is_comprehension(parent.kind()) {
             let mut cursor = parent.walk();
-            let clauses = parent
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "for_in_clause")
-                .collect::<Vec<_>>();
-            let in_outer_iterable = clauses.first().is_some_and(|clause| {
+            let mut clauses = Vec::new();
+            for child in parent.named_children(&mut cursor) {
+                if !scope_step() {
+                    return None;
+                }
+                if child.kind() == "for_in_clause" {
+                    clauses.push(child);
+                }
+            }
+            let mut in_outer_iterable = false;
+            if let Some(clause) = clauses.first() {
                 let mut cursor = clause.walk();
-                clause
-                    .children_by_field_name("right", &mut cursor)
-                    .any(|right| {
-                        right.start_byte() <= reference.start_byte()
-                            && reference.end_byte() <= right.end_byte()
-                    })
-            });
+                for right in clause.children_by_field_name("right", &mut cursor) {
+                    if !scope_step() {
+                        return None;
+                    }
+                    if right.start_byte() <= reference.start_byte()
+                        && reference.end_byte() <= right.end_byte()
+                    {
+                        in_outer_iterable = true;
+                        break;
+                    }
+                }
+            }
             if in_outer_iterable {
                 current = parent;
                 continue;
             }
             for clause in clauses {
+                if !scope_step() {
+                    return None;
+                }
                 let Some(target) = clause.child_by_field_name("left") else {
                     continue;
                 };
                 let mut bound = false;
-                collect_binding_targets(target, source, &mut || true, |candidate, _| {
+                collect_binding_targets(target, source, &mut scope_step, |candidate, _| {
                     bound |= candidate == name;
-                })
-                .expect("unbounded comprehension target collection completes");
+                })?;
                 if bound {
-                    return true;
+                    return Some(true);
                 }
             }
         }
@@ -71,7 +102,7 @@ pub fn python_comprehension_binds_name_at(name: &str, reference: Node<'_>, sourc
         }
         current = parent;
     }
-    false
+    Some(false)
 }
 
 /// Whether `reference` reads a PEP 695 type parameter declared by its enclosing
@@ -81,9 +112,24 @@ pub fn python_comprehension_binds_name_at(name: &str, reference: Node<'_>, sourc
 /// declarations. The binder is the first identifier in each structured
 /// parameter node; identifiers in bounds and constraints remain references.
 pub fn python_type_parameter_binds_name_at(name: &str, reference: Node<'_>, source: &str) -> bool {
+    python_type_parameter_binds_name_at_bounded(name, reference, source, || true)
+        .expect("unbounded type parameter lookup completes")
+}
+
+/// The shared type-parameter proof under the caller's live work budget.
+/// An interrupted ancestor, binder, or directive walk supplies no answer.
+pub fn python_type_parameter_binds_name_at_bounded(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
     let mut current = reference;
     let mut enclosing_functions = Vec::new();
     while let Some(parent) = current.parent() {
+        if !scope_step() {
+            return None;
+        }
         if parent.kind() == "function_definition" {
             enclosing_functions.push(parent);
         }
@@ -96,24 +142,27 @@ pub fn python_type_parameter_binds_name_at(name: &str, reference: Node<'_>, sour
         {
             let mut cursor = parameters.walk();
             for parameter in parameters.named_children(&mut cursor) {
-                let binder = python_type_parameter_binder_node(parameter);
+                if !scope_step() {
+                    return None;
+                }
+                let binder = first_identifier_bounded(parameter, &mut scope_step)?;
                 if binder.is_some_and(|binder| node_text(binder, source) == name) {
-                    // Only a name that actually matched an enclosing type
-                    // parameter needs the function-wide directive scans. This
-                    // keeps the hot-path check for ordinary identifiers a
-                    // bounded ancestor walk with no scope-inventory builds.
-                    return !python_name_declared_global_at_in_functions(
-                        name,
-                        reference,
-                        source,
-                        enclosing_functions,
+                    // Preserve the existing function-wide directive precedence.
+                    return Some(
+                        python_name_resolution_at_in_functions_bounded(
+                            name,
+                            reference,
+                            source,
+                            enclosing_functions,
+                            &mut scope_step,
+                        )? != PythonLexicalNameResolution::Global,
                     );
                 }
             }
         }
         current = parent;
     }
-    false
+    Some(false)
 }
 
 /// Resolve `name` through the nearest enclosing function scope. This is the
@@ -135,54 +184,59 @@ pub fn python_name_resolution_at(
     python_name_resolution_at_in_functions(name, reference, source, functions)
 }
 
-fn python_name_declared_global_at_in_functions(
-    name: &str,
-    reference: Node<'_>,
-    source: &str,
-    functions: Vec<Node<'_>>,
-) -> bool {
-    python_name_resolution_at_in_functions(name, reference, source, functions)
-        == PythonLexicalNameResolution::Global
-}
-
 fn python_name_resolution_at_in_functions(
     name: &str,
     reference: Node<'_>,
     source: &str,
     functions: Vec<Node<'_>>,
 ) -> PythonLexicalNameResolution {
+    python_name_resolution_at_in_functions_bounded(name, reference, source, functions, || true)
+        .expect("unbounded function binding lookup completes")
+}
+
+fn python_name_resolution_at_in_functions_bounded(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+    functions: Vec<Node<'_>>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<PythonLexicalNameResolution> {
     for function in functions {
-        let parameter_names = function
-            .child_by_field_name("parameters")
-            .into_iter()
-            .flat_map(|parameters| {
-                let mut cursor = parameters.walk();
-                parameters
-                    .named_children(&mut cursor)
-                    .filter_map(|parameter| python_parameter_name(parameter, source))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let Some(inventory) =
-            PythonLexicalScopeInventory::collect_bounded(function, source, parameter_names, || {
-                true
-            })
-        else {
-            return PythonLexicalNameResolution::Unbound;
-        };
-        let resolution = inventory.name_resolution_at(name, reference);
-        match resolution {
-            PythonLexicalNameResolution::Global => return PythonLexicalNameResolution::Global,
-            PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
-                return resolution;
+        if !scope_step() {
+            return None;
+        }
+        let mut parameter_names = Vec::new();
+        if let Some(parameters) = function.child_by_field_name("parameters") {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if !scope_step() {
+                    return None;
+                }
+                if let Some(name) = crate::syntax::python_parameter_name_bounded(
+                    parameter,
+                    source,
+                    &mut scope_step,
+                )? {
+                    parameter_names.push(name);
+                }
             }
+        }
+        let inventory = PythonLexicalScopeInventory::collect_bounded(
+            function,
+            source,
+            parameter_names,
+            &mut scope_step,
+        )?;
+        let resolution = inventory.name_resolution_at_bounded(name, reference, &mut scope_step)?;
+        match resolution {
+            PythonLexicalNameResolution::Global
+            | PythonLexicalNameResolution::Local
+            | PythonLexicalNameResolution::Nonlocal => return Some(resolution),
             PythonLexicalNameResolution::Unbound => {}
         }
     }
-    PythonLexicalNameResolution::Unbound
+    Some(PythonLexicalNameResolution::Unbound)
 }
-
-use crate::syntax::python_parameter_name;
 
 /// Whether this identifier is the binder (rather than a bound/constraint use)
 /// of one structured PEP 695 type parameter.
@@ -239,6 +293,7 @@ struct PythonLocalBinding<'tree> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PythonLocalBindingKind {
     FunctionOnly,
+    ClassOnly,
     Other,
 }
 
@@ -267,6 +322,8 @@ pub struct PythonLexicalScopeBindings {
     parameters: HashSet<Box<str>>,
     local_names: HashMap<Box<str>, PythonLocalBindingKind>,
     binding_writes: HashSet<Box<str>>,
+    // Real binding events retained before global declarations leave locals.
+    global_binding_events: HashSet<Box<str>>,
     globals: HashSet<Box<str>>,
     nonlocals: HashSet<Box<str>>,
     comprehensions: Vec<PythonComprehensionBinding>,
@@ -293,6 +350,26 @@ impl PythonLexicalScopeBindings {
         if !scope_step() {
             return None;
         }
+        if self.comprehension_binds_name_at_bounded(name, reference, &mut scope_step)? {
+            return Some(PythonLexicalNameResolution::Local);
+        }
+        Some(if self.nonlocals.contains(name) {
+            PythonLexicalNameResolution::Nonlocal
+        } else if self.globals.contains(name) {
+            PythonLexicalNameResolution::Global
+        } else if self.parameters.contains(name) || self.local_names.contains_key(name) {
+            PythonLexicalNameResolution::Local
+        } else {
+            PythonLexicalNameResolution::Unbound
+        })
+    }
+
+    fn comprehension_binds_name_at_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        mut scope_step: impl FnMut() -> bool,
+    ) -> Option<bool> {
         let reference_byte = reference.start_byte();
         for binding in &self.comprehensions {
             if !scope_step() {
@@ -310,51 +387,61 @@ impl PythonLexicalScopeBindings {
                     in_outer_iterable |= *start <= reference_byte && reference_byte < *end;
                 }
                 if !in_outer_iterable {
-                    return Some(PythonLexicalNameResolution::Local);
+                    return Some(true);
                 }
             }
         }
-        Some(if self.nonlocals.contains(name) {
-            PythonLexicalNameResolution::Nonlocal
-        } else if self.globals.contains(name) {
-            PythonLexicalNameResolution::Global
-        } else if self.parameters.contains(name) || self.local_names.contains_key(name) {
-            PythonLexicalNameResolution::Local
-        } else {
-            PythonLexicalNameResolution::Unbound
-        })
+        Some(false)
+    }
+
+    /// A directive alone is not an event. Declarations, imports, assignments,
+    /// and every other collected binder/delete count, without value inference.
+    pub fn has_global_binding_event(&self, name: &str) -> bool {
+        self.global_binding_events.contains(name)
     }
 
     pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
-        let reference_byte = reference.start_byte();
-        !self.parameters.contains(name)
-            && !self.comprehensions.iter().any(|binding| {
-                binding.name.as_ref() == name
-                    && binding.start_byte <= reference_byte
-                    && reference_byte < binding.end_byte
-                    && !binding
-                        .enclosing_iterable_ranges
-                        .iter()
-                        .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
-            })
-            && self.local_names.get(name) == Some(&PythonLocalBindingKind::FunctionOnly)
+        self.resolves_to_local_function_bounded(name, reference, || true)
+            .expect("unbounded local function lookup completes")
+    }
+
+    pub fn resolves_to_local_function_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        mut scope_step: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        if !scope_step() {
+            return None;
+        }
+        Some(
+            !self.parameters.contains(name)
+                && !self.comprehension_binds_name_at_bounded(name, reference, &mut scope_step)?
+                && self.local_names.get(name) == Some(&PythonLocalBindingKind::FunctionOnly),
+        )
     }
 
     /// Whether the active callable obtains `name` from a runtime binding
     /// rather than an untouched function or import declaration.
     pub fn has_runtime_callable_binding_at(&self, name: &str, reference: Node<'_>) -> bool {
-        let reference_byte = reference.start_byte();
-        self.parameters.contains(name)
-            || self.binding_writes.contains(name)
-            || self.comprehensions.iter().any(|binding| {
-                binding.name.as_ref() == name
-                    && binding.start_byte <= reference_byte
-                    && reference_byte < binding.end_byte
-                    && !binding
-                        .enclosing_iterable_ranges
-                        .iter()
-                        .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
-            })
+        self.has_runtime_callable_binding_at_bounded(name, reference, || true)
+            .expect("unbounded runtime binding lookup completes")
+    }
+
+    pub fn has_runtime_callable_binding_at_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        mut scope_step: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        if !scope_step() {
+            return None;
+        }
+        Some(
+            self.parameters.contains(name)
+                || self.binding_writes.contains(name)
+                || self.comprehension_binds_name_at_bounded(name, reference, &mut scope_step)?,
+        )
     }
 }
 
@@ -362,6 +449,89 @@ impl PythonLexicalScopeBindings {
 struct ScanFrame<'tree> {
     node: Node<'tree>,
     in_comprehension: bool,
+}
+
+/// Binding events in an executing class namespace at one reference. Only a
+/// proved static superclass path precedes that class statement's name binding.
+/// Lazy type-parameter expressions and other header contexts keep that event.
+/// Other events retain the existing whole-scope conservative interpretation.
+pub struct PythonClassReferenceScope<'tree> {
+    scope: Node<'tree>,
+    pending_name: Option<Node<'tree>>,
+}
+
+impl<'tree> PythonClassReferenceScope<'tree> {
+    pub fn new_bounded(
+        scope: Node<'tree>,
+        reference: Node<'tree>,
+        mut scope_step: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        assert_eq!(scope.kind(), "class_definition");
+        let mut current = reference;
+        let mut pending_name = None;
+        while current != scope {
+            if !scope_step() {
+                return None;
+            }
+            if current.kind() == "class_definition"
+                && let Some(superclasses) = current.child_by_field_name("superclasses")
+            {
+                for expression in named_children_iter(superclasses) {
+                    if !scope_step() {
+                        return None;
+                    }
+                    if expression.start_byte() <= reference.start_byte()
+                        && reference.end_byte() <= expression.end_byte()
+                        && let Some(path) = crate::syntax::python_static_value_path_bounded(
+                            expression,
+                            &mut scope_step,
+                        )?
+                        && (path.first().copied() == Some(reference) || expression == reference)
+                    {
+                        pending_name = Some(current.child_by_field_name("name")?);
+                    }
+                }
+            }
+            current = current.parent()?;
+        }
+        Some(Self {
+            scope,
+            pending_name,
+        })
+    }
+
+    fn includes_binding(&self, declaration: Node<'tree>) -> bool {
+        Some(declaration) != self.pending_name
+    }
+
+    pub fn collect_bounded(
+        &self,
+        source: &str,
+        scope_step: impl FnMut() -> bool,
+    ) -> Option<PythonLexicalScopeInventory<'tree>> {
+        PythonLexicalScopeInventory::collect_with_declaration_filter_bounded(
+            self.scope,
+            source,
+            std::iter::empty::<String>(),
+            |declaration| self.includes_binding(declaration),
+            scope_step,
+        )
+    }
+
+    pub fn binds_name_bounded(
+        &self,
+        name: &str,
+        source: &str,
+        scope_step: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        python_scope_binds_name_with_filter_bounded(
+            self.scope,
+            name,
+            source,
+            |declaration| self.includes_binding(declaration),
+            scope_step,
+        )
+    }
 }
 
 impl<'tree> PythonLexicalScopeInventory<'tree> {
@@ -375,6 +545,22 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         callable: Node<'tree>,
         source: &str,
         parameter_names: impl IntoIterator<Item = String>,
+        scope_step: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        Self::collect_with_declaration_filter_bounded(
+            callable,
+            source,
+            parameter_names,
+            |_| true,
+            scope_step,
+        )
+    }
+
+    fn collect_with_declaration_filter_bounded(
+        callable: Node<'tree>,
+        source: &str,
+        parameter_names: impl IntoIterator<Item = String>,
+        include_declaration: impl Fn(Node<'tree>) -> bool,
         mut scope_step: impl FnMut() -> bool,
     ) -> Option<Self> {
         let mut inventory = Self {
@@ -383,12 +569,17 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                 parameters: parameter_names.into_iter().map(Box::<str>::from).collect(),
                 local_names: HashMap::default(),
                 binding_writes: HashSet::default(),
+                global_binding_events: HashSet::default(),
                 globals: HashSet::default(),
                 nonlocals: HashSet::default(),
                 comprehensions: Vec::new(),
             },
         };
-        let Some(body) = callable.child_by_field_name("body") else {
+        let body = if callable.kind() == "module" {
+            callable
+        } else if let Some(body) = callable.child_by_field_name("body") {
+            body
+        } else {
             return Some(inventory);
         };
         let mut stack = vec![ScanFrame {
@@ -409,6 +600,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             if nested_scope {
                 if matches!(node.kind(), "function_definition" | "class_definition")
                     && let Some(name) = node.child_by_field_name("name")
+                    && include_declaration(name)
                 {
                     inventory.record_local_node(name, source);
                 }
@@ -427,6 +619,9 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
 
             match node.kind() {
                 "global_statement" => {
+                    if callable.kind() == "module" {
+                        continue;
+                    }
                     collect_direct_identifier_names(node, source, &mut scope_step, |name| {
                         inventory.bindings.globals.insert(name.into());
                     })?;
@@ -613,6 +808,21 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             push_named_children(&mut stack, node, frame.in_comprehension, &mut scope_step)?;
         }
 
+        // Preserve all real global binding events before pruning semantic
+        // locals, including def/class/import declarations that intentionally
+        // do not belong to the runtime-callable-value predicate.
+        for name in inventory.bindings.local_names.keys() {
+            if !scope_step() {
+                return None;
+            }
+            if inventory.bindings.globals.contains(name.as_ref()) {
+                inventory
+                    .bindings
+                    .global_binding_events
+                    .insert(name.clone());
+            }
+        }
+
         // `global` and `nonlocal` are whole-function directives regardless of
         // source order. Neither declaration may become a semantic local.
         inventory.locals.retain(|binding| {
@@ -638,6 +848,16 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         self.bindings.name_resolution_at(name, reference)
     }
 
+    pub fn name_resolution_at_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        scope_step: impl FnMut() -> bool,
+    ) -> Option<PythonLexicalNameResolution> {
+        self.bindings
+            .name_resolution_at_bounded(name, reference, scope_step)
+    }
+
     pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
         self.bindings.resolves_to_local_function(name, reference)
     }
@@ -647,20 +867,81 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             .has_runtime_callable_binding_at(name, reference)
     }
 
+    pub fn has_runtime_callable_binding_at_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        scope_step: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        self.bindings
+            .has_runtime_callable_binding_at_bounded(name, reference, scope_step)
+    }
+
     pub fn local_function_declaration(
         &self,
         name: &str,
         reference: Node<'_>,
     ) -> Option<Node<'tree>> {
-        self.resolves_to_local_function(name, reference)
-            .then(|| {
-                self.locals
-                    .iter()
-                    .find(|binding| binding.name.as_ref() == name)
-                    .and_then(|binding| binding.declaration.parent())
-                    .filter(|declaration| declaration.kind() == "function_definition")
-            })
-            .flatten()
+        self.local_function_declaration_bounded(name, reference, || true)
+    }
+
+    pub fn local_function_declaration_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        mut scope_step: impl FnMut() -> bool,
+    ) -> Option<Node<'tree>> {
+        if !self
+            .bindings
+            .resolves_to_local_function_bounded(name, reference, &mut scope_step)?
+        {
+            return None;
+        }
+        for binding in &self.locals {
+            if !scope_step() {
+                return None;
+            }
+            if binding.name.as_ref() == name {
+                return binding
+                    .declaration
+                    .parent()
+                    .filter(|declaration| declaration.kind() == "function_definition");
+            }
+        }
+        None
+    }
+
+    /// A single untouched local class declaration, not an inferred instance
+    /// type. Statement ordering/containment is checked at the selected use.
+    pub fn local_class_declaration_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        mut scope_step: impl FnMut() -> bool,
+    ) -> Option<Node<'tree>> {
+        if self.name_resolution_at_bounded(name, reference, &mut scope_step)?
+            != PythonLexicalNameResolution::Local
+            || self.bindings.has_runtime_callable_binding_at_bounded(
+                name,
+                reference,
+                &mut scope_step,
+            )?
+            || self.bindings.local_names.get(name) != Some(&PythonLocalBindingKind::ClassOnly)
+        {
+            return None;
+        }
+        for binding in &self.locals {
+            if !scope_step() {
+                return None;
+            }
+            if binding.name.as_ref() == name {
+                return binding
+                    .declaration
+                    .parent()
+                    .filter(|node| node.kind() == "class_definition");
+            }
+        }
+        None
     }
 
     pub fn local_bindings(&self) -> impl Iterator<Item = (&str, Node<'tree>)> + '_ {
@@ -680,6 +961,15 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         }
         let binding_kind = if is_function_declaration_name(declaration) {
             PythonLocalBindingKind::FunctionOnly
+        } else if declaration.parent().is_some_and(|parent| {
+            parent.kind() == "class_definition"
+                && brokk_bifrost_core::analyzer::tree_walk::is_field_child(
+                    parent,
+                    declaration,
+                    "name",
+                )
+        }) {
+            PythonLocalBindingKind::ClassOnly
         } else {
             PythonLocalBindingKind::Other
         };
@@ -703,6 +993,53 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         }
         self.record_local(name, declaration);
     }
+}
+
+/// Prove that a selected `global` route has no known binding event in its
+/// executing enclosing scopes. Outer locals are unrelated to this namespace;
+/// an outer scope declaring the same global can still replace its identity.
+/// Class namespaces are not captured: only explicit global events are read.
+/// The caller has already selected `global_scope` by lexical precedence.
+pub fn python_global_binding_is_untouched_bounded(
+    name: &str,
+    reference: Node<'_>,
+    global_scope: Node<'_>,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
+    assert!(matches!(
+        global_scope.kind(),
+        "function_definition" | "lambda" | "class_definition"
+    ));
+    let mut current = Some(global_scope);
+    while let Some(scope) = current {
+        if !scope_step() {
+            return None;
+        }
+        if matches!(
+            scope.kind(),
+            "function_definition" | "lambda" | "class_definition"
+        ) && scope.child_by_field_name("body").is_some_and(|body| {
+            body.start_byte() <= reference.start_byte() && reference.end_byte() <= body.end_byte()
+        }) {
+            let inventory = if scope.kind() == "class_definition" {
+                PythonClassReferenceScope::new_bounded(scope, reference, &mut scope_step)?
+                    .collect_bounded(source, &mut scope_step)?
+            } else {
+                PythonLexicalScopeInventory::collect_bounded(
+                    scope,
+                    source,
+                    std::iter::empty::<String>(),
+                    &mut scope_step,
+                )?
+            };
+            if inventory.bindings.has_global_binding_event(name) {
+                return Some(false);
+            }
+        }
+        current = scope.parent();
+    }
+    Some(true)
 }
 
 fn is_function_declaration_name(node: Node<'_>) -> bool {
@@ -893,6 +1230,16 @@ pub fn python_module_or_class_scope_binds_name_bounded(
     scope: Node<'_>,
     target_name: &str,
     source: &str,
+    scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
+    python_scope_binds_name_with_filter_bounded(scope, target_name, source, |_| true, scope_step)
+}
+
+fn python_scope_binds_name_with_filter_bounded<'tree>(
+    scope: Node<'tree>,
+    target_name: &str,
+    source: &str,
+    include_binding: impl Fn(Node<'tree>) -> bool,
     mut scope_step: impl FnMut() -> bool,
 ) -> Option<bool> {
     assert!(matches!(scope.kind(), "module" | "class_definition"));
@@ -907,7 +1254,10 @@ pub fn python_module_or_class_scope_binds_name_bounded(
         }
         if python_direct_scope_bindings_bounded(node, source, &mut scope_step)?
             .into_iter()
-            .any(|binding| node_text(binding.declaration, source) == target_name)
+            .any(|binding| {
+                include_binding(binding.declaration)
+                    && node_text(binding.declaration, source) == target_name
+            })
         {
             return Some(true);
         }
@@ -1292,12 +1642,17 @@ fn push_nested_scope_header_children<'tree>(
 ) -> Option<()> {
     let body = node.child_by_field_name("body").map(|child| child.id());
     let name = node.child_by_field_name("name").map(|child| child.id());
-    let children = named_children_bounded(node, scope_step)?;
+    // Prune execution boundaries before charging or visiting their bodies.
+    // Only the header belongs to the enclosing scope's collector walk.
+    let mut cursor = node.walk();
+    let children = node
+        .named_children(&mut cursor)
+        .filter(|child| Some(child.id()) != body);
+    let mut headers = Vec::new();
+    push_bounded_nodes(children, &mut headers, scope_step).then_some(())?;
     push_bounded_children(
         stack,
-        children
-            .into_iter()
-            .filter(|child| Some(child.id()) != body && Some(child.id()) != name),
+        headers.into_iter().filter(|child| Some(child.id()) != name),
         in_comprehension,
     );
     Some(())
@@ -1402,9 +1757,11 @@ mod tests {
     }
 
     #[test]
-    #[hardwon("#5044: exhausted scope lookups must remain incomplete")]
+    #[hardwon(
+        "#5044+#5511: bounded lexical lookups bypassed budgets or erased lazy class bindings"
+    )]
     fn bounded_comprehension_lookup_preserves_exhaustion() {
-        let source = "def run(xs):\n    return [target for target in xs]\n";
+        let source = "def run(xs):\n    class Base:\n        pass\n    def helper():\n        pass\n    class Derived(Base):\n        pass\n    helper()\n    return [target for target in xs]\n";
         let tree = crate::declarations::parse_python_tree(source).unwrap();
         let function = tree.root_node().named_child(0).unwrap();
         let inventory = super::PythonLexicalScopeInventory::collect_bounded(
@@ -1413,8 +1770,7 @@ mod tests {
             ["xs".to_owned()],
             || true,
         )
-        .unwrap()
-        .into_bindings();
+        .unwrap();
         let mut stack = vec![function];
         let comprehension = loop {
             let node = stack.pop().expect("fixture contains a comprehension");
@@ -1438,6 +1794,86 @@ mod tests {
             inventory.name_resolution_at_bounded("target", reference, || true),
             Some(super::PythonLexicalNameResolution::Local)
         );
+        let body = function.child_by_field_name("body").unwrap();
+        let derived = brokk_bifrost_core::analyzer::tree_walk::named_children_iter(body)
+            .find(|node| node.child_by_field_name("superclasses").is_some())
+            .unwrap();
+        let base_reference = derived
+            .child_by_field_name("superclasses")
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        let call = brokk_bifrost_core::analyzer::tree_walk::named_children_iter(body)
+            .filter(|node| node.kind() == "expression_statement")
+            .find_map(|node| node.named_child(0).filter(|node| node.kind() == "call"))
+            .unwrap();
+        let helper_reference = call.child_by_field_name("function").unwrap();
+        // Collection has completed, but every later lookup must still charge
+        // retained comprehension facts. One step cannot finish that scan.
+        let one_step = || {
+            let mut available = true;
+            move || std::mem::take(&mut available)
+        };
+        assert!(
+            inventory
+                .has_runtime_callable_binding_at_bounded("helper", helper_reference, one_step())
+                .is_none()
+        );
+        assert!(
+            inventory
+                .local_function_declaration_bounded("helper", helper_reference, one_step())
+                .is_none()
+        );
+        assert!(
+            inventory
+                .local_class_declaration_bounded("Base", base_reference, one_step())
+                .is_none()
+        );
+        assert_eq!(
+            inventory
+                .local_function_declaration_bounded("helper", helper_reference, || true)
+                .unwrap()
+                .kind(),
+            "function_definition"
+        );
+        assert_eq!(
+            inventory
+                .local_class_declaration_bounded("Base", base_reference, || true)
+                .unwrap()
+                .kind(),
+            "class_definition"
+        );
+        let bindings = inventory.into_bindings();
+        assert_eq!(
+            bindings.name_resolution_at_bounded("missing", reference, one_step()),
+            None,
+            "stopped lookup must not manufacture Unbound"
+        );
+        assert_eq!(
+            bindings.name_resolution_at_bounded("missing", reference, || true),
+            Some(super::PythonLexicalNameResolution::Unbound)
+        );
+        assert_eq!(
+            bindings.resolves_to_local_function_bounded("helper", helper_reference, one_step()),
+            None
+        );
+        assert_eq!(
+            bindings.resolves_to_local_function_bounded("helper", helper_reference, || true),
+            Some(true)
+        );
+        assert_eq!(
+            super::python_comprehension_binds_name_at_bounded(
+                "target",
+                reference,
+                source,
+                one_step()
+            ),
+            None
+        );
+        assert_eq!(
+            super::python_comprehension_binds_name_at_bounded("target", reference, source, || true),
+            Some(true)
+        );
         let clause = brokk_bifrost_core::analyzer::tree_walk::named_children_iter(comprehension)
             .find(|node| node.kind() == "for_in_clause")
             .unwrap();
@@ -1452,5 +1888,57 @@ mod tests {
             Some(targets[0].declaration),
             clause.child_by_field_name("left")
         );
+
+        // The same spelling is an immediate base root and a lazy bound root.
+        // Generic hierarchy refusal cannot test this shared binding distinction.
+        let source = "import ns_source as ns\nclass Outer:\n    class ns[T: ns.Target]((ns.Target)):\n        pass\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let outer = brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind(
+            tree.root_node(),
+            "class_definition",
+        )
+        .unwrap();
+        let inner = brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind(
+            outer.child_by_field_name("body").unwrap(),
+            "class_definition",
+        )
+        .unwrap();
+        let base = inner
+            .child_by_field_name("superclasses")
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        let immediate = crate::syntax::python_static_value_path_bounded(base, || true)
+            .unwrap()
+            .unwrap()[0];
+        let bound =
+            brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(
+                inner.child_by_field_name("type_parameters").unwrap(),
+                "attribute",
+            )
+            .unwrap()
+            .child_by_field_name("object")
+            .unwrap();
+        for (reference, resolution, binds) in [
+            (
+                immediate,
+                super::PythonLexicalNameResolution::Unbound,
+                false,
+            ),
+            (bound, super::PythonLexicalNameResolution::Local, true),
+        ] {
+            assert!(
+                super::PythonClassReferenceScope::new_bounded(outer, reference, || false).is_none()
+            );
+            let scope =
+                super::PythonClassReferenceScope::new_bounded(outer, reference, || true).unwrap();
+            let inventory = scope.collect_bounded(source, || true).unwrap();
+            assert_eq!(
+                inventory.name_resolution_at_bounded("ns", reference, || true),
+                Some(resolution)
+            );
+            assert_eq!(scope.binds_name_bounded("ns", source, || true), Some(binds));
+        }
     }
 }

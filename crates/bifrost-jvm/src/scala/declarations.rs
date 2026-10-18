@@ -493,6 +493,40 @@ impl ScalaVisitor<'_, '_> {
             .package_contexts
             .prefixes_at(node.start_byte())
             .to_vec();
+        if let Some(qualifier) = crate::scala::graph::syntax::scala_access_qualifier(node) {
+            use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+            let name = scala_node_text(qualifier, self.source);
+            if name != "this" {
+                // A qualifier selects a lexical owner, never an ordinary type
+                // alias or imported name. Innermost templates win.
+                let mut ancestor = node.parent();
+                while let Some(owner) = ancestor {
+                    if matches!(
+                        owner.kind(),
+                        "class_definition"
+                            | "trait_definition"
+                            | "object_definition"
+                            | "enum_definition"
+                    ) && let Some(owner_name) = scala_type_declaration_name_node(owner)
+                        && scala_node_text(owner_name, self.source) == name
+                    {
+                        fact.access_boundary = Some(DeclarationAccessBoundary::Template(
+                            self.collector.declare_node(owner, Some(owner_name)),
+                        ));
+                        break;
+                    }
+                    ancestor = owner.parent();
+                }
+                if fact.access_boundary.is_none() {
+                    let segments = self.package_contexts.package_segments_at(node.start_byte());
+                    if let Some(position) = segments.iter().rposition(|segment| segment == name) {
+                        fact.access_boundary = Some(DeclarationAccessBoundary::Package(
+                            segments[..=position].join("."),
+                        ));
+                    }
+                }
+            }
+        }
         // A declaration lookup occurs at its opening token, inside its own
         // lexical region, just as the previous point-syntax lookup observed.
         let mut current = Some(node);
@@ -1025,8 +1059,10 @@ impl ScalaVisitor<'_, '_> {
             self.parsed.set_scala_trait(code_unit.clone());
         }
 
+        let constructor_modifier =
+            crate::scala::graph::syntax::scala_primary_constructor_modifier(node);
         if matches!(node.kind(), "class_definition" | "full_enum_case")
-            && !scala_class_parameter_lists(node).is_empty()
+            && (!scala_class_parameter_lists(node).is_empty() || constructor_modifier.is_some())
         {
             let constructor = CodeUnit::with_signature_and_fq(
                 self.file.clone(),
@@ -1046,16 +1082,35 @@ impl ScalaVisitor<'_, '_> {
                     .with_pushed(segment_interner().intern(raw_name, SegmentKind::Member)),
             )
             .with_synthetic(true);
-            // The constructor is a declaration of its own, not a second unit of
-            // the class's declaration. Source declarations are keyed by their
-            // (node, name) pair, so declaring the constructor with the class's
-            // name node returns the class's declaration id, and every reader
-            // that takes one declaration to be one parser unit (the selected
-            // unit read, the Java inheritance metadata read) then sees the
-            // class and its constructor as conflicting rows. Like a Kotlin
-            // constructor it has no name occurrence; its source fact is read
-            // from the same node, so it keeps the class's lexical context.
-            let declaration = self.declare(&constructor, node, None);
+            // Keep the existing constructor identity with parameter lists. An
+            // explicit modifier without lists needs its own source anchor too:
+            // class and constructor can name different lexical boundaries.
+            let anchor = if scala_class_parameter_lists(node).is_empty() {
+                constructor_modifier.expect("a constructor without lists has an explicit modifier")
+            } else {
+                node
+            };
+            let declaration = self.collector.declare_node(anchor, None);
+            assert!(self.captured_declarations.insert(declaration));
+            let mut fact = crate::scala::graph::syntax::scala_declaration_source_fact(
+                node,
+                self.source,
+                declaration,
+            );
+            let visibility =
+                constructor_modifier.map_or(DeclaredVisibility::Public, scala_declared_visibility);
+            fact.visibility = constructor_modifier
+                .map_or(ScalaDeclarationVisibility::Public, |modifier| {
+                    crate::scala::graph::syntax::scala_declaration_modifiers(modifier).0
+                });
+            self.capture_declaration_context(constructor_modifier.unwrap_or(node), &mut fact);
+            if constructor_modifier.is_none() {
+                fact.access_boundary = None;
+            }
+            self.scala_facts.declarations.push(fact);
+            self.parsed
+                .source_declaration_units
+                .push((declaration, constructor.clone()));
             self.parsed.add_code_unit(
                 constructor.clone(),
                 node,
@@ -1072,7 +1127,7 @@ impl ScalaVisitor<'_, '_> {
                     // saying so is what keeps it out of method families
                     // (#1721) as a proven exclusion rather than as a member
                     // whose modifiers nobody read.
-                    .with_callable_modifiers(false, true, scala_declared_visibility(node))
+                    .with_callable_modifiers(false, true, visibility)
                     .with_dispatch_extensibility(DispatchExtensibility::Closed),
             );
             self.visit_class_parameter_fields(node, package_name, &code_unit);
@@ -2091,9 +2146,9 @@ fn scala_parameter_type_spellings(parameter_nodes: &[Node<'_>], source: &str) ->
 
 /// The declared visibility of one Scala declaration, in the shared vocabulary.
 ///
-/// Scala's `private[pkg]` and `protected[pkg]` qualifiers narrow *where* the
-/// member is visible; they never widen it, so both collapse onto the
-/// unqualified form for the purposes every consumer of this field has.
+/// Keep the coarse private/protected modifier here. An explicit lexical
+/// qualifier is recorded separately as a source declaration access boundary;
+/// selected access combines that region with this modifier.
 fn scala_declared_visibility(node: Node<'_>) -> DeclaredVisibility {
     match crate::scala::graph::syntax::scala_declaration_modifiers(node).0 {
         ScalaDeclarationVisibility::NonApi => DeclaredVisibility::Private,

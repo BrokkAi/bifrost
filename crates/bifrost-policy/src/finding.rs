@@ -4,6 +4,7 @@
 //! evaluator must combine a loaded policy, detailed analyzer evidence, and a
 //! budget before constructing these diagnostic/report values.
 
+use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonAncestryBasis;
 use std::fmt;
 use std::mem::size_of;
 
@@ -1651,6 +1652,20 @@ impl RetainedSize for PolicyDependencyMitigation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyQueryResultRef {
+    PythonHierarchyFact {
+        id: String,
+        root_id: String,
+        declaration_id: Option<String>,
+        owner_id: Option<String>,
+        target_id: Option<String>,
+        target_owner_id: Option<String>,
+        fact_kind: String,
+        outcome: String,
+        coverage: String,
+        reason: Option<String>,
+        location: PolicySourceLocation,
+        ancestry_basis: PythonAncestryBasis,
+    },
     DependencyEvidence {
         location: PolicySourceLocation,
         id: String,
@@ -1846,6 +1861,291 @@ impl PolicyExportLocalDefinition {
     }
 }
 
+// Both retained-size accounting and validation walk authored TypeRefs without
+// recursively serializing them or allocating a second JSON representation.
+fn python_ancestry_type_refs(
+    basis: &PythonAncestryBasis,
+) -> impl Iterator<Item = &brokk_bifrost_analysis::analyzer::semantic_model::TypeRef> {
+    use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+    let mut pending = basis
+        .claims
+        .iter()
+        .flat_map(|claim| &claim.declared_bases)
+        .collect::<Vec<_>>();
+    std::iter::from_fn(move || {
+        let reference = pending.pop()?;
+        match reference {
+            TypeRef::Unknown | TypeRef::TypeParameter { .. } => {}
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments)
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::Channel { element, .. }
+            | TypeRef::FixedArray { element, .. } => pending.push(element),
+            TypeRef::Map { key, value } => pending.extend([key.as_ref(), value.as_ref()]),
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref()),
+            TypeRef::Tuple { elements } => pending.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
+                pending.extend(result.as_deref());
+            }
+        }
+        Some(reference)
+    })
+}
+
+fn python_ancestry_retained_bytes(basis: &PythonAncestryBasis) -> usize {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{Parameter, TypeRef};
+    use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::{
+        PythonModeledClassIdentity, PythonRuntimeBaseClaim,
+    };
+    let mut bytes = basis
+        .claims
+        .capacity()
+        .saturating_mul(size_of::<PythonRuntimeBaseClaim>());
+    for claim in &basis.claims {
+        for identity in std::iter::once(&claim.declared_class)
+            .chain(claim.class.iter())
+            .chain(claim.bases.iter().flatten())
+        {
+            bytes = bytes
+                .saturating_add(identity.qualified_name.capacity())
+                .saturating_add(identity.symbol_id.capacity());
+        }
+        bytes = bytes
+            .saturating_add(
+                claim
+                    .bases
+                    .capacity()
+                    .saturating_mul(size_of::<Option<PythonModeledClassIdentity>>()),
+            )
+            .saturating_add(
+                claim
+                    .declared_bases
+                    .capacity()
+                    .saturating_mul(size_of::<TypeRef>()),
+            );
+        let p = &claim.provenance;
+        for text in [
+            &p.active_model_set_hash,
+            &p.pack_digest,
+            &p.pack_id,
+            &p.pack_version,
+            &p.producer,
+            &p.producer_version,
+            &p.record_id,
+            &p.activation.status,
+            &p.activation.reason,
+            &p.activation.source_kind,
+            &p.activation.source_id,
+        ] {
+            bytes = bytes.saturating_add(text.capacity());
+        }
+        bytes = bytes.saturating_add(p.rule_id.as_ref().map_or(0, String::capacity));
+        let evidence = &p.activation.matched_evidence;
+        bytes = bytes
+            .saturating_add(evidence.language.capacity())
+            .saturating_add(evidence.ecosystem.capacity());
+        for coordinate in [&evidence.package, &evidence.module, &evidence.toolchain]
+            .into_iter()
+            .flatten()
+        {
+            bytes = bytes
+                .saturating_add(coordinate.name.capacity())
+                .saturating_add(coordinate.version.as_ref().map_or(0, String::capacity));
+        }
+        for text in [
+            &evidence.target,
+            &evidence.configuration,
+            &evidence.artifact_sha256,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(text.capacity());
+        }
+    }
+    // Iterative traversal counts the actual retained capacities, including
+    // unsupported authored shapes retained by an incomplete provider answer.
+    for reference in python_ancestry_type_refs(basis) {
+        match reference {
+            TypeRef::Unknown => {}
+            TypeRef::Named {
+                name, arguments, ..
+            }
+            | TypeRef::Declared {
+                id: name,
+                arguments,
+                ..
+            } => {
+                bytes = bytes
+                    .saturating_add(name.capacity())
+                    .saturating_add(arguments.capacity().saturating_mul(size_of::<TypeRef>()));
+            }
+            TypeRef::TypeParameter { name } => bytes = bytes.saturating_add(name.capacity()),
+            TypeRef::Array { .. }
+            | TypeRef::ByRef { .. }
+            | TypeRef::Pointer { .. }
+            | TypeRef::Slice { .. }
+            | TypeRef::Channel { .. } => {
+                bytes = bytes.saturating_add(size_of::<TypeRef>());
+            }
+            TypeRef::FixedArray { length, .. } => {
+                bytes = bytes
+                    .saturating_add(size_of::<TypeRef>())
+                    .saturating_add(length.capacity());
+            }
+            TypeRef::Map { .. } => {
+                bytes = bytes.saturating_add(size_of::<TypeRef>().saturating_mul(2));
+            }
+            TypeRef::Wildcard { bound, .. } => {
+                if bound.is_some() {
+                    bytes = bytes.saturating_add(size_of::<TypeRef>());
+                }
+            }
+            TypeRef::Tuple { elements } => {
+                bytes =
+                    bytes.saturating_add(elements.capacity().saturating_mul(size_of::<TypeRef>()));
+            }
+            TypeRef::Function { parameters, result } => {
+                bytes = bytes
+                    .saturating_add(parameters.capacity().saturating_mul(size_of::<Parameter>()));
+                for parameter in parameters {
+                    bytes =
+                        bytes.saturating_add(parameter.name.as_ref().map_or(0, String::capacity));
+                }
+                if result.is_some() {
+                    bytes = bytes.saturating_add(size_of::<TypeRef>());
+                }
+            }
+        }
+    }
+    bytes
+}
+
+fn validate_python_ancestry_basis(basis: &PythonAncestryBasis) -> Result<(), ReportValueError> {
+    use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+    let required_text = |text: &str| {
+        if text.is_empty() {
+            return Err(ReportValueError::EmptyIdentifier);
+        }
+        // Semantic-model artifact text already excludes NUL; keep that
+        // identity boundary without imposing policy-ID spelling on model IDs.
+        if text.contains('\0') {
+            return Err(ReportValueError::InvalidIdentifier);
+        }
+        validate_report_prose(text)
+    };
+    let digest = |text: &str| {
+        required_text(text)?;
+        super::definition::parse_lower_sha256(text)
+            .map(|_| ())
+            .map_err(|_| ReportValueError::InvalidIdentifier)
+    };
+    if u64::try_from(python_ancestry_retained_bytes(basis)).unwrap_or(u64::MAX) > MAX_EVIDENCE_BYTES
+    {
+        return Err(ReportValueError::TooManyBytes {
+            field: "python_ancestry_basis",
+            max_bytes: MAX_EVIDENCE_BYTES,
+        });
+    }
+    for claim in &basis.claims {
+        if claim.declared_bases.len() != claim.bases.len() {
+            return Err(ReportValueError::InvalidIdentifier);
+        }
+        for identity in std::iter::once(&claim.declared_class)
+            .chain(claim.class.iter())
+            .chain(claim.bases.iter().flatten())
+        {
+            required_text(&identity.symbol_id)?;
+            required_text(&identity.qualified_name)?;
+        }
+        let provenance = &claim.provenance;
+        digest(&provenance.active_model_set_hash)?;
+        digest(&provenance.pack_digest)?;
+        for text in [
+            &provenance.pack_id,
+            &provenance.pack_version,
+            &provenance.producer,
+            &provenance.producer_version,
+            &provenance.record_id,
+            &provenance.activation.source_kind,
+            &provenance.activation.source_id,
+        ] {
+            required_text(text)?;
+        }
+        if let Some(rule_id) = &provenance.rule_id {
+            required_text(rule_id)?;
+        }
+        if provenance.activation.status != "active" {
+            return Err(ReportValueError::InvalidIdentifier);
+        }
+        validate_report_prose(&provenance.activation.reason)?;
+        let evidence = &provenance.activation.matched_evidence;
+        required_text(&evidence.language)?;
+        required_text(&evidence.ecosystem)?;
+        for coordinate in [&evidence.package, &evidence.module, &evidence.toolchain]
+            .into_iter()
+            .flatten()
+        {
+            required_text(&coordinate.name)?;
+            if let Some(version) = &coordinate.version {
+                required_text(version)?;
+            }
+            // Matched versions originate in the existing typed catalog
+            // coordinate. Reuse that field's parser without imposing a new
+            // spelling grammar on package/module names or producer versions.
+            let _checked = brokk_bifrost_analysis::analyzer::semantic_model::CatalogCoordinate {
+                name: coordinate.name.clone(),
+                version: coordinate
+                    .version
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| ReportValueError::InvalidIdentifier)?,
+            };
+        }
+        for text in [&evidence.target, &evidence.configuration]
+            .into_iter()
+            .flatten()
+        {
+            required_text(text)?;
+        }
+        if let Some(artifact) = &evidence.artifact_sha256 {
+            digest(artifact)?;
+        }
+        // Authored proof/completeness and ambiguity are evidence, not reasons
+        // to discard an otherwise well-formed active contributor.
+    }
+    for reference in python_ancestry_type_refs(basis) {
+        match reference {
+            TypeRef::Named { name, .. } | TypeRef::TypeParameter { name } => required_text(name)?,
+            TypeRef::Declared { id, .. } => required_text(id)?,
+            TypeRef::FixedArray { length, .. } => required_text(length)?,
+            TypeRef::Function { parameters, .. } => {
+                for parameter in parameters {
+                    if let Some(name) = &parameter.name {
+                        required_text(name)?;
+                    }
+                }
+            }
+            TypeRef::Unknown
+            | TypeRef::Array { .. }
+            | TypeRef::ByRef { .. }
+            | TypeRef::Pointer { .. }
+            | TypeRef::Slice { .. }
+            | TypeRef::Channel { .. }
+            | TypeRef::Map { .. }
+            | TypeRef::Wildcard { .. }
+            | TypeRef::Tuple { .. } => {}
+        }
+    }
+    Ok(())
+}
+
 impl PolicyQueryResultRef {
     pub fn file(path: WorkspaceRelativePath) -> Self {
         Self::File { path }
@@ -1858,7 +2158,9 @@ impl PolicyQueryResultRef {
             Self::GenerationSite { .. } => Some(MatchResultDomain::GenerationSite),
             Self::Export { .. } => Some(MatchResultDomain::Export),
             Self::CrossDomain { .. } => Some(MatchResultDomain::CrossDomain),
-            Self::StructuralMatch { .. } => Some(MatchResultDomain::StructuralMatch),
+            Self::StructuralMatch { .. } | Self::PythonHierarchyFact { .. } => {
+                Some(MatchResultDomain::StructuralMatch)
+            }
             Self::Binding { .. } => Some(MatchResultDomain::Binding),
             Self::LexicalScope { .. } => Some(MatchResultDomain::LexicalScope),
             Self::Occurrence { .. } => Some(MatchResultDomain::Occurrence),
@@ -1883,6 +2185,7 @@ impl PolicyQueryResultRef {
             | Self::Export { location, .. }
             | Self::CrossDomain { location, .. }
             | Self::StructuralMatch { location, .. }
+            | Self::PythonHierarchyFact { location, .. }
             | Self::Binding { location, .. }
             | Self::LexicalScope { location, .. }
             | Self::Occurrence { location, .. }
@@ -1996,6 +2299,39 @@ impl PolicyQueryResultRef {
                 if let Some(location) = configuration_location {
                     require_span_bearing(location)?;
                 }
+            }
+            Self::PythonHierarchyFact {
+                id,
+                root_id,
+                declaration_id,
+                owner_id,
+                target_id,
+                target_owner_id,
+                fact_kind,
+                outcome,
+                coverage,
+                reason,
+                location,
+                ancestry_basis,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_prose(id)?;
+                validate_report_prose(root_id)?;
+                for id in [declaration_id, owner_id, target_id, target_owner_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_report_prose(id)?;
+                }
+                validate_report_identifier(fact_kind)?;
+                validate_report_identifier(outcome)?;
+                if !matches!(coverage.as_str(), "complete" | "open") {
+                    return Err(ReportValueError::InvalidIdentifier);
+                }
+                if let Some(reason) = reason {
+                    validate_report_identifier(reason)?;
+                }
+                validate_python_ancestry_basis(ancestry_basis)?;
             }
             Self::StructuralMatch {
                 kind,
@@ -2237,6 +2573,34 @@ impl PolicyQueryResultRef {
                     tighten_string(identifier);
                 }
             }
+            Self::PythonHierarchyFact {
+                id,
+                root_id,
+                declaration_id,
+                owner_id,
+                target_id,
+                target_owner_id,
+                fact_kind,
+                outcome,
+                coverage,
+                reason,
+                ..
+            } => {
+                tighten_string(id);
+                tighten_string(root_id);
+                for id in [declaration_id, owner_id, target_id, target_owner_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    tighten_string(id);
+                }
+                tighten_string(fact_kind);
+                tighten_string(outcome);
+                tighten_string(coverage);
+                if let Some(reason) = reason {
+                    tighten_string(reason);
+                }
+            }
             Self::StructuralMatch { kind, .. } => tighten_string(kind),
             Self::Binding {
                 id, ast_id, name, ..
@@ -2436,6 +2800,32 @@ impl RetainedSize for PolicyQueryResultRef {
                 .saturating_add(retained_extra(configuration_id))
                 .saturating_add(retained_extra(configuration_location))
                 .saturating_add(retained_extra(dependency_mitigation)),
+            Self::PythonHierarchyFact {
+                id,
+                root_id,
+                declaration_id,
+                owner_id,
+                target_id,
+                target_owner_id,
+                fact_kind,
+                outcome,
+                coverage,
+                reason,
+                location,
+                ancestry_basis,
+            } => id
+                .capacity()
+                .saturating_add(root_id.capacity())
+                .saturating_add(retained_extra(declaration_id))
+                .saturating_add(retained_extra(owner_id))
+                .saturating_add(retained_extra(target_id))
+                .saturating_add(retained_extra(target_owner_id))
+                .saturating_add(fact_kind.capacity())
+                .saturating_add(outcome.capacity())
+                .saturating_add(coverage.capacity())
+                .saturating_add(retained_extra(reason))
+                .saturating_add(retained_extra(location))
+                .saturating_add(python_ancestry_retained_bytes(ancestry_basis)),
             Self::StructuralMatch {
                 kind,
                 location,

@@ -3262,6 +3262,7 @@ pub struct Parameter {
     #[serde(default)]
     pub variadic: bool,
     #[serde(default, skip_serializing_if = "ParameterPassingMode::is_default")]
+    #[schemars(extend("default" = "positional_or_named"))]
     pub passing_mode: ParameterPassingMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<ParameterRole>,
@@ -3342,6 +3343,7 @@ pub enum TypeRef {
         /// lvalue and rvalue references. Existing producers omit this field
         /// and therefore retain the historical lvalue-reference meaning.
         #[serde(default, skip_serializing_if = "TypeRefReferenceKind::is_lvalue")]
+        #[schemars(extend("default" = "lvalue"))]
         reference_kind: TypeRefReferenceKind,
     },
     Pointer {

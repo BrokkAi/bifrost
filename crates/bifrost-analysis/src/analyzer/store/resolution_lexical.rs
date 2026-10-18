@@ -61,7 +61,7 @@ use super::resolution_prepare::resolution_rows::{
     RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL, RESOLUTION_ROOT_TERMINAL_PATHS_SQL,
     RESOLUTION_SITES_BY_KEY_SQL, RootKeyBuilder, covers_candidate_endpoint,
     covers_candidate_inventory, decode_lookup_recipe, decode_path_row, decode_selected_endpoint,
-    parse_endpoint_cells, parse_path_body,
+    decode_stored_lookup_recipe, parse_endpoint_cells, parse_path_body,
 };
 use super::resolution_selection::{
     SelectedResolutionMountInventory, SelectedResolutionMountRecord, SelectedResolutionReadStamp,
@@ -2036,15 +2036,20 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             let mut stored: HashMap<SemanticId, ResolutionLookupSemanticRecipe> =
                 HashMap::default();
             while let Some(row) = rows.next()? {
-                let name = SemanticId::shared_name(shared_names.from_persisted(
-                    SharedNameId::interned(row.get::<_, i64>(0)?),
-                ));
+                let stored_id = SharedNameId::interned(row.get::<_, i64>(0)?);
+                let name = SemanticId::shared_name(shared_names.from_persisted(stored_id));
                 let Some(language) = row.get::<_, Option<i64>>(1)? else {
                     continue;
                 };
+                let digest = row.get::<_, [u8; 32]>(4)?;
+                self.selection.shared_name_table().remember_stored_identity(
+                    digest,
+                    stored_id,
+                    name.shared_name_id().expect("a persisted recipe has a shared name"),
+                );
                 stored.insert(
                     name,
-                    decode_lookup_recipe(language, row.get(2)?, &row.get::<_, String>(3)?),
+                    decode_stored_lookup_recipe(language, row.get(2)?, &row.get::<_, String>(3)?, digest),
                 );
             }
             let mut statement = conn.prepare_cached(r#"
@@ -5347,6 +5352,14 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         Ok(Some(evidence))
     }
 
+    fn semantic_language_of(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::Language>> {
+        SelectedResolutionLexicalSource::semantic_language_of(self, identity, cancellation)
+    }
+
     fn universe_entry(
         &self,
         reference: SemanticId,
@@ -5356,9 +5369,9 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         if !self.selection.has_universe_semantics() {
             return Ok(None);
         }
-        let Some(ordinal) = reference.ordinal() else {
+        if reference.ordinal().is_none() {
             return Ok(None);
-        };
+        }
         // The spelling read loads the reference's mount record, so the
         // language read below is a memo hit for a persisted mount.
         let mut spellings =
@@ -5366,32 +5379,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         let Some(spelling) = spellings.remove(&reference) else {
             return Ok(None);
         };
-        let language = if (ordinal as usize) < self.selection.persisted_mount_count() {
-            self.selected_mount(SelectedResolutionMountOrdinal::new(ordinal))?
-                .map(|mount| mount.semantic_language())
-        } else {
-            // A transient replacement mount has no persisted record.
-            let Some(label) = self.read_statement(cancellation, |conn| {
-                let label = conn
-                    .query_row(
-                        "SELECT semantic_language FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1",
-                        [ordinal],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?;
-                Ok(Some(label))
-            })?
-            else {
-                return Ok(None);
-            };
-            label
-                .map(|label| {
-                    crate::analyzer::Language::from_config_label(&label).ok_or_else(|| {
-                        StoreError::corrupt(format!("unknown selected language {label:?}"))
-                    })
-                })
-                .transpose()?
-        };
+        let language = self.semantic_language_of(reference, cancellation)?;
         Ok(language.and_then(|language| {
             crate::analyzer::resolution::universe_lookup(language, namespace, &spelling)
         }))
@@ -5413,6 +5401,15 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
     ) -> StoreResult<Option<[u8; 32]>> {
         self.authority
             .shared_name_digest_for_identity(identity, cancellation)
+    }
+
+    fn supports_direct_type_shapes(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(self.semantic_language_of(reference, cancellation)?
+            == Some(crate::analyzer::Language::Java))
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -9676,5 +9673,44 @@ mod stage_completion_cache_tests {
             serde_json::from_str::<serde_json::Value>(&complete).unwrap(),
             serde_json::json!([0, "[[1,null,0]]", 0, 1, [1]])
         );
+    }
+}
+
+impl SelectedResolutionLexicalSource<'_, '_> {
+    fn semantic_language_of(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::Language>> {
+        let Some(ordinal) = reference.ordinal() else {
+            return Ok(None);
+        };
+        let language = if (ordinal as usize) < self.selection.persisted_mount_count() {
+            self.selected_mount(SelectedResolutionMountOrdinal::new(ordinal))?
+                .map(|mount| mount.semantic_language())
+        } else {
+            // A transient replacement mount has no persisted record.
+            let Some(label) = self.read_statement(cancellation, |conn| {
+                let label = conn
+                    .query_row(
+                        "SELECT semantic_language FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1",
+                        [ordinal],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok(Some(label))
+            })?
+            else {
+                return Ok(None);
+            };
+            label
+                .map(|label| {
+                    crate::analyzer::Language::from_config_label(&label).ok_or_else(|| {
+                        StoreError::corrupt(format!("unknown selected language {label:?}"))
+                    })
+                })
+                .transpose()?
+        };
+        Ok(language)
     }
 }

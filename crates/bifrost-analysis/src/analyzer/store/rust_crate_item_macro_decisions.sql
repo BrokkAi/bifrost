@@ -1,5 +1,5 @@
--- Decide the item-position `macro_rules!` invocations this crate's member
--- files carry. A row records either a passthrough route or a proven route
+-- Decide the item-position `macro_rules!` and documented `cfg_if!`
+-- invocations this crate's member files carry. A row records either a passthrough route or a proven route
 -- absence; all other invocations remain open.
 --
 -- Decided item passthrough: the matcher proved every rule replays each of its
@@ -178,6 +178,21 @@ chosen AS (
          row_number() OVER (PARTITION BY blob_id, invocation_occurrence_id
                             ORDER BY distance, scope_start DESC, visible_after DESC) AS rank
   FROM visible
+), cfg_if AS (
+  -- The producer accepts this spelling only with the documented structural
+  -- arm grammar, reparses just the item interiors, and attaches ordered cfg
+  -- guards to their source properties. Selection remains crate-owned.
+  SELECT invocation.blob_id, invocation.invocation_occurrence_id,
+         'always' AS decoration_cfg, 0 AS no_route
+  FROM invocations AS invocation
+  CROSS JOIN source_rust_item_macro_expansions AS expansion
+    ON expansion.blob_id=invocation.blob_id
+   AND expansion.invocation_occurrence_id=invocation.invocation_occurrence_id
+  WHERE invocation.macro_name IN ('cfg_if', 'cfg_if::cfg_if')
+    AND expansion.expansion_kind=0
+    AND NOT EXISTS (SELECT 1 FROM chosen
+                    WHERE chosen.blob_id=invocation.blob_id
+                      AND chosen.invocation_occurrence_id=invocation.invocation_occurrence_id)
 ), no_route AS (
   -- A selected no-item arm has no native gap, which closes its module route
   -- even when another arm of the same macro is an item passthrough. Do not
@@ -237,5 +252,10 @@ chosen AS (
 SELECT blob_id, invocation_occurrence_id, decoration_cfg, 0 AS no_route FROM chosen
 WHERE rank=1 AND passthrough=1 AND decoration_cfg IS NOT NULL
 UNION ALL
+SELECT blob_id, invocation_occurrence_id, decoration_cfg, no_route FROM cfg_if
+UNION ALL
 SELECT blob_id, invocation_occurrence_id, decoration_cfg, no_route FROM no_route
+WHERE NOT EXISTS (SELECT 1 FROM cfg_if
+                  WHERE cfg_if.blob_id=no_route.blob_id
+                    AND cfg_if.invocation_occurrence_id=no_route.invocation_occurrence_id)
 ORDER BY blob_id, invocation_occurrence_id;

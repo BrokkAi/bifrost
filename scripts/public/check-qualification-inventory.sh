@@ -74,7 +74,7 @@ fi
 
 echo "  semantic-pack installer: $installer_name"
 echo "  semantic-pack installer checksum: verified"
-if [[ "$release_tag" == v0.13.0 ]]; then
+if [[ "$release_tag" == v0.13.0 || "$release_tag" == v0.13.1 ]]; then
   require_count 'core-policy-status.json' exactly 1
   node - "$bundle/core-policy-status.json" <<'JS'
 const assert = require('node:assert/strict');

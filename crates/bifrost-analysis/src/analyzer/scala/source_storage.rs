@@ -512,6 +512,21 @@ impl AnalyzerStore {
                 }
             );
 
+            let mut boundaries = HashMap::default();
+            read_rows!(
+                "SELECT declaration_id,boundary_kind,package_region,template_declaration_id FROM source_declaration_access_boundaries WHERE blob_id=?1 ORDER BY declaration_id",
+                row,
+                {
+                    use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+                    let declaration: u32 = row.get(0)?;
+                    let boundary = match row.get::<_, i64>(1)? {
+                        0 => DeclarationAccessBoundary::Package(row.get(2)?),
+                        1 => DeclarationAccessBoundary::Template(SourceDeclarationId::new(row.get(3)?)),
+                        kind => return Err(StoreError::new(format!("invalid access boundary kind {kind}"))),
+                    };
+                    assert!(boundaries.insert(declaration, boundary).is_none());
+                }
+            );
             let mut facts = ScalaSourceFacts::default();
             read_rows!(
                 "SELECT declaration_id,kind,visibility,callable_present,
@@ -694,6 +709,7 @@ impl AnalyzerStore {
                         declaration,
                         kind,
                         visibility,
+                        access_boundary: boundaries.remove(&declaration_key),
                         callable,
                         field_type_path,
                         type_alias_path,
@@ -715,6 +731,7 @@ impl AnalyzerStore {
                     });
                 }
             );
+            if !boundaries.is_empty() { return Err(StoreError::new(format!("orphan access boundaries: {boundaries:?}"))); }
             if !prefixes.is_empty()
                 || !scopes.is_empty()
                 || !declaration_paths.is_empty()

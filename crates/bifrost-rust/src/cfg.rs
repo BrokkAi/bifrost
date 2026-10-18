@@ -631,7 +631,6 @@ fn evaluate_with_assumptions(
         RustCfgCondition::Expression(instructions) => instructions.as_ref(),
     };
     let mut stack = Vec::new();
-    let mut unknown = false;
     for instruction in instructions {
         let value = match instruction {
             RustCfgInstruction::Atom(name) => atom(name),
@@ -647,6 +646,8 @@ fn evaluate_with_assumptions(
                 let values = stack.split_off(stack.len() - *count);
                 if values.contains(&Inactive) {
                     Inactive
+                } else if values.contains(&Unknown) {
+                    Unknown
                 } else {
                     Active
                 }
@@ -656,16 +657,17 @@ fn evaluate_with_assumptions(
                 let values = stack.split_off(stack.len() - *count);
                 if values.contains(&Active) {
                     Active
+                } else if values.contains(&Unknown) {
+                    Unknown
                 } else {
                     Inactive
                 }
             }
         };
-        unknown |= value == Unknown;
         stack.push(value);
     }
     assert_eq!(stack.len(), 1, "cfg expression has exactly one result");
-    if unknown { Unknown } else { stack[0] }
+    stack[0]
 }
 
 fn assumed_activation(assumption: Option<bool>) -> RustSelectedActivation {

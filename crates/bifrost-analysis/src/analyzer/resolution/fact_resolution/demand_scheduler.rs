@@ -2,7 +2,7 @@
 //!
 //! Discovery and materialization run only between evaluator polls. An exact
 //! endpoint becomes readable once, after all of its positioned prefix tasks
-//! finish. Cyclic selected-root dependencies still return no answer.
+//! finish. Cyclic selected-root dependencies remain incomplete.
 
 use super::completed_roots::RootMemoKey;
 use super::*;
@@ -12,6 +12,7 @@ pub(super) struct Resources<'resources, 'source> {
     pub(super) hierarchy: &'resources mut HierarchyOperationArena,
     pub(super) completed_roots: Option<(&'resources SelectedDemandState, u64, [u8; 32])>,
     pub(super) forward_candidate_artifacts: &'resources mut ForwardCandidateArtifactCache,
+    pub(super) candidate_paths: &'resources mut CandidatePathStore,
 }
 
 impl Resources<'_, '_> {
@@ -76,6 +77,7 @@ impl<'source> MemberSelectionFrame<'source> {
             operation.session,
             operation.hierarchy,
             operation.forward_candidate_artifacts,
+            operation.candidate_paths,
             request.reference,
         );
         let namespace = if request.namespace == ResolutionNamespace::Callable
@@ -134,6 +136,7 @@ impl<'source> MemberSelectionFrame<'source> {
             operation.session,
             operation.hierarchy,
             operation.forward_candidate_artifacts,
+            operation.candidate_paths,
             state.root,
         );
         evaluation.replace_with_checkpoint_state(state);
@@ -226,7 +229,8 @@ impl<'source> MemberSelectionFrame<'source> {
             .take()
             .expect("member phase is between polls");
         let mut evaluation =
-            FactEvaluation::new(operation.session, operation.hierarchy, state.root);
+            FactEvaluation::new(operation.session, operation.hierarchy, state.root)
+                .with_candidate_paths(operation.candidate_paths);
         evaluation.replace_with_checkpoint_state(state);
         if let Some(active) = self.active.take()
             && let Some(inherited) = active.inherited
@@ -478,28 +482,28 @@ pub(crate) enum Unsupported {
     /// discovery returned, every runnable task drained, and the roots below
     /// still wait on relations that wait on them.
     ///
-    /// No root answer and no relation is published. `completion` names each
-    /// unanswered root with `CyclicPrefixDependency` so a caller can return an
-    /// honest incomplete answer for exactly those sites instead of an
-    /// anonymous unsupported outcome.
+    /// No cyclic relation is published. `completion` names unanswered roots
+    /// with `CyclicPrefixDependency`; `root_answers` retains independent results
+    /// and per-root incomplete evidence for production consumers.
     CyclicPrefixDependency {
         pending_roots: Vec<SemanticId>,
         pending_endpoints: Vec<EndpointSignature>,
         completion: ResolutionCompletion,
+        root_answers: Vec<FactResolutionAnswer>,
     },
 }
 
 pub(crate) enum Outcome {
     Ready(FactResolutionAnswer),
     Cancelled(ResolutionCompletion),
-    /// No root answer or relation is published for this demand. Completion
-    /// retains discovery-returned coverage and already retained operation
-    /// evidence, not a fabricated completion of the unfinished task frames.
+    /// No unavailable relation is published. Completion retains the scheduler's
+    /// diagnostic evidence; `root_answers` retains the input's own evidence.
     Unavailable {
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
         completion: ResolutionCompletion,
         root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
+        root_answers: Vec<FactResolutionAnswer>,
     },
     Unsupported(Unsupported),
 }
@@ -515,9 +519,9 @@ pub(crate) struct RootResolution {
 
 /// The batch counterpart of [`Outcome`].
 ///
-/// Only `Ready` is per root. A stop, an unplaceable endpoint and a prefix cycle
-/// end the whole scheduler, exactly as they end a single-root one, and no
-/// prefix of a batch is a valid broad answer.
+/// Cancellation stops the whole operation. Unavailable endpoints and cycles
+/// retain one answer per input after all independent work has finished; the raw
+/// failure variant also keeps the scheduler's diagnostic evidence.
 pub(crate) enum BatchOutcome {
     /// One resolution per input root, in input order.
     Ready(Vec<RootResolution>),
@@ -527,6 +531,7 @@ pub(crate) enum BatchOutcome {
         reason: RootUnavailableReason,
         completion: ResolutionCompletion,
         root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
+        root_answers: Vec<FactResolutionAnswer>,
     },
     Unsupported(Unsupported),
 }
@@ -585,15 +590,14 @@ struct Relation<'source> {
     waits_on: Vec<usize>,
     /// Other member phases waiting for this relation to close.
     relation_waiters: Vec<usize>,
+    // Unplaceable endpoints stay in the wait graph, without becoming readable.
+    // Their dependents stop, while unrelated tasks continue in this batch.
+    unavailable: Option<(RootUnavailableReason, ResolutionCompletion)>,
 }
 
 enum RelationAdmission {
     Ready(usize),
     Cancelled,
-    Unavailable {
-        endpoint: EndpointSignature,
-        reason: RootUnavailableReason,
-    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -629,11 +633,11 @@ impl<'a> Scheduler<'a> {
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
         root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
-    ) -> BatchOutcome {
+    ) -> SchedulerOutcome<'a> {
         let cancellation = operation.session.cancellation;
         for task in &self.tasks {
             if !operation.session.charge_scope_steps(1) {
-                return self.cancelled(operation);
+                return SchedulerOutcome::Terminal(self.cancelled(operation));
             }
             let Some(frame) = &task.frame else {
                 // Completed answers are already in the scheduler ledger.
@@ -652,11 +656,11 @@ impl<'a> Scheduler<'a> {
                     .cancellation_reasons
                     .include_retained_evidence(&mut self.evidence, cancellation, &mut self.work);
                 if cycle.origin.evaluation.cancellation_observed {
-                    return self.cancelled(operation);
+                    return SchedulerOutcome::Terminal(self.cancelled(operation));
                 }
             }
             if state.cancellation_observed {
-                return self.cancelled(operation);
+                return SchedulerOutcome::Terminal(self.cancelled(operation));
             }
         }
         for relation in &self.relations {
@@ -680,7 +684,7 @@ impl<'a> Scheduler<'a> {
             || operation.session.resolution_stopped()
             || self.evidence.cancellation_observed()
         {
-            return self.cancelled(operation);
+            return SchedulerOutcome::Terminal(self.cancelled(operation));
         }
         // Do not finalize live batches or cancel frames merely to manufacture
         // a terminal union. Their not-yet-ledgered operands stay unfinished.
@@ -691,13 +695,159 @@ impl<'a> Scheduler<'a> {
         if cancelled || cancellation.is_cancelled() || operation.session.resolution_stopped() {
             self.evidence
                 .include(&completion, cancellation, &mut self.work);
-            return self.cancelled(operation);
+            return SchedulerOutcome::Terminal(self.cancelled(operation));
         }
-        BatchOutcome::Unavailable {
+        let outcome = BatchOutcome::Unavailable {
             endpoint,
             reason,
             completion,
             root_seed_completions,
+            root_answers: Vec::new(),
+        };
+        SchedulerOutcome::Incomplete(Box::new(self), outcome)
+    }
+
+    /// Finalize only input roots left blocked after all runnable work drained.
+    /// Walk each task's recorded waits, so a failed endpoint contributes evidence
+    /// only to its dependency component. This state lives for this batch only.
+    fn finish_incomplete_roots(
+        &mut self,
+        operation: &mut Resources<'_, 'a>,
+        root_task_count: usize,
+    ) {
+        self.retain_completed_roots(operation);
+        let completions = self.tasks[..root_task_count]
+            .iter()
+            .enumerate()
+            .map(|(id, task)| {
+                if task.answer.is_some() {
+                    return None;
+                }
+                let mut stack = vec![Runnable::Task(id)];
+                let mut seen = HashSet::default();
+                let mut reasons = ResolutionCompletion::Complete;
+                let mut pending = Vec::new();
+                let mut unavailable = false;
+                while let Some(node) = stack.pop() {
+                    if !seen.insert(node) {
+                        continue;
+                    }
+                    match node {
+                        Runnable::Task(id) => {
+                            let task = &self.tasks[id];
+                            if task.answer.is_some() {
+                                continue;
+                            }
+                            pending.push(task.root);
+                            stack.extend(task.waits_on.iter().copied().map(Runnable::Relation));
+                            stack.extend(task.hierarchy_waits.iter().copied().map(Runnable::Task));
+                            if let Some(reference) = task.claim_wait {
+                                let claim = self
+                                    .claims
+                                    .get(&reference)
+                                    .expect("a blocked claim retains its owner");
+                                stack.push(Runnable::Task(claim.owner));
+                            }
+                        }
+                        Runnable::Relation(id) => {
+                            let relation = &self.relations[id];
+                            if relation.closed {
+                                continue;
+                            }
+                            if let Some(frame) = &relation.member_selection {
+                                reasons = reasons.combine(&frame.completion);
+                                pending.push(
+                                    frame
+                                        .evaluation
+                                        .as_ref()
+                                        .expect("member phase is between polls")
+                                        .root,
+                                );
+                            }
+                            if let Some((_, completion)) = &relation.unavailable {
+                                unavailable = true;
+                                reasons = reasons.combine(completion);
+                            }
+                            stack.extend(relation.dependencies.iter().copied().map(Runnable::Task));
+                            stack.extend(relation.waits_on.iter().copied().map(Runnable::Relation));
+                        }
+                    }
+                }
+                Some(if unavailable {
+                    let seed_completion = task
+                        .frame
+                        .as_ref()
+                        .and_then(|frame| frame.evaluation.as_ref())
+                        .and_then(|state| state.root_seed.as_ref())
+                        .map_or(ResolutionCompletion::Complete, |seed| {
+                            seed.completion().clone()
+                        });
+                    unavailable_reference_completion(
+                        &reasons,
+                        task.root,
+                        &[(task.root, seed_completion)],
+                    )
+                } else {
+                    reasons.combine(&ResolutionCompletion::incomplete(
+                        pending
+                            .into_iter()
+                            .map(ResolutionIncompleteReason::CyclicPrefixDependency),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (task, completion) in self.tasks[..root_task_count].iter_mut().zip(completions) {
+            let Some(completion) = completion else {
+                continue;
+            };
+            let state = task
+                .frame
+                .as_ref()
+                .expect("a blocked task retains its frame")
+                .evaluation
+                .as_ref()
+                .expect("task is between polls");
+            let metadata = state.root_site_metadata.or_else(|| {
+                state
+                    .root_seed
+                    .as_ref()
+                    .and_then(ReferenceSeed::site_metadata)
+            });
+            let completion = state.root_seed.as_ref().map_or(completion.clone(), |seed| {
+                completion.combine(seed.completion())
+            });
+            let mut answer = incomplete_fact_resolution_answer(
+                metadata,
+                completion,
+                operation.session.cancellation,
+            );
+            if let Some(binding) = state.lexical_answers.get(&task.root) {
+                answer.binding = ResolutionAnswer::new(
+                    binding.targets().to_vec(),
+                    binding.witnesses().to_vec(),
+                    binding.completion().combine(answer.binding.completion()),
+                );
+                answer.completion = answer.completion.combine(binding.completion());
+                if metadata.is_some_and(FactReferenceSiteMetadata::is_callable_reference) {
+                    // Lexical targets are retained evidence, but the blocked
+                    // evaluation has not certified target-local receiver
+                    // admission. Keep those channels explicitly unresolved.
+                    answer.callable_receiver_dispositions = binding
+                        .targets()
+                        .iter()
+                        .map(|&target| {
+                            FactCallableReceiverTargetDisposition::new(
+                                target,
+                                FactCallableReceiverDisposition::unresolved(
+                                    FactReferenceReceiverGap::UnresolvedReceiver,
+                                ),
+                            )
+                        })
+                        .collect();
+                }
+            }
+            task.answer = Some(answer);
+            task.frame = None;
         }
     }
 
@@ -725,6 +875,7 @@ impl<'a> Scheduler<'a> {
             operation.session,
             operation.hierarchy,
             operation.forward_candidate_artifacts,
+            operation.candidate_paths,
             root,
         );
         if let Some(seed) = seed {
@@ -775,11 +926,13 @@ impl<'a> Scheduler<'a> {
             return RelationAdmission::Cancelled;
         }
         let initial_completion = completion.clone();
+        let mut unavailable = None;
         let (prefixes, closed) = match discovery {
             RootDiscovery::AlreadyReady { .. } => (Vec::new(), true),
             RootDiscovery::Ready(plan) => (plan.prefixes, false),
-            RootDiscovery::Unavailable { reason, .. } => {
-                return RelationAdmission::Unavailable { endpoint, reason };
+            RootDiscovery::Unavailable { reason, completion } => {
+                unavailable = Some((reason, completion));
+                (Vec::new(), false)
             }
             RootDiscovery::Cancelled(_) => return RelationAdmission::Cancelled,
         };
@@ -817,8 +970,9 @@ impl<'a> Scheduler<'a> {
             completion: closed.then_some(initial_completion),
             waits_on: Vec::new(),
             relation_waiters: Vec::new(),
+            unavailable,
         });
-        if !closed && pending == 0 {
+        if !closed && pending == 0 && self.relations[id].unavailable.is_none() {
             self.runnable.push_back(Runnable::Relation(id));
         }
         RelationAdmission::Ready(id)
@@ -886,7 +1040,11 @@ impl<'a> Scheduler<'a> {
     fn cancelled(mut self, operation: &mut Resources<'_, 'a>) -> BatchOutcome {
         for task in &mut self.tasks {
             let answer = match task.frame.take() {
-                Some(mut frame) => frame.cancel(operation.session, operation.hierarchy),
+                Some(mut frame) => frame.cancel(
+                    operation.session,
+                    operation.hierarchy,
+                    operation.candidate_paths,
+                ),
                 None => task
                     .answer
                     .take()
@@ -974,11 +1132,13 @@ pub(super) fn resolve_with_metrics<'a>(
                 reason,
                 completion,
                 root_seed_completions,
+                root_answers,
             } => Outcome::Unavailable {
                 endpoint,
                 reason,
                 completion,
                 root_seed_completions,
+                root_answers,
             },
             BatchOutcome::Unsupported(unsupported) => Outcome::Unsupported(unsupported),
         },
@@ -1107,6 +1267,33 @@ fn resolve_admitted_batch<'a>(
                 metrics,
             )))
         }
+        SchedulerOutcome::Incomplete(mut scheduler, mut outcome) => {
+            scheduler.finish_incomplete_roots(operation, root_task_count);
+            if operation.session.cancellation.is_cancelled()
+                || operation.session.resolution_stopped()
+            {
+                return Ok(scheduler.cancelled(operation));
+            }
+            // Incomplete roots are request-local; only independently completed
+            // roots were eligible for memo retention before finalization.
+            let answers = scheduler
+                .take_root_resolutions(&root_tasks, root_task_count, metrics)
+                .into_iter()
+                .map(|resolution| {
+                    metrics.accumulate(resolution.metrics);
+                    resolution.answer
+                })
+                .collect();
+            match &mut outcome {
+                BatchOutcome::Unavailable { root_answers, .. }
+                | BatchOutcome::Unsupported(Unsupported::CyclicPrefixDependency {
+                    root_answers,
+                    ..
+                }) => *root_answers = answers,
+                _ => unreachable!("an incomplete scheduler retains its failure"),
+            }
+            Ok(outcome)
+        }
         SchedulerOutcome::Terminal(outcome) => Ok(outcome),
     }
 }
@@ -1114,6 +1301,7 @@ fn resolve_admitted_batch<'a>(
 enum SchedulerOutcome<'source> {
     Ready(Box<Scheduler<'source>>),
     Terminal(BatchOutcome),
+    Incomplete(Box<Scheduler<'source>>, BatchOutcome),
 }
 
 /// Drive reference tasks and relation member selection in one dependency graph.
@@ -1155,22 +1343,26 @@ fn drive_scheduler<'source>(
                 RoundOutcome::Cancelled => {
                     return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
                 }
-                RoundOutcome::Unavailable { endpoint, reason } => {
-                    return Ok(SchedulerOutcome::Terminal(scheduler.unavailable(
-                        operation,
-                        endpoint,
-                        reason,
-                        root_seed_completions,
-                    )));
-                }
             }
         }
         let Some(runnable) = scheduler.runnable.pop_front() else {
+            if let Some((endpoint, reason)) = scheduler.relations.iter().find_map(|relation| {
+                relation
+                    .unavailable
+                    .as_ref()
+                    .map(|(reason, _)| (relation.endpoint.clone(), *reason))
+            }) {
+                return Ok(scheduler.unavailable(
+                    operation,
+                    endpoint,
+                    reason,
+                    root_seed_completions,
+                ));
+            }
             // Every discover call has returned and every runnable task has
-            // drained. The remaining finite dependency graph is cyclic. No
-            // root answer and no relation is published; the outcome names the
-            // roots the cycle left unanswered so the caller can report exactly
-            // those sites as incomplete.
+            // drained. The remaining finite dependency graph is cyclic. Keep
+            // independently completed answers and name the blocked roots.
+            // No cyclic relation is published.
             let mut pending_roots = scheduler
                 .tasks
                 .iter()
@@ -1207,18 +1399,18 @@ fn drive_scheduler<'source>(
                     completion = completion.combine(&frame.completion);
                 }
             }
-            return Ok(SchedulerOutcome::Terminal(BatchOutcome::Unsupported(
-                Unsupported::CyclicPrefixDependency {
-                    pending_roots,
-                    pending_endpoints: scheduler
-                        .relations
-                        .iter()
-                        .filter(|relation| !relation.closed)
-                        .map(|relation| relation.endpoint.clone())
-                        .collect(),
-                    completion,
-                },
-            )));
+            let outcome = BatchOutcome::Unsupported(Unsupported::CyclicPrefixDependency {
+                pending_roots,
+                pending_endpoints: scheduler
+                    .relations
+                    .iter()
+                    .filter(|relation| !relation.closed)
+                    .map(|relation| relation.endpoint.clone())
+                    .collect(),
+                completion,
+                root_answers: Vec::new(),
+            });
+            return Ok(SchedulerOutcome::Incomplete(Box::new(scheduler), outcome));
         };
         if !operation.session.charge_scope_steps(1) {
             return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
@@ -1335,29 +1527,20 @@ fn drive_scheduler<'source>(
                         if !operation.session.charge_scope_steps(1) {
                             return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
                         }
-                        let dependency = if let Some(&dependency) =
-                            scheduler.relation_ids.get(&endpoint)
-                        {
-                            dependency
-                        } else {
-                            let discovery = provider.discover(&endpoint)?;
-                            match scheduler.install_relation(operation, endpoint, discovery) {
-                                RelationAdmission::Ready(id) => id,
-                                RelationAdmission::Cancelled => {
-                                    return Ok(SchedulerOutcome::Terminal(
-                                        scheduler.cancelled(operation),
-                                    ));
+                        let dependency =
+                            if let Some(&dependency) = scheduler.relation_ids.get(&endpoint) {
+                                dependency
+                            } else {
+                                let discovery = provider.discover(&endpoint)?;
+                                match scheduler.install_relation(operation, endpoint, discovery) {
+                                    RelationAdmission::Ready(id) => id,
+                                    RelationAdmission::Cancelled => {
+                                        return Ok(SchedulerOutcome::Terminal(
+                                            scheduler.cancelled(operation),
+                                        ));
+                                    }
                                 }
-                                RelationAdmission::Unavailable { endpoint, reason } => {
-                                    return Ok(SchedulerOutcome::Terminal(scheduler.unavailable(
-                                        operation,
-                                        endpoint,
-                                        reason,
-                                        root_seed_completions,
-                                    )));
-                                }
-                            }
-                        };
+                            };
                         if !scheduler.relations[dependency].closed && seen.insert(dependency) {
                             scheduler.relations[dependency].relation_waiters.push(id);
                             scheduler.relations[id].waits_on.push(dependency);
@@ -1452,11 +1635,6 @@ enum RoundOutcome {
     Ready,
     /// The scheduler must drain its retained evidence and stop.
     Cancelled,
-    /// Discovery cannot place this endpoint under the fixed selection.
-    Unavailable {
-        endpoint: EndpointSignature,
-        reason: RootUnavailableReason,
-    },
 }
 
 /// Poll every task of one round, in the FIFO order it was drained in.
@@ -1530,6 +1708,7 @@ fn poll_round<'a>(
                     operation.session,
                     operation.hierarchy,
                     operation.forward_candidate_artifacts,
+                    operation.candidate_paths,
                     &mut |requests| {
                         Ok(
                             if requests.iter().all(|request| {
@@ -1744,9 +1923,6 @@ fn poll_round<'a>(
                             match scheduler.install_relation(operation, endpoint, discovery) {
                                 RelationAdmission::Ready(id) => id,
                                 RelationAdmission::Cancelled => return Ok(RoundOutcome::Cancelled),
-                                RelationAdmission::Unavailable { endpoint, reason } => {
-                                    return Ok(RoundOutcome::Unavailable { endpoint, reason });
-                                }
                             }
                         };
                     if !scheduler.relations[relation_id].closed && waiting.insert(relation_id) {
@@ -1808,9 +1984,6 @@ fn poll_round<'a>(
                 match scheduler.install_relation(operation, endpoint, discovery) {
                     RelationAdmission::Ready(id) => id,
                     RelationAdmission::Cancelled => return Ok(RoundOutcome::Cancelled),
-                    RelationAdmission::Unavailable { endpoint, reason } => {
-                        return Ok(RoundOutcome::Unavailable { endpoint, reason });
-                    }
                 }
             };
             if !scheduler.relations[relation_id].closed && waiting.insert(relation_id) {
@@ -2003,7 +2176,7 @@ fn merge_round_reads<'a>(
             continue;
         };
         frame.round_endpoint_classifications(operation.forward_candidate_artifacts, &mut nodes);
-        frame.round_candidate_hydrations(operation.forward_candidate_artifacts, &mut hydrations);
+        frame.round_candidate_hydrations(operation.candidate_paths, &mut hydrations);
         // Building the page is the work this frame's own poll does, and the
         // page its poll then reads is this one.
         let page = frame.round_request_page(cancellation);
@@ -2043,7 +2216,7 @@ fn merge_round_reads<'a>(
     )?;
     prefetch_candidate_hydrations(
         operation.session.lexical_source,
-        operation.forward_candidate_artifacts,
+        operation.candidate_paths,
         &hydrations,
         cancellation,
         work,
@@ -2201,7 +2374,6 @@ fn prepare_selected_member_relation(
             };
             return Ok(EndpointPreparation::Incomplete(completion));
         }
-        RelationAdmission::Unavailable { .. } => unreachable!("a discovered selection is ready"),
     };
     // These are immutable, terminal evaluations from this same Resources. The
     // newly admitted frame has not performed reads and is replaced by its answer.
@@ -2234,7 +2406,7 @@ fn prepare_selected_member_relation(
                     .expect("closed relation retains its completion"),
             ))
         }
-        SchedulerOutcome::Terminal(outcome) => {
+        SchedulerOutcome::Terminal(outcome) | SchedulerOutcome::Incomplete(_, outcome) => {
             let completion = match outcome {
                 BatchOutcome::Cancelled(completion)
                 | BatchOutcome::Unavailable { completion, .. }

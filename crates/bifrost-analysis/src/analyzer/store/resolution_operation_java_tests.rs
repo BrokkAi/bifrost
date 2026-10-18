@@ -611,6 +611,54 @@ fn selected_jvm_file_context_reuses_derivation_only_within_one_operation() {
             .ordinal()
     };
     let check_import_facts = |operation: &SelectedResolutionOperation<'_, '_>| {
+        let blob = operation
+            .ready
+            .inventory
+            .mount_record_by_ordinal(source_mount(operation))
+            .unwrap()
+            .blob_id();
+        let alias_before = derivations(operation, "derive_alias_rows");
+        for _ in 0..2 {
+            assert!(
+                operation
+                    .jvm_alias_rows(blob, "absentAlias", &cancellation)
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            derivations(operation, "derive_alias_rows"),
+            alias_before + 1
+        );
+        assert!(
+            operation
+                .jvm_alias_rows(blob, "differentAlias", &cancellation)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            derivations(operation, "derive_alias_rows"),
+            alias_before + 2
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            operation
+                .jvm_alias_rows(blob, "absentAlias", &cancelled)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            derivations(operation, "derive_alias_rows"),
+            alias_before + 2
+        );
+        let first =
+            operation.jvm_generated_lookup(Language::Java, ResolutionNamespace::Type, "Use");
+        let second =
+            operation.jvm_generated_lookup(Language::Java, ResolutionNamespace::Type, "Use");
+        assert!(Arc::ptr_eq(&first, &second));
         let statement = super::super::jvm_context::JVM_IMPORT_TARGET_MOUNTS;
         for _ in 0..2 {
             let _rows = operation.jvm_import_targets(statement, "dep").unwrap();

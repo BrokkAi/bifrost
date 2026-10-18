@@ -1,5 +1,4 @@
 use crate::scala::supertypes::scala_type_lookup_segments;
-use crate::scala::wildcard_imports::scala_package_prefixes_at;
 use brokk_bifrost_core::analyzer::CodeUnit;
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::ProjectFile;
@@ -415,6 +414,31 @@ fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     ))
 }
 
+/// A direct access modifier on a class belongs to its primary constructor.
+pub(crate) fn scala_primary_constructor_modifier(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "access_modifier")
+}
+
+pub(crate) fn scala_access_qualifier(node: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "access_qualifier" {
+            return node.named_child(0);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor).filter(|child| {
+            matches!(
+                child.kind(),
+                "modifiers" | "access_modifier" | "access_qualifier"
+            ) && !(matches!(node.kind(), "class_definition" | "full_enum_case")
+                && child.kind() == "access_modifier")
+        }));
+    }
+    None
+}
+
 pub(crate) fn scala_declaration_modifiers(
     node: Node<'_>,
 ) -> (ScalaDeclarationVisibility, bool, bool, bool) {
@@ -427,6 +451,8 @@ pub(crate) fn scala_declaration_modifiers(
         let mut cursor = current.walk();
         for child in current.children(&mut cursor) {
             match child.kind() {
+                "access_modifier"
+                    if matches!(current.kind(), "class_definition" | "full_enum_case") => {}
                 "modifiers" | "access_modifier" => modifiers.push(child),
                 "private" => visibility = ScalaDeclarationVisibility::NonApi,
                 "protected" if visibility != ScalaDeclarationVisibility::NonApi => {
@@ -462,6 +488,7 @@ pub(crate) fn scala_declaration_source_fact(
         declaration,
         kind,
         visibility,
+        access_boundary: None,
         is_explicitly_abstract,
         is_sealed,
         is_final,
@@ -1245,6 +1272,7 @@ pub struct ScalaPackageContextIndex {
 struct ScalaPackageContextSegment {
     start_byte: usize,
     prefixes: Vec<String>,
+    package_segments: Vec<String>,
 }
 
 impl ScalaPackageContextIndex {
@@ -1271,24 +1299,36 @@ impl ScalaPackageContextIndex {
 
         let mut segments = Vec::<ScalaPackageContextSegment>::new();
         for start_byte in boundaries {
-            let prefixes = scala_package_prefixes_at(root, source, start_byte);
+            let (prefixes, package_segments) =
+                crate::scala::wildcard_imports::scala_package_context_at(root, source, start_byte);
             if let Some(last) = segments.last()
                 && last.prefixes == prefixes
+                && last.package_segments == package_segments
             {
                 continue;
             }
             segments.push(ScalaPackageContextSegment {
                 start_byte,
                 prefixes,
+                package_segments,
             });
         }
         if segments.is_empty() {
             segments.push(ScalaPackageContextSegment {
                 start_byte: 0,
                 prefixes: Vec::new(),
+                package_segments: Vec::new(),
             });
         }
         Self { segments }
+    }
+
+    pub(crate) fn package_segments_at(&self, byte: usize) -> &[String] {
+        let index = self
+            .segments
+            .partition_point(|segment| segment.start_byte <= byte)
+            .saturating_sub(1);
+        &self.segments[index].package_segments
     }
 
     pub fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[String] {

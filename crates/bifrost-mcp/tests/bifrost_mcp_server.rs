@@ -4219,6 +4219,7 @@ fn hold_analyzer_cache_build_lock(root: &std::path::Path) -> (fs::File, std::pat
 /// share the server so the corpus is indexed once.
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
+#[hardwon("#4627: fresh Python functions rescanned all earlier declaration metadata")]
 fn output_schema_describes_search_symbols_hits_bounds_and_overload() {
     let generated_declarations: String = (0..10_000)
         .map(|index| format!("def widget{index}(): pass\n"))

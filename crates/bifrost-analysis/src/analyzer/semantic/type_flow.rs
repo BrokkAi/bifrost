@@ -22,7 +22,7 @@ use brokk_bifrost_core::analyzer::prepared_syntax::{
 use crate::analyzer::languages::language_support;
 use crate::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelMemberTargetDisposition, SemanticModelOverlay,
-    SemanticModelProvenance, SemanticModelSymbolKind,
+    SemanticModelProvenance, SemanticModelSymbol, SemanticModelSymbolKind,
 };
 use crate::analyzer::usages::get_type::TypeLookupType;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer};
@@ -97,13 +97,21 @@ pub enum ClassIdentity {
         qualified_name: Box<str>,
         symbol_id: Box<str>,
     },
+    /// A class the language itself supplies for every program, such as
+    /// Python's implicit `builtins.object` root. It has no workspace
+    /// declaration and no semantic-model symbol ID.
+    Intrinsic {
+        qualified_name: Box<str>,
+    },
 }
 
 impl ClassIdentity {
     pub fn qualified_name(&self) -> &str {
         match self {
             Self::Workspace(unit) => unit.fq_name_str(),
-            Self::External { qualified_name, .. } => qualified_name,
+            Self::External { qualified_name, .. } | Self::Intrinsic { qualified_name } => {
+                qualified_name
+            }
         }
     }
 }
@@ -344,72 +352,108 @@ pub(crate) fn external_class_identity(
     semantic_model_id: Option<&str>,
     cache: &mut ExternalClassCache,
 ) -> Option<ClassIdentity> {
+    external_class_identity_with_visits(
+        overlay,
+        language,
+        qualified_name,
+        semantic_model_id,
+        cache,
+        &mut || Ok::<_, std::convert::Infallible>(()),
+    )
+    .unwrap_or_else(|never| match never {})
+}
+
+/// The same canonical selection with streaming candidates and caller-owned
+/// accounting. A failed visit never inserts a partial result into the cache.
+pub(crate) fn external_class_identity_with_visits<'a, E>(
+    overlay: Option<&'a SemanticModelOverlay>,
+    language: Language,
+    qualified_name: &str,
+    semantic_model_id: Option<&str>,
+    cache: &mut ExternalClassCache,
+    visit: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Option<ClassIdentity>, E> {
+    visit()?;
     let key = (
         language,
         qualified_name.into(),
         semantic_model_id.map(Box::from),
     );
     if let Some(cached) = cache.get(&key) {
-        return cached.clone();
+        return Ok(cached.clone());
     }
-    let resolved = overlay.and_then(|overlay| {
-        let mut records = match semantic_model_id {
-            Some(id) => overlay.symbols_with_id(id).records,
-            None => overlay.symbols_named(qualified_name).records,
-        }
-        .into_iter()
-        .filter(|symbol| {
+    let resolved = (|| -> Result<Option<ClassIdentity>, E> {
+        let Some(overlay) = overlay else {
+            return Ok(None);
+        };
+        let eligible = |symbol: &SemanticModelSymbol| {
             symbol.language == language.config_label()
                 && symbol.owner_id.is_none()
                 && symbol.kind == SemanticModelSymbolKind::Class
                 && !symbol.provenance.ambiguous
-        })
-        .collect::<Vec<_>>();
-        if semantic_model_id.is_none() {
-            let exact = records
-                .iter()
-                .copied()
-                .filter(|symbol| symbol.qualified_name == qualified_name)
-                .collect::<Vec<_>>();
-            if !exact.is_empty() {
-                records = exact;
+        };
+        let mut fallback = None;
+        let mut conflicting_names = false;
+        let mut exact = false;
+        // Both branches feed the same selection, without allocating a match
+        // vector before the caller has charged the candidates.
+        let mut candidate = |symbol: &'a SemanticModelSymbol| -> Result<(), E> {
+            visit()?;
+            if eligible(symbol) {
+                if symbol.qualified_name == qualified_name {
+                    exact = true;
+                }
+                if fallback.is_some_and(|name| name != symbol.qualified_name) {
+                    conflicting_names = true;
+                }
+                fallback = Some(symbol.qualified_name.as_str());
+            }
+            Ok(())
+        };
+        match semantic_model_id {
+            Some(id) => {
+                for symbol in overlay.symbol_candidates_with_id(id) {
+                    candidate(symbol)?;
+                }
+            }
+            None => {
+                for symbol in overlay.symbol_candidates_named(qualified_name) {
+                    candidate(symbol)?;
+                }
             }
         }
-        let names = records
-            .iter()
-            .map(|symbol| symbol.qualified_name.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        if names.len() != 1 {
-            return None;
+        let group_name = if semantic_model_id.is_none() && exact {
+            qualified_name
+        } else if conflicting_names {
+            return Ok(None);
+        } else if let Some(name) = fallback {
+            name
+        } else {
+            return Ok(None);
+        };
+        let mut representative = None;
+        let mut requested_id_present = semantic_model_id.is_none();
+        for symbol in overlay.symbol_candidates_named(group_name) {
+            visit()?;
+            if symbol.qualified_name != group_name || !eligible(symbol) {
+                continue;
+            }
+            requested_id_present |= semantic_model_id == Some(symbol.id.as_str());
+            representative = match representative {
+                None => Some(symbol),
+                Some(previous) => overlay.class_representative([previous, symbol]),
+            };
         }
-        let group_name = *names.iter().next().expect("one eligible class name exists");
-        let group = overlay
-            .symbols_named(group_name)
-            .records
-            .into_iter()
-            .filter(|symbol| {
-                symbol.qualified_name == group_name
-                    && symbol.language == language.config_label()
-                    && symbol.owner_id.is_none()
-                    && symbol.kind == SemanticModelSymbolKind::Class
-                    && !symbol.provenance.ambiguous
-            })
-            .collect::<Vec<_>>();
-        if semantic_model_id.is_some()
-            && !group
-                .iter()
-                .any(|symbol| records.iter().any(|record| record.id == symbol.id))
-        {
-            return None;
+        if !requested_id_present {
+            return Ok(None);
         }
-        let symbol = overlay.class_representative(group)?;
-        Some(ClassIdentity::External {
+        Ok(representative.map(|symbol| ClassIdentity::External {
             qualified_name: symbol.qualified_name.clone().into_boxed_str(),
             symbol_id: symbol.id.clone().into_boxed_str(),
-        })
-    });
+        }))
+    })()?;
     cache.insert(key, resolved.clone());
-    resolved
+    Ok(resolved)
 }
 
 pub(crate) fn class_seed_from_lookup_types(
@@ -990,8 +1034,24 @@ fn class_identity_order(left: &ClassIdentity, right: &ClassIdentity) -> Ordering
             .declaration_id()
             .as_str()
             .cmp(right.declaration_id().as_str()),
-        (ClassIdentity::Workspace(_), ClassIdentity::External { .. }) => Ordering::Less,
-        (ClassIdentity::External { .. }, ClassIdentity::Workspace(_)) => Ordering::Greater,
+        (
+            ClassIdentity::Workspace(_),
+            ClassIdentity::External { .. } | ClassIdentity::Intrinsic { .. },
+        ) => Ordering::Less,
+        (
+            ClassIdentity::External { .. } | ClassIdentity::Intrinsic { .. },
+            ClassIdentity::Workspace(_),
+        ) => Ordering::Greater,
+        (ClassIdentity::External { .. }, ClassIdentity::Intrinsic { .. }) => Ordering::Less,
+        (ClassIdentity::Intrinsic { .. }, ClassIdentity::External { .. }) => Ordering::Greater,
+        (
+            ClassIdentity::Intrinsic {
+                qualified_name: left_name,
+            },
+            ClassIdentity::Intrinsic {
+                qualified_name: right_name,
+            },
+        ) => left_name.cmp(right_name),
         (
             ClassIdentity::External {
                 qualified_name: left_name,
@@ -1105,6 +1165,10 @@ fn push_class_identity(digest: &mut LengthDelimitedDigest, identity: &ClassIdent
             digest.push(b"external-class");
             digest.push(qualified_name.as_bytes());
             digest.push(symbol_id.as_bytes());
+        }
+        ClassIdentity::Intrinsic { qualified_name } => {
+            digest.push(b"intrinsic-class");
+            digest.push(qualified_name.as_bytes());
         }
     }
 }

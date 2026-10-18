@@ -93,7 +93,7 @@ WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
   FROM main.go_package_files AS members
   JOIN main.go_package_instances AS package
     ON package.package_id=members.package_id
-  WHERE package.context_id=?1 AND members.file_version_id=?2
+  WHERE package.context_id=?1 AND members.file_version_id=?2 AND members.source_role<>'ignored'
   UNION
   SELECT package.package_id,package.tool_import_path,package.package_name
   FROM main.go_package_instances AS package JOIN json_each(?6) AS family ON family.value=package.package_id
@@ -127,7 +127,7 @@ WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
     ON members.package_id=package.package_id
   JOIN temp.selected_resolution_mounts AS mounted
     ON mounted.file_version_id=members.file_version_id
-  WHERE mounted.storage_language='go'
+  WHERE mounted.storage_language='go' AND members.source_role<>'ignored'
     AND (?5=1 OR members.source_role NOT IN ('test','xtest'))
   UNION
   SELECT placed.mount_ordinal, members.source_role, package.package_id, 1,
@@ -147,7 +147,7 @@ WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
     ON placed.file_version_id=members.file_version_id
   JOIN temp.selected_resolution_mounts AS mounted
     ON mounted.mount_ordinal=placed.mount_ordinal
-  WHERE mounted.storage_language='go'
+  WHERE mounted.storage_language='go' AND members.source_role<>'ignored'
     AND (?5=1 OR members.source_role NOT IN ('test','xtest'))
 )
 SELECT mounted.mount_ordinal, mounted.persisted_relative_path,
@@ -309,6 +309,7 @@ LEFT JOIN main.resolution_unit_summary_dependencies AS dependency
 LEFT JOIN main.resolution_unit_summary_versions AS versions
   ON export.alias_dependency_ordinal IS NOT NULL
  AND versions.workspace_id=?5 AND versions.lang='go' AND versions.generation=?6
+ AND versions.profile_digest=?10
  AND versions.unit_key=dependency.dependency_unit_key AND versions.valid_from<=?7
  AND (versions.valid_until IS NULL OR ?7<versions.valid_until)
 LEFT JOIN main.resolution_unit_summaries AS child
@@ -485,7 +486,7 @@ SELECT DISTINCT source_import.import_id,
            WHEN 'module' THEN 'external' ELSE overlay_target.provider_kind END END),
        EXISTS(
          SELECT 1 FROM main.go_package_files AS files
-           WHERE files.package_id=COALESCE(target_package.package_id,overlay_target.package_id))
+           WHERE files.package_id=COALESCE(target_package.package_id,overlay_target.package_id) AND files.source_role<>'ignored')
 FROM scope_spellings AS scope
 CROSS JOIN main.resolution_go_package_imports AS binder
   INDEXED BY resolution_go_package_imports_scope
@@ -540,7 +541,7 @@ WITH dot_imports AS (
              WHEN 'module' THEN 'external' ELSE overlay_target.provider_kind END END) AS boundary,
          EXISTS(
            SELECT 1 FROM main.go_package_files AS files
-           WHERE files.package_id=COALESCE(target_package.package_id,overlay_target.package_id)) AS has_selected_sources
+           WHERE files.package_id=COALESCE(target_package.package_id,overlay_target.package_id) AND files.source_role<>'ignored') AS has_selected_sources
   FROM main.source_imports AS source_import
   LEFT JOIN main.resolution_unit_summary_imports AS imports
     ON imports.summary_id=?1 AND imports.blob_id=source_import.blob_id
@@ -571,6 +572,7 @@ WITH dot_imports AS (
   FROM dot_imports AS dot
   LEFT JOIN main.resolution_unit_summary_versions AS versions
     ON versions.workspace_id=?4 AND versions.lang='go' AND versions.generation=?5
+   AND versions.profile_digest=?9
    AND versions.unit_key=dot.dependency_unit_key AND versions.valid_from<=?6
    AND (versions.valid_until IS NULL OR ?6<versions.valid_until)
   LEFT JOIN main.resolution_unit_summaries AS summary
@@ -635,7 +637,7 @@ LEFT JOIN main.resolution_unit_summary_dependencies AS dependency
 LEFT JOIN main.resolution_unit_summary_versions AS alias_versions
   ON export.alias_dependency_ordinal IS NOT NULL
  AND alias_versions.workspace_id=?4 AND alias_versions.lang='go'
- AND alias_versions.generation=?5
+ AND alias_versions.generation=?5 AND alias_versions.profile_digest=?9
  AND alias_versions.unit_key=dependency.dependency_unit_key
  AND alias_versions.valid_from<=?6
  AND (alias_versions.valid_until IS NULL OR ?6<alias_versions.valid_until)
@@ -656,7 +658,7 @@ WITH target_packages(package_id,tool_import_path,package_name,for_test,source_ro
          package.for_test,members.source_role
   FROM main.go_package_files AS members
   JOIN main.go_package_instances AS package ON package.package_id=members.package_id
-  WHERE package.context_id=?1 AND members.file_version_id=?2
+  WHERE package.context_id=?1 AND members.file_version_id=?2 AND members.source_role<>'ignored'
     AND ((members.source_role='go' AND package.for_test='')
       OR (members.source_role IN ('test','xtest') AND package.for_test<>'')
       OR (members.source_role IN ('test','xtest')
@@ -694,6 +696,7 @@ WITH target_packages(package_id,tool_import_path,package_name,for_test,source_ro
   CROSS JOIN main.resolution_unit_summary_versions AS versions
     ON versions.summary_id=dependency.summary_id
   WHERE versions.workspace_id=?6 AND versions.lang='go' AND versions.generation=?7
+    AND versions.profile_digest=?10
     AND versions.valid_from<=?8
     AND (versions.valid_until IS NULL OR ?8<versions.valid_until)
     AND (?4=1 OR NOT EXISTS(
@@ -705,6 +708,7 @@ WITH target_packages(package_id,tool_import_path,package_name,for_test,source_ro
   FROM target_keys AS target
   LEFT JOIN main.resolution_unit_summary_versions AS versions
     ON versions.workspace_id=?6 AND versions.lang='go' AND versions.generation=?7
+    AND versions.profile_digest=?10
    AND versions.unit_key=target.unit_key AND versions.valid_from<=?8
    AND (versions.valid_until IS NULL OR ?8<versions.valid_until)
   UNION ALL
@@ -714,6 +718,7 @@ WITH target_packages(package_id,tool_import_path,package_name,for_test,source_ro
   FROM visible_units AS visible
   JOIN main.resolution_unit_summary_versions AS versions
     ON versions.workspace_id=?6 AND versions.lang='go' AND versions.generation=?7
+    AND versions.profile_digest=?10
    AND versions.unit_key=visible.unit_key AND versions.valid_from<=?8
    AND (versions.valid_until IS NULL OR ?8<versions.valid_until)
   JOIN main.resolution_unit_summaries AS summary
@@ -957,7 +962,7 @@ JOIN main.go_package_files AS members
   ON members.file_version_id=mounted.file_version_id
 JOIN main.go_package_instances AS package
   ON package.package_id=members.package_id AND package.context_id=?1
-WHERE mounted.storage_language='go' AND mounted.persisted_relative_path=?2
+WHERE mounted.storage_language='go' AND mounted.persisted_relative_path=?2 AND members.source_role<>'ignored'
 "#;
 
 pub(crate) const GO_RENAME_LOCAL_NAME_CONFLICT_SQL: &str = r#"
@@ -2080,7 +2085,7 @@ impl SelectedResolutionOperation<'_, '_> {
             "SELECT EXISTS(
                SELECT 1 FROM main.go_package_files AS members
                JOIN main.go_package_instances AS package USING(package_id)
-               WHERE package.context_id=?1 AND members.file_version_id=?2
+               WHERE package.context_id=?1 AND members.file_version_id=?2 AND members.source_role<>'ignored'
                  AND package.provider_kind='standard')",
             params![context_id, file_version],
             |row| row.get(0),
@@ -3130,6 +3135,7 @@ pub(crate) fn mark_go_unit_summary_unavailable_for_test(
                  WHERE publication.context_id=?1
                    AND selection.workspace_id=versions.workspace_id
                    AND selection.generation=versions.generation
+                   AND selection.profile_digest=versions.profile_digest
                    AND selection.revision>=versions.valid_from)",
             params![context_id, unit_key.as_slice()],
         )?)

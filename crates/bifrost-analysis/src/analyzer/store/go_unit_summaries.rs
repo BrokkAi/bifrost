@@ -26,7 +26,8 @@ use super::{Result, StoreError, WorkspaceSnapshotId};
 use crate::analyzer::canonical_hash::CanonicalHasher;
 
 /// Version 6 records imports from every source role included in a test unit.
-pub(crate) const GO_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 7;
+// Version 8 consumes the anonymous/local declaration inventory (#5074).
+pub(crate) const GO_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 8;
 
 fn go_provider_gap_detail(gaps_json: &str) -> Option<String> {
     let mut gaps: Value =
@@ -231,7 +232,20 @@ const UNIT_ALIAS_EXPORTS_SQL: &str =
       AND alias_identity.spelling = aliases.name
      LEFT JOIN main.source_go_types AS target_type
        ON target_type.blob_id = aliases.blob_id AND target_type.type_id = aliases.target_type_id
-     LEFT JOIN main.source_occurrences AS target_occurrence
+     -- Filter the join view before the LEFT JOIN: SQLite otherwise materializes
+     -- occurrences for every blob in the store (#5658).
+     LEFT JOIN (
+       SELECT occurrence.* FROM main.source_occurrences AS occurrence
+       WHERE occurrence.blob_id IN (
+         SELECT selected_blob.id
+         FROM main.go_context_source_files AS selected_file
+         JOIN main.blobs AS selected_blob
+           ON selected_blob.blob_oid = selected_file.blob_oid
+          AND selected_blob.lang = 'go' AND selected_blob.generation = ?4
+         WHERE selected_file.context_id = ?1 AND selected_file.package_id = ?2
+           AND selected_file.source_role IN ('go', ?3)
+       )
+     ) AS target_occurrence
        ON target_occurrence.blob_id = target_type.blob_id
       AND target_occurrence.occurrence_id = target_type.occurrence_id
      LEFT JOIN main.source_go_type_names AS qualifier
@@ -315,11 +329,10 @@ const UNIT_IMPORT_TARGETS_SQL: &str = "SELECT imports.import_role, imports.sourc
 
 /// The Go validity predicate: the shared one plus the profile match. The read
 /// ledger records which context profile each summary derives from (key
-/// `go-context-profile` of the unit), and only one profile's summary is live per
-/// unit key, so a reader that selected a profile matches that digest and falls
-/// back when the live summary belongs to the other.
+/// `go-context-profile` of the unit). Its version interval is selected by the
+/// same profile, so publishing another profile cannot replace this one.
 pub(crate) const GO_LIVE_SUMMARY_SQL: &str = concat!(
-    super::unit_summaries::live_summary_select!(),
+    super::unit_summaries::live_summary_select!("?9"),
     " AND EXISTS (SELECT 1 FROM resolution_unit_summary_reads AS profile
        WHERE profile.summary_id = versions.summary_id
          AND profile.key_digest = ?8 AND profile.digest = ?9)"
@@ -467,6 +480,10 @@ impl UnitSummaryLanguage for GoUnitSummaries {
         GO_UNIT_SUMMARY_DERIVATION_VERSION
     }
 
+    fn profile_digest(&self) -> [u8; 32] {
+        self.profile
+    }
+
     fn stage(&self, conn: &Connection, _snapshot: &WorkspaceSnapshotId) -> Result<()> {
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS go_unit_summary_units(
@@ -484,6 +501,11 @@ impl UnitSummaryLanguage for GoUnitSummaries {
         )?;
         conn.execute(STAGE_IMPORT_EDGES_SQL, [])?;
         conn.execute(STAGE_TEST_EDGES_SQL, [])?;
+        Ok(())
+    }
+
+    fn clear_stage(&self, conn: &Connection) -> Result<()> {
+        conn.execute("DELETE FROM temp.go_unit_summary_units", [])?;
         Ok(())
     }
 
@@ -975,6 +997,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
             imports,
             gaps,
             complete,
+            public_surface_digest: None,
         })
     }
 }

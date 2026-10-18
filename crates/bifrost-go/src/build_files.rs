@@ -225,6 +225,28 @@ fn quoted_atom(
     cancelled: &impl Fn() -> bool,
 ) -> Result<GoModToken, BuildFileIssue> {
     let start = *offset;
+    let value = quoted_bytes(contents, offset, cancelled)?;
+    String::from_utf8(value)
+        .map(GoModToken::String)
+        .map_err(|_| issue(BuildFileIssueKind::Unsupported, start..*offset))
+}
+
+/// Decode the value of one AST-selected Go string literal, not source syntax.
+pub(crate) fn go_string_literal_bytes(literal: &str) -> Option<Vec<u8>> {
+    if !matches!(literal.as_bytes().first(), Some(b'"' | b'`')) {
+        return None;
+    }
+    let mut offset = 0;
+    let value = quoted_bytes(literal, &mut offset, &|| false).ok()?;
+    (offset == literal.len()).then_some(value)
+}
+
+fn quoted_bytes(
+    contents: &str,
+    offset: &mut usize,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<u8>, BuildFileIssue> {
+    let start = *offset;
     let delimiter = contents[*offset..].chars().next().expect("quote start");
     *offset += delimiter.len_utf8();
     let mut value = Vec::new();
@@ -235,9 +257,7 @@ fn quoted_atom(
         let character = contents[*offset..].chars().next().expect("in-bounds UTF-8");
         *offset += character.len_utf8();
         if character == delimiter {
-            return String::from_utf8(value)
-                .map(GoModToken::String)
-                .map_err(|_| issue(BuildFileIssueKind::Unsupported, start..*offset));
+            return Ok(value);
         }
         if delimiter == '"' && character == '\\' {
             let Some(escaped) = contents[*offset..].chars().next() else {

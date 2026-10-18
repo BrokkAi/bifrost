@@ -1511,6 +1511,9 @@ func (*Concrete) Required(struct { X int `json:"x"` }, string) {}
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5074: anonymous occurrence identities must not disprove native signature coupling"
+    )]
     fn selected_go_method_family_reports_unsupported_structural_signatures() {
         use crate::analyzer::resolution::GoMethodSatisfaction;
         for parameter in [

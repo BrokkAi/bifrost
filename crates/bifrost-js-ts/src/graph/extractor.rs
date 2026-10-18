@@ -208,6 +208,7 @@ pub fn scan_files_for_seeds(
         // reused by graph construction, but exact position-sensitive proof
         // also needs the lexical scopes from this parsed candidate tree.
         let lexical_index = JsTsLexicalBindingIndex::build(root, source_str);
+        let commonjs = crate::commonjs::CommonJsObjects::new(root, source_str, &lexical_index);
         let imports = cached_imports.with_lexical_bindings(root, lexical_index.clone());
         let file_is_script = host
             .source_facts(file)
@@ -282,6 +283,7 @@ pub fn scan_files_for_seeds(
                 receiver_facts,
                 language,
                 lexical_bindings,
+                commonjs,
                 scope_stack: vec![HashMap::default()],
                 lexical_shadow_scopes: Vec::new(),
                 binding_engine,
@@ -413,6 +415,7 @@ pub struct ScanCtx<'a> {
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
     language: Language,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
+    commonjs: crate::commonjs::CommonJsObjects,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     lexical_shadow_scopes: Vec<HashSet<String>>,
     binding_engine: LocalInferenceEngine<&'static str>,
@@ -595,8 +598,7 @@ fn chained_assignment_aliases_for_local_property(
             && let Some(name) = node.child_by_field_name("name")
             && name.kind() == "identifier"
             && slice(name, source) == definition.receiver_root
-            && lexical_bindings.binding_scope_at(&definition.receiver_root, name.start_byte())
-                == Some(definition.scope)
+            && lexical_bindings.binding_scope_for_binder(name) == Some(definition.scope)
             && latest_declarator
                 .is_none_or(|latest: Node<'_>| latest.start_byte() < node.start_byte())
         {
@@ -738,7 +740,7 @@ fn this_alias_owner_binding(
             )
             && simple_identifier_text(name, source) == Some(alias_name)
             && value.kind() == "this"
-            && lexical_bindings.binding_scope_at(alias_name, name.start_byte()) == Some(alias_scope)
+            && lexical_bindings.binding_scope_for_binder(name) == Some(alias_scope)
         {
             if binding.replace(node).is_some() {
                 return None;
@@ -1061,7 +1063,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         handle_export_specifier(node, ctx);
         return;
     }
-    if kind == "expression_statement" && is_commonjs_export_statement(node, ctx.source) {
+    if kind == "expression_statement"
+        && is_commonjs_export_statement(node, ctx.source, &ctx.commonjs)
+    {
         if let Some(value) = node
             .named_child(0)
             .and_then(|assignment| assignment.child_by_field_name("right"))
@@ -3241,13 +3245,15 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
 pub fn compute_export_index(source: &str, tree: &Tree) -> ExportIndex {
     let mut index = ExportIndex::empty();
     let root = tree.root_node();
-    let module_object_exports = collect_module_object_exports(root, source);
+    let lexical = JsTsLexicalBindingIndex::build(root, source);
+    let commonjs = crate::commonjs::CommonJsObjects::new(root, source, &lexical);
+    let module_object_exports = collect_module_object_exports(root, source, &commonjs);
 
     for index_id in 0..root.named_child_count() {
         let Some(child) = root.named_child(index_id) else {
             continue;
         };
-        collect_export_statement(child, source, &module_object_exports, &mut index);
+        collect_export_statement(child, source, &module_object_exports, &commonjs, &mut index);
     }
 
     index
@@ -3257,17 +3263,22 @@ pub(crate) fn collect_export_statement(
     node: Node<'_>,
     source: &str,
     module_object_exports: &HashSet<String>,
+    commonjs: &crate::commonjs::CommonJsObjects,
     index: &mut ExportIndex,
 ) {
     if node.kind() == "export_statement" {
         visit_export_statement(node, source, index);
     } else if node.kind() == "expression_statement" {
-        visit_commonjs_export_statement(node, source, index);
+        visit_commonjs_export_statement(node, source, commonjs, index);
         visit_module_object_member_export_statement(node, source, module_object_exports, index);
     }
 }
 
-pub(crate) fn collect_module_object_exports(root: Node<'_>, source: &str) -> HashSet<String> {
+pub(crate) fn collect_module_object_exports(
+    root: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> HashSet<String> {
     let mut exports = HashSet::default();
     for index_id in 0..root.named_child_count() {
         let Some(child) = root.named_child(index_id) else {
@@ -3283,7 +3294,7 @@ pub(crate) fn collect_module_object_exports(root: Node<'_>, source: &str) -> Has
             continue;
         };
         if !matches!(
-            commonjs_export_target(left, source),
+            commonjs_export_target(left, source, commonjs),
             Some(CommonJsExportTarget::ModuleExports)
         ) {
             continue;
@@ -3299,7 +3310,12 @@ pub(crate) fn collect_module_object_exports(root: Node<'_>, source: &str) -> Has
     exports
 }
 
-fn visit_commonjs_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex) {
+fn visit_commonjs_export_statement(
+    node: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+    index: &mut ExportIndex,
+) {
     let Some(assignment) = first_named_child_of_kind(node, "assignment_expression") else {
         return;
     };
@@ -3310,7 +3326,7 @@ fn visit_commonjs_export_statement(node: Node<'_>, source: &str, index: &mut Exp
         return;
     };
 
-    match commonjs_export_target(left, source) {
+    match commonjs_export_target(left, source, commonjs) {
         Some(CommonJsExportTarget::Named(exported_name)) => {
             let local_name = local_export_name(right, source)
                 .or_else(|| exported_function_name(right, &exported_name))
@@ -3350,13 +3366,17 @@ fn visit_module_object_member_export_statement(
         .insert(exported_name.to_string(), ExportEntry::Local { local_name });
 }
 
-fn is_commonjs_export_statement(node: Node<'_>, source: &str) -> bool {
+fn is_commonjs_export_statement(
+    node: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> bool {
     let Some(assignment) = first_named_child_of_kind(node, "assignment_expression") else {
         return false;
     };
     assignment
         .child_by_field_name("left")
-        .is_some_and(|left| commonjs_export_target(left, source).is_some())
+        .is_some_and(|left| commonjs_export_target(left, source, commonjs).is_some())
 }
 
 enum CommonJsExportTarget {
@@ -3364,7 +3384,11 @@ enum CommonJsExportTarget {
     ModuleExports,
 }
 
-fn commonjs_export_target(node: Node<'_>, source: &str) -> Option<CommonJsExportTarget> {
+fn commonjs_export_target(
+    node: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> Option<CommonJsExportTarget> {
     if node.kind() != "member_expression" {
         return None;
     }
@@ -3372,33 +3396,15 @@ fn commonjs_export_target(node: Node<'_>, source: &str) -> Option<CommonJsExport
     let property = node.child_by_field_name("property")?;
     let property_name = property_name_text(property, source)?;
 
-    if simple_identifier_text_for_source(object, source) == Some("exports") {
+    if commonjs.is_exports(object) {
         return Some(CommonJsExportTarget::Named(property_name));
     }
 
-    if commonjs_module_exports_object(object, source) {
-        return Some(CommonJsExportTarget::Named(property_name));
-    }
-
-    if commonjs_module_exports_object(node, source) {
+    if commonjs.is_exports(node) {
         return Some(CommonJsExportTarget::ModuleExports);
     }
 
     None
-}
-
-fn commonjs_module_exports_object(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != "member_expression" {
-        return false;
-    }
-    let Some(object) = node.child_by_field_name("object") else {
-        return false;
-    };
-    let Some(property) = node.child_by_field_name("property") else {
-        return false;
-    };
-    simple_identifier_text_for_source(object, source) == Some("module")
-        && property_name_text(property, source).as_deref() == Some("exports")
 }
 
 fn local_member_assignment_target<'a>(

@@ -683,7 +683,11 @@ impl LanguageSupport for JavascriptSupport {
         Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
-    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+    fn path_synthetic_module_unit(
+        &self,
+        _project: &dyn crate::analyzer::Project,
+        file: &ProjectFile,
+    ) -> Option<CodeUnit> {
         Some(module_code_unit(file))
     }
 
@@ -814,7 +818,11 @@ impl LanguageSupport for TypescriptSupport {
         Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
     }
 
-    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+    fn path_synthetic_module_unit(
+        &self,
+        _project: &dyn crate::analyzer::Project,
+        file: &ProjectFile,
+    ) -> Option<CodeUnit> {
         Some(module_code_unit(file))
     }
 

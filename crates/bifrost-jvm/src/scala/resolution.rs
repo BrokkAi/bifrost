@@ -21,10 +21,11 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionImportRouteKind, ResolutionImportRouteSegmentFact, ResolutionImportSelectorFact,
     ResolutionImportSelectorKind, ResolutionInvocationRole, ResolutionInvocationRoleFact,
     ResolutionJvmAliasFact, ResolutionJvmAliasId, ResolutionJvmAliasKind,
-    ResolutionJvmAliasOwnerSegmentFact, ResolutionJvmAliasStatus, ResolutionMemberAccess,
-    ResolutionMemberKind, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
-    ResolutionNameFact, ResolutionNameId, ResolutionNamedArgumentLabelFact, ResolutionNamespace,
-    ResolutionPackageFact, ResolutionPackageObjectExportFact, ResolutionPackageSegmentFact,
+    ResolutionJvmAliasOwnerSegmentFact, ResolutionJvmAliasStatus, ResolutionLocalWriteFact,
+    ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberOwnerFact,
+    ResolutionMemberQualifierCompatibility, ResolutionNameFact, ResolutionNameId,
+    ResolutionNamedArgumentLabelFact, ResolutionNamespace, ResolutionPackageFact,
+    ResolutionPackageObjectExportFact, ResolutionPackageSegmentFact,
     ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact, ResolutionRootExportFact,
     ResolutionRootImportAnchor, ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
     ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
@@ -140,6 +141,13 @@ struct ScalaResolutionBuilder<'a, 'source> {
     pending_function_types: Vec<(ResolutionSiteId, ResolutionTypeSlotId, Node<'source>)>,
     pending_type_aliases: Vec<(ResolutionSiteId, ResolutionTypeSlotId, Node<'source>)>,
     pending_initializers: Vec<(ResolutionTypeSlotId, Node<'source>, ResolutionScopeId)>,
+    pending_initializer_values: Vec<(ResolutionTypeSlotId, Node<'source>, ResolutionScopeId)>,
+    pending_writes: Vec<(Node<'source>, ResolutionScopeId)>,
+    /// A `super.member` receiver and the template whose parent linearization
+    /// answers it. The identity slots are connected after the walk has
+    /// published every supertype edge.
+    super_receivers: Vec<(ResolutionSiteId, ResolutionTypeSlotId)>,
+    super_receiver_slots_by_node: HashMap<usize, ResolutionTypeSlotId>,
     /// Members selected on `this`: they carry no qualifier and are looked up
     /// in the body of the template that contains `this`.
     current_instance_members: HashSet<ResolutionSiteId>,
@@ -196,6 +204,10 @@ pub(super) fn extract_scala_resolution<'source>(
         pending_function_types: Vec::new(),
         pending_type_aliases: Vec::new(),
         pending_initializers: Vec::new(),
+        pending_initializer_values: Vec::new(),
+        pending_writes: Vec::new(),
+        super_receivers: Vec::new(),
+        super_receiver_slots_by_node: HashMap::default(),
         current_instance_members: HashSet::default(),
         wildcard_imports: Vec::new(),
         root_scope,
@@ -213,11 +225,16 @@ pub(super) fn extract_scala_resolution<'source>(
     builder.finish_callable_result_types(root);
     builder.finish_packages(root);
     builder.finish_supertypes(root);
+    builder.finish_super_receivers();
     builder.finish_calls(root);
+    builder.finish_writes();
     builder.finish_import_demands();
     builder.finish_function_types();
     builder.finish_shape_dependent_gaps(root);
     builder.finish_generic_formals();
+    // Companion relations and projected aliases must exist before regions are
+    // copied from their canonical source declarations.
+    builder.finish_access_boundaries(root, source_declarations);
     builder.validate();
     ScalaResolutionExtraction {
         facts: builder.facts,
@@ -303,6 +320,21 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
 
             if node.kind() == "import_declaration" {
                 self.lower_import(node, item.scope);
+            }
+
+            if (node.kind() == "assignment_expression" && !is_named_argument(node))
+                || (node.kind() == "infix_expression"
+                    && node
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| {
+                            let name = node_text(operator, self.source);
+                            operator.kind() == "operator_identifier"
+                                && name.ends_with('=')
+                                && !name.starts_with('=')
+                                && !matches!(name, "<=" | ">=" | "!=")
+                        }))
+            {
+                self.pending_writes.push((node, item.scope));
             }
 
             if node.kind() == "call_expression" || node.kind() == "infix_expression" {
@@ -512,10 +544,17 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                                 unit: unit.clone(),
                             });
                     }
-                    // Only an alias publishes an identity slot: its value arrives
-                    // through a transfer. A nominal type has none, so a reference
-                    // to it projects the declaration itself as the type object.
-                    if node.kind() == "type_definition" {
+                    // Only a transparent alias publishes an identity slot: its
+                    // value arrives through a transfer from the written type.
+                    // An abstract member and an opaque alias name a type of
+                    // their own, so a reference to either projects the
+                    // declaration itself as the type object. Publishing an
+                    // identity slot with no producer instead would leave every
+                    // reference to that type without a value.
+                    if node.kind() == "type_definition"
+                        && let Some(target) = node.child_by_field_name("type")
+                        && !has_opaque_modifier(node)
+                    {
                         let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
                         self.facts
                             .declaration_type_slots
@@ -524,14 +563,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                                 slot,
                                 role: DeclarationTypeRole::Identity,
                             });
-                        // A transparent alias denotes the type it is written as. An
-                        // opaque alias hides that type outside its definition and an
-                        // abstract member has none, so their identity stays open.
-                        if let Some(target) = node.child_by_field_name("type")
-                            && !has_opaque_modifier(node)
-                        {
-                            self.pending_type_aliases.push((site, slot, target));
-                        }
+                        self.pending_type_aliases.push((site, slot, target));
                     }
                     let visibility_eligible = kind == ResolutionSiteKind::TypeDeclaration
                         || namespace == ResolutionNamespace::Type
@@ -609,12 +641,17 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 let site =
                     self.add_site_distinct(node, ResolutionSiteKind::ConstructorDeclaration, scope);
                 let occurrence = self.collector.intern_node(node);
+                let modifier =
+                    crate::scala::graph::syntax::scala_primary_constructor_modifier(node);
+                let modifier_occurrence =
+                    modifier.map(|modifier| self.collector.intern_node(modifier));
                 let source = if let Some((constructor, unit)) = parsed
                     .source_declaration_units
                     .iter()
                     .find(|(source, unit)| {
                         let declaration = self.collector.declaration(*source);
-                        declaration.occurrence == occurrence
+                        (declaration.occurrence == occurrence
+                            || Some(declaration.occurrence) == modifier_occurrence)
                             && declaration.name.is_none()
                             && unit.is_function()
                     }) {
@@ -636,7 +673,13 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         .expect("a Scala class already has its source declaration")
                 };
                 self.declaration_sources.push((site, source));
-                self.declaration_nodes.insert(site, node);
+                let source_node =
+                    if Some(self.collector.declaration(source).occurrence) == modifier_occurrence {
+                        modifier.expect("a modifier-anchored constructor has its modifier")
+                    } else {
+                        node
+                    };
+                self.declaration_nodes.insert(site, source_node);
                 self.publish_declaration_visibility(site, source, source_declarations);
                 self.facts
                     .callable_signatures
@@ -830,6 +873,319 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 ScalaDeclarationVisibility::NonApi => DeclaredVisibility::Private,
             })
             .unwrap_or(DeclaredVisibility::Unknown)
+    }
+
+    fn finish_access_boundaries(
+        &mut self,
+        root: Node<'source>,
+        source: &brokk_bifrost_core::analyzer::scala_facts::ScalaSourceFacts,
+    ) {
+        use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+        let template_sites = self
+            .facts
+            .scopes
+            .iter()
+            .filter(|scope| scope.kind == ResolutionScopeKind::TypeBody)
+            .filter_map(|scope| scope.owner)
+            .collect::<HashSet<_>>();
+        let templates = self
+            .declaration_sources
+            .iter()
+            .filter(|(site, _)| template_sites.contains(site))
+            .map(|(site, source)| (*source, *site))
+            .collect::<HashMap<_, _>>();
+        let mut declarations = HashMap::default();
+        for &(site, declaration) in &self.declaration_sources {
+            let Some(node) = self.declaration_nodes.get(&site) else {
+                continue;
+            };
+            if node_range(*node)
+                != self
+                    .collector
+                    .occurrence(self.collector.declaration(declaration).occurrence)
+                    .range
+            {
+                continue;
+            }
+            // An unwritten constructor shares its class's source declaration.
+            // The authored declaration remains the canonical modifier owner.
+            if self.declaration_sites.get(&node.id()) == Some(&site) {
+                declarations.insert(declaration, site);
+            } else {
+                declarations.entry(declaration).or_insert(site);
+            }
+        }
+        let mut pending = Vec::new();
+        let mut qualifier_references = HashSet::default();
+        for fact in &source.declarations {
+            let Some(&site) = declarations.get(&fact.declaration) else {
+                continue;
+            };
+            let Some(&node) = self.declaration_nodes.get(&site) else {
+                continue;
+            };
+            let modifier_owner = if self.facts.sites[site.index()].kind
+                == ResolutionSiteKind::ConstructorDeclaration
+                && matches!(node.kind(), "class_definition" | "full_enum_case")
+            {
+                let Some(modifier) =
+                    crate::scala::graph::syntax::scala_primary_constructor_modifier(node)
+                else {
+                    continue;
+                };
+                modifier
+            } else {
+                node
+            };
+            let Some(qualifier) =
+                crate::scala::graph::syntax::scala_access_qualifier(modifier_owner)
+            else {
+                continue;
+            };
+            // Both dialects use the ordinary access modifier for [this]. Scala
+            // 2's extra instance restriction rejects invalid code but does not
+            // change the declaration named by any valid program.
+            if node_text(qualifier, self.source) == "this" {
+                continue;
+            }
+            let publish_reference = qualifier_references.insert(qualifier.id());
+            let scope = self.facts.sites[site.index()].scope;
+            let boundary = match &fact.access_boundary {
+                Some(DeclarationAccessBoundary::Package(package)) => {
+                    DeclarationAccessBoundary::Package(package.clone())
+                }
+                Some(DeclarationAccessBoundary::Template(owner)) => {
+                    let target = *templates
+                        .get(owner)
+                        .expect("an enclosing template has a native declaration");
+                    DeclarationAccessBoundary::Template(target)
+                }
+                None => {
+                    // This is a missing lexical owner, independent of the
+                    // coarse modifier's access obligation. Ordinary private
+                    // access must not discharge invalid-qualifier evidence.
+                    self.gap(site, ResolutionGapKind::UnsupportedRoute);
+                    if !publish_reference {
+                        continue;
+                    }
+                    let reference =
+                        self.add_site(qualifier, ResolutionSiteKind::ValueReference, scope);
+                    self.identifier(
+                        reference,
+                        qualifier,
+                        ResolutionIdentifierRole::Reference,
+                        ResolutionNamespace::Value,
+                        None,
+                    );
+                    self.gap(reference, ResolutionGapKind::UnsupportedRoute);
+                    self.facts
+                        .reference_owners
+                        .push(ResolutionReferenceOwnerFact {
+                            reference,
+                            owner: Some(site),
+                        });
+                    self.facts.lexical_owner_references.push(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionLexicalOwnerReferenceFact {
+                            reference,
+                            declaration: None,
+                        },
+                    );
+                    continue;
+                }
+            };
+            // Some non-public fields previously had no access row at all.
+            // Publish their unchanged modifier so the explicit region can be
+            // checked, instead of dropping that region on a field declaration.
+            if !self
+                .facts
+                .declaration_visibilities
+                .iter()
+                .any(|row| row.declaration == site)
+            {
+                self.publish_visibility_rows(
+                    site,
+                    Self::source_visibility(fact.declaration, source),
+                );
+            }
+            self.facts.declaration_access_boundaries.push(
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionDeclarationAccessBoundaryFact { declaration: site, boundary: boundary.clone() }
+            );
+            if publish_reference {
+                pending.push((site, qualifier, scope, boundary));
+            }
+        }
+        // Every native projection of one source declaration shares its region.
+        // The source producer adds generated companion facts after extraction
+        // by inheriting the case class/enum fact. Mirror that same inheritance
+        // before projecting source boundaries onto all native declarations.
+        let mut source_boundaries = source
+            .declarations
+            .iter()
+            .filter_map(|fact| {
+                let boundary = match fact.access_boundary.as_ref()? {
+                    DeclarationAccessBoundary::Package(package) => {
+                        DeclarationAccessBoundary::Package(package.clone())
+                    }
+                    DeclarationAccessBoundary::Template(owner) => {
+                        DeclarationAccessBoundary::Template(templates[owner])
+                    }
+                };
+                Some((
+                    fact.declaration,
+                    (boundary, Self::source_visibility(fact.declaration, source)),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        for definition in &self.facts.definition_units {
+            if !definition.unit.is_synthetic() {
+                continue;
+            }
+            let Some(class) = self.facts.singleton_relations.iter().find_map(|relation| {
+                (relation.declaration == definition.declaration && relation.kind ==
+                    brokk_bifrost_core::analyzer::resolution_facts::ResolutionSingletonRelationKind::Companion)
+                    .then_some(relation.enclosing_type).flatten()
+            }) else { continue; };
+            let companion_source = self
+                .declaration_sources
+                .iter()
+                .find_map(|(site, source)| (*site == definition.declaration).then_some(*source))
+                .expect("a generated companion has source authority");
+            if source
+                .declarations
+                .iter()
+                .any(|fact| fact.declaration == companion_source)
+            {
+                continue;
+            }
+            let class_source = self
+                .declaration_sources
+                .iter()
+                .find_map(|(site, source)| (*site == class).then_some(*source))
+                .expect("a generated companion has its class source authority");
+            if let Some(boundary) = source_boundaries.get(&class_source).cloned() {
+                assert!(
+                    source_boundaries
+                        .insert(companion_source, boundary)
+                        .is_none()
+                );
+            }
+        }
+        for (site, declaration) in self.declaration_sources.clone() {
+            let Some((boundary, visibility)) = source_boundaries.get(&declaration) else {
+                continue;
+            };
+            if let Some(existing) = self
+                .facts
+                .declaration_access_boundaries
+                .iter()
+                .find(|row| row.declaration == site)
+            {
+                assert_eq!(&existing.boundary, boundary);
+                continue;
+            }
+            if !self
+                .facts
+                .declaration_visibilities
+                .iter()
+                .any(|row| row.declaration == site)
+            {
+                self.publish_visibility_rows(site, *visibility);
+            }
+            self.facts.declaration_access_boundaries.push(
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionDeclarationAccessBoundaryFact {
+                    declaration: site, boundary: boundary.clone(),
+                }
+            );
+            self.facts.gaps.retain(|gap| {
+                gap.site != site || gap.kind != ResolutionGapKind::UnsupportedVisibility
+            });
+        }
+        let mut package_targets = HashMap::default();
+        for (owner, qualifier, scope, boundary) in pending {
+            let target = match boundary {
+                DeclarationAccessBoundary::Template(target) => target,
+                DeclarationAccessBoundary::Package(package) => {
+                    if let Some(&target) = package_targets.get(&package) {
+                        target
+                    } else {
+                        // Recover the already selected package owner from AST
+                        // package segments. No import/type namespace participates.
+                        let mut clauses = root
+                            .named_children(&mut root.walk())
+                            .filter(|node| {
+                                node.kind() == "package_clause"
+                                    && node.child_by_field_name("body").is_none()
+                                    && node.start_byte() <= qualifier.start_byte()
+                            })
+                            .collect::<Vec<_>>();
+                        let node = self.declaration_nodes[&owner];
+                        clauses.extend(package_ancestor_nodes(node));
+                        clauses.sort_unstable_by_key(Node::start_byte);
+                        clauses.dedup_by_key(|node| node.id());
+                        let mut path = Vec::new();
+                        let mut selected = None;
+                        for clause in clauses {
+                            if let Some(name) = clause.child_by_field_name("name") {
+                                for segment in package_name_nodes(name) {
+                                    path.push(node_text(segment, self.source));
+                                    if path.join(".") == package {
+                                        selected = Some(segment);
+                                    }
+                                }
+                            }
+                        }
+                        let segment = selected.expect(
+                            "a source-selected package boundary has an AST package segment",
+                        );
+                        let target = self.add_site_distinct(
+                            segment,
+                            ResolutionSiteKind::PackageDeclaration,
+                            self.root_scope,
+                        );
+                        self.identifier(
+                            target,
+                            segment,
+                            ResolutionIdentifierRole::Declaration,
+                            ResolutionNamespace::Package,
+                            None,
+                        );
+                        let declaration = self.collector.declare_node(segment, Some(segment));
+                        self.publish_unitless_declaration(
+                            target,
+                            declaration,
+                            DeclarationKind::BlockLocalItem,
+                        );
+                        package_targets.insert(package, target);
+                        target
+                    }
+                }
+            };
+            let namespace = self
+                .facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.site == target
+                        && identifier.role == ResolutionIdentifierRole::Declaration
+                })
+                .expect("an owner has its declaration identifier")
+                .namespace;
+            let reference = self.add_site(qualifier, ResolutionSiteKind::TypeReference, scope);
+            self.identifier(
+                reference,
+                qualifier,
+                ResolutionIdentifierRole::Reference,
+                namespace,
+                None,
+            );
+            self.facts
+                .reference_owners
+                .push(ResolutionReferenceOwnerFact {
+                    reference,
+                    owner: Some(owner),
+                });
+            self.facts.lexical_owner_references.push(brokk_bifrost_core::analyzer::resolution_facts::ResolutionLexicalOwnerReferenceFact { reference, declaration: Some(target) });
+        }
     }
 
     fn publish_visibility_rows(&mut self, site: ResolutionSiteId, visibility: DeclaredVisibility) {
@@ -1156,6 +1512,12 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             }
             return;
         }
+        if node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "access_qualifier")
+        {
+            return;
+        }
         if self.sites_by_node.contains_key(&node.id())
             || role == OccurrenceRole::DeclarationName
             || role == OccurrenceRole::ImportAlias
@@ -1166,6 +1528,9 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         }
         if role == OccurrenceRole::Binder {
             self.lower_binder(node, scope, owner, type_owner, parsed, source_declarations);
+            return;
+        }
+        if is_super_identifier(node, self.source) {
             return;
         }
         let import_ancestor = nearest_ancestor(node, "import_declaration");
@@ -1269,13 +1634,27 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 }
             }
         }
+        // `super.member` is an up-call answered by the enclosing template's
+        // parent linearization, never by its own override. The receiver is a
+        // type identity, not a value `super` declares, so it must not lower as
+        // an ordinary expression reference. Its identity slots are connected
+        // once the walk has published the template's supertype edges.
+        let super_receiver = if qualifier.is_none() && this_scope.is_none() {
+            receiver.filter(|receiver| is_super_identifier(*receiver, self.source))
+        } else {
+            None
+        };
         if qualifier.is_none()
             && this_scope.is_none()
+            && super_receiver.is_none()
             && let Some(receiver) = receiver
         {
             qualifier = Some(self.expression_slot(receiver, scope));
         }
         let site = self.add_site(node, kind, this_scope.unwrap_or(scope));
+        if let Some(receiver) = super_receiver {
+            qualifier = Some(self.super_receiver_slot(receiver, site));
+        }
         if this_scope.is_some() {
             self.current_instance_members.insert(site);
         }
@@ -1591,6 +1970,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 namespace,
             });
         }
+        let initializer = binder_initializer(node, declaration_node);
         if kind == ResolutionBinderKind::Parameter
             && nearest_ancestor(node, "lambda_expression").is_none()
             && let Some(callable) = owner
@@ -1629,7 +2009,9 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             );
         } else if let Some(role) = declared_value_role(node, declaration_node) {
             self.add_declared_value_slot(site, role, declaration_node.child_by_field_name("type"));
-        } else if let Some(value) = untyped_initializer(node, declaration_node) {
+        } else if let Some(value) =
+            initializer.filter(|_| declaration_node.child_by_field_name("type").is_none())
+        {
             let slot = self.add_declared_value_slot(site, DeclarationTypeRole::Value, None);
             self.pending_initializers.push((slot, value, scope));
         } else if matches!(
@@ -1644,6 +2026,38 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 DeclarationTypeRole::Value
             };
             self.add_declared_value_slot(site, role, None);
+        }
+        if matches!(
+            kind,
+            ResolutionBinderKind::Local | ResolutionBinderKind::Pattern
+        ) {
+            if let Some(value) = initializer {
+                let output = self.add_slot(site, ResolutionTypeSlotRole::AssignmentValue);
+                self.pending_initializer_values.push((output, value, scope));
+            } else if kind == ResolutionBinderKind::Local
+                && matches!(declaration_node.kind(), "val_definition" | "var_definition")
+                && declaration_node.child_by_field_name("value").is_some()
+            {
+                // A destructured local receives an unknown component of the
+                // initializer. Do not copy the whole tuple or gap the binder.
+                assert!(!direct_value_binding(node, declaration_node));
+                let incoming =
+                    self.add_site_distinct(node, ResolutionSiteKind::UnsupportedExpression, scope);
+                assert_ne!(incoming, site);
+                self.gap(incoming, ResolutionGapKind::InferredType);
+                let input = self.add_slot(incoming, ResolutionTypeSlotRole::ExpressionValue);
+                let output = self.add_slot(site, ResolutionTypeSlotRole::AssignmentValue);
+                self.facts
+                    .type_transfers
+                    .push(ResolutionTypeTransferFact::new(
+                        input,
+                        output,
+                        ResolutionTypeTransferKind::Assignment,
+                        0,
+                        0,
+                        ResolutionTypeTransferValueTransform::Preserve,
+                    ));
+            }
         }
     }
 
@@ -2474,6 +2888,65 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         .expect("Scala parent count fits u32");
                 }
             }
+        }
+    }
+
+    /// Connect each `super.member` receiver to the enclosing template's parent
+    /// identities. The identity projection reads the written parent reference,
+    /// not the edge's full frontier: the enclosing type's hierarchy
+    /// uncertainty does not make this receiver's type unknown. Multiple
+    /// written parents form a union of the identities the linearization may
+    /// select.
+    fn finish_super_receivers(&mut self) {
+        let pending = std::mem::take(&mut self.super_receivers);
+        for (owner, receiver) in pending {
+            let site = self.facts.type_slots[receiver.index()].site;
+            let references = self
+                .facts
+                .supertypes
+                .iter()
+                .filter(|edge| {
+                    edge.subtype == owner && edge.kind != ResolutionSupertypeKind::SelfType
+                })
+                .map(|edge| edge.supertype_reference)
+                .collect::<Vec<_>>();
+            if references.is_empty() {
+                self.gap(site, ResolutionGapKind::InferredType);
+                continue;
+            }
+            let mut identities = Vec::with_capacity(references.len());
+            for reference in references {
+                let identity = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+                self.facts
+                    .binding_projections
+                    .push(BindingProjectionFact::target_type_identity(
+                        reference, identity,
+                    ));
+                identities.push(identity);
+            }
+            let input = if let [identity] = identities.as_slice() {
+                *identity
+            } else {
+                let union = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+                for identity in identities {
+                    crate::call_arguments::publish_jvm_type_union_transfer(
+                        &mut self.facts,
+                        identity,
+                        union,
+                    );
+                }
+                union
+            };
+            self.facts
+                .type_transfers
+                .push(ResolutionTypeTransferFact::new(
+                    input,
+                    receiver,
+                    ResolutionTypeTransferKind::Receiver,
+                    0,
+                    0,
+                    ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+                ));
         }
     }
 
@@ -3651,6 +4124,19 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     ResolutionTypeTransferValueTransform::Preserve,
                 ));
         }
+        for (output, value, scope) in std::mem::take(&mut self.pending_initializer_values) {
+            let input = self.expression_slot(value, scope);
+            self.facts
+                .type_transfers
+                .push(ResolutionTypeTransferFact::new(
+                    input,
+                    output,
+                    ResolutionTypeTransferKind::Assignment,
+                    0,
+                    0,
+                    ResolutionTypeTransferValueTransform::Preserve,
+                ));
+        }
         for (alias, identity, target) in std::mem::take(&mut self.pending_type_aliases) {
             let input = self.declared_type_identity_slot(alias, target);
             self.facts
@@ -3663,6 +4149,41 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     0,
                     ResolutionTypeTransferValueTransform::Preserve,
                 ));
+        }
+    }
+
+    fn finish_writes(&mut self) {
+        for (node, scope) in std::mem::take(&mut self.pending_writes) {
+            let target = node.child_by_field_name("left").filter(|left| {
+                matches!(left.kind(), "identifier" | "operator_identifier")
+                    && !left.is_missing()
+                    && !left.has_error()
+            });
+            let value = if node.kind() == "assignment_expression"
+                && target.is_some()
+                && let Some(right) = node.child_by_field_name("right")
+            {
+                self.expression_slot(right, scope)
+            } else {
+                // An assignment operator is a method application or a
+                // read/modify/write operation, never a copy of its RHS.
+                // An infix write already owns a call site and its receiver.
+                // Keep mutation uncertainty off that supported receiver.
+                let site =
+                    self.add_site_distinct(node, ResolutionSiteKind::UnsupportedExpression, scope);
+                self.gap(site, ResolutionGapKind::UnsupportedExpression);
+                self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue)
+            };
+            if let Some(target) = target {
+                if let Some(target) = self.sites_by_node.get(&target.id()).copied() {
+                    self.facts
+                        .local_writes
+                        .push(ResolutionLocalWriteFact { target, value });
+                } else {
+                    let site = self.facts.type_slots[value.index()].site;
+                    self.gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+                }
+            }
         }
     }
 
@@ -4943,6 +5464,9 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         scope: ResolutionScopeId,
     ) -> ResolutionTypeSlotId {
         let expression = expression_target_node(node);
+        if let Some(slot) = self.super_receiver_slots_by_node.get(&expression.id()) {
+            return *slot;
+        }
         if let Some(slot) = self.call_result_slots_by_node.get(&expression.id()) {
             return *slot;
         }
@@ -5399,6 +5923,48 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         id
     }
 
+    /// The receiver slot of one `super.member` selection. A second request for
+    /// the same selection (the callee's qualifier and the call's receiver)
+    /// reuses the slot, so both read one receiver type.
+    fn super_receiver_slot(
+        &mut self,
+        receiver: Node<'source>,
+        site: ResolutionSiteId,
+    ) -> ResolutionTypeSlotId {
+        if let Some(slot) = self.super_receiver_slots_by_node.get(&receiver.id()) {
+            return *slot;
+        }
+        let slot = self.add_slot(site, ResolutionTypeSlotRole::Receiver);
+        self.super_receiver_slots_by_node
+            .insert(receiver.id(), slot);
+        if let Some(owner) = self.enclosing_type_declaration_site(receiver) {
+            self.super_receivers.push((owner, slot));
+        } else {
+            self.gap(site, ResolutionGapKind::InferredType);
+        }
+        slot
+    }
+
+    /// The innermost template whose parent linearization answers `super`.
+    fn enclosing_type_declaration_site(&self, receiver: Node<'source>) -> Option<ResolutionSiteId> {
+        let mut ancestor = receiver.parent();
+        while let Some(node) = ancestor {
+            if matches!(
+                node.kind(),
+                "class_definition"
+                    | "trait_definition"
+                    | "object_definition"
+                    | "enum_definition"
+                    | "instance_expression"
+            ) && let Some(site) = self.declaration_sites.get(&node.id())
+            {
+                return Some(*site);
+            }
+            ancestor = node.parent();
+        }
+        None
+    }
+
     fn add_call_input_transfer(
         &mut self,
         input: ResolutionTypeSlotId,
@@ -5677,26 +6243,28 @@ fn declared_value_role(binder: Node<'_>, declaration: Node<'_>) -> Option<Declar
             == Some(binder))
         .then_some(DeclarationTypeRole::Parameter),
         "val_definition" | "var_definition" => {
-            let pattern = declaration.child_by_field_name("pattern")?;
-            (pattern == binder
-                || (pattern.kind() == "identifiers" && binder.parent() == Some(pattern)))
-            .then_some(DeclarationTypeRole::Value)
+            direct_value_binding(binder, declaration).then_some(DeclarationTypeRole::Value)
         }
         _ => None,
     }
 }
 
-fn untyped_initializer<'tree>(
-    binder: Node<'tree>,
-    declaration: Node<'tree>,
-) -> Option<Node<'tree>> {
+fn binder_initializer<'tree>(binder: Node<'tree>, declaration: Node<'tree>) -> Option<Node<'tree>> {
     if !matches!(declaration.kind(), "val_definition" | "var_definition")
-        || declaration.child_by_field_name("type").is_some()
+        || !direct_value_binding(binder, declaration)
     {
         return None;
     }
-    let pattern = declaration.child_by_field_name("pattern")?;
-    (pattern == binder).then(|| declaration.child_by_field_name("value"))?
+    declaration.child_by_field_name("value")
+}
+
+fn direct_value_binding(binder: Node<'_>, declaration: Node<'_>) -> bool {
+    declaration
+        .child_by_field_name("pattern")
+        .is_some_and(|pattern| {
+            pattern == binder
+                || (pattern.kind() == "identifiers" && binder.parent() == Some(pattern))
+        })
 }
 
 /// The lexical declaration kind of a binder that has no parser unit.
@@ -6138,6 +6706,12 @@ fn scope_is_ancestor(
 /// spelling.
 fn is_this_identifier(node: Node<'_>, source: &str) -> bool {
     node.kind() == "identifier" && node_text(node, source) == "this"
+}
+
+/// `super` is a keyword in this grammar's identifier position, not a value the
+/// source declares. Only a `super.member` selection gives it a type.
+fn is_super_identifier(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "identifier" && node_text(node, source) == "super"
 }
 
 fn is_this_or_super_identifier(node: Node<'_>, source: &str) -> bool {
@@ -7720,6 +8294,185 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#5015: Scala reassignments and typed local initializers had no observed value facts"
+    )]
+    fn local_writes_keep_initializer_values_and_isolate_labels_and_members() {
+        let source = r#"
+class Box(var member: String)
+object Writes {
+  def consume(value: String): String = value
+  def use(box: Box, items: Array[String]): Unit = {
+    var typed, sibling: String = "first"
+    var inferred = "second"
+    var count = 0
+    typed = inferred
+    inferred = if (true) "then" else "else"
+    consume(value = typed)
+    new Box(member = typed)
+    count += 1
+    box.member = typed
+    items(0) = inferred
+    box.member += typed
+    items(0) += inferred
+  }
+}
+"#;
+        let parsed = parse(source);
+        let facts = &parsed.resolution_facts;
+        let mut writes = facts.local_writes.iter().collect::<Vec<_>>();
+        writes.sort_unstable_by_key(|write| facts.sites[write.target.index()].start_byte);
+        let targets = writes
+            .iter()
+            .map(|write| {
+                let identifier = facts
+                    .identifiers
+                    .iter()
+                    .find(|identifier| identifier.site == write.target)
+                    .expect("write keeps the positioned LHS reference");
+                assert_eq!(identifier.role, ResolutionIdentifierRole::Reference);
+                assert!(identifier.qualifier.is_none());
+                facts.names[identifier.name.index()].spelling.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets, ["typed", "inferred", "count"]);
+        assert!(
+            facts
+                .binding_projections
+                .iter()
+                .any(|projection| projection.output == writes[0].value)
+        );
+        for write in &writes[1..] {
+            let site = facts.type_slots[write.value.index()].site;
+            assert!(
+                facts.gaps.iter().any(|gap| gap.site == site),
+                "{:?}",
+                facts.gaps
+            );
+            assert!(
+                !facts
+                    .type_transfers
+                    .iter()
+                    .any(|transfer| transfer.output == write.value)
+            );
+        }
+        for (name, kind) in [
+            ("typed", ResolutionTypeTransferKind::DeclaredType),
+            ("sibling", ResolutionTypeTransferKind::DeclaredType),
+            ("inferred", ResolutionTypeTransferKind::Initialization),
+            ("count", ResolutionTypeTransferKind::Initialization),
+        ] {
+            let binder = facts
+                .binders
+                .iter()
+                .find(|binder| {
+                    binder.kind == ResolutionBinderKind::Local
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == binder.declaration
+                                && facts.names[identifier.name.index()].spelling == name
+                        })
+                })
+                .expect("local binder");
+            let declared = facts
+                .declaration_type_slots
+                .iter()
+                .find(|slot| slot.declaration == binder.declaration)
+                .expect("declared value");
+            assert!(
+                facts
+                    .type_transfers
+                    .iter()
+                    .any(|transfer| { transfer.output == declared.slot && transfer.kind == kind })
+            );
+            let observations = facts
+                .type_transfers
+                .iter()
+                .filter(|transfer| {
+                    let output = facts.type_slots[transfer.output.index()];
+                    transfer.kind == ResolutionTypeTransferKind::Assignment
+                        && output.site == binder.declaration
+                        && output.role == ResolutionTypeSlotRole::AssignmentValue
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 1, "{name}: {observations:?}");
+            assert_ne!(observations[0].output, declared.slot);
+        }
+        for spelling in [
+            "box.member = typed",
+            "items(0) = inferred",
+            "box.member += typed",
+            "items(0) += inferred",
+        ] {
+            let gap = facts
+                .gaps
+                .iter()
+                .find(|gap| {
+                    let site = facts.sites[gap.site.index()];
+                    gap.kind == ResolutionGapKind::UnsupportedExpression
+                        && &source[site.start_byte..site.end_byte] == spelling
+                })
+                .expect("non-bare mutation remains explicitly unsupported");
+            let mutation = facts.sites[gap.site.index()];
+            assert_eq!(mutation.kind, ResolutionSiteKind::UnsupportedExpression);
+            for slot in facts.type_slots.iter().filter(|slot| {
+                slot.role == ResolutionTypeSlotRole::Receiver
+                    && facts.sites[slot.site.index()].start_byte >= mutation.start_byte
+                    && facts.sites[slot.site.index()].end_byte <= mutation.end_byte
+            }) {
+                assert_ne!(slot.site, gap.site, "{spelling}: {slot:?}");
+                assert!(
+                    !facts.gaps.iter().any(|gap| {
+                        gap.site == slot.site
+                            && gap.kind == ResolutionGapKind::UnsupportedExpression
+                    }),
+                    "{spelling}: {slot:?}"
+                );
+            }
+            assert!(
+                !facts
+                    .identifiers
+                    .iter()
+                    .any(|identifier| identifier.site == gap.site),
+                "mutation gap must not reuse a member reference"
+            );
+            for member in facts.sites.iter().filter(|site| {
+                site.kind == ResolutionSiteKind::MemberReference
+                    && site.start_byte >= mutation.start_byte
+                    && site.end_byte <= mutation.end_byte
+            }) {
+                assert!(
+                    !facts.gaps.iter().any(|gap| {
+                        gap.site == member.id
+                            && gap.kind == ResolutionGapKind::UnsupportedExpression
+                    }),
+                    "{spelling}: {member:?}"
+                );
+            }
+        }
+        for spelling in ["box.member += typed", "items(0) += inferred"] {
+            let call = facts
+                .sites
+                .iter()
+                .find(|site| {
+                    site.kind == ResolutionSiteKind::Call
+                        && &source[site.start_byte..site.end_byte] == spelling
+                })
+                .expect("compound mutation retains its infix call");
+            let has_receiver = facts
+                .type_slots
+                .iter()
+                .any(|slot| slot.site == call.id && slot.role == ResolutionTypeSlotRole::Receiver);
+            let has_unsupported_call_gap = facts.gaps.iter().any(|gap| {
+                gap.site == call.id && gap.kind == ResolutionGapKind::UnsupportedCallApplicability
+            });
+            assert!(
+                has_receiver || has_unsupported_call_gap,
+                "{spelling}: absent receiver must retain an explicit call-applicability gap"
+            );
+        }
+    }
+
+    #[test]
     fn scala_named_argument_labels_and_import_segments_have_positioned_references() {
         let source = "package app\n\
                      import scala.collection.mutable\n\
@@ -8038,6 +8791,73 @@ mod tests {
             gap.kind == ResolutionGapKind::UnsupportedRoute
                 && facts.sites[gap.site.index()].start_byte == export_start
         }));
+    }
+
+    #[test]
+    #[hardwon("#5015: destructured locals omitted unknown incoming values before reassignment")]
+    fn destructured_local_inputs_do_not_copy_the_tuple_or_gap_static_bindings() {
+        let parsed = parse(
+            "class Box\nobject Inputs {\n\
+             var (field, fieldNumber) = (new Box, 0)\n\
+             def use(parameter: Box): Unit = {\n\
+             var (current, n) = ((new Box): Box, 0)\n\
+             current = new Box\n\
+             var direct: Box = new Box\n\
+             var pending: Box\n}\n}\n",
+        );
+        let facts = &parsed.resolution_facts;
+        for name in ["current", "n", "direct", "pending", "field", "parameter"] {
+            let declaration = facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Declaration
+                        && facts.names[identifier.name.index()].spelling == name
+                })
+                .expect("binding declaration")
+                .site;
+            let observations = facts
+                .type_transfers
+                .iter()
+                .filter(|row| {
+                    row.kind == ResolutionTypeTransferKind::Assignment
+                        && facts.type_slots[row.output.index()].site == declaration
+                })
+                .collect::<Vec<_>>();
+            assert!(!facts.gaps.iter().any(|gap| gap.site == declaration));
+            if matches!(name, "current" | "n") {
+                assert_eq!(observations.len(), 1, "{name}: {observations:?}");
+                let input = observations[0].input;
+                let incoming = facts.type_slots[input.index()].site;
+                assert_ne!(incoming, declaration);
+                assert_eq!(
+                    facts.type_slots[observations[0].output.index()].role,
+                    ResolutionTypeSlotRole::AssignmentValue
+                );
+                assert!(facts.gaps.contains(&ResolutionGapFact {
+                    site: incoming,
+                    kind: ResolutionGapKind::InferredType,
+                }));
+                assert!(!facts.type_transfers.iter().any(|row| row.output == input));
+            } else if name == "direct" {
+                assert_eq!(observations.len(), 1);
+                let incoming = facts.type_slots[observations[0].input.index()].site;
+                assert!(!facts.gaps.iter().any(|gap| gap.site == incoming));
+            } else {
+                assert!(observations.is_empty(), "{name}: {observations:?}");
+            }
+            if matches!(name, "direct" | "pending" | "parameter") {
+                let declared = facts
+                    .declaration_type_slots
+                    .iter()
+                    .find(|row| row.declaration == declaration)
+                    .expect("written type keeps its declared slot");
+                assert!(facts.type_transfers.iter().any(|row| {
+                    row.output == declared.slot
+                        && row.kind == ResolutionTypeTransferKind::DeclaredType
+                }));
+            }
+        }
     }
 
     #[test]

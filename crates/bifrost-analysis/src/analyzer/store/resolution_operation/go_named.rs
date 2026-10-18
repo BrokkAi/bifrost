@@ -222,7 +222,7 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
   AND imports.complete=1 AND target.complete=1
   AND target.provider_kind IN ('standard','module')
   AND NOT EXISTS (SELECT 1 FROM main.go_package_files files
-                  WHERE files.package_id=target.package_id)
+                  WHERE files.package_id=target.package_id AND files.source_role<>'ignored')
 ORDER BY imports.source_spelling,target.tool_import_path
 "#;
 
@@ -252,7 +252,7 @@ const SELECTED_IMPORT_CONTEXT_FILES: &str = r#"
 WITH RECURSIVE reachable(package_id) AS (
   SELECT caller.package_id
   FROM main.go_context_source_files caller
-  WHERE caller.context_id=?1 AND caller.file_version_id=?2
+  WHERE caller.context_id=?1 AND caller.file_version_id=?2 AND caller.source_role<>'ignored'
   UNION
   SELECT imports.target_package_id
   FROM reachable
@@ -268,8 +268,8 @@ WITH RECURSIVE reachable(package_id) AS (
     ON package.context_id=source.context_id AND package.package_id=source.package_id
   JOIN main.workspace_file_versions files
     ON files.file_version_id=source.file_version_id
-  WHERE source.file_version_id=?2 OR source.source_role='go'
-     OR (source.source_role='test' AND package.for_test<>'')
+  WHERE source.source_role<>'ignored' AND (source.file_version_id=?2 OR source.source_role='go'
+     OR (source.source_role='test' AND package.for_test<>''))
 )
 SELECT rel_path, source_role FROM (
   SELECT source_files.rel_path, source_files.source_role
@@ -711,6 +711,80 @@ impl SelectedResolutionOperation<'_, '_> {
         drop(rows);
         drop(statement);
         Ok(source_role)
+    }
+
+    /// Classify an absent selected placement using publication evidence only.
+    pub(crate) fn go_graph_file_exclusion(
+        &self,
+        context_id: i64,
+        path: &str,
+        module_path: Option<&str>,
+    ) -> Result<super::graph_stage::GraphFileSkipReason> {
+        use super::graph_stage::GraphFileSkipReason;
+        let connection = self.ready.inventory.connection();
+        let version = if let Some(mount) = self.mount_table().mount_for_path("go", path)? {
+            let record = self
+                .ready
+                .inventory
+                .mount_record_by_ordinal(mount.ordinal())?;
+            super::go_context::go_placement_file_version(connection, &record)?
+        } else {
+            // Exclusion evidence does not require a resolution bundle. Bind an
+            // unmounted persisted source to this operation's exact revision;
+            // an overlay must prove its placement through the mounted branch.
+            connection
+                .query_row(
+                    "SELECT file.file_version_id FROM main.workspace_file_versions file
+                 JOIN temp.selected_workspace_revisions selected
+                   ON selected.workspace_id=file.workspace_id AND selected.lang=file.lang
+                  AND selected.generation=file.generation
+                 WHERE file.lang='go' AND file.rel_path=?1 AND file.input_kind='source'
+                   AND file.valid_from<=selected.revision
+                   AND (file.valid_until IS NULL OR selected.revision<file.valid_until)
+                   AND NOT EXISTS(SELECT 1 FROM temp.selected_resolution_overlay_masks mask
+                     WHERE mask.storage_language='go' AND mask.persisted_relative_path=?1)",
+                    [path],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        let Some(version) = version else {
+            return Ok(GraphFileSkipReason::Unplaced);
+        };
+        let ignored: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.go_context_source_files
+             WHERE context_id=?1 AND file_version_id=?2 AND source_role='ignored')",
+            rusqlite::params![context_id, version],
+            |row| row.get(0),
+        )?;
+        if ignored {
+            return Ok(GraphFileSkipReason::ExcludedBuildSelection);
+        }
+        let inventory: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.go_context_source_files source
+             JOIN main.go_package_instances package USING(package_id)
+             JOIN main.go_context_publications publication ON publication.context_id=source.context_id
+             JOIN main.go_context_heads head ON head.context_id=publication.context_id
+             JOIN main.go_context_selections selection ON selection.selection_id=head.selection_id
+             JOIN temp.selected_workspace_revisions selected
+               ON selected.workspace_id=selection.workspace_id AND selected.lang=selection.lang
+              AND selected.generation=selection.generation AND selected.revision=selection.revision
+             WHERE source.file_version_id=?1 AND package.provider_provenance='source_inventory')",
+            [version], |row| row.get(0),
+        )?;
+        if let Some(module_path) = module_path.filter(|_| inventory) {
+            let selected: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.go_package_instances
+                 WHERE context_id=?1 AND provider_module_path=?2 AND provider_provenance='go_tool')",
+                rusqlite::params![context_id, module_path], |row| row.get(0),
+            )?;
+            if !selected {
+                return Ok(GraphFileSkipReason::OutsideSelectedModules {
+                    module_path: module_path.to_owned(),
+                });
+            }
+        }
+        Ok(GraphFileSkipReason::Unplaced)
     }
 
     pub(crate) fn go_package_stage_unit_for_path(

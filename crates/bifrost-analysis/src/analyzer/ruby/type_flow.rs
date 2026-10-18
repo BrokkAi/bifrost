@@ -535,6 +535,9 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
                 .semantic_model_overlay()
                 .map(|overlay| external_member_lookup(&overlay, kind, symbol_id, member))
                 .unwrap_or(MemberLookup::Unknown(UnknownReason::ExternalNotModeled)),
+            ClassIdentity::Intrinsic { .. } => {
+                MemberLookup::Unknown(UnknownReason::ExternalNotModeled)
+            }
         }
     }
 

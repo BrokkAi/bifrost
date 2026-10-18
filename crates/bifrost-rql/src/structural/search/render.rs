@@ -1667,32 +1667,79 @@ pub(super) fn render_member_family_edge_ref(
     }
 }
 
+pub(super) fn python_hierarchy_endpoint_id(
+    analyzer: &dyn IAnalyzer,
+    endpoint: &crate::analyzer::semantic::type_flow::ClassIdentity,
+) -> String {
+    use crate::analyzer::semantic::type_flow::ClassIdentity;
+    match endpoint {
+        ClassIdentity::Workspace(unit) => canonical_member_digest(analyzer, unit),
+        ClassIdentity::External { symbol_id, .. } => symbol_id.to_string(),
+        ClassIdentity::Intrinsic { qualified_name } => {
+            format!("python.intrinsic.{qualified_name}")
+        }
+    }
+}
+
+fn render_python_hierarchy_endpoint(
+    analyzer: &dyn IAnalyzer,
+    endpoint: &crate::analyzer::semantic::type_flow::ClassIdentity,
+    canonical_id: &str,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryPythonHierarchyEndpoint {
+    use crate::analyzer::semantic::type_flow::ClassIdentity;
+    match endpoint {
+        ClassIdentity::Workspace(unit) => CodeQueryPythonHierarchyEndpoint::Source {
+            canonical_declaration_id: canonical_id.to_owned(),
+            declaration: render_unit_declaration(analyzer, unit, detail, cache),
+        },
+        ClassIdentity::External {
+            qualified_name,
+            symbol_id,
+        } => CodeQueryPythonHierarchyEndpoint::ExternalClass {
+            canonical_symbol_id: symbol_id.to_string(),
+            qualified_name: qualified_name.to_string(),
+        },
+        ClassIdentity::Intrinsic { qualified_name } => {
+            CodeQueryPythonHierarchyEndpoint::ExternalClass {
+                canonical_symbol_id: format!("python.intrinsic.{qualified_name}"),
+                qualified_name: qualified_name.to_string(),
+            }
+        }
+    }
+}
+
 pub(super) fn render_python_hierarchy_fact(
     analyzer: &dyn IAnalyzer,
     value: &PythonHierarchyFactValue,
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryPythonHierarchyFact {
-    let declaration = value
-        .declaration
-        .as_ref()
-        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
-    let owner = value
-        .owner
-        .as_ref()
-        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
-    let target = value
-        .target
-        .as_ref()
-        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
-    let target_owner = value
-        .target_owner
-        .as_ref()
-        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
+    let endpoint = |identity: &Option<crate::analyzer::semantic::type_flow::ClassIdentity>,
+                    slot: usize,
+                    cache: &mut PipelineRenderCache| {
+        identity.as_ref().map(|identity| {
+            render_python_hierarchy_endpoint(
+                analyzer,
+                identity,
+                value.endpoint_ids[slot]
+                    .as_deref()
+                    .expect("pipeline finalized canonical endpoint"),
+                detail,
+                cache,
+            )
+        })
+    };
+    let declaration = endpoint(&value.declaration, 0, cache);
+    let owner = endpoint(&value.owner, 1, cache);
+    let target = endpoint(&value.target, 2, cache);
+    let target_owner = endpoint(&value.target_owner, 3, cache);
     let root = render_unit_declaration(analyzer, &value.root.unit, detail, cache);
     CodeQueryPythonHierarchyFact {
         id: value.id(),
         root_id: value.root_id.clone(),
+        ancestry_basis: value.ancestry_basis.clone(),
         path: rel_path_string(value.file()),
         language: crate::analyzer::common::language_for_file(value.file()).config_label(),
         range: render_source_range(
@@ -1710,25 +1757,13 @@ pub(super) fn render_python_hierarchy_fact(
         ordinal: value.ordinal,
         base_spelling: value.base_spelling.clone(),
         base_resolution: value.base_resolution,
-        declaration_id: value
-            .declaration
-            .as_ref()
-            .map(|unit| canonical_member_digest(analyzer, unit)),
+        declaration_id: value.endpoint_ids[0].clone(),
         declaration,
-        owner_id: value
-            .owner
-            .as_ref()
-            .map(|unit| canonical_member_digest(analyzer, unit)),
+        owner_id: value.endpoint_ids[1].clone(),
         owner,
-        target_id: value
-            .target
-            .as_ref()
-            .map(|unit| canonical_member_digest(analyzer, unit)),
+        target_id: value.endpoint_ids[2].clone(),
         target,
-        target_owner_id: value
-            .target_owner
-            .as_ref()
-            .map(|unit| canonical_member_digest(analyzer, unit)),
+        target_owner_id: value.endpoint_ids[3].clone(),
         target_owner,
         member_name: value.member_name.clone(),
         mro_rank: value.mro_rank,
@@ -1800,6 +1835,11 @@ pub(super) fn render_python_hierarchy_fact_ref(
     CodeQueryResultRef::PythonHierarchyFact {
         id: value.id(),
         root_id: value.root_id.clone(),
+        declaration_id: value.endpoint_ids[0].clone(),
+        owner_id: value.endpoint_ids[1].clone(),
+        target_id: value.endpoint_ids[2].clone(),
+        target_owner_id: value.endpoint_ids[3].clone(),
+        ancestry_basis: value.ancestry_basis.clone(),
         path: rel_path_string(value.file()),
         range: render_source_range(
             analyzer,
@@ -1809,6 +1849,8 @@ pub(super) fn render_python_hierarchy_fact_ref(
         ),
         fact_kind: value.fact_kind,
         outcome: value.outcome,
+        coverage: value.coverage,
+        reason: value.reason,
     }
 }
 

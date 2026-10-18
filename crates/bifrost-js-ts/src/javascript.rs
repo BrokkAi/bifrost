@@ -18,7 +18,7 @@ use crate::imports::{
 };
 use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
-use crate::primary::JsTsParsedFile;
+use crate::primary::{JsTsParsedFile, StructuralOwnerClaim};
 use crate::syntax::{
     expression_preserves_parameter_shape, function_returns_parameter_shape,
     js_program_is_external_module, parameter_name_at_index,
@@ -51,16 +51,14 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
     };
     let mut module_has_imports = false;
     let lexical_bindings = crate::syntax::JsTsLexicalBindingIndex::build(root, source);
-    let exported_roots = js_exported_binding_roots(root, source);
-    let mut assignment_state = JsAssignmentDeclarationState::new(
-        js_commonjs_exported_roots(root, source),
-        js_commonjs_exported_members(root, source),
-    );
+    let mut assignment_state = JsAssignmentDeclarations::new(root, source, &lexical_bindings);
+    let exported_roots = js_exported_binding_roots(root, source, &assignment_state.state.commonjs);
     crate::primary::parse_primary_with_lexical_bindings(
         source,
         tree,
         &crate::structural::JAVASCRIPT_STRUCTURAL_SPEC,
         lexical_bindings,
+        assignment_state.commonjs().clone(),
         |parsed, event| {
             if blocked {
                 return;
@@ -117,66 +115,10 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                             _ => {}
                         }
                     }
-                    register_js_assignment_declaration_name(child, source, &mut assignment_state);
-                    if let Some(scope) = js_assignment_scope_kind(child) {
-                        assignment_state.enter_scope(scope);
-                        register_js_assignment_parameters(child, source, &mut assignment_state);
-                    }
-                    register_js_assignment_variable(
-                        child,
-                        parent_kind,
-                        source,
-                        &mut assignment_state,
-                    );
-                    if child.kind() == "variable_declarator"
-                        && assignment_state.scopes.len() > 1
-                        && let Some(name) = child
-                            .child_by_field_name("name")
-                            .filter(|name| name.kind() == "identifier")
-                        && let Some(object) = child
-                            .child_by_field_name("value")
-                            .and_then(crate::syntax::js_ts_object_literal_value)
-                    {
-                        // Local literal keys have the same lookup-only surface as
-                        // properties established by local member assignments.
-                        // Do not publish the local binding as a global declaration.
-                        let binding_name = name;
-                        let name = node_text(binding_name, source);
-                        let fq = parsed
-                            .local_binding_fq(child, binding_name, name)
-                            .expect("local object literal binder has an indexed binding scope");
-                        let short_name = fq.display_native(file.language(), segment_interner());
-                        let owner = CodeUnit::new_fq(
-                            file.clone(),
-                            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-                            "",
-                            short_name,
-                            fq,
-                        );
-                        visit_js_object_literal_properties_for_surface(
-                            file,
-                            source,
-                            object,
-                            &owner,
-                            &owner,
-                            parsed,
-                            JsAssignmentSymbolSurface::DefinitionLookupOnly,
-                        );
-                    }
-                    if child.kind() == "assignment_expression" {
-                        visit_js_assignment_expression(
-                            file,
-                            source,
-                            child,
-                            parsed,
-                            &assignment_state,
-                        );
-                    }
+                    assignment_state.enter(file, source, child, parent_kind, parsed);
                 }
                 crate::primary::PrimaryEvent::Exit { node } => {
-                    if js_assignment_scope_kind(node).is_some() {
-                        assignment_state.exit_scope();
-                    }
+                    assignment_state.exit(node);
                     if node.id() == root.id() && module_has_imports {
                         parsed.add_code_unit(module.clone(), root, source, None, None);
                     }
@@ -863,8 +805,12 @@ fn js_object_literal_property_name(node: Node<'_>, source: &str) -> Option<Strin
     crate::typescript::ts_object_literal_property_name(node, source)
 }
 
-fn js_exported_binding_roots(root: Node<'_>, source: &str) -> HashSet<String> {
-    let mut roots = js_commonjs_exported_roots(root, source);
+fn js_exported_binding_roots(
+    root: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> HashSet<String> {
+    let mut roots = js_commonjs_exported_roots(root, source, commonjs);
     roots.extend(crate::identifiers::es_named_exported_roots(root, source));
     roots
 }
@@ -1140,6 +1086,92 @@ fn js_parameter_label_node(parameter: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// The shared JS/TS member-assignment and local-object extraction walk.
+pub(crate) struct JsAssignmentDeclarations {
+    state: JsAssignmentDeclarationState,
+}
+
+impl JsAssignmentDeclarations {
+    pub(crate) fn new(
+        root: Node<'_>,
+        source: &str,
+        lexical: &crate::syntax::JsTsLexicalBindingIndex,
+    ) -> Self {
+        let commonjs = crate::commonjs::CommonJsObjects::new(root, source, lexical);
+        Self {
+            state: JsAssignmentDeclarationState::new(
+                js_commonjs_exported_roots(root, source, &commonjs),
+                js_commonjs_exported_members(root, source, &commonjs),
+                commonjs,
+            ),
+        }
+    }
+
+    pub(crate) fn commonjs(&self) -> &crate::commonjs::CommonJsObjects {
+        &self.state.commonjs
+    }
+
+    pub(crate) fn enter(
+        &mut self,
+        file: &ProjectFile,
+        source: &str,
+        node: Node<'_>,
+        parent_kind: Option<&str>,
+        parsed: &mut JsTsParsedFile<'_>,
+    ) {
+        register_js_assignment_declaration_name(node, source, &mut self.state);
+        if let Some(scope) = js_assignment_scope_kind(node) {
+            self.state.enter_scope(scope);
+            register_js_assignment_parameters(node, source, &mut self.state);
+        }
+        register_js_assignment_variable(node, parent_kind, source, &mut self.state);
+        if node.kind() == "variable_declarator"
+            && self.state.scopes.len() > 1
+            && let Some(name) = node
+                .child_by_field_name("name")
+                .filter(|name| name.kind() == "identifier")
+            && let Some(object) = node
+                .child_by_field_name("value")
+                .and_then(crate::syntax::js_ts_object_literal_value)
+        {
+            // Local literal keys have the same lookup-only surface as
+            // properties established by local member assignments.
+            // Do not publish the local binding as a global declaration.
+            let binding_name = name;
+            let name = node_text(binding_name, source);
+            let fq = parsed
+                .local_binding_fq(binding_name, name)
+                .expect("local object literal binder has an indexed binding scope");
+            let short_name = fq.display_native(file.language(), segment_interner());
+            let owner = CodeUnit::new_fq(
+                file.clone(),
+                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+                "",
+                short_name,
+                fq,
+            );
+            visit_js_object_literal_properties_for_surface(
+                file,
+                source,
+                object,
+                &owner,
+                &owner,
+                parsed,
+                JsAssignmentSymbolSurface::DefinitionLookupOnly,
+            );
+        }
+        if node.kind() == "assignment_expression" {
+            visit_js_assignment_expression(file, source, node, parsed, &self.state);
+        }
+    }
+
+    pub(crate) fn exit(&mut self, node: Node<'_>) {
+        if js_assignment_scope_kind(node).is_some() {
+            self.state.exit_scope();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JsAssignmentBindingKind {
     /// A parameter or a local whose value comes from elsewhere. The object it
@@ -1172,6 +1204,7 @@ struct JsMemberAssignmentTarget {
     /// `name` string exactly.
     fq: FqName,
     surface: JsAssignmentSymbolSurface,
+    owner: StructuralOwnerClaim,
 }
 
 struct JsAssignmentScope {
@@ -1192,17 +1225,20 @@ struct JsAssignmentDeclarationState {
     scopes: Vec<JsAssignmentScope>,
     commonjs_exported_roots: HashSet<String>,
     commonjs_exported_members: HashSet<String>,
+    commonjs: crate::commonjs::CommonJsObjects,
 }
 
 impl JsAssignmentDeclarationState {
     fn new(
         commonjs_exported_roots: HashSet<String>,
         commonjs_exported_members: HashSet<String>,
+        commonjs: crate::commonjs::CommonJsObjects,
     ) -> Self {
         Self {
             scopes: vec![JsAssignmentScope::new(JsAssignmentScopeKind::Function)],
             commonjs_exported_roots,
             commonjs_exported_members,
+            commonjs,
         }
     }
 
@@ -1248,14 +1284,13 @@ impl JsAssignmentDeclarationState {
         &self,
         name: &str,
         declarator: Node<'_>,
-        source: &str,
     ) -> JsAssignmentBindingKind {
         if self.commonjs_exported_roots.contains(name)
             || declarator
                 .child_by_field_name("value")
                 .is_some_and(|value| {
                     js_assignment_value_is_declaration_root(value)
-                        || js_assignment_value_exports_commonjs_root(value, source)
+                        || js_assignment_value_exports_commonjs_root(value, &self.commonjs)
                 })
         {
             JsAssignmentBindingKind::DeclarationRoot
@@ -1307,13 +1342,16 @@ fn register_js_assignment_parameters(
 ) {
     let mut names = Vec::new();
     if let Some(parameters) = node.child_by_field_name("parameters") {
-        collect_js_assignment_binding_names(parameters, source, &mut names);
+        names.extend(crate::syntax::pattern_binder_identifiers(parameters));
     }
     if let Some(parameter) = node.child_by_field_name("parameter") {
-        collect_js_assignment_binding_names(parameter, source, &mut names);
+        names.extend(crate::syntax::pattern_binder_identifiers(parameter));
     }
     for name in names {
-        state.declare_current(&name, JsAssignmentBindingKind::PlainLocal);
+        state.declare_current(
+            node_text(name, source).trim(),
+            JsAssignmentBindingKind::PlainLocal,
+        );
     }
 }
 
@@ -1329,55 +1367,13 @@ fn register_js_assignment_variable(
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
-    let mut names = Vec::new();
-    collect_js_assignment_binding_names(name_node, source, &mut names);
-    for name in names {
-        let kind = state.binding_kind_for_declarator(&name, node, source);
+    for name in crate::syntax::pattern_binder_identifiers(name_node) {
+        let name = node_text(name, source).trim();
+        let kind = state.binding_kind_for_declarator(name, node);
         if parent_kind == Some("variable_declaration") {
-            state.declare_function_scoped(&name, kind);
+            state.declare_function_scoped(name, kind);
         } else {
-            state.declare_current(&name, kind);
-        }
-    }
-}
-
-fn collect_js_assignment_binding_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
-    match node.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
-            let name = node_text(node, source).trim();
-            if !name.is_empty() {
-                names.push(name.to_string());
-            }
-            return;
-        }
-        "assignment_pattern" => {
-            if let Some(left) = node.child_by_field_name("left") {
-                collect_js_assignment_binding_names(left, source, names);
-            }
-            return;
-        }
-        // The TSX grammar's spelling of the same parameter (#3322): the
-        // binding is `pattern` and the default is the sibling `value`, so
-        // falling through to "every named child" would bind the names the
-        // default expression merely reads -- `process` in
-        // `run(argv = process.argv.slice(2))`.
-        "required_parameter" | "optional_parameter" => {
-            if let Some(pattern) = node.child_by_field_name("pattern") {
-                collect_js_assignment_binding_names(pattern, source, names);
-            }
-            return;
-        }
-        "rest_pattern" => {
-            if let Some(child) = node.named_child(0) {
-                collect_js_assignment_binding_names(child, source, names);
-            }
-            return;
-        }
-        _ => {}
-    }
-    for index in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(index) {
-            collect_js_assignment_binding_names(child, source, names);
+            state.declare_current(name, kind);
         }
     }
 }
@@ -1389,19 +1385,23 @@ fn js_assignment_value_is_declaration_root(value: Node<'_>) -> bool {
     )
 }
 
-fn js_assignment_value_exports_commonjs_root(value: Node<'_>, source: &str) -> bool {
-    if value.kind() != "assignment_expression" {
-        return false;
+fn js_assignment_value_exports_commonjs_root(
+    mut value: Node<'_>,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> bool {
+    while value.kind() == "assignment_expression" {
+        if value
+            .child_by_field_name("left")
+            .is_some_and(|left| js_is_commonjs_export_assignment_target(left, commonjs))
+        {
+            return true;
+        }
+        let Some(right) = value.child_by_field_name("right") else {
+            return false;
+        };
+        value = right;
     }
-    if value
-        .child_by_field_name("left")
-        .is_some_and(|left| js_is_commonjs_export_assignment_target(left, source))
-    {
-        return true;
-    }
-    value
-        .child_by_field_name("right")
-        .is_some_and(|right| js_assignment_value_exports_commonjs_root(right, source))
+    false
 }
 
 fn visit_js_assignment_expression(
@@ -1415,7 +1415,7 @@ fn visit_js_assignment_expression(
         return;
     };
     let value = node.child_by_field_name("right");
-    if js_is_commonjs_root_export_assignment_target(left, source)
+    if state.commonjs.is_exports(left)
         && let Some(value) = value
         && let Some(object) = crate::syntax::js_ts_object_literal_value(value)
     {
@@ -1430,7 +1430,7 @@ fn visit_js_assignment_expression(
     }
     let value_is_function =
         value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
-    let Some(target) = js_commonjs_export_assignment_name(left, value, source)
+    let Some(target) = js_commonjs_export_assignment_name(left, value, source, &state.commonjs)
         .map(|name| {
             let fq =
                 FqName::new().with_pushed(segment_interner().intern(&name, SegmentKind::Member));
@@ -1438,6 +1438,7 @@ fn visit_js_assignment_expression(
                 name,
                 fq,
                 surface: JsAssignmentSymbolSurface::Declaration,
+                owner: StructuralOwnerClaim::Root,
             }
         })
         .or_else(|| js_member_assignment_target(left, source, state, parsed))
@@ -1453,7 +1454,14 @@ fn visit_js_assignment_expression(
         .fq
         .display_native(file.language(), segment_interner());
     let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, target.fq);
-    add_js_assignment_code_unit(parsed, target.surface, code_unit.clone(), node, source);
+    add_js_assignment_code_unit(
+        parsed,
+        target.surface,
+        target.owner,
+        code_unit.clone(),
+        node,
+        source,
+    );
     let (signature, parameter_text) = js_assignment_signature(node, left, value, source);
     if let Some(value) = value.filter(|_| value_is_function) {
         parsed.add_signature_with_metadata(
@@ -1485,13 +1493,14 @@ fn visit_js_assignment_expression(
 fn add_js_assignment_code_unit(
     parsed: &mut JsTsParsedFile<'_>,
     surface: JsAssignmentSymbolSurface,
+    owner: StructuralOwnerClaim,
     code_unit: CodeUnit,
     node: Node<'_>,
     source: &str,
 ) {
     match surface {
         JsAssignmentSymbolSurface::Declaration => {
-            parsed.add_code_unit(code_unit.clone(), node, source, None, Some(code_unit));
+            parsed.add_assignment_code_unit(code_unit, node, owner);
         }
         JsAssignmentSymbolSurface::DefinitionLookupOnly => {
             parsed.add_definition_lookup_unit(code_unit, node, source);
@@ -1503,6 +1512,7 @@ fn js_commonjs_export_assignment_name(
     left: Node<'_>,
     value: Option<Node<'_>>,
     source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
 ) -> Option<String> {
     let exposes_surface = value.is_some_and(|value| {
         matches!(value.kind(), "arrow_function" | "function_expression")
@@ -1512,11 +1522,15 @@ fn js_commonjs_export_assignment_name(
     if !exposes_surface {
         return None;
     }
-    let property = js_commonjs_export_assignment_property(left, source)?;
+    let property = js_commonjs_export_assignment_property(left, source, commonjs)?;
     (!property.is_empty()).then_some(property)
 }
 
-fn js_commonjs_export_assignment_property(node: Node<'_>, source: &str) -> Option<String> {
+fn js_commonjs_export_assignment_property(
+    node: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> Option<String> {
     if node.kind() != "member_expression" {
         return None;
     }
@@ -1531,9 +1545,7 @@ fn js_commonjs_export_assignment_property(node: Node<'_>, source: &str) -> Optio
         .trim_matches('\'')
         .to_string();
 
-    if object.kind() == "identifier" && trimmed_identifier_text(object, source) == Some("exports")
-        || js_is_module_exports_object(object, source)
-    {
+    if commonjs.is_exports(object) {
         return Some(property_name);
     }
 
@@ -1546,99 +1558,104 @@ fn js_member_assignment_target(
     state: &JsAssignmentDeclarationState,
     parsed: &JsTsParsedFile<'_>,
 ) -> Option<JsMemberAssignmentTarget> {
-    if node.kind() != "member_expression" {
+    if node.kind() != "member_expression"
+        || js_is_commonjs_export_assignment_target(node, &state.commonjs)
+    {
         return None;
     }
-    if js_is_commonjs_export_assignment_target(node, source) {
-        return None;
-    }
-    let object = node.child_by_field_name("object")?;
-    let property = node.child_by_field_name("property")?;
-    if property.kind() == "computed_property_name" {
-        return None;
-    }
-    // `receiver.#name = value` is never a declaration site. A private name is
-    // only legal inside a class body that already declares it, so the field
-    // this writes to was already indexed with its exact class owner (#1926);
-    // minting a parentless unit here would duplicate it under a name that
-    // renders identically but carries different segment kinds. Declining also
-    // makes the recursion below reject a chain rooted through a private
-    // segment, such as `child.#out.length`.
-    if property.kind() == "private_property_identifier" {
-        return None;
-    }
-    let (object_name, object_fq) = match object.kind() {
-        "identifier" | "property_identifier" => {
-            let object_name = node_text(object, source).trim().to_string();
-            let object_fq =
-                if state.binding_of(&object_name) == Some(JsAssignmentBindingKind::LocalObject) {
-                    parsed
-                        .local_binding_fq(object, object, &object_name)
-                        .expect("local assignment receiver has an indexed binding scope")
-                } else {
-                    FqName::new()
-                        .with_pushed(segment_interner().intern(&object_name, SegmentKind::Member))
-                };
-            (object_name, object_fq)
-        }
-        "member_expression" => {
-            let nested = js_member_assignment_target(object, source, state, parsed)?;
-            (nested.name, nested.fq)
-        }
-        _ => return None,
+    // Reject dynamic/private segments through the shared structured chain.
+    // Classify the indexed binding before source capture, including hoisted
+    // roots and distinct environments sharing one syntactic owner (#5589).
+    let receiver = crate::syntax::static_member_receiver(node, source)?;
+    let root_name = node_text(receiver.root, source).trim();
+    let binding_kind = js_receiver_binding_kind(receiver.root, root_name, state, parsed);
+    let mut fq = if matches!(root_name, "exports" | "module")
+        && parsed.binding_is_local(receiver.root, root_name)
+        || binding_kind == Some(JsAssignmentBindingKind::LocalObject)
+    {
+        parsed
+            .local_receiver_fq(receiver.root, root_name)
+            .expect("local assignment receiver has an indexed binding scope")
+    } else if binding_kind == Some(JsAssignmentBindingKind::DeclarationRoot) {
+        parsed.declaration_receiver_fq(receiver.root, root_name)?
+    } else {
+        FqName::new().with_pushed(segment_interner().intern(root_name, SegmentKind::Member))
     };
-    let property_name = node_text(property, source)
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'');
-    if object_name.is_empty() || property_name.is_empty() {
-        return None;
+    let mut name = root_name.to_string();
+    for property in &receiver.members {
+        let property_name = node_text(*property, source);
+        name.push('.');
+        name.push_str(property_name);
+        fq.push(segment_interner().intern(property_name, SegmentKind::Member));
     }
-    let name = format!("{object_name}.{property_name}");
-    let fq = object_fq.with_pushed(segment_interner().intern(property_name, SegmentKind::Member));
-    let surface = if state.commonjs_exported_members.contains(&name) {
+    let has_export_spelling = root_name == "exports"
+        || root_name == "module"
+            && receiver
+                .members
+                .first()
+                .is_some_and(|property| node_text(*property, source) == "exports");
+    let surface = if state.commonjs_exported_members.contains(&name) || has_export_spelling {
         JsAssignmentSymbolSurface::Declaration
-    } else if js_member_assignment_has_plain_local_root(node, source, state) {
+    } else if matches!(
+        binding_kind,
+        Some(JsAssignmentBindingKind::PlainLocal | JsAssignmentBindingKind::LocalObject)
+    ) {
         JsAssignmentSymbolSurface::DefinitionLookupOnly
     } else {
         JsAssignmentSymbolSurface::Declaration
     };
-    Some(JsMemberAssignmentTarget { name, fq, surface })
+    Some(JsMemberAssignmentTarget {
+        name,
+        fq,
+        surface,
+        owner: StructuralOwnerClaim::UnspecifiedMember,
+    })
 }
 
-fn js_member_assignment_has_plain_local_root(
-    node: Node<'_>,
-    source: &str,
+fn js_receiver_binding_kind(
+    receiver: Node<'_>,
+    name: &str,
     state: &JsAssignmentDeclarationState,
-) -> bool {
-    let Some(root) = js_member_expression_root_identifier(node, source) else {
-        return false;
-    };
-    matches!(
-        state.binding_of(root),
-        Some(JsAssignmentBindingKind::PlainLocal | JsAssignmentBindingKind::LocalObject)
-    )
-}
-
-fn js_member_expression_root_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    match node.kind() {
-        "identifier" | "property_identifier" => {
-            let text = node_text(node, source).trim();
-            (!text.is_empty()).then_some(text)
+    parsed: &JsTsParsedFile<'_>,
+) -> Option<JsAssignmentBindingKind> {
+    use crate::syntax::JsTsReceiverDeclarationKind;
+    match parsed.receiver_binding_kind(receiver, name, |target| {
+        js_is_commonjs_export_assignment_target(target, &state.commonjs)
+    }) {
+        Some(JsTsReceiverDeclarationKind::DeclarationRoot) => {
+            Some(JsAssignmentBindingKind::DeclarationRoot)
         }
-        "member_expression" => node
-            .child_by_field_name("object")
-            .and_then(|object| js_member_expression_root_identifier(object, source)),
-        _ => None,
+        Some(JsTsReceiverDeclarationKind::LocalObject)
+            if !state.commonjs_exported_roots.contains(name) =>
+        {
+            Some(JsAssignmentBindingKind::LocalObject)
+        }
+        Some(JsTsReceiverDeclarationKind::LocalObject) => {
+            Some(JsAssignmentBindingKind::DeclarationRoot)
+        }
+        Some(JsTsReceiverDeclarationKind::PlainLocal)
+            if state.commonjs_exported_roots.contains(name)
+                && state.binding_of(name) == Some(JsAssignmentBindingKind::DeclarationRoot) =>
+        {
+            Some(JsAssignmentBindingKind::DeclarationRoot)
+        }
+        Some(
+            JsTsReceiverDeclarationKind::PlainLocal | JsTsReceiverDeclarationKind::Unsupported,
+        ) => Some(JsAssignmentBindingKind::PlainLocal),
+        None => state.binding_of(name),
     }
 }
 
-fn js_commonjs_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
+fn js_commonjs_exported_roots(
+    root: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> HashSet<String> {
     let mut roots = HashSet::default();
     walk_named_tree_preorder(root, true, |node| {
         if node.kind() == "assignment_expression"
             && let Some(left) = node.child_by_field_name("left")
-            && js_is_commonjs_root_or_property_export_assignment_target(left, source)
+            && js_is_commonjs_export_assignment_target(left, commonjs)
             && let Some(right) = node.child_by_field_name("right")
             && let Some(root) = js_commonjs_exported_root_identifier(right, source)
         {
@@ -1649,12 +1666,16 @@ fn js_commonjs_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
     roots
 }
 
-fn js_commonjs_exported_members(root: Node<'_>, source: &str) -> HashSet<String> {
+fn js_commonjs_exported_members(
+    root: Node<'_>,
+    source: &str,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> HashSet<String> {
     let mut members = HashSet::default();
     walk_named_tree_preorder(root, true, |node| {
         if node.kind() == "assignment_expression"
             && let Some(left) = node.child_by_field_name("left")
-            && js_is_commonjs_export_assignment_target(left, source)
+            && js_is_commonjs_export_assignment_target(left, commonjs)
             && let Some(right) = node.child_by_field_name("right")
             && let Some(member) = js_member_expression_name(right, source)
         {
@@ -1666,27 +1687,13 @@ fn js_commonjs_exported_members(root: Node<'_>, source: &str) -> HashSet<String>
 }
 
 fn js_member_expression_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "property_identifier" => {
-            let text = node_text(node, source).trim();
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        "member_expression" => {
-            let object = node.child_by_field_name("object")?;
-            let property = node.child_by_field_name("property")?;
-            if property.kind() == "computed_property_name" {
-                return None;
-            }
-            let object_name = js_member_expression_name(object, source)?;
-            let property_name = node_text(property, source)
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'');
-            (!object_name.is_empty() && !property_name.is_empty())
-                .then(|| format!("{object_name}.{property_name}"))
-        }
-        _ => None,
+    let receiver = crate::syntax::static_member_receiver(node, source)?;
+    let mut name = node_text(receiver.root, source).to_string();
+    for member in receiver.members {
+        name.push('.');
+        name.push_str(node_text(member, source));
     }
+    Some(name)
 }
 
 fn js_commonjs_exported_root_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -1697,48 +1704,19 @@ fn js_commonjs_exported_root_identifier<'a>(node: Node<'_>, source: &'a str) -> 
     }
 }
 
-fn js_is_commonjs_root_export_assignment_target(node: Node<'_>, source: &str) -> bool {
-    (node.kind() == "identifier" && trimmed_identifier_text(node, source) == Some("exports"))
-        || js_is_module_exports_object(node, source)
-}
-
-fn js_is_commonjs_root_or_property_export_assignment_target(node: Node<'_>, source: &str) -> bool {
-    js_is_commonjs_root_export_assignment_target(node, source)
-        || js_commonjs_root_identifier_node(node, source).is_some()
-}
-
-fn js_is_commonjs_export_assignment_target(node: Node<'_>, source: &str) -> bool {
-    js_commonjs_root_identifier_node(node, source).is_some()
-}
-
-fn js_commonjs_root_identifier_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-    match node.kind() {
-        "identifier" => (trimmed_identifier_text(node, source) == Some("exports")).then_some(node),
-        "member_expression" => {
-            if js_is_module_exports_object(node, source) {
-                return node.child_by_field_name("object");
-            }
-            node.child_by_field_name("object")
-                .and_then(|object| js_commonjs_root_identifier_node(object, source))
+fn js_is_commonjs_export_assignment_target(
+    mut node: Node<'_>,
+    commonjs: &crate::commonjs::CommonJsObjects,
+) -> bool {
+    loop {
+        if commonjs.is_exports(node) {
+            return true;
         }
-        _ => None,
+        let Some(object) = node.child_by_field_name("object") else {
+            return false;
+        };
+        node = object;
     }
-}
-
-fn js_is_module_exports_object(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != "member_expression" {
-        return false;
-    }
-    let Some(object) = node.child_by_field_name("object") else {
-        return false;
-    };
-    let Some(property) = node.child_by_field_name("property") else {
-        return false;
-    };
-    object.kind() == "identifier"
-        && property.kind() == "property_identifier"
-        && trimmed_identifier_text(object, source) == Some("module")
-        && trimmed_identifier_text(property, source) == Some("exports")
 }
 
 fn js_assignment_signature(
@@ -2144,5 +2122,78 @@ mod jsx_declaration_tests {
                 .collect::<Vec<_>>(),
             ["props"]
         );
+    }
+}
+
+#[cfg(test)]
+mod bundled_export_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#3864: distinct bundled exports.default declarations merged across factories")]
+    fn bundled_export_owners_are_distinct_and_contain_members() {
+        for (source, expected_owners) in [
+            (include_str!("../fixtures/3864/bundle.js"), 2),
+            (include_str!("../fixtures/3864/mixed-wrappers.js"), 3),
+        ] {
+            for (extension, tree) in [
+                ("js", crate::test_support::parse_javascript(source)),
+                ("ts", crate::test_support::parse_typescript(source)),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let file = ProjectFile::new(
+                    directory.path().canonicalize().unwrap(),
+                    format!("bundle.{extension}"),
+                );
+                assert!(!tree.root_node().has_error());
+                let parsed = if extension == "js" {
+                    parse_javascript_file(&file, source, &tree)
+                } else {
+                    crate::typescript::parse_typescript_file(&file, source, &tree)
+                };
+                let defaults = parsed
+                    .ranges
+                    .iter()
+                    .filter(|(unit, _)| unit.terminal_name() == "default")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    defaults.len(),
+                    expected_owners,
+                    "distinct factory defaults: {:#?}",
+                    parsed.ranges
+                );
+                assert_eq!(
+                    defaults
+                        .iter()
+                        .filter(|(owner, _)| owner.is_function())
+                        .count(),
+                    2
+                );
+                for (owner, ranges) in defaults {
+                    assert_eq!(
+                        ranges.len(),
+                        1,
+                        "distinct factory sites: {owner:?} {ranges:?}"
+                    );
+                    let members = parsed
+                        .children
+                        .get(owner)
+                        .expect("default owns returned members");
+                    assert_eq!(members.len(), 1, "{members:?}");
+                    for member in members {
+                        for child in &parsed.ranges[member] {
+                            assert!(
+                                ranges
+                                    .iter()
+                                    .any(|parent| parent.start_byte <= child.start_byte
+                                        && child.end_byte <= parent.end_byte),
+                                "I1: {owner:?} {ranges:?} must contain {member:?} {child:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

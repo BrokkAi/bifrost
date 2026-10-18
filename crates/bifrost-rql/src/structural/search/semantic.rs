@@ -1739,6 +1739,8 @@ impl<'a> SemanticQueryContext<'a> {
             artifact.as_ref(),
             &[SemanticCapability::Procedures],
         ));
+        // The shared lookup subtracts language-supplied ownership holes
+        // before this consumer chooses the smallest enclosing procedure.
         let lookup = procedures_for_source_ranges(
             &artifact,
             &ranges,

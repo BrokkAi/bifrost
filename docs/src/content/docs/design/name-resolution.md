@@ -145,6 +145,33 @@ type. Expected-type narrowing is separate work (#5344). Java publishes this
 projection for method references; Kotlin callable references and Scala method
 values can supply the same receiver, terminal, and namespace facts.
 
+Local reassignment uses an unordered value join. Language producers record a
+write's positioned left-hand reference and its right-hand value from syntax;
+shared lowering resolves the reference to its exact lexical binder. The
+initializer and subsequent writes feed one `ValueJoin` output, followed by one
+`Assignment` transfer to the binder's observed-value slot. Inferred local
+types read the same join. An explicitly declared static type stays separate
+from observed values. The persisted `ObservedValue` declaration property links
+the exact local definition to its `AssignmentValue` slot, including locals with
+only an initializer. Readers can select that slot without replacing the
+declaration's static `Value` property. Its completion is independent of whether
+lexical binding found one definition.
+
+Member-definition lookup on an explicitly typed local retains declared-type
+precedence. The observed alternatives do not turn that lookup into runtime
+dispatch. Inferred locals instead expose the initializer and write alternatives
+through their shared inferred type. Tests of an explicitly typed local therefore
+check its static member target and its observed-value join independently.
+
+This contract retains every alternative and every input's incompleteness. It
+does not select the latest write or prove runtime reachability. Shadowed names
+remain different binders, and named argument labels do not write to locals.
+Unsupported writes remain explicit gaps rather than disappearing from the
+known alternatives. Implicit and destructured initializers whose component value
+is not modeled contribute an explicit unknown input. A genuinely uninitialized
+local has no invented initializer input. These runtime gaps do not alter a
+known static declaration type. See issue #5015 for the owner decision.
+
 ## Storage and identity
 
 Lowering output is stored as ordinary SQLite rows. Two kinds of rows serve two
@@ -275,6 +302,29 @@ digests into their key. The shared summary relation, which stores them as rows
 so that a unit's dependents can be found by query, is being adopted language by
 language.
 
+A Rust re-export can name a declaration reached through a direct dependency's
+own exports. Its shared export row records that direct dependency's ordinal,
+while Rust's target coordinates still identify the final declaration. The
+dependency's published surface must therefore include public descendants of
+modules it forwards, including their namespaces and effective visibility.
+Forwarding a module is not just publishing the module's name: removing a
+reachable item changes the facade's output. Changes outside that exposed
+surface still allow early cutoff. Tuple-struct types and their value
+constructors have separate visibility; a constructor is no more visible than
+its least visible field.
+
+The topology stores canonical public module memberships as relational rows.
+These prove that a direct dependency exposes a target module even when a public
+alias leaves the forwarded module's physical subtree. Membership follows only
+unambiguous public edges. Uncertain candidate edges still affect the output
+digest and open the inventory, but do not prove accessibility. Both results
+come from the same finite module graph; aliases and cycles do not create new
+canonical nodes. Shared Rust summaries reuse the topology's surface digest.
+Those surface gaps belong to the topology, not to a member's binding summary: a
+missing public module still has a known declaration and a known failed lookup,
+so it opens the topology inventory and changes the digest without marking every
+member of the crate incomplete.
+
 ### Incremental context derivation
 
 Summaries are derived for each unit during workspace reconcile, from the
@@ -359,6 +409,16 @@ group cannot be enumerated as references. Fully parsed arguments keep the
 inventory complete while their guessed references remain unproven. Other
 references an expansion might generate are the same accepted residual as
 additive generation under #5205.
+
+The documented `cfg_if!` arm structure is handled without general macro
+expansion. The producer reads structural token trees and gives each ordinary
+item its own arm predicate together with the negation of earlier predicates.
+Cargo context selects those items at request time. Unknown conditions retain
+uncertainty, while a proven earlier match excludes later unknown arms.
+Unsupported macros inside an arm keep their own name and member frontiers;
+only a predicate proven inactive in every selected membership discharges those
+frontiers. Existing bindings follow the same additive rule as other item
+macros.
 
 Parse-time lowering evaluates the operands of built-in macro names: the
 formatting and value macros listed in `crates/bifrost-rust/src/format_args.rs`,

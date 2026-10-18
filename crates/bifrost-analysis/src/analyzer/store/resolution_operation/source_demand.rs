@@ -4,6 +4,80 @@ use crate::analyzer::resolution::{BatchCandidateRequest, EndpointSignature};
 
 const MAX_REVERSE_ROOT_CANDIDATE_KEYS_PER_BATCH: usize = 64;
 
+/// Source halves live where a demand originated, independently of the units
+/// that can export its answer. The vector dies with this discovery batch.
+pub(crate) enum RootSourceHorizon {
+    Bounded(Vec<SelectedResolutionMountOrdinal>),
+    Universal,
+}
+
+pub(super) fn root_source_horizon(
+    ready: &ReadySelectedResolution<'_, '_>,
+    endpoint: &EndpointSignature,
+    cancellation: &CancellationToken,
+    transient_languages: &mut HashMap<Language, bool>,
+) -> Result<RootSourceHorizon> {
+    let lexical = ready.lexical_source();
+    if let Some(first) = endpoint.symbols().fixed().first()
+        && matches!(
+            lexical.semantic_provenance(first.symbol(), cancellation)?,
+            Some(SelectedSemanticProvenance::Shared(_))
+        )
+        && crate::analyzer::resolution::selected_root_source_anchor(
+            &lexical,
+            endpoint,
+            cancellation,
+        )?
+        .is_none()
+    {
+        // Both Import and Reference classification require this exact anchor
+        // guard. When a Shared head fails that guard, neither classifier can
+        // accept a source half, regardless of the remaining symbol stack.
+        // There is nothing to probe; target lookup and closure are unaffected.
+        return Ok(RootSourceHorizon::Bounded(Vec::new()));
+    }
+    let source = match endpoint.symbols().fixed().first() {
+        Some(symbol) => match lexical.semantic_provenance(symbol.symbol(), cancellation)? {
+            Some(SelectedSemanticProvenance::FragmentLocal(provenance)) => Some(provenance.mount()),
+            Some(SelectedSemanticProvenance::Stage(provenance)) => Some(provenance.mount()),
+            Some(SelectedSemanticProvenance::Shared(_)) | None => None,
+        },
+        None => None,
+    };
+    let Some(source) = source else {
+        return Ok(RootSourceHorizon::Universal);
+    };
+    let record = ready.inventory.mount_record_by_ordinal(source.ordinal())?;
+    let language = record.semantic_language();
+    let Some(support) = crate::analyzer::languages::language_support(language) else {
+        return Ok(RootSourceHorizon::Universal);
+    };
+    if matches!(
+        support.root_source_horizon(Some(source.ordinal()), false),
+        RootSourceHorizon::Universal
+    ) {
+        return Ok(RootSourceHorizon::Universal);
+    }
+    let transient = if let Some(transient) = transient_languages.get(&language) {
+        *transient
+    } else {
+        // Even a placed unsaved replacement keeps the conservative discovery
+        // path. Overlay masks can also remove a source without replacing it.
+        let storage_language = record.storage_language();
+        let transient = ready.inventory.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_mounts
+                           WHERE storage_language=?1 AND file_version_id IS NULL)
+                 OR EXISTS(SELECT 1 FROM temp.selected_resolution_overlay_masks
+                           WHERE storage_language=?1)",
+            [storage_language],
+            |row| row.get::<_, bool>(0),
+        )?;
+        transient_languages.insert(language, transient);
+        transient
+    };
+    Ok(support.root_source_horizon(Some(source.ordinal()), transient))
+}
+
 /// Proven by an admitted source half, never inferred from a spelling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SourceDemandKey {
@@ -32,9 +106,8 @@ pub(super) fn root_source_key(
     )
 }
 
-/// `None` is used by Rust and JVM root-source lookup, whose callers do not
-/// supply a finite admitted-mount set, and Go forward demand, whose package
-/// set can grow as roots are discovered.
+/// An explicit mount set is an existing caller admission bound. Languages
+/// may additionally prove a smaller source-provenance horizon below.
 pub(super) fn root_source_half(
     ready: &ReadySelectedResolution<'_, '_>,
     base: &dyn BatchResolutionFragmentSource,
@@ -108,11 +181,51 @@ pub(super) fn root_source_halves_in_mounts(
     }
 
     let anchors = ready.lexical_source();
+    let mut transient_languages = HashMap::default();
     for eligible_batch in eligible.chunks(MAX_REVERSE_ROOT_CANDIDATE_KEYS_PER_BATCH) {
+        let mut bounded_mounts = Vec::new();
+        let mut universal = false;
+        let mut source_batch = Vec::new();
+        for (position, probe) in eligible_batch {
+            let horizon = root_source_horizon(
+                ready,
+                &endpoints[*position],
+                cancellation,
+                &mut transient_languages,
+            )?;
+            crate::analyzer::resolution::seam_profile::record_root_source_horizon(matches!(
+                horizon,
+                RootSourceHorizon::Bounded(_)
+            ));
+            match horizon {
+                // A structurally rejected root must not become a probe key
+                // merely because another root in this batch has a source.
+                RootSourceHorizon::Bounded(sources) if sources.is_empty() => continue,
+                RootSourceHorizon::Bounded(sources) => bounded_mounts.extend(sources),
+                RootSourceHorizon::Universal => universal = true,
+            }
+            source_batch.push((*position, probe));
+        }
+        if source_batch.is_empty() {
+            continue;
+        }
+        let eligible_batch = source_batch.as_slice();
+        bounded_mounts.sort_unstable();
+        bounded_mounts.dedup();
+        // Preserve the caller's admission bound. A provenance proof only
+        // narrows it; an unknown proof leaves today's universal scan intact.
+        let discovery_mounts = if universal {
+            mounts
+        } else {
+            if let Some(admitted) = mounts {
+                bounded_mounts.retain(|mount| admitted.contains(mount));
+            }
+            Some(bounded_mounts.as_slice())
+        };
         let requests = eligible_batch
             .iter()
             .enumerate()
-            .map(|(ordinal, (_, probe))| BatchCandidateRequest::new(ordinal, probe.clone()))
+            .map(|(ordinal, (_, probe))| BatchCandidateRequest::new(ordinal, (*probe).clone()))
             .collect::<Vec<_>>();
         let mut candidates = (0..eligible_batch.len())
             .map(|_| {
@@ -126,7 +239,7 @@ pub(super) fn root_source_halves_in_mounts(
             .collect::<Vec<_>>();
         let outcome = base.visit_reverse_root_candidate_match_pages(
             &requests,
-            mounts,
+            discovery_mounts,
             cancellation,
             &mut |page| {
                 let mut identities = Vec::new();

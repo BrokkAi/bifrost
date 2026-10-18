@@ -183,6 +183,22 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
         None
     }
 
+    fn has_receiver_binding_obligation(&self) -> bool {
+        false
+    }
+
+    /// Receiver-dependent declaration evidence that still constrains binding.
+    /// The shared engine combines it with the selected call-target answer.
+    fn receiver_binding_completion(
+        &self,
+        _evaluation: &mut FactEvaluation<'_, '_>,
+        _candidate: SemanticId,
+        _call: &LoweredCallApplicabilityObligation,
+        _signature: &LoweredCallableSignatureProperty,
+    ) -> StoreResult<Option<ResolutionCompletion>> {
+        Ok(Some(ResolutionCompletion::Complete))
+    }
+
     /// Receiver syntax can name a lexically visible extension declaration.
     fn has_scoped_receiver_extensions(&self) -> bool {
         false

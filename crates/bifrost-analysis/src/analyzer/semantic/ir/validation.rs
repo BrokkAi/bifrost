@@ -186,6 +186,7 @@ pub(super) fn measure_artifact_work(
         // rather than as a budget dimension of its own.
         work.nested_entries = work
             .nested_entries
+            .saturating_add(procedure.source_range_holes.len())
             .saturating_add(procedure.statement_entries.len())
             .saturating_add(procedure.loop_sites.len())
             .saturating_add(procedure.guard_facts.len())
@@ -592,6 +593,21 @@ fn validate_procedure(
     let id = procedure.id;
 
     validate_dense_rows(procedure)?;
+    let span = procedure.locator.anchor().span();
+    if procedure
+        .source_range_holes
+        .iter()
+        .any(|hole| hole.start_byte() < span.start_byte() || span.end_byte() < hole.end_byte())
+    {
+        return Err(SemanticIrError::procedure(
+            id,
+            SemanticIrErrorKind::SourceScope,
+            format!(
+                "source ownership holes {:?} extend outside procedure span {:?}",
+                procedure.source_range_holes, span
+            ),
+        ));
+    }
     for mapping in &procedure.source_mappings {
         validate_locator_scope(key, id, "source mapping", &mapping.locator)?;
         if let Some(identity) = mapping.ast_identity

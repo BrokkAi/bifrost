@@ -532,6 +532,7 @@ pub struct ProcedureSemantics {
     id: ProcedureId,
     materialization_id: ProcedureMaterializationId,
     locator: SemanticLocator,
+    source_range_holes: Box<[super::super::SourceSpan]>,
     lexical_parent: Option<ProcedureId>,
     kind: ProcedureKind,
     properties: ProcedureProperties,
@@ -590,6 +591,7 @@ impl ProcedureSemantics {
             id: parts.id,
             materialization_id: ProcedureMaterializationId(StableDigest::from_array([0; 32])),
             locator: parts.locator,
+            source_range_holes: parts.source_range_holes.into_boxed_slice(),
             lexical_parent: parts.lexical_parent,
             kind: parts.kind,
             properties: parts.properties,
@@ -634,6 +636,12 @@ impl ProcedureSemantics {
         let mut digest = MaterializationFingerprintHasher::new(PROCEDURE_MATERIALIZATION_ID_DOMAIN);
         self.id.hash(&mut digest);
         self.locator.hash(&mut digest);
+        // Empty holes preserve existing materialization identities for all
+        // adapters that do not supply query-time ownership exclusions.
+        if !self.source_range_holes.is_empty() {
+            b"source-range-holes-v1".hash(&mut digest);
+            self.source_range_holes.hash(&mut digest);
+        }
         self.lexical_parent.hash(&mut digest);
         self.kind.hash(&mut digest);
         self.properties.hash(&mut digest);
@@ -680,6 +688,10 @@ impl ProcedureSemantics {
 
     pub fn locator(&self) -> &SemanticLocator {
         &self.locator
+    }
+
+    pub fn source_range_holes(&self) -> &[super::super::SourceSpan] {
+        &self.source_range_holes
     }
 
     pub const fn lexical_parent(&self) -> Option<ProcedureId> {

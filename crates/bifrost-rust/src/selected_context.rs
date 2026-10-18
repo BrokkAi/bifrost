@@ -6302,6 +6302,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#5172: undecidable operands overrode decisive cfg conjunctions and disjunctions")]
     fn detached_cfg_defaults_prove_refute_and_preserve_unknown_atoms() {
         let profile = detached_profile_for_source(None, Path::new("scratch.rs")).unwrap();
         for (predicate, expected) in [
@@ -6319,9 +6320,9 @@ mod tests {
             ),
             (
                 "all(not(test), custom_atom)",
-                RustSelectedActivation::Unknown,
+                RustSelectedActivation::Inactive,
             ),
-            ("any(test, custom_atom)", RustSelectedActivation::Unknown),
+            ("any(test, custom_atom)", RustSelectedActivation::Active),
         ] {
             let source = format!("#[cfg({predicate})] fn gated() {{}}");
             let mut parser = tree_sitter::Parser::new();

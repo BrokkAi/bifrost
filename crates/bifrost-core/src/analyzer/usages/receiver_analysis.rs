@@ -432,6 +432,7 @@ pub enum ReceiverBudgetLimit {
     SummaryExpansions,
     ResolutionRounds,
     ScopeNodes,
+    TotalWork,
 }
 
 impl ReceiverBudgetLimit {
@@ -440,6 +441,7 @@ impl ReceiverBudgetLimit {
             ReceiverBudgetLimit::SummaryExpansions => "summary_expansions",
             ReceiverBudgetLimit::ResolutionRounds => "resolution_rounds",
             ReceiverBudgetLimit::ScopeNodes => "scope_nodes",
+            ReceiverBudgetLimit::TotalWork => "total_work",
         }
     }
 

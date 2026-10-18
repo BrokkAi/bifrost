@@ -3120,7 +3120,7 @@ fn adapt_match_candidates(
             continue;
         }
         if evidence.domain == DetailedCodeQueryDomain::PythonHierarchyFact
-            && !matches!(unit_row_label(&item, "coverage"), Ok("complete"))
+            && !matches!(&item.terminal, Some(UnitRowItemTerminal::PythonHierarchyFact { coverage, .. }) if coverage == "complete")
         {
             incomplete_reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
             continue;
@@ -3141,6 +3141,20 @@ fn adapt_match_candidates(
     }
 }
 
+fn has_modeled_python_ancestry(evidence: &UnitRowEvidence) -> bool {
+    fn modeled(key: &DetailedCodeQueryKey) -> bool {
+        matches!(key, DetailedCodeQueryKey::PythonHierarchyFact { ancestry_basis, .. } if !ancestry_basis.claims.is_empty())
+    }
+    modeled(&evidence.key)
+        || evidence.provenance.iter().any(|trace| {
+            modeled(&trace.seed.key)
+                || trace.steps.iter().any(|step| {
+                    modeled(&step.result.key)
+                        || step.via.as_ref().is_some_and(|via| modeled(&via.key))
+                })
+        })
+}
+
 fn adapt_match_candidate(
     policy_id: &PolicyId,
     item: UnitRowItem,
@@ -3155,6 +3169,7 @@ fn adapt_match_candidate(
         })
         .ok_or(())?;
     let path = workspace_relative_path(&evidence.rel_path)?;
+    let modeled_ancestry = has_modeled_python_ancestry(&evidence);
     let (location, mut candidate_reasons, proof) =
         terminal_presentation(&item, evidence.domain, &path, evidence.byte_span.as_ref())?;
     candidate_reasons.extend(certainty_reasons(query_diagnostics, &evidence.provenance));
@@ -3266,6 +3281,19 @@ fn adapt_match_candidate(
     let proof = if provenance_identity_uncertain {
         candidate_reasons.push(CertaintyReason::NameBasedResolution);
         lower_proof_for_missing_identity(proof)?
+    } else {
+        proof
+    };
+    let proof = if modeled_ancestry {
+        let mut reasons = proof
+            .reasons()
+            .iter()
+            .filter(|reason| !matches!(reason, ProofReason::DirectStructuralMatch))
+            .cloned()
+            .collect::<Vec<_>>();
+        reasons.push(ProofReason::analyzer_evidence("python_modeled_runtime_c3").map_err(|_| ())?);
+        ProofMetadata::try_new(proof.state(), reasons, proof.evidence_refs().to_vec())
+            .map_err(|_| ())?
     } else {
         proof
     };
@@ -3588,10 +3616,11 @@ fn terminal_presentation(
                 },
             )
         }
-        UnitRowItemTerminal::SourcePosition
-            if *actual_domain == DetailedCodeQueryDomain::PythonHierarchyFact =>
-        {
-            let complete = unit_row_label(item, "coverage")? == "complete";
+        UnitRowItemTerminal::PythonHierarchyFact { coverage, .. } => {
+            if *actual_domain != DetailedCodeQueryDomain::PythonHierarchyFact {
+                return Err(());
+            }
+            let complete = coverage == "complete";
             let certainty = if complete {
                 Vec::new()
             } else {
@@ -3996,17 +4025,60 @@ fn adapt_terminal_result(
             false,
         )),
         (
-            UnitRowItemTerminal::SourcePosition,
+            UnitRowItemTerminal::PythonHierarchyFact {
+                id,
+                root_id,
+                declaration_id,
+                owner_id,
+                target_id,
+                target_owner_id,
+                fact_kind,
+                outcome,
+                coverage,
+                reason,
+                ancestry_basis,
+            },
             DetailedCodeQueryDomain::PythonHierarchyFact,
-            DetailedCodeQueryKey::PythonHierarchyFact { .. },
+            DetailedCodeQueryKey::PythonHierarchyFact {
+                id: key_id,
+                root_id: key_root,
+                declaration_id: key_declaration,
+                owner_id: key_owner,
+                target_id: key_target,
+                target_owner_id: key_target_owner,
+                fact_kind: key_kind,
+                outcome: key_outcome,
+                coverage: key_coverage,
+                reason: key_reason,
+                ancestry_basis: key_basis,
+            },
             UnitRowIdentities::None,
-        ) => {
-            let fact_kind = unit_row_label(item, "fact_kind")?;
+        ) if id == key_id
+            && root_id == key_root
+            && declaration_id == key_declaration
+            && owner_id == key_owner
+            && target_id == key_target
+            && target_owner_id == key_target_owner
+            && fact_kind == key_kind
+            && outcome == key_outcome
+            && coverage == key_coverage
+            && reason == key_reason
+            && ancestry_basis == key_basis =>
+        {
             Ok((
-                PolicyQueryResultRef::StructuralMatch {
-                    kind: fact_kind.to_owned(),
+                PolicyQueryResultRef::PythonHierarchyFact {
+                    id: id.clone(),
+                    root_id: root_id.clone(),
+                    declaration_id: declaration_id.clone(),
+                    owner_id: owner_id.clone(),
+                    target_id: target_id.clone(),
+                    target_owner_id: target_owner_id.clone(),
+                    fact_kind: fact_kind.clone(),
+                    outcome: outcome.clone(),
+                    coverage: coverage.clone(),
+                    reason: reason.clone(),
                     location: location.clone(),
-                    identity: None,
+                    ancestry_basis: ancestry_basis.clone(),
                 },
                 false,
             ))
@@ -4486,7 +4558,9 @@ fn adapt_provenance_ref(
                 | DetailedCodeQueryDomain::CallArgumentGroup
                 | DetailedCodeQueryDomain::CallArgument
                 | DetailedCodeQueryDomain::CallBinding
-        );
+        )
+        || matches!(&value.value, UnitRowItemRefValue::PythonHierarchyFact { coverage, .. } if coverage != "complete")
+        || matches!(&value.value, UnitRowItemRefValue::CallableSignature { coverage, .. } if coverage.as_ref() != "exact");
     let adapted = match (value.value, domain, key, identities) {
         // Analysis-only rows such as call shapes and call bindings are not
         // terminal policy result families, but they can still occur in the
@@ -4671,21 +4745,116 @@ fn adapt_provenance_ref(
             }
         }
         (
-            UnitRowItemRefValue::StructuralMatch {
-                kind,
-                node_range: Some(range),
+            UnitRowItemRefValue::PythonHierarchyFact {
+                id,
+                root_id,
+                declaration_id,
+                owner_id,
+                target_id,
+                target_owner_id,
+                fact_kind,
+                outcome,
+                coverage,
+                reason,
+                range,
+                ancestry_basis,
             },
             DetailedCodeQueryDomain::PythonHierarchyFact,
-            DetailedCodeQueryKey::PythonHierarchyFact { .. },
+            DetailedCodeQueryKey::PythonHierarchyFact {
+                id: key_id,
+                root_id: key_root,
+                declaration_id: key_declaration,
+                owner_id: key_owner,
+                target_id: key_target,
+                target_owner_id: key_target_owner,
+                fact_kind: key_kind,
+                outcome: key_outcome,
+                coverage: key_coverage,
+                reason: key_reason,
+                ancestry_basis: key_basis,
+            },
             UnitRowIdentities::None,
-        ) if python_hierarchy_fact_ref && Some(range) == display_range => {
-            PolicyQueryResultRef::StructuralMatch {
-                kind: kind.to_string(),
+        ) if python_hierarchy_fact_ref
+            && Some(range) == display_range
+            && id == key_id
+            && root_id == key_root
+            && declaration_id == key_declaration
+            && owner_id == key_owner
+            && target_id == key_target
+            && target_owner_id == key_target_owner
+            && fact_kind == key_kind
+            && outcome == key_outcome
+            && coverage == key_coverage
+            && reason == key_reason
+            && ancestry_basis == key_basis =>
+        {
+            PolicyQueryResultRef::PythonHierarchyFact {
+                id,
+                root_id,
+                declaration_id,
+                owner_id,
+                target_id,
+                target_owner_id,
+                fact_kind,
+                outcome,
+                coverage,
+                reason,
+                ancestry_basis,
                 location: policy_span_location(
                     path,
                     byte_span.as_ref().ok_or(())?,
                     display_range.ok_or(())?,
                 )?,
+            }
+        }
+        (
+            UnitRowItemRefValue::CallableSignature {
+                id,
+                declaration_id,
+                site_id,
+                range,
+                ..
+            },
+            DetailedCodeQueryDomain::CallableSignature,
+            DetailedCodeQueryKey::CallableSignature {
+                id: detailed_id,
+                declaration_id: detailed_declaration_id,
+                site_id: detailed_site_id,
+            },
+            UnitRowIdentities::None,
+        ) if value_kind.as_ref() == "callable_signature"
+            && id.as_ref() == detailed_id.as_str()
+            && declaration_id.as_deref() == Some(detailed_declaration_id.as_str())
+            && site_id.as_ref() == detailed_site_id.as_str()
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::StructuralMatch {
+                kind: "callable_signature".to_owned(),
+                location: policy_span_location(path, byte_span.as_ref().ok_or(())?, range)?,
+                identity: None,
+            }
+        }
+        (
+            UnitRowItemRefValue::SignatureParameter {
+                id,
+                signature_id,
+                range,
+                ..
+            },
+            DetailedCodeQueryDomain::SignatureParameter,
+            DetailedCodeQueryKey::SignatureParameter {
+                id: detailed_id,
+                signature_id: detailed_signature_id,
+            },
+            UnitRowIdentities::None,
+        ) if value_kind.as_ref() == "signature_parameter"
+            && id.as_ref() == detailed_id.as_str()
+            && signature_id.as_ref() == detailed_signature_id.as_str()
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::StructuralMatch {
+                kind: "signature_parameter".to_owned(),
+                location: policy_span_location(path, byte_span.as_ref().ok_or(())?, range)?,
                 identity: None,
             }
         }
@@ -5688,7 +5857,7 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, member_id.as_bytes());
             update_hash(&mut hasher, &ordinal.to_le_bytes());
         }
-        DetailedCodeQueryKey::PythonHierarchyFact { id, root_id } => {
+        DetailedCodeQueryKey::PythonHierarchyFact { id, root_id, .. } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, root_id.as_bytes());
         }

@@ -1,3 +1,6 @@
+#[path = "native_query_plan_tests.rs"]
+mod native_query_plan_tests;
+
 #[path = "resolution_operation_go_member_tests.rs"]
 mod go_member_tests;
 #[path = "resolution_operation_go_spelling_tests.rs"]
@@ -4119,7 +4122,14 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // statement and no decoded rows, for cold and warm queries. Migration
         // 0180's named TypeBody unique index adds one cold schema row/statement.
         // Includes the #5243 type-production read and migration 0181 schema statements.
-        (262, 234, 339, 215),
+        // #5172 adds four indexed conditional-import inventory seeks, no rows.
+        // Its persistent partial index does not change the TEMP setup work.
+        // #5618 decodes persisted lookup recipes with their stored digest/ID,
+        // removing six cold identity seeks and six decoded rows in this fixture.
+        // Those committed IDs also warm the existing bounded store cache, so
+        // first and repeated warm searches keep their existing 337/209 pins.
+        // Measured on the integrated schema-186 tree: 262/234 open, 337/209 search.
+        (262, 234, 337, 209),
         "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
     );
     assert_eq!(
@@ -4152,7 +4162,8 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // Full forward-answer authority adds the same two identity reads and
         // decoded rows as the cold search.
         // Includes the #5243 type-production read; migration 0181 adds cold schema statements.
-        (5, 4, 333, 209),
+        // The same four conditional-import inventory seeks as the cold search.
+        (5, 4, 337, 209),
         "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
     );
     assert_eq!(
@@ -4163,7 +4174,7 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
             second_warm.1.decoded_rows,
         ),
         // Includes the #5243 type-production read; migration 0181 adds cold schema statements.
-        (5, 4, 333, 209),
+        (5, 4, 337, 209),
         "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
     );
     assert_eq!(cold.2, first_warm.2);
@@ -4294,10 +4305,11 @@ fn measure_production_go_point_sql(
 
 #[test]
 fn production_go_point_statement_decoded_row_and_engine_work_is_repeatable() {
-    for kind in [
+    let measurements = [
         ProductionGoPointKind::Definition,
         ProductionGoPointKind::Type,
-    ] {
+    ]
+    .map(|kind| {
         let fixture = GoRootResolutionOperationFixture::new();
         let context_id = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
         let cold = measure_production_go_point_sql(&fixture, context_id, kind);
@@ -4318,10 +4330,15 @@ fn production_go_point_statement_decoded_row_and_engine_work_is_repeatable() {
             second_warm.search.statement_count(),
             second_warm.search.decoded_rows,
         );
+        (kind, cold, first_warm, second_warm)
+    });
+    // Measure both kinds before checking either pin so a changed reader can
+    // report every independent cold/warm tuple in one test run.
+    for (kind, cold, first_warm, second_warm) in measurements {
         // Includes the #5243 type-production read and migration 0181 schema statements.
         let expected_scope_nodes = match kind {
-            ProductionGoPointKind::Definition => 438,
-            ProductionGoPointKind::Type => 441,
+            ProductionGoPointKind::Definition => 435,
+            ProductionGoPointKind::Type => 438,
         };
         // These generic-free fixtures no longer open the optional formal-row
         // table and its indexes during cold point setup. The cold open is
@@ -4344,9 +4361,24 @@ fn production_go_point_statement_decoded_row_and_engine_work_is_repeatable() {
         // probes the ordinary and staged production relations (+2 search
         // statements, zero rows here) and charges one more scope step. Go
         // answers, rounds, and warm-open work remain unchanged.
+        // #5618 uses the stored digest/ID while decoding lookup recipes,
+        // removing four cold identity seeks and rows from each point kind here.
+        // Cache only the committed IDs in the existing bounded store cache;
+        // the first warm search must not inherit the four skipped cold reads.
+        // Master's measured warm/repeated pins stay 157/109 for Definition and 175/105
+        // for Type. Schema-186 cold Type search measured 218/166.
+        // Source-provenance discovery checks transient/overlay inputs once
+        // per batch: one scalar statement and row. The shared anchor proof
+        // skips impossible source reads and hydration without interning a
+        // package domain. Relative to the master pins, both query kinds lose
+        // 6 statements/9 rows in cold and warm search, and 3 scope steps.
+        // Rounds, target bindings and open work stay unchanged. Each cold
+        // tuple and both warm tuples were independently measured. The merged
+        // #5618 reader removes four more cold statements/rows from the prior
+        // D measurement; warm work, targets and closure rounds do not change.
         let (cold_open, cold_search, warm_open, warm_search) = match kind {
-            ProductionGoPointKind::Definition => ((262, 234), (204, 174), (5, 4), (157, 109)),
-            ProductionGoPointKind::Type => ((262, 234), (222, 170), (5, 4), (175, 105)),
+            ProductionGoPointKind::Definition => ((262, 234), (194, 161), (5, 4), (151, 100)),
+            ProductionGoPointKind::Type => ((262, 234), (212, 157), (5, 4), (169, 96)),
         };
         let production_schema = cold
             .open
@@ -13068,4 +13100,178 @@ fn go_owner_proof_reads_exact_source_receivers_and_reuses_only_the_current_stage
             .any(|line| line.contains("SEARCH owner") && line.contains("file_version_id=?")),
         "{plan:?}"
     );
+}
+
+#[test]
+#[hardwon("#5600: root source discovery must keep the universal path for unsaved package inputs")]
+fn go_context_reads_root_source_horizon_retains_unsaved_package_answer() {
+    use super::super::resolution_publication::ResolutionContentPublicationOutcome;
+    use crate::analyzer::resolution::{EndpointSignature, SharedNameInterner, StackPattern};
+
+    let fixture = GoRootResolutionOperationFixture::new();
+    let context_id = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+    let cancellation = CancellationToken::new();
+    let snapshot = &fixture.snapshots["go"];
+    let (state, _) = parsed_go_state(
+        fixture.project.root(),
+        GO_ROOT_CONSUMER_PATH,
+        GO_ROOT_CONSUMER_SOURCE,
+    );
+    let oid = Oid::hash_object(ObjectType::Blob, GO_ROOT_CONSUMER_SOURCE.as_bytes()).unwrap();
+    let prepared =
+        AnalyzerStore::prepare_parsed_blob(oid, "go", snapshot.generation, &GoAdapter, state)
+            .unwrap();
+    let ResolutionContentPublicationOutcome::Ready(content) = fixture
+        .store
+        .publish_selected_parsed_content(snapshot, GO_ROOT_CONSUMER_PATH, prepared, &cancellation)
+        .unwrap()
+    else {
+        panic!("publish the unsaved consumer");
+    };
+    let content = content_mount_request(content.into_parts().0, GO_ROOT_CONSUMER_PATH, oid)
+        .with_counterfactual_base_content_digest(
+            brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                GO_ROOT_CONSUMER_SOURCE.as_bytes(),
+            ),
+        );
+    let masks = [SelectedResolutionOverlayMask::replacement(
+        "go",
+        GO_ROOT_CONSUMER_PATH,
+    )];
+    for overlay in [false, true] {
+        let operation = open_ready_operation(
+            &fixture.store,
+            selected_operation_input(
+                &fixture.project,
+                &fixture.workspace_id,
+                &fixture.snapshots,
+                &fixture.languages,
+                if overlay { &masks } else { &[] },
+                if overlay {
+                    vec![content.clone()]
+                } else {
+                    Vec::new()
+                },
+            ),
+            &cancellation,
+        );
+        let source = operation
+            .mount_table()
+            .mount_for_path("go", GO_ROOT_CONSUMER_PATH)
+            .unwrap()
+            .unwrap();
+        let lexical = operation.ready.lexical_source();
+        let mut root_anchor = None;
+        let outcome = visit_selected_root_import_half_pages(
+            &operation.ready.context_identities,
+            &lexical,
+            &lexical,
+            Some(&[source.ordinal()]),
+            &cancellation,
+            &mut FactPageVisitor::new(&mut |page| {
+                for half in page {
+                    if let SelectedRootPathHalf::Import {
+                        anchor_semantic, ..
+                    } = half
+                    {
+                        root_anchor = Some(*anchor_semantic);
+                    }
+                }
+                Ok(true)
+            }),
+        )
+        .unwrap();
+        assert!(outcome.is_exhausted());
+        let endpoint = EndpointSignature::new(
+            BindingNodeId::universal_root(),
+            StackPattern::closed(vec![root_anchor.expect("consumer root import")]),
+            StackPattern::closed([]),
+        );
+        let horizon = super::source_demand::root_source_horizon(
+            &operation.ready,
+            &endpoint,
+            &cancellation,
+            &mut HashMap::default(),
+        )
+        .unwrap();
+        assert_eq!(matches!(horizon, RootSourceHorizon::Universal), overlay);
+        // A shared package domain is not a source anchor, even with an
+        // overlay. Both source-half classifiers reject any unanchored Shared
+        // head; the proof does not depend on its language or stack shape.
+        for language in [Language::Go, Language::Java] {
+            let shared = crate::analyzer::resolution::package_domain_semantic(
+                language,
+                &operation.ready.shared_names(),
+            );
+            let lookup = SemanticId::shared_name(operation.ready.shared_names().intern([7; 32]));
+            for symbols in [
+                vec![shared],
+                // Indexed package-member declaration roots start with a
+                // shared lookup, then the package domain and a local token.
+                vec![lookup, shared, root_anchor.unwrap()],
+            ] {
+                let shared_endpoint = EndpointSignature::new(
+                    BindingNodeId::universal_root(),
+                    StackPattern::closed(symbols),
+                    StackPattern::closed([]),
+                );
+                let shared_horizon = super::source_demand::root_source_horizon(
+                    &operation.ready,
+                    &shared_endpoint,
+                    &cancellation,
+                    &mut HashMap::default(),
+                )
+                .unwrap();
+                match shared_horizon {
+                    RootSourceHorizon::Bounded(mounts) => assert!(mounts.is_empty()),
+                    RootSourceHorizon::Universal => {
+                        panic!("an unanchored Shared head has no source halves")
+                    }
+                }
+            }
+        }
+        let go_context::GoDotImportContext::Ready { context, .. } = operation
+            .go_dot_import_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
+            .unwrap()
+        else {
+            panic!("selected consumer context");
+        };
+        let reference = site_for_identifier(
+            &fixture.consumer_facts,
+            "Item",
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Type,
+        );
+        let provider = operation
+            .mount_table()
+            .mount_for_path("go", GO_ROOT_PROVIDER_PATH)
+            .unwrap()
+            .unwrap()
+            .ordinal()
+            .get();
+        let outcome = operation
+            .resolve_reference(
+                context,
+                &SelectedSemanticLocator::new(
+                    "go",
+                    GO_ROOT_CONSUMER_PATH,
+                    reference,
+                    LoweredSemanticRole::Reference,
+                ),
+                &cancellation,
+                &mut SelectedResolutionContextMetrics,
+            )
+            .unwrap();
+        let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(answer)) =
+            outcome
+        else {
+            panic!("the unsaved consumer still resolves its imported type");
+        };
+        assert_eq!(answer.binding().targets().len(), 1, "{answer:?}");
+        assert_eq!(
+            answer.binding().targets()[0].ordinal(),
+            Some(provider),
+            "the overlay must preserve the intended provider: {answer:?}"
+        );
+    }
 }

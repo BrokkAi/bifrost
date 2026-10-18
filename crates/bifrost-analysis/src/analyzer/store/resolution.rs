@@ -349,6 +349,7 @@ macro_rules! resolution_bundle_families {
             additional_definition_namespaces => ("additional_definition_namespaces", "resolution_additional_definition_namespaces", "expected_additional_definition_namespace_count", "definition_semantic_key, namespace, hoisting", 3, 2),
             definition_unit_crosswalks => ("definition_unit_crosswalks", "resolution_definition_unit_crosswalks", "expected_definition_unit_crosswalk_count", "definition_semantic_key, unit_key, identity_digest", 3, 1),
             declaration_visibility_properties => ("declaration_visibility_properties", "resolution_declaration_visibility_properties", "expected_declaration_visibility_property_count", "definition_semantic_key, visibility", 2, 1),
+            declaration_access_boundaries => ("declaration_access_boundaries", "resolution_declaration_access_boundaries", "expected_declaration_access_boundary_count", "definition_semantic_key, boundary_kind, package_region, template_semantic_key", 4, 1),
             member_scope_properties => ("member_scope_properties", "resolution_member_scope_properties", "expected_member_scope_property_count", "definition_semantic_key, scope_head_node_key, scope_kind", 3, 2),
             member_owner_properties => ("member_owner_properties", "resolution_member_owner_properties", "expected_member_owner_property_count", "definition_semantic_key, owner_definition_semantic_key, owner_scope_head_node_key, member_name, member_kind, member_access, qualifier_compatibility", 7, 7),
             trait_implementations => ("trait_implementations", "resolution_trait_implementations", "expected_trait_implementation_count", "relation_key, side, position, segment, terminal_spelling, impl_site, impl_start_byte, impl_end_byte", 8, 3),
@@ -756,24 +757,41 @@ pub(super) const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
 /// whose source facts are unchanged.
 pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str {
     match language {
+        // Reconciled above both parents: shared observed-value properties and
+        // local write joins compose with the current producer and gap facts.
         // Super receivers and anonymous construction add Java producer facts
         // on top of the non-invoking member-reference and positioned
-        // expression-gap bundle.
-        Language::Java => "resolution-bundle-java-v44-super-and-anonymous-construction-2026-10",
-        Language::Go => "resolution-bundle-go-v56-positioned-expression-gaps-5375-2026-10",
-        Language::Cpp => "resolution-bundle-cpp-v23-positioned-expression-gaps-5375-2026-10",
+        // expression-gap bundle. A suppressed enclosing expression still
+        // publishes each anonymous allocation's synthetic body identity, so
+        // warm bundles from v46 lack those facts for casts and qualified
+        // assignments.
+        Language::Java => {
+            "resolution-bundle-java-v47-suppressed-anonymous-allocation-identity-5701-2026-10"
+        }
+        Language::Go => {
+            "resolution-bundle-go-v63-receiver-applicability-binding-result-separation-2026-10"
+        }
+        Language::Cpp => {
+            "resolution-bundle-cpp-v25-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+        }
         Language::JavaScript => {
-            "resolution-bundle-javascript-v22-positioned-expression-gaps-5375-2026-10"
+            "resolution-bundle-javascript-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         Language::TypeScript => {
-            "resolution-bundle-typescript-v22-positioned-expression-gaps-5375-2026-10"
+            "resolution-bundle-typescript-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
-        Language::Python => "resolution-bundle-python-v22-positioned-expression-gaps-5375-2026-10",
+        Language::Python => {
+            "resolution-bundle-python-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+        }
         // Definitionless item macros preserve existing bindings and keep
         // argument uncertainty on guessed reference sites. Only unenumerable input
         // groups open reverse inventory (#5517).
-        Language::Rust => "resolution-bundle-rust-v110-enumerated-macro-inventory-5517-2026-10",
-        Language::Php => "resolution-bundle-php-v22-positioned-expression-gaps-5375-2026-10",
+        Language::Rust => {
+            "resolution-bundle-rust-v116-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10"
+        }
+        Language::Php => {
+            "resolution-bundle-php-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+        }
         // Self-type edges and aliases extend Scala's explicit-instantiation
         // bundle; case-class and enum companions publish binders and singleton
         // relations, and enum cases are companion members. Constructors use
@@ -782,10 +800,21 @@ pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str 
         // Imports select inherited members and import heads bind lexically.
         // Companion module ownership and projected apply/unapply members join
         // the inherited-member bundle.
-        Language::Scala => "resolution-bundle-scala-v73-callable-values-and-term-families-2026-10",
-        Language::CSharp => "resolution-bundle-csharp-v22-positioned-expression-gaps-5375-2026-10",
-        Language::Ruby => "resolution-bundle-ruby-v22-positioned-expression-gaps-5375-2026-10",
-        Language::Kotlin => "resolution-bundle-kotlin-v43-function-type-arguments-2026-10",
+        // An up-call's `super` receiver is the enclosing template's parent
+        // identity, and an abstract or opaque type alias projects itself
+        // instead of publishing an unproduced identity slot (#5685).
+        Language::Scala => {
+            "resolution-bundle-scala-v76-super-receivers-and-alias-identities-2026-10"
+        }
+        Language::CSharp => {
+            "resolution-bundle-csharp-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+        }
+        Language::Ruby => {
+            "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+        }
+        Language::Kotlin => {
+            "resolution-bundle-kotlin-v47-function-type-arguments-local-write-joins-5015-2026-10"
+        }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
 }
@@ -1365,6 +1394,12 @@ pub(super) fn insert_prepared_bundle_tx(
         .into_iter()
         .zip(bundle.rows.families())
     {
+        // Boundary validation needs the canonical template's type-body row,
+        // which is published with the typed families below (including locals
+        // that have no definition/unit crosswalk).
+        if spec.name == "declaration_access_boundaries" {
+            continue;
+        }
         if let Some(digest_column) = interned_identity_column(spec.name) {
             if !insert_interned_header_family(tx, blob_id, spec, digest_column, rows, cancellation)?
             {
@@ -1386,6 +1421,17 @@ pub(super) fn insert_prepared_bundle_tx(
         return Ok(false);
     }
     if !insert_typed_fact_rows(tx, blob_id, bundle, cancellation)? {
+        return Ok(false);
+    }
+    let boundary_spec = PreparedResolutionBundleRows::family_specs()
+        [ResolutionManifestFamilyIndex::declaration_access_boundaries as usize];
+    if !insert_resolution_family(
+        tx,
+        blob_id,
+        boundary_spec,
+        &bundle.rows.declaration_access_boundaries,
+        cancellation,
+    )? {
         return Ok(false);
     }
     let payload_bytes = tx
@@ -2696,6 +2742,23 @@ impl SharedNameTable {
         if let Some(previous) = self.digests_by_id.borrow_mut().insert(id, digest) {
             assert_eq!(previous, digest, "one request identity keeps one digest");
         }
+    }
+
+    /// Remember an observed catalog identity without making the next request
+    /// repeat its seek. Only the committed ID enters the bounded store cache;
+    /// the request may already have a different, publication-local alias.
+    pub(crate) fn remember_stored_identity(
+        &self,
+        digest: [u8; 32],
+        stored: SharedNameId,
+        request: SharedNameId,
+    ) {
+        assert!(
+            stored.is_interned(),
+            "the store cache holds only committed IDs"
+        );
+        self.remember_identity(digest, request);
+        self.cache.charged(|entries| entries.insert(digest, stored));
     }
 
     /// Admit one blob's complete committed shared-name membership.

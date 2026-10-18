@@ -17,6 +17,20 @@ impl CallApplicabilityAdapter for GoCallApplicabilityAdapter {
         TypeInCallPosition::Conversion
     }
 
+    fn has_receiver_binding_obligation(&self) -> bool {
+        true
+    }
+
+    fn receiver_binding_completion(
+        &self,
+        evaluation: &mut FactEvaluation<'_, '_>,
+        candidate: SemanticId,
+        call: &LoweredCallApplicabilityObligation,
+        signature: &LoweredCallableSignatureProperty,
+    ) -> Result<Option<ResolutionCompletion>> {
+        evaluation.go_receiver_binding_completion(candidate, call, signature)
+    }
+
     fn map_arguments(
         &self,
         call: &LoweredCallApplicabilityObligation,
@@ -43,8 +57,13 @@ impl CallApplicabilityAdapter for GoCallApplicabilityAdapter {
         previous_states: &StateMap,
         _completion: &mut ResolutionCompletion,
     ) -> Result<Option<CandidateAssessment>> {
+        let Some(signature_types_complete) =
+            evaluation.go_signature_type_inventory_complete(signature)?
+        else {
+            return Ok(None);
+        };
         if !call_inventory_complete
-            || signature.completion() != &ResolutionCompletion::Complete
+            || !signature_types_complete
             || call.explicit_type_argument_count() != 0
             || signature.type_parameter_count() != 0
         {

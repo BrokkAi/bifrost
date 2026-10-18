@@ -124,6 +124,11 @@ pub(super) fn encode<'a>(
             "semantic IR procedure {index} carries id {}",
             procedure.id
         );
+        assert!(
+            procedure.source_range_holes.is_empty(),
+            "query-time source ownership holes cannot be persisted as IR rows: {:?}",
+            procedure.source_range_holes,
+        );
         encoder.procedure(procedure);
     }
     if let Some(flows) = partial_flows {

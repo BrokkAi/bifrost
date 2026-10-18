@@ -20,7 +20,7 @@ use crate::analyzer::{
     AnalyzerBuildTierAccess, AnalyzerConfig, AnalyzerDelegate, BuildProgress,
     CSharpDependencyPackAdapter, GoDependencyDiscoveryMode, GoDependencyPackAdapter, IAnalyzer,
     JsTsDependencyPackAdapter, JvmDependencyDiscoveryMode, JvmDependencyPackAdapter, Language,
-    MultiAnalyzer, Project, PythonDependencyPackAdapter, RevisionBlobIdentities,
+    MultiAnalyzer, Project, ProjectFile, PythonDependencyPackAdapter, RevisionBlobIdentities,
     RubyDependencyPackAdapter, RustDependencyPackAdapter,
     resolve_csharp_semantic_pack_dependencies, resolve_go_semantic_pack_dependencies,
     resolve_js_ts_semantic_pack_dependencies, resolve_jvm_semantic_pack_dependencies,
@@ -149,10 +149,8 @@ impl WorkspaceProjectionLease {
         store: Arc<crate::analyzer::store::AnalyzerStore>,
         workspace_id: crate::analyzer::store::WorkspaceId,
     ) -> Self {
-        assert!(
-            store.db_path().is_some(),
-            "projection leases require a persistent store"
-        );
+        // Ephemeral stores can also be shared by retained snapshots. Their
+        // request projections need the same cleanup as persistent stores.
         Self {
             store,
             workspace_id,
@@ -169,6 +167,169 @@ impl Drop for WorkspaceProjectionLease {
                  generation next changes: {error}"
             );
         }
+    }
+}
+
+/// A language context reads configuration from its selected SQL revision.
+/// Source reads and listing ownership remain with the caller's project. No
+/// configuration collection is retained in Rust, and a missing selected input
+/// never falls back to a file that happens to remain on disk.
+pub(crate) struct SelectedConfigurationProject {
+    project: Arc<dyn Project>,
+    language: Language,
+    store: Arc<crate::analyzer::store::AnalyzerStore>,
+    snapshot: crate::analyzer::store::WorkspaceSnapshotId,
+    _projection_lease: Option<Arc<WorkspaceProjectionLease>>,
+}
+
+impl SelectedConfigurationProject {
+    pub(crate) fn new(
+        project: Arc<dyn Project>,
+        language: Language,
+        store: Arc<crate::analyzer::store::AnalyzerStore>,
+        snapshot: crate::analyzer::store::WorkspaceSnapshotId,
+        projection_lease: Option<Arc<WorkspaceProjectionLease>>,
+    ) -> Self {
+        Self {
+            project,
+            language,
+            store,
+            snapshot,
+            _projection_lease: projection_lease,
+        }
+    }
+
+    fn is_configuration(&self, path: &Path) -> bool {
+        crate::analyzer::store::WorkspaceConfigurationInput::is_native_input(self.language, path)
+    }
+
+    fn configuration_source(&self, file: &ProjectFile) -> std::io::Result<Option<Vec<u8>>> {
+        self.store
+            .selected_configuration_source(
+                &self.snapshot,
+                &crate::path_utils::rel_path_string(file),
+            )
+            .map_err(std::io::Error::other)
+    }
+}
+
+impl Project for SelectedConfigurationProject {
+    fn root(&self) -> &Path {
+        self.project.root()
+    }
+    fn coverage(&self) -> brokk_bifrost_core::analyzer::project::ProjectCoverage {
+        self.project.coverage()
+    }
+    fn workspace_root_for_file(&self, file: &ProjectFile) -> PathBuf {
+        self.project.workspace_root_for_file(file)
+    }
+    fn analyzer_languages(&self) -> BTreeSet<Language> {
+        self.project.analyzer_languages()
+    }
+    fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.project.all_files()
+    }
+    fn all_files_shared(&self) -> std::io::Result<Arc<BTreeSet<ProjectFile>>> {
+        self.project.all_files_shared()
+    }
+    fn workspace_file_listing_count(&self) -> usize {
+        self.project.workspace_file_listing_count()
+    }
+    fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.project.analyzable_files(language)
+    }
+    fn analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.project.analyzable_files_from(files, language)
+    }
+    fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+        if !self.is_configuration(path) {
+            return self.project.file_by_rel_path(path);
+        }
+        let file = ProjectFile::new(self.root(), path);
+        self.configuration_source(&file)
+            .expect("selected configuration must remain readable")
+            .map(|_| file)
+    }
+    fn has_directory(&self, path: &Path) -> bool {
+        self.project.has_directory(path)
+    }
+    fn persistence_root(&self) -> Option<&Path> {
+        self.project.persistence_root()
+    }
+    fn is_gitignored(&self, path: &Path) -> bool {
+        self.project.is_gitignored(path)
+    }
+    fn is_bifrostignored(&self, path: &Path) -> bool {
+        self.project.is_bifrostignored(path)
+    }
+    fn invalidate_cached_file_listing(&self) {
+        self.project.invalidate_cached_file_listing();
+    }
+    fn update_cached_listing_for_path(&self, path: &Path) -> bool {
+        self.project.update_cached_listing_for_path(path)
+    }
+    fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
+        if !self.is_configuration(file.rel_path()) {
+            return self.project.read_source(file);
+        }
+        let source = self.configuration_source(file)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{} is absent from selected configuration",
+                    file.rel_path().display()
+                ),
+            )
+        })?;
+        brokk_bifrost_core::analyzer::project::decode_source_bytes(source)
+    }
+    fn read_source_limited(
+        &self,
+        file: &ProjectFile,
+        max: usize,
+    ) -> std::io::Result<Option<String>> {
+        if !self.is_configuration(file.rel_path()) {
+            return self.project.read_source_limited(file, max);
+        }
+        self.read_source(file)
+            .map(|source| (source.len() <= max).then_some(source))
+    }
+    fn read_source_snapshot(
+        &self,
+        file: &ProjectFile,
+    ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot> {
+        if !self.is_configuration(file.rel_path()) {
+            return self.project.read_source_snapshot(file);
+        }
+        self.read_source(file)
+            .map(brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk)
+    }
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max: usize,
+    ) -> std::io::Result<Option<brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot>> {
+        if !self.is_configuration(file.rel_path()) {
+            return self.project.read_source_snapshot_limited(file, max);
+        }
+        self.read_source_limited(file, max).map(|source| {
+            source.map(brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk)
+        })
+    }
+    fn overlay_content(
+        &self,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent>> {
+        self.project.overlay_content()
+    }
+    fn has_overlay(&self, file: &ProjectFile) -> bool {
+        self.project.has_overlay(file)
+    }
+    fn analysis_generation(&self) -> u64 {
+        self.project.analysis_generation()
     }
 }
 

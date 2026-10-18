@@ -43,6 +43,8 @@ pub mod declaration_range;
 pub(crate) mod digest;
 pub(crate) mod exception_handling;
 mod go;
+#[cfg(test)]
+pub(crate) use go::native_graph::GoNativeWorkspaceGraphProvider;
 pub use go::package_identity::{
     modeled_go_callable_result_nominal_type, modeled_go_callable_result_pointer_field,
 };
@@ -71,7 +73,8 @@ mod multi_analyzer;
 mod native_points;
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::{
-    NativeTypeProbe, probe_native_definition, probe_native_definition_trace, probe_native_type,
+    NativeAssignmentValueProbe, NativeTypeProbe, probe_native_assignment_value,
+    probe_native_definition, probe_native_definition_trace, probe_native_type,
 };
 pub mod packs_document;
 mod php;

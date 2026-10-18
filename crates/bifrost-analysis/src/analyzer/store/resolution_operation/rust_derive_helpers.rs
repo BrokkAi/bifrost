@@ -1,4 +1,8 @@
-//! Derive-helper binder gaps, closed on demand.
+//! Source-owned conditional gaps, closed on demand.
+//!
+//! Inactive item-macro inputs use the same exact reason-closure mechanism as
+//! derive helpers. Only predicates false in every selected membership close;
+//! active or unknown predicates retain the original frontier.
 //!
 //! A Rust item that carries a derive may carry a bare attribute that is really
 //! an inert helper of that derive (`#[serde(..)]`). The producer cannot tell
@@ -146,7 +150,7 @@ impl SelectedResolutionMountInventory<'_> {
                     Ok((
                         row.get::<_, u32>(0)?,
                         row.get::<_, u32>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, String>(4)?,
                     ))
@@ -164,14 +168,17 @@ impl SelectedResolutionMountInventory<'_> {
             if cancellation.is_cancelled() {
                 return Ok(false);
             }
-            let proven = match proven_names.get(&(topology, path.clone(), helper.clone())) {
-                Some(&proven) => proven,
-                None => {
-                    let proven =
-                        helper_absent_from_macro_lookup(connection, topology, &path, &helper)?;
-                    proven_names.insert((topology, path, helper), proven);
-                    proven
-                }
+            let proven = match helper.as_ref() {
+                None => true,
+                Some(helper) => match proven_names.get(&(topology, path.clone(), helper.clone())) {
+                    Some(&proven) => proven,
+                    None => {
+                        let proven =
+                            helper_absent_from_macro_lookup(connection, topology, &path, helper)?;
+                        proven_names.insert((topology, path, helper.clone()), proven);
+                        proven
+                    }
+                },
             };
             match decided.last_mut() {
                 Some((last_ordinal, last_reason, all))

@@ -744,7 +744,15 @@ pub struct MacroOnly;
                 .any(|star| { star.module_specifier == "crate::models" })
         );
 
-        for excluded in ["LocalOnly", "NestedOnly", "external_alias", "MacroOnly"] {
+        assert_eq!(
+            index.exports_by_name.get("MacroOnly"),
+            Some(&ExportEntry::ReexportedNamed {
+                module_specifier: "crate::models".to_string(),
+                imported_name: "MacroOnly".to_string(),
+            }),
+            "a proven source-preserving root import has ordinary export authority"
+        );
+        for excluded in ["LocalOnly", "NestedOnly", "external_alias"] {
             assert!(
                 !index.exports_by_name.contains_key(excluded),
                 "non-root import {excluded} must not be an export"

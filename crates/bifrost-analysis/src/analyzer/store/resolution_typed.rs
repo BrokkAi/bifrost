@@ -83,6 +83,8 @@ pub(crate) struct SelectedResolutionTypedSource<'selection, 'store> {
     authority: Rc<SelectedResolutionAuthority<'selection>>,
     context_identities: crate::analyzer::resolution::SelectedContextIdentities,
     external_providers: Vec<String>,
+    external_models:
+        Option<std::sync::Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>>,
     go_owner_proofs: std::cell::RefCell<go_members::OwnerProofMemo>,
 }
 
@@ -106,8 +108,19 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             authority,
             context_identities: crate::analyzer::resolution::SelectedContextIdentities::new(),
             external_providers: Vec::new(),
+            external_models: None,
             go_owner_proofs: Default::default(),
         }
+    }
+
+    pub(super) fn with_external_models(
+        mut self,
+        models: Option<
+            std::sync::Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>,
+        >,
+    ) -> Self {
+        self.external_models = models;
+        self
     }
 
     pub(super) fn with_external_providers(mut self, providers: Vec<String>) -> Self {
@@ -951,10 +964,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             let namespace = if let Some(row) = rows.next()? {
                 if let Some(language) = row.get::<_, Option<i64>>(1)? {
                     Some(
-                        super::resolution_prepare::resolution_rows::decode_lookup_recipe(
+                        super::resolution_prepare::resolution_rows::decode_stored_lookup_recipe(
                             language,
                             row.get(2)?,
                             &row.get::<_, String>(3)?,
+                            row.get(4)?,
                         )
                         .namespace(),
                     )
@@ -2795,6 +2809,13 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                 visitor,
                 |context, row| {
                     let label: String = row.get(1)?;
+                    use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+                    let boundary = match row.get::<_, Option<i64>>(2)? {
+                        None => None,
+                        Some(0) => Some(DeclarationAccessBoundary::Package(row.get(3)?)),
+                        Some(1) => Some(DeclarationAccessBoundary::Template(context.semantic(row.get(4)?))),
+                        kind => return Err(invalid_fact(format!("stored access boundary kind {kind:?} is outside its vocabulary"))),
+                    };
                     Ok(SelectedTypedRow::new(
                         context.fragment,
                         LoweredDeclarationVisibilityProperty::new(
@@ -2804,7 +2825,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                                     "stored declaration visibility {label:?} is outside its vocabulary"
                                 ))
                             })?,
-                        ),
+                        ).with_boundary(boundary),
                     ))
                 },
             )
@@ -3186,7 +3207,8 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDefinitionPropertyGap>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        self.visit_open_property_gaps(cancellation, visitor, |visitor| {
+            self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -3219,6 +3241,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                 )
             },
         )
+        })
     }
 
     fn visit_definition_property_gap_pages_for_reasons(
@@ -3227,47 +3250,49 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDefinitionPropertyGap>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
-            cancellation,
-            visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
-                    reasons.as_slice(),
-                    TypedFactRelation::DefinitionPropertyGapReason,
-                    cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::DEFINITION_PROPERTY_GAPS_BY_REASON_SQL,
-                    cancellation,
-                    visitor,
-                    |context, row| {
-                        Ok(SelectedTypedRow::new(
-                            context.fragment,
-                            typed_rows::decode_definition_property_gap(
-                                context,
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                            ),
-                        ))
-                    },
-                )
-            },
-            |visitor| {
-                super::resolution_stage::typed::visit_definition_property_gap_pages_for_reasons(
-                    self.selection,
-                    reasons,
-                    cancellation,
-                    visitor,
-                )
-            },
-        )
+        self.visit_open_property_gaps(cancellation, visitor, |visitor| {
+            visit_combined_typed_rows(
+                cancellation,
+                visitor,
+                |visitor| {
+                    let Some(mounts) = self.local_keys_by_mount(
+                        reasons.as_slice(),
+                        TypedFactRelation::DefinitionPropertyGapReason,
+                        cancellation,
+                    )?
+                    else {
+                        return cancelled();
+                    };
+                    self.visit_typed_rows(
+                        &mounts,
+                        typed_rows::DEFINITION_PROPERTY_GAPS_BY_REASON_SQL,
+                        cancellation,
+                        visitor,
+                        |context, row| {
+                            Ok(SelectedTypedRow::new(
+                                context.fragment,
+                                typed_rows::decode_definition_property_gap(
+                                    context,
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                ),
+                            ))
+                        },
+                    )
+                },
+                |visitor| {
+                    super::resolution_stage::typed::visit_definition_property_gap_pages_for_reasons(
+                        self.selection,
+                        reasons,
+                        cancellation,
+                        visitor,
+                    )
+                },
+            )
+        })
     }
 
     fn visit_call_applicability_pages_for_callee_references(
@@ -3829,6 +3854,61 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             return Ok(None);
         };
         Ok(Some(group_keys(coordinates.into_iter())))
+    }
+
+    /// A selected source proof can close a gap used by a member property as
+    /// well as by lexical or type-frontier completion. Keep the same proof on
+    /// both keyed property reads, including staged rows.
+    fn visit_open_property_gaps(
+        &self,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDefinitionPropertyGap>>,
+        read: impl FnOnce(
+            &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDefinitionPropertyGap>>,
+        ) -> StoreResult<TypedFactReadOutcome>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let maximum_rows = visitor.maximum_rows();
+        let mut cancelled = false;
+        let outcome = read(&mut TypedFactPageVisitor::with_maximum_rows(
+            &mut |page: &[SelectedTypedRow<LoweredDefinitionPropertyGap>]| {
+                let completions = page
+                    .iter()
+                    .map(|gap| {
+                        ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::UnsupportedSemantic(
+                                gap.row().reason_semantic(),
+                            ),
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+                let Some(closed) = super::resolution_stage::lexical_readers::close_completions(
+                    self.selection,
+                    &completions,
+                    cancellation,
+                )?
+                else {
+                    cancelled = true;
+                    return Ok(false);
+                };
+                let open = page
+                    .iter()
+                    .zip(closed)
+                    .filter(|(_, completion)| *completion != ResolutionCompletion::Complete)
+                    .map(|(gap, _)| gap.clone())
+                    .collect::<Vec<_>>();
+                if open.is_empty() {
+                    Ok(true)
+                } else {
+                    visitor.visit_page(&open)
+                }
+            },
+            maximum_rows,
+        ))?;
+        if cancelled {
+            Ok(TypedFactReadOutcome::cancelled(outcome.evidence().clone()))
+        } else {
+            Ok(outcome)
+        }
     }
 
     /// Visit one request's selected local rows and matching staged rows.

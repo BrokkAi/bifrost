@@ -14,7 +14,7 @@ use rusqlite::{OptionalExtension, params};
 /// The `unmounted` column and its `+` are explained beside
 /// `rust_crate_context::MODULES`, which reads the same thing for the graph
 /// route. The two must not drift. Both leave out a module with no persisted
-/// resolution scope: an inline module an item macro's expansion declares
+/// resolution scope: an inline module an unproven item macro's expansion declares
 /// outside the file's own lowering, whose body only a request-scoped capsule
 /// lowers. No persisted reference is written in such a scope, so it is no
 /// requester's module.
@@ -1032,7 +1032,16 @@ pub(super) const EXTERNAL_TYPE_IDENTITY: &str = "SELECT 1
 /// Module segments plus the terminal item of one external type import. The
 /// route is read from structured Rust import facts and the exact mounted
 /// identity, never from its rendered spelling.
-const EXTERNAL_TYPE_IMPORT_PATH: &str = "SELECT import.imported_name,
+// SQLite materializes a join view on the nullable side of a LEFT JOIN. Scope
+// the segment relation before materialization so it cannot visit other blobs
+// (#5638). Both readers below use this shape.
+const EXTERNAL_TYPE_IMPORT_PATH: &str = "WITH scoped_segments AS MATERIALIZED (
+ SELECT blob_id, import_ordinal, ordinal, segment
+ FROM source_rust_import_module_segments
+ WHERE blob_id IN (SELECT blob_id FROM temp.selected_resolution_mounts
+                   WHERE mount_ordinal=?1)
+ )
+ SELECT import.imported_name,
  segment.ordinal, segment.segment
  FROM temp.selected_resolution_mounts AS mount
  CROSS JOIN resolution_paths AS binding
@@ -1044,16 +1053,19 @@ const EXTERNAL_TYPE_IMPORT_PATH: &str = "SELECT import.imported_name,
   ON import.blob_id=mount.blob_id
   AND import.ordinal=json_extract(binding.end_fixed_key,'$[#-2][0]')
   AND import.is_glob=0
- LEFT JOIN source_rust_import_module_segments AS segment
+ LEFT JOIN scoped_segments AS segment
   ON segment.blob_id=import.blob_id AND segment.import_ordinal=import.ordinal
  WHERE mount.mount_ordinal=?1 AND identity.namespace=?3
  ORDER BY segment.ordinal";
 
-const EXTERNAL_TYPE_IMPORT_PATHS_FOR_BINDING: &str = "SELECT import.ordinal, import.imported_name,
- segment.segment
+const EXTERNAL_TYPE_IMPORT_PATHS_FOR_BINDING: &str = "WITH scoped_segments AS MATERIALIZED (
+ SELECT import_ordinal, ordinal, segment
+ FROM source_rust_import_module_segments WHERE blob_id=?1
+ )
+ SELECT import.ordinal, import.imported_name, segment.segment
  FROM source_rust_import_targets AS import
- LEFT JOIN source_rust_import_module_segments AS segment
-  ON segment.blob_id=import.blob_id AND segment.import_ordinal=import.ordinal
+ LEFT JOIN scoped_segments AS segment
+  ON segment.import_ordinal=import.ordinal
  WHERE import.blob_id=?1 AND import.native_scope=?2 AND import.bound_name=?3
   AND import.is_glob=0 AND import.imported_name IS NOT NULL
  ORDER BY import.ordinal, segment.ordinal";
@@ -1677,6 +1689,27 @@ impl RustCrateRows<'_, '_, '_> {
         Ok(vec![bridge])
     }
 
+    /// An import with no active binding can still bind a name under an
+    /// undecidable cfg. Inspect the source inventory before following its
+    /// terminal route, where an alias's spelling need not exist.
+    pub(super) fn crate_import_inventory_completion(
+        &self,
+        requester: &Module,
+        demand: &ResolutionLookupSemanticRecipe,
+    ) -> Result<ResolutionCompletion> {
+        let details = self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(UNKNOWN_IMPORT_INVENTORY)?
+            .query_map(
+                params![requester.topology, requester.path, demand.spelling()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(self.inventory_completion(details))
+    }
+
     pub(super) fn crate_inventory_completion(
         &self,
         requester: &Module,
@@ -1725,6 +1758,10 @@ impl RustCrateRows<'_, '_, '_> {
                 details
             }
         };
+        Ok(self.inventory_completion(details))
+    }
+
+    fn inventory_completion(&self, details: Vec<String>) -> ResolutionCompletion {
         let mut completion = ResolutionCompletion::Complete;
         for detail in details {
             completion = completion.combine(&ResolutionCompletion::incomplete([
@@ -1734,7 +1771,7 @@ impl RustCrateRows<'_, '_, '_> {
                 )),
             ]));
         }
-        Ok(completion)
+        completion
     }
 
     /// The native import scopes of one module scope

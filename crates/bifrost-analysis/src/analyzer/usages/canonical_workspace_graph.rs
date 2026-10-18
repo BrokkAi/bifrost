@@ -3,6 +3,9 @@
 //! The legacy workspace graph remains in the parent module. This module owns
 //! the selected canonical path so its eventual cutover is a module operation.
 
+use crate::analyzer::store::resolution_operation::graph_stage::{
+    GraphSkippedCallers, certify_graph_callers,
+};
 use std::collections::BTreeMap;
 
 use super::super::inverted_edges::MAX_CALLSITES;
@@ -672,6 +675,7 @@ pub(crate) struct SelectedWorkspaceUsageGraphProjection {
     /// Includes admitted empty files. Dependency declaration files are not
     /// callers unless the source operation independently admitted them.
     pub(crate) admitted_callers: HashSet<ProjectFile>,
+    pub(crate) skipped_callers: GraphSkippedCallers,
     /// The names this build's unresolved forward bindings spell, or `None`
     /// when one of them has no identifier the route could read.
     ///
@@ -695,6 +699,10 @@ pub(crate) struct SelectedWorkspaceUsageGraphProjection {
 impl SelectedWorkspaceUsageGraphProjection {
     pub(crate) fn raw_proven_inbound(&self) -> &[usize] {
         &self.raw_proven_inbound
+    }
+
+    pub(crate) fn certify_callers(&self, requested: &HashSet<ProjectFile>) {
+        certify_graph_callers(requested, &self.admitted_callers, &self.skipped_callers);
     }
 
     pub(crate) fn admitted_callers(&self) -> &HashSet<ProjectFile> {
@@ -947,16 +955,22 @@ pub(crate) fn aggregate_disjoint_workspace_usage_projections(
     };
     let mut admitted_callers = HashSet::default();
     let mut overlapping = BTreeSet::new();
+    let mut accounted_callers = HashSet::default();
     let mut unresolved_names = Some(BTreeSet::new());
     for projection in projections {
-        for file in projection.admitted_callers() {
+        for file in projection
+            .admitted_callers()
+            .iter()
+            .chain(projection.skipped_callers.keys())
+        {
             if cancellation.is_cancelled() {
                 return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
             }
-            if !admitted_callers.insert(file.clone()) {
+            if !accounted_callers.insert(file.clone()) {
                 overlapping.insert(file.clone());
             }
         }
+        admitted_callers.extend(projection.admitted_callers().iter().cloned());
         // Caller admission is disjoint, but a declaration one contribution's
         // unresolved binding can reach may be declared in another's files.
         // The union is the aggregate's evidence, and one contribution that
@@ -1120,7 +1134,12 @@ pub(crate) fn aggregate_disjoint_workspace_usage_projections(
     } else {
         EdgeCompleteness::Incomplete { reasons }
     };
-    let complete = kind_projection_complete
+    let complete = !projections.iter().any(|projection| {
+        projection
+            .skipped_callers
+            .values()
+            .any(|reason| reason.opens_incompleteness())
+    }) && kind_projection_complete
         && [
             EdgeAxis::ForwardProjection,
             EdgeAxis::OwnerClassification,
@@ -1133,6 +1152,10 @@ pub(crate) fn aggregate_disjoint_workspace_usage_projections(
         edges,
         raw_proven_inbound,
         admitted_callers,
+        skipped_callers: projections
+            .iter()
+            .flat_map(|projection| projection.skipped_callers.clone())
+            .collect(),
         unresolved_names,
         forward_completeness,
         kind_projection_complete,
@@ -1306,7 +1329,10 @@ pub(super) fn merge_workspace_usage_graph_projections(
 ///
 /// Caller admission is independent of the declaration catalog: dependencies
 /// may supply endpoints, and admitted empty files still establish ownership.
-pub(crate) struct NativeWorkspaceUsageGraphAccumulator(CanonicalWorkspaceUsageGraphAccumulator);
+pub(crate) struct NativeWorkspaceUsageGraphAccumulator(
+    CanonicalWorkspaceUsageGraphAccumulator,
+    GraphSkippedCallers,
+);
 
 impl NativeWorkspaceUsageGraphAccumulator {
     pub(crate) fn new(
@@ -1328,11 +1354,28 @@ impl NativeWorkspaceUsageGraphAccumulator {
             }
             admitted.insert(file.clone());
         }
-        Some(Self(CanonicalWorkspaceUsageGraphAccumulator::new(
-            catalog,
-            BTreeSet::from([ecosystem]),
-            admitted,
-        )))
+        Some(Self(
+            CanonicalWorkspaceUsageGraphAccumulator::new(
+                catalog,
+                BTreeSet::from([ecosystem]),
+                admitted,
+            ),
+            GraphSkippedCallers::new(),
+        ))
+    }
+
+    pub(crate) fn record_skipped_callers(&mut self, skipped: GraphSkippedCallers) {
+        assert!(
+            skipped
+                .keys()
+                .all(|file| !self.0.admitted_callers.contains(file))
+        );
+        // A skipped caller with missing authority can reference any name. Its
+        // absence cannot support a per-declaration proof of zero inbound sites.
+        if skipped.values().any(|reason| reason.opens_incompleteness()) {
+            self.0.unresolved_names = None;
+        }
+        self.1 = skipped;
     }
 
     pub(crate) fn stage(
@@ -1394,6 +1437,7 @@ impl NativeWorkspaceUsageGraphAccumulator {
             edges: projection.edges,
             raw_proven_inbound: projection.raw_proven_inbound,
             admitted_callers: projection.admitted_callers,
+            skipped_callers: self.1,
             unresolved_names: projection.unresolved_names,
             forward_completeness: projection.forward_completeness,
             kind_projection_complete: projection.kind_projection_complete,
@@ -1405,7 +1449,12 @@ impl NativeWorkspaceUsageGraphAccumulator {
             #[cfg(test)]
             resolved_ecosystems: projection.resolved_ecosystems,
         };
-        if complete {
+        if complete
+            && !projection
+                .skipped_callers
+                .values()
+                .any(|reason| reason.opens_incompleteness())
+        {
             SelectedWorkspaceUsageGraphProjectionOutcome::Complete(projection)
         } else {
             SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(projection)
@@ -1702,6 +1751,7 @@ where
         edges,
         raw_proven_inbound,
         admitted_callers,
+        skipped_callers: Default::default(),
         unresolved_names,
         forward_completeness,
         kind_projection_complete,
@@ -2172,6 +2222,7 @@ mod tests {
             nodes: catalog.catalog.nodes,
             raw_proven_inbound,
             admitted_callers: HashSet::from_iter([caller.source().clone()]),
+            skipped_callers: Default::default(),
             unresolved_names: Some(BTreeSet::new()),
             edges: vec![CanonicalWorkspaceUsageProjectedEdge {
                 from,
@@ -2233,6 +2284,7 @@ mod tests {
             edges: projection.edges,
             raw_proven_inbound: projection.raw_proven_inbound,
             admitted_callers: projection.admitted_callers,
+            skipped_callers: Default::default(),
             unresolved_names: projection.unresolved_names,
             forward_completeness: projection.forward_completeness,
             kind_projection_complete: projection.kind_projection_complete,

@@ -4127,6 +4127,175 @@ fn generated_surfaces_preserve_existing_names_and_keep_absence_and_members_open(
     }
 }
 
+#[test]
+#[hardwon("#5172: inactive cfg_if arm macros leaked name and member frontiers")]
+fn cfg_if_unsupported_macro_frontiers_follow_cfg_placement() {
+    let manifest = "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n";
+    for (condition, active) in [
+        ("all()", true),
+        ("unknown_build_flag", true),
+        ("any()", false),
+    ] {
+        let source = format!(
+            r#"
+pub struct Local;
+impl Local {{ pub fn existing(&self) {{}} }}
+mod helpers {{ pub fn imported_item() {{}} }}
+use helpers::imported_item as imported;
+pub fn ordinary() {{}}
+cfg_if::cfg_if! {{ if #[cfg({condition})] {{ unsupported_items! {{}} }} }}
+pub fn caller(value: Local) {{ ordinary(); imported(); missing_name(); value.existing(); }}
+"#
+        );
+        for (marker, name, expected) in [
+            ("ordinary();", "ordinary", DefinitionLookupStatus::Resolved),
+            ("imported();", "imported", DefinitionLookupStatus::Resolved),
+            (
+                "missing_name();",
+                "missing_name",
+                if active {
+                    DefinitionLookupStatus::Incomplete
+                } else {
+                    DefinitionLookupStatus::NoDefinition
+                },
+            ),
+            (
+                "value.existing();",
+                "existing",
+                if active {
+                    DefinitionLookupStatus::Incomplete
+                } else {
+                    DefinitionLookupStatus::Resolved
+                },
+            ),
+        ] {
+            let outcome = definition_in_workspace(
+                &[("Cargo.toml", manifest), ("src/lib.rs", &source)],
+                "src/lib.rs",
+                marker,
+                name,
+            );
+            assert_eq!(
+                outcome.status, expected,
+                "{condition} {marker}: {outcome:#?}"
+            );
+            if expected == DefinitionLookupStatus::Incomplete {
+                assert!(!outcome.diagnostics.is_empty(), "{outcome:#?}");
+            }
+            if name != "missing_name" {
+                assert_eq!(outcome.definitions.len(), 1, "{outcome:#?}");
+                let expected_name = match name {
+                    "imported" => "app.helpers.imported_item",
+                    "existing" => "app.Local.existing",
+                    _ => "app.ordinary",
+                };
+                assert_eq!(
+                    outcome.definitions[0].fq_name(),
+                    expected_name,
+                    "{outcome:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[hardwon("#5172: cfg_if ordinary items and ordered alternatives remained generated surfaces")]
+fn cfg_if_first_match_else_if_else_and_unknown_context() {
+    let source = r#"pub mod platform {
+cfg_if::cfg_if! {
+    if #[cfg(feature = "first")] {
+        pub fn first() {}
+        pub use crate::helpers::first_target as selected;
+        pub mod selected_mod { pub use crate::helpers::first_target as run; }
+    } else if #[cfg(feature = "second")] {
+        pub fn second() {}
+        pub use crate::helpers::second_target as selected;
+        pub mod selected_mod { pub use crate::helpers::second_target as run; }
+    } else {
+        pub fn last() {}
+        pub use crate::helpers::last_target as selected;
+        pub mod selected_mod { pub use crate::helpers::last_target as run; }
+    }
+}
+pub fn caller() { first(); second(); last(); selected(); selected_mod::run(); }
+}
+pub mod helpers {
+    pub fn first_target() {}
+    pub fn second_target() {}
+    pub fn last_target() {}
+}
+"#;
+    for (features, selected) in [
+        ("[\"first\", \"second\"]", "first"),
+        ("[\"second\"]", "second"),
+        ("[]", "last"),
+    ] {
+        let manifest = format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = {features}\nfirst = []\nsecond = []\n"
+        );
+        for name in ["first", "second", "last"] {
+            let outcome = definition_in_workspace(
+                &[("Cargo.toml", &manifest), ("src/lib.rs", source)],
+                "src/lib.rs",
+                &format!("{name}();"),
+                name,
+            );
+            if name == selected {
+                assert_eq!(
+                    outcome.status,
+                    DefinitionLookupStatus::Resolved,
+                    "{features} {name}: {outcome:#?}"
+                );
+                assert_eq!(outcome.definitions.len(), 1, "{outcome:#?}");
+            } else {
+                assert_eq!(
+                    outcome.status,
+                    DefinitionLookupStatus::NoDefinition,
+                    "{features} {name}: {outcome:#?}"
+                );
+                assert!(outcome.definitions.is_empty(), "{outcome:#?}");
+            }
+        }
+        for (marker, name) in [("selected();", "selected"), ("selected_mod::run();", "run")] {
+            let outcome = definition_in_workspace(
+                &[("Cargo.toml", &manifest), ("src/lib.rs", source)],
+                "src/lib.rs",
+                marker,
+                name,
+            );
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{features} {marker}: {outcome:#?}"
+            );
+            assert_eq!(outcome.definitions.len(), 1, "{outcome:#?}");
+            assert_eq!(
+                outcome.definitions[0].terminal_name(),
+                format!("{selected}_target")
+            );
+        }
+    }
+    let source = source.replace("feature = \"first\"", "unknown_build_flag");
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = [\"second\"]\nsecond = []\n";
+    for name in ["first", "second", "selected"] {
+        let outcome = definition_in_workspace(
+            &[("Cargo.toml", manifest), ("src/lib.rs", &source)],
+            "src/lib.rs",
+            &format!("{name}();"),
+            name,
+        );
+        assert!(
+            matches!(
+                outcome.status,
+                DefinitionLookupStatus::Incomplete
+                    | DefinitionLookupStatus::UnresolvableImportBoundary
+            ),
+            "{name}: {outcome:#?}"
+        );
+    }
+}
+
 fn definition_in_workspace(
     files: &[(&str, &str)],
     path: &str,

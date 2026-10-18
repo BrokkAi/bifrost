@@ -3361,7 +3361,7 @@ pub fn project_fact_reference_edge_batch(
     let mut edges = Vec::new();
     let mut gaps = Vec::new();
     let mut reasons = Vec::new();
-    let mut unresolved_names = Some(std::collections::BTreeSet::new());
+    let mut unresolved_sites = HashSet::default();
     let mut missing_reference_kinds = HashSet::default();
 
     for answer in batch.answers() {
@@ -3369,6 +3369,11 @@ pub fn project_fact_reference_edge_batch(
             return Ok(cancelled_edge_batch(batch.fragment(), catalog.generation));
         }
         let binding = answer.answer().binding();
+        // LoweredSemanticSite::published_site_metadata deliberately omits
+        // metadata for SyntheticReference nodes. Both persisted and preloaded
+        // readers enumerate those internal references, so this gap path remains
+        // legitimate. Seeded demand batches assert that authored metadata is
+        // preserved before reaching the projector.
         let Some(metadata) = answer.site_metadata() else {
             let Some(may_contribute_graph) =
                 binding_may_contribute_graph(catalog, binding, cancellation)?
@@ -3451,23 +3456,7 @@ pub fn project_fact_reference_edge_batch(
                 &mut reasons,
                 EdgeIncompleteReason::ForwardResolutionIncomplete,
             );
-            // What this reference can still reach is bounded by the name it
-            // spells. Read that name from the identifier node the parser
-            // produced at the site's own range, and normalize it the way a
-            // declaration's short name is. A file with no structural adapter
-            // has no identifier node to read, and the batch then reports that
-            // its unresolved references are unnamed rather than pretending
-            // there are none.
-            match file.classifier.as_ref().and_then(|classifier| {
-                classifier.identifier_at(metadata.start_byte(), metadata.end_byte())
-            }) {
-                Some(identifier) => {
-                    if let Some(names) = unresolved_names.as_mut() {
-                        names.insert(strip_raw_identifier_prefix(identifier).to_owned());
-                    }
-                }
-                None => unresolved_names = None,
-            }
+            unresolved_sites.insert((metadata.start_byte(), metadata.end_byte()));
         }
 
         if metadata.namespace() == ResolutionNamespace::Callable
@@ -3671,6 +3660,35 @@ pub fn project_fact_reference_edge_batch(
                 &mut gaps,
                 &mut reasons,
             );
+        }
+    }
+
+    // Lowering can publish several namespace or receiver alternatives for one
+    // authored site. Resolution is their union: a proven alternative resolves
+    // that site even when another root retains an incomplete outcome. Keep the
+    // incomplete roots' diagnostic gaps, but derive unresolved names only after
+    // all alternatives have contributed their edges. Key by exact source site,
+    // never spelling: another occurrence of the same name may remain unresolved.
+    for edge in &edges {
+        if edge.proof == UsageProof::Proven {
+            unresolved_sites.remove(&(edge.site.range.start_byte, edge.site.range.end_byte));
+        }
+    }
+    let mut unresolved_names = Some(std::collections::BTreeSet::new());
+    for (start_byte, end_byte) in unresolved_sites {
+        // Read the value from the structurally selected identifier. A missing
+        // classifier means the remaining unresolved sites cannot all be named.
+        match file
+            .classifier
+            .as_ref()
+            .and_then(|classifier| classifier.identifier_at(start_byte, end_byte))
+        {
+            Some(identifier) => {
+                if let Some(names) = unresolved_names.as_mut() {
+                    names.insert(strip_raw_identifier_prefix(identifier).to_owned());
+                }
+            }
+            None => unresolved_names = None,
         }
     }
 

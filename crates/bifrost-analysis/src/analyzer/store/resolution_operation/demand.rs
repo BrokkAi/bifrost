@@ -838,6 +838,14 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
         self.base.scope_reverse_inventory_completion(completion)
     }
 
+    fn semantic_language_of(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::analyzer::Language>> {
+        self.base.semantic_language_of(identity, cancellation)
+    }
+
     fn universe_entry(
         &self,
         reference: SemanticId,

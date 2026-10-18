@@ -1858,6 +1858,35 @@ fn prepare_typed_rows(
                     && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
                 "contextual type transfer has inconsistent roles or transform: {rule:?}"
             ),
+            ResolutionTypeTransferKind::ValueJoin => assert!(
+                preserves_value
+                    && rule.indirection_delta() == 0
+                    && rule.reference_indirection_delta() == 0
+                    && matches!(
+                        source_role,
+                        Some(
+                            ResolutionTypeSlotRole::ExpressionValue
+                                | ResolutionTypeSlotRole::CallResult
+                        )
+                    )
+                    && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
+                "value-join transfer has inconsistent roles or transform: {rule:?}"
+            ),
+            ResolutionTypeTransferKind::NumericPromotion
+            | ResolutionTypeTransferKind::StringConcatenation => assert!(
+                rule.value_transform() == TypeTransferValueTransform::RuntimeOnly
+                    && rule.indirection_delta() == 0
+                    && rule.reference_indirection_delta() == 0
+                    && matches!(
+                        source_role,
+                        Some(
+                            ResolutionTypeSlotRole::ExpressionValue
+                                | ResolutionTypeSlotRole::CallResult
+                        )
+                    )
+                    && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
+                "operand promotion has inconsistent roles or transform: {rule:?}"
+            ),
             ResolutionTypeTransferKind::ExpressionResult => assert!(
                 matches!(
                     rule.value_transform(),
@@ -1888,28 +1917,33 @@ fn prepare_typed_rows(
                 }
             }
             ResolutionTypeTransferKind::AddressOf => assert!(
-                rule.indirection_delta() == 1
-                    && rule.reference_indirection_delta() == 0
-                    && matches!(
-                        rule.value_transform(),
-                        TypeTransferValueTransform::AddressableOperandOnly
-                            | TypeTransferValueTransform::RuntimeOnly
-                    )
-                    && matches!(
-                        source_role,
-                        Some(
-                            ResolutionTypeSlotRole::CallResult
-                                | ResolutionTypeSlotRole::ExpressionValue
-                        )
-                    )
-                    && matches!(
-                        target_role,
-                        Some(
-                            ResolutionTypeSlotRole::ExpressionValue
-                                | ResolutionTypeSlotRole::CallResult
-                        )
+                matches!(
+                    (
+                        rule.indirection_delta(),
+                        rule.reference_indirection_delta(),
+                        rule.value_transform()
                     ),
-                "address-of transfer has inconsistent roles or transform: {rule:?}"
+                    (1, 0, TypeTransferValueTransform::AddressableOperandOnly)
+                        | (1, 0, TypeTransferValueTransform::RuntimeOnly)
+                        | (
+                            1,
+                            1,
+                            TypeTransferValueTransform::ToRuntime { addressable: false }
+                        )
+                ) && matches!(
+                    source_role,
+                    Some(
+                        ResolutionTypeSlotRole::CallResult
+                            | ResolutionTypeSlotRole::ExpressionValue
+                    )
+                ) && matches!(
+                    target_role,
+                    Some(
+                        ResolutionTypeSlotRole::ExpressionValue
+                            | ResolutionTypeSlotRole::CallResult
+                    )
+                ),
+                "address-of transfer has an unapproved tuple or inconsistent roles: {rule:?}"
             ),
             ResolutionTypeTransferKind::Unwrap => assert!(
                 preserves_value
@@ -1924,6 +1958,40 @@ fn prepare_typed_rows(
                     && target_role == Some(ResolutionTypeSlotRole::CallResult),
                 "unwrap transfer has inconsistent roles or transform: {rule:?}"
             ),
+            ResolutionTypeTransferKind::ComponentElement
+            | ResolutionTypeTransferKind::ComponentKey
+            | ResolutionTypeTransferKind::ComponentValue => {
+                assert!(
+                    matches!(
+                        source_role,
+                        Some(
+                            ResolutionTypeSlotRole::TargetTypeIdentity
+                                | ResolutionTypeSlotRole::DeclaredValue
+                                | ResolutionTypeSlotRole::ExpressionValue
+                                | ResolutionTypeSlotRole::CallResult
+                        )
+                    ) && matches!(
+                        target_role,
+                        Some(
+                            ResolutionTypeSlotRole::TargetTypeIdentity
+                                | ResolutionTypeSlotRole::DeclaredValue
+                                | ResolutionTypeSlotRole::ExpressionValue
+                        )
+                    ),
+                    "component transfer has inconsistent roles: {rule:?}"
+                );
+                if target_role == Some(ResolutionTypeSlotRole::ExpressionValue) {
+                    assert!(
+                        rule.indirection_delta() == 0
+                            && rule.reference_indirection_delta() == 0
+                            && matches!(
+                                rule.value_transform(),
+                                TypeTransferValueTransform::ToRuntime { .. }
+                            ),
+                        "runtime component projection must preserve indirection and convert its value: {rule:?}"
+                    );
+                }
+            }
             _ => {}
         }
         if serialized_completion(rule.completion(), keys, cancellation).is_none() {
@@ -2051,6 +2119,23 @@ fn prepare_typed_rows(
             keys.semantic(property.definition()),
             property.visibility().label(),
         ]);
+        if let Some(boundary) = property.boundary() {
+            use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+            let (kind, package, template) = match boundary {
+                DeclarationAccessBoundary::Package(package) => {
+                    (0_i64, Some(package.as_str()), None)
+                }
+                DeclarationAccessBoundary::Template(template) => {
+                    (1_i64, None, Some(keys.semantic(*template)))
+                }
+            };
+            rows.declaration_access_boundaries.push(row![
+                keys.semantic(property.definition()),
+                kind,
+                package,
+                template
+            ]);
+        }
     }
     for property in typed.member_scopes() {
         if cancellation.is_cancelled() {

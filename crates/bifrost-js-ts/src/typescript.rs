@@ -46,10 +46,15 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
     };
     let mut module_has_imports = false;
     let exported_roots = crate::identifiers::es_named_exported_roots(root, source);
-    crate::primary::parse_primary(
+    let lexical_bindings = crate::syntax::JsTsLexicalBindingIndex::build(root, source);
+    let mut assignments =
+        crate::javascript::JsAssignmentDeclarations::new(root, source, &lexical_bindings);
+    crate::primary::parse_primary_with_lexical_bindings(
         source,
         tree,
         &crate::structural::TYPESCRIPT_STRUCTURAL_SPEC,
+        lexical_bindings,
+        assignments.commonjs().clone(),
         |parsed, event| {
             if blocked {
                 return;
@@ -148,9 +153,10 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                             _ => {}
                         }
                     }
-                    let _ = parent_kind;
+                    assignments.enter(file, source, child, parent_kind, parsed);
                 }
                 crate::primary::PrimaryEvent::Exit { node } => {
+                    assignments.exit(node);
                     if node.id() == root.id() && module_has_imports {
                         parsed.add_code_unit(module.clone(), root, source, None, None);
                     }

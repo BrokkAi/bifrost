@@ -5,6 +5,7 @@ use super::demand::{
 };
 use super::jvm_context::{
     JvmImportContext, JvmImportContextGap, JvmRoutePublication, is_jvm_language,
+    jvm_prefix_defers_member_selection,
 };
 use super::package_context::SelectedPackageRows;
 use super::*;
@@ -278,9 +279,12 @@ impl JvmDemandLanguage<'_, '_, '_> {
                     .mount_table()
                     .mount_by_ordinal(mount.ordinal())?;
                 if is_jvm_language(record.semantic_language()) {
-                    let SelectedPackageRows::Ready(references) = self
-                        .operation
-                        .selected_package_references(mount.ordinal(), self.cancellation)?
+                    let SelectedPackageRows::Ready(references) =
+                        self.operation.selected_package_reference_for_token(
+                            mount.ordinal(),
+                            token,
+                            self.cancellation,
+                        )?
                     else {
                         return Ok(None);
                     };
@@ -907,9 +911,7 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                             }
                         }
                     }
-                    if matches!(language, Language::Kotlin | Language::Scala)
-                        && let Some(route_completion) = source.qualified_completion.as_ref()
-                    {
+                    if let Some(route_completion) = source.qualified_completion.as_ref() {
                         let Some((_, retired, _)) = self.jvm_root_reference_evidence(
                             language,
                             identity.fragment(),
@@ -924,6 +926,21 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                             });
                         };
                         terminal_route_reasons = retired;
+                        if jvm_prefix_defers_member_selection(language)
+                            && evidence == ResolutionCompletion::Complete
+                            && prefix_targets
+                                .as_ref()
+                                .is_some_and(|targets| targets.len() == 1)
+                        {
+                            // The proved prefix classifies the name even when
+                            // member lookup still lacks hierarchy or signatures.
+                            // Retire exactly its own ambiguity, not that lookup.
+                            discharges
+                                .get_or_insert_with(DemandClosureDischarges::default)
+                                .merge(DemandClosureDischarges::exact(
+                                    terminal_route_reasons.iter().copied(),
+                                ));
+                        }
                     }
                 } else if has_prefix_target {
                     // A selected value shadows a package of the same name.
@@ -1053,7 +1070,7 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                 let package_reference_tokens = if let Some(reference) = source_reference_semantic {
                     let SelectedPackageRows::Ready(references) = self
                         .operation
-                        .selected_package_references(mount, self.cancellation)?
+                        .selected_package_reference_for_site(mount, reference, self.cancellation)?
                     else {
                         return Ok(LanguageClosure {
                             completion: cancelled_completion(),
@@ -1206,6 +1223,7 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
                 }
             };
             if publication.complete
+                && !jvm_prefix_defers_member_selection(source_language)
                 && (!has_import_route || !publication.selected_targets.is_empty())
                 && !terminal_route_reasons.is_empty()
             {
@@ -1237,6 +1255,7 @@ impl DemandLanguage for JvmDemandLanguage<'_, '_, '_> {
             }
             drop(existing);
             if publication.complete
+                && !jvm_prefix_defers_member_selection(source_language)
                 && !lexical_import_head
                 && (!has_import_route || !publication.selected_targets.is_empty())
             {
@@ -1516,7 +1535,7 @@ impl JvmDemandLanguage<'_, '_, '_> {
             };
             if row.fragment() == fragment
                 && row.source_site() == source_site
-                && crate::analyzer::resolution::jvm_type_prefix_gap_origin_is_safe(
+                && crate::analyzer::resolution::jvm_terminal_type_gap_origin_is_safe(
                     language,
                     row.fragment(),
                     row.source_site(),

@@ -847,11 +847,7 @@ pub(crate) fn build_workspace_usage_graph_with_passes(
                     }
                     Err(error) => return WorkspaceUsageGraphBuildOutcome::Failed(error),
                 };
-                assert_eq!(
-                    projection.admitted_callers(),
-                    &admitted_callers.into_iter().collect::<HashSet<_>>(),
-                    "native graph providers must retain exact caller admission"
-                );
+                projection.certify_callers(&admitted_callers.into_iter().collect());
                 native_projections.push(projection);
                 continue;
             }

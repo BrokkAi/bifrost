@@ -10,7 +10,9 @@ use brokk_bifrost_core::analyzer::model::{
     child_fq_base,
 };
 use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts, SourceImportFact};
-use brokk_bifrost_core::analyzer::resolution_facts::ResolutionDefinitionUnitFact;
+use brokk_bifrost_core::analyzer::resolution_facts::{
+    ResolutionDefinitionUnitFact, ResolutionScopeId,
+};
 use brokk_bifrost_core::analyzer::rust_facts::{
     RustCfgCondition, RustImportContextFact, RustImportSourceOccurrences,
     RustItemMacroSourcePosition, RustMacroParseFailure, RustTypeSourceFact,
@@ -193,7 +195,8 @@ impl SourceOccurrenceSink for RustEmbeddedSourceOccurrenceSink<'_, '_> {
 pub(crate) struct RustEmbeddedSourceMap {
     occurrences: HashMap<usize, SourceOccurrenceId>,
     declarations: HashMap<usize, SourceDeclarationId>,
-    imports: HashMap<usize, Vec<SourceImportId>>,
+    imports: HashMap<usize, RustEmbeddedImports>,
+    native_module_scopes: HashMap<usize, ResolutionScopeId>,
     /// Per-tree property contexts. Embedded items share most of their AST
     /// ancestry, so retaining these only for the live replay tree avoids
     /// repeating depth-proportional parent walks for every item.
@@ -207,6 +210,7 @@ pub(crate) struct RustEmbeddedSourceMap {
     /// exists only where the invocation does, so its activation is the
     /// conjunction of this and the item's own attributes.
     host_cfg: RustCfgCondition,
+    host_module: String,
 }
 
 /// An empty map for a tree whose invocation is at the top of a file with no
@@ -217,12 +221,20 @@ impl Default for RustEmbeddedSourceMap {
             occurrences: HashMap::default(),
             declarations: HashMap::default(),
             imports: HashMap::default(),
+            native_module_scopes: HashMap::default(),
             cfg_conditions: HashMap::default(),
             declaration_ancestries: HashMap::default(),
             host: crate::declaration_properties::RustDeclarationAncestry::default(),
             host_cfg: RustCfgCondition::Always,
+            host_module: String::new(),
         }
     }
+}
+
+struct RustEmbeddedImports {
+    ids: Vec<SourceImportId>,
+    projected: Vec<RustProjectedImport>,
+    context: Option<RustImportContextFact>,
 }
 
 impl RustEmbeddedSourceMap {
@@ -252,6 +264,17 @@ impl RustEmbeddedSourceMap {
 
     pub(crate) const fn host_cfg(&self) -> &RustCfgCondition {
         &self.host_cfg
+    }
+
+    pub(crate) fn cfg_condition(&mut self, node: Node<'_>, source: &str) -> RustCfgCondition {
+        RustCfgCondition::conjunction([
+            self.host_cfg.clone(),
+            crate::lexical_scope::rust_effective_cfg_condition_with_cache(
+                node,
+                source,
+                &mut self.cfg_conditions,
+            ),
+        ])
     }
 
     pub(crate) fn declare_node(
@@ -288,30 +311,154 @@ impl RustEmbeddedSourceMap {
             matches!(node.kind(), "use_declaration" | "extern_crate_declaration"),
             "embedded source import cache requires an import declaration"
         );
-        let mut ids = Vec::new();
-        for (projected, nodes) in rust_import_projection_with_source_nodes(node, source, "") {
-            let source_import_id = SourceImportId::try_from_index(source_imports.len())
-                .expect("source import ids must fit in a u32");
-            let (source_import, _) = source_import_from_nodes(
-                projected.import.info,
-                projected.import.is_macro_use,
-                &nodes,
-                |node| self.intern_node(node, collector),
-            );
-            source_imports.push(source_import);
-            ids.push(source_import_id);
+        let (mut projected, nodes): (Vec<_>, Vec<_>) =
+            rust_import_projection_with_source_nodes(node, source, &self.host_module)
+                .into_iter()
+                .unzip();
+        let condition = self.cfg_condition(node, source);
+        for import in &mut projected {
+            import.cfg_condition = condition.clone();
         }
+        let mut contexts = Vec::new();
+        attach_import_source_occurrences(
+            &mut projected,
+            &nodes,
+            &mut RustEmbeddedSourceOccurrenceSink {
+                collector,
+                source_maps: std::slice::from_mut(self),
+                tree_id: 0,
+            },
+            source_imports,
+            &mut contexts,
+        );
         assert!(
-            self.imports.insert(node.id(), ids).is_none(),
+            contexts.len() <= 1,
+            "one source import declaration has one context"
+        );
+        let ids = projected
+            .iter()
+            .map(|import| {
+                import
+                    .source_import_id
+                    .expect("captured import has a source id")
+            })
+            .collect();
+        assert!(
+            self.imports
+                .insert(
+                    node.id(),
+                    RustEmbeddedImports {
+                        ids,
+                        projected,
+                        context: contexts.pop(),
+                    }
+                )
+                .is_none(),
             "one embedded import declaration cannot be interpreted twice"
         );
     }
 
     fn source_import_ids(&self, node: Node<'_>) -> &[SourceImportId] {
-        self.imports
+        &self
+            .imports
             .get(&node.id())
-            .expect("embedded import declaration was captured before replay")
-            .as_slice()
+            .expect("embedded import was captured before replay")
+            .ids
+    }
+
+    pub(crate) fn take_projected_imports(&mut self, node: Node<'_>) -> Vec<RustProjectedImport> {
+        std::mem::take(
+            &mut self
+                .imports
+                .get_mut(&node.id())
+                .expect("native replay uses captured imports")
+                .projected,
+        )
+    }
+
+    pub(crate) fn return_projected_imports(
+        &mut self,
+        node: Node<'_>,
+        projected: Vec<RustProjectedImport>,
+    ) {
+        let imports = self
+            .imports
+            .get_mut(&node.id())
+            .expect("native replay returns a captured projection");
+        assert!(
+            std::mem::replace(&mut imports.projected, projected).is_empty(),
+            "one projection is borrowed by one native import event"
+        );
+    }
+
+    fn take_native_imports(&mut self) -> Vec<(RustImportContextFact, Vec<RustProjectedImport>)> {
+        let mut imports = self
+            .imports
+            .values_mut()
+            .filter_map(|imports| {
+                imports
+                    .context
+                    .take()
+                    .map(|context| (context, std::mem::take(&mut imports.projected)))
+            })
+            .collect::<Vec<_>>();
+        imports.sort_unstable_by_key(|(context, _)| context.declaration.index());
+        imports
+    }
+
+    pub(crate) fn inherit_import_scope(
+        &mut self,
+        occurrence: Option<SourceOccurrenceId>,
+        host: &crate::imports::RustImportOwner,
+    ) {
+        let (start, end) = match host {
+            crate::imports::RustImportOwner::Module { start, end, .. } => (*start, *end),
+            crate::imports::RustImportOwner::LocalOnly {
+                module_start,
+                module_end,
+                ..
+            } => (*module_start, *module_end),
+        };
+        for imports in self.imports.values_mut() {
+            let Some(context) = imports.context.as_mut() else {
+                continue;
+            };
+            if context.owner_scope.is_some() {
+                continue;
+            }
+            context.owner_scope = occurrence;
+            for projected in &mut imports.projected {
+                match &mut projected.owner {
+                    crate::imports::RustImportOwner::Module {
+                        start: owner_start,
+                        end: owner_end,
+                        ..
+                    } => {
+                        *owner_start = start;
+                        *owner_end = end;
+                    }
+                    crate::imports::RustImportOwner::LocalOnly {
+                        module_start,
+                        module_end,
+                        ..
+                    } => {
+                        *module_start = start;
+                        *module_end = end;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record_native_module_scope(&mut self, node: Node<'_>, scope: ResolutionScopeId) {
+        assert!(
+            self.native_module_scopes.insert(node.id(), scope).is_none(),
+            "one replayed module has one native body scope"
+        );
+    }
+
+    pub(crate) fn native_module_scope(&self, node: Node<'_>) -> Option<ResolutionScopeId> {
+        self.native_module_scopes.get(&node.id()).copied()
     }
 }
 
@@ -338,6 +485,10 @@ pub(crate) fn ensure_embedded_source_declaration(
 }
 
 impl RustItemSourceSink for RustEmbeddedSourceOccurrenceSink<'_, '_> {
+    fn cfg_condition(&mut self, node: Node<'_>, source: &str) -> RustCfgCondition {
+        self.source_maps[self.tree_id].cfg_condition(node, source)
+    }
+
     fn declare_node(&mut self, node: Node<'_>) -> SourceDeclarationId {
         self.source_maps[self.tree_id].declare_node(node, self.collector)
     }
@@ -409,18 +560,21 @@ impl RustEmbeddedReplayTree {
 
 impl RustEmbeddedReplayGraph {
     fn new(
-        tree: Tree,
+        parsed: RustParsedMacroSource,
         host: crate::declaration_properties::RustDeclarationAncestry,
         host_cfg: RustCfgCondition,
+        host_module: String,
     ) -> Self {
         Self {
             trees: vec![RustEmbeddedReplayTree {
-                tree,
+                tree: parsed.tree,
                 child_macros: HashMap::default(),
             }],
             source_maps: vec![RustEmbeddedSourceMap {
                 host,
                 host_cfg,
+                host_module,
+                cfg_conditions: parsed.cfg_conditions,
                 ..RustEmbeddedSourceMap::default()
             }],
         }
@@ -432,18 +586,21 @@ impl RustEmbeddedReplayGraph {
 
     fn add_tree(
         &mut self,
-        tree: Tree,
+        parsed: RustParsedMacroSource,
         host: crate::declaration_properties::RustDeclarationAncestry,
         host_cfg: RustCfgCondition,
+        host_module: String,
     ) -> usize {
         let id = self.trees.len();
         self.trees.push(RustEmbeddedReplayTree {
-            tree,
+            tree: parsed.tree,
             child_macros: HashMap::default(),
         });
         self.source_maps.push(RustEmbeddedSourceMap {
             host,
             host_cfg,
+            host_module,
+            cfg_conditions: parsed.cfg_conditions,
             ..RustEmbeddedSourceMap::default()
         });
         id
@@ -474,6 +631,10 @@ pub(crate) fn build_rust_embedded_replay_graph(
         tree,
         crate::declaration_properties::RustDeclarationAncestry::of(node, None),
         crate::lexical_scope::rust_effective_cfg_condition(node, source),
+        crate::imports::rust_import_owner(node, source, "")
+            .owner
+            .module()
+            .to_owned(),
     );
     let mut pending = vec![graph.root_id()];
     while let Some(tree_id) = pending.pop() {
@@ -481,6 +642,7 @@ pub(crate) fn build_rust_embedded_replay_graph(
         let source_map = &mut graph.source_maps[tree_id];
         let host = source_map.host;
         let host_cfg = source_map.host_cfg.clone();
+        let host_module = source_map.host_module.clone();
         let cfg_conditions = &mut source_map.cfg_conditions;
         let declaration_ancestries = &mut source_map.declaration_ancestries;
         let mut nodes = vec![root];
@@ -502,6 +664,10 @@ pub(crate) fn build_rust_embedded_replay_graph(
                             cfg_conditions,
                         ),
                     ]),
+                    crate::imports::rust_import_owner(current, source, &host_module)
+                        .owner
+                        .module()
+                        .to_owned(),
                     parse_rust_macro_source_tree(current, source),
                 ));
                 continue;
@@ -511,10 +677,10 @@ pub(crate) fn build_rust_embedded_replay_graph(
             children.reverse();
             nodes.extend(children);
         }
-        for (node_id, child_host, child_cfg, child) in child_trees {
+        for (node_id, child_host, child_cfg, child_module, child) in child_trees {
             let outcome = child.map(|child| {
                 child.map(|child| {
-                    let child_id = graph.add_tree(child, child_host, child_cfg);
+                    let child_id = graph.add_tree(child, child_host, child_cfg, child_module);
                     pending.push(child_id);
                     child_id
                 })
@@ -530,10 +696,23 @@ pub(crate) fn build_rust_embedded_replay_graph(
     Ok(Some(graph))
 }
 
+struct RustParsedMacroSource {
+    tree: Tree,
+    cfg_conditions: HashMap<usize, RustCfgCondition>,
+}
+
 fn parse_rust_macro_source_tree(
     node: Node<'_>,
     source: &str,
-) -> Result<Option<Tree>, RustMacroParseFailure> {
+) -> Result<Option<RustParsedMacroSource>, RustMacroParseFailure> {
+    if crate::cfg_if::is_cfg_if(node, source) {
+        let (tree, cfg_conditions) = crate::cfg_if::item_tree(node, source)
+            .ok_or(RustMacroParseFailure::ParseUnavailable)?;
+        return Ok(Some(RustParsedMacroSource {
+            tree,
+            cfg_conditions,
+        }));
+    }
     let arguments =
         rust_macro_invocation_arguments(node).ok_or(RustMacroParseFailure::MissingInterior)?;
     let interior =
@@ -542,7 +721,12 @@ fn parse_rust_macro_source_tree(
         return Ok(None);
     }
     crate::lexical_scope::parse_rust_range_tree(source, interior)
-        .map(Some)
+        .map(|tree| {
+            Some(RustParsedMacroSource {
+                tree,
+                cfg_conditions: HashMap::default(),
+            })
+        })
         .ok_or(RustMacroParseFailure::ParseUnavailable)
 }
 
@@ -605,6 +789,7 @@ fn collect_rust_embedded_item_sources<'source>(
         );
         pending.push(Event::Exit);
         if node.kind() == "macro_invocation" {
+            module_sources.ensure_embedded_invocation(tree_id, node, collector, maps);
             let invocation = maps[tree_id].intern_node(node, collector);
             let outcome = *trees[tree_id]
                 .child_macros
@@ -686,10 +871,10 @@ impl<'source, 'tree> RustPrimaryImportProjectionCache<'source, 'tree> {
     }
 }
 
-fn attach_import_source_occurrences<'source, 'tree>(
+fn attach_import_source_occurrences<'tree>(
     imports: &mut [RustProjectedImport],
     source_nodes: &[RustImportSourceNodes<'tree>],
-    collector: &mut PrimarySourceFactCollector<'source>,
+    collector: &mut dyn SourceOccurrenceSink,
     source_imports: &mut Vec<SourceImportFact>,
     rust_import_contexts: &mut Vec<RustImportContextFact>,
 ) {
@@ -1698,7 +1883,17 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                             .primary_macros
                             .latest_visible_expands_to_arguments_only(name, node.start_byte())
                 },
-            );
+            ) || (crate::cfg_if::is_cfg_if(node, self.declarations.source)
+                && rust_item_macro_invocation_name(node, self.declarations.source).is_some_and(
+                    |name| {
+                        rust_latest_visible_rules_item_macro(
+                            self.primary_macros.as_slice(),
+                            name,
+                            node.start_byte(),
+                        )
+                        .is_none()
+                    },
+                ));
         if let Some(request) = replay_request
             && let Some(graph) = replay_graph.as_mut()
         {
@@ -1743,7 +1938,11 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
             let root_tree_id = graph.root_id();
             let map = std::mem::take(&mut graph.source_maps[root_tree_id]);
             let tree = graph.trees[root_tree_id].tree.clone();
-            let returned = self.native.lower_passthrough_item_macro(node, tree, map);
+            let mut returned = self.native.lower_replayed_item_macro(node, tree, map);
+            for (context, imports) in returned.take_native_imports() {
+                self.declarations.rust_import_contexts.push(context);
+                self.usage.collect_replayed_imports(imports);
+            }
             graph.source_maps[root_tree_id] = returned;
         }
         let macro_candidate =
@@ -2569,7 +2768,7 @@ fn rust_embedded_macro_invocation_admission(
     trees: &[RustEmbeddedReplayTree],
     tree_id: usize,
 ) -> Option<RustEmbeddedAdmittedMacro> {
-    let invoked_macro = rust_unqualified_macro_invocation_name(node, source)?;
+    let invoked_macro = rust_item_macro_invocation_name(node, source)?;
     if rust_builtin_macro_does_not_replay_item_arguments(invoked_macro) {
         return None;
     }
@@ -3235,19 +3434,24 @@ pub fn rust_macro_token_tree_interior(token_tree: Node<'_>) -> Option<tree_sitte
 /// interiors are not item streams, while admitting real item blocks -- including
 /// `thread_local! { static FOO: ...; }`, which correctly yields a static.
 fn rust_reparsed_items_are_indexable(root: Node<'_>) -> bool {
+    rust_reparsed_item_count(root).is_some_and(|count| count > 0)
+}
+
+/// Validate an ordinary item stream, including a valid empty cfg_if arm.
+pub(crate) fn rust_reparsed_item_count(root: Node<'_>) -> Option<usize> {
     if root.has_error() {
-        return false;
+        return None;
     }
     let mut cursor = root.walk();
-    let mut saw_item = false;
+    let mut item_count = 0;
     for child in root.named_children(&mut cursor) {
         match unwrap_attributes(child).kind() {
             "line_comment" | "block_comment" | "attribute_item" | "inner_attribute_item" => {}
-            kind if rust_is_indexable_item_kind(kind) => saw_item = true,
-            _ => return false,
+            kind if rust_is_indexable_item_kind(kind) => item_count += 1,
+            _ => return None,
         }
     }
-    saw_item
+    Some(item_count)
 }
 
 pub(crate) fn rust_is_indexable_item_kind(kind: &str) -> bool {
@@ -3269,6 +3473,16 @@ pub(crate) fn rust_is_indexable_item_kind(kind: &str) -> bool {
             | "extern_crate_declaration"
             | "foreign_mod_item"
     )
+}
+
+/// A route-capable macro head. Only cfg_if adds a documented qualified
+/// item grammar to the existing unqualified item replay surface.
+pub(crate) fn rust_item_macro_invocation_name<'a>(
+    node: Node<'_>,
+    source: &'a str,
+) -> Option<&'a str> {
+    rust_unqualified_macro_invocation_name(node, source)
+        .or_else(|| crate::cfg_if::is_cfg_if(node, source).then_some("cfg_if::cfg_if"))
 }
 
 pub fn rust_unqualified_macro_invocation_name<'a>(
@@ -5615,11 +5829,24 @@ replay! {
         assert_eq!(source_facts.generic_imports.len(), imports.len());
         assert_eq!(
             source_facts.rust_import_contexts.len(),
-            1,
-            "embedded macro imports do not acquire primary Rust contexts"
+            2,
+            "proven source-preserving imports have ordinary Rust contexts"
+        );
+        let targets = &parsed.rust_usage_facts.import_targets;
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert!(
+            targets.iter().all(|target| target.native_scope.is_some()),
+            "{targets:?}"
         );
         let primary = source_facts.imports[source_facts.generic_imports[0].index()].declaration;
         let generated = source_facts.imports[source_facts.generic_imports[1].index()].declaration;
+        assert_eq!(source_facts.rust_import_contexts[1].declaration, generated);
+        assert!(
+            source_facts
+                .rust_import_contexts
+                .iter()
+                .all(|context| context.native_scope.is_some())
+        );
         assert_ne!(
             primary, generated,
             "embedded imports get fresh occurrence ids"
@@ -7806,6 +8033,34 @@ impl Engine {
                         != brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface
                 }),
             "attribute expansion preserves authored reference enumeration"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5133: grouped tuple-field attributes made a public constructor appear private"
+    )]
+    fn attributed_tuple_fields_keep_constructor_visibility_and_ordinal() {
+        let (parsed, _) = parse_fixture("pub struct Attributed(#[first] pub u8, #[second] u16);");
+        let facts = parsed.source_facts.as_ref().expect("source facts");
+        let declaration = parsed
+            .source_declaration_units
+            .iter()
+            .find(|(_, unit)| unit.identifier() == "Attributed")
+            .map(|(declaration, _)| *declaration)
+            .expect("Attributed declaration");
+        let constructor = facts
+            .rust_declaration_properties
+            .iter()
+            .find(|property| property.declaration == declaration)
+            .and_then(|property| property.value_constructor.as_deref())
+            .expect("tuple constructor properties");
+        assert_eq!(
+            constructor.field_visibilities,
+            vec![
+                crate::imports::RustVisibility::Public,
+                crate::imports::RustVisibility::Private,
+            ]
         );
     }
 

@@ -1373,7 +1373,12 @@ static GO_USAGE_STRATEGY: GoUsageGraphStrategy = GoUsageGraphStrategy::new();
 static GO_NATIVE_USAGE_STRATEGY: native_usages::GoNativeUsageStrategy =
     native_usages::GoNativeUsageStrategy::new();
 
-/// Whether Go consumers route to the native resolver.
+fn trial_native_go_selected() -> bool {
+    std::env::var_os("BIFROST_TRIAL_NATIVE_GO").is_some()
+}
+
+/// Whether Go point, call, rename, selected-reference and reference-usage
+/// consumers route to the native resolver.
 ///
 /// Production keeps the incumbent resolver until the Go flip lands. Native
 /// answers only in this crate's own unit tests (`cfg(test)`) and when
@@ -1382,7 +1387,20 @@ static GO_NATIVE_USAGE_STRATEGY: native_usages::GoNativeUsageStrategy =
 /// that feature and pin the incumbent unless the trial flag is set.
 pub(crate) fn native_go_selected() -> bool {
     static SELECTED: OnceLock<bool> = OnceLock::new();
-    *SELECTED.get_or_init(|| cfg!(test) || std::env::var_os("BIFROST_TRIAL_NATIVE_GO").is_some())
+    *SELECTED.get_or_init(|| cfg!(test) || trial_native_go_selected())
+}
+
+/// Trial selection for the rooted and whole-workspace Go graph.
+///
+/// The graph stays on the incumbent backend in ordinary unit-test builds, so
+/// the capability snapshot describes production. Either Go trial flag selects
+/// the native graph for an explicit measurement run.
+pub(crate) fn native_go_graph_selected() -> bool {
+    static SELECTED: OnceLock<bool> = OnceLock::new();
+    *SELECTED.get_or_init(|| {
+        trial_native_go_selected()
+            || std::env::var_os("BIFROST_TRIAL_NATIVE_GO_GRAPH").is_some_and(|value| value == "1")
+    })
 }
 
 pub(crate) struct GoSupport;
@@ -1396,6 +1414,18 @@ fn go_type_skeleton(code_unit: &CodeUnit, skeleton: String) -> String {
 }
 
 impl LanguageSupport for GoSupport {
+    fn root_source_horizon(
+        &self,
+        source: Option<crate::analyzer::resolution::SelectedResolutionMountOrdinal>,
+        has_transient_sources: bool,
+    ) -> crate::analyzer::store::resolution_operation::RootSourceHorizon {
+        use crate::analyzer::store::resolution_operation::RootSourceHorizon;
+        match source {
+            Some(source) if !has_transient_sources => RootSourceHorizon::Bounded(vec![source]),
+            _ => RootSourceHorizon::Universal,
+        }
+    }
+
     fn native_member_attribution(
         &self,
         context: &crate::analyzer::store::resolution_operation::ProjectedNativeMemberContext,
@@ -1481,6 +1511,10 @@ impl LanguageSupport for GoSupport {
     }
 
     fn call_may_apply_value(&self) -> bool {
+        true
+    }
+
+    fn callable_result_is_applicability_independent(&self) -> bool {
         true
     }
 
@@ -1597,7 +1631,7 @@ impl LanguageSupport for GoSupport {
     }
 
     fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
-        if native_go_selected() {
+        if native_go_graph_selected() {
             crate::analyzer::languages::LanguageGraphBackend::Native(
                 &native_graph::GoNativeWorkspaceGraphProvider,
             )

@@ -474,6 +474,15 @@ pub fn scala_import_path(info: &ImportInfo) -> Option<String> {
         .map(|path| path.segments.join("."))
 }
 
+pub(crate) fn scala_package_context_at(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> (Vec<String>, Vec<String>) {
+    scala_package_scope_at_impl(root, source, reference_byte, None)
+        .expect("unbounded Scala package traversal cannot stop")
+}
+
 pub fn scala_package_prefixes_at(
     root: Node<'_>,
     source: &str,

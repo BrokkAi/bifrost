@@ -222,13 +222,14 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             if let PythonImportDetails::FromImport { module, name, .. } = &details
                 && module.starts_with('.')
             {
-                let Some(resolved_module) = resolve_python_relative_module(source_file, module)
+                let Some(resolved_module) =
+                    resolve_python_relative_module(self.project(), source_file, module)
                 else {
                     return true;
                 };
                 let candidate_module = format!("{resolved_module}.{name}");
-                if python_module_name(target) == candidate_module
-                    || python_module_name(target) == resolved_module
+                if python_module_name(self.project(), target) == candidate_module
+                    || python_module_name(self.project(), target) == resolved_module
                 {
                     return true;
                 }

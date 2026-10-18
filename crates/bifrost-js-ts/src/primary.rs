@@ -4,7 +4,7 @@ use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::js_ts_facts::*;
 use brokk_bifrost_core::analyzer::model::{
-    CodeUnit, ImportInfo, SignatureMetadata, StructuredImportPath,
+    CodeUnit, ImportInfo, Range, SignatureMetadata, StructuredImportPath,
 };
 use brokk_bifrost_core::analyzer::parsed_file::{
     ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink, SourceImportFact,
@@ -46,14 +46,34 @@ fn declaration_name(node: Node<'_>) -> Option<Node<'_>> {
         })
 }
 
+/// A direct member write does not assert that its containing declaration is a root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StructuralOwnerClaim {
+    Root,
+    Parent(CodeUnit),
+    UnspecifiedMember,
+}
+
+enum StructuralPublication {
+    Declaration {
+        unit: CodeUnit,
+        range: Range,
+        owner: StructuralOwnerClaim,
+        top_level: Option<CodeUnit>,
+    },
+    DefinitionLookupOnly {
+        unit: CodeUnit,
+        range: Range,
+    },
+}
+
 /// Declaration admission receives the live syntax handle before it creates a
 /// display projection. Structural extraction borrows this same arena.
 pub(crate) struct JsTsParsedFile<'source> {
     parsed: ParsedFile,
     source_text: &'source str,
     pub source: PrimarySourceFactCollector<'source>,
-    #[cfg(debug_assertions)]
-    structural_parent_by_unit: HashMap<CodeUnit, Option<CodeUnit>>,
+    structural_publications: Vec<StructuralPublication>,
     code_unit_by_node: HashMap<usize, CodeUnit>,
     declaration_by_unit: HashMap<CodeUnit, SourceDeclarationId>,
     declaration_links: HashSet<(SourceDeclarationId, CodeUnit)>,
@@ -76,8 +96,7 @@ impl<'source> JsTsParsedFile<'source> {
             parsed: ParsedFile::new(String::new()),
             source_text: source,
             source: PrimarySourceFactCollector::new(source),
-            #[cfg(debug_assertions)]
-            structural_parent_by_unit: HashMap::default(),
+            structural_publications: Vec::new(),
             code_unit_by_node: HashMap::default(),
             declaration_by_unit: HashMap::default(),
             declaration_links: HashSet::default(),
@@ -303,8 +322,30 @@ impl<'source> JsTsParsedFile<'source> {
         unit: CodeUnit,
         node: Node<'_>,
         name: Option<Node<'_>>,
-        source: &str,
+        _source: &str,
         parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        let owner = parent.map_or(StructuralOwnerClaim::Root, StructuralOwnerClaim::Parent);
+        self.admit_code_unit(unit, node, name, owner, top_level);
+    }
+
+    pub(crate) fn add_assignment_code_unit(
+        &mut self,
+        unit: CodeUnit,
+        node: Node<'_>,
+        owner: StructuralOwnerClaim,
+    ) {
+        let top_level = Some(unit.clone());
+        self.admit_code_unit(unit, node, declaration_name(node), owner, top_level);
+    }
+
+    fn admit_code_unit(
+        &mut self,
+        unit: CodeUnit,
+        node: Node<'_>,
+        name: Option<Node<'_>>,
+        owner: StructuralOwnerClaim,
         top_level: Option<CodeUnit>,
     ) {
         let declaration_node = if node.kind() == "export_statement" {
@@ -314,6 +355,12 @@ impl<'source> JsTsParsedFile<'source> {
         } else {
             node
         };
+        if declaration_node.kind() == "assignment_expression"
+            && let Some(value) = declaration_node.child_by_field_name("right")
+            && crate::syntax::is_function_like(value.kind())
+        {
+            self.code_unit_by_node.insert(value.id(), unit.clone());
+        }
         if matches!(
             declaration_node.kind(),
             "function_declaration"
@@ -335,49 +382,145 @@ impl<'source> JsTsParsedFile<'source> {
         {
             self.code_unit_by_node.insert(parent.id(), unit.clone());
         }
-        #[cfg(debug_assertions)]
-        {
-            match self.structural_parent_by_unit.get(&unit) {
-                Some(previous_parent) => debug_assert_eq!(
-                    previous_parent, &parent,
-                    "JS/TS code unit acquired a second structural parent: unit={unit:?}, previous={previous_parent:?}, new={parent:?}"
-                ),
-                None => {
-                    self.structural_parent_by_unit
-                        .insert(unit.clone(), parent.clone());
+        self.capture_declaration(&unit, node, name);
+        self.structural_publications
+            .push(StructuralPublication::Declaration {
+                unit,
+                range: brokk_bifrost_core::analyzer::tree_walk::node_range(node),
+                owner,
+                top_level,
+            });
+    }
+
+    pub fn add_definition_lookup_unit(&mut self, unit: CodeUnit, node: Node<'_>, _source: &str) {
+        self.capture_declaration(&unit, node, declaration_name(node));
+        self.structural_publications
+            .push(StructuralPublication::DefinitionLookupOnly {
+                unit,
+                range: brokk_bifrost_core::analyzer::tree_walk::node_range(node),
+            });
+    }
+
+    fn publish_structure(&mut self) {
+        let mut explicit = HashMap::default();
+        for publication in &self.structural_publications {
+            let StructuralPublication::Declaration { unit, owner, .. } = publication else {
+                continue;
+            };
+            if *owner == StructuralOwnerClaim::UnspecifiedMember {
+                continue;
+            }
+            match explicit.entry(unit.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(owner.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    assert_eq!(
+                        entry.get(),
+                        owner,
+                        "JS/TS code unit acquired conflicting explicit structural owners: unit={unit:?}"
+                    );
                 }
             }
         }
-        self.capture_declaration(&unit, node, name);
-        self.parsed
-            .add_code_unit(unit, node, source, parent, top_level);
+        for publication in self.structural_publications.drain(..) {
+            match publication {
+                StructuralPublication::DefinitionLookupOnly { unit, range } => self
+                    .parsed
+                    .add_definition_lookup_unit_with_range(unit, range),
+                StructuralPublication::Declaration {
+                    unit,
+                    range,
+                    top_level,
+                    ..
+                } => {
+                    let parent = match explicit.get(&unit) {
+                        Some(StructuralOwnerClaim::Parent(parent)) => Some(parent.clone()),
+                        Some(StructuralOwnerClaim::Root) | None => None,
+                        Some(StructuralOwnerClaim::UnspecifiedMember) => {
+                            unreachable!("unspecified owner is not an explicit claim")
+                        }
+                    };
+                    // This hint only preallocates a backend children entry. It
+                    // is not an ownership claim and belongs to this publication.
+                    self.parsed
+                        .add_code_unit_with_range(unit, range, parent, top_level);
+                }
+            }
+        }
     }
 
-    pub fn add_definition_lookup_unit(&mut self, unit: CodeUnit, node: Node<'_>, source: &str) {
-        self.capture_declaration(&unit, node, declaration_name(node));
-        self.parsed.add_definition_lookup_unit(unit, node, source);
+    fn binding_context(
+        &self,
+        binding_scope: crate::syntax::JsTsLexicalBindingScope,
+        name: &str,
+    ) -> Option<(crate::syntax::JsTsLexicalBindingScope, Vec<Node<'source>>)> {
+        // Exact binders and active references select their scope separately.
+        // Its owner is a genuine ancestor; visibility ranges are never owners.
+        let range = self
+            .lexical_bindings
+            .binding_ranges_in_scope(name, binding_scope)
+            .into_iter()
+            .min_by_key(|range| range.start_byte)?;
+        let mut anchor = self
+            .declaration_scopes
+            .root()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)?;
+        while anchor.id() != binding_scope.node_id {
+            anchor = self.declaration_scopes.parent(anchor)?;
+        }
+        let mut path = Vec::new();
+        let mut current = Some(anchor);
+        while let Some(node) = current {
+            path.push(node);
+            current = self.declaration_scopes.parent(node);
+        }
+        path.reverse();
+        Some((binding_scope, path))
+    }
+
+    pub(crate) fn binding_is_local(&self, node: Node<'_>, name: &str) -> bool {
+        self.lexical_bindings
+            .binding_is_program_at(name, node.start_byte())
+            == Some(false)
     }
 
     pub(crate) fn local_binding_fq(
         &self,
-        node: Node<'_>,
         binder: Node<'_>,
         name: &str,
     ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
-        use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
+        self.local_scope_fq(
+            self.lexical_bindings.binding_scope_for_binder(binder)?,
+            name,
+        )
+    }
 
-        let binding_scope = self
-            .lexical_bindings
-            .binding_scope_at(name, binder.start_byte())?;
-        let owner = self
-            .declaration_scopes
-            .declaration_owner_chain(node)
-            .into_iter()
-            .find_map(|owner_node| {
-                self.code_unit_by_node
-                    .get(&owner_node.id())
-                    .map(|unit| (owner_node, unit))
-            });
+    pub(crate) fn local_receiver_fq(
+        &self,
+        receiver: Node<'_>,
+        name: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
+        self.local_scope_fq(
+            self.lexical_bindings
+                .binding_scope_at(name, receiver.start_byte())?,
+            name,
+        )
+    }
+
+    fn local_scope_fq(
+        &self,
+        binding_scope: crate::syntax::JsTsLexicalBindingScope,
+        name: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
+        let (binding_scope, mut path) = self.binding_context(binding_scope, name)?;
+        let anchor = *path.last()?;
+        let owner = self.declaration_scopes.declaration_owner_chain(anchor);
+        let owner = std::iter::once(anchor).chain(owner).find_map(|owner_node| {
+            self.code_unit_by_node
+                .get(&owner_node.id())
+                .map(|unit| (owner_node, unit))
+        });
         let (base, owner_id) = owner.map_or_else(
             || {
                 (
@@ -388,16 +531,11 @@ impl<'source> JsTsParsedFile<'source> {
             |(owner_node, unit)| (unit.fq().clone(), owner_node.id()),
         );
 
-        let mut path = Vec::new();
-        let mut current = Some(node);
-        while let Some(ancestor) = current {
-            if ancestor.id() == owner_id {
-                break;
-            }
-            path.push(ancestor);
-            current = self.declaration_scopes.parent(ancestor);
-        }
-        path.reverse();
+        let owner_index = path
+            .iter()
+            .position(|node| node.id() == owner_id)
+            .expect("indexed owner belongs to binding ancestry");
+        path = path.split_off(owner_index + 1);
         let mut fq = base;
         for scope in path {
             let Some((kind, ordinal)) = self.declaration_scopes.scope_segment(scope) else {
@@ -408,7 +546,68 @@ impl<'source> JsTsParsedFile<'source> {
             }
             fq.push(segment_interner().intern(&format!("{kind}_{ordinal}"), SegmentKind::Nested));
         }
+        if let Some(component) = binding_scope.environment_component() {
+            fq.push(segment_interner().intern(component, SegmentKind::Nested));
+        }
         Some(fq.with_pushed(segment_interner().intern(name, SegmentKind::Member)))
+    }
+
+    /// Declaration roots use the binding's source ancestry, independent of
+    /// which display owners have already been admitted. Local literal lookup
+    /// surfaces retain their existing indexed-owner naming above.
+    pub(crate) fn declaration_receiver_fq(
+        &self,
+        receiver: Node<'_>,
+        name: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
+        match self
+            .lexical_bindings
+            .binding_is_program_at(name, receiver.start_byte())
+        {
+            Some(false) => {
+                let scope = self
+                    .lexical_bindings
+                    .binding_scope_at(name, receiver.start_byte())?;
+                let (binding_scope, path) = self.binding_context(scope, name)?;
+                let mut fq = brokk_bifrost_core::analyzer::fq_name::FqName::new();
+                for scope in path {
+                    let Some((kind, ordinal)) = self.declaration_scopes.scope_segment(scope) else {
+                        continue;
+                    };
+                    if kind != "block" || scope.id() == binding_scope.node_id {
+                        fq.push(
+                            segment_interner()
+                                .intern(&format!("{kind}_{ordinal}"), SegmentKind::Nested),
+                        );
+                    }
+                }
+                if let Some(component) = binding_scope.environment_component() {
+                    fq.push(segment_interner().intern(component, SegmentKind::Nested));
+                }
+                Some(fq.with_pushed(segment_interner().intern(name, SegmentKind::Member)))
+            }
+            Some(true) => Some(
+                brokk_bifrost_core::analyzer::fq_name::FqName::new()
+                    .with_pushed(segment_interner().intern(name, SegmentKind::Member)),
+            ),
+            None => None,
+        }
+    }
+
+    /// Classify all declaration tokens of the active binding, including hoisted
+    /// functions not reached by the publication walk yet.
+    pub(crate) fn receiver_binding_kind(
+        &self,
+        receiver: Node<'_>,
+        name: &str,
+        is_export_target: impl Fn(Node<'_>) -> bool,
+    ) -> Option<crate::syntax::JsTsReceiverDeclarationKind> {
+        self.lexical_bindings.receiver_declaration_kind(
+            self.declaration_scopes.root(),
+            receiver,
+            name,
+            is_export_target,
+        )
     }
 
     pub fn add_import_syntaxes(&mut self, syntaxes: Vec<crate::imports::JsTsImportSyntax<'_>>) {
@@ -648,27 +847,12 @@ pub(crate) enum PrimaryEvent<'tree> {
 
 /// The primary tree has one stack-safe driver. Declaration admission, local
 /// assignment state, identifier capture and structural roles share its events.
-pub(crate) fn parse_primary<'source>(
-    source: &'source str,
-    tree: &'source Tree,
-    spec: &crate::structural::JsTsStructuralSpec,
-    event: impl FnMut(&mut JsTsParsedFile<'source>, PrimaryEvent<'source>),
-) -> ParsedFile {
-    let root = tree.root_node();
-    parse_primary_with_lexical_bindings(
-        source,
-        tree,
-        spec,
-        crate::syntax::JsTsLexicalBindingIndex::build(root, source),
-        event,
-    )
-}
-
 pub(crate) fn parse_primary_with_lexical_bindings<'source>(
     source: &'source str,
     tree: &'source Tree,
     spec: &crate::structural::JsTsStructuralSpec,
     lexical_bindings: crate::syntax::JsTsLexicalBindingIndex,
+    commonjs: crate::commonjs::CommonJsObjects,
     mut event: impl FnMut(&mut JsTsParsedFile<'source>, PrimaryEvent<'source>),
 ) -> ParsedFile {
     let root = tree.root_node();
@@ -685,7 +869,7 @@ pub(crate) fn parse_primary_with_lexical_bindings<'source>(
     let mut parsed = JsTsParsedFile::new_with_lexical_bindings(source, root, lexical_bindings);
     let mut module_value_declarators = Vec::new();
     let module_object_exports =
-        crate::graph::extractor::collect_module_object_exports(root, source);
+        crate::graph::extractor::collect_module_object_exports(root, source, &commonjs);
     enum Frame<'tree> {
         Enter(Node<'tree>, Option<&'static str>, usize, Option<u32>),
         Exit(Node<'tree>),
@@ -756,6 +940,7 @@ pub(crate) fn parse_primary_with_lexical_bindings<'source>(
                         node,
                         source,
                         &module_object_exports,
+                        &commonjs,
                         &mut exports,
                     );
                     parsed.add_exports(node, exports);
@@ -794,6 +979,7 @@ pub(crate) fn parse_primary_with_lexical_bindings<'source>(
     ) {
         parsed.add_import_syntax(syntax);
     }
+    parsed.publish_structure();
     let structural = structural
         .finish(root)
         .expect("JS/TS structural collection must finish");

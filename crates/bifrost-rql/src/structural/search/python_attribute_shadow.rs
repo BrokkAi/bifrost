@@ -7,6 +7,7 @@ use super::python_rule_facts::{
     python_definition_decorators, row_range, scope_nodes,
 };
 use super::*;
+use crate::analyzer::semantic::type_flow::ClassIdentity;
 use crate::analyzer::usages::python_class_hierarchy::PythonHierarchyOutcome;
 use tree_sitter::Node;
 
@@ -96,139 +97,173 @@ pub(super) fn expansions(
         )];
     };
     let hierarchy = provider.class_hierarchy(unit, cancellation);
-    if hierarchy.outcome != PythonHierarchyOutcome::Complete {
+    let Some(premise) =
+        super::python_class_hierarchy::hierarchy_premise(analyzer, unit, &hierarchy)
+    else {
         return vec![open_fact(
             file,
             declaration,
             Some(&source),
-            match hierarchy.outcome {
-                PythonHierarchyOutcome::Inconsistent => "inconsistent_hierarchy",
-                PythonHierarchyOutcome::Incomplete => "unknown_base_or_incomplete_hierarchy",
-                PythonHierarchyOutcome::Unsupported => "unsupported_hierarchy",
-                PythonHierarchyOutcome::Complete => unreachable!(),
-            },
+            "hierarchy_source_anchor_unavailable",
         )];
-    }
+    };
+    let mut expansions = (|| {
+        if hierarchy.outcome != PythonHierarchyOutcome::Complete {
+            return vec![open_fact(
+                file,
+                declaration,
+                Some(&source),
+                match hierarchy.outcome {
+                    PythonHierarchyOutcome::Inconsistent => "inconsistent_hierarchy",
+                    PythonHierarchyOutcome::Incomplete => "unknown_base_or_incomplete_hierarchy",
+                    PythonHierarchyOutcome::Unsupported => "unsupported_hierarchy",
+                    PythonHierarchyOutcome::Complete => unreachable!(),
+                },
+            )];
+        }
 
-    let mut expansions = Vec::new();
-    let mut emitted = HashSet::default();
-    for ancestor in hierarchy.mro.iter().skip(1) {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            expansions.push(open_fact(file, declaration, Some(&source), "cancelled"));
-            break;
-        }
-        let Some(ancestor_source) =
-            analyzer.get_source(&CodeUnit::file_scope(ancestor.source().clone()), false)
-        else {
-            expansions.push(open_fact(
-                file,
-                declaration,
-                Some(&source),
-                "initializer_source_unavailable",
-            ));
-            continue;
-        };
-        let Some(ancestor_tree) = parse_python(&ancestor_source) else {
-            expansions.push(open_fact(
-                file,
-                declaration,
-                Some(&source),
-                "initializer_syntax_unavailable",
-            ));
-            continue;
-        };
-        if ancestor_tree.root_node().has_error() {
-            expansions.push(open_fact(
-                file,
-                declaration,
-                Some(&source),
-                "initializer_recovered_syntax",
-            ));
-            continue;
-        }
-        let Some(ancestor_class) = python_class_node_for_unit(analyzer, ancestor, &ancestor_tree)
-        else {
-            expansions.push(open_fact(
-                file,
-                declaration,
-                Some(&source),
-                "ancestor_class_range_unavailable",
-            ));
-            continue;
-        };
-        let ancestor_methods = direct_class_methods(ancestor_class);
-        let shadowable = eligible
-            .iter()
-            .filter(|(_, name)| {
-                !ancestor_methods.iter().any(|method| {
+        let mut expansions = Vec::new();
+        let mut emitted = HashSet::default();
+        for ancestor in hierarchy.mro.iter().skip(1) {
+            let ClassIdentity::Workspace(ancestor) = ancestor else {
+                if matches!(ancestor, ClassIdentity::Intrinsic { .. }) {
+                    // The language-supplied object root contributes no
+                    // initializer that could write an attribute.
+                    continue;
+                }
+                expansions.push(open_fact(
+                    file,
+                    declaration,
+                    Some(&source),
+                    "external_initializer_surface_unknown",
+                ));
+                continue;
+            };
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                expansions.push(open_fact(file, declaration, Some(&source), "cancelled"));
+                break;
+            }
+            let Some(ancestor_source) =
+                analyzer.get_source(&CodeUnit::file_scope(ancestor.source().clone()), false)
+            else {
+                expansions.push(open_fact(
+                    file,
+                    declaration,
+                    Some(&source),
+                    "initializer_source_unavailable",
+                ));
+                continue;
+            };
+            let Some(ancestor_tree) = parse_python(&ancestor_source) else {
+                expansions.push(open_fact(
+                    file,
+                    declaration,
+                    Some(&source),
+                    "initializer_syntax_unavailable",
+                ));
+                continue;
+            };
+            if ancestor_tree.root_node().has_error() {
+                expansions.push(open_fact(
+                    file,
+                    declaration,
+                    Some(&source),
+                    "initializer_recovered_syntax",
+                ));
+                continue;
+            }
+            let Some(ancestor_class) =
+                python_class_node_for_unit(analyzer, ancestor, &ancestor_tree)
+            else {
+                expansions.push(open_fact(
+                    file,
+                    declaration,
+                    Some(&source),
+                    "ancestor_class_range_unavailable",
+                ));
+                continue;
+            };
+            let ancestor_methods = direct_class_methods(ancestor_class);
+            let shadowable = eligible
+                .iter()
+                .filter(|(_, name)| {
+                    !ancestor_methods.iter().any(|method| {
+                        method
+                            .child_by_field_name("name")
+                            .and_then(|name_node| node_text(&ancestor_source, name_node))
+                            == Some(name.as_str())
+                    })
+                })
+                .collect::<Vec<_>>();
+            if shadowable.is_empty() {
+                continue;
+            }
+            let Some(initializer_node) = ancestor_methods
+                .into_iter()
+                .filter(|method| {
                     method
                         .child_by_field_name("name")
                         .and_then(|name_node| node_text(&ancestor_source, name_node))
-                        == Some(name.as_str())
+                        == Some("__init__")
                 })
-            })
-            .collect::<Vec<_>>();
-        if shadowable.is_empty() {
-            continue;
-        }
-        let Some(initializer_node) = ancestor_methods
-            .into_iter()
-            .filter(|method| {
-                method
-                    .child_by_field_name("name")
-                    .and_then(|name_node| node_text(&ancestor_source, name_node))
-                    == Some("__init__")
-            })
-            .max_by_key(|method| method.start_byte())
-        else {
-            continue;
-        };
-        if initializer_node.kind() != "function_definition" {
-            expansions.push(open_fact(
-                file,
-                declaration,
-                Some(&source),
-                "initializer_definition_unavailable",
-            ));
-            continue;
-        }
-
-        let analysis = initializer_writes(initializer_node, &ancestor_source);
-        if let Some(reason) = analysis.open_reason {
-            expansions.push(open_fact(file, declaration, Some(&source), reason));
-        }
-        for write in &analysis.writes {
-            for (method_name, name) in &shadowable {
-                if *name != write.name {
-                    continue;
-                }
-                let method_range = method_name.start_byte()..method_name.end_byte();
-                let fact = make_row(
-                    RELATION,
+                .max_by_key(|method| method.start_byte())
+            else {
+                continue;
+            };
+            if initializer_node.kind() != "function_definition" {
+                expansions.push(open_fact(
                     file,
-                    method_range.clone(),
-                    row_range(&source, method_range.clone()),
-                    Some(declaration.declaration_id().to_string()),
-                    "issue",
-                    "proven",
-                    true,
-                    Some(format!(
-                        "initializer attribute write at {}:{}",
-                        rel_path_string(ancestor.source()),
-                        write.line
-                    )),
-                );
-                if emitted.insert(fact.row.id.clone()) {
-                    let mut fact = fact;
-                    fact.row.target_id = Some(ancestor.declaration_id().to_string());
-                    expansions.push(pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
-                        fact,
-                    ))));
+                    declaration,
+                    Some(&source),
+                    "initializer_definition_unavailable",
+                ));
+                continue;
+            }
+
+            let analysis = initializer_writes(initializer_node, &ancestor_source);
+            if let Some(reason) = analysis.open_reason {
+                expansions.push(open_fact(file, declaration, Some(&source), reason));
+            }
+            for write in &analysis.writes {
+                for (method_name, name) in &shadowable {
+                    if *name != write.name {
+                        continue;
+                    }
+                    let method_range = method_name.start_byte()..method_name.end_byte();
+                    let fact = make_row(
+                        RELATION,
+                        file,
+                        method_range.clone(),
+                        row_range(&source, method_range.clone()),
+                        Some(declaration.declaration_id().to_string()),
+                        "issue",
+                        "proven",
+                        true,
+                        Some(format!(
+                            "initializer attribute write at {}:{}",
+                            rel_path_string(ancestor.source()),
+                            write.line
+                        )),
+                    );
+                    if emitted.insert(fact.row.id.clone()) {
+                        let mut fact = fact;
+                        fact.row.target_id = Some(ancestor.declaration_id().to_string());
+                        expansions.push(pipeline_expansion(PipelineValue::PythonRuleFact(
+                            Box::new(fact),
+                        )));
+                    }
                 }
             }
         }
-    }
 
+        expansions
+    })();
+    for expansion in &mut expansions {
+        super::python_class_hierarchy::attach_hierarchy_premises(
+            expansion,
+            std::slice::from_ref(&premise),
+        );
+    }
     expansions
 }
 

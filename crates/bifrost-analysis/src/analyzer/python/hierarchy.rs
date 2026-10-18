@@ -1,15 +1,29 @@
 use super::*;
-use crate::analyzer::usages::python_class_hierarchy::{
-    PythonBaseFact, PythonBaseResolution, PythonClassHierarchyAnswer, PythonClassHierarchyProvider,
-    PythonHierarchyOutcome, PythonHierarchyReason, PythonMroMember, PythonMroMembersAnswer,
-    PythonOverrideAnswer, PythonOverrideOutcome,
+use crate::analyzer::semantic::type_flow::{
+    ClassIdentity, ExternalClassCache, external_class_identity_with_visits,
 };
+use crate::analyzer::semantic_model::{
+    ActivatedSemanticModelRecord, ActiveSemanticModelShard, ActiveSemanticModelSnapshot,
+    ResolvedActiveSemanticModels, SemanticModelOverlay, TypeFact, TypeKind, TypeRef,
+    activated_type_provenance,
+};
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, PythonDefinitionProvider, ResolutionSession,
+};
+use crate::analyzer::usages::python_class_hierarchy::{
+    PythonAncestryBasis, PythonBaseFact, PythonBaseOrigin, PythonBaseResolution,
+    PythonClassHierarchyAnswer, PythonClassHierarchyProvider, PythonHierarchyOutcome,
+    PythonHierarchyReason, PythonModeledClassIdentity, PythonMroMember, PythonMroMembersAnswer,
+    PythonOverrideAnswer, PythonOverrideOutcome, PythonRuntimeBaseClaim,
+};
+use crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     DescendantIndexScope, build_direct_descendant_index, descendants_from_variant_index,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+// Legacy source-only TypeHierarchyProvider below retains its existing path.
 use brokk_bifrost_python::graph_support::resolve_base_class;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -17,14 +31,11 @@ use std::sync::Arc;
 const MAX_PYTHON_HIERARCHY_VISITS: usize = 4096;
 const MAX_PYTHON_C3_WORK: usize = 65_536;
 const MAX_PYTHON_MEMBER_VISITS: usize = 32_768;
-
-struct ResolvedClassNode {
-    bases: Vec<CodeUnit>,
-}
+const PYTHON_OBJECT_ROOT: &str = "builtins.object";
 
 enum ClassWork {
-    Enter(CodeUnit),
-    Exit(CodeUnit),
+    Enter(ClassIdentity),
+    Exit(ClassIdentity),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,10 +44,355 @@ enum ClassVisit {
     Done,
 }
 
-enum C3Failure {
+pub(super) enum C3Failure {
     Inconsistent,
     VisitLimit,
     Cancelled,
+}
+
+/// All accounting and retained state belong to this invocation, not the analyzer.
+struct HierarchyBudget<'a> {
+    visits: usize,
+    session: &'a ResolutionSession,
+    provider: &'a PythonDefinitionProvider<'a>,
+    retained_claims: HashSet<(*const ActiveSemanticModelShard, *const TypeFact)>,
+}
+
+impl HierarchyBudget<'_> {
+    fn charge(&mut self, visits: usize, work: usize) -> Result<(), PythonHierarchyReason> {
+        if self.visits.saturating_add(visits) > MAX_PYTHON_HIERARCHY_VISITS {
+            return Err(PythonHierarchyReason::VisitLimit);
+        }
+        if !self.session.scope_steps(work.max(visits)) {
+            return Err(session_reason(self.session));
+        }
+        self.visits += visits;
+        Ok(())
+    }
+}
+
+fn session_reason(session: &ResolutionSession) -> PythonHierarchyReason {
+    match session.finish(()) {
+        BoundedResolution::Cancelled { .. } => PythonHierarchyReason::Cancelled,
+        BoundedResolution::Exceeded { .. } => PythonHierarchyReason::VisitLimit,
+        BoundedResolution::Complete { .. } => unreachable!("failed charge has a sticky stop"),
+    }
+}
+
+fn modeled_identity(identity: &ClassIdentity) -> PythonModeledClassIdentity {
+    let ClassIdentity::External {
+        qualified_name,
+        symbol_id,
+    } = identity
+    else {
+        unreachable!("runtime model claims refer to external class identities")
+    };
+    PythonModeledClassIdentity {
+        qualified_name: qualified_name.to_string(),
+        symbol_id: symbol_id.to_string(),
+    }
+}
+
+fn retain_claim(
+    active: &ResolvedActiveSemanticModels,
+    activated: &ActivatedSemanticModelRecord<'_, TypeFact>,
+    overlay: Option<&SemanticModelOverlay>,
+    basis: &mut PythonAncestryBasis,
+    budget: &mut HierarchyBudget<'_>,
+) -> Result<Option<usize>, PythonHierarchyReason> {
+    let Some(declared) = &activated.record.runtime_bases else {
+        return Ok(None);
+    };
+    // Addresses are only query-local deduplication keys, never public identity.
+    let key = (
+        std::ptr::from_ref(activated.shard),
+        std::ptr::from_ref(activated.record),
+    );
+    if budget.retained_claims.contains(&key) {
+        return Ok(None);
+    }
+    budget.charge(declared.len(), declared.len().saturating_add(1))?;
+    let mut ambiguous = false;
+    if let Some(overlay) = overlay {
+        for symbol in overlay.symbol_candidates_with_id(&activated.record.id) {
+            budget.charge(1, 1)?;
+            ambiguous |= symbol.provenance.ambiguous;
+        }
+    }
+    let provenance = activated_type_provenance(
+        active,
+        activated.shard,
+        activated.record,
+        ambiguous,
+        &mut || budget.charge(1, 1),
+    )?;
+    budget.retained_claims.insert(key);
+    let index = basis.claims.len();
+    basis.claims.push(PythonRuntimeBaseClaim {
+        declared_class: PythonModeledClassIdentity {
+            qualified_name: activated.record.name.clone(),
+            symbol_id: activated.record.id.clone(),
+        },
+        class: None,
+        declared_bases: declared.clone(),
+        bases: vec![None; declared.len()],
+        provenance,
+    });
+    Ok(Some(index))
+}
+
+type RetainedRuntimeClaim<'a> = (ActivatedSemanticModelRecord<'a, TypeFact>, usize);
+
+/// Collect all raw records for admitted owner IDs, retaining lower-ranked
+/// same-ID owner conflicts without admitting unrelated alias-only classes.
+fn collect_claim_ids<'a>(
+    active: &'a ResolvedActiveSemanticModels,
+    ids: &[&str],
+    overlay: Option<&SemanticModelOverlay>,
+    basis: &mut PythonAncestryBasis,
+    budget: &mut HierarchyBudget<'_>,
+) -> Result<Vec<RetainedRuntimeClaim<'a>>, PythonHierarchyReason> {
+    let mut records = Vec::new();
+    for id in ids {
+        for activated in active.all_type_records_with_id(id) {
+            budget.charge(1, 1)?;
+            if activated.shard.manifest.language == "python"
+                && let Some(index) = retain_claim(active, &activated, overlay, basis, budget)?
+            {
+                records.push((activated, index));
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn collect_runtime_claims<'a>(
+    active: &'a ResolvedActiveSemanticModels,
+    owner: &ClassIdentity,
+    overlay: Option<&SemanticModelOverlay>,
+    basis: &mut PythonAncestryBasis,
+    budget: &mut HierarchyBudget<'_>,
+) -> Result<Vec<RetainedRuntimeClaim<'a>>, PythonHierarchyReason> {
+    let ClassIdentity::External {
+        qualified_name,
+        symbol_id,
+    } = owner
+    else {
+        unreachable!("only external classes have runtime model claims")
+    };
+    budget.charge(1, 1)?;
+    let mut ids = vec![symbol_id.as_ref()];
+    let mut seen_ids = HashSet::default();
+    seen_ids.insert(symbol_id.as_ref());
+    for activated in active.all_type_records_named(qualified_name) {
+        budget.charge(1, 1)?;
+        if activated.shard.manifest.language == "python"
+            && activated.record.name == qualified_name.as_ref()
+            && seen_ids.insert(activated.record.id.as_str())
+        {
+            ids.push(activated.record.id.as_str());
+        }
+    }
+    collect_claim_ids(active, &ids, overlay, basis, budget)
+}
+
+/// Unresolved names have no established canonical owner. Preserve their
+/// possible claim evidence conservatively, separately from admitted owners.
+fn retain_open_claims(
+    active: &ResolvedActiveSemanticModels,
+    name: &str,
+    overlay: Option<&SemanticModelOverlay>,
+    basis: &mut PythonAncestryBasis,
+    budget: &mut HierarchyBudget<'_>,
+) -> Result<(), PythonHierarchyReason> {
+    let mut ids = Vec::new();
+    let mut seen_ids = HashSet::default();
+    for activated in active.all_type_records_named(name) {
+        budget.charge(1, 1)?;
+        if activated.shard.manifest.language == "python"
+            && seen_ids.insert(activated.record.id.as_str())
+        {
+            ids.push(activated.record.id.as_str());
+        }
+    }
+    drop(collect_claim_ids(active, &ids, overlay, basis, budget)?);
+    Ok(())
+}
+
+fn runtime_claim_target(
+    overlay: Option<&SemanticModelOverlay>,
+    reference: &TypeRef,
+    cache: &mut ExternalClassCache,
+    budget: &mut HierarchyBudget<'_>,
+    unresolved: &mut Vec<TypeRef>,
+) -> Result<ClassIdentity, PythonHierarchyReason> {
+    let target = match reference {
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable: false,
+        } if arguments.is_empty() => {
+            let target = super::type_flow::exact_external_class_name_with_visits(
+                overlay,
+                name,
+                cache,
+                &mut || budget.charge(1, 1),
+            )?;
+            if target.is_none() {
+                budget.charge(1, 1)?;
+                unresolved.push(reference.clone());
+            }
+            target
+        }
+        TypeRef::Declared {
+            id,
+            arguments,
+            nullable: false,
+        } if arguments.is_empty() => {
+            // ID resolution uses the same canonical class selection and rank
+            // boundary as name resolution, not a preferred raw claim.
+            let target = external_class_identity_with_visits(
+                overlay,
+                Language::Python,
+                "",
+                Some(id),
+                cache,
+                &mut || budget.charge(1, 1),
+            )?;
+            if target.is_none() {
+                budget.charge(1, 1)?;
+                unresolved.push(reference.clone());
+            }
+            target
+        }
+        _ => return Err(PythonHierarchyReason::UnsupportedBaseExpression),
+    };
+    target.ok_or(PythonHierarchyReason::UnresolvedBase)
+}
+
+fn runtime_bases(
+    active: &ResolvedActiveSemanticModels,
+    overlay: Option<&SemanticModelOverlay>,
+    identity: &ClassIdentity,
+    basis: &mut PythonAncestryBasis,
+    cache: &mut ExternalClassCache,
+    budget: &mut HierarchyBudget<'_>,
+) -> Result<Vec<ClassIdentity>, PythonHierarchyReason> {
+    // None abstains; every explicit raw contributor, including lower-ranked
+    // owners that cannot bind, is collected before admission checks.
+    let records = collect_runtime_claims(active, identity, overlay, basis, budget)?;
+    if records.is_empty() {
+        return Err(PythonHierarchyReason::MissingRuntimeBases);
+    }
+    let mut failure = None;
+    // Retain all contributors before checking their declaration admission.
+    for (activated, index) in &records {
+        let admitted =
+            active.type_declaration_admitted(activated.record, &mut || budget.charge(1, 1))?;
+        let canonical = external_class_identity_with_visits(
+            overlay,
+            Language::Python,
+            &activated.record.name,
+            Some(&activated.record.id),
+            cache,
+            &mut || budget.charge(1, 1),
+        )?;
+        if activated.record.type_kind != TypeKind::Class
+            || !admitted
+            || canonical.as_ref() != Some(identity)
+        {
+            failure.get_or_insert(PythonHierarchyReason::AmbiguousRuntimeBase);
+        } else {
+            basis.claims[*index].class = canonical.as_ref().map(modeled_identity);
+        }
+    }
+    let mut agreed = None;
+    let mut unresolved = Vec::new();
+    for (_, index) in records {
+        let claim = &mut basis.claims[index];
+        let mut resolved = Vec::new();
+        let mut seen = HashSet::default();
+        for (slot, reference) in claim.declared_bases.iter().enumerate() {
+            budget.charge(0, 1)?;
+            match runtime_claim_target(overlay, reference, cache, budget, &mut unresolved) {
+                Ok(target) => {
+                    claim.bases[slot] = Some(modeled_identity(&target));
+                    if !seen.insert(target.clone()) {
+                        failure.get_or_insert(PythonHierarchyReason::DuplicateBase);
+                    }
+                    resolved.push(target);
+                }
+                Err(
+                    reason @ (PythonHierarchyReason::Cancelled | PythonHierarchyReason::VisitLimit),
+                ) => return Err(reason),
+                Err(reason) => {
+                    failure.get_or_insert(reason);
+                }
+            }
+        }
+        if resolved.len() == claim.declared_bases.len() {
+            match &agreed {
+                Some(previous) if *previous != resolved => {
+                    failure.get_or_insert(PythonHierarchyReason::ConflictingRuntimeBases);
+                }
+                None => agreed = Some(resolved),
+                _ => {}
+            }
+        }
+    }
+    for reference in unresolved {
+        match reference {
+            TypeRef::Named { name, .. } => {
+                retain_open_claims(active, &name, overlay, basis, budget)?
+            }
+            TypeRef::Declared { id, .. } => {
+                for activated in active.all_type_records_with_id(&id) {
+                    budget.charge(1, 1)?;
+                    if activated.shard.manifest.language == "python" {
+                        let _retained_index =
+                            retain_claim(active, &activated, overlay, basis, budget)?;
+                    }
+                }
+            }
+            _ => unreachable!("only supported unresolved class references are queued"),
+        }
+    }
+    match failure {
+        Some(reason) => Err(reason),
+        None => Ok(agreed.expect("all claims resolved, including empty roots")),
+    }
+}
+
+/// Whether the active model claims runtime bases for this external identity.
+///
+/// An implicit object root needs this claim only to choose between the
+/// model-backed endpoint and the language-intrinsic endpoint. The object's
+/// bases are a language rule either way.
+fn runtime_base_claim_declared(
+    active: &ResolvedActiveSemanticModels,
+    identity: &ClassIdentity,
+    budget: &mut HierarchyBudget<'_>,
+) -> Result<bool, PythonHierarchyReason> {
+    let ClassIdentity::External {
+        qualified_name,
+        symbol_id,
+    } = identity
+    else {
+        return Ok(false);
+    };
+    let mut declared = false;
+    for activated in active.all_type_records_with_id(symbol_id) {
+        budget.charge(1, 1)?;
+        declared |= activated.shard.manifest.language == "python"
+            && activated.record.runtime_bases.is_some();
+    }
+    for activated in active.all_type_records_named(qualified_name) {
+        budget.charge(1, 1)?;
+        declared |= activated.shard.manifest.language == "python"
+            && activated.record.name == qualified_name.as_ref()
+            && activated.record.runtime_bases.is_some();
+    }
+    Ok(declared)
 }
 
 impl PythonClassHierarchyProvider for PythonAnalyzer {
@@ -45,223 +401,139 @@ impl PythonClassHierarchyProvider for PythonAnalyzer {
         class: &CodeUnit,
         cancellation: Option<&CancellationToken>,
     ) -> PythonClassHierarchyAnswer {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return PythonClassHierarchyAnswer::stopped(
-                PythonHierarchyOutcome::Incomplete,
-                PythonHierarchyReason::Cancelled,
-                Vec::new(),
-            );
-        }
-        if !class.is_class() {
-            return PythonClassHierarchyAnswer::stopped(
-                PythonHierarchyOutcome::Unsupported,
-                PythonHierarchyReason::NotClass,
-                Vec::new(),
-            );
-        }
-        if class.is_synthetic() {
-            return PythonClassHierarchyAnswer::stopped(
-                PythonHierarchyOutcome::Incomplete,
-                PythonHierarchyReason::ExternalBase,
-                Vec::new(),
-            );
-        }
-
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        let mut stack = vec![ClassWork::Enter(class.clone())];
-        let mut states = HashMap::<CodeUnit, ClassVisit>::default();
-        let mut nodes = HashMap::<CodeUnit, ResolvedClassNode>::default();
-        let mut linearizations = HashMap::<CodeUnit, Vec<CodeUnit>>::default();
+        let mut basis = PythonAncestryBasis::default();
         let mut root_bases = Vec::new();
-        let mut visits = 0usize;
-        let mut c3_work = 0usize;
-
-        while let Some(work) = stack.pop() {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return PythonClassHierarchyAnswer::stopped(
-                    PythonHierarchyOutcome::Incomplete,
-                    PythonHierarchyReason::Cancelled,
-                    root_bases,
-                );
+        let session = ResolutionSession::bounded_with_total_work(
+            INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            MAX_PYTHON_C3_WORK,
+            cancellation,
+        );
+        let provider = PythonDefinitionProvider::new(self, &session);
+        let mut budget = HierarchyBudget {
+            visits: 0,
+            session: &session,
+            provider: &provider,
+            retained_claims: HashSet::default(),
+        };
+        let snapshot = self.active_semantic_model_snapshot();
+        let active = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.active_models().as_ref());
+        let overlay = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::as_ref));
+        let mut cache = ExternalClassCache::default();
+        let root = ClassIdentity::Workspace(class.clone());
+        let mut stack = vec![ClassWork::Enter(root.clone())];
+        let mut states = HashMap::<ClassIdentity, ClassVisit>::default();
+        let mut nodes = HashMap::<ClassIdentity, Vec<ClassIdentity>>::default();
+        let mut linearizations = HashMap::<ClassIdentity, Vec<ClassIdentity>>::default();
+        let result = (|| -> Result<(), PythonHierarchyReason> {
+            budget.charge(1, 1)?;
+            if !class.is_class() {
+                return Err(PythonHierarchyReason::NotClass);
             }
-
-            let current = match work {
-                ClassWork::Enter(current) => match states.get(&current) {
-                    Some(ClassVisit::Done) => continue,
-                    Some(ClassVisit::Visiting) => {
-                        return PythonClassHierarchyAnswer::stopped(
-                            PythonHierarchyOutcome::Inconsistent,
-                            PythonHierarchyReason::CyclicBases,
-                            root_bases,
-                        );
-                    }
-                    None => current,
-                },
-                ClassWork::Exit(current) => {
-                    let node = nodes
-                        .get(&current)
-                        .expect("entered class has a resolved node");
-                    match merge_c3(
-                        &current,
-                        &node.bases,
-                        &linearizations,
-                        &mut c3_work,
-                        cancellation,
-                    ) {
-                        Ok(mro) => {
-                            linearizations.insert(current.clone(), mro);
-                            states.insert(current, ClassVisit::Done);
-                        }
-                        Err(C3Failure::Inconsistent) => {
-                            return PythonClassHierarchyAnswer::stopped(
-                                PythonHierarchyOutcome::Inconsistent,
-                                PythonHierarchyReason::InconsistentLinearization,
-                                root_bases,
-                            );
-                        }
-                        Err(C3Failure::VisitLimit) => {
-                            return PythonClassHierarchyAnswer::stopped(
-                                PythonHierarchyOutcome::Incomplete,
-                                PythonHierarchyReason::VisitLimit,
-                                root_bases,
-                            );
-                        }
-                        Err(C3Failure::Cancelled) => {
-                            return PythonClassHierarchyAnswer::stopped(
-                                PythonHierarchyOutcome::Incomplete,
-                                PythonHierarchyReason::Cancelled,
-                                root_bases,
-                            );
-                        }
-                    }
-                    continue;
-                }
-            };
-
-            if visits == MAX_PYTHON_HIERARCHY_VISITS {
-                return PythonClassHierarchyAnswer::stopped(
-                    PythonHierarchyOutcome::Incomplete,
-                    PythonHierarchyReason::VisitLimit,
-                    root_bases,
-                );
+            if class.is_synthetic() {
+                return Err(PythonHierarchyReason::ExternalBase);
             }
-            visits += 1;
-            if current.is_synthetic() {
-                return PythonClassHierarchyAnswer::stopped(
-                    PythonHierarchyOutcome::Incomplete,
-                    PythonHierarchyReason::ExternalBase,
-                    root_bases,
-                );
-            }
-
-            let raw_bases = self.inner.raw_supertypes_of(&current);
-            let mut base_facts = Vec::with_capacity(raw_bases.len());
-            let mut resolved_bases = Vec::with_capacity(raw_bases.len());
-            let mut seen_bases = HashSet::default();
-            let mut failure = None;
-            for (ordinal, raw) in raw_bases.into_iter().enumerate() {
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    let bases = if current == *class {
-                        base_facts
-                    } else {
-                        root_bases
-                    };
-                    return PythonClassHierarchyAnswer::stopped(
-                        PythonHierarchyOutcome::Incomplete,
-                        PythonHierarchyReason::Cancelled,
-                        bases,
-                    );
-                }
-                if visits == MAX_PYTHON_HIERARCHY_VISITS {
-                    let bases = if current == *class {
-                        base_facts
-                    } else {
-                        root_bases
-                    };
-                    return PythonClassHierarchyAnswer::stopped(
-                        PythonHierarchyOutcome::Incomplete,
-                        PythonHierarchyReason::VisitLimit,
-                        bases,
-                    );
-                }
-                visits += 1;
-                let target = resolve_base_class(self, token, &current, &raw);
-                let (resolution, target) = match target {
-                    // Intrinsic builtin roots have no source CodeUnit. Their
-                    // identity must be established from the selected base AST
-                    // node and lexical bindings before treating them as leaves.
-                    None if super::type_flow::python_intrinsic_base_is_unshadowed(
-                        self, &current, &raw,
-                    ) =>
-                    {
-                        (PythonBaseResolution::Resolved, None)
-                    }
-                    None => {
-                        failure.get_or_insert((
-                            PythonHierarchyOutcome::Incomplete,
-                            PythonHierarchyReason::UnresolvedBase,
-                        ));
-                        (PythonBaseResolution::Unresolved, None)
-                    }
-                    Some(target) if !target.is_class() => {
-                        failure.get_or_insert((
-                            PythonHierarchyOutcome::Incomplete,
-                            PythonHierarchyReason::NonClassBase,
-                        ));
-                        (PythonBaseResolution::NonClass, Some(target))
-                    }
-                    Some(target) if target.is_synthetic() => {
-                        failure.get_or_insert((
-                            PythonHierarchyOutcome::Incomplete,
-                            PythonHierarchyReason::ExternalBase,
-                        ));
-                        (PythonBaseResolution::External, Some(target))
-                    }
-                    Some(target) if !seen_bases.insert(target.clone()) => {
-                        failure = Some((
-                            PythonHierarchyOutcome::Inconsistent,
-                            PythonHierarchyReason::DuplicateBase,
-                        ));
-                        (PythonBaseResolution::Resolved, Some(target))
-                    }
-                    Some(target) => {
-                        resolved_bases.push(target.clone());
-                        (PythonBaseResolution::Resolved, Some(target))
+            while let Some(work) = stack.pop() {
+                budget.charge(1, 1)?;
+                let current = match work {
+                    ClassWork::Enter(current) => match states.get(&current) {
+                        Some(ClassVisit::Done) => continue,
+                        Some(ClassVisit::Visiting) => {
+                            return Err(PythonHierarchyReason::CyclicBases);
+                        }
+                        None => current,
+                    },
+                    ClassWork::Exit(current) => {
+                        let mro =
+                            merge_c3(&current, &nodes[&current], &linearizations, &mut |amount| {
+                                if session.scope_steps(amount) {
+                                    Ok(())
+                                } else {
+                                    Err(match session_reason(&session) {
+                                        PythonHierarchyReason::Cancelled => C3Failure::Cancelled,
+                                        _ => C3Failure::VisitLimit,
+                                    })
+                                }
+                            })
+                            .map_err(|failure| match failure {
+                                C3Failure::Inconsistent => {
+                                    PythonHierarchyReason::InconsistentLinearization
+                                }
+                                C3Failure::VisitLimit => PythonHierarchyReason::VisitLimit,
+                                C3Failure::Cancelled => PythonHierarchyReason::Cancelled,
+                            })?;
+                        linearizations.insert(current.clone(), mro);
+                        states.insert(current, ClassVisit::Done);
+                        continue;
                     }
                 };
-                base_facts.push(PythonBaseFact {
-                    ordinal,
-                    spelling: raw,
-                    resolution,
-                    target,
-                });
+                let bases = match &current {
+                    ClassIdentity::Workspace(owner) => self.runtime_source_bases(
+                        owner,
+                        snapshot.as_deref(),
+                        &mut cache,
+                        &mut budget,
+                        &mut basis,
+                        (current == root).then_some(&mut root_bases),
+                    )?,
+                    ClassIdentity::Intrinsic { .. } => Vec::new(),
+                    ClassIdentity::External { .. } => runtime_bases(
+                        active.ok_or(PythonHierarchyReason::MissingRuntimeBases)?,
+                        overlay,
+                        &current,
+                        &mut basis,
+                        &mut cache,
+                        &mut budget,
+                    )?,
+                };
+                budget.charge(0, bases.len())?;
+                let mut seen = HashSet::default();
+                for base in &bases {
+                    if !seen.insert(base) {
+                        return Err(PythonHierarchyReason::DuplicateBase);
+                    }
+                }
+                states.insert(current.clone(), ClassVisit::Visiting);
+                stack.push(ClassWork::Exit(current.clone()));
+                for base in bases.iter().rev() {
+                    stack.push(ClassWork::Enter(base.clone()));
+                }
+                nodes.insert(current, bases);
             }
-
-            if current == *class {
-                root_bases = base_facts;
-            }
-            if let Some((outcome, reason)) = failure {
-                return PythonClassHierarchyAnswer::stopped(outcome, reason, root_bases);
-            }
-
-            nodes.insert(
-                current.clone(),
-                ResolvedClassNode {
-                    bases: resolved_bases.clone(),
+            Ok(())
+        })();
+        let result = match session.finish(result) {
+            BoundedResolution::Complete { value, .. } => value,
+            BoundedResolution::Exceeded { .. } => Err(PythonHierarchyReason::VisitLimit),
+            BoundedResolution::Cancelled { .. } => Err(PythonHierarchyReason::Cancelled),
+        };
+        match result {
+            Ok(()) => PythonClassHierarchyAnswer::complete(
+                root_bases,
+                linearizations.remove(&root).expect("completed root has C3"),
+                basis,
+            ),
+            Err(reason) => PythonClassHierarchyAnswer::stopped(
+                match reason {
+                    PythonHierarchyReason::NotClass
+                    | PythonHierarchyReason::UnsupportedBaseExpression => {
+                        PythonHierarchyOutcome::Unsupported
+                    }
+                    PythonHierarchyReason::DuplicateBase
+                    | PythonHierarchyReason::CyclicBases
+                    | PythonHierarchyReason::InconsistentLinearization => {
+                        PythonHierarchyOutcome::Inconsistent
+                    }
+                    _ => PythonHierarchyOutcome::Incomplete,
                 },
-            );
-            states.insert(current.clone(), ClassVisit::Visiting);
-            stack.push(ClassWork::Exit(current));
-            for base in resolved_bases.into_iter().rev() {
-                stack.push(ClassWork::Enter(base));
-            }
+                reason,
+                root_bases,
+                basis,
+            ),
         }
-
-        let mro = linearizations
-            .remove(class)
-            .expect("complete class walk produces the selected class MRO");
-        PythonClassHierarchyAnswer::complete(root_bases, mro)
     }
 
     fn mro_members(
@@ -269,8 +541,7 @@ impl PythonClassHierarchyProvider for PythonAnalyzer {
         class: &CodeUnit,
         cancellation: Option<&CancellationToken>,
     ) -> PythonMroMembersAnswer {
-        let hierarchy = self.class_hierarchy(class, cancellation);
-        self.mro_members_from_hierarchy(hierarchy, cancellation)
+        self.mro_members_from_hierarchy(self.class_hierarchy(class, cancellation), cancellation)
     }
 
     fn method_override(
@@ -278,131 +549,318 @@ impl PythonClassHierarchyProvider for PythonAnalyzer {
         method: &CodeUnit,
         cancellation: Option<&CancellationToken>,
     ) -> PythonOverrideAnswer {
-        if !method.is_function() {
+        let owner = self.parent_of(method).filter(CodeUnit::is_class);
+        if !method.is_function() || owner.is_none() {
             return PythonOverrideAnswer::stopped(
                 PythonOverrideOutcome::Unsupported,
                 Some(PythonHierarchyReason::NotClass),
-                None,
+                owner,
+                PythonAncestryBasis::default(),
             );
         }
-        let Some(owner) = self.parent_of(method).filter(CodeUnit::is_class) else {
-            return PythonOverrideAnswer::stopped(
-                PythonOverrideOutcome::Unsupported,
-                Some(PythonHierarchyReason::NotClass),
-                None,
-            );
-        };
+        let owner = owner.expect("class owner checked");
         let hierarchy = self.class_hierarchy(&owner, cancellation);
+        let stopped = |outcome, reason| {
+            PythonOverrideAnswer::stopped(
+                outcome,
+                reason,
+                Some(owner.clone()),
+                hierarchy.ancestry_basis.clone(),
+            )
+        };
         if hierarchy.outcome != PythonHierarchyOutcome::Complete {
-            return PythonOverrideAnswer::stopped(
-                match hierarchy.outcome {
-                    PythonHierarchyOutcome::Unsupported => PythonOverrideOutcome::Unsupported,
-                    _ => PythonOverrideOutcome::Incomplete,
+            return stopped(
+                if hierarchy.outcome == PythonHierarchyOutcome::Unsupported {
+                    PythonOverrideOutcome::Unsupported
+                } else {
+                    PythonOverrideOutcome::Incomplete
                 },
                 hierarchy.reason,
-                Some(owner),
             );
         }
-        let name = method.terminal_name();
         let mut visits = 0usize;
-        for (rank, mro_owner) in hierarchy.mro.iter().enumerate() {
+        for (rank, identity) in hierarchy.mro.iter().enumerate() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return PythonOverrideAnswer::stopped(
+                return stopped(
                     PythonOverrideOutcome::Incomplete,
                     Some(PythonHierarchyReason::Cancelled),
-                    Some(owner),
                 );
             }
+            let ClassIdentity::Workspace(mro_owner) = identity else {
+                if matches!(identity, ClassIdentity::Intrinsic { .. }) {
+                    // The language-supplied object root declares no source
+                    // member that could override the selected method.
+                    continue;
+                }
+                // A complete ancestry claim is not a complete member inventory.
+                return stopped(
+                    PythonOverrideOutcome::Incomplete,
+                    Some(PythonHierarchyReason::UnknownMemberSurface),
+                );
+            };
             let declarations = self.direct_children_in_source_order(mro_owner);
             visits = visits.saturating_add(declarations.len());
             if visits > MAX_PYTHON_MEMBER_VISITS {
-                return PythonOverrideAnswer::stopped(
+                return stopped(
                     PythonOverrideOutcome::Incomplete,
                     Some(PythonHierarchyReason::VisitLimit),
-                    Some(owner),
                 );
             }
             let selected = declarations
                 .into_iter()
                 .rev()
-                .find(|declaration| declaration.terminal_name() == name);
+                .find(|declaration| declaration.terminal_name() == method.terminal_name());
             if rank == 0 {
                 if selected.as_ref() != Some(method) {
-                    return PythonOverrideAnswer::stopped(
+                    return stopped(
                         PythonOverrideOutcome::Unsupported,
                         Some(PythonHierarchyReason::NotEffectiveMember),
-                        Some(owner),
                     );
                 }
                 continue;
             }
-            let Some(target) = selected else {
-                continue;
-            };
-            if target.is_function() {
+            if let Some(target) = selected {
+                if !target.is_function() {
+                    return stopped(PythonOverrideOutcome::NoOverride, None);
+                }
                 return PythonOverrideAnswer {
                     outcome: PythonOverrideOutcome::Overrides,
                     reason: None,
-                    source_owner: Some(owner),
+                    source_owner: Some(owner.clone()),
                     target: Some(target),
                     target_owner: Some(mro_owner.clone()),
                     mro_rank: Some(rank),
+                    ancestry_basis: hierarchy.ancestry_basis.clone(),
                 };
             }
-            return PythonOverrideAnswer::stopped(
-                PythonOverrideOutcome::NoOverride,
-                None,
-                Some(owner),
-            );
         }
-        PythonOverrideAnswer::stopped(PythonOverrideOutcome::NoOverride, None, Some(owner))
+        stopped(PythonOverrideOutcome::NoOverride, None)
     }
 }
 
 impl PythonAnalyzer {
+    fn runtime_source_bases(
+        &self,
+        owner: &CodeUnit,
+        models: Option<&ActiveSemanticModelSnapshot>,
+        cache: &mut ExternalClassCache,
+        budget: &mut HierarchyBudget<'_>,
+        basis: &mut PythonAncestryBasis,
+        mut root_facts: Option<&mut Vec<PythonBaseFact>>,
+    ) -> Result<Vec<ClassIdentity>, PythonHierarchyReason> {
+        let active = models.map(|models| models.active_models().as_ref());
+        let overlay = models.and_then(|models| models.semantic_model_overlay().map(Arc::as_ref));
+        let session = budget.session;
+        let prepared = session
+            .query(|| super::type_flow::current_indexed_prepared(self, owner.source()))
+            .flatten()
+            .ok_or(PythonHierarchyReason::UnresolvedBase)?;
+        let class =
+            super::type_flow::class_node_for_unit_in_session(self, &prepared, owner, session)
+                .ok_or(PythonHierarchyReason::UnresolvedBase)?;
+        if class.child_by_field_name("type_parameters").is_some() {
+            // PEP 695 can insert Generic into runtime bases. A typing origin
+            // or the ordinary implicit-object rule does not prove that graph.
+            return Err(PythonHierarchyReason::UnsupportedBaseExpression);
+        }
+        let body = class.child_by_field_name("body");
+        let mut cursor = class.walk();
+        for child in class.named_children(&mut cursor) {
+            if Some(child) != body {
+                budget.charge(1, 1)?;
+                if child.has_error() || child.is_missing() {
+                    return Err(PythonHierarchyReason::UnsupportedBaseExpression);
+                }
+            }
+        }
+        if class
+            .parent()
+            .is_some_and(|parent| parent.kind() == "decorated_definition")
+        {
+            return Err(PythonHierarchyReason::UnsupportedBaseExpression);
+        }
+        let mut base_nodes = Vec::new();
+        if let Some(arguments) = class.child_by_field_name("superclasses") {
+            if arguments.has_error() {
+                return Err(PythonHierarchyReason::UnsupportedBaseExpression);
+            }
+            let mut cursor = arguments.walk();
+            for argument in arguments.named_children(&mut cursor) {
+                budget.charge(1, 1)?;
+                if argument.kind() == "comment" {
+                    continue;
+                }
+                brokk_bifrost_core::analyzer::tree_walk::try_walk_named_tree_preorder(
+                    argument,
+                    true,
+                    |_| {
+                        budget.charge(1, 1)?;
+                        Ok::<_, PythonHierarchyReason>(
+                            brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue,
+                        )
+                    },
+                )?;
+                if brokk_bifrost_python::syntax::python_static_attribute_path_bounded(
+                    argument,
+                    || session.scope_step(),
+                )
+                .is_none()
+                {
+                    // Calls, subscriptions, splats, and class keywords can
+                    // change runtime bases/metaclasses; typing origins cannot
+                    // certify those runtime operations.
+                    return Err(PythonHierarchyReason::UnsupportedBaseExpression);
+                }
+                base_nodes.push(argument);
+            }
+        }
+        let scope = AnalyzerQueryScope::new(self);
+        let mut bases = Vec::new();
+        if base_nodes.is_empty() {
+            // A class with no written bases inherits `object` by language
+            // rule. A runtime-base claim may refine that endpoint to the
+            // model's canonical identity, but its absence must not make the
+            // implicit root unresolved.
+            let target = match active {
+                Some(active) => {
+                    let target = super::type_flow::exact_external_class_name_with_visits(
+                        overlay,
+                        PYTHON_OBJECT_ROOT,
+                        cache,
+                        &mut || budget.charge(1, 1),
+                    )?;
+                    match target {
+                        Some(target) if runtime_base_claim_declared(active, &target, budget)? => {
+                            target
+                        }
+                        _ => ClassIdentity::Intrinsic {
+                            qualified_name: PYTHON_OBJECT_ROOT.into(),
+                        },
+                    }
+                }
+                None => ClassIdentity::Intrinsic {
+                    qualified_name: PYTHON_OBJECT_ROOT.into(),
+                },
+            };
+            // Implicit object is a language identity, never lexical `object`.
+            if let Some(facts) = &mut root_facts {
+                facts.push(PythonBaseFact {
+                    origin: PythonBaseOrigin::ImplicitObject,
+                    ordinal: 0,
+                    spelling: PYTHON_OBJECT_ROOT.into(),
+                    resolution: PythonBaseResolution::Resolved,
+                    target: Some(target.clone()),
+                });
+            }
+            bases.push(target);
+        } else {
+            let support = budget.provider;
+            for (ordinal, base) in base_nodes.into_iter().enumerate() {
+                budget.charge(1, 1)?;
+                let raw = base
+                    .utf8_text(prepared.source().as_bytes())
+                    .map_err(|_| PythonHierarchyReason::UnsupportedBaseExpression)?
+                    .to_owned();
+                let source =
+                    crate::analyzer::usages::get_definition::python_class_object_base_candidate(
+                        support,
+                        scope.token(),
+                        owner.source(),
+                        &prepared,
+                        base,
+                    );
+                let target = match source {
+                    Some(source) if !source.is_synthetic() => {
+                        debug_assert!(source.is_class(), "class-object proof returned {source:?}");
+                        Some(ClassIdentity::Workspace(source))
+                    }
+                    _ => super::type_flow::exact_external_base_node_with_lookup(
+                        support,
+                        owner,
+                        &prepared,
+                        base,
+                        &mut |name| {
+                            let target = super::type_flow::exact_external_class_name_with_visits(
+                                overlay,
+                                name,
+                                cache,
+                                &mut || budget.charge(1, 1),
+                            )?;
+                            if target.is_none()
+                                && let Some(active) = active
+                            {
+                                retain_open_claims(active, name, overlay, basis, budget)?;
+                            }
+                            Ok::<_, PythonHierarchyReason>(target)
+                        },
+                    )?,
+                };
+                if let Some(facts) = &mut root_facts {
+                    facts.push(PythonBaseFact {
+                        origin: PythonBaseOrigin::Source,
+                        ordinal,
+                        spelling: raw,
+                        resolution: if target.is_some() {
+                            PythonBaseResolution::Resolved
+                        } else {
+                            PythonBaseResolution::Unresolved
+                        },
+                        target: target.clone(),
+                    });
+                }
+                bases.push(target.ok_or(PythonHierarchyReason::UnresolvedBase)?);
+            }
+        }
+        if !self.indexed_source_matches(owner.source(), prepared.source()) {
+            return Err(PythonHierarchyReason::UnresolvedBase);
+        }
+        Ok(bases)
+    }
+
     fn mro_members_from_hierarchy(
         &self,
-        mut hierarchy: PythonClassHierarchyAnswer,
+        hierarchy: PythonClassHierarchyAnswer,
         cancellation: Option<&CancellationToken>,
     ) -> PythonMroMembersAnswer {
-        if hierarchy.outcome != PythonHierarchyOutcome::Complete {
-            return PythonMroMembersAnswer {
-                hierarchy,
-                members: Vec::new(),
-            };
+        let mut answer = PythonMroMembersAnswer {
+            outcome: hierarchy.outcome,
+            reason: hierarchy.reason,
+            hierarchy,
+            members: Vec::new(),
+        };
+        if answer.outcome != PythonHierarchyOutcome::Complete {
+            return answer;
         }
         let mut selected = HashSet::<String>::default();
-        let mut members = Vec::new();
         let mut visits = 0usize;
-        for (rank, owner) in hierarchy.mro.iter().enumerate() {
+        for (rank, identity) in answer.hierarchy.mro.iter().enumerate() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                hierarchy = PythonClassHierarchyAnswer::stopped(
-                    PythonHierarchyOutcome::Incomplete,
-                    PythonHierarchyReason::Cancelled,
-                    hierarchy.bases,
-                );
-                return PythonMroMembersAnswer {
-                    hierarchy,
-                    members: Vec::new(),
-                };
+                answer.outcome = PythonHierarchyOutcome::Incomplete;
+                answer.reason = Some(PythonHierarchyReason::Cancelled);
+                break;
             }
+            let ClassIdentity::Workspace(owner) = identity else {
+                // The implicit object root is a language-supplied terminal;
+                // it contributes no source declarations. Any other external
+                // class leaves the member surface unknown.
+                if matches!(identity, ClassIdentity::Intrinsic { .. }) {
+                    continue;
+                }
+                answer.outcome = PythonHierarchyOutcome::Incomplete;
+                answer.reason = Some(PythonHierarchyReason::UnknownMemberSurface);
+                break;
+            };
             let declarations = self.direct_children_in_source_order(owner);
             visits = visits.saturating_add(declarations.len());
             if visits > MAX_PYTHON_MEMBER_VISITS {
-                hierarchy = PythonClassHierarchyAnswer::stopped(
-                    PythonHierarchyOutcome::Incomplete,
-                    PythonHierarchyReason::VisitLimit,
-                    hierarchy.bases,
-                );
-                return PythonMroMembersAnswer {
-                    hierarchy,
-                    members: Vec::new(),
-                };
+                answer.outcome = PythonHierarchyOutcome::Incomplete;
+                answer.reason = Some(PythonHierarchyReason::VisitLimit);
+                break;
             }
             for member in declarations.into_iter().rev() {
                 let name = member.terminal_name().to_owned();
                 if selected.insert(name.clone()) {
-                    members.push(PythonMroMember {
+                    answer.members.push(PythonMroMember {
                         name,
                         member,
                         owner: owner.clone(),
@@ -411,8 +869,10 @@ impl PythonAnalyzer {
                 }
             }
         }
-        members.sort_by(|left, right| (left.rank, &left.name).cmp(&(right.rank, &right.name)));
-        PythonMroMembersAnswer { hierarchy, members }
+        answer
+            .members
+            .sort_by(|left, right| (left.rank, &left.name).cmp(&(right.rank, &right.name)));
+        answer
     }
 
     fn direct_children_in_source_order(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
@@ -428,46 +888,41 @@ impl PythonAnalyzer {
     }
 }
 
-fn merge_c3(
-    class: &CodeUnit,
-    bases: &[CodeUnit],
-    linearizations: &HashMap<CodeUnit, Vec<CodeUnit>>,
-    work: &mut usize,
-    cancellation: Option<&CancellationToken>,
-) -> Result<Vec<CodeUnit>, C3Failure> {
-    let mut sequences = Vec::<VecDeque<CodeUnit>>::with_capacity(bases.len() + 1);
+/// C3 mechanics shared by runtime ancestry and the separate typing-edge provider.
+pub(super) fn merge_c3<T: Clone + Eq + std::hash::Hash>(
+    class: &T,
+    bases: &[T],
+    linearizations: &HashMap<T, Vec<T>>,
+    charge: &mut impl FnMut(usize) -> Result<(), C3Failure>,
+) -> Result<Vec<T>, C3Failure> {
+    charge(bases.len().saturating_add(1))?;
+    let mut sequences = Vec::<VecDeque<T>>::with_capacity(bases.len() + 1);
     for base in bases {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(C3Failure::Cancelled);
-        }
         let base_mro = linearizations
             .get(base)
             .expect("base MRO is complete before its subclass");
-        spend_c3(work, base_mro.len())?;
+        charge(base_mro.len())?;
         sequences.push(base_mro.iter().cloned().collect());
     }
-    spend_c3(work, bases.len())?;
     sequences.push(bases.iter().cloned().collect());
-
     let mut result = vec![class.clone()];
     while sequences.iter().any(|sequence| !sequence.is_empty()) {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(C3Failure::Cancelled);
-        }
-        let mut tails = HashSet::<CodeUnit>::default();
+        let mut tails = HashSet::<T>::default();
         for sequence in &sequences {
+            charge(sequence.len())?;
             for tail in sequence.iter().skip(1) {
-                spend_c3(work, 1)?;
                 tails.insert(tail.clone());
             }
         }
+        // Charge even empty sequence heads and the pop sweep.
+        charge(sequences.len().saturating_mul(2))?;
         let candidate = sequences
             .iter()
             .filter_map(VecDeque::front)
             .find(|head| !tails.contains(*head))
             .cloned()
             .ok_or(C3Failure::Inconsistent)?;
-        spend_c3(work, 1)?;
+        charge(1)?;
         result.push(candidate.clone());
         for sequence in &mut sequences {
             if sequence.front() == Some(&candidate) {
@@ -478,7 +933,7 @@ fn merge_c3(
     Ok(result)
 }
 
-fn spend_c3(work: &mut usize, amount: usize) -> Result<(), C3Failure> {
+pub(super) fn spend_c3(work: &mut usize, amount: usize) -> Result<(), C3Failure> {
     *work = work.saturating_add(amount);
     if *work > MAX_PYTHON_C3_WORK {
         Err(C3Failure::VisitLimit)

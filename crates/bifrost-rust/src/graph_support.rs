@@ -4281,20 +4281,12 @@ pub fn rust_value_constructor_properties(
     match node.child_by_field_name("body") {
         None => {}
         Some(body) if body.kind() == "ordered_field_declaration_list" => {
-            let mut pending_visibility = None;
-            let mut cursor = body.walk();
-            for child in body.named_children(&mut cursor) {
-                match child.kind() {
-                    "attribute_item"
-                    | "inner_attribute_item"
-                    | "line_comment"
-                    | "block_comment" => {}
-                    "visibility_modifier" => {
-                        pending_visibility = Some(rust_visibility_modifier(child, source));
-                    }
-                    _ => field_visibilities
-                        .push(pending_visibility.take().unwrap_or(RustVisibility::Private)),
-                }
+            for (_, visibility) in crate::syntax::rust_positional_fields(body) {
+                field_visibilities.push(
+                    visibility
+                        .map(|node| rust_visibility_modifier(node, source))
+                        .unwrap_or(RustVisibility::Private),
+                );
             }
         }
         Some(_) => return None,

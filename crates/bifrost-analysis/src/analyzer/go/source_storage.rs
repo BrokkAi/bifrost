@@ -225,7 +225,7 @@ impl AnalyzerStore {
                 }
             );
             read_rows!(
-                "SELECT declaration_id, owner_type_id, type_id, name, embedded FROM source_go_fields WHERE blob_id = ?1 ORDER BY declaration_id",
+                "SELECT declaration_id, owner_type_id, type_id, name, embedded, tag FROM source_go_fields WHERE blob_id = ?1 ORDER BY declaration_id",
                 row,
                 {
                     facts.fields.push(GoFieldFact {
@@ -234,6 +234,7 @@ impl AnalyzerStore {
                         ty: row.get::<_, Option<u32>>(2)?.map(GoSourceTypeId::new),
                         name: row.get(3)?,
                         embedded: strict_bool(row.get(4)?, "embedded field")?,
+                        tag: row.get(5)?,
                     });
                 }
             );

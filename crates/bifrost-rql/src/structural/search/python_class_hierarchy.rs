@@ -2,14 +2,16 @@
 
 use super::python_rule_facts::{direct_identifier, named_children, node_text};
 use super::*;
+use crate::analyzer::semantic::type_flow::ClassIdentity;
 use crate::analyzer::usages::callable_signature::callable_signature_reports;
+use crate::analyzer::usages::python_class_hierarchy::PythonAncestryBasis;
 use crate::analyzer::usages::python_class_hierarchy::{
-    PythonBaseFact, PythonBaseResolution, PythonClassHierarchyAnswer, PythonClassHierarchyProvider,
-    PythonHierarchyOutcome, PythonHierarchyReason, PythonMroMember, PythonMroMembersAnswer,
-    PythonOverrideAnswer, PythonOverrideOutcome,
+    PythonBaseFact, PythonBaseOrigin, PythonBaseResolution, PythonClassHierarchyAnswer,
+    PythonClassHierarchyProvider, PythonHierarchyOutcome, PythonHierarchyReason, PythonMroMember,
+    PythonMroMembersAnswer, PythonOverrideAnswer, PythonOverrideOutcome,
 };
 
-const PYTHON_HIERARCHY_FACT_ID_DOMAIN: &[u8] = b"bifrost.code_query.python_hierarchy_fact.v1";
+const PYTHON_HIERARCHY_FACT_ID_DOMAIN: &[u8] = b"bifrost.code_query.python_hierarchy_fact.v2";
 const MAX_PYTHON_BASE_BRANCH_MEMBER_VISITS: usize = 16_384;
 pub(super) const PYTHON_HIERARCHY_FACT_KIND_LABELS: &[&str] = &[
     "hierarchy",
@@ -48,6 +50,12 @@ pub(super) const PYTHON_HIERARCHY_REASON_LABELS: &[&str] = &[
     "unresolved_base",
     "non_class_base",
     "external_base",
+    "missing_runtime_bases",
+    "conflicting_runtime_bases",
+    "ambiguous_runtime_base",
+    "unsupported_base_expression",
+    "unknown_member_surface",
+    "base_branch_members_unavailable",
     "duplicate_base",
     "cyclic_bases",
     "inconsistent_linearization",
@@ -72,6 +80,8 @@ pub(super) const PYTHON_HIERARCHY_COVERAGE_LABELS: &[&str] = &["complete", "open
 pub(super) struct PythonHierarchyFactValue {
     pub(super) root: DeclarationValue,
     pub(super) root_id: String,
+    pub(super) ancestry_basis: PythonAncestryBasis,
+    pub(super) endpoint_ids: [Option<String>; 4],
     pub(super) site_range: Option<Range>,
     pub(super) fact_kind: &'static str,
     pub(super) outcome: &'static str,
@@ -80,10 +90,10 @@ pub(super) struct PythonHierarchyFactValue {
     pub(super) ordinal: Option<usize>,
     pub(super) base_spelling: Option<String>,
     pub(super) base_resolution: Option<&'static str>,
-    pub(super) declaration: Option<CodeUnit>,
-    pub(super) owner: Option<CodeUnit>,
-    pub(super) target: Option<CodeUnit>,
-    pub(super) target_owner: Option<CodeUnit>,
+    pub(super) declaration: Option<ClassIdentity>,
+    pub(super) owner: Option<ClassIdentity>,
+    pub(super) target: Option<ClassIdentity>,
+    pub(super) target_owner: Option<ClassIdentity>,
     pub(super) member_name: Option<String>,
     pub(super) mro_rank: Option<usize>,
     pub(super) target_non_trivial: Option<bool>,
@@ -123,6 +133,20 @@ pub(super) struct PythonCallableArityFact {
 }
 
 impl PythonHierarchyFactValue {
+    pub(super) fn finalize_endpoints(&mut self, analyzer: &dyn IAnalyzer) {
+        self.endpoint_ids = [
+            &self.declaration,
+            &self.owner,
+            &self.target,
+            &self.target_owner,
+        ]
+        .map(|endpoint| {
+            endpoint
+                .as_ref()
+                .map(|endpoint| render::python_hierarchy_endpoint_id(analyzer, endpoint))
+        });
+    }
+
     pub(super) fn file(&self) -> &ProjectFile {
         self.root.unit.source()
     }
@@ -141,8 +165,9 @@ impl PythonHierarchyFactValue {
         if let Some(name) = &self.member_name {
             digest.push(name.as_bytes());
         }
-        if let Some(target) = &self.target {
-            digest.push(target.fq_name().as_bytes());
+        for (slot, identity) in self.endpoint_ids.iter().enumerate() {
+            digest.push(&(slot as u64).to_be_bytes());
+            digest.push(identity.as_deref().unwrap_or("").as_bytes());
         }
         if let Some(range) = self.site_range {
             digest.push(&range.start_byte.to_be_bytes());
@@ -156,6 +181,99 @@ impl PythonHierarchyFactValue {
         }
         digest.finish().to_string()
     }
+}
+
+/// A derived decision and the actual source-root hierarchy premises used to
+/// reach it. These are existing hierarchy facts, not a second evidence carrier.
+#[derive(Debug, Clone)]
+pub(super) struct HierarchyDecision<T> {
+    pub(super) value: T,
+    pub(super) premises: Vec<PythonHierarchyFactValue>,
+}
+
+impl<T> HierarchyDecision<T> {
+    pub(super) fn plain(value: T) -> Self {
+        Self {
+            value,
+            premises: Vec::new(),
+        }
+    }
+}
+
+/// Build a premise from an answer already obtained by the deriving operation.
+/// A missing source declaration range cannot be replaced by an invented anchor.
+pub(super) fn hierarchy_premise(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    answer: &PythonClassHierarchyAnswer,
+) -> Option<PythonHierarchyFactValue> {
+    let range = analyzer
+        .ranges_of(unit)
+        .into_iter()
+        .min_by_key(primary_range_key)?;
+    let declaration = DeclarationValue::new(unit.clone(), range);
+    let root_id = render::canonical_member_digest(analyzer, unit);
+    let expansion = hierarchy_outcome_fact(&declaration, &root_id, answer);
+    let PipelineValue::PythonHierarchyFact(mut value) = expansion.value else {
+        unreachable!("hierarchy outcome produces a hierarchy fact")
+    };
+    value.ancestry_basis = answer.ancestry_basis.clone();
+    value.finalize_endpoints(analyzer);
+    Some(*value)
+}
+
+/// Preserve member-inventory coverage independently of its nested topology.
+pub(super) fn member_premise(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    answer: &PythonMroMembersAnswer,
+) -> Option<PythonHierarchyFactValue> {
+    let mut value = hierarchy_premise(analyzer, unit, &answer.hierarchy)?;
+    value.fact_kind = "member";
+    value.outcome = answer.outcome.label();
+    value.reason = answer.reason.map(PythonHierarchyReason::label);
+    value.coverage = if answer.outcome == PythonHierarchyOutcome::Complete {
+        "complete"
+    } else {
+        "open"
+    };
+    Some(value)
+}
+
+pub(super) fn override_premise(
+    analyzer: &dyn IAnalyzer,
+    method: &CodeUnit,
+    answer: &PythonOverrideAnswer,
+) -> Option<PythonHierarchyFactValue> {
+    let range = analyzer
+        .ranges_of(method)
+        .into_iter()
+        .min_by_key(primary_range_key)?;
+    let declaration = DeclarationValue::new(method.clone(), range);
+    let root_id = render::canonical_member_digest(analyzer, method);
+    let expansion = override_fact(&declaration, &root_id, answer);
+    let PipelineValue::PythonHierarchyFact(mut value) = expansion.value else {
+        unreachable!("override answer produces an override fact")
+    };
+    value.ancestry_basis = answer.ancestry_basis.clone();
+    value.finalize_endpoints(analyzer);
+    Some(*value)
+}
+
+pub(super) fn attach_hierarchy_premises(
+    expansion: &mut PipelineExpansion,
+    premises: &[PythonHierarchyFactValue],
+) {
+    // Preserve the terminal trace entry and its identity as the last result.
+    expansion.trace.splice(
+        0..0,
+        premises.iter().cloned().map(|value| {
+            (
+                PipelineTraceValue::PythonHierarchyFact(Box::new(value)),
+                None,
+            )
+        }),
+    );
 }
 
 pub(super) fn python_hierarchy_expansions_for_declaration(
@@ -213,7 +331,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
                 None,
                 None,
                 None,
-                Some(declaration.unit.clone()),
+                Some(ClassIdentity::Workspace(declaration.unit.clone())),
                 None,
                 None,
                 None,
@@ -224,9 +342,11 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
         };
     };
 
-    match step {
+    let mut basis = PythonAncestryBasis::default();
+    let mut expansions = (|| match step {
         QueryStep::ClassHierarchy => {
             let answer = provider.class_hierarchy(&declaration.unit, cancellation);
+            basis = answer.ancestry_basis.clone();
             let mut facts = vec![hierarchy_outcome_fact(declaration, &root_id, &answer)];
             facts.extend(
                 answer
@@ -238,6 +358,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
         }
         QueryStep::ClassBases => {
             let answer = provider.class_hierarchy(&declaration.unit, cancellation);
+            basis = answer.ancestry_basis.clone();
             if answer.bases.is_empty() {
                 return if answer.outcome == PythonHierarchyOutcome::Complete {
                     Vec::new()
@@ -253,6 +374,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
         }
         QueryStep::ClassMro => {
             let answer = provider.class_hierarchy(&declaration.unit, cancellation);
+            basis = answer.ancestry_basis.clone();
             if answer.outcome != PythonHierarchyOutcome::Complete {
                 return vec![hierarchy_outcome_fact(declaration, &root_id, &answer)];
             }
@@ -283,6 +405,7 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
         }
         QueryStep::MroMembers => {
             let answer = provider.mro_members(&declaration.unit, cancellation);
+            basis = answer.hierarchy.ancestry_basis.clone();
             if answer.hierarchy.outcome != PythonHierarchyOutcome::Complete {
                 return vec![hierarchy_outcome_fact(
                     declaration,
@@ -290,34 +413,48 @@ pub(super) fn python_hierarchy_expansions_for_declaration(
                     &answer.hierarchy,
                 )];
             }
+            let mut rows = Vec::new();
+            if answer.outcome != PythonHierarchyOutcome::Complete {
+                let mut open = hierarchy_outcome_fact(declaration, &root_id, &answer.hierarchy);
+                if let PipelineValue::PythonHierarchyFact(value) = &mut open.value {
+                    value.fact_kind = "member";
+                    value.outcome = answer.outcome.label();
+                    value.reason = answer.reason.map(PythonHierarchyReason::label);
+                    value.coverage = "open";
+                }
+                rows.push(open);
+            }
             let base_branch_counts =
                 mro_base_branch_definition_counts(provider, &answer, cancellation);
             let protocol_facts =
                 python_class_member_protocol_facts(analyzer, declaration, &answer, cancellation);
-            answer
-                .members
-                .iter()
-                .enumerate()
-                .map(|(ordinal, member)| {
-                    member_fact(
-                        declaration,
-                        &root_id,
-                        ordinal,
-                        member,
-                        base_branch_counts
-                            .as_ref()
-                            .map(|counts| *counts.get(&member.name).unwrap_or(&0)),
-                        protocol_facts,
-                    )
-                })
-                .collect()
+            rows.extend(answer.members.iter().enumerate().map(|(ordinal, member)| {
+                member_fact(
+                    declaration,
+                    &root_id,
+                    ordinal,
+                    member,
+                    base_branch_counts
+                        .as_ref()
+                        .map(|counts| *counts.get(&member.name).unwrap_or(&0)),
+                    protocol_facts,
+                )
+            }));
+            rows
         }
         QueryStep::PythonOverrides => {
             let answer = provider.method_override(&declaration.unit, cancellation);
+            basis = answer.ancestry_basis.clone();
             vec![override_fact(declaration, &root_id, &answer)]
         }
         _ => unreachable!("only Python hierarchy steps call this helper"),
+    })();
+    for expansion in &mut expansions {
+        if let PipelineValue::PythonHierarchyFact(value) = &mut expansion.value {
+            value.ancestry_basis = basis.clone();
+        }
     }
+    expansions
 }
 
 fn python_class_member_protocol_facts(
@@ -336,15 +473,15 @@ fn python_class_member_protocol_facts(
             && member.member.is_function()
             && matches!(member.name.as_str(), "__le__" | "__ge__")
     });
-    let has_direct_ne = answer
-        .members
-        .iter()
-        .any(|member| member.member.is_function() && member.name == "__ne__" && member.rank == 0);
     let (inherited_ne_present, inherited_ne_delegates) =
-        inherited_inequality_facts(analyzer, answer, has_direct_ne, cancellation);
+        inherited_inequality_facts(analyzer, answer, cancellation);
     PythonClassMemberProtocolFacts {
-        has_strict_ordering: Some(has_strict_ordering),
-        has_non_strict_ordering: Some(has_non_strict_ordering),
+        has_strict_ordering: (has_strict_ordering
+            || answer.outcome == PythonHierarchyOutcome::Complete)
+            .then_some(has_strict_ordering),
+        has_non_strict_ordering: (has_non_strict_ordering
+            || answer.outcome == PythonHierarchyOutcome::Complete)
+            .then_some(has_non_strict_ordering),
         total_ordering_decorator: python_total_ordering_decorator(analyzer, declaration),
         inherited_ne_present,
         inherited_ne_delegates,
@@ -354,45 +491,38 @@ fn python_class_member_protocol_facts(
 fn inherited_inequality_facts(
     analyzer: &dyn IAnalyzer,
     answer: &PythonMroMembersAnswer,
-    has_direct_ne: bool,
     cancellation: Option<&CancellationToken>,
 ) -> (Option<bool>, Option<bool>) {
-    if has_direct_ne {
-        return (Some(false), Some(false));
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return (None, None);
     }
-    let mut method_count = 0usize;
-    let mut has_method = false;
-    let mut has_non_delegating = false;
-    let mut unknown = false;
-    for owner in answer.hierarchy.mro.iter().skip(1) {
+    // The provider has already selected each name in C3 order and stopped at
+    // the first unknown member surface. Later ancestors cannot mask a selected
+    // source method, and members beyond that frontier supply no callable proof.
+    for member in &answer.members {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return (None, None);
         }
-        let children = analyzer.direct_children(owner);
-        method_count = method_count.saturating_add(children.len());
-        if method_count > MAX_PYTHON_BASE_BRANCH_MEMBER_VISITS {
+        if member.name != "__ne__" {
+            continue;
+        }
+        if member.rank == 0 {
+            return (Some(false), Some(false));
+        }
+        if !member.member.is_function() {
             return (None, None);
         }
-        for method in children
-            .into_iter()
-            .filter(|member| member.is_function() && member.terminal_name() == "__ne__")
-        {
-            has_method = true;
-            match python_method_delegates_to_eq(analyzer, &method) {
-                Some(true) => {}
-                Some(false) => has_non_delegating = true,
-                None => unknown = true,
-            }
+        let delegates = python_method_delegates_to_eq(analyzer, &member.member);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return (None, None);
         }
+        return (Some(true), delegates);
     }
-    let delegates = if has_non_delegating {
-        Some(false)
-    } else if unknown {
-        None
+    if answer.outcome == PythonHierarchyOutcome::Complete {
+        (Some(false), Some(false))
     } else {
-        Some(has_method)
-    };
-    (Some(has_method), delegates)
+        (None, None)
+    }
 }
 
 fn python_total_ordering_decorator(
@@ -628,7 +758,12 @@ pub(super) fn python_override_signature_expansions_for_declaration(
 ) -> Vec<PipelineExpansion> {
     let root_id = render::canonical_member_digest(analyzer, &declaration.unit);
     let Some(provider) = analyzer.python_class_hierarchy_provider_for(&declaration.unit) else {
-        let answer = PythonOverrideAnswer::stopped(PythonOverrideOutcome::Unsupported, None, None);
+        let answer = PythonOverrideAnswer::stopped(
+            PythonOverrideOutcome::Unsupported,
+            None,
+            None,
+            PythonAncestryBasis::default(),
+        );
         return vec![override_signature_fact_expansion(
             declaration,
             &root_id,
@@ -767,6 +902,8 @@ fn override_signature_fact_expansion(
         PythonHierarchyFactValue {
             root: declaration.clone(),
             root_id: root_id.to_owned(),
+            ancestry_basis: answer.ancestry_basis.clone(),
+            endpoint_ids: Default::default(),
             site_range: None,
             fact_kind: "override_signature",
             outcome: answer.outcome.label(),
@@ -775,10 +912,10 @@ fn override_signature_fact_expansion(
             ordinal: None,
             base_spelling: None,
             base_resolution: None,
-            declaration: Some(declaration.unit.clone()),
-            owner: answer.source_owner.clone(),
-            target: answer.target.clone(),
-            target_owner: answer.target_owner.clone(),
+            declaration: Some(ClassIdentity::Workspace(declaration.unit.clone())),
+            owner: answer.source_owner.clone().map(ClassIdentity::Workspace),
+            target: answer.target.clone().map(ClassIdentity::Workspace),
+            target_owner: answer.target_owner.clone().map(ClassIdentity::Workspace),
             member_name: Some(declaration.unit.terminal_name().to_owned()),
             mro_rank: answer.mro_rank,
             target_non_trivial: None,
@@ -826,7 +963,13 @@ fn base_fact(
 ) -> PipelineExpansion {
     let reason = match base.resolution {
         PythonBaseResolution::Resolved => None,
-        PythonBaseResolution::Unresolved => Some(PythonHierarchyReason::UnresolvedBase.label()),
+        PythonBaseResolution::Unresolved => Some(
+            match base.origin {
+                PythonBaseOrigin::Source => PythonHierarchyReason::UnresolvedBase,
+                PythonBaseOrigin::ImplicitObject => PythonHierarchyReason::MissingRuntimeBases,
+            }
+            .label(),
+        ),
         PythonBaseResolution::NonClass => Some(PythonHierarchyReason::NonClassBase.label()),
         PythonBaseResolution::External => Some(PythonHierarchyReason::ExternalBase.label()),
     };
@@ -854,6 +997,9 @@ fn inference_failure_fact(
     root_id: &str,
     base: &PythonBaseFact,
 ) -> Option<PipelineExpansion> {
+    if base.origin == PythonBaseOrigin::ImplicitObject {
+        return None;
+    }
     let reason = match base.resolution {
         PythonBaseResolution::Unresolved => PythonHierarchyReason::UnresolvedBase,
         PythonBaseResolution::NonClass => PythonHierarchyReason::NonClassBase,
@@ -896,8 +1042,8 @@ fn member_fact(
         Some(ordinal),
         None,
         None,
-        Some(member.member.clone()),
-        Some(member.owner.clone()),
+        Some(ClassIdentity::Workspace(member.member.clone())),
+        Some(ClassIdentity::Workspace(member.owner.clone())),
         None,
         None,
         Some(member.name.clone()),
@@ -930,21 +1076,18 @@ fn mro_base_branch_definition_counts(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
+        if base.origin == PythonBaseOrigin::ImplicitObject {
+            // The language-supplied object root is not a source branch.
+            continue;
+        }
         if base.resolution != PythonBaseResolution::Resolved {
             return None;
         }
-        let Some(unit) = base.target.as_ref() else {
-            // A resolved intrinsic builtin root has no source declarations
-            // available to contribute to this branch's member count.
-            let name = base.spelling.trim();
-            assert!(
-                name == "object" || crate::analyzer::python_builtin_exception_name(name).is_some(),
-                "unexpected targetless resolved Python base: {base:?}"
-            );
-            continue;
+        let Some(ClassIdentity::Workspace(unit)) = base.target.as_ref() else {
+            return None;
         };
         let branch = provider.mro_members(unit, cancellation);
-        if branch.hierarchy.outcome != PythonHierarchyOutcome::Complete {
+        if branch.outcome != PythonHierarchyOutcome::Complete {
             return None;
         }
         visits = visits.saturating_add(branch.members.len());
@@ -984,10 +1127,10 @@ fn override_fact(
         None,
         None,
         None,
-        Some(declaration.unit.clone()),
-        answer.source_owner.clone(),
-        answer.target.clone(),
-        answer.target_owner.clone(),
+        Some(ClassIdentity::Workspace(declaration.unit.clone())),
+        answer.source_owner.clone().map(ClassIdentity::Workspace),
+        answer.target.clone().map(ClassIdentity::Workspace),
+        answer.target_owner.clone().map(ClassIdentity::Workspace),
         Some(declaration.unit.terminal_name().to_owned()),
         answer.mro_rank,
     )
@@ -1004,10 +1147,10 @@ fn fact_expansion(
     ordinal: Option<usize>,
     base_spelling: Option<String>,
     base_resolution: Option<&'static str>,
-    member: Option<CodeUnit>,
-    owner: Option<CodeUnit>,
-    target: Option<CodeUnit>,
-    target_owner: Option<CodeUnit>,
+    member: Option<ClassIdentity>,
+    owner: Option<ClassIdentity>,
+    target: Option<ClassIdentity>,
+    target_owner: Option<ClassIdentity>,
     member_name: Option<String>,
     mro_rank: Option<usize>,
 ) -> PipelineExpansion {
@@ -1015,6 +1158,8 @@ fn fact_expansion(
         PythonHierarchyFactValue {
             root: declaration.clone(),
             root_id: root_id.to_owned(),
+            ancestry_basis: PythonAncestryBasis::default(),
+            endpoint_ids: Default::default(),
             site_range: None,
             fact_kind,
             outcome,

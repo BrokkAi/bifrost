@@ -511,6 +511,7 @@ impl SelectedPackageBridgeDescriptor {
                     SelectedJvmBridgeVisibility::Public => b"public".as_slice(),
                     SelectedJvmBridgeVisibility::Protected => b"protected".as_slice(),
                     SelectedJvmBridgeVisibility::Package => b"package".as_slice(),
+                    SelectedJvmBridgeVisibility::Scoped => b"scoped".as_slice(),
                     SelectedJvmBridgeVisibility::Open => b"open".as_slice(),
                 }),
             )?;

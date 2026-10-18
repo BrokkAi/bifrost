@@ -224,6 +224,16 @@ impl PythonAnalyzer {
         self.inner.active_query_request_memo::<T>()
     }
 
+    pub(crate) fn module_candidates_by_fqn_limited(
+        &self,
+        fqn: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_path_modules_by_fqn_limited(fqn, limit, continue_query)
+    }
+
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -314,6 +324,9 @@ impl PythonAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        if clone.inner.workspace_configuration_changed() {
+            return Self::from_inner(clone.inner.reproject_workspace(), self.memo_budget);
+        }
         // Both products describe the snapshot's file view, not just the
         // analyzer's parsed content: the usage index holds the module index
         // and the source-root spelling index the snapshot's own package
@@ -338,7 +351,7 @@ impl PythonAnalyzer {
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         TreeSitterAnalyzer::wrap_with_config(
             config,
-            |config| TreeSitterAnalyzer::new_with_config(project, PythonAdapter, config),
+            |config| TreeSitterAnalyzer::new_with_config(project, PythonAdapter::default(), config),
             Self::from_inner,
         )
     }
@@ -354,7 +367,7 @@ impl PythonAnalyzer {
             |config| {
                 TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
                     project,
-                    PythonAdapter,
+                    PythonAdapter::default(),
                     config,
                     store_context,
                     progress,
@@ -581,14 +594,16 @@ impl PythonSource for PythonAnalyzer {
         // the evidence this snapshot's roots rest on (#3506).
         self.module_spellings.get_or_build(
             || {
-                PythonModuleSpellings::build(self.inner.workspace_language_files(), |file| {
-                    self.inner.project().read_source(file).ok()
-                })
+                PythonModuleSpellings::build(
+                    self.inner.workspace_language_files(),
+                    self.inner.adapter().shared_project(),
+                )
             },
             || {
-                PythonModuleSpellings::build(self.inner.workspace_language_files(), |file| {
-                    self.inner.project().read_source(file).ok()
-                })
+                PythonModuleSpellings::build(
+                    self.inner.workspace_language_files(),
+                    self.inner.adapter().shared_project(),
+                )
             },
         )
     }
@@ -763,8 +778,8 @@ impl CodeUnitIndex for PythonAnalyzer {
         fn languages(&self) -> BTreeSet<Language>;
     }
 
-    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
-        fn project(&self) -> &dyn Project;
+    fn project(&self) -> &dyn Project {
+        self.inner.adapter().project()
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -1587,6 +1602,59 @@ fn python_imports_ctypes(
 }
 
 impl LanguageSupport for PythonSupport {
+    fn workspace_module_member_mutation_free(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        module: &str,
+        member: &str,
+        max_nodes: usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<bool> {
+        let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+        let Ok(files) = python.project().all_files_shared() else {
+            return Some(false);
+        };
+        for file in files.iter() {
+            if !keep_going() {
+                return None;
+            }
+            if crate::analyzer::common::language_for_file(file) != Language::Python {
+                continue;
+            }
+            let Ok(source) = file.read_to_string() else {
+                return Some(false);
+            };
+            let mut parser = tree_sitter::Parser::new();
+            if parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .is_err()
+            {
+                return Some(false);
+            }
+            let Some(tree) = parser.parse(&source, None) else {
+                return Some(false);
+            };
+            if tree.root_node().has_error() {
+                return Some(false);
+            }
+            let source_module =
+                brokk_bifrost_python::declarations::python_module_name(python.project(), file);
+            if brokk_bifrost_python::runtime_values::python_module_member_mutation(
+                tree.root_node(),
+                &source,
+                &source_module,
+                module,
+                member,
+                max_nodes,
+            )
+            .is_some()
+            {
+                return Some(false);
+            }
+        }
+        keep_going().then_some(true)
+    }
+
     fn keyed_property_reads_container_element(&self) -> bool {
         true
     }
@@ -1660,9 +1728,20 @@ impl LanguageSupport for PythonSupport {
         Some(external::python_qualified_base_name(target, &module).into_owned())
     }
 
-    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
-        use brokk_bifrost_python::declarations::{module_code_unit, python_module_name};
-        module_code_unit(file, &python_module_name(file))
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("pyproject.toml" | "setup.py" | "__init__.py")
+        )
+    }
+
+    fn path_synthetic_module_unit(
+        &self,
+        project: &dyn Project,
+        file: &ProjectFile,
+    ) -> Option<CodeUnit> {
+        use brokk_bifrost_python::declarations::module_code_unit;
+        module_code_unit(project, file)
     }
 
     fn signature_metadata_limited(

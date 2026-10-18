@@ -1,5 +1,6 @@
 //! Query-time Python method receiver evidence for callable-signature rows.
 
+use super::python_class_hierarchy::{HierarchyDecision, hierarchy_premise};
 use super::python_rule_facts::named_children;
 use super::*;
 use crate::analyzer::semantic::ContentIdentity;
@@ -15,8 +16,9 @@ use brokk_bifrost_python::bindings::{
 use brokk_bifrost_python::imports::python_import_bindings_from_tree;
 use tree_sitter::Node;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct PythonMethodReceiverEvidence {
+    pub(super) hierarchy_premises: Vec<PythonHierarchyFactValue>,
     pub(super) kind: Option<&'static str>,
     pub(super) owner_is_metaclass: Option<bool>,
     pub(super) owner_is_zope_interface: Option<bool>,
@@ -122,7 +124,7 @@ pub(super) fn receiver_evidence(
         None if matches!(name, "__new__" | "__init_subclass__" | "__class_getitem__") => "class",
         None => "instance",
     };
-    let (owner_is_metaclass, owner_is_zope_interface) = owner_hierarchy_membership(
+    let membership = owner_hierarchy_membership(
         analyzer,
         environment_cache,
         &owner,
@@ -143,9 +145,10 @@ pub(super) fn receiver_evidence(
     let no_args_with_decorator = !has_any_arguments && has_any_decorator(function);
 
     PythonMethodReceiverEvidence {
+        hierarchy_premises: membership.premises,
         kind: Some(kind),
-        owner_is_metaclass,
-        owner_is_zope_interface,
+        owner_is_metaclass: membership.value.0,
+        owner_is_zope_interface: membership.value.1,
         used_in_class_body,
         no_args_with_decorator: Some(no_args_with_decorator),
     }
@@ -381,59 +384,89 @@ fn owner_hierarchy_membership(
     source: &str,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> (Option<bool>, Option<bool>) {
-    let answer = analyzer
-        .python_class_hierarchy_provider_for(owner)
-        .map(|provider| provider.class_hierarchy(owner, cancellation));
-    if let Some(answer) = answer {
-        match answer.outcome {
-            PythonHierarchyOutcome::Complete => {
-                let has = |expected_fq_name| {
-                    answer
-                        .mro
-                        .iter()
-                        .any(|ancestor| ancestor.fq_name_str() == expected_fq_name)
-                };
-                (
-                    Some(has("builtins.type")),
-                    Some(has("zope.interface.Interface")),
-                )
+) -> HierarchyDecision<(Option<bool>, Option<bool>)> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let answer = analyzer
+            .python_class_hierarchy_provider_for(owner)
+            .map(|provider| provider.class_hierarchy(owner, cancellation));
+        if let Some(answer) = answer {
+            let Some(premise) = hierarchy_premise(analyzer, owner, &answer) else {
+                return (None, None);
+            };
+            premises.push(premise);
+            match answer.outcome {
+                PythonHierarchyOutcome::Complete => {
+                    let has = |expected_fq_name| {
+                        answer.mro.iter().any(|ancestor| match ancestor {
+                            crate::analyzer::semantic::type_flow::ClassIdentity::Workspace(
+                                unit,
+                            ) => {
+                                expected_fq_name != "builtins.type"
+                                    && unit.fq_name_str() == expected_fq_name
+                            }
+                            crate::analyzer::semantic::type_flow::ClassIdentity::External {
+                                qualified_name,
+                                ..
+                            } => qualified_name.as_ref() == expected_fq_name,
+                            crate::analyzer::semantic::type_flow::ClassIdentity::Intrinsic {
+                                qualified_name,
+                            } => qualified_name.as_ref() == expected_fq_name,
+                        })
+                    };
+                    (
+                        Some(has("builtins.type")),
+                        Some(has("zope.interface.Interface")),
+                    )
+                }
+                PythonHierarchyOutcome::Inconsistent => {
+                    let has = |expected_fq_name| {
+                        answer.mro.iter().any(|ancestor| match ancestor {
+                            crate::analyzer::semantic::type_flow::ClassIdentity::Workspace(
+                                unit,
+                            ) => {
+                                expected_fq_name != "builtins.type"
+                                    && unit.fq_name_str() == expected_fq_name
+                            }
+                            crate::analyzer::semantic::type_flow::ClassIdentity::External {
+                                qualified_name,
+                                ..
+                            } => qualified_name.as_ref() == expected_fq_name,
+                            crate::analyzer::semantic::type_flow::ClassIdentity::Intrinsic {
+                                qualified_name,
+                            } => qualified_name.as_ref() == expected_fq_name,
+                        })
+                    };
+                    (
+                        has("builtins.type").then_some(true),
+                        has("zope.interface.Interface").then_some(true),
+                    )
+                }
+                PythonHierarchyOutcome::Incomplete | PythonHierarchyOutcome::Unsupported => {
+                    ordinary_object_root_membership(
+                        analyzer,
+                        environment_cache,
+                        owner,
+                        class,
+                        source,
+                        cancellation,
+                        diagnostics,
+                    )
+                }
             }
-            PythonHierarchyOutcome::Inconsistent => {
-                let has = |expected_fq_name| {
-                    answer
-                        .mro
-                        .iter()
-                        .any(|ancestor| ancestor.fq_name_str() == expected_fq_name)
-                };
-                (
-                    has("builtins.type").then_some(true),
-                    has("zope.interface.Interface").then_some(true),
-                )
-            }
-            PythonHierarchyOutcome::Incomplete | PythonHierarchyOutcome::Unsupported => {
-                ordinary_object_root_membership(
-                    analyzer,
-                    environment_cache,
-                    owner,
-                    class,
-                    source,
-                    cancellation,
-                    diagnostics,
-                )
-            }
+        } else {
+            ordinary_object_root_membership(
+                analyzer,
+                environment_cache,
+                owner,
+                class,
+                source,
+                cancellation,
+                diagnostics,
+            )
         }
-    } else {
-        ordinary_object_root_membership(
-            analyzer,
-            environment_cache,
-            owner,
-            class,
-            source,
-            cancellation,
-            diagnostics,
-        )
-    }
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn ordinary_object_root_membership(

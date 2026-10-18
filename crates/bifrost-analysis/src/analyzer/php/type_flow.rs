@@ -962,6 +962,9 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
                 };
                 external_member_lookup(&overlay, symbol_id, kind, member)
             }
+            ClassIdentity::Intrinsic { .. } => {
+                MemberLookup::Unknown(UnknownReason::ExternalNotModeled)
+            }
         }
     }
 

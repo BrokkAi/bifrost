@@ -23,7 +23,7 @@ pub(crate) use demand_scheduler::{
 
 /// What production gets back from one demand-resolved reference: an answer, or
 /// the evidence of a stop. There is no third case: a scheduler non-answer is
-/// already an answer with no target and a named reason.
+/// already an incomplete answer with retained source evidence.
 pub(crate) enum FactDemandResolution {
     Ready(Box<FactResolutionAnswer>),
     Cancelled(ResolutionCompletion),
@@ -129,13 +129,13 @@ use super::batch::{
 use super::batch::{
     BatchCandidateMatch, BatchCandidateRequest, BatchResolutionEngine,
     BatchResolutionFragmentSource, CancellationEvidenceLedger, CandidatePathIdentity,
-    DemandedReferenceKey, ExperimentalReverseBatchFrame, ExperimentalReverseBatchPoll,
-    ExperimentalReverseBatchStart, ExperimentalReverseReadiness, FactReferenceSiteMetadata,
-    ForwardCandidateArtifactCache, MAX_REFERENCE_SEEDS_PER_BATCH, MAX_REVERSE_TARGETS_PER_BATCH,
-    MAX_SOURCE_ROWS_PER_BATCH, ReferenceSeed, ReferenceSeedBatch, ReferenceSeedReadTerminal,
-    ResolutionBatchMetrics, ReverseCandidateGapExclusionPlan, ReverseReferenceSeedRequest,
-    SeedReadAuthority, SeededPartialPath, SeededReferenceRequest,
-    SelectedContextOverlayFragmentSourceBlueprint,
+    CandidatePathStore, CandidatePathStoreHandle, DemandedReferenceKey,
+    ExperimentalReverseBatchFrame, ExperimentalReverseBatchPoll, ExperimentalReverseBatchStart,
+    ExperimentalReverseReadiness, FactReferenceSiteMetadata, ForwardCandidateArtifactCache,
+    MAX_REFERENCE_SEEDS_PER_BATCH, MAX_REVERSE_TARGETS_PER_BATCH, MAX_SOURCE_ROWS_PER_BATCH,
+    ReferenceSeed, ReferenceSeedBatch, ReferenceSeedReadTerminal, ResolutionBatchMetrics,
+    ReverseCandidateGapExclusionPlan, ReverseReferenceSeedRequest, SeedReadAuthority,
+    SeededPartialPath, SeededReferenceRequest, SelectedContextOverlayFragmentSourceBlueprint,
     SelectedContextOverlayFragmentSourceBlueprintConstruction, prefetch_candidate_hydrations,
     prefetch_endpoint_classifications, prefetch_forward_candidate_artifacts,
     read_endpoint_classification_artifacts, read_forward_candidate_artifacts,
@@ -3380,6 +3380,26 @@ impl<'a> FactReadSession<'a> {
         self.context_identities
             .as_ref()?
             .jvm_external_provider_type_identity_for_reference(reference)
+    }
+
+    /// A scope-proven nominal name is usable without an indexed type row.
+    /// An implicit fallback must not replace a selected source declaration.
+    /// Consumers of members or supertypes still need its inventory boundary.
+    fn jvm_nominal_type_identity_for_answer(
+        &self,
+        reference: SemanticId,
+        answer: &ResolutionAnswer,
+    ) -> Option<SemanticId> {
+        let identities = self.context_identities.as_ref()?;
+        self.jvm_external_provider_type_identity_for_reference(reference)
+            .or_else(|| {
+                if !answer.targets().is_empty()
+                    || answer.completion() != &ResolutionCompletion::Complete
+                {
+                    return None;
+                }
+                identities.jvm_implicit_nominal_fallback(reference)
+            })
     }
 
     fn jvm_external_provider_type_boundaries(&self, identity: SemanticId) -> Vec<SemanticId> {
@@ -6687,6 +6707,7 @@ fn signature_session_rows_equal(
 #[cfg(any(test, feature = "test-support"))]
 pub struct PreloadedFactResolutionService {
     source: PreloadedFragmentSource,
+    fragment_languages: HashMap<BindingFragmentId, Language>,
     typed: TypedSelection,
     selected_fragments: Box<[BindingFragmentId]>,
     has_jvm_semantics: bool,
@@ -6811,6 +6832,7 @@ impl PreloadedFactResolutionService {
     pub fn estimated_retained_bytes(&self) -> usize {
         let Self {
             source,
+            fragment_languages,
             typed,
             selected_fragments,
             has_jvm_semantics: _,
@@ -6847,6 +6869,7 @@ impl PreloadedFactResolutionService {
         let estimated = source
             .estimated_retained_bytes()
             .saturating_add(typed.estimated_retained_bytes())
+            .saturating_add(brokk_bifrost_core::hash::map_slot_bytes(fragment_languages))
             .saturating_add(brokk_bifrost_core::hash::set_slot_bytes(
                 preserved_binding_references,
             ))
@@ -6930,6 +6953,10 @@ impl PreloadedFactResolutionService {
     ) -> Self {
         let typed_fragments = typed_fragments.into_iter().collect::<Vec<_>>();
         let lexical_fragments = lexical_fragments.into_iter().collect::<Vec<_>>();
+        let fragment_languages = lexical_fragments
+            .iter()
+            .map(|fragment| (fragment.fragment(), fragment.language()))
+            .collect();
         let has_jvm_semantics = typed_fragments
             .iter()
             .any(|fragment| super::language_has_jvm_semantics(fragment.language()));
@@ -7112,6 +7139,7 @@ impl PreloadedFactResolutionService {
         );
         Self {
             source,
+            fragment_languages,
             typed,
             selected_fragments: selected_fragments.into_boxed_slice(),
             has_jvm_semantics,
@@ -8388,7 +8416,8 @@ impl DemandHierarchyReferenceFrame {
 
     fn cancel(self, evaluation: &mut FactEvaluation<'_, '_>) {
         if let Some((_, frame)) = self.active {
-            let (answers, completion, metrics) = frame.cancel().into_parts();
+            let (answers, completion, metrics) =
+                frame.cancel(&evaluation.candidate_paths).into_parts();
             evaluation.binding_metrics.accumulate(metrics);
             evaluation.observe_hierarchy_raw_cancellation_completion(&completion);
             for answer in answers.iter() {
@@ -8428,6 +8457,7 @@ impl DemandHierarchyReferenceFrame {
                 frame.poll_with_selection_access(
                     &engine,
                     evaluation.forward_candidate_artifacts.as_deref_mut(),
+                    &mut evaluation.candidate_paths,
                     evaluation.cancellation,
                     access_lookup.as_deref_mut(),
                     readiness,
@@ -9484,6 +9514,7 @@ pub(crate) struct FactResolutionOperation<'a> {
     // Immutable lexical artifacts share the operation's source authority.
     // Answer selection and typed saturation remain fresh for every root.
     forward_candidate_artifacts: ForwardCandidateArtifactCache,
+    candidate_paths: CandidatePathStore,
     demand_provider: Option<Box<dyn DemandRootProvider + 'a>>,
     completed_roots: Option<(Arc<SelectedDemandState>, u64)>,
     root_context: Option<[u8; 32]>,
@@ -9568,6 +9599,7 @@ impl<'a> FactResolutionOperation<'a> {
             session,
             hierarchy: HierarchyOperationArena::default(),
             forward_candidate_artifacts: ForwardCandidateArtifactCache::default(),
+            candidate_paths: CandidatePathStore::default(),
             demand_provider: None,
             completed_roots: None,
             root_context: None,
@@ -9594,6 +9626,7 @@ impl<'a> FactResolutionOperation<'a> {
             session: &mut self.session,
             hierarchy: &mut self.hierarchy,
             forward_candidate_artifacts: &mut self.forward_candidate_artifacts,
+            candidate_paths: &mut self.candidate_paths,
             completed_roots: self.completed_roots.as_ref().map(|(state, access)| {
                 (
                     state.as_ref(),
@@ -9634,15 +9667,10 @@ impl<'a> FactResolutionOperation<'a> {
         })
     }
 
-    /// Production demand resolution for one reference.
-    ///
-    /// The scheduler reports two non-answers that only a test can read: an
-    /// endpoint whose source authority the provider does not own, and a finite
-    /// prefix dependency cycle. Neither is a product outcome, and neither may
-    /// become a silent empty answer, so both become an answer with no target
-    /// and an incompleteness reason naming this exact reference. The cycle case
-    /// already carries `CyclicPrefixDependency` per unanswered root; the
-    /// unavailable case names the reference the provider could not place.
+    /// Production demand resolution for one reference. The scheduler's raw
+    /// unavailable and cyclic outcomes retain an incomplete answer with the
+    /// source metadata and any proven binding evidence, rather than silently
+    /// manufacturing an empty answer.
     pub(crate) fn resolve_reference_by_demand(
         &mut self,
         reference: SemanticId,
@@ -9661,7 +9689,6 @@ impl<'a> FactResolutionOperation<'a> {
         provider: &mut (impl DemandRootProvider + ?Sized),
         metrics: &mut ResolutionBatchMetrics,
     ) -> StoreResult<FactDemandResolution> {
-        let cancellation = self.session.cancellation;
         Ok(
             match self.with_demand_resources(|resources| {
                 demand_scheduler::resolve_with_metrics(resources, reference, provider, metrics)
@@ -9673,52 +9700,33 @@ impl<'a> FactResolutionOperation<'a> {
                     FactDemandResolution::Cancelled(completion)
                 }
                 DemandAcyclicOutcome::Unavailable {
-                    completion,
-                    root_seed_completions,
-                    ..
-                } => FactDemandResolution::Ready(Box::new(empty_fact_resolution_answer(
-                    unavailable_reference_completion(
-                        &completion,
-                        reference,
-                        &root_seed_completions,
-                    ),
-                    cancellation,
-                ))),
-                DemandAcyclicOutcome::Unsupported(
-                    DemandAcyclicUnsupported::CyclicPrefixDependency { completion, .. },
-                ) => FactDemandResolution::Ready(Box::new(empty_fact_resolution_answer(
-                    completion,
-                    cancellation,
-                ))),
+                    mut root_answers, ..
+                }
+                | DemandAcyclicOutcome::Unsupported(
+                    DemandAcyclicUnsupported::CyclicPrefixDependency {
+                        mut root_answers, ..
+                    },
+                ) => {
+                    assert_eq!(root_answers.len(), 1);
+                    FactDemandResolution::Ready(Box::new(root_answers.pop().unwrap()))
+                }
             },
         )
     }
 
-    /// Production demand resolution for one whole enumerated reference batch.
-    ///
-    /// One scheduler serves the batch, so a prefix reference that several of
-    /// its references share is admitted, seeded and resolved once instead of
-    /// once per dependent reference. The two non-answer outcomes become the
-    /// same empty answers with the same named reasons that the single-reference
-    /// route produces, applied to every reference of the batch: a stopped
-    /// scheduler publishes no root answer, and no prefix of a batch is a valid
-    /// broad answer.
+    /// Resolve an enumerated batch once, retaining completed roots and the
+    /// metadata and local evidence of roots blocked by unavailable dependencies
+    /// or cycles. A sibling's failure does not change an independent answer.
     fn resolve_seeded_reference_batch_by_demand(
         &mut self,
         seeds: &[ReferenceSeed],
         provider: &mut (impl DemandRootProvider + ?Sized),
         metrics: &mut ResolutionBatchMetrics,
     ) -> StoreResult<FactDemandBatchResolution> {
-        let cancellation = self.session.cancellation;
         let outcome = self.with_demand_resources(|resources| {
             demand_scheduler::resolve_seeded_batch_with_metrics(resources, seeds, provider, metrics)
         })?;
-        let references = seeds
-            .iter()
-            .map(ReferenceSeed::reference)
-            .collect::<Vec<_>>();
-        let references = references.as_slice();
-        Ok(match outcome {
+        let resolved = match outcome {
             DemandBatchOutcome::Ready(resolutions) => FactDemandBatchResolution::Ready(
                 resolutions
                     .into_iter()
@@ -9728,35 +9736,28 @@ impl<'a> FactResolutionOperation<'a> {
             DemandBatchOutcome::Cancelled(completion) => {
                 FactDemandBatchResolution::Cancelled(completion)
             }
-            DemandBatchOutcome::Unavailable {
-                completion,
-                root_seed_completions,
+            DemandBatchOutcome::Unavailable { root_answers, .. }
+            | DemandBatchOutcome::Unsupported(DemandAcyclicUnsupported::CyclicPrefixDependency {
+                root_answers,
                 ..
-            } => FactDemandBatchResolution::Ready(
-                references
-                    .iter()
-                    .map(|&reference| {
-                        empty_fact_resolution_answer(
-                            unavailable_reference_completion(
-                                &completion,
-                                reference,
-                                &root_seed_completions,
-                            ),
-                            cancellation,
-                        )
-                    })
-                    .collect(),
-            ),
-            DemandBatchOutcome::Unsupported(DemandAcyclicUnsupported::CyclicPrefixDependency {
-                completion,
-                ..
-            }) => FactDemandBatchResolution::Ready(
-                references
-                    .iter()
-                    .map(|_| empty_fact_resolution_answer(completion.clone(), cancellation))
-                    .collect(),
-            ),
-        })
+            }) => FactDemandBatchResolution::Ready(root_answers),
+        };
+        // Synthetic references deliberately publish no site metadata. An
+        // authored input that supplied metadata must retain it even when a
+        // dependency made its evaluation incomplete.
+        debug_assert!(
+            match &resolved {
+                FactDemandBatchResolution::Ready(answers) =>
+                    answers.len() == seeds.len()
+                        && seeds.iter().zip(answers).all(|(seed, answer)| {
+                            seed.site_metadata()
+                                .is_none_or(|metadata| answer.site_metadata() == Some(metadata))
+                        }),
+                FactDemandBatchResolution::Cancelled(_) => true,
+            },
+            "evaluated demand inputs retain their authored site metadata"
+        );
+        Ok(resolved)
     }
 
     fn new(
@@ -9876,6 +9877,76 @@ impl<'a> FactResolutionOperation<'a> {
                 .is_none(),
             "one expression result slot is selected per point operation"
         );
+    }
+
+    /// Select the persisted assignment-value property of one exact local use.
+    /// An installed demand provider must close reachable root relations before
+    /// lexical binding reads them; no declared-type projection substitutes for
+    /// an absent observed property.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn select_native_assignment_value_slot(
+        &mut self,
+        reference: SemanticId,
+    ) -> StoreResult<SemanticId> {
+        match self.named_argument_label_for_reference(reference)? {
+            super::fact_source::NamedArgumentLabelRead::Missing => {}
+            label => {
+                return Err(StoreError::new(format!(
+                    "assignment-value probe requires a local use, not a named argument: {label:?}"
+                )));
+            }
+        }
+        let binding = if self.demand_provider.is_some() {
+            self.resolve_reference(reference)?.binding().clone()
+        } else {
+            let seed = self
+                .session
+                .lexical_source
+                .reference_seed(ResolutionQuery::new(reference), self.session.cancellation)?
+                .ok_or_else(|| {
+                    StoreError::new("assignment-value probe has no exact reference seed")
+                })?;
+            let mut lexical = FactEvaluation::new_with_forward_artifacts(
+                &mut self.session,
+                &mut self.hierarchy,
+                &mut self.forward_candidate_artifacts,
+                &mut self.candidate_paths,
+                reference,
+            );
+            lexical.resolve_seeded_lexical(seed)?
+        };
+        let [definition] = binding.targets() else {
+            return Err(StoreError::new(format!(
+                "assignment-value probe requires one exact local binder: {binding:?}"
+            )));
+        };
+        if reference.ordinal().is_none() || reference.ordinal() != definition.ordinal() {
+            return Err(StoreError::new(format!(
+                "assignment-value probe requires a file-local binder: {reference:?} -> {definition:?}"
+            )));
+        }
+        let read = self
+            .session
+            .declaration_types_for_definitions(&[*definition])?;
+        let SessionFactRead::Exhausted { rows, .. } = read else {
+            return Err(StoreError::new(
+                "assignment-value property read did not complete",
+            ));
+        };
+        let slots = rows
+            .iter()
+            .map(|row| row.get(&self.session).row())
+            .filter(|row| row.role() == DeclarationTypeRole::ObservedValue)
+            .map(|row| row.slot())
+            .collect::<BTreeSet<_>>();
+        if slots.len() != 1 {
+            return Err(StoreError::new(format!(
+                "assignment-value probe requires one ObservedValue property for {definition:?}: {slots:?}"
+            )));
+        }
+        let slot = *slots.first().expect("one observed property was checked");
+        self.set_query_result_slot(reference, slot);
+        Ok(slot)
     }
 
     pub(crate) fn resolve_reference(
@@ -10060,6 +10131,7 @@ impl<'a> FactResolutionOperation<'a> {
             &mut self.session,
             &mut self.hierarchy,
             &mut self.forward_candidate_artifacts,
+            &mut self.candidate_paths,
             reference,
         );
         let answer = evaluation.run()?;
@@ -10135,6 +10207,7 @@ impl<'a> FactResolutionOperation<'a> {
                     let mut evaluation = match row.into_seed() {
                         Some(seed) => {
                             FactEvaluation::from_seed(&mut self.session, &mut self.hierarchy, seed)
+                                .with_candidate_paths(&mut self.candidate_paths)
                         }
                         None => {
                             let mut evaluation = FactEvaluation::from_lexical_answer(
@@ -10146,7 +10219,8 @@ impl<'a> FactResolutionOperation<'a> {
                                     Vec::new(),
                                     incomplete(reference),
                                 ),
-                            );
+                            )
+                            .with_candidate_paths(&mut self.candidate_paths);
                             // Exact exhausted absence must also cover a typed
                             // qualified root, whose ordinary evaluator consults
                             // this seed relation instead of its lexical answer.
@@ -10221,6 +10295,7 @@ impl<'a> FactResolutionOperation<'a> {
                 session: &mut self.session,
                 hierarchy: &mut self.hierarchy,
                 forward_candidate_artifacts: &mut self.forward_candidate_artifacts,
+                candidate_paths: &mut self.candidate_paths,
             },
             references,
             provider.as_mut(),
@@ -10228,7 +10303,6 @@ impl<'a> FactResolutionOperation<'a> {
         );
         self.demand_provider = Some(provider);
         let outcome = outcome?;
-        let cancellation = self.session.cancellation;
         Ok(match outcome {
             DemandBatchOutcome::Ready(resolutions) => {
                 assert_eq!(resolutions.len(), references.len());
@@ -10249,45 +10323,19 @@ impl<'a> FactResolutionOperation<'a> {
                 answers: Box::new([]),
                 completion,
             },
-            DemandBatchOutcome::Unavailable {
-                completion,
-                root_seed_completions,
-                ..
-            } => {
-                let answers = references
-                    .iter()
-                    .map(|&reference| FactBatchedReferenceAnswer {
-                        reference,
-                        answer: empty_fact_resolution_answer(
-                            unavailable_reference_completion(
-                                &completion,
-                                reference,
-                                &root_seed_completions,
-                            ),
-                            cancellation,
-                        ),
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                FactReferenceQueryBatchAnswer {
-                    answers,
-                    completion: ResolutionCompletion::Complete,
-                }
-            }
-            DemandBatchOutcome::Unsupported(DemandAcyclicUnsupported::CyclicPrefixDependency {
-                completion,
+            DemandBatchOutcome::Unavailable { root_answers, .. }
+            | DemandBatchOutcome::Unsupported(DemandAcyclicUnsupported::CyclicPrefixDependency {
+                root_answers,
                 ..
             }) => {
-                let answers = references
-                    .iter()
-                    .map(|&reference| FactBatchedReferenceAnswer {
-                        reference,
-                        answer: empty_fact_resolution_answer(completion.clone(), cancellation),
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
+                assert_eq!(root_answers.len(), references.len());
                 FactReferenceQueryBatchAnswer {
-                    answers,
+                    answers: references
+                        .iter()
+                        .copied()
+                        .zip(root_answers)
+                        .map(|(reference, answer)| FactBatchedReferenceAnswer { reference, answer })
+                        .collect(),
                     completion: ResolutionCompletion::Complete,
                 }
             }
@@ -10434,6 +10482,7 @@ impl<'a> FactResolutionOperation<'a> {
         } = TypedReverseNarrowing::new_with_metrics(
             &mut self.session,
             &mut self.hierarchy,
+            &mut self.candidate_paths,
             metrics,
         )
         .with_demand_provider(self.demand_provider.as_deref_mut())
@@ -10903,6 +10952,8 @@ impl<'a> FactResolutionOperation<'a> {
                 // state. Its cancellation-only evidence is harvested below
                 // before the next root replaces the arena.
                 self.hierarchy = HierarchyOperationArena::default();
+                // The fresh allocator starts a new candidate identity domain.
+                self.candidate_paths = CandidatePathStore::default();
                 let mut metrics = FactReverseResolutionMetrics::default();
                 let mut bindings = Vec::new();
                 let mut binding_stager = |binding| {
@@ -11100,10 +11151,12 @@ impl<'a> FactResolutionOperation<'a> {
                     &mut access_cancelled,
                     &mut access_work,
                 );
-                let result = engine.resolve_owned_reference_batch_with_selection_access(
+                let result = engine.resolve_owned_reference_batch_with_artifact_cache(
                     batch,
                     cancellation,
-                    &mut access_lookup,
+                    None,
+                    &mut self.candidate_paths,
+                    Some(&mut access_lookup),
                 )?;
                 drop(access_lookup);
                 self.hierarchy.cancellation_reasons.merge_with_poll(
@@ -11114,7 +11167,13 @@ impl<'a> FactResolutionOperation<'a> {
                 );
                 result
             } else {
-                engine.resolve_owned_reference_batch(batch, cancellation)?
+                engine.resolve_owned_reference_batch_with_artifact_cache(
+                    batch,
+                    cancellation,
+                    None,
+                    &mut self.candidate_paths,
+                    None,
+                )?
             };
             let (lexical_answers, lexical_completion, _) = lexical.into_parts();
             // The lexical aggregate is pre-refinement evidence. Retain it for
@@ -11171,7 +11230,8 @@ impl<'a> FactResolutionOperation<'a> {
                     *site_metadata
                         .get(&reference)
                         .expect("every reverse lexical answer comes from one source seed"),
-                );
+                )
+                .with_candidate_paths(&mut self.candidate_paths);
                 metrics.record_full_fact_evaluation();
                 let answer = evaluation.run()?;
                 // Reverse references request the binding relation, not the
@@ -11217,7 +11277,8 @@ impl<'a> FactResolutionOperation<'a> {
                 });
             }
             let reference = seed.reference();
-            let mut evaluation = FactEvaluation::from_seed(session, &mut self.hierarchy, seed);
+            let mut evaluation = FactEvaluation::from_seed(session, &mut self.hierarchy, seed)
+                .with_candidate_paths(&mut self.candidate_paths);
             metrics.record_full_fact_evaluation();
             let answer = evaluation.run()?;
             completion.include(answer.binding().completion());
@@ -11514,10 +11575,12 @@ impl<'a> FactResolutionOperation<'a> {
                             &mut access_work,
                         );
                         let result = BatchResolutionEngine::new(enumeration_source)
-                            .resolve_owned_reference_batch_with_selection_access(
+                            .resolve_owned_reference_batch_with_artifact_cache(
                                 ReferenceSeedBatch::new(unqualified),
                                 cancellation,
-                                &mut access_lookup,
+                                None,
+                                &mut self.candidate_paths,
+                                Some(&mut access_lookup),
                             )?;
                         drop(access_lookup);
                         self.hierarchy.cancellation_reasons.merge_with_poll(
@@ -11529,9 +11592,12 @@ impl<'a> FactResolutionOperation<'a> {
                         result
                     } else {
                         BatchResolutionEngine::new(enumeration_source)
-                            .resolve_owned_reference_batch(
+                            .resolve_owned_reference_batch_with_artifact_cache(
                                 ReferenceSeedBatch::new(unqualified),
                                 cancellation,
+                                None,
+                                &mut self.candidate_paths,
+                                None,
                             )?
                     };
                     drop(root_timing);
@@ -11571,6 +11637,7 @@ impl<'a> FactResolutionOperation<'a> {
                                 .get(&reference)
                                 .expect("every root answer comes from one source seed"),
                         )
+                        .with_candidate_paths(&mut self.candidate_paths)
                         .run()?;
                         batch_completion.include(
                             answer.completion(),
@@ -11602,6 +11669,7 @@ impl<'a> FactResolutionOperation<'a> {
                     let reference = seed.reference();
                     let answer =
                         FactEvaluation::from_seed(&mut self.session, &mut self.hierarchy, seed)
+                            .with_candidate_paths(&mut self.candidate_paths)
                             .run()?;
                     batch_completion.include(
                         answer.completion(),
@@ -11787,6 +11855,95 @@ where
 
 #[cfg(any(test, feature = "test-support"))]
 impl PreloadedFactResolutionService {
+    /// Stage a private differential fixture whose named reference has no
+    /// available dependency authority. Other references use the immutable
+    /// fixture source, through the production demand scheduler and stager.
+    pub fn stage_unavailable_reference_fixture(
+        &self,
+        reference: SemanticId,
+        spelling: &str,
+        stager: &mut dyn FnMut(&FactReferenceBatchAnswer) -> StoreResult<()>,
+    ) -> StoreResult<FactResolutionBatchSummary> {
+        struct UnavailableReference<'a> {
+            reference: SemanticId,
+            node: BindingNodeId,
+            lookup: SemanticId,
+            observed: &'a std::cell::Cell<bool>,
+        }
+        impl DemandRootProvider for UnavailableReference<'_> {
+            fn discover(
+                &mut self,
+                endpoint: &EndpointSignature,
+            ) -> StoreResult<DemandRootDiscovery> {
+                if endpoint.node() == self.node
+                    || endpoint
+                        .symbols()
+                        .fixed()
+                        .iter()
+                        .any(|symbol| symbol.symbol() == self.lookup)
+                {
+                    self.observed.set(true);
+                    Ok(DemandRootDiscovery::Unavailable {
+                        reason: DemandRootUnavailableReason::MissingSourceProvenance,
+                        completion: ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::UnsupportedSemantic(self.reference),
+                        ]),
+                    })
+                } else {
+                    Ok(DemandRootDiscovery::AlreadyReady {
+                        completion: ResolutionCompletion::Complete,
+                    })
+                }
+            }
+
+            fn close(
+                &mut self,
+                _endpoint: &EndpointSignature,
+                _inputs: &[(SemanticId, &FactResolutionAnswer)],
+            ) -> StoreResult<ResolutionCompletion> {
+                unreachable!("fixture relations use the base source or remain unavailable")
+            }
+        }
+        let observed = std::cell::Cell::new(false);
+        let cancellation = CancellationToken::new();
+        let seed = BatchResolutionFragmentSource::reference_seed(
+            &self.source,
+            ResolutionQuery::new(reference),
+            &cancellation,
+        )?
+        .expect("the unavailable fixture reference has a source seed");
+        let metadata = seed
+            .site_metadata()
+            .expect("the unavailable fixture reference is authored");
+        let language = self.fragment_languages[&seed.fragment()];
+        let lookup = super::fact_lowering::lookup_semantic(
+            super::test_shared_names(),
+            language,
+            metadata.namespace(),
+            spelling,
+        );
+        let mut operation = FactResolutionOperation::new_with_callable_static_import_boundaries(
+            self,
+            self,
+            &self.callable_static_import_boundaries,
+            &cancellation,
+        );
+        operation.demand_provider = Some(Box::new(UnavailableReference {
+            reference,
+            node: seed.node(),
+            lookup,
+            observed: &observed,
+        }));
+        let summary =
+            operation.stage_all_reference_batches(MAX_REFERENCE_SEEDS_PER_BATCH, stager)?;
+        drop(operation);
+        assert!(
+            observed.get(),
+            "the fixture must exercise an unavailable dependency"
+        );
+        Ok(summary)
+    }
+
     /// Resolve one reference and its typed outputs through a fresh fixed point.
     pub fn resolve_reference(
         &self,
@@ -11820,7 +11977,7 @@ impl PreloadedFactResolutionService {
         cancellation: &CancellationToken,
         metrics: &mut FactReverseResolutionMetrics,
     ) -> StoreResult<ReferenceSearchAnswer> {
-        self.with_operation(&self.source, cancellation, |mut operation| {
+        self.with_operation(self, cancellation, |mut operation| {
             operation.references_to_with_metrics(
                 MAX_REFERENCE_SEEDS_PER_BATCH,
                 definition,
@@ -11838,7 +11995,7 @@ impl PreloadedFactResolutionService {
         definitions: &[SemanticId],
         cancellation: &CancellationToken,
     ) -> StoreResult<FactTargetReferenceBatchAnswer> {
-        self.with_operation(&self.source, cancellation, |mut operation| {
+        self.with_operation(self, cancellation, |mut operation| {
             operation.references_to_many(
                 MAX_REFERENCE_SEEDS_PER_BATCH,
                 definitions,
@@ -11892,12 +12049,7 @@ impl PreloadedFactResolutionService {
         cancellation: &CancellationToken,
         stager: &mut dyn FnMut(&FactReferenceBatchAnswer) -> StoreResult<()>,
     ) -> StoreResult<FactResolutionBatchSummary> {
-        self.stage_all_reference_batches_from(
-            &self.source,
-            maximum_batch_size,
-            cancellation,
-            stager,
-        )
+        self.stage_all_reference_batches_from(self, maximum_batch_size, cancellation, stager)
     }
 
     fn stage_all_reference_batches_from<S: BatchResolutionFragmentSource>(
@@ -12556,13 +12708,21 @@ fn empty_fact_resolution_answer(
     completion: ResolutionCompletion,
     cancellation: &CancellationToken,
 ) -> FactResolutionAnswer {
+    incomplete_fact_resolution_answer(None, completion, cancellation)
+}
+
+fn incomplete_fact_resolution_answer(
+    site_metadata: Option<FactReferenceSiteMetadata>,
+    completion: ResolutionCompletion,
+    cancellation: &CancellationToken,
+) -> FactResolutionAnswer {
     let mut observed = PolledCompletionAccumulator::new(cancellation);
     observed.include(&completion);
     let completion = observed.finish().0;
     let (binding_completion, completion) =
         duplicate_completion_observing_cancellation(&completion, cancellation);
     FactResolutionAnswer {
-        site_metadata: None,
+        site_metadata,
         callable_receiver_dispositions: Box::new([]),
         callable_candidate_applicability: Box::new([]),
         member_owners: Box::new([]),
@@ -13554,6 +13714,22 @@ const PRELOADED_FIXTURE_AUTHORITY: SeedReadAuthority = SeedReadAuthority {
 
 #[cfg(any(test, feature = "test-support"))]
 impl BatchResolutionFragmentSource for PreloadedFactResolutionService {
+    fn semantic_language_of(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Language>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(self
+            .typed
+            .source_row_fragments
+            .get(&identity)
+            .and_then(|fragment| self.fragment_languages.get(fragment))
+            .copied())
+    }
+
     /// One fixture service is one immutable set of fragments, so it can name
     /// a constant authority and exercise the callers that key by one.
     fn selection_authority(&self) -> Option<SeedReadAuthority> {
@@ -13604,6 +13780,32 @@ impl BatchResolutionFragmentSource for PreloadedFactResolutionService {
             return Ok(None);
         };
         Ok(super::test_shared_names().digest_for_id(shared_id))
+    }
+
+    #[cfg(test)]
+    fn supports_direct_type_shapes(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        let Some(seed) = self
+            .source
+            .reference_seed(ResolutionQuery::new(reference), cancellation)?
+        else {
+            return Ok(false);
+        };
+        // Match the stored reader's per-fragment Java capability using the
+        // explicit Java metadata already installed by the fixture. A Java
+        // provider fragment does not enable shapes for another language.
+        for definition in self.java_inheritance_metadata.keys() {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            if self.typed.source_row_fragments.get(definition) == Some(&seed.fragment()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[cfg(test)]
@@ -14868,7 +15070,12 @@ impl SelectedTypedFactSource for PreloadedFactResolutionService {
                 )
             },
             no_preloaded_typed_evidence,
-            |row, _| Some(self.typed.selected_source_row(row.definition(), **row)),
+            |row, _| {
+                Some(
+                    self.typed
+                        .selected_source_row(row.definition(), (**row).clone()),
+                )
+            },
             cancellation,
             visitor,
         )
@@ -15582,6 +15789,10 @@ impl TypedSelection {
             map_of_vec_slot_bytes(declaration_types_by_definition),
             map_of_vec_slot_bytes(declaration_types_by_slot),
             map_slot_bytes(declaration_visibility_by_definition),
+            declaration_visibility_by_definition.values().filter_map(|property| match property.boundary() {
+                Some(brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary::Package(package)) => Some(package.capacity()),
+                _ => None,
+            }).sum(),
             map_slot_bytes(member_scope_by_definition),
             map_slot_bytes(member_scope_definition_by_head),
             map_of_vec_slot_bytes(member_owners_by_definition),
@@ -15865,7 +16076,8 @@ impl TypedSelection {
                 .or_default()
                 .push(property);
         }
-        for property in fragment.declaration_visibilities().iter().copied() {
+        for property in fragment.declaration_visibilities().iter().cloned() {
+            let definition = property.definition();
             retain_source_row_fragment(
                 &mut self.source_row_fragments,
                 property.definition(),
@@ -15873,10 +16085,10 @@ impl TypedSelection {
             );
             assert!(
                 self.declaration_visibility_by_definition
-                    .insert(property.definition(), property)
+                    .insert(definition, property)
                     .is_none(),
                 "one selected visibility row per declaration is required: {}",
-                property.definition()
+                definition
             );
         }
         for property in fragment.member_scopes() {
@@ -16615,6 +16827,7 @@ struct TypedReverseNarrowing<'resources, 'source, 'metrics> {
     requested_qualifier_slots: BTreeSet<SemanticId>,
     resolved_qualifier_slots: HashSet<SemanticId>,
     forward_candidate_artifacts: ForwardCandidateArtifactCache,
+    candidate_paths: CandidatePathStoreHandle<'resources>,
     producer_evaluation: Option<FactEvaluationState<'source>>,
     published_producer_states: BTreeMap<SemanticId, SharedState>,
     producer_completions: BTreeMap<SemanticId, ResolutionCompletion>,
@@ -16661,9 +16874,12 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
     fn new_with_metrics(
         session: &'resources mut FactReadSession<'source>,
         hierarchy: &'resources mut HierarchyOperationArena,
+        candidate_paths: &'resources mut CandidatePathStore,
         metrics: &'metrics mut FactReverseResolutionMetrics,
     ) -> Self {
-        Self::new_with_optional_metrics(session, hierarchy, Some(metrics))
+        let mut narrowing = Self::new_with_optional_metrics(session, hierarchy, Some(metrics));
+        narrowing.candidate_paths = CandidatePathStoreHandle::Borrowed(candidate_paths);
+        narrowing
     }
 
     fn new_with_optional_metrics(
@@ -16713,6 +16929,7 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
             requested_qualifier_slots: BTreeSet::new(),
             resolved_qualifier_slots: HashSet::default(),
             forward_candidate_artifacts: ForwardCandidateArtifactCache::default(),
+            candidate_paths: CandidatePathStoreHandle::Owned(CandidatePathStore::default()),
             producer_evaluation: None,
             published_producer_states: BTreeMap::new(),
             producer_completions: BTreeMap::new(),
@@ -16759,6 +16976,7 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
                 &mut *self.session,
                 self.hierarchy,
                 &mut self.forward_candidate_artifacts,
+                &mut self.candidate_paths,
                 root,
             )
             .into_checkpoint_state(),
@@ -17244,6 +17462,7 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
             self.session,
             &mut *self.hierarchy,
             &mut self.forward_candidate_artifacts,
+            &mut self.candidate_paths,
             root,
         );
         evaluation.qualified_reference_seeds =
@@ -17962,6 +18181,7 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
                             session: self.session,
                             hierarchy: self.hierarchy,
                             forward_candidate_artifacts: &mut self.forward_candidate_artifacts,
+                            candidate_paths: &mut self.candidate_paths,
                         },
                         provider,
                         request.endpoint(),
@@ -18467,6 +18687,7 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
             self.record_reference_node(reference, node);
             let answer = if let Some(seed) = seed {
                 let mut hierarchy = HierarchyOperationArena::default();
+                // This evaluator owns both its allocator and candidate store.
                 FactEvaluation::from_seed(self.session, &mut hierarchy, seed).run()?
             } else {
                 self.session.resolve_reference(reference)?
@@ -19227,7 +19448,8 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
                 &mut *self.session,
                 &mut *self.hierarchy,
                 selected_route.row().reference(),
-            );
+            )
+            .with_candidate_paths(&mut self.candidate_paths);
             let candidate =
                 evaluation.rust_supertrait_may_reach(receiver_type.identity(), frontier_owner)?;
             let cancelled = evaluation.cancellation_observed;
@@ -19440,7 +19662,8 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
                     if !hierarchy_roots.is_empty() {
                         let session = &mut *self.session;
                         let hierarchy = &mut *self.hierarchy;
-                        let mut evaluation = FactEvaluation::new(session, hierarchy, reference);
+                        let mut evaluation = FactEvaluation::new(session, hierarchy, reference)
+                            .with_candidate_paths(&mut self.candidate_paths);
                         let selection = evaluation
                             .select_hierarchy_candidate_expressions(shape, &hierarchy_roots)?;
                         let evaluation_cancelled = evaluation.cancellation_observed;
@@ -20606,7 +20829,7 @@ struct FactEvaluationState<'a> {
     root_site_metadata: Option<FactReferenceSiteMetadata>,
     root_is_callable: bool,
     callable_candidate_applicability: BTreeMap<SemanticId, FactCallableCandidateApplicability>,
-    root_explicit_receiver_evidence: BTreeMap<SemanticId, ExplicitReceiverTargetEvidence>,
+    receiver_target_evidence: BTreeMap<(SemanticId, SemanticId), ExplicitReceiverTargetEvidence>,
     type_union_frontiers: HashSet<SemanticId>,
     member_owner_by_target: HashMap<SemanticId, Option<FactMemberOwner>>,
     member_rejection_by_target: HashMap<SemanticId, Option<FactMemberRejection>>,
@@ -20870,6 +21093,7 @@ impl<'source> DemandFactEvaluationTask<'source> {
         session: &mut FactReadSession<'source>,
         hierarchy: &mut HierarchyOperationArena,
         artifacts: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
     ) -> StoreResult<DemandFactEvaluationPoll> {
         assert_ne!(self.phase, DemandFactEvaluationPhase::Terminal);
         assert!(
@@ -20877,8 +21101,13 @@ impl<'source> DemandFactEvaluationTask<'source> {
             "cannot switch an active dependency frame to eager polling"
         );
         let state = self.evaluation.take().expect("task is not being polled");
-        let mut evaluation =
-            FactEvaluation::new_with_forward_artifacts(session, hierarchy, artifacts, state.root);
+        let mut evaluation = FactEvaluation::new_with_forward_artifacts(
+            session,
+            hierarchy,
+            artifacts,
+            candidate_paths,
+            state.root,
+        );
         evaluation.replace_with_checkpoint_state(state);
         let result = self.poll_round(&mut evaluation);
         self.demand_epoch = (
@@ -21145,10 +21374,12 @@ impl<'source> DemandFactEvaluationTask<'source> {
         &mut self,
         session: &mut FactReadSession<'source>,
         hierarchy: &mut HierarchyOperationArena,
+        candidate_paths: &mut CandidatePathStore,
     ) -> FactResolutionAnswer {
         assert_ne!(self.phase, DemandFactEvaluationPhase::Terminal);
         let state = self.evaluation.take().expect("task is not being polled");
         let mut evaluation = FactEvaluation::new(session, hierarchy, state.root);
+        evaluation.candidate_paths = CandidatePathStoreHandle::Borrowed(candidate_paths);
         evaluation.replace_with_checkpoint_state(state);
         if let Some(certificate) = &mut self.cycle {
             evaluation.merge_cancellation_reasons(certificate.take_cancellation_reasons());
@@ -21179,7 +21410,8 @@ impl<'source> DemandFactEvaluationTask<'source> {
             .as_mut()
             .and_then(|frame| frame.active.take())
         {
-            let (answers, completion, metrics) = batch.cancel().into_parts();
+            let (answers, completion, metrics) =
+                batch.cancel(&evaluation.candidate_paths).into_parts();
             evaluation.binding_metrics.accumulate(metrics);
             evaluation.observe_cancellation_completion(&completion);
             for answer in answers.into_vec() {
@@ -21220,19 +21452,33 @@ impl<'source> DemandFactEvaluationTask<'source> {
         session: &mut FactReadSession<'source>,
         hierarchy: &mut HierarchyOperationArena,
         artifacts: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
         readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
         claim: &mut impl FnMut(SemanticId) -> DemandedReferenceClaim,
     ) -> StoreResult<DemandFactEvaluationPoll> {
         assert_ne!(self.phase, DemandFactEvaluationPhase::Terminal);
         let state = self.evaluation.take().expect("task is not being polled");
-        let mut evaluation =
-            FactEvaluation::new_with_forward_artifacts(session, hierarchy, artifacts, state.root);
+        let mut evaluation = FactEvaluation::new_with_forward_artifacts(
+            session,
+            hierarchy,
+            artifacts,
+            candidate_paths,
+            state.root,
+        );
         evaluation.replace_with_checkpoint_state(state);
         let result = self.poll_dependency_round(&mut evaluation, readiness, claim);
         self.demand_epoch = (
             evaluation.demanded_references.len(),
             evaluation.demanded_slots.len(),
         );
+        if matches!(&result, Ok(DemandFactEvaluationPoll::Ready(_))) {
+            crate::profiling::note_with(|| {
+                format!(
+                    "resolution::hydration_measure_root_completed root={:?}",
+                    evaluation.root
+                )
+            });
+        }
         self.evaluation = Some(evaluation.into_checkpoint_state());
         if !matches!(
             &result,
@@ -21293,11 +21539,17 @@ impl<'source> DemandFactEvaluationTask<'source> {
         session: &mut FactReadSession<'source>,
         hierarchy: &mut HierarchyOperationArena,
         artifacts: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
         readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandFactEvaluationPoll> {
-        self.poll_with_dependencies(session, hierarchy, artifacts, readiness, &mut |_| {
-            DemandedReferenceClaim::Claimed
-        })
+        self.poll_with_dependencies(
+            session,
+            hierarchy,
+            artifacts,
+            candidate_paths,
+            readiness,
+            &mut |_| DemandedReferenceClaim::Claimed,
+        )
     }
 
     fn poll_dependency_round(
@@ -21462,7 +21714,7 @@ impl<'source> DemandFactEvaluationTask<'source> {
 
 impl DemandReferenceEvaluationFrame {
     fn prepare(evaluation: &mut FactEvaluation<'_, '_>) -> StoreResult<Option<Self>> {
-        evaluation.root_explicit_receiver_evidence.clear();
+        evaluation.receiver_target_evidence.clear();
         let mut references = evaluation
             .demanded_references
             .iter()
@@ -21908,6 +22160,7 @@ impl DemandReferenceEvaluationFrame {
             frame.poll_with_selection_access(
                 &engine,
                 evaluation.forward_candidate_artifacts.as_deref_mut(),
+                &mut evaluation.candidate_paths,
                 evaluation.cancellation,
                 access_lookup.as_deref_mut(),
                 readiness,
@@ -22266,7 +22519,8 @@ impl DemandQualifiedFrame {
             }
         }
         if let Some(batch) = self.active {
-            let (answers, completion, metrics) = batch.cancel().into_parts();
+            let (answers, completion, metrics) =
+                batch.cancel(&evaluation.candidate_paths).into_parts();
             evaluation.binding_metrics.accumulate(metrics);
             evaluation.observe_cancellation_completion(&completion);
             for answer in answers.into_vec() {
@@ -22359,6 +22613,7 @@ impl DemandQualifiedFrame {
                 batch.poll_with_selection_access(
                     &engine,
                     evaluation.forward_candidate_artifacts.as_deref_mut(),
+                    &mut evaluation.candidate_paths,
                     evaluation.cancellation,
                     access_lookup.as_deref_mut(),
                     readiness,
@@ -22672,6 +22927,14 @@ impl DemandQualifiedFrame {
     }
 }
 
+/// Call-local evidence read with the selected result projections. This lives
+/// on the evaluation's slot preparation and never survives the query.
+#[derive(Default)]
+struct CallResultEvidence {
+    residual_completions: HashMap<SemanticId, ResolutionCompletion>,
+    independent_references: HashMap<SemanticId, SemanticId>,
+}
+
 /// What `evaluate_states` reads for one demanded slot set that does not
 /// depend on the round's answers or states: the slots' intrinsic seeds,
 /// projections, constructor qualifier slots, call residuals, incoming
@@ -22690,7 +22953,7 @@ struct SlotPrep {
     projections: HashMap<SemanticId, LoweredBindingProjection>,
     productions: HashMap<SemanticId, LoweredTypeProduction>,
     constructor_qualifier_slots_by_output: HashMap<SemanticId, SemanticId>,
-    call_result_residual_completions: HashMap<SemanticId, ResolutionCompletion>,
+    call_result_evidence: CallResultEvidence,
     incoming_rows: Vec<InternedFactRow<SelectedTypedRow<LoweredTypeTransfer>>>,
     incoming_targets: HashSet<SemanticId>,
     transfers_by_source:
@@ -22728,7 +22991,7 @@ pub(crate) struct FactEvaluation<'resources, 'source> {
     root_site_metadata: Option<FactReferenceSiteMetadata>,
     root_is_callable: bool,
     callable_candidate_applicability: BTreeMap<SemanticId, FactCallableCandidateApplicability>,
-    root_explicit_receiver_evidence: BTreeMap<SemanticId, ExplicitReceiverTargetEvidence>,
+    receiver_target_evidence: BTreeMap<(SemanticId, SemanticId), ExplicitReceiverTargetEvidence>,
     type_union_frontiers: HashSet<SemanticId>,
     /// Where the member lookup matched each target, as it matched it. `None`
     /// records a target two different owners answered, which is unattributed
@@ -22758,6 +23021,7 @@ pub(crate) struct FactEvaluation<'resources, 'source> {
     // itself is operation-owned so exact immutable artifacts survive different
     // roots, cycle checkpoints, and bottom restarts without retaining answers.
     forward_candidate_artifacts: Option<&'resources mut ForwardCandidateArtifactCache>,
+    candidate_paths: CandidatePathStoreHandle<'resources>,
     cancellation_reasons: CancellationReasonCollection,
     cancellation_observed: bool,
     binding_metrics: ResolutionBatchMetrics,
@@ -22773,6 +23037,11 @@ pub(crate) struct FactEvaluation<'resources, 'source> {
 }
 
 impl<'resources, 'source> FactEvaluation<'resources, 'source> {
+    fn with_candidate_paths(mut self, candidate_paths: &'resources mut CandidatePathStore) -> Self {
+        self.candidate_paths = CandidatePathStoreHandle::Borrowed(candidate_paths);
+        self
+    }
+
     fn new(
         session: &'resources mut FactReadSession<'source>,
         hierarchy: &'resources mut HierarchyOperationArena,
@@ -22785,10 +23054,12 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         session: &'resources mut FactReadSession<'source>,
         hierarchy: &'resources mut HierarchyOperationArena,
         forward_candidate_artifacts: &'resources mut ForwardCandidateArtifactCache,
+        candidate_paths: &'resources mut CandidatePathStore,
         root: SemanticId,
     ) -> Self {
         let mut evaluation = Self::base(session, hierarchy, root, None, None);
         evaluation.forward_candidate_artifacts = Some(forward_candidate_artifacts);
+        evaluation.candidate_paths = CandidatePathStoreHandle::Borrowed(candidate_paths);
         evaluation
     }
 
@@ -22877,7 +23148,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             root_is_callable: root_site_metadata
                 .is_some_and(FactReferenceSiteMetadata::is_callable_reference),
             callable_candidate_applicability: BTreeMap::new(),
-            root_explicit_receiver_evidence: BTreeMap::new(),
+            receiver_target_evidence: BTreeMap::new(),
             type_union_frontiers: HashSet::default(),
             member_owner_by_target: HashMap::default(),
             member_rejection_by_target: HashMap::default(),
@@ -22894,6 +23165,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             lexical_answers,
             qualified_suffixes: HashMap::default(),
             forward_candidate_artifacts: None,
+            candidate_paths: CandidatePathStoreHandle::Owned(CandidatePathStore::default()),
             cancellation_reasons: CancellationReasonCollection::default(),
             cancellation_observed: cancellation.is_cancelled(),
             binding_metrics: ResolutionBatchMetrics::default(),
@@ -22922,8 +23194,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             &mut checkpoint.type_union_frontiers,
         );
         std::mem::swap(
-            &mut self.root_explicit_receiver_evidence,
-            &mut checkpoint.root_explicit_receiver_evidence,
+            &mut self.receiver_target_evidence,
+            &mut checkpoint.receiver_target_evidence,
         );
         std::mem::swap(
             &mut self.member_owner_by_target,
@@ -23015,7 +23287,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             root_site_metadata,
             root_is_callable,
             callable_candidate_applicability,
-            root_explicit_receiver_evidence,
+            receiver_target_evidence,
             type_union_frontiers,
             member_owner_by_target,
             member_rejection_by_target,
@@ -23032,6 +23304,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             lexical_answers,
             qualified_suffixes,
             forward_candidate_artifacts: _,
+            candidate_paths: _,
             cancellation_reasons,
             cancellation_observed,
             binding_metrics,
@@ -23047,7 +23320,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             root_site_metadata,
             root_is_callable,
             callable_candidate_applicability,
-            root_explicit_receiver_evidence,
+            receiver_target_evidence,
             type_union_frontiers,
             member_owner_by_target,
             member_rejection_by_target,
@@ -23128,11 +23401,58 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             .and_then(ReferenceSeed::site_metadata)
     }
 
+    fn uses_term_family_binding(&self, reference: SemanticId, language: Language) -> bool {
+        super::fact_lowering::call_target_lookup_routes(language, true).is_some()
+            && self
+                .reference_site_metadata(reference)
+                .is_none_or(|metadata| {
+                    // Explicit construction selects the Constructor namespace, not
+                    // a term followed by implicit apply. Its applicability and
+                    // completion must keep the shared constructor rules (#5015).
+                    metadata.namespace() != ResolutionNamespace::Constructor
+                })
+    }
+
     const fn root_callable_receiver_origin(&self) -> Option<ResolutionCallableReceiverOrigin> {
         match self.root_site_metadata {
             Some(metadata) => metadata.callable_receiver_origin(),
             None => None,
         }
+    }
+
+    // The batched call read precedes qualified lookup in both evaluation paths.
+    // Reuse its language hook without issuing a receiver-specific source read.
+    fn records_receiver_target_evidence(
+        &self,
+        reference: SemanticId,
+        kind: ResolutionMemberKind,
+    ) -> bool {
+        (reference == self.root
+            && self.root_callable_receiver_origin()
+                == Some(ResolutionCallableReceiverOrigin::ExplicitExpression))
+            || (kind == ResolutionMemberKind::Method
+                && self
+                    .session
+                    .cache
+                    .calls_by_reference
+                    .by_request
+                    .get(&reference)
+                    .is_some_and(|relation| {
+                        assert!(
+                            relation.row_keys.len() <= 1,
+                            "one reference has one invocation obligation"
+                        );
+                        relation.row_keys.iter().any(|key| {
+                            let (_, call) = self
+                                .session
+                                .cache
+                                .call_rows
+                                .get(key)
+                                .expect("a cached call relation names an interned row");
+                            call_applicability_adapter(call.row().language())
+                                .has_receiver_binding_obligation()
+                        })
+                    }))
     }
 
     fn record_non_invoking_reference(
@@ -23457,6 +23777,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 completed_roots: None,
                                 session: self.session,
                                 hierarchy: self.hierarchy,
+                                candidate_paths: &mut self.candidate_paths,
                                 forward_candidate_artifacts: self
                                     .forward_candidate_artifacts
                                     .as_deref_mut()
@@ -23480,17 +23801,24 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 }
                                 continue;
                             }
-                            demand_scheduler::BatchOutcome::Cancelled(evidence)
-                            | demand_scheduler::BatchOutcome::Unavailable {
-                                completion: evidence,
-                                ..
+                            demand_scheduler::BatchOutcome::Unavailable {
+                                root_answers, ..
                             }
                             | demand_scheduler::BatchOutcome::Unsupported(
                                 demand_scheduler::Unsupported::CyclicPrefixDependency {
-                                    completion: evidence,
+                                    root_answers,
                                     ..
                                 },
-                            ) => evidence,
+                            ) => {
+                                assert_eq!(root_answers.len(), chunk.len());
+                                for (&root, answer) in chunk.iter().zip(root_answers) {
+                                    if !self.publish_qualified_hierarchy_reference(root, &answer)? {
+                                        return Ok(None);
+                                    }
+                                }
+                                continue;
+                            }
+                            demand_scheduler::BatchOutcome::Cancelled(evidence) => evidence,
                         };
                         self.observe_cancellation_completion(&evidence);
                         if self.cancellation_observed || self.poll_cancelled() {
@@ -23501,7 +23829,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 qualified.cancel(self);
                             }
                             if let Some(batch) = frame.active.take() {
-                                let (answers, completion, metrics) = batch.cancel().into_parts();
+                                let (answers, completion, metrics) =
+                                    batch.cancel(&self.candidate_paths).into_parts();
                                 self.binding_metrics.accumulate(metrics);
                                 self.observe_cancellation_completion(&completion);
                                 for answer in answers.into_vec() {
@@ -23537,6 +23866,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                         completed_roots: None,
                         session: self.session,
                         hierarchy: self.hierarchy,
+                        candidate_paths: &mut self.candidate_paths,
                         forward_candidate_artifacts: self
                             .forward_candidate_artifacts
                             .as_deref_mut()
@@ -23575,7 +23905,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 qualified.cancel(self);
                             }
                             if let Some(batch) = frame.active.take() {
-                                let (answers, completion, metrics) = batch.cancel().into_parts();
+                                let (answers, completion, metrics) =
+                                    batch.cancel(&self.candidate_paths).into_parts();
                                 self.binding_metrics.accumulate(metrics);
                                 self.observe_cancellation_completion(&completion);
                                 for answer in answers.into_vec() {
@@ -23763,8 +24094,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             clone_answer_map_with_poll(&self.lexical_answers, self.cancellation, &mut self.work)?;
         let answers = clone_answer_map_with_poll(answers, self.cancellation, &mut self.work)?;
         let states = clone_state_map_with_poll(states, self.cancellation, &mut self.work)?;
-        let mut root_explicit_receiver_evidence = BTreeMap::new();
-        for (&target, evidence) in &self.root_explicit_receiver_evidence {
+        let mut receiver_target_evidence = BTreeMap::new();
+        for (&target, evidence) in &self.receiver_target_evidence {
             if poll_cancelled(self.cancellation, &mut self.work) {
                 return None;
             }
@@ -23776,7 +24107,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 values.insert(value);
             }
             assert!(
-                root_explicit_receiver_evidence
+                receiver_target_evidence
                     .insert(
                         target,
                         ExplicitReceiverTargetEvidence {
@@ -23825,7 +24156,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 member_rejection_by_target: self.member_rejection_by_target.clone(),
                 root_is_callable: self.root_is_callable,
                 callable_candidate_applicability,
-                root_explicit_receiver_evidence,
+                receiver_target_evidence,
                 type_union_frontiers: clone_semantic_set_with_poll(
                     &self.type_union_frontiers,
                     self.cancellation,
@@ -24526,6 +24857,19 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 if slots.is_empty() {
                     continue;
                 }
+                if self
+                    .session
+                    .lexical_source
+                    .supports_direct_type_shapes(self.root, self.cancellation)?
+                {
+                    let read = self.session.type_components_for_containers(&slots)?;
+                    let Some(components) = self.accept_session_read(read) else {
+                        return Ok(false);
+                    };
+                    for selected in components {
+                        self.demand_slot(selected.get(self.session).row().component());
+                    }
+                }
                 let read = self.session.projections_for_outputs(&slots)?;
                 let Some(projections) = self.accept_session_read(read) else {
                     return Ok(false);
@@ -24872,7 +25216,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
     }
 
     fn evaluate_references(&mut self, previous_states: &StateMap) -> StoreResult<AnswerMap> {
-        self.root_explicit_receiver_evidence.clear();
+        self.receiver_target_evidence.clear();
         let mut references = self.demanded_references.iter().copied().collect::<Vec<_>>();
         references.sort_unstable();
         let route_read = self.session.routes_for_references(&references)?;
@@ -25284,29 +25628,37 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                             &mut self.work,
                         );
                         if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
-                            engine.resolve_reference_cached_with_selection_access_and_metrics(
+                            engine.resolve_reference_with_artifact_cache_and_metrics(
                                 ResolutionQuery::new(reference),
                                 self.cancellation,
-                                cache,
-                                &mut access_lookup,
+                                Some(cache),
+                                &mut self.candidate_paths,
+                                Some(&mut access_lookup),
                             )?
                         } else {
-                            engine.resolve_reference_with_selection_access_and_metrics(
+                            engine.resolve_reference_with_artifact_cache_and_metrics(
                                 ResolutionQuery::new(reference),
                                 self.cancellation,
-                                &mut access_lookup,
+                                None,
+                                &mut self.candidate_paths,
+                                Some(&mut access_lookup),
                             )?
                         }
                     } else if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
-                        engine.resolve_reference_cached_with_metrics(
+                        engine.resolve_reference_with_artifact_cache_and_metrics(
                             ResolutionQuery::new(reference),
                             self.cancellation,
-                            cache,
+                            Some(cache),
+                            &mut self.candidate_paths,
+                            None,
                         )?
                     } else {
-                        engine.resolve_reference_with_metrics(
+                        engine.resolve_reference_with_artifact_cache_and_metrics(
                             ResolutionQuery::new(reference),
                             self.cancellation,
+                            None,
+                            &mut self.candidate_paths,
+                            None,
                         )?
                     };
                     self.binding_metrics.accumulate(metrics);
@@ -25581,6 +25933,11 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     }
                     let row = row.get(self.session);
                     if fragments.contains(&row.fragment())
+                        && (!self.session.typed_source.selection_has_java_semantics()
+                            || super::fact_lowering::site_semantic(
+                                row.fragment(),
+                                row.source_site(),
+                            ) == reference)
                         && row.origin()
                             == LoweringGapOrigin::Extracted(
                                 ResolutionGapKind::AmbiguousQualifiedType,
@@ -25675,6 +26032,108 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         Ok(true)
     }
 
+    /// A decided type name retires only its own package/type ambiguity,
+    /// wherever lowering copied that same obligation (slot or transfer).
+    fn completion_after_selected_type_name(
+        &mut self,
+        source: SemanticId,
+        completion: ResolutionCompletion,
+        projections: &HashMap<SemanticId, LoweredBindingProjection>,
+        answers: &AnswerMap,
+    ) -> StoreResult<Option<ResolutionCompletion>> {
+        let ResolutionCompletion::Incomplete(reasons) = &completion else {
+            return Ok(Some(completion));
+        };
+        let Some(projection) = projections.get(&source).filter(|projection| {
+            matches!(
+                projection.kind(),
+                BindingProjectionKind::TargetTypeIdentity
+                    | BindingProjectionKind::TargetNominalTypeIdentity
+            )
+        }) else {
+            return Ok(Some(completion));
+        };
+        let Some(answer) = answers.get(&projection.reference()) else {
+            return Ok(Some(completion));
+        };
+        if answer.targets().is_empty() {
+            return Ok(Some(completion));
+        }
+        let language = self
+            .session
+            .lexical_source
+            .semantic_language_of(projection.reference(), self.cancellation)?;
+        let candidates = reasons
+            .iter()
+            .filter_map(|reason| match reason {
+                ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                    if !answer.completion().contains_reason(*reason) =>
+                {
+                    Some(*semantic)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut discharged = BTreeSet::new();
+        for chunk in candidates.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let read = self.session.gap_reason_provenance_for_reasons(chunk)?;
+            let Some(rows) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            for row in rows {
+                if self.poll_cancelled() {
+                    return Ok(None);
+                }
+                let row = row.get(self.session);
+                if row.origin()
+                    == LoweringGapOrigin::Extracted(ResolutionGapKind::AmbiguousQualifiedType)
+                    && language.is_some_and(|language| {
+                        super::fact_lowering::jvm_type_prefix_gap_origin_is_safe(
+                            language,
+                            row.fragment(),
+                            row.source_site(),
+                            row.origin(),
+                            projection.reference(),
+                        )
+                    })
+                {
+                    discharged.insert(row.reason());
+                }
+            }
+        }
+        Ok(completion_without_unsupported_semantics_with_poll(
+            &completion,
+            &discharged,
+            &mut || self.poll_cancelled(),
+        ))
+    }
+
+    fn transfer_rule_after_selected_type_name(
+        &mut self,
+        source: SemanticId,
+        rule: TypeTransferRule,
+        projections: &HashMap<SemanticId, LoweredBindingProjection>,
+        answers: &AnswerMap,
+    ) -> StoreResult<Option<TypeTransferRule>> {
+        let Some(completion) = self.completion_after_selected_type_name(
+            source,
+            rule.completion().clone(),
+            projections,
+            answers,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TypeTransferRule::new_with_reference_indirection(
+            rule.semantic(),
+            rule.target_slot(),
+            rule.indirection_delta(),
+            rule.reference_indirection_delta(),
+            rule.value_transform(),
+            completion,
+        )))
+    }
+
     /// The immutable frontier completion of a resolved type projection, minus
     /// the lookup obligations its lexical answer already decided.
     ///
@@ -25694,6 +26153,11 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         answers: &AnswerMap,
         previous_states: &StateMap,
     ) -> StoreResult<Option<ResolutionCompletion>> {
+        let Some(completion) =
+            self.completion_after_selected_type_name(source, completion, projections, answers)?
+        else {
+            return Ok(None);
+        };
         let ResolutionCompletion::Incomplete(_) = &completion else {
             return Ok(Some(completion));
         };
@@ -25915,10 +26379,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
     /// A resolved type operand discharges its hierarchy lookup gap. A complete
     /// Go package inventory also closes that reference's placement boundary.
     /// Abstract Self frontiers and gaps on enclosing type syntax remain intact.
-    fn refine_type_reference_hierarchy_gaps(
-        &mut self,
-        answers: &mut AnswerMap,
-    ) -> StoreResult<bool> {
+    fn refine_type_reference_lookup_gaps(&mut self, answers: &mut AnswerMap) -> StoreResult<bool> {
         for (&reference, answer) in answers.iter_mut() {
             if self.poll_cancelled() {
                 return Ok(false);
@@ -25971,6 +26432,11 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 }
             }
             let reasons = reasons.into_iter().collect::<Vec<_>>();
+            let language = self
+                .session
+                .lexical_source
+                .semantic_language_of(reference, self.cancellation)?;
+            let mut name_ambiguities = BTreeSet::new();
             let mut discharged = BTreeSet::new();
             for chunk in reasons.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
                 let read = self.session.gap_reason_provenance_for_reasons(chunk)?;
@@ -25982,6 +26448,20 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                         return Ok(false);
                     }
                     let row = row.get(self.session);
+                    if row.origin()
+                        == LoweringGapOrigin::Extracted(ResolutionGapKind::AmbiguousQualifiedType)
+                        && language.is_some_and(|language| {
+                            super::fact_lowering::jvm_type_prefix_gap_origin_is_safe(
+                                language,
+                                row.fragment(),
+                                row.source_site(),
+                                row.origin(),
+                                reference,
+                            )
+                        })
+                    {
+                        name_ambiguities.insert(row.reason());
+                    }
                     if row.origin()
                         == LoweringGapOrigin::Extracted(
                             ResolutionGapKind::UnsupportedHierarchyTraversal,
@@ -25996,6 +26476,31 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 .go_package_inventory_complete_for_fragment(row.fragment()))
                     {
                         discharged.insert(row.reason());
+                    }
+                }
+            }
+            if !name_ambiguities.is_empty() && answer.targets().len() == 1 {
+                let Some(classification) = completion_without_unsupported_semantics_with_poll(
+                    answer.completion(),
+                    &name_ambiguities,
+                    &mut || self.poll_cancelled(),
+                ) else {
+                    return Ok(false);
+                };
+                if classification == ResolutionCompletion::Complete {
+                    let read = self
+                        .session
+                        .member_scopes_for_definitions(answer.targets())?;
+                    let Some(scopes) = self.accept_session_read(read) else {
+                        return Ok(false);
+                    };
+                    if scopes.iter().any(|scope| {
+                        scope.get(self.session).row().definition() == answer.targets()[0]
+                    }) {
+                        // A unique lexical type with no other open lookup
+                        // evidence obscures a package. Member lookup still
+                        // owns its hierarchy and overload completeness.
+                        discharged.extend(name_ambiguities);
                     }
                 }
             }
@@ -26129,11 +26634,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             return Ok(answers);
         }
         if calls_by_reference.get(&self.root).is_some_and(|call| {
-            super::fact_lowering::call_target_lookup_routes(
-                call.get(self.session).row().language(),
-                true,
-            )
-            .is_some()
+            self.uses_term_family_binding(self.root, call.get(self.session).row().language())
         }) && answers.contains_key(&self.root)
         {
             // Scala type fallback may establish a negative candidate proof
@@ -26191,8 +26692,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 obligation.language() == Language::Go && obligation.receiver_slot().is_some();
             if rules.contains(&ResolutionEngineRuleKind::ArgumentIndependentBinding)
                 && !go_receiver_call
-                && super::fact_lowering::call_target_lookup_routes(obligation.language(), true)
-                    .is_none()
+                && !self.uses_term_family_binding(reference, obligation.language())
                 && !(rules.contains(&ResolutionEngineRuleKind::ArgumentCoercionFilter)
                     && answers
                         .get(&reference)
@@ -26449,7 +26949,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         if !self.refine_generated_surface_name_bindings(&mut answers)? {
             return Ok(answers);
         }
-        if !self.refine_type_reference_hierarchy_gaps(&mut answers)? {
+        if !self.refine_type_reference_lookup_gaps(&mut answers)? {
             return Ok(answers);
         }
         let Some(visibility_completion_by_target) =
@@ -26792,16 +27292,20 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             for &reference in references {
                 if self
                     .reference_site_metadata(reference)
-                    .is_some_and(|metadata| metadata.namespace() == ResolutionNamespace::Type)
+                    .is_some_and(|metadata| {
+                        matches!(
+                            metadata.namespace(),
+                            ResolutionNamespace::Type | ResolutionNamespace::Constructor
+                        )
+                    })
                 {
                     continue;
                 }
                 if let Some(call) = calls.get(&reference)
-                    && super::fact_lowering::call_target_lookup_routes(
+                    && !self.uses_term_family_binding(
+                        reference,
                         call.get(self.session).row().language(),
-                        true,
                     )
-                    .is_none()
                 {
                     continue;
                 }
@@ -26864,12 +27368,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             let Some(call) = calls.get(&reference) else {
                 continue;
             };
-            if super::fact_lowering::call_target_lookup_routes(
-                call.get(self.session).row().language(),
-                true,
-            )
-            .is_none()
-            {
+            if !self.uses_term_family_binding(reference, call.get(self.session).row().language()) {
                 continue;
             }
             if self.poll_cancelled() {
@@ -26886,7 +27385,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             if self.poll_cancelled() {
                 return Ok(None);
             }
-            if super::fact_lowering::call_target_lookup_routes(role.language, true).is_some()
+            if self.uses_term_family_binding(role.reference, role.language)
                 && !super::fact_source::language_extractor_member_names(role.language, role.role)
                     .is_empty()
                 && answers.contains_key(&role.reference)
@@ -27056,8 +27555,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         {
             return Ok(Some(answer));
         }
-        let binding_only = super::fact_lowering::call_target_lookup_routes(call.language(), true)
-            .is_some()
+        let binding_only = self.uses_term_family_binding(call.callee_reference(), call.language())
             && bound_term_count == 1
             && answer.targets().len() == 1;
         let mut discharged = BTreeSet::new();
@@ -28605,7 +29103,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         obligation: &LoweredCallApplicabilityObligation,
         answer: &ResolutionAnswer,
     ) -> StoreResult<Option<ResolutionCompletion>> {
-        if super::fact_lowering::call_target_lookup_routes(obligation.language(), true).is_none() {
+        if !self.uses_term_family_binding(obligation.callee_reference(), obligation.language()) {
             return Ok(Some(obligation.completion().clone()));
         }
         let Some(metadata) = self.reference_site_metadata(obligation.callee_reference()) else {
@@ -28683,7 +29181,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 obligation.language()
             };
         let term_family =
-            super::fact_lowering::call_target_lookup_routes(obligation.language(), true).is_some();
+            self.uses_term_family_binding(obligation.callee_reference(), obligation.language());
         let Some(call_completion) = self.call_completion_after_binding(obligation, &answer)? else {
             return Ok(None);
         };
@@ -28816,6 +29314,31 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             } else {
                 answer
             };
+            let mut answer = answer;
+            if adapter.has_receiver_binding_obligation()
+                && let [target] = answer.targets()
+                && let Some(signature_row) = signatures.get(target)
+                && signature_row.get(self.session).row().completion()
+                    != &ResolutionCompletion::Complete
+            {
+                let target = *target;
+                let signature = {
+                    let signature = signature_row.get(self.session);
+                    let mut cancelled = || poll_cancelled(self.cancellation, &mut self.work);
+                    let Some(signature) = signature.row().clone_with_poll(&mut cancelled) else {
+                        self.cancellation_observed = true;
+                        return Ok(None);
+                    };
+                    signature
+                };
+                let Some(receiver_completion) =
+                    adapter.receiver_binding_completion(self, target, obligation, &signature)?
+                else {
+                    return Ok(None);
+                };
+                let completion = answer.completion().combine(&receiver_completion);
+                answer = answer_with_completion(answer, completion);
+            }
             if obligation.language() == Language::Go
                 && obligation.receiver_slot().is_some()
                 && obligation
@@ -31413,8 +31936,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             return Ok(None);
         }
         if let Some(identities) = self.session.context_identities.clone()
-            && let Some(target) =
-                identities.jvm_external_provider_type_identity_for_reference(reference)
+            && let Some(target) = self.session.jvm_nominal_type_identity_for_answer(
+                reference,
+                self.hierarchy.effective_reference_answer(reference),
+            )
             && let Some(owner) = identities.external_owner_identity(target)
         {
             let read = self.session.member_scopes_for_definitions(&[target])?;
@@ -32309,10 +32834,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             self.cancellation_observed = true;
             return Ok(None);
         }
-        if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
+        {
             let (returned, evidence) = read_hydrated_candidate_artifacts(
                 self.session.lexical_source,
-                cache,
+                &mut self.candidate_paths,
                 &candidates,
                 self.cancellation,
                 &mut self.work,
@@ -32334,47 +32859,6 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     hydrated.insert(identity, path).is_none(),
                     "one hierarchy candidate is hydrated once"
                 );
-            }
-        } else {
-            for candidate_chunk in candidates.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
-                if self.poll_cancelled() {
-                    return Ok(None);
-                }
-                let returned = self
-                    .session
-                    .lexical_source
-                    .hydrate_candidate_paths(candidate_chunk, self.cancellation)?;
-                for (_, path) in &returned {
-                    if self.poll_cancelled() {
-                        return Ok(None);
-                    }
-                    self.observe_cancellation_completion(path.completion());
-                }
-                if self.cancellation_observed || self.cancellation.is_cancelled() {
-                    self.cancellation_observed = true;
-                    return Ok(None);
-                }
-                let requested = candidate_chunk.iter().copied().collect::<BTreeSet<_>>();
-                let mut observed = BTreeSet::new();
-                for (identity, path) in returned {
-                    if self.poll_cancelled() {
-                        return Ok(None);
-                    }
-                    if !requested.contains(&identity) || !observed.insert(identity) {
-                        return Err(StoreError::new(format!(
-                            "hierarchy hydration returned unrequested or duplicate candidate {identity:?}"
-                        )));
-                    }
-                    assert!(
-                        hydrated.insert(identity, path).is_none(),
-                        "one hierarchy candidate is hydrated once"
-                    );
-                }
-                if observed != requested {
-                    return Err(StoreError::new(format!(
-                        "hierarchy hydration omitted candidates: requested {requested:?}, returned {observed:?}"
-                    )));
-                }
             }
         }
 
@@ -32706,19 +33190,29 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                         &mut self.cancellation_observed,
                         &mut self.work,
                     );
-                    engine.resolve_owned_reference_batch_with_selection_access(
+                    engine.resolve_owned_reference_batch_with_artifact_cache(
                         seed_batch,
                         self.cancellation,
-                        &mut access_lookup,
+                        None,
+                        &mut self.candidate_paths,
+                        Some(&mut access_lookup),
                     )?
                 } else if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
-                    engine.resolve_owned_reference_batch_cached(
+                    engine.resolve_owned_reference_batch_with_artifact_cache(
                         seed_batch,
                         self.cancellation,
-                        cache,
+                        Some(cache),
+                        &mut self.candidate_paths,
+                        None,
                     )?
                 } else {
-                    engine.resolve_owned_reference_batch(seed_batch, self.cancellation)?
+                    engine.resolve_owned_reference_batch_with_artifact_cache(
+                        seed_batch,
+                        self.cancellation,
+                        None,
+                        &mut self.candidate_paths,
+                        None,
+                    )?
                 };
                 if !self.retain_hierarchy_reference_batch(
                     &mut prepared.lexical_answers,
@@ -33210,6 +33704,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     completed_roots: None,
                     session: self.session,
                     hierarchy: self.hierarchy,
+                    candidate_paths: &mut self.candidate_paths,
                     forward_candidate_artifacts: self
                         .forward_candidate_artifacts
                         .as_deref_mut()
@@ -33235,18 +33730,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     return Ok(false);
                 }
                 demand_scheduler::BatchOutcome::Unsupported(
-                    demand_scheduler::Unsupported::CyclicPrefixDependency { completion, .. },
+                    demand_scheduler::Unsupported::CyclicPrefixDependency { root_answers, .. },
                 ) => {
-                    self.observe_cancellation_completion(&completion);
-                    for &reference in chunk {
-                        let Some(completion) =
-                            clone_resolution_completion_with_poll(&completion, &mut || {
-                                self.poll_cancelled()
-                            })
-                        else {
-                            return Ok(false);
-                        };
-                        let answer = empty_fact_resolution_answer(completion, self.cancellation);
+                    assert_eq!(root_answers.len(), chunk.len());
+                    for (&reference, answer) in chunk.iter().zip(root_answers) {
                         if !self.publish_qualified_hierarchy_reference(reference, &answer)? {
                             return Ok(false);
                         }
@@ -34066,6 +34553,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 completed_roots: None,
                                 session: self.session,
                                 hierarchy: self.hierarchy,
+                                candidate_paths: &mut self.candidate_paths,
                                 forward_candidate_artifacts: self
                                     .forward_candidate_artifacts
                                     .as_deref_mut()
@@ -34104,6 +34592,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 completed_roots: None,
                                 session: self.session,
                                 hierarchy: self.hierarchy,
+                                candidate_paths: &mut self.candidate_paths,
                                 forward_candidate_artifacts: self
                                     .forward_candidate_artifacts
                                     .as_deref_mut()
@@ -35679,7 +36168,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 .first()
                 .map(|call| call.get(self.session).row().clone())
                 .filter(|call| {
-                    super::fact_lowering::call_target_lookup_routes(call.language(), true).is_some()
+                    self.uses_term_family_binding(call.callee_reference(), call.language())
                 })
         } else {
             None
@@ -36038,13 +36527,12 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                             },
                         );
                     }
-                    if reference == self.root
-                        && self.root_callable_receiver_origin()
-                            == Some(ResolutionCallableReceiverOrigin::ExplicitExpression)
-                    {
+                    if self.records_receiver_target_evidence(reference, property.kind()) {
                         let category_closed =
                             if matches!(qualifier_completion, ResolutionCompletion::Complete) {
                                 true
+                            } else if reference != self.root {
+                                false
                             } else if let Some(&closed) =
                                 receiver_category_closure.get(&origin.qualifier_slot)
                             {
@@ -36061,8 +36549,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 closed
                             };
                         let evidence = self
-                            .root_explicit_receiver_evidence
-                            .entry(target)
+                            .receiver_target_evidence
+                            .entry((reference, target))
                             .or_default();
                         evidence.values.insert(origin.value);
                         evidence.category_open |= !category_closed;
@@ -36593,7 +37081,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 };
                 closed
             } else {
-                true
+                qualifier.completion() == &ResolutionCompletion::Complete
             };
             let route_rows = rows
                 .iter()
@@ -36739,13 +37227,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 member.owners,
                                 false,
                             );
-                            if reference == self.root
-                                && self.root_callable_receiver_origin()
-                                    == Some(ResolutionCallableReceiverOrigin::ExplicitExpression)
-                            {
+                            if self.records_receiver_target_evidence(reference, member.kind) {
                                 let evidence = self
-                                    .root_explicit_receiver_evidence
-                                    .entry(member.target)
+                                    .receiver_target_evidence
+                                    .entry((reference, member.target))
                                     .or_default();
                                 evidence.values.insert(member.value);
                                 evidence.category_open |= !receiver_category_closed;
@@ -37029,13 +37514,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     // trait through the frontier its block's trait path feeds.
                     // The tie is a method-call rule: an associated type or
                     // constant the impl declares is answered as before.
-                    if reference == self.root
-                        && self.root_callable_receiver_origin()
-                            == Some(ResolutionCallableReceiverOrigin::ExplicitExpression)
-                    {
+                    if self.records_receiver_target_evidence(reference, row.kind()) {
                         let evidence = self
-                            .root_explicit_receiver_evidence
-                            .entry(target)
+                            .receiver_target_evidence
+                            .entry((reference, target))
                             .or_default();
                         evidence.values.insert(value);
                         evidence.category_open |= !receiver_category_closed;
@@ -37651,17 +38133,20 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             );
             let engine = BatchResolutionEngine::maybe_bounded(lexical_source, resolution_session);
             let result = if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
-                engine.resolve_reference_batch_cached_with_selection_access(
+                engine.resolve_reference_batch_with_artifact_cache(
                     &seeds,
                     self.cancellation,
-                    cache,
-                    &mut access_lookup,
+                    Some(cache),
+                    &mut self.candidate_paths,
+                    Some(&mut access_lookup),
                 )?
             } else {
-                engine.resolve_reference_batch_with_selection_access(
+                engine.resolve_reference_batch_with_artifact_cache(
                     &seeds,
                     self.cancellation,
-                    &mut access_lookup,
+                    None,
+                    &mut self.candidate_paths,
+                    Some(&mut access_lookup),
                 )?
             };
             drop(access_lookup);
@@ -37672,9 +38157,21 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 self.session.resolution_session,
             );
             if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
-                engine.resolve_reference_batch_cached(&seeds, self.cancellation, cache)?
+                engine.resolve_reference_batch_with_artifact_cache(
+                    &seeds,
+                    self.cancellation,
+                    Some(cache),
+                    &mut self.candidate_paths,
+                    None,
+                )?
             } else {
-                engine.resolve_reference_batch(&seeds, self.cancellation)?
+                engine.resolve_reference_batch_with_artifact_cache(
+                    &seeds,
+                    self.cancellation,
+                    None,
+                    &mut self.candidate_paths,
+                    None,
+                )?
             }
         };
         let (answers, completion, metrics) = batch.into_parts();
@@ -37804,27 +38301,38 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 &mut self.work,
             );
             if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
-                engine.resolve_seeded_reference_cached_with_selection_access_and_metrics(
+                engine.resolve_seeded_reference_with_artifact_cache_and_metrics(
                     &request,
                     self.cancellation,
-                    cache,
-                    &mut access_lookup,
+                    Some(cache),
+                    &mut self.candidate_paths,
+                    Some(&mut access_lookup),
                 )?
             } else {
-                engine.resolve_seeded_reference_with_selection_access_and_metrics(
+                engine.resolve_seeded_reference_with_artifact_cache_and_metrics(
                     &request,
                     self.cancellation,
-                    &mut access_lookup,
+                    None,
+                    &mut self.candidate_paths,
+                    Some(&mut access_lookup),
                 )?
             }
         } else if let Some(cache) = self.forward_candidate_artifacts.as_deref_mut() {
-            engine.resolve_seeded_reference_cached_with_metrics(
+            engine.resolve_seeded_reference_with_artifact_cache_and_metrics(
                 &request,
                 self.cancellation,
-                cache,
+                Some(cache),
+                &mut self.candidate_paths,
+                None,
             )?
         } else {
-            engine.resolve_seeded_reference_with_metrics(&request, self.cancellation)?
+            engine.resolve_seeded_reference_with_artifact_cache_and_metrics(
+                &request,
+                self.cancellation,
+                None,
+                &mut self.candidate_paths,
+                None,
+            )?
         };
         self.binding_metrics.accumulate(metrics);
         self.observe_resolution_answer_cancellation_evidence(&answer);
@@ -39520,7 +40028,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             let cancellation = self.cancellation;
             let cancellation_observed = &mut self.cancellation_observed;
             let work = &mut self.work;
-            for evidence in self.root_explicit_receiver_evidence.values_mut() {
+            for (&(owner_reference, _), evidence) in &mut self.receiver_target_evidence {
+                if owner_reference != reference {
+                    continue;
+                }
                 let cancelled = *cancellation_observed || poll_cancelled(cancellation, work);
                 *cancellation_observed |= cancelled;
                 if cancelled {
@@ -40823,7 +41334,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         else {
             return Ok(None);
         };
-        let Some(call_result_residual_completions) =
+        let Some(call_result_evidence) =
             self.eligible_call_result_residual_completions(&projections)?
         else {
             return Ok(None);
@@ -40904,7 +41415,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             projections,
             constructor_qualifier_slots_by_output,
             productions,
-            call_result_residual_completions,
+            call_result_evidence,
             incoming_rows,
             incoming_targets,
             transfers_by_source,
@@ -41104,6 +41615,240 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         Ok(Some(true))
     }
 
+    /// A numeric/concatenation output is one producer over all its operand
+    /// rows. Applying these rows independently would union operand types and
+    /// could publish a proof before an unknown operand has been considered.
+    fn evaluate_promoted_expression_types(
+        &mut self,
+        prep: &SlotPrep,
+        answers: &AnswerMap,
+        previous: &StateMap,
+        lexical: &StateMap,
+        states: &mut StateMap,
+    ) -> StoreResult<bool> {
+        let SlotPrep {
+            incoming_rows,
+            frontier_completions,
+            projections,
+            ..
+        } = prep;
+        let mut groups = BTreeMap::<SemanticId, Vec<LoweredTypeTransfer>>::new();
+        for selected in incoming_rows {
+            if !selected
+                .get(self.session)
+                .row()
+                .kind()
+                .is_operand_promotion()
+            {
+                continue;
+            }
+            // Existing languages' copy transfers do no additional counted
+            // work just because promotion rules are available to Java.
+            if self.poll_cancelled() {
+                return Ok(false);
+            }
+            let transfer = selected.get(self.session).row();
+            groups
+                .entry(transfer.rule().target_slot())
+                .or_default()
+                .push(transfer.clone());
+        }
+        for (output, transfers) in groups {
+            if self.poll_cancelled() {
+                return Ok(false);
+            }
+            let kind = transfers[0].kind();
+            assert!(transfers.iter().all(|transfer| transfer.kind() == kind));
+            let language = self
+                .session
+                .lexical_source
+                .semantic_language_of(output, self.cancellation)?;
+            let support = language.and_then(crate::analyzer::languages::language_support);
+            let mut completion = ExactCompletionAccumulator::default();
+            let mut operands = Vec::with_capacity(transfers.len());
+            let mut identities = Vec::new();
+            let mut unknown = false;
+            for transfer in &transfers {
+                let source = transfer.source_slot();
+                let Some(rule) = self.transfer_rule_after_selected_type_name(
+                    source,
+                    transfer.rule().clone(),
+                    projections,
+                    answers,
+                )?
+                else {
+                    return Ok(false);
+                };
+                let state = lexical.get(&source).or_else(|| previous.get(&source));
+                let source_completion = frontier_completions
+                    .get(&source)
+                    .expect("every selected transfer source has frontier completion")
+                    .get(self.session)
+                    .completion()
+                    .clone();
+                let Some(source_completion) = self.frontier_completion_after_lexical_answer(
+                    source,
+                    source_completion,
+                    projections,
+                    answers,
+                    previous,
+                )?
+                else {
+                    return Ok(false);
+                };
+                if !self.include_semantic_completion(&mut completion, &source_completion)
+                    || !self.include_semantic_completion(&mut completion, rule.completion())
+                {
+                    return Ok(false);
+                }
+                let value = if let Some(state) = state {
+                    if !self.include_semantic_completion(&mut completion, state.completion()) {
+                        return Ok(false);
+                    }
+                    // A singleton on an incomplete frontier is a witness, not
+                    // an exact static operand type.
+                    if matches!(state.completion(), ResolutionCompletion::Complete)
+                        && matches!(source_completion, ResolutionCompletion::Complete)
+                        && matches!(rule.completion(), ResolutionCompletion::Complete)
+                    {
+                        match state.possible_values() {
+                            [value] => match rule.apply(*value) {
+                                TypeTransferApplication::Value(value) => Some(value.ty()),
+                                TypeTransferApplication::NoValue
+                                | TypeTransferApplication::IndirectionOutOfRange => None,
+                            },
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                unknown |=
+                    value.is_none() || !matches!(source_completion, ResolutionCompletion::Complete);
+                if let Some(ty) = value {
+                    identities.push(ty.identity());
+                }
+                operands.push(value);
+            }
+            let Some(descriptors) = self.session.intrinsic_call_type_descriptors(&identities)?
+            else {
+                return Ok(false);
+            };
+            let descriptors = descriptors
+                .into_iter()
+                .map(|descriptor| (descriptor.identity(), descriptor))
+                .collect::<HashMap<_, _>>();
+            let names = operands
+                .iter()
+                .map(|operand| {
+                    let ty = operand.as_ref()?;
+                    if ty.indirection() != 0 || ty.reference_indirection() != 0 {
+                        return None;
+                    }
+                    descriptors
+                        .get(&ty.identity())
+                        .map(|descriptor| descriptor.spelling().to_owned())
+                        .or_else(|| {
+                            self.session
+                                .context_identities
+                                .as_ref()
+                                .and_then(|identities| {
+                                    identities.external_owner_identity(ty.identity())
+                                })
+                                .map(|owner| owner.owner_fqn.to_string())
+                        })
+                })
+                .collect::<Vec<_>>();
+            let name_refs = names.iter().map(|name| name.as_deref()).collect::<Vec<_>>();
+            let string_operand = if kind == ResolutionTypeTransferKind::StringConcatenation {
+                support.and_then(|support| support.string_concatenation_operand(&name_refs))
+            } else {
+                None
+            };
+            let result = if let Some(index) = string_operand {
+                // JLS 15.18: the String operand proves this result without
+                // resolving the other operand. Do not carry its missing-type
+                // reasons into this independently decided static result.
+                completion = ExactCompletionAccumulator::default();
+                operands[index]
+            } else if !unknown {
+                if let Some(name) =
+                    support.and_then(|support| support.numeric_promotion(&name_refs))
+                {
+                    let language = language.expect("a promotion hook belongs to a language");
+                    let digest = super::universe::intrinsic_type_identity_digest(
+                        language,
+                        IntrinsicTypeKind::Primitive,
+                        name,
+                    );
+                    let Some(identity) = self
+                        .session
+                        .lexical_source
+                        .intern_shared_name_digest(digest, self.cancellation)?
+                    else {
+                        return Ok(false);
+                    };
+                    // Promoted int need not occur as an explicit literal or
+                    // declaration elsewhere in the selected source.
+                    self.session
+                        .cache
+                        .intrinsic_type_descriptors_by_identity
+                        .insert(
+                            identity,
+                            Some(FactIntrinsicTypeDescriptor {
+                                identity,
+                                kind: IntrinsicTypeKind::Primitive,
+                                spelling: name.into(),
+                            }),
+                        );
+                    Some(ResolutionTypeRef::new(identity, 0))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if result.is_none() {
+                let reason = canonical_service_reason(
+                    self.session,
+                    &*self.hierarchy,
+                    b"unknown-operand-promotion",
+                    &[CanonicalIdentityPart::identity(output)],
+                )?;
+                if !self.include_semantic_reason(
+                    &mut completion,
+                    ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                ) {
+                    return Ok(false);
+                }
+            }
+            // Preserve a gap that belongs to the expression itself; only
+            // operand incompleteness is discharged by a String witness.
+            if let Some(existing) = states.get(&output)
+                && !self.include_semantic_completion(&mut completion, existing.completion())
+            {
+                return Ok(false);
+            }
+            let Some(completion) = self.finish_semantic_completion(completion) else {
+                return Ok(false);
+            };
+            states.insert(
+                output,
+                Arc::new(TypedFrontierState::new(
+                    output,
+                    result
+                        .into_iter()
+                        .map(|ty| ResolutionSlotValue::runtime(ty, false))
+                        .collect::<Vec<_>>(),
+                    completion,
+                )),
+            );
+        }
+        Ok(true)
+    }
+
     fn evaluate_states(
         &mut self,
         previous_states: &StateMap,
@@ -41155,13 +41900,20 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             projections,
             constructor_qualifier_slots_by_output,
             productions,
-            call_result_residual_completions,
+            call_result_evidence,
             incoming_rows,
             incoming_targets,
             transfers_by_source,
             frontier_completions,
             transfer_cycles,
         } = &*prep;
+        let Some(result_answers) = self.applicability_independent_result_answers(
+            &call_result_evidence.independent_references,
+            answers,
+        )?
+        else {
+            return Ok(None);
+        };
         let mut lexical_value_sources = StateMap::default();
 
         let mut target_definitions = BTreeSet::new();
@@ -41580,7 +42332,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             let Some(projection) = projections.get(slot) else {
                 continue;
             };
-            let Some(answer) = answers.get(&projection.reference()) else {
+            let Some(answer) = result_answers
+                .get(&projection.reference())
+                .or_else(|| answers.get(&projection.reference()))
+            else {
                 continue;
             };
             // An external declaration may still have a stable type identity.
@@ -41600,7 +42355,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             {
                 if let Some(identity) = self
                     .session
-                    .jvm_external_provider_type_identity_for_reference(projection.reference())
+                    .jvm_nominal_type_identity_for_answer(projection.reference(), answer)
                 {
                     jvm_external_types.push(ResolutionSlotValue::type_object(
                         ResolutionTypeRef::new(identity, 0),
@@ -41746,7 +42501,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             if let Some(state) = projected {
                 let slot = state.slot();
                 let mut completion = state.completion().clone();
-                if let Some(residual) = call_result_residual_completions.get(&slot) {
+                if let Some(residual) = call_result_evidence.residual_completions.get(&slot) {
                     completion = completion.combine(residual);
                 }
                 if !result_was_instantiated
@@ -41891,7 +42646,9 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                         return Ok(None);
                     }
                     let transfer = transfer.get(self.session).row();
-                    if transfer.kind().component_kind().is_some() {
+                    if transfer.kind().component_kind().is_some()
+                        || transfer.kind().is_operand_promotion()
+                    {
                         continue;
                     }
                     let rule = transfer.rule();
@@ -41908,14 +42665,17 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     {
                         continue;
                     }
-                    rules.push(TypeTransferRule::new_with_reference_indirection(
-                        rule.semantic(),
-                        target,
-                        rule.indirection_delta(),
-                        rule.reference_indirection_delta(),
-                        rule.value_transform(),
-                        rule.completion().clone(),
-                    ));
+                    let rule = rule.clone();
+                    let Some(rule) = self.transfer_rule_after_selected_type_name(
+                        source,
+                        rule,
+                        projections,
+                        answers,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    rules.push(rule);
                 }
                 let (alternatives, completion) = apply_type_transfer_rules(
                     &source_state,
@@ -42035,7 +42795,9 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     return Ok(None);
                 }
                 let transfer = transfer.get(self.session);
-                if transfer.row().kind().component_kind().is_some() {
+                if transfer.row().kind().component_kind().is_some()
+                    || transfer.row().kind().is_operand_promotion()
+                {
                     continue;
                 }
                 only_trait_bound_unions &=
@@ -42060,6 +42822,15 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     rule.value_transform(),
                     completion,
                 );
+                let Some(rule) = self.transfer_rule_after_selected_type_name(
+                    source,
+                    rule,
+                    projections,
+                    answers,
+                )?
+                else {
+                    return Ok(None);
+                };
                 if let Some(reason) =
                     transfer_cycles.productive_edge_reason(source, rule.target_slot())
                 {
@@ -42231,6 +43002,15 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         ) else {
             return Ok(None);
         };
+        if !self.evaluate_promoted_expression_types(
+            &prep,
+            answers,
+            previous_states,
+            &lexical_value_sources,
+            &mut states,
+        )? {
+            return Ok(None);
+        }
         if self
             .session
             .context_identities
@@ -42334,29 +43114,35 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         Ok(Some(states))
     }
 
-    fn projected_go_type_shapes(
+    fn projected_type_shapes(
         &mut self,
-        projections: &[LoweredBindingProjection],
+        slots: &[SemanticId],
         states: &StateMap,
     ) -> StoreResult<Option<Box<[FactProjectedTypeShape]>>> {
-        if !self.session.lexical_source.supports_go_universe()
-            || self.generic_type_projections.is_empty()
+        let direct_shapes = self
+            .session
+            .lexical_source
+            .supports_direct_type_shapes(self.root, self.cancellation)?;
+        if !direct_shapes
+            && (!self.session.lexical_source.supports_go_universe()
+                || self.generic_type_projections.is_empty())
         {
             return Ok(Some(Box::new([])));
         }
         let mut shapes = Vec::new();
-        for projection in projections {
-            let Some(environment) = self
-                .generic_type_projections
-                .get(&projection.output_slot())
-                .cloned()
-            else {
-                continue;
+        for &output_slot in slots {
+            let environment = match self.generic_type_projections.get(&output_slot).cloned() {
+                Some(environment) => environment,
+                None if direct_shapes => GenericTypeProjection {
+                    source_slot: output_slot,
+                    substitutions: HashMap::default(),
+                },
+                None => continue,
             };
             if self.poll_cancelled() {
                 return Ok(None);
             }
-            let Some(output_state) = states.get(&projection.output_slot()) else {
+            let Some(output_state) = states.get(&output_slot) else {
                 continue;
             };
             let formal_definitions = environment
@@ -42621,6 +43407,18 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                     }
                                 }
                             }
+                            ResolutionTypeConstructorKind::Sequence if direct_shapes => {
+                                match by_kind.get(&ResolutionTypeComponentKind::Element).copied() {
+                                    Some(element) if by_kind.len() == 1 => {
+                                        pending.push(element);
+                                        FactProjectedTypeNodeForm::Array(element)
+                                    }
+                                    _ => {
+                                        supported = false;
+                                        FactProjectedTypeNodeForm::Unsupported
+                                    }
+                                }
+                            }
                             ResolutionTypeConstructorKind::Sequence
                             | ResolutionTypeConstructorKind::Channel => {
                                 supported = false;
@@ -42680,7 +43478,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 supported = false;
             }
             shapes.push(FactProjectedTypeShape {
-                output_slot: projection.output_slot(),
+                output_slot,
                 root_slot: environment.source_slot,
                 nodes: nodes.into_boxed_slice(),
                 completion,
@@ -43060,10 +43858,93 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         Ok(true)
     }
 
+    /// Read provenance once for the applicability reasons in this query's
+    /// completions. Operation-local and other semantic reasons are preserved.
+    pub(crate) fn call_applicability_reasons<'a>(
+        &mut self,
+        completions: impl IntoIterator<Item = &'a ResolutionCompletion>,
+    ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
+        let mut candidates = BTreeSet::new();
+        for completion in completions {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if let ResolutionCompletion::Incomplete(reasons) = completion {
+                for reason in reasons.iter() {
+                    if let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason {
+                        candidates.insert(*reason);
+                    }
+                }
+            }
+        }
+        let candidates = candidates.into_iter().collect::<Vec<_>>();
+        let mut applicability = BTreeSet::new();
+        for chunk in candidates.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let read = self.session.gap_reason_provenance_for_reasons(chunk)?;
+            let Some(rows) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            for row in rows {
+                let row = row.get(self.session);
+                if row.origin()
+                    == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability)
+                {
+                    applicability.insert(row.reason());
+                }
+            }
+        }
+        Ok(Some(applicability))
+    }
+
+    /// Project binding evidence into result-type evidence without changing
+    /// the call-target answers. Languages opt in only when applicability
+    /// cannot change their declared result types.
+    fn applicability_independent_result_answers(
+        &mut self,
+        independent_references: &HashMap<SemanticId, SemanticId>,
+        answers: &AnswerMap,
+    ) -> StoreResult<Option<AnswerMap>> {
+        let eligible = independent_references
+            .iter()
+            .filter(|(reference, _)| {
+                answers
+                    .get(*reference)
+                    .is_some_and(|answer| answer.completion() != &ResolutionCompletion::Complete)
+            })
+            .map(|(&reference, &reason)| (reference, reason))
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return Ok(Some(AnswerMap::default()));
+        }
+        let Some(mut reasons) =
+            self.call_applicability_reasons(eligible.iter().filter_map(|(reference, _)| {
+                answers.get(reference).map(|answer| answer.completion())
+            }))?
+        else {
+            return Ok(None);
+        };
+        reasons.extend(eligible.iter().map(|(_, reason)| *reason));
+        let mut projected = AnswerMap::default();
+        for (reference, _) in eligible {
+            let answer = &answers[&reference];
+            let Some(answer) = refine_answer_after_discharging_reasons(
+                answer.targets().iter().copied(),
+                answer.witnesses().iter().cloned(),
+                answer.completion(),
+                &reasons,
+                &mut || self.poll_cancelled(),
+            ) else {
+                return Ok(None);
+            };
+            projected.insert(reference, Arc::new(answer));
+        }
+        Ok(Some(projected))
+    }
+
     fn eligible_call_result_residual_completions(
         &mut self,
         projections: &HashMap<SemanticId, LoweredBindingProjection>,
-    ) -> StoreResult<Option<HashMap<SemanticId, ResolutionCompletion>>> {
+    ) -> StoreResult<Option<CallResultEvidence>> {
         let mut references = Vec::new();
         for projection in projections.values() {
             if self.poll_cancelled() {
@@ -43076,20 +43957,34 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         references.sort_unstable();
         references.dedup();
         if references.is_empty() {
-            return Ok(Some(HashMap::default()));
+            return Ok(Some(CallResultEvidence::default()));
         }
 
         let call_read = self.session.calls_for_references(&references)?;
         let Some(call_rows) = self.accept_session_read(call_read) else {
             return Ok(None);
         };
-        let mut residuals = HashMap::default();
+        let mut evidence = CallResultEvidence::default();
         for call in call_rows {
             if self.poll_cancelled() {
                 return Ok(None);
             }
             let call = call.get(self.session);
             let obligation = call.row();
+            if crate::analyzer::languages::language_support(obligation.language())
+                .is_some_and(|support| support.callable_result_is_applicability_independent())
+            {
+                assert!(
+                    evidence
+                        .independent_references
+                        .insert(
+                            obligation.callee_reference(),
+                            obligation.applicability_reason(),
+                        )
+                        .is_none(),
+                    "one callee has one applicability-independent result contract"
+                );
+            }
             if !obligation
                 .eligible_rules()
                 .contains(&ResolutionEngineRuleKind::ArgumentIndependentBinding)
@@ -43119,14 +44014,15 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     )));
                 }
                 assert!(
-                    residuals
+                    evidence
+                        .residual_completions
                         .insert(projection.output_slot(), residual.clone())
                         .is_none(),
                     "one callable result projection has one residual call completion"
                 );
             }
         }
-        Ok(Some(residuals))
+        Ok(Some(evidence))
     }
 
     /// Infer callable formals from direct parameter types and positional
@@ -43266,6 +44162,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                         | ResolutionTypeTransferKind::Construction
                         | ResolutionTypeTransferKind::DeclaredType
                         | ResolutionTypeTransferKind::Initialization
+                        | ResolutionTypeTransferKind::ValueJoin
                 ) {
                     pending.push(transfer.source_slot());
                 }
@@ -45523,45 +46420,25 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
 
     /// Receiver applicability does not change a method's written signature.
     /// Preserve every other gap when comparing its parameter and result types.
-    fn go_signature_type_inventory_complete(
+    pub(crate) fn go_signature_type_inventory_complete(
         &mut self,
         signature: &LoweredCallableSignatureProperty,
     ) -> StoreResult<Option<bool>> {
-        let reasons = match signature.completion() {
-            ResolutionCompletion::Complete => return Ok(Some(true)),
-            ResolutionCompletion::Incomplete(reasons) => reasons
-                .iter()
-                .map(|reason| match reason {
-                    ResolutionIncompleteReason::UnsupportedSemantic(semantic) => Some(*semantic),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>(),
-        };
-        let Some(reasons) = reasons else {
-            return Ok(Some(false));
-        };
-        if reasons.is_empty() {
-            return Ok(Some(false));
+        if signature.completion() == &ResolutionCompletion::Complete {
+            return Ok(Some(true));
         }
-        for chunk in reasons.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
-            let read = self.session.gap_reason_provenance_for_reasons(chunk)?;
-            let Some(rows) = self.accept_session_read(read) else {
-                return Ok(None);
-            };
-            let returned = rows
-                .iter()
-                .map(|row| row.get(self.session).reason())
-                .collect::<HashSet<_>>();
-            if chunk.iter().any(|reason| !returned.contains(reason))
-                || rows.iter().any(|row| {
-                    row.get(self.session).origin()
-                        != LoweringGapOrigin::Extracted(
-                            ResolutionGapKind::UnsupportedCallApplicability,
-                        )
-                })
-            {
-                return Ok(Some(false));
-            }
+        let Some(reasons) = self.call_applicability_reasons([signature.completion()])? else {
+            return Ok(None);
+        };
+        let Some(residual) = completion_without_unsupported_semantics_with_poll(
+            signature.completion(),
+            &reasons,
+            &mut || self.poll_cancelled(),
+        ) else {
+            return Ok(None);
+        };
+        if residual != ResolutionCompletion::Complete {
+            return Ok(Some(false));
         }
         let owner_read = self
             .session
@@ -46209,9 +47086,9 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 }
             }
         }
-        // A complete empty callable result is meaningful only after the
-        // binding answer itself proves one applicable candidate. Applicability
-        // has no projection-local escape hatch.
+        // Result evidence combines the selected binding's type-relevant
+        // completion. Invocation-only reasons stay on the call-target answer
+        // when the language declares result types independently of applicability.
         completion = completion.combine(answer.completion());
         if let Some(generic_projection) = generic_type_projection {
             let Some(source_state) = previous_states.get(&generic_projection.source_slot) else {
@@ -46638,7 +47515,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         target: SemanticId,
         enclosing_type: Option<SemanticId>,
     ) -> Option<FactCallableReceiverDisposition> {
-        let Some(evidence) = self.root_explicit_receiver_evidence.get(&target) else {
+        let Some(evidence) = self.receiver_target_evidence.get(&(self.root, target)) else {
             return Some(FactCallableReceiverDisposition::unresolved(
                 FactReferenceReceiverGap::UnresolvedReceiver,
             ));
@@ -46764,8 +47641,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                                 let Some(owner) = owner.as_ref() else {
                                     return false;
                                 };
-                                self.root_explicit_receiver_evidence
-                                    .get(&target)
+                                self.receiver_target_evidence
+                                    .get(&(self.root, target))
                                     .is_some_and(|evidence| {
                                         !evidence.values.is_empty()
                                             && evidence.values.iter().all(|value| {
@@ -46902,9 +47779,22 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 projection.reference(),
             )
         });
-        let Some(projected_type_shapes) =
-            self.projected_go_type_shapes(&root_projections, &states)?
-        else {
+        let mut shape_slots = root_projections
+            .iter()
+            .map(LoweredBindingProjection::output_slot)
+            .collect::<Vec<_>>();
+        if self
+            .session
+            .lexical_source
+            .supports_direct_type_shapes(self.root, self.cancellation)?
+        {
+            for &slot in &projected_slots {
+                if !shape_slots.contains(&slot) {
+                    shape_slots.push(slot);
+                }
+            }
+        }
+        let Some(projected_type_shapes) = self.projected_type_shapes(&shape_slots, &states)? else {
             return Ok(None);
         };
         let projected_type_shapes = (!projected_type_shapes.is_empty()).then(|| {
@@ -50123,8 +51013,8 @@ mod tests {
         let mut session = preloaded_session(&fixture.service, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
         let mut evaluation = FactEvaluation::new(&mut session, &mut hierarchy, target);
-        evaluation.root_explicit_receiver_evidence.insert(
-            target,
+        evaluation.receiver_target_evidence.insert(
+            (target, target),
             ExplicitReceiverTargetEvidence {
                 values: values.into_iter().collect(),
                 category_open: open,
@@ -51773,11 +52663,13 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut forward_candidate_artifacts_paths = CandidatePathStore::default();
         let mut forward_candidate_artifacts = ForwardCandidateArtifactCache::default();
         let mut evaluation = FactEvaluation::new_with_forward_artifacts(
             &mut session,
             &mut hierarchy,
             &mut forward_candidate_artifacts,
+            &mut forward_candidate_artifacts_paths,
             SemanticId::for_test(b"reverse-producer-seed-cache-root"),
         );
         let fragment = *fixture
@@ -51917,11 +52809,13 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut forward_candidate_artifacts_paths = CandidatePathStore::default();
         let mut forward_candidate_artifacts = ForwardCandidateArtifactCache::default();
         let mut evaluation = FactEvaluation::new_with_forward_artifacts(
             &mut session,
             &mut hierarchy,
             &mut forward_candidate_artifacts,
+            &mut forward_candidate_artifacts_paths,
             SemanticId::for_test(b"reverse-producer-seed-fixed-point-root"),
         );
         let mut answers = HashMap::default();
@@ -52078,7 +52972,7 @@ mod tests {
         );
         drop(evaluation);
         assert_eq!(
-            forward_candidate_artifacts.artifact_counts(),
+            forward_candidate_artifacts.artifact_counts(&forward_candidate_artifacts_paths),
             (
                 sourced_endpoints.len(),
                 sourced_paths.len(),
@@ -52131,7 +53025,9 @@ mod tests {
             .get(&first_output)
             .cloned()
             .expect("the first producer output is published");
-        let first_cache_counts = narrowing.forward_candidate_artifacts.artifact_counts();
+        let first_cache_counts = narrowing
+            .forward_candidate_artifacts
+            .artifact_counts(&narrowing.candidate_paths);
         assert!(first_cache_counts.0 > 0 && first_cache_counts.1 > 0);
 
         assert!(narrowing.pending_qualifier_slots.insert(late_output));
@@ -52175,7 +53071,9 @@ mod tests {
             }
         }
         assert_eq!(
-            narrowing.forward_candidate_artifacts.artifact_counts(),
+            narrowing
+                .forward_candidate_artifacts
+                .artifact_counts(&narrowing.candidate_paths),
             (
                 restart_endpoints.len(),
                 restart_paths.len(),
@@ -52185,7 +53083,8 @@ mod tests {
         );
 
         let producer_cache = std::mem::take(&mut narrowing.forward_candidate_artifacts);
-        let cache_before_validation = producer_cache.artifact_counts();
+        let producer_paths = std::mem::take(&mut *narrowing.candidate_paths);
+        let cache_before_validation = producer_cache.artifact_counts(&producer_paths);
         drop(narrowing);
         let seed = fixture
             .service
@@ -52202,7 +53101,7 @@ mod tests {
             "the cache-boundary law performs one real full validation"
         );
         assert_eq!(
-            producer_cache.artifact_counts(),
+            producer_cache.artifact_counts(&producer_paths),
             cache_before_validation,
             "reverse final validation is streaming and cannot grow the producer cache"
         );
@@ -52573,7 +53472,8 @@ mod tests {
                 | TypeTransferValueTransform::TypeObjectOnly
                 | TypeTransferValueTransform::AddressableRuntimeOnly
                 | TypeTransferValueTransform::AddressableOperandOnly
-                | TypeTransferValueTransform::RuntimeOnly => {
+                | TypeTransferValueTransform::RuntimeOnly
+                | TypeTransferValueTransform::StaticTypeObject => {
                     unreachable!("the productive-cycle law selects two explicit transforms")
                 }
             };
@@ -53863,6 +54763,7 @@ mod tests {
             pending_roots,
             pending_endpoints,
             completion,
+            ..
         }) = operation
             .resolve_reference_acyclic_with_provider(roots[0], &mut provider)
             .unwrap()
@@ -54520,8 +55421,9 @@ mod tests {
             completion.contains_reason(ResolutionIncompleteReason::UnsupportedSemantic(reason)),
             "the evidence the cancelled read returned is retained: {completion:?}"
         );
-        let (endpoint_matches, hydrated_paths, _) =
-            operation.forward_candidate_artifacts.artifact_counts();
+        let (endpoint_matches, hydrated_paths, _) = operation
+            .forward_candidate_artifacts
+            .artifact_counts(&operation.candidate_paths);
         assert_eq!(
             (endpoint_matches, hydrated_paths),
             (0, 0),
@@ -54985,7 +55887,7 @@ mod tests {
         answers.insert(reference, Arc::clone(&original_answer));
         assert!(
             evaluation
-                .refine_type_reference_hierarchy_gaps(&mut answers)
+                .refine_type_reference_lookup_gaps(&mut answers)
                 .unwrap()
         );
         assert!(Arc::ptr_eq(&answers[&reference], &original_answer));
@@ -55447,6 +56349,7 @@ mod tests {
                     reason,
                     completion,
                     root_seed_completions,
+                    ..
                 } => {
                     assert!(mode < 2);
                     assert_eq!(endpoint, provider.discovered[0]);
@@ -55497,7 +56400,9 @@ mod tests {
             assert_eq!(source.reference_seed_lookups.get(), 0);
             assert_eq!(source.reference_seed_batch_lookups.get(), 1);
             assert_eq!(
-                operation.forward_candidate_artifacts.artifact_counts(),
+                operation
+                    .forward_candidate_artifacts
+                    .artifact_counts(&operation.candidate_paths),
                 (0, 0, 0)
             );
 
@@ -55956,7 +56861,9 @@ mod tests {
                 cached_source.endpoint_classification_calls.get(),
             )
         );
-        let artifacts = operation.forward_candidate_artifacts.artifact_counts();
+        let artifacts = operation
+            .forward_candidate_artifacts
+            .artifact_counts(&operation.candidate_paths);
         cancellation.cancel();
         let cancelled = operation.resolve_reference(references[2]).unwrap();
         assert!(
@@ -55965,7 +56872,9 @@ mod tests {
                 .contains_reason(ResolutionIncompleteReason::Cancelled)
         );
         assert_eq!(
-            operation.forward_candidate_artifacts.artifact_counts(),
+            operation
+                .forward_candidate_artifacts
+                .artifact_counts(&operation.candidate_paths),
             artifacts
         );
         assert_eq!(
@@ -58768,11 +59677,13 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut session = preloaded_session(&cycle.fixture.service, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut forward_candidate_artifacts_paths = CandidatePathStore::default();
         let mut forward_candidate_artifacts = ForwardCandidateArtifactCache::default();
         let mut evaluation = FactEvaluation::new_with_forward_artifacts(
             &mut session,
             &mut hierarchy,
             &mut forward_candidate_artifacts,
+            &mut forward_candidate_artifacts_paths,
             reverse_producer_evaluation_identity(
                 &test_digest_session(),
                 test_arena(),
@@ -59007,11 +59918,13 @@ mod tests {
                 &cancellation,
             );
             let mut hierarchy = HierarchyOperationArena::default();
+            let mut forward_candidate_artifacts_paths = CandidatePathStore::default();
             let mut forward_candidate_artifacts = ForwardCandidateArtifactCache::default();
             let mut evaluation = FactEvaluation::new_with_forward_artifacts(
                 &mut session,
                 &mut hierarchy,
                 &mut forward_candidate_artifacts,
+                &mut forward_candidate_artifacts_paths,
                 reverse_producer_evaluation_identity(
                     &test_digest_session(),
                     test_arena(),
@@ -59190,7 +60103,7 @@ mod tests {
                 .forward_candidate_artifacts
                 .as_deref()
                 .expect("producer evaluation owns its artifact cache")
-                .artifact_counts();
+                .artifact_counts(&evaluation.candidate_paths);
             assert_eq!(
                 artifact_counts,
                 (
@@ -59329,7 +60242,9 @@ mod tests {
                     .to_vec(),
                 narrowing.producer_completions[&cycle.stable_slot].clone(),
                 scalar_queries[0],
-                narrowing.forward_candidate_artifacts.artifact_counts(),
+                narrowing
+                    .forward_candidate_artifacts
+                    .artifact_counts(&narrowing.candidate_paths),
             )
         };
 
@@ -59549,7 +60464,9 @@ mod tests {
                 narrowing.hierarchy_work,
                 scalar_queries,
                 qualified_queries.into_iter().collect::<BTreeSet<_>>(),
-                narrowing.forward_candidate_artifacts.artifact_counts(),
+                narrowing
+                    .forward_candidate_artifacts
+                    .artifact_counts(&narrowing.candidate_paths),
             );
 
             let public_observed = ObservedBatchSource::new(&wide.cycle.fixture.service.source);
@@ -60776,7 +61693,7 @@ mod tests {
     }
 
     struct ObservedBatchSource<'a> {
-        inner: &'a PreloadedFragmentSource,
+        inner: &'a dyn BatchResolutionFragmentSource,
         /// Which selection this fake claims to answer under. A test that wants
         /// the demanded-reference memo to miss moves this.
         selection_authority: Option<SeedReadAuthority>,
@@ -60820,7 +61737,7 @@ mod tests {
     }
 
     impl<'a> ObservedBatchSource<'a> {
-        fn new(inner: &'a PreloadedFragmentSource) -> Self {
+        fn new(inner: &'a dyn BatchResolutionFragmentSource) -> Self {
             Self {
                 inner,
                 selection_authority: Some(PRELOADED_FIXTURE_AUTHORITY),
@@ -61065,6 +61982,40 @@ mod tests {
     }
 
     impl BatchResolutionFragmentSource for ObservedBatchSource<'_> {
+        fn semantic_language_of(
+            &self,
+            identity: SemanticId,
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Option<Language>> {
+            self.inner.semantic_language_of(identity, cancellation)
+        }
+
+        fn intern_shared_name_digest(
+            &self,
+            digest: [u8; 32],
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Option<SemanticId>> {
+            self.inner.intern_shared_name_digest(digest, cancellation)
+        }
+
+        fn shared_name_digest_for_identity(
+            &self,
+            identity: SemanticId,
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Option<[u8; 32]>> {
+            self.inner
+                .shared_name_digest_for_identity(identity, cancellation)
+        }
+
+        fn supports_direct_type_shapes(
+            &self,
+            reference: SemanticId,
+            cancellation: &CancellationToken,
+        ) -> StoreResult<bool> {
+            self.inner
+                .supports_direct_type_shapes(reference, cancellation)
+        }
+
         fn selection_authority(&self) -> Option<SeedReadAuthority> {
             self.selection_authority
         }
@@ -66574,11 +67525,13 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
+        let mut forward_candidate_artifacts_paths = CandidatePathStore::default();
         let mut forward_candidate_artifacts = ForwardCandidateArtifactCache::default();
         let mut cancelled_evaluation = FactEvaluation::new_with_forward_artifacts(
             &mut session,
             &mut hierarchy,
             &mut forward_candidate_artifacts,
+            &mut forward_candidate_artifacts_paths,
             reverse_producer_evaluation_identity(&test_digest_session(), test_arena(), leaf)
                 .unwrap(),
         );
@@ -66625,6 +67578,7 @@ mod tests {
             &mut session,
             &mut hierarchy,
             &mut forward_candidate_artifacts,
+            &mut forward_candidate_artifacts_paths,
             reverse_producer_evaluation_identity(&test_digest_session(), test_arena(), leaf)
                 .unwrap(),
         );
@@ -66703,11 +67657,13 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
+        let mut forward_candidate_artifacts_paths = CandidatePathStore::default();
         let mut forward_candidate_artifacts = ForwardCandidateArtifactCache::default();
         let mut evaluation = FactEvaluation::new_with_forward_artifacts(
             &mut session,
             &mut hierarchy,
             &mut forward_candidate_artifacts,
+            &mut forward_candidate_artifacts_paths,
             reverse_producer_evaluation_identity(&test_digest_session(), test_arena(), leaf)
                 .unwrap(),
         );
@@ -66760,11 +67716,13 @@ mod tests {
             &retry_cancellation,
         );
         let mut retry_hierarchy = HierarchyOperationArena::default();
+        let mut retry_forward_candidate_artifacts_paths = CandidatePathStore::default();
         let mut retry_forward_candidate_artifacts = ForwardCandidateArtifactCache::default();
         let mut retry = FactEvaluation::new_with_forward_artifacts(
             &mut retry_session,
             &mut retry_hierarchy,
             &mut retry_forward_candidate_artifacts,
+            &mut retry_forward_candidate_artifacts_paths,
             reverse_producer_evaluation_identity(&test_digest_session(), &hierarchy, leaf).unwrap(),
         );
         assert!(
@@ -69092,11 +70050,13 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut eager_session = preloaded_session(&fixture.service, &cancellation);
         let mut eager_hierarchy = HierarchyOperationArena::default();
+        let mut eager_artifacts_paths = CandidatePathStore::default();
         let mut eager_artifacts = ForwardCandidateArtifactCache::default();
         let mut eager = FactEvaluation::new_with_forward_artifacts(
             &mut eager_session,
             &mut eager_hierarchy,
             &mut eager_artifacts,
+            &mut eager_artifacts_paths,
             reference,
         );
         let expected = eager.run().unwrap();
@@ -69112,6 +70072,7 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial =
             FactEvaluation::new(&mut session, &mut hierarchy, reference).into_checkpoint_state();
@@ -69119,9 +70080,13 @@ mod tests {
         let mut suspended = false;
         for _ in 0..64 {
             match task
-                .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                    Ok(DemandForwardReadiness::AwaitingDependencies)
-                })
+                .poll_with_readiness(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                    &mut |_| Ok(DemandForwardReadiness::AwaitingDependencies),
+                )
                 .unwrap()
             {
                 DemandFactEvaluationPoll::Continue => {}
@@ -69167,6 +70132,7 @@ mod tests {
                     &mut session,
                     &mut hierarchy,
                     &mut artifacts,
+                    &mut artifacts_paths,
                     &mut |requests| {
                         assert_eq!(
                             requests
@@ -69195,9 +70161,13 @@ mod tests {
         }
         for _ in 0..512 {
             match task
-                .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                    Ok(DemandForwardReadiness::Ready)
-                })
+                .poll_with_readiness(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                    &mut |_| Ok(DemandForwardReadiness::Ready),
+                )
                 .unwrap()
             {
                 DemandFactEvaluationPoll::Continue => {}
@@ -69223,6 +70193,7 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial =
             FactEvaluation::new(&mut session, &mut hierarchy, reference).into_checkpoint_state();
@@ -69230,9 +70201,13 @@ mod tests {
         let mut waiting = false;
         for _ in 0..64 {
             match task
-                .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                    Ok(DemandForwardReadiness::AwaitingDependencies)
-                })
+                .poll_with_readiness(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                    &mut |_| Ok(DemandForwardReadiness::AwaitingDependencies),
+                )
                 .unwrap()
             {
                 DemandFactEvaluationPoll::Continue => {}
@@ -69255,9 +70230,13 @@ mod tests {
         );
         cancellation.cancel();
         let DemandFactEvaluationPoll::Ready(answer) = task
-            .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                panic!("cancelled batch cannot ask for dependency readiness")
-            })
+            .poll_with_readiness(
+                &mut session,
+                &mut hierarchy,
+                &mut artifacts,
+                &mut artifacts_paths,
+                &mut |_| panic!("cancelled batch cannot ask for dependency readiness"),
+            )
             .unwrap()
         else {
             panic!("pending cancellation must produce an evidence-bearing terminal")
@@ -69315,6 +70294,7 @@ mod tests {
                 &budget,
             );
             let mut hierarchy = HierarchyOperationArena::default();
+            let mut artifacts_paths = CandidatePathStore::default();
             let mut artifacts = ForwardCandidateArtifactCache::default();
             let initial = FactEvaluation::new(&mut session, &mut hierarchy, reference)
                 .into_checkpoint_state();
@@ -69322,13 +70302,19 @@ mod tests {
             let mut reached_boundary = false;
             for _ in 0..128 {
                 let outcome = task
-                    .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                        Ok(if read_page {
-                            DemandForwardReadiness::Ready
-                        } else {
-                            DemandForwardReadiness::AwaitingDependencies
-                        })
-                    })
+                    .poll_with_readiness(
+                        &mut session,
+                        &mut hierarchy,
+                        &mut artifacts,
+                        &mut artifacts_paths,
+                        &mut |_| {
+                            Ok(if read_page {
+                                DemandForwardReadiness::Ready
+                            } else {
+                                DemandForwardReadiness::AwaitingDependencies
+                            })
+                        },
+                    )
                     .unwrap();
                 match outcome {
                     DemandFactEvaluationPoll::AwaitingDependencies => {
@@ -69363,7 +70349,7 @@ mod tests {
                 BoundedResolution::Exceeded { .. }
             ));
             assert!(!cancellation.is_cancelled());
-            let answer = task.cancel(&mut session, &mut hierarchy);
+            let answer = task.cancel(&mut session, &mut hierarchy, &mut artifacts_paths);
             assert!(!cancellation.is_cancelled());
             assert_eq!(source_reads(), reads_before_cancel);
             assert_eq!(budget.finish(()).work(), work);
@@ -69524,6 +70510,7 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial =
             FactEvaluation::new(&mut session, &mut hierarchy, reference).into_checkpoint_state();
@@ -69531,9 +70518,13 @@ mod tests {
         let mut suspended = false;
         for _ in 0..128 {
             match task
-                .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                    Ok(DemandForwardReadiness::AwaitingDependencies)
-                })
+                .poll_with_readiness(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                    &mut |_| Ok(DemandForwardReadiness::AwaitingDependencies),
+                )
                 .unwrap()
             {
                 DemandFactEvaluationPoll::Continue => {}
@@ -69555,7 +70546,7 @@ mod tests {
         assert_eq!(observed.forward_match_calls.get(), 0);
         let seed_reads =
             observed.reference_seed_lookups.get() + observed.reference_seed_batch_lookups.get();
-        let answer = task.cancel(&mut session, &mut hierarchy);
+        let answer = task.cancel(&mut session, &mut hierarchy, &mut artifacts_paths);
         assert!(!cancellation.is_cancelled());
         assert_eq!(observed.forward_match_calls.get(), 0);
         assert_eq!(observed.path_hydration_calls.get(), 0);
@@ -69582,6 +70573,7 @@ mod tests {
         let observed = ObservedBatchSource::new(&service.source);
         let mut session = FactReadSession::for_preloaded_service(service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial =
             FactEvaluation::new(&mut session, &mut hierarchy, reference).into_checkpoint_state();
@@ -69607,14 +70599,20 @@ mod tests {
             let release = std::mem::take(&mut release_next);
             let mut admitted = false;
             let outcome = task
-                .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                    admitted |= release;
-                    Ok(if release {
-                        DemandForwardReadiness::Ready
-                    } else {
-                        DemandForwardReadiness::AwaitingDependencies
-                    })
-                })
+                .poll_with_readiness(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                    &mut |_| {
+                        admitted |= release;
+                        Ok(if release {
+                            DemandForwardReadiness::Ready
+                        } else {
+                            DemandForwardReadiness::AwaitingDependencies
+                        })
+                    },
+                )
                 .unwrap();
             if observed.forward_match_calls.get() != candidate_reads {
                 assert!(
@@ -69667,6 +70665,7 @@ mod tests {
                                 &mut session,
                                 &mut hierarchy,
                                 &mut artifacts,
+                                &mut artifacts_paths,
                                 &mut |_| Ok(DemandForwardReadiness::AwaitingDependencies)
                             )
                             .unwrap(),
@@ -69705,6 +70704,7 @@ mod tests {
         session: &mut FactReadSession<'source>,
         hierarchy: &mut HierarchyOperationArena,
         artifacts: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
         mut read_counts: impl FnMut() -> R,
         expected: RepeatedAwaitExpectations<R>,
     ) where
@@ -69713,9 +70713,13 @@ mod tests {
         assert!(!expected.endpoints.is_empty());
         for _ in 0..3 {
             assert!(matches!(
-                task.poll_with_readiness(session, hierarchy, artifacts, &mut |_| Ok(
-                    DemandForwardReadiness::AwaitingDependencies
-                ))
+                task.poll_with_readiness(
+                    session,
+                    hierarchy,
+                    artifacts,
+                    candidate_paths,
+                    &mut |_| Ok(DemandForwardReadiness::AwaitingDependencies)
+                )
                 .unwrap(),
                 DemandFactEvaluationPoll::AwaitingDependencies
             ));
@@ -69748,6 +70752,7 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial =
             FactEvaluation::new(&mut session, &mut hierarchy, reference).into_checkpoint_state();
@@ -69771,13 +70776,19 @@ mod tests {
                     !suspended_direct
                 };
             let result = task
-                .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                    Ok(if suspend {
-                        DemandForwardReadiness::AwaitingDependencies
-                    } else {
-                        DemandForwardReadiness::Ready
-                    })
-                })
+                .poll_with_readiness(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                    &mut |_| {
+                        Ok(if suspend {
+                            DemandForwardReadiness::AwaitingDependencies
+                        } else {
+                            DemandForwardReadiness::Ready
+                        })
+                    },
+                )
                 .unwrap();
             match result {
                 DemandFactEvaluationPoll::Continue => {}
@@ -69810,6 +70821,7 @@ mod tests {
                         &mut session,
                         &mut hierarchy,
                         &mut artifacts,
+                        &mut artifacts_paths,
                         source_reads,
                         RepeatedAwaitExpectations {
                             work,
@@ -69850,6 +70862,7 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial =
             FactEvaluation::new(&mut session, &mut hierarchy, reference).into_checkpoint_state();
@@ -69861,13 +70874,19 @@ mod tests {
                 .and_then(|frame| frame.qualified.as_ref())
                 .is_some_and(|frame| frame.replay.is_some());
             match task
-                .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                    Ok(if suffix {
-                        DemandForwardReadiness::AwaitingDependencies
-                    } else {
-                        DemandForwardReadiness::Ready
-                    })
-                })
+                .poll_with_readiness(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                    &mut |_| {
+                        Ok(if suffix {
+                            DemandForwardReadiness::AwaitingDependencies
+                        } else {
+                            DemandForwardReadiness::Ready
+                        })
+                    },
+                )
                 .unwrap()
             {
                 DemandFactEvaluationPoll::Continue => {}
@@ -69890,7 +70909,7 @@ mod tests {
                         observed.forward_match_calls.get(),
                         observed.path_hydration_calls.get(),
                     );
-                    let answer = task.cancel(&mut session, &mut hierarchy);
+                    let answer = task.cancel(&mut session, &mut hierarchy, &mut artifacts_paths);
                     assert!(!cancellation.is_cancelled());
                     assert_eq!(
                         (
@@ -69955,11 +70974,13 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let mut evaluation = FactEvaluation::new_with_forward_artifacts(
             &mut session,
             &mut hierarchy,
             &mut artifacts,
+            &mut artifacts_paths,
             reference,
         );
         let mut first = DemandHierarchyLocalFrame::new(&mut evaluation, &keys[..1]).unwrap();
@@ -70061,10 +71082,13 @@ mod tests {
                 .resolve_reference(reference, &cancellation)
                 .unwrap();
             assert!(!expected.binding().targets().is_empty());
-            let observed = ObservedBatchSource::new(&fixture.service.source);
+            // Observe the same composite source as the eager answer, including
+            // its language and structured type-shape capabilities.
+            let observed = ObservedBatchSource::new(&fixture.service);
             let mut session =
                 FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
             let mut hierarchy = HierarchyOperationArena::default();
+            let mut artifacts_paths = CandidatePathStore::default();
             let mut artifacts = ForwardCandidateArtifactCache::default();
             let initial = FactEvaluation::new(&mut session, &mut hierarchy, reference)
                 .into_checkpoint_state();
@@ -70078,13 +71102,19 @@ mod tests {
                     .and_then(|frame| frame.qualified.as_ref())
                     .is_some_and(|frame| frame.hierarchy_group.is_some());
                 match task
-                    .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                        Ok(if local && !suspended {
-                            DemandForwardReadiness::AwaitingDependencies
-                        } else {
-                            DemandForwardReadiness::Ready
-                        })
-                    })
+                    .poll_with_readiness(
+                        &mut session,
+                        &mut hierarchy,
+                        &mut artifacts,
+                        &mut artifacts_paths,
+                        &mut |_| {
+                            Ok(if local && !suspended {
+                                DemandForwardReadiness::AwaitingDependencies
+                            } else {
+                                DemandForwardReadiness::Ready
+                            })
+                        },
+                    )
                     .unwrap()
                 {
                     DemandFactEvaluationPoll::Continue => {}
@@ -70117,6 +71147,7 @@ mod tests {
                             &mut session,
                             &mut hierarchy,
                             &mut artifacts,
+                            &mut artifacts_paths,
                             reads,
                             RepeatedAwaitExpectations {
                                 work,
@@ -70162,11 +71193,13 @@ mod tests {
         let mut session =
             FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let mut evaluation = FactEvaluation::new_with_forward_artifacts(
             &mut session,
             &mut hierarchy,
             &mut artifacts,
+            &mut artifacts_paths,
             a,
         );
         let mut first =
@@ -70227,11 +71260,13 @@ mod tests {
             let mut session =
                 FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
             let mut hierarchy = HierarchyOperationArena::default();
+            let mut artifacts_paths = CandidatePathStore::default();
             let mut artifacts = ForwardCandidateArtifactCache::default();
             let mut evaluation = FactEvaluation::new_with_forward_artifacts(
                 &mut session,
                 &mut hierarchy,
                 &mut artifacts,
+                &mut artifacts_paths,
                 shared,
             );
             let mut frame =
@@ -70324,10 +71359,13 @@ mod tests {
                 .resolve_reference(reference, &cancellation)
                 .unwrap();
             assert_eq!(!expected.binding().targets().is_empty(), expect_target);
-            let observed = ObservedBatchSource::new(&fixture.service.source);
+            // Observe the same composite source as the eager answer, including
+            // its language and structured type-shape capabilities.
+            let observed = ObservedBatchSource::new(&fixture.service);
             let mut session =
                 FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
             let mut hierarchy = HierarchyOperationArena::default();
+            let mut artifacts_paths = CandidatePathStore::default();
             let mut artifacts = ForwardCandidateArtifactCache::default();
             let initial = FactEvaluation::new(&mut session, &mut hierarchy, reference)
                 .into_checkpoint_state();
@@ -70347,13 +71385,19 @@ mod tests {
                 let member_phase = inherited.is_some_and(|frame| frame.summaries.is_some());
                 let release = std::mem::take(&mut release_next);
                 match task
-                    .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                        Ok(if release {
-                            DemandForwardReadiness::Ready
-                        } else {
-                            DemandForwardReadiness::AwaitingDependencies
-                        })
-                    })
+                    .poll_with_readiness(
+                        &mut session,
+                        &mut hierarchy,
+                        &mut artifacts,
+                        &mut artifacts_paths,
+                        &mut |_| {
+                            Ok(if release {
+                                DemandForwardReadiness::Ready
+                            } else {
+                                DemandForwardReadiness::AwaitingDependencies
+                            })
+                        },
+                    )
                     .unwrap()
                 {
                     DemandFactEvaluationPoll::Continue => {}
@@ -70391,6 +71435,7 @@ mod tests {
                                     &mut session,
                                     &mut hierarchy,
                                     &mut artifacts,
+                                    &mut artifacts_paths,
                                     &mut |_| Ok(DemandForwardReadiness::AwaitingDependencies)
                                 )
                                 .unwrap(),
@@ -70474,6 +71519,7 @@ mod tests {
             let mut session =
                 FactReadSession::for_preloaded_service(&fixture.service, &observed, &cancellation);
             let mut hierarchy = HierarchyOperationArena::default();
+            let mut artifacts_paths = CandidatePathStore::default();
             let mut artifacts = ForwardCandidateArtifactCache::default();
             let initial = FactEvaluation::new(&mut session, &mut hierarchy, reference)
                 .into_checkpoint_state();
@@ -70488,13 +71534,19 @@ mod tests {
                     .and_then(|group| group.inherited.as_ref())
                     .is_some_and(|frame| frame.closure.is_some());
                 match task
-                    .poll_with_readiness(&mut session, &mut hierarchy, &mut artifacts, &mut |_| {
-                        Ok(if inherited {
-                            DemandForwardReadiness::AwaitingDependencies
-                        } else {
-                            DemandForwardReadiness::Ready
-                        })
-                    })
+                    .poll_with_readiness(
+                        &mut session,
+                        &mut hierarchy,
+                        &mut artifacts,
+                        &mut artifacts_paths,
+                        &mut |_| {
+                            Ok(if inherited {
+                                DemandForwardReadiness::AwaitingDependencies
+                            } else {
+                                DemandForwardReadiness::Ready
+                            })
+                        },
+                    )
                     .unwrap()
                 {
                     DemandFactEvaluationPoll::Continue => {}
@@ -70516,6 +71568,7 @@ mod tests {
                             &mut session,
                             &mut hierarchy,
                             &mut artifacts,
+                            &mut artifacts_paths,
                             &mut |_| Ok(DemandForwardReadiness::Ready)
                         )
                         .unwrap(),
@@ -70564,7 +71617,7 @@ mod tests {
                 )
             };
             let before = reads();
-            let answer = task.cancel(&mut session, &mut hierarchy);
+            let answer = task.cancel(&mut session, &mut hierarchy, &mut artifacts_paths);
             assert_eq!(reads(), before);
             assert!(!cancellation.is_cancelled());
             assert!(answer.binding().targets().is_empty());
@@ -70592,17 +71645,20 @@ mod tests {
             let cancellation = CancellationToken::new();
             let mut eager_session = preloaded_session(&fixture.service, &cancellation);
             let mut eager_hierarchy = HierarchyOperationArena::default();
+            let mut eager_artifacts_paths = CandidatePathStore::default();
             let mut eager_artifacts = ForwardCandidateArtifactCache::default();
             let mut eager = FactEvaluation::new_with_forward_artifacts(
                 &mut eager_session,
                 &mut eager_hierarchy,
                 &mut eager_artifacts,
+                &mut eager_artifacts_paths,
                 reference,
             );
             let expected = eager.run().unwrap();
             let expected_work = eager.work;
             let mut session = preloaded_session(&fixture.service, &cancellation);
             let mut hierarchy = HierarchyOperationArena::default();
+            let mut artifacts_paths = CandidatePathStore::default();
             let mut artifacts = ForwardCandidateArtifactCache::default();
             let initial = FactEvaluation::new(&mut session, &mut hierarchy, reference)
                 .into_checkpoint_state();
@@ -70614,7 +71670,12 @@ mod tests {
                 let mut arena = vec![task];
                 task = arena.pop().unwrap();
                 match task
-                    .poll(&mut session, &mut hierarchy, &mut artifacts)
+                    .poll(
+                        &mut session,
+                        &mut hierarchy,
+                        &mut artifacts,
+                        &mut artifacts_paths,
+                    )
                     .unwrap()
                 {
                     DemandFactEvaluationPoll::Continue => {}
@@ -70663,19 +71724,30 @@ mod tests {
             .unwrap();
         let mut session = preloaded_session(&fixture.service, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial =
             FactEvaluation::new(&mut session, &mut hierarchy, reference).into_checkpoint_state();
         let mut task = DemandFactEvaluationTask::new(initial);
         assert!(matches!(
-            task.poll(&mut session, &mut hierarchy, &mut artifacts)
-                .unwrap(),
+            task.poll(
+                &mut session,
+                &mut hierarchy,
+                &mut artifacts,
+                &mut artifacts_paths
+            )
+            .unwrap(),
             DemandFactEvaluationPoll::Continue
         ));
         let initial_epoch = task.demand_epoch;
         assert!(matches!(
-            task.poll(&mut session, &mut hierarchy, &mut artifacts)
-                .unwrap(),
+            task.poll(
+                &mut session,
+                &mut hierarchy,
+                &mut artifacts,
+                &mut artifacts_paths
+            )
+            .unwrap(),
             DemandFactEvaluationPoll::Continue
         ));
         assert!(task.demand_epoch.0 > initial_epoch.0);
@@ -70686,7 +71758,12 @@ mod tests {
         );
         for _ in 0..64 {
             if let DemandFactEvaluationPoll::Ready(actual) = task
-                .poll(&mut session, &mut hierarchy, &mut artifacts)
+                .poll(
+                    &mut session,
+                    &mut hierarchy,
+                    &mut artifacts,
+                    &mut artifacts_paths,
+                )
                 .unwrap()
             {
                 assert_eq!(*actual, expected);
@@ -70713,6 +71790,7 @@ mod tests {
         assert!(eager.initialize_root_demands().unwrap());
         let mut session = preloaded_session(&fixture.service, &cancellation);
         let mut hierarchy = HierarchyOperationArena::default();
+        let mut artifacts_paths = CandidatePathStore::default();
         let mut artifacts = ForwardCandidateArtifactCache::default();
         let initial = FactEvaluation::from_lexical_answer(
             &mut session,
@@ -70723,14 +71801,24 @@ mod tests {
         .into_checkpoint_state();
         let mut task = DemandFactEvaluationTask::new(initial);
         assert!(matches!(
-            task.poll(&mut session, &mut hierarchy, &mut artifacts)
-                .unwrap(),
+            task.poll(
+                &mut session,
+                &mut hierarchy,
+                &mut artifacts,
+                &mut artifacts_paths
+            )
+            .unwrap(),
             DemandFactEvaluationPoll::Continue
         ));
         cancellation.cancel();
         let expected = eager.run().unwrap();
         let DemandFactEvaluationPoll::Ready(answer) = task
-            .poll(&mut session, &mut hierarchy, &mut artifacts)
+            .poll(
+                &mut session,
+                &mut hierarchy,
+                &mut artifacts,
+                &mut artifacts_paths,
+            )
             .unwrap()
         else {
             panic!("cancelled frame must terminate, never become pending or absent")
@@ -71475,6 +72563,11 @@ func use(w Widget, speaker Speaker) {
             widget_site,
             LoweredSemanticRole::Definition,
         );
+        let method = go_callable_definition_at(
+            &fixture,
+            source.find("func (Widget) Method").unwrap() + "func (Widget) ".len(),
+        )
+        .1;
         fixture.service.set_go_member_declarations([
             super::super::fact_source::GoMemberDeclaration {
                 definition: speaker,
@@ -71488,15 +72581,16 @@ func use(w Widget, speaker Speaker) {
                     fields: Vec::new(),
                 },
             },
+            super::super::fact_source::GoMemberDeclaration {
+                definition: method,
+                kind: super::super::fact_source::GoMemberDeclarationKind::Method {
+                    pointer_receiver: Some(false),
+                },
+            },
         ]);
         let target = go_callable_definition_at(
             &fixture,
             source.find("func Target").unwrap() + "func ".len(),
-        )
-        .1;
-        let method = go_callable_definition_at(
-            &fixture,
-            source.find("func (Widget) Method").unwrap() + "func (Widget) ".len(),
         )
         .1;
 
@@ -71900,15 +72994,6 @@ func use(widget Widget, value int) { widget.Variadic(value) }
             widget_site,
             LoweredSemanticRole::Definition,
         );
-        fixture.service.set_go_member_declarations([
-            super::super::fact_source::GoMemberDeclaration {
-                definition: widget,
-                kind: super::super::fact_source::GoMemberDeclarationKind::Struct {
-                    fields: Vec::new(),
-                },
-            },
-        ]);
-
         let target = go_callable_definition_at(
             &fixture,
             source
@@ -71917,6 +73002,21 @@ func use(widget Widget, value int) { widget.Variadic(value) }
                 + "func (Widget) ".len(),
         )
         .1;
+        fixture.service.set_go_member_declarations([
+            super::super::fact_source::GoMemberDeclaration {
+                definition: widget,
+                kind: super::super::fact_source::GoMemberDeclarationKind::Struct {
+                    fields: Vec::new(),
+                },
+            },
+            super::super::fact_source::GoMemberDeclaration {
+                definition: target,
+                kind: super::super::fact_source::GoMemberDeclarationKind::Method {
+                    pointer_receiver: Some(false),
+                },
+            },
+        ]);
+
         let (answer, _) = resolve_go_call_expression_at(
             &fixture,
             source

@@ -31,7 +31,10 @@ mod source_demand;
 pub(crate) use jvm_context::{
     JavaExternalStaticImportBoundary, JavaImportContext, JvmImportContext, JvmImportContextGap,
 };
+pub(crate) use source_demand::RootSourceHorizon;
 pub(super) mod native_units;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use native_units::SelectedNativeAssignmentValue;
 pub(crate) use native_units::{
     NativeExternalMemberTarget, ProjectedNativeMemberContext, SelectedNativeDefinition,
     SelectedNativeDefinitions, SelectedNativeNamedArgument, SelectedNativeReferenceTypes,
@@ -64,7 +67,8 @@ pub(crate) use rust_crate_context::{
     reset_rust_context_bridge_peak_for_test, rust_context_bridge_peak_for_test,
 };
 mod demand;
-mod graph_stage;
+mod demand_closure;
+pub(crate) mod graph_stage;
 pub(super) mod rust_crate_rows;
 mod rust_demand;
 use demand::{ClosedForwardSource, ClosedRelations, DemandProvider};
@@ -1208,13 +1212,13 @@ impl<'store> ReadySelectedResolution<'store, '_> {
             .analyzer
             .map(crate::analyzer::languages::selected_external_inventory_providers)
             .unwrap_or_default();
-        if let Some(snapshot) = self
+        let external_models = self
             .analyzer
             .and_then(|analyzer| analyzer.active_semantic_model_snapshot())
-        {
+            .map(|snapshot| std::sync::Arc::clone(snapshot.active_models()));
+        if let Some(models) = &external_models {
             providers.extend(
-                snapshot
-                    .active_models()
+                models
                     .shards()
                     .iter()
                     .map(|shard| shard.manifest.semantic_sha256.clone()),
@@ -1225,6 +1229,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         SelectedResolutionTypedSource::new_on_demand(&self.inventory)
             .with_context_identities(self.context_identities.clone())
             .with_external_providers(providers)
+            .with_external_models(external_models)
     }
 
     /// Read route-prefix spellings from the selected ordinary or stage source.
@@ -1710,6 +1715,9 @@ pub(crate) struct SelectedResolutionOperation<'store, 'input> {
     jvm_root_exports_memo: RefCell<jvm_context::JvmRootExportMemo>,
     /// Exact import membership facts demanded by this operation.
     jvm_import_target_memo: RefCell<jvm_context::JvmImportTargetMemo>,
+    /// Raw alias facts and generated names demanded by this query only.
+    jvm_alias_rows_memo: RefCell<jvm_context::JvmAliasRowsMemo>,
+    jvm_generated_lookup_memo: RefCell<jvm_context::JvmGeneratedLookupMemo>,
     jvm_package_member_memo: RefCell<jvm_context::JvmPackageMemberMemo>,
     /// Complete node/visibility reads for distinct selected JVM inputs.
     jvm_endpoint_memo: RefCell<jvm_context::JvmEndpointMemo>,
@@ -7421,6 +7429,8 @@ impl AnalyzerStore {
                             jvm_lookup_recipe_memo: RefCell::default(),
                             jvm_root_exports_memo: RefCell::default(),
                             jvm_import_target_memo: RefCell::default(),
+                            jvm_alias_rows_memo: RefCell::default(),
+                            jvm_generated_lookup_memo: RefCell::default(),
                             jvm_package_member_memo: RefCell::default(),
                             jvm_endpoint_memo: RefCell::default(),
                             jvm_visibility_memo: RefCell::default(),
@@ -7827,6 +7837,23 @@ impl SelectedResolutionOperation<'_, '_> {
             FactResolutionAnswer,
         ) -> Result<T>,
     ) -> Result<SelectedResolutionOperationOutcome<SelectedResolutionLocated<T>>> {
+        self.resolve_reference_with_projection_and_setup(query, |_, _| Ok(()), project)
+    }
+
+    fn resolve_reference_with_projection_and_setup<T>(
+        &mut self,
+        query: NativeReferenceQuery<'_>,
+        setup: impl FnOnce(
+            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+            SemanticId,
+        ) -> Result<()>,
+        project: impl FnOnce(
+            &ReadySelectedResolution<'_, '_>,
+            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+            SemanticId,
+            FactResolutionAnswer,
+        ) -> Result<T>,
+    ) -> Result<SelectedResolutionOperationOutcome<SelectedResolutionLocated<T>>> {
         let NativeReferenceQuery {
             context,
             locator,
@@ -7896,6 +7923,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             if let Some(slot) = query_result_slot {
                                 operation.set_query_result_slot(reference, slot);
                             }
+                            setup(operation, reference)?;
                             let answer = operation.resolve_reference_with_metrics(
                                 reference,
                                 &mut resolution_metrics,
@@ -8726,6 +8754,42 @@ impl SelectedResolutionOperation<'_, '_> {
             &CancellationToken,
         ) -> Result<SelectedResolutionOperationOutcome<T>>,
     ) -> Result<SelectedRustCallerReferencesOutcome<T>> {
+        self.resolve_rust_references_for_caller_with_setup(
+            caller,
+            locators,
+            cancellation,
+            context_metrics,
+            point_metrics,
+            session,
+            access,
+            |_, _| Ok(()),
+            project,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_rust_references_for_caller_with_setup<T>(
+        &mut self,
+        caller: &Path,
+        locators: &[&SelectedSemanticLocator],
+        cancellation: &CancellationToken,
+        context_metrics: &mut SelectedResolutionContextMetrics,
+        point_metrics: &mut ResolutionBatchMetrics,
+        session: &ResolutionSession,
+        access: RustDeclarationAccessKind,
+        setup: impl FnMut(
+            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+            SemanticId,
+        ) -> Result<()>,
+        project: impl FnMut(
+            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+            &FactResolutionAnswer,
+            &ReadySelectedResolution<'_, '_>,
+            SelectedMountTable<'_, '_>,
+            &ResolutionSession,
+            &CancellationToken,
+        ) -> Result<SelectedResolutionOperationOutcome<T>>,
+    ) -> Result<SelectedRustCallerReferencesOutcome<T>> {
         // Each point request owns a fresh metric sink. Crate-context preparation
         // is outside its receiver budget; native stitching charges this request.
         assert_eq!(
@@ -8803,6 +8867,7 @@ impl SelectedResolutionOperation<'_, '_> {
             operation_cancellation,
             context_metrics,
             session,
+            setup,
             project,
         )?;
         Ok(SelectedRustCallerReferencesOutcome::Operation(outcome))
@@ -9405,6 +9470,10 @@ impl SelectedResolutionOperation<'_, '_> {
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
         session: &ResolutionSession,
+        mut setup: impl FnMut(
+            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+            SemanticId,
+        ) -> Result<()>,
         mut project: impl FnMut(
             &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
             &FactResolutionAnswer,
@@ -9559,6 +9628,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     cancelled_completion(),
                                 ));
                             }
+                            setup(operation, reference)?;
                             let resolution = match operation
                                 .resolve_reference_by_demand(reference, &mut provider)?
                             {

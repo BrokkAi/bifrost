@@ -1328,13 +1328,28 @@ does not apply to authored packs checked with `validate`.
 | `dot_net_assembly` | none | A .NET assembly. |
 | `rustdoc_json` | none | One rustdoc JSON file. |
 | `rustdoc_json_set` | `crates` (`[{name, path}]`) | Several rustdoc JSON files. |
-| `python_stub` | `stubs` (relative `.pyi` paths) | A stub tree. |
+| `python_stub` | `stubs` (relative seed `.pyi` paths) | A pinned stub tree; local imports determine the loaded closure. |
 | `authored_semantic_model` | none | An authored pack source, compiled directly. |
 | `npm_package` | `manifest`, `declarations` (`[{module, path}]`) | An npm package manifest and its declaration files. |
 | `go_module` | `packages` (`[{import_path, name, files}]`) | A Go module source set. |
 | `ruby_gem_archive` | none | A `.gem` archive. |
 | `composer_package` | `rules` (tagged by `rule`: `psr4` with `namespace_prefix` and `files`; `classmap` with `files`; `files` with `files`) | A Composer package source set. |
 | `php_declaration_stub` | `stubs` (relative `.php` paths) | A tree of PHP declaration stubs. |
+
+For `python_stub`, the artifact directory is an import root, such as a pinned
+typeshed `stdlib` tree. Generation follows AST imports, including module aliases,
+relative imports, package initializers and available imported child modules,
+until no new stubs remain. Seeds are order independent and duplicates are
+ignored. Resolution reads only this local tree; absent modules remain unresolved.
+The existing source-file, path-depth, byte and symlink bounds apply to the full
+closure. No Python code executes.
+
+`artifact.sha256` pins the canonical exact source set over the computed closure,
+including every relative path and its exact bytes. The compiled manifest's
+`source_inputs` records that digest and the sorted loaded `files`, each with
+`path`, `sha256` and `bytes`. A transitive input edit changes the input identity
+even if it leaves the declarations unchanged. This inventory records generation
+provenance; it does not claim that those files are available for navigation.
 
 A release bundle has `index.json` (bundle index schema version `3`),
 `rejects.json`, `measurements.json`, `SHA256SUMS`, and the pack assets.

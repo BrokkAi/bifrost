@@ -59,6 +59,7 @@ pub mod usage_queries;
 pub mod usage_walks;
 
 pub mod cfg;
+mod cfg_if;
 
 #[cfg(test)]
 mod producer_smoke_tests;

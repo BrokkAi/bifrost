@@ -114,7 +114,8 @@ pub mod native_resolution_test_support {
         java_native_incoming_calls, java_native_rename, java_selected_inverse_for,
     };
     pub use crate::analyzer::{
-        NativeTypeProbe, probe_native_definition, probe_native_definition_trace, probe_native_type,
+        NativeAssignmentValueProbe, NativeTypeProbe, probe_native_assignment_value,
+        probe_native_definition, probe_native_definition_trace, probe_native_type,
     };
     pub use crate::analyzer::{
         RustSelectedReverseOutcome, RustSelectedReverseQueries, with_rust_selected_reverse_queries,
@@ -179,6 +180,12 @@ pub mod native_resolution_test_support {
         (lowered.lexical().clone(), lowered.typed().clone())
     }
 
+    /// The shared name catalog used by `lower_fixture_facts`, for constructing
+    /// a native graph catalog from the same private differential artifacts.
+    pub fn fixture_shared_names() -> &'static dyn SharedNameInterner {
+        crate::analyzer::resolution::test_shared_names()
+    }
+
     /// Return the exact schema-owned universal root identity for private SQL
     /// differential fixtures without exposing its constructor in shipped APIs.
     pub fn universal_root_binding_node() -> BindingNodeId {
@@ -215,6 +222,22 @@ pub mod native_resolution_test_support {
             |file, source, tree| {
                 brokk_bifrost_rust::declarations::parse_rust_file(file, source, tree)
                     .resolution_facts
+            },
+        )
+    }
+
+    /// Run the production Go parse walk and return only its target-independent
+    /// native-resolution facts for the private differential harness.
+    pub fn parse_go_resolution_facts(
+        file: &brokk_bifrost_core::analyzer::ProjectFile,
+        source: &str,
+    ) -> FileResolutionFacts {
+        parse_resolution_facts(
+            file,
+            source,
+            tree_sitter_go::LANGUAGE.into(),
+            |file, source, tree| {
+                brokk_bifrost_go::declarations::parse_go_file(file, source, tree).resolution_facts
             },
         )
     }

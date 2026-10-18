@@ -596,11 +596,13 @@ impl<'project> SelectedResolutionAuthority<'project> {
                 .prepare_cached(authority_rows::ROOT_EXPORT_HALVES_SQL)?
                 .query_map(rusqlite::params![mount.blob_id(), site.get()], |row| {
                     Ok(RootExportHalf {
-                        recipe: super::resolution_prepare::resolution_rows::decode_lookup_recipe(
-                            row.get(0)?,
-                            row.get(1)?,
-                            &row.get::<_, String>(2)?,
-                        ),
+                        recipe:
+                            super::resolution_prepare::resolution_rows::decode_stored_lookup_recipe(
+                                row.get(0)?,
+                                row.get(1)?,
+                                &row.get::<_, String>(2)?,
+                                row.get(4)?,
+                            ),
                         canonical_export_shape: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
                     })
                 })?
@@ -618,10 +620,11 @@ impl<'project> SelectedResolutionAuthority<'project> {
                 .prepare_cached(authority_rows::LOOKUP_RECIPES_SQL)?
                 .query_map([mount.blob_id()], |row| {
                     Ok(
-                        super::resolution_prepare::resolution_rows::decode_lookup_recipe(
+                        super::resolution_prepare::resolution_rows::decode_stored_lookup_recipe(
                             row.get(0)?,
                             row.get(1)?,
                             &row.get::<_, String>(2)?,
+                            row.get(3)?,
                         ),
                     )
                 })?

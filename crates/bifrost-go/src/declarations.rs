@@ -1407,6 +1407,23 @@ where
             _ => {}
         }
         match node.kind() {
+            "struct_type" => {
+                let name = format!("$anon${}", node.start_byte());
+                let fq = go_package_fq(&self.package_name)
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Type));
+                let unit = CodeUnit::new_fq(
+                    self.file.clone(),
+                    CodeUnitType::Class,
+                    self.package_name.clone(),
+                    name,
+                    fq,
+                );
+                GoDeclarationContext::TypeOwner {
+                    unit,
+                    container_id: node.id(),
+                    kind: GoMemberContainerKind::Struct,
+                }
+            }
             "function_declaration" if matches!(&context, GoDeclarationContext::TopLevel) => {
                 self.register_function(node, None);
                 GoDeclarationContext::Inactive
@@ -1424,7 +1441,7 @@ where
             "const_declaration" if matches!(&context, GoDeclarationContext::TopLevel) => {
                 GoDeclarationContext::ValueDeclaration("const")
             }
-            "type_spec" if matches!(&context, GoDeclarationContext::TypeDeclaration) => self
+            "type_spec" => self
                 .register_type_spec(node)
                 .unwrap_or(GoDeclarationContext::Inactive),
             "type_alias" if matches!(&context, GoDeclarationContext::TypeDeclaration) => {
@@ -1680,13 +1697,24 @@ where
             .native
             .capture_source_type(type_node)
             .expect("Go type declaration has a source type fact");
-        let fq = go_package_fq(&self.package_name)
-            .with_pushed(segment_interner().intern(name, SegmentKind::Type));
+        let file_scope = node
+            .parent()
+            .and_then(|parent| parent.parent())
+            .is_some_and(|parent| parent.kind() == "source_file");
+        let mut fq = go_package_fq(&self.package_name);
+        let short_name = if file_scope {
+            name.to_string()
+        } else {
+            let scope = format!("$local${}", node.start_byte());
+            fq = fq.with_pushed(segment_interner().intern(&scope, SegmentKind::Member));
+            format!("{scope}.{name}")
+        };
+        let fq = fq.with_pushed(segment_interner().intern(name, SegmentKind::Type));
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
             self.package_name.clone(),
-            name.to_string(),
+            short_name,
             fq,
         );
         self.parsed.add_code_unit(
@@ -1729,9 +1757,12 @@ where
                 .add_metadata_for_signature(code_unit.clone(), signature_ordinal, metadata);
         }
         let declaration = self.source_declaration(node, Some(name_node), code_unit.clone());
-        self.native
-            .source_properties_mut()
-            .add_type_declaration(declaration, name, type_id, true);
+        self.native.source_properties_mut().add_type_declaration(
+            declaration,
+            name,
+            type_id,
+            file_scope,
+        );
         Some(match member_container_kind(type_node) {
             Some(kind) => GoDeclarationContext::TypeOwnerPending {
                 unit: code_unit,
@@ -1828,9 +1859,6 @@ where
 
     fn register_field(&mut self, node: Node<'_>, owner_list: usize) -> GoDeclarationContext {
         let owner_count = self.field_owner_lists[owner_list].len();
-        let owner_type = self
-            .member_container_type(node)
-            .expect("Go field has a captured struct or interface owner");
         let names = children_by_field(node, "name");
         if names.is_empty() {
             if let Some((field_name, type_node)) = go_embedded_struct_field(node, self.source) {
@@ -1886,18 +1914,10 @@ where
                             .with_return_type_identity(identity),
                     );
                 }
-                let declaration = declaration_id.expect("Go embedded field has a display owner");
-                self.native.source_properties_mut().add_field(
-                    declaration,
-                    owner_type,
-                    Some(type_id),
-                    &field_name,
-                    true,
+                assert!(
+                    declaration_id.is_some(),
+                    "Go embedded field has a display owner"
                 );
-                let occurrence = self.native.source_collector_mut().intern_node(type_node);
-                self.native
-                    .source_properties_mut()
-                    .add_embedding(owner_type, occurrence, type_id);
             }
             return GoDeclarationContext::Inactive;
         }
@@ -1966,13 +1986,9 @@ where
                     });
                 }
             }
-            let declaration = declaration_id.expect("Go named field has a display owner");
-            self.native.source_properties_mut().add_field(
-                declaration,
-                owner_type,
-                type_id,
-                field_name,
-                false,
+            assert!(
+                declaration_id.is_some(),
+                "Go named field has a display owner"
             );
         }
         if let Some(nested_type) = nested_type {
@@ -2169,7 +2185,74 @@ mod coordinated_producer_tests {
     use super::*;
     use brokk_bifrost_core::analyzer::ProjectFile;
     use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
+
+    #[test]
+    #[hardwon("#5074: anonymous table rows had no field membership or native source bridge")]
+    fn anonymous_test_table_fields_have_native_source_bridges() {
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            ResolutionGapKind, ResolutionSiteKind,
+        };
+        let source = r#"package p
+ type Options struct{}
+ type Client struct{}
+ func TestCreate() {
+     tests := []struct { opts *Options; ctx struct { Client *Client } }{}
+     for _, tt := range tests {
+         opts := tt.opts
+         _ = opts
+         _ = tt.ctx.Client
+     }
+     type localOptions struct { opts *Options }
+     _ = localOptions{}
+ }
+"#;
+        let parsed = parse(source);
+        let source_facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("coordinated source facts");
+        let go = source_facts.go.as_ref().expect("Go source properties");
+        let mut fields = go
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, ["Client", "ctx", "opts", "opts"], "{go:#?}");
+        assert!(
+            parsed
+                .source_declaration_units
+                .iter()
+                .any(|(_, unit)| unit.is_class() && unit.identifier() == "localOptions"),
+            "local owner must project"
+        );
+        let anonymous = go
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.name.starts_with("$anon$"))
+            .collect::<Vec<_>>();
+        assert_eq!(anonymous.len(), 2, "{go:#?}");
+        for declaration in anonymous {
+            let (native, _) = source_facts
+                .native_declaration_sources
+                .iter()
+                .find(|(_, source)| *source == declaration.declaration)
+                .expect("anonymous type has its native source bridge");
+            let site = &parsed.resolution_facts.sites[native.index()];
+            assert_eq!(site.kind, ResolutionSiteKind::TypeDeclaration);
+            assert!(
+                !parsed
+                    .resolution_facts
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.site == site.id
+                        && gap.kind == ResolutionGapKind::UnsupportedExpressionType),
+                "anonymous type is still unsupported: {site:#?}"
+            );
+        }
+    }
 
     fn parse(source: &str) -> ParsedFile {
         let tree = parse_go_tree(source);

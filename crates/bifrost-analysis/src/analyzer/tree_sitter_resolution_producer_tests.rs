@@ -625,8 +625,8 @@ passthrough! {
     assert_eq!(source_facts.imports.len(), 10);
     assert_eq!(
         source_facts.rust_import_contexts.len(),
-        6,
-        "one context per primary import declaration, including the local-only use"
+        7,
+        "one context per authoritative import declaration, including the local-only use"
     );
     let context_for = |statement: &str| {
         let import = source_facts
@@ -698,24 +698,22 @@ passthrough! {
     assert!(inner_local_range.start_byte <= inner_declaration.range.start_byte);
     assert!(inner_declaration.range.end_byte <= inner_local_range.end_byte);
     assert!(SOURCE[inner_owner_range.start_byte..inner_owner_range.end_byte].contains("Inside"));
+    let generated_context = context_for("use crate::generated");
+    assert_eq!(generated_context.owner_module, "");
+    assert!(generated_context.owner_scope.is_none());
+    assert!(generated_context.local_scope.is_none());
+    assert!(generated_context.native_scope.is_some());
     for target in &cold_state.rust_usage_facts.import_targets {
         if let Some(source_import_id) = target.source_import_id {
             let source_import = &source_facts.imports[source_import_id.index()];
             let declaration = source_import.declaration;
-            if source_facts
-                .occurrences
-                .occurrence(declaration)
-                .provenance
-                == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode
-            {
-                assert!(
-                    source_facts
-                        .rust_import_contexts
-                        .iter()
-                        .any(|context| context.declaration == declaration),
-                    "primary Rust target must link to its declaration context"
-                );
-            }
+            assert!(
+                source_facts
+                    .rust_import_contexts
+                    .iter()
+                    .any(|context| context.declaration == declaration),
+                "authoritative Rust target must link to its declaration context"
+            );
         }
     }
     assert_eq!(
@@ -836,21 +834,21 @@ passthrough! {
     }) {
         let embedded_declaration = source_facts.imports[id.index()].declaration;
         assert!(
-            !source_facts
+            source_facts
                 .rust_import_contexts
                 .iter()
                 .any(|context| context.declaration == embedded_declaration),
-            "embedded generic import has no Rust context projection"
+            "proven source-preserving import has a Rust context projection"
         );
         assert!(
-            !cold_state
+            cold_state
                 .rust_usage_facts
                 .import_targets
                 .iter()
                 .any(|target| target
                     .source_import_id
                     .is_some_and(|target_id| target_id == *id)),
-            "embedded generic import has no Rust target projection"
+            "proven source-preserving import has a Rust target projection"
         );
     }
     // Grouped leaves share a declaration identity within either live tree.

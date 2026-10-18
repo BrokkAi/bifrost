@@ -62,6 +62,7 @@ impl ResolutionOwnerFrontier {
 /// [`Self::finish`] returns the terminal condition instead of any partial value.
 pub struct ResolutionSession {
     budget: Option<ReceiverAnalysisBudget>,
+    total_work_limit: Option<usize>,
     cancellation: Option<CancellationToken>,
     state: RefCell<ResolutionState>,
     expanded_owners: RefCell<HashSet<ResolutionOwnerFrontier>>,
@@ -71,6 +72,7 @@ impl ResolutionSession {
     pub fn unbounded() -> Self {
         Self {
             budget: None,
+            total_work_limit: None,
             cancellation: None,
             state: RefCell::new(ResolutionState::default()),
             expanded_owners: RefCell::default(),
@@ -83,6 +85,24 @@ impl ResolutionSession {
     ) -> Self {
         Self {
             budget: Some(budget),
+            total_work_limit: None,
+            cancellation: Some(
+                cancellation.map_or_else(CancellationToken::new, |token| token.child()),
+            ),
+            state: RefCell::new(ResolutionState::default()),
+            expanded_owners: RefCell::default(),
+        }
+    }
+
+    /// Start a bounded request with an additional cap shared by all work axes.
+    pub fn bounded_with_total_work(
+        budget: ReceiverAnalysisBudget,
+        total_work_limit: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Self {
+        Self {
+            budget: Some(budget),
+            total_work_limit: Some(total_work_limit),
             cancellation: Some(
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
@@ -106,6 +126,7 @@ impl ResolutionSession {
         assert!(shared_work.resolution_rounds <= budget.max_resolution_rounds);
         Self {
             budget: Some(budget),
+            total_work_limit: None,
             cancellation: Some(
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
@@ -259,7 +280,7 @@ impl ResolutionSession {
         if !self.scope_step() {
             return Vec::new();
         }
-        let limit = self.remaining_scope_steps().saturating_add(1);
+        let limit = self.scope_lookahead_limit();
         let batch = query(limit);
         if !self.observe_cancellation() {
             return Vec::new();
@@ -271,7 +292,7 @@ impl ResolutionSession {
             }
         }
         if !batch.complete {
-            self.stop(ResolutionStop::Exceeded(ReceiverBudgetLimit::ScopeNodes));
+            self.mark_scope_incomplete();
             return Vec::new();
         }
         batch.rows
@@ -327,6 +348,15 @@ impl ResolutionSession {
             budget.max_summary_expansions = budget
                 .max_summary_expansions
                 .saturating_sub(state.work.summary_expansions);
+            if let Some(total_work_limit) = self.total_work_limit {
+                let remaining_total = total_work_limit.saturating_sub(total_work(&state.work));
+                budget.max_scope_nodes = budget.max_scope_nodes.min(remaining_total);
+                budget.max_summary_expansions = budget.max_summary_expansions.min(remaining_total);
+                budget.max_resolution_rounds = budget
+                    .max_resolution_rounds
+                    .saturating_sub(state.work.resolution_rounds)
+                    .min(remaining_total);
+            }
             budget
         })
     }
@@ -338,7 +368,8 @@ impl ResolutionSession {
     }
 
     pub fn mark_scope_incomplete(&self) {
-        self.stop(ResolutionStop::Exceeded(ReceiverBudgetLimit::ScopeNodes));
+        let limit = self.scope_binding_limit();
+        self.stop(ResolutionStop::Exceeded(limit));
     }
 
     fn remaining_scope_steps(&self) -> usize {
@@ -347,10 +378,29 @@ impl ResolutionSession {
             return 0;
         }
         self.budget.map_or(usize::MAX, |budget| {
-            budget
+            let axis_remaining = budget
                 .max_scope_nodes
-                .saturating_sub(state.work.scope_nodes)
+                .saturating_sub(state.work.scope_nodes);
+            self.total_work_limit.map_or(axis_remaining, |limit| {
+                axis_remaining.min(limit.saturating_sub(total_work(&state.work)))
+            })
         })
+    }
+
+    fn scope_binding_limit(&self) -> ReceiverBudgetLimit {
+        let Some(budget) = self.budget else {
+            return ReceiverBudgetLimit::ScopeNodes;
+        };
+        let state = self.state.borrow();
+        let axis_remaining = budget
+            .max_scope_nodes
+            .saturating_sub(state.work.scope_nodes);
+        match self.total_work_limit {
+            Some(limit) if limit.saturating_sub(total_work(&state.work)) <= axis_remaining => {
+                ReceiverBudgetLimit::TotalWork
+            }
+            _ => ReceiverBudgetLimit::ScopeNodes,
+        }
     }
 
     fn stop(&self, stop: ResolutionStop) {
@@ -377,6 +427,18 @@ impl ResolutionSession {
             return true;
         };
         let mut state = self.state.borrow_mut();
+        if self
+            .total_work_limit
+            .is_some_and(|maximum| total_work(&state.work) >= maximum)
+        {
+            state.stop = Some(ResolutionStop::Exceeded(ReceiverBudgetLimit::TotalWork));
+            drop(state);
+            self.cancellation
+                .as_ref()
+                .expect("a bounded session has an operation cancellation token")
+                .cancel();
+            return false;
+        }
         let (used, maximum) = match limit {
             ReceiverBudgetLimit::ScopeNodes => {
                 (&mut state.work.scope_nodes, budget.max_scope_nodes)
@@ -389,6 +451,7 @@ impl ResolutionSession {
                 &mut state.work.resolution_rounds,
                 budget.max_resolution_rounds,
             ),
+            ReceiverBudgetLimit::TotalWork => unreachable!("aggregate work is checked above"),
         };
         if *used == maximum {
             state.stop = Some(ResolutionStop::Exceeded(limit));
@@ -403,6 +466,12 @@ impl ResolutionSession {
             true
         }
     }
+}
+
+fn total_work(work: &ReceiverAnalysisWork) -> usize {
+    work.scope_nodes
+        .saturating_add(work.summary_expansions)
+        .saturating_add(work.resolution_rounds)
 }
 
 #[cfg(test)]
@@ -547,5 +616,141 @@ mod tests {
         assert!(sibling.scope_step());
         assert!(!sibling.cancellation().unwrap().is_cancelled());
         assert!(!caller.is_cancelled());
+    }
+
+    #[test]
+    #[hardwon("#5511: repeated modeled bases could exceed every independently bounded work axis")]
+    fn aggregate_work_cap_bounds_mixed_axes_and_provider_rows() {
+        let caller = CancellationToken::new();
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 8,
+            max_summary_expansions: 8,
+            max_resolution_rounds: 8,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let session = ResolutionSession::bounded_with_total_work(budget, 3, Some(&caller));
+        assert!(session.scope_step());
+        assert!(session.summary_step());
+        assert!(session.round_step());
+        assert_eq!(
+            session.finish(()).work(),
+            ReceiverAnalysisWork {
+                setup_nodes: 0,
+                scope_nodes: 1,
+                summary_expansions: 1,
+                resolution_rounds: 1,
+            }
+        );
+        assert!(!session.scope_step());
+        assert!(!session.summary_step());
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::TotalWork,
+                work: ReceiverAnalysisWork {
+                    setup_nodes: 0,
+                    scope_nodes: 1,
+                    summary_expansions: 1,
+                    resolution_rounds: 1,
+                }
+            }
+        ));
+        assert!(!caller.is_cancelled());
+
+        let projected = ResolutionSession::bounded_with_total_work(budget, 5, None);
+        assert!(projected.round_step());
+        assert_eq!(
+            projected.remaining_budget().unwrap().max_resolution_rounds,
+            4,
+            "opted-in projections subtract rounds already spent"
+        );
+
+        let row_session = ResolutionSession::bounded_with_total_work(budget, 2, None);
+        assert!(row_session.summary_step());
+        let rows = row_session.query_limited_rows(|limit| {
+            assert_eq!(limit, 1, "one aggregate lookahead row is allowed");
+            LimitedQueryRows::incomplete(Vec::<()>::new(), 1)
+        });
+        assert!(rows.is_empty());
+        assert!(matches!(
+            row_session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::TotalWork,
+                work: ReceiverAnalysisWork {
+                    setup_nodes: 0,
+                    scope_nodes: 1,
+                    summary_expansions: 1,
+                    resolution_rounds: 0,
+                }
+            }
+        ));
+
+        let legacy = ResolutionSession::bounded(budget, None);
+        assert!(legacy.round_step());
+        assert_eq!(
+            legacy.remaining_budget().unwrap().max_resolution_rounds,
+            budget.max_resolution_rounds,
+            "legacy constructors retain their existing round projection"
+        );
+        assert_eq!(ReceiverBudgetLimit::TotalWork.as_str(), "total_work");
+
+        let tight_axis = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 1,
+                ..budget
+            },
+            9,
+            None,
+        );
+        assert!(tight_axis.scope_step());
+        assert!(!tight_axis.scope_step());
+        assert!(matches!(
+            tight_axis.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+
+        let cancelled_caller = CancellationToken::new();
+        let cancelled =
+            ResolutionSession::bounded_with_total_work(budget, 9, Some(&cancelled_caller));
+        cancelled_caller.cancel();
+        assert!(!cancelled.scope_step());
+        assert!(matches!(
+            cancelled.finish(()),
+            BoundedResolution::Cancelled {
+                work: ReceiverAnalysisWork {
+                    setup_nodes: 0,
+                    scope_nodes: 0,
+                    summary_expansions: 0,
+                    resolution_rounds: 0,
+                }
+            }
+        ));
+
+        let zero = ResolutionSession::bounded_with_total_work(budget, 0, None);
+        let mut queried = false;
+        let rows = zero.query_limited_rows(|_| {
+            queried = true;
+            LimitedQueryRows::complete(Vec::<()>::new(), 0)
+        });
+        assert!(rows.is_empty());
+        assert!(
+            !queried,
+            "zero aggregate allowance must stop before provider work"
+        );
+        assert!(matches!(
+            zero.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::TotalWork,
+                work: ReceiverAnalysisWork {
+                    setup_nodes: 0,
+                    scope_nodes: 0,
+                    summary_expansions: 0,
+                    resolution_rounds: 0,
+                }
+            }
+        ));
     }
 }

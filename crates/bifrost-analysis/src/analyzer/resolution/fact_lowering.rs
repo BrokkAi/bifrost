@@ -1932,6 +1932,17 @@ pub(super) fn lower_file_resolution_facts_with_identities(
 
     let reasons_by_site = gap_reasons_by_site(identities, &gap_sources);
     let mut forward_gap_endpoints = HashMap::default();
+    let owner_references = facts
+        .lexical_owner_references
+        .iter()
+        .map(|fact| (fact.reference, fact.declaration))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        owner_references.len(),
+        facts.lexical_owner_references.len(),
+        "one structural owner per qualifier reference: {:?}",
+        facts.lexical_owner_references
+    );
 
     for semantic in semantics
         .iter()
@@ -1942,6 +1953,37 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         let completion = completion_for_site(&reasons_by_site, semantic.site, |origin| {
             index.lexical_reference_gap(semantic.site, origin)
         });
+        if let Some(&owner) = owner_references.get(&semantic.site) {
+            let (target, required) = if let Some(owner) = owner {
+                let (_, target) = semantic_by_site[&(owner, LoweredSemanticRole::Definition)];
+                (target, Vec::new())
+            } else {
+                assert!(matches!(&completion, ResolutionCompletion::Incomplete(_)));
+                let sink = identities.node(gap_sink_node_identity(
+                    semantic.site,
+                    b"lexical-owner-unavailable",
+                ));
+                nodes.push((sink, BindingNodeKind::Scope));
+                let lookup = identities.lookup_semantic(
+                    language,
+                    identifier.namespace,
+                    index.name(identifier.name),
+                );
+                (sink, vec![lookup])
+            };
+            let id = identities.path(reference_path_identity(semantic.site, identifier.namespace));
+            paths.push((
+                id,
+                PartialPath::new(
+                    closed_endpoint(semantic.node, []),
+                    closed_endpoint(target, required),
+                    Vec::new(),
+                    [WitnessStep::Node(target)],
+                    completion,
+                ),
+            ));
+            continue;
+        }
         if index.keyword_references.contains(&identifier.site) {
             // A keyword the language binds implicitly (Rust `Self`) is
             // answered by its typed identity alone. Its lookup ends at a sink
@@ -4683,6 +4725,29 @@ fn blocks_fragment(origin: LoweringGapOrigin) -> bool {
     }
 }
 
+/// Result slots whose declared types do not depend on invocation validity.
+/// This set belongs to one immutable file's lowering and is never retained.
+pub(super) fn applicability_independent_result_slots(
+    language: Language,
+    facts: &FileResolutionFacts,
+) -> HashSet<ResolutionTypeSlotId> {
+    if !crate::analyzer::languages::language_support(language)
+        .is_some_and(|support| support.callable_result_is_applicability_independent())
+    {
+        return HashSet::default();
+    }
+    facts
+        .callable_signatures
+        .iter()
+        .flat_map(|signature| {
+            signature
+                .result_types
+                .iter()
+                .map(|result| result.value_type)
+        })
+        .collect()
+}
+
 fn has_type_impact(origin: LoweringGapOrigin) -> bool {
     match origin {
         LoweringGapOrigin::Extracted(kind) => !matches!(
@@ -4966,6 +5031,7 @@ fn lower_coverage_gaps(
     forward_gap_endpoints: &HashMap<ResolutionSiteId, Vec<BindingNodeId>>,
 ) -> Vec<LoweredCoverageGap> {
     let mut output = Vec::new();
+    let independent_results = applicability_independent_result_slots(language, facts);
     let mut definitions_by_scope: HashMap<ResolutionScopeId, Vec<BindingNodeId>> =
         HashMap::default();
     for (&(site, role), &(_, node)) in semantics {
@@ -5261,11 +5327,20 @@ fn lower_coverage_gaps(
         if has_type_impact(source.origin) {
             if let Some(slots) = index.type_slots_by_site.get(&source.site) {
                 for &slot in slots {
+                    if source.origin
+                        == LoweringGapOrigin::Extracted(
+                            ResolutionGapKind::UnsupportedCallApplicability,
+                        )
+                        && independent_results.contains(&slot)
+                    {
+                        continue;
+                    }
                     frontiers.push(LoweringCoverageFrontier::Type {
                         frontier: identities.semantic(type_slot_semantic_identity(slot)),
                     });
                 }
-            } else if frontiers.is_empty() {
+            }
+            if frontiers.is_empty() {
                 // Completion only asks about real type slots, so a slotless site needs no
                 // type frontier. But resolution_gap_reasons and stage gap rows derive
                 // provenance from coverage rows, so keep this row to publish reason, site,
@@ -5421,11 +5496,28 @@ pub(crate) fn jvm_type_prefix_gap_origin_is_safe(
     }
 }
 
-/// Scala ranks a binding in scope above a package member of the same name
-/// (SLS chapter 2, binding precedence). Java keeps the qualified-name
-/// ambiguity open, and Kotlin has not adopted this rule.
+/// A proved Java type obscures a package of the same name (JLS 6.4.2 and
+/// 6.5.4.1). Scala likewise ranks a binding in scope above a package member
+/// (SLS chapter 2). An unproved prefix retains its other completion reasons.
 const fn lexical_type_outranks_package(language: Language) -> bool {
-    matches!(language, Language::Scala)
+    matches!(language, Language::Java | Language::Scala)
+}
+
+/// Java's new terminal type continuation retires only its own name ambiguity.
+/// Existing prefix rules for placement or receivers are separate claims.
+pub(crate) fn jvm_terminal_type_gap_origin_is_safe(
+    language: Language,
+    fragment: BindingFragmentId,
+    source_site: ResolutionSiteId,
+    origin: LoweringGapOrigin,
+    reference: SemanticId,
+) -> bool {
+    if language == Language::Java
+        && origin != LoweringGapOrigin::Extracted(ResolutionGapKind::AmbiguousQualifiedType)
+    {
+        return false;
+    }
+    jvm_type_prefix_gap_origin_is_safe(language, fragment, source_site, origin, reference)
 }
 
 pub(super) fn reference_semantic_identity(site: ResolutionSiteId) -> ResolutionSemanticIdentity {

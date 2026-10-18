@@ -1424,6 +1424,19 @@ impl UnitRowScalar {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "terminal_kind", rename_all = "snake_case")]
 pub enum UnitRowItemTerminal {
+    PythonHierarchyFact {
+        id: String,
+        root_id: String,
+        declaration_id: Option<String>,
+        owner_id: Option<String>,
+        target_id: Option<String>,
+        target_owner_id: Option<String>,
+        fact_kind: String,
+        outcome: String,
+        coverage: String,
+        reason: Option<String>,
+        ancestry_basis: crate::analyzer::usages::python_class_hierarchy::PythonAncestryBasis,
+    },
     SourcePosition,
     GenerationSite {
         id: Box<str>,
@@ -1593,6 +1606,19 @@ fn boxed(value: &str) -> Box<str> {
 impl UnitRowItemTerminal {
     fn project(value: &CodeQueryResultValue) -> Option<Self> {
         let terminal = match value {
+            CodeQueryResultValue::PythonHierarchyFact { value } => Self::PythonHierarchyFact {
+                id: value.id.clone(),
+                root_id: value.root_id.clone(),
+                declaration_id: value.declaration_id.clone(),
+                owner_id: value.owner_id.clone(),
+                target_id: value.target_id.clone(),
+                target_owner_id: value.target_owner_id.clone(),
+                fact_kind: value.fact_kind.to_owned(),
+                outcome: value.outcome.to_owned(),
+                coverage: value.coverage.to_owned(),
+                reason: value.reason.map(str::to_owned),
+                ancestry_basis: value.ancestry_basis.clone(),
+            },
             CodeQueryResultValue::StructuralMatch { value } => {
                 UnitRowItemTerminal::StructuralMatch {
                     kind: boxed(value.kind),
@@ -1730,10 +1756,7 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::BuildTarget { .. }
             | CodeQueryResultValue::TopologyEdge { .. }
             | CodeQueryResultValue::DependencyEvidence { .. }
-            | CodeQueryResultValue::ConfigurationFact { .. }
-            | CodeQueryResultValue::PythonHierarchyFact { .. } => {
-                UnitRowItemTerminal::SourcePosition
-            }
+            | CodeQueryResultValue::ConfigurationFact { .. } => UnitRowItemTerminal::SourcePosition,
             CodeQueryResultValue::CrossDomain { value } => UnitRowItemTerminal::CrossDomain {
                 operator: boxed(value.operator),
                 domain: boxed(value.domain),
@@ -1956,6 +1979,20 @@ pub struct UnitRowItemRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "ref", rename_all = "snake_case")]
 pub enum UnitRowItemRefValue {
+    PythonHierarchyFact {
+        id: String,
+        root_id: String,
+        declaration_id: Option<String>,
+        owner_id: Option<String>,
+        target_id: Option<String>,
+        target_owner_id: Option<String>,
+        fact_kind: String,
+        outcome: String,
+        coverage: String,
+        reason: Option<String>,
+        range: CodeQueryRange,
+        ancestry_basis: crate::analyzer::usages::python_class_hierarchy::PythonAncestryBasis,
+    },
     Unsupported,
     StructuralMatch {
         kind: Box<str>,
@@ -2043,6 +2080,20 @@ pub enum UnitRowItemRefValue {
         outcome: Box<str>,
         capture: Option<Box<str>>,
     },
+    CallableSignature {
+        id: Box<str>,
+        declaration_id: Option<Box<str>>,
+        site_id: Box<str>,
+        role: Box<str>,
+        coverage: Box<str>,
+        range: CodeQueryRange,
+    },
+    SignatureParameter {
+        id: Box<str>,
+        signature_id: Box<str>,
+        parameter_index: usize,
+        range: CodeQueryRange,
+    },
     DecoratedParameter {
         id: Box<str>,
         parameter_id: Box<str>,
@@ -2081,10 +2132,32 @@ impl UnitRowItemRef {
                 node_range: *node_range,
             },
             CodeQueryResultRef::PythonHierarchyFact {
-                range, fact_kind, ..
-            } => UnitRowItemRefValue::StructuralMatch {
-                kind: boxed(fact_kind),
-                node_range: Some(*range),
+                id,
+                root_id,
+                declaration_id,
+                owner_id,
+                target_id,
+                target_owner_id,
+                range,
+                fact_kind,
+                outcome,
+                coverage,
+                reason,
+                ancestry_basis,
+                ..
+            } => UnitRowItemRefValue::PythonHierarchyFact {
+                id: id.clone(),
+                root_id: root_id.clone(),
+                declaration_id: declaration_id.clone(),
+                owner_id: owner_id.clone(),
+                target_id: target_id.clone(),
+                target_owner_id: target_owner_id.clone(),
+                fact_kind: (*fact_kind).to_owned(),
+                outcome: (*outcome).to_owned(),
+                coverage: (*coverage).to_owned(),
+                reason: reason.map(str::to_owned),
+                range: *range,
+                ancestry_basis: ancestry_basis.clone(),
             },
             CodeQueryResultRef::Binding {
                 id,
@@ -2260,6 +2333,34 @@ impl UnitRowItemRef {
             } => UnitRowItemRefValue::StructuralMatch {
                 kind: boxed(relation),
                 node_range: Some(*range),
+            },
+            CodeQueryResultRef::CallableSignature {
+                id,
+                declaration_id,
+                site_id,
+                role,
+                coverage,
+                range,
+                ..
+            } => UnitRowItemRefValue::CallableSignature {
+                id: boxed(id),
+                declaration_id: declaration_id.as_deref().map(boxed),
+                site_id: boxed(site_id),
+                role: boxed(role),
+                coverage: boxed(coverage),
+                range: *range,
+            },
+            CodeQueryResultRef::SignatureParameter {
+                id,
+                signature_id,
+                parameter_index,
+                range,
+                ..
+            } => UnitRowItemRefValue::SignatureParameter {
+                id: boxed(id),
+                signature_id: boxed(signature_id),
+                parameter_index: *parameter_index,
+                range: *range,
             },
             CodeQueryResultRef::DecoratedParameter {
                 id,

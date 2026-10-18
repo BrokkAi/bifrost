@@ -88,14 +88,23 @@ pub(super) fn callable_signature_expansions_for_declaration(
         .map(|report| {
             let python_special_method =
                 special_method_context.map(|context| context.contract(report.signature.arity));
-            pipeline_expansion(PipelineValue::CallableSignature(Box::new(
+            // The actual premises live once in the pipeline trace, including
+            // parameter projections; the row's private derivation state is spent.
+            let mut receiver = python_receiver.clone();
+            receiver.hierarchy_premises.clear();
+            let mut expansion = pipeline_expansion(PipelineValue::CallableSignature(Box::new(
                 CallableSignatureValue {
                     declaration: declaration.clone(),
                     report: Arc::new(report),
                     python_special_method,
-                    python_receiver,
+                    python_receiver: receiver,
                 },
-            )))
+            )));
+            super::python_class_hierarchy::attach_hierarchy_premises(
+                &mut expansion,
+                &python_receiver.hierarchy_premises,
+            );
+            expansion
         })
         .collect()
 }

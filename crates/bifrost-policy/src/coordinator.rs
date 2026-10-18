@@ -3317,7 +3317,18 @@ fn evaluate_prepared_policy_inputs(
     // Reuse the resolved runtime the activation already built, exactly as an
     // API caller would, and only when it is `Ready`: an incomplete activation
     // must not silently model calls it never resolved.
-    let policy_categories = built_in_scope_categories();
+    // Category metadata cannot affect a scope that selects only policy ids or
+    // all policies. Avoid loading unrelated rule packs for those runs.
+    let policy_categories = if scope_document.as_ref().is_some_and(|document| {
+        document
+            .scopes()
+            .iter()
+            .any(|entry| !entry.policy_categories().is_empty())
+    }) {
+        built_in_scope_categories()
+    } else {
+        HashMap::new()
+    };
     let workspace_files = workspace
         .map(|workspace| workspace.analyzer().analyzed_files())
         .unwrap_or_default();

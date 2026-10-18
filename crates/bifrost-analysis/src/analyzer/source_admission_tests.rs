@@ -658,7 +658,7 @@ fn numeric_data_admission_persisted_policy_transitions() {
 #[test]
 #[hardwon("#5596: generated Python bytes descriptors were rejected by exact syntax admission")]
 fn python_literal_admission_grammar_boundary() {
-    let adapter = crate::analyzer::python::PythonAdapter;
+    let adapter = crate::analyzer::python::PythonAdapter::default();
     let payload = "x".repeat(17_000);
     for literal in [format!("b'{payload}'"), format!("'{payload}' 'suffix'")] {
         let source = format!("DESCRIPTOR = consume({literal})\n");

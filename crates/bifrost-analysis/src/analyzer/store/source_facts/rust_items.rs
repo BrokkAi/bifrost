@@ -578,7 +578,7 @@ pub(in crate::analyzer) fn insert_rust_item_source_facts_tx(
         ])?;
     }
     drop(macros);
-    let mut inputs = tx.prepare_cached("INSERT INTO source_rust_macro_inputs(blob_id, invocation_occurrence_id, start_byte, source, native_gap_site, native_scope, invocation_start_byte) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+    let mut inputs = tx.prepare_cached("INSERT INTO source_rust_macro_inputs(blob_id, invocation_occurrence_id, start_byte, source, native_gap_site, native_scope, invocation_start_byte, cfg_condition) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
     let mut tokens = tx.prepare_cached("INSERT INTO source_rust_macro_input_tokens(blob_id, invocation_occurrence_id, ordinal, parent_ordinal, syntax_kind, start_byte, end_byte, source_occurrence_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
     for input in &item_facts.macro_inputs {
         check_cancelled(cancellation)?;
@@ -592,6 +592,9 @@ pub(in crate::analyzer) fn insert_rust_item_source_facts_tx(
                 .native_frontier
                 .map(|(_, scope)| i64::from(scope.get())),
             usize_to_i64(span_of(input.invocation).0)?,
+            brokk_bifrost_core::analyzer::rust_facts::encode_rust_cfg_condition(
+                &input.cfg_condition
+            ),
         ])?;
         assert_eq!(
             input.tree.tokens.len(),

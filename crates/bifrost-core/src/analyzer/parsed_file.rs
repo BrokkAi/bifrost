@@ -347,8 +347,8 @@ pub struct ParsedSourceFacts {
     /// The order is producer-defined and need not match `imports` order.
     pub generic_imports: Vec<SourceImportId>,
     /// Rust-only owner, scope, visibility, and cfg interpretation attached to
-    /// each primary import declaration. Embedded macro imports intentionally do
-    /// not appear here because they have no primary Rust target authority.
+    /// primary imports and proven source-preserving item-macro imports.
+    /// Speculative embedded imports have no target authority here.
     pub rust_import_contexts: Vec<RustImportContextFact>,
 }
 
@@ -794,11 +794,13 @@ impl ParsedFile {
         node: Node<'_>,
         _source: &str,
     ) {
+        self.add_definition_lookup_unit_with_range(code_unit, node_range(node));
+    }
+
+    /// Range form for source-backed publication delayed until a file walk ends.
+    pub fn add_definition_lookup_unit_with_range(&mut self, code_unit: CodeUnit, range: Range) {
         self.definition_lookup_units.insert(code_unit.clone());
-        self.ranges
-            .entry(code_unit)
-            .or_default()
-            .push(node_range(node));
+        self.ranges.entry(code_unit).or_default().push(range);
     }
 
     /// Registers a declaration-like code unit for analysis without giving it a source range.

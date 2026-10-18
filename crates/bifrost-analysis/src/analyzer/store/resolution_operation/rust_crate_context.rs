@@ -786,6 +786,8 @@ pub(super) const EXPORT: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     include_str!("rust_crate_point_export.sql")
 );
+/// Source gap conditions: derive-helper names of module-level declarations and
+/// directly proven inactive macro inputs. A NULL helper is an inactive-input proof.
 /// The derive-helper attribute names of the module-level declarations a
 /// lookup reached, with the open binder gap the producer left on each
 /// declaration site (origin ?1) and every placement of the declaration.
@@ -815,7 +817,39 @@ pub(super) const DERIVE_HELPER_CONDITIONS: &str = "SELECT mount.mount_ordinal, g
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
  WHERE mount.storage_language='rust' AND property.nearest_declaration_boundary=0
- ORDER BY mount.mount_ordinal, gap.reason, helper.value, placement.topology_id, placement.container_path";
+ UNION ALL
+ -- A macro input in a proven-inactive source placement cannot add names or
+ -- members. A NULL helper denotes this direct cfg proof, not a helper lookup.
+ SELECT mount.mount_ordinal, gap.reason, NULL, 0, ''
+ FROM json_each(?2) AS reached
+ CROSS JOIN temp.selected_resolution_mounts AS mount
+  ON mount.mount_ordinal=reached.value->>0
+ CROSS JOIN main.source_rust_macro_inputs AS input
+  INDEXED BY source_rust_macro_inputs_conditional_frontier
+  ON input.blob_id=mount.blob_id AND input.cfg_condition<>'always'
+  AND input.native_gap_site IS NOT NULL
+ CROSS JOIN main.resolution_gap_reasons AS gap
+  INDEXED BY resolution_gap_reasons_site
+  ON gap.blob_id=input.blob_id AND gap.site=input.native_gap_site
+  AND (reached.value->>1 IS NULL OR gap.reason=reached.value->>1)
+ WHERE mount.storage_language='rust'
+  AND EXISTS (
+   SELECT 1 FROM main.resolution_unit_summary_members AS member
+    INDEXED BY resolution_unit_summary_members_blob
+   CROSS JOIN selected_rust_unit_summaries AS selected
+    ON selected.summary_id=member.summary_id
+   WHERE member.blob_id=input.blob_id)
+  AND NOT EXISTS (
+   SELECT 1 FROM main.resolution_unit_summary_members AS member
+    INDEXED BY resolution_unit_summary_members_blob
+   CROSS JOIN selected_rust_unit_summaries AS selected
+    ON selected.summary_id=member.summary_id
+   LEFT JOIN main.rust_resolution_unit_summary_contexts AS context
+    ON context.summary_id=selected.summary_id
+   WHERE member.blob_id=input.blob_id
+    AND CASE WHEN context.summary_id IS NULL THEN -1
+             ELSE cr_cfg(input.cfg_condition,json(context.cfg_atoms)) END<>0)
+ ORDER BY 1, 2, 3, 4, 5";
 pub(super) const EXTERNAL_BINDING: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     include_str!("rust_crate_point_external.sql")
@@ -931,6 +965,13 @@ pub(super) const OPEN_INVENTORY: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     include_str!("rust_crate_point_inventory.sql"),
 );
+pub(super) const UNKNOWN_IMPORT_INVENTORY: &str = "SELECT json(gap.detail)
+ FROM selected_rust_unit_summaries AS unit
+ CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap
+  ON gap.summary_id=unit.summary_id AND gap.gap_kind='unknown_activation'
+ WHERE unit.topology_id=?1 AND gap.subject IN (?2, ?2 || '::' || ?3)
+  AND EXISTS(SELECT 1 FROM json_each(gap.detail, '$.evidence') AS evidence
+             WHERE json_extract(evidence.value, '$.import_ordinal') IS NOT NULL)";
 pub(super) const UNINDEXED_SCOPE: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     include_str!("rust_crate_point_unindexed_scope.sql"),
@@ -2198,6 +2239,10 @@ impl SelectedResolutionOperation<'_, '_> {
                         module.scope,
                     )
                 {
+                    route_completion = route_completion.combine(
+                        &(super::rust_crate_rows::RustCrateRows { ready: &self.ready })
+                            .crate_import_inventory_completion(module, &demand)?,
+                    );
                     for (id, path) in (super::rust_crate_rows::RustCrateRows { ready: &self.ready })
                         .crate_route(
                             module,
@@ -4322,6 +4367,11 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ("rust_point_import_inventory", IMPORT_INVENTORY, 1),
         ("rust_point_gap_details", GAP_DETAILS, 1),
         ("rust_point_open_inventory", OPEN_INVENTORY, 6),
+        (
+            "rust_point_unknown_import_inventory",
+            UNKNOWN_IMPORT_INVENTORY,
+            3,
+        ),
         ("rust_point_open_route", OPEN_ROUTE, 3),
     ]
 }
@@ -5830,7 +5880,9 @@ mod tests {
                     "rust_point_unindexed_scope" => {
                         vec![int(topology), text("crate::inner"), text("macro"), text("helper"), int(topology), text("crate")]
                     }
-                    "rust_point_open_route" => vec![int(topology), text("crate"), text("inner")],
+                    "rust_point_open_route" | "rust_point_unknown_import_inventory" => {
+                        vec![int(topology), text("crate"), text("inner")]
+                    }
                     "rust_point_module_prefix_route"
                     | "rust_point_module_import_prefix_route" => vec![
                         int(topology),
@@ -6542,6 +6594,11 @@ mod tests {
                     // the only scans are the two `json_each` tables and the
                     // placement view's own scope-alignment recursion.
                     if pin.name == "rust_point_derive_helper_conditions" {
+                        assert!(
+                            plan.iter().any(|step| step
+                                .contains("source_rust_macro_inputs_conditional_frontier")),
+                            "{state:?} conditional frontiers must use their partial index: {plan:?}"
+                        );
                         assert!(
                             plan.iter().any(|step| step
                                 .contains("source_rust_declaration_properties_derive_helpers")),

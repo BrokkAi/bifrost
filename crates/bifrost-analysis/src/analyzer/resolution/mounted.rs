@@ -1161,6 +1161,15 @@ where
         self.result(&self.inner.scope_reverse_inventory_completion(&completion))
     }
 
+    fn semantic_language_of(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::Language>> {
+        self.inner
+            .semantic_language_of(self.argument(&identity), cancellation)
+    }
+
     fn universe_entry(
         &self,
         reference: SemanticId,
@@ -1189,6 +1198,15 @@ where
     ) -> StoreResult<Option<[u8; 32]>> {
         self.inner
             .shared_name_digest_for_identity(self.argument(&identity), cancellation)
+    }
+
+    fn supports_direct_type_shapes(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.inner
+            .supports_direct_type_shapes(self.argument(&reference), cancellation)
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -2203,7 +2221,7 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 31, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(batch.len(), 33, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
         assert_eq!(typed.len(), 79, "SelectedTypedFactSource: {typed:?}");

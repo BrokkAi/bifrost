@@ -22,6 +22,14 @@ pub(crate) fn python_lexical_scope_inventory_bounded<'tree>(
     source: &str,
     mut scope_step: impl FnMut() -> bool,
 ) -> Option<PythonLexicalScopeInventory<'tree>> {
+    if callable.kind() == "module" {
+        return PythonLexicalScopeInventory::collect_bounded(
+            callable,
+            source,
+            std::iter::empty(),
+            scope_step,
+        );
+    }
     let layout = formal_parameter_slots_for_owner_bounded(
         Language::Python,
         callable,

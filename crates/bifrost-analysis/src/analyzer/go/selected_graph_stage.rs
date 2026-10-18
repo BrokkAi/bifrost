@@ -3,7 +3,7 @@
 use super::go_named::{GoDemandContext, GoPackageStageUnit};
 use super::go_same_package::GoPackageMemberIndexCache;
 use super::graph_stage::{
-    GraphStageAdapter, GraphStageGuard, GraphStageMetrics, GraphStageResult,
+    GraphStageAdapter, GraphStageAdmission, GraphStageGuard, GraphStageMetrics, GraphStageResult,
     MAX_GRAPH_STAGE_READ_BATCH_SIZE, run_graph_stages,
 };
 use super::*;
@@ -42,9 +42,11 @@ impl GraphStageAdapter for GoGraphStageAdapter<'_> {
         operation: &SelectedResolutionOperation<'_, '_>,
         files: &[ProjectFile],
         cancellation: &CancellationToken,
-    ) -> Result<SelectedResolutionOperationOutcome<Vec<(Self::Unit, Vec<ProjectFile>)>>> {
+    ) -> Result<SelectedResolutionOperationOutcome<GraphStageAdmission<Self::Unit>>> {
         let mounts = operation.mount_table();
         let mut groups = BTreeMap::<GoPackageStageUnit, Vec<ProjectFile>>::new();
+        let mut skipped = BTreeMap::new();
+        let mut modules = None;
         for file in files {
             if cancellation.is_cancelled() {
                 return Ok(SelectedResolutionOperationOutcome::Cancelled(
@@ -52,36 +54,45 @@ impl GraphStageAdapter for GoGraphStageAdapter<'_> {
                 ));
             }
             let path = selected_path_key(file.rel_path());
-            let Some(mount) = mounts.mount_for_path("go", &path)? else {
-                return Ok(SelectedResolutionOperationOutcome::Unavailable(
-                    SelectedResolutionUnavailable::GoContextUnavailable {
-                        persisted_relative_path: path,
-                    },
-                ));
-            };
-            assert_eq!(mount.semantic_language(), Language::Go);
-            let Some(unit) =
+            let unit = if let Some(mount) = mounts.mount_for_path("go", &path)? {
+                assert_eq!(mount.semantic_language(), Language::Go);
                 operation.go_package_stage_unit_for_path(self.context_id, &path, cancellation)?
-            else {
-                if cancellation.is_cancelled() {
-                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                        cancelled_completion(),
-                    ));
-                }
-                return Ok(SelectedResolutionOperationOutcome::Unavailable(
-                    SelectedResolutionUnavailable::GoContextUnavailable {
-                        persisted_relative_path: path,
-                    },
-                ));
+            } else {
+                None
             };
-            groups.entry(unit).or_default().push(file.clone());
+            if let Some(unit) = unit {
+                groups.entry(unit).or_default().push(file.clone());
+                continue;
+            }
+            if cancellation.is_cancelled() {
+                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                    cancelled_completion(),
+                ));
+            }
+            // Read module roots only when a caller lacks a selected unit.
+            let modules = modules.get_or_insert_with(|| {
+                brokk_bifrost_go::packages::go_module_roots(self.analyzer.project())
+            });
+            let module = modules
+                .iter()
+                .filter(|module| file.parent().starts_with(&module.workspace_dir))
+                .max_by_key(|module| module.workspace_dir.components().count());
+            let reason = operation.go_graph_file_exclusion(
+                self.context_id,
+                &path,
+                module.map(|module| module.import_path.as_str()),
+            )?;
+            skipped.insert(file.clone(), reason);
         }
         for group in groups.values_mut() {
             group.sort();
             group.dedup();
         }
         Ok(SelectedResolutionOperationOutcome::Native(
-            groups.into_iter().collect(),
+            GraphStageAdmission {
+                units: groups.into_iter().collect(),
+                skipped,
+            },
         ))
     }
 

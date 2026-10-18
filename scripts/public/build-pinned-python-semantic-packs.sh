@@ -30,8 +30,8 @@ e4faf1d0ebbbc22a4932f56af7c3067f21334cd88146bd23deec41d529220626  typeshed-1620e
 CHECKSUMS
 tar -C "${typeshed_dir}" -xzf typeshed-1620e225476597f34177351ef913dc8390dade30.tar.gz
 # The pinned artifact is a source set, not one file. Its canonical digest
-# covers the stub paths and bytes the specification lists, so `generate`
-# verifies the extracted tree itself. The directory name is pinned too, so
+# covers the discovered local import closure of the specification's seeds, so
+# `generate` verifies the extracted tree itself. The directory name is pinned too, so
 # copy the stub root to the name the specification records. Copying the
 # contents keeps a repeated run in the same work directory idempotent instead
 # of nesting a second `stdlib` directory below the pinned artifact root.

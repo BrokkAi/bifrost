@@ -804,6 +804,7 @@ mod tests {
                     nodes,
                     edges: Vec::new(),
                     admitted_callers: HashSet::from_iter(admitted_callers.iter().cloned()),
+                    skipped_callers: Default::default(),
                     unresolved_names: Some(self.unresolved_names.clone()),
                     forward_completeness: self.completeness.clone(),
                     kind_projection_complete: true,

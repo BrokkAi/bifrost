@@ -125,6 +125,7 @@ pub(crate) struct SelectedSemanticLocator {
     address: SelectedSemanticAddress,
     role: LoweredSemanticRole,
     reference_namespace: Option<ResolutionNamespace>,
+    call_argument_ordinal: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -157,6 +158,7 @@ impl SelectedSemanticLocator {
             address: SelectedSemanticAddress::SourceSite(source_site),
             role,
             reference_namespace: None,
+            call_argument_ordinal: None,
         }
     }
 
@@ -210,6 +212,15 @@ impl SelectedSemanticLocator {
         locator
     }
 
+    pub(crate) fn with_call_argument_ordinal(mut self, ordinal: u32) -> Self {
+        self.call_argument_ordinal = Some(ordinal);
+        self
+    }
+
+    pub(crate) const fn call_argument_ordinal(&self) -> Option<u32> {
+        self.call_argument_ordinal
+    }
+
     pub(crate) const fn reference_namespace(&self) -> Option<ResolutionNamespace> {
         self.reference_namespace
     }
@@ -249,6 +260,7 @@ impl SelectedSemanticLocator {
             address,
             role,
             reference_namespace: None,
+            call_argument_ordinal: None,
         }
     }
 
@@ -1592,11 +1604,22 @@ impl SharedNameInterner for PerRequestSharedNames {
 /// storage-language or parser-dialect key. The recipe therefore survives
 /// remounting and can be written directly to the normalized lookup-recipe
 /// relation without trying to invert an opaque semantic digest.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ResolutionLookupSemanticRecipe {
     identity_domain: ResolutionIdentityDomain,
     namespace: ResolutionNamespace,
     spelling: String,
+    name_digest: [u8; 32],
+}
+
+// The carried digest is derived data. Keep recipe hashing on the original
+// identity fields so memo iteration does not change when that data is read.
+impl std::hash::Hash for ResolutionLookupSemanticRecipe {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.identity_domain, state);
+        std::hash::Hash::hash(&self.namespace, state);
+        std::hash::Hash::hash(&self.spelling, state);
+    }
 }
 
 impl ResolutionLookupSemanticRecipe {
@@ -1606,6 +1629,7 @@ impl ResolutionLookupSemanticRecipe {
             identity_domain: _,
             namespace: _,
             spelling,
+            name_digest: _,
         } = self;
         spelling.capacity()
     }
@@ -1618,6 +1642,20 @@ impl ResolutionLookupSemanticRecipe {
         identity_domain: ResolutionIdentityDomain,
         namespace: ResolutionNamespace,
         spelling: &str,
+    ) -> Self {
+        let mut hasher = CanonicalHasher::new(b"bifrost-resolution-effective-lookup-key:v1");
+        hasher.field("language", identity_domain.identity_label().as_bytes());
+        hasher.field("namespace", namespace.identity_label().as_bytes());
+        hasher.field("spelling", spelling.as_bytes());
+        Self::from_name_digest(identity_domain, namespace, spelling, hasher.finish())
+    }
+
+    /// Rehydrate an immutable recipe with its stored canonical interning key.
+    pub(crate) fn from_name_digest(
+        identity_domain: ResolutionIdentityDomain,
+        namespace: ResolutionNamespace,
+        spelling: &str,
+        name_digest: [u8; 32],
     ) -> Self {
         assert_ne!(
             identity_domain,
@@ -1645,6 +1683,7 @@ impl ResolutionLookupSemanticRecipe {
             identity_domain,
             namespace,
             spelling: spelling.to_owned(),
+            name_digest,
         }
     }
 
@@ -1664,12 +1703,8 @@ impl ResolutionLookupSemanticRecipe {
     ///
     /// This is the interning key, not the identity: it is how a store finds or
     /// creates the row whose id the recipe then is.
-    pub(crate) fn name_digest(&self) -> [u8; 32] {
-        let mut hasher = CanonicalHasher::new(b"bifrost-resolution-effective-lookup-key:v1");
-        hasher.field("language", self.identity_domain.identity_label().as_bytes());
-        hasher.field("namespace", self.namespace.identity_label().as_bytes());
-        hasher.field("spelling", self.spelling.as_bytes());
-        hasher.finish()
+    pub(crate) const fn name_digest(&self) -> [u8; 32] {
+        self.name_digest
     }
 
     pub(crate) fn identity(&self, names: &dyn SharedNameInterner) -> ResolutionSemanticIdentity {

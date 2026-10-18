@@ -95,6 +95,15 @@ pub struct SourceLexicalDeclarationFact {
     pub identifier: String,
 }
 
+/// A source-selected lexical access region, independent of the access modifier.
+/// Package values come from structured package context; template owners retain
+/// declaration identity, so an unrelated same-named declaration cannot match.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeclarationAccessBoundary<Owner> {
+    Package(String),
+    Template(Owner),
+}
+
 /// The source-owned visibility of one declaration.
 ///
 /// This fact is keyed by the declaration identity allocated by the primary

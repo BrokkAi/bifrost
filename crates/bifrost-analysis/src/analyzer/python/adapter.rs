@@ -16,10 +16,50 @@ use brokk_bifrost_python::queries::PYTHON_QUERY_DIRECTORY;
 use brokk_bifrost_python::test_detection::python_source_contains_tests;
 use tree_sitter::Tree;
 
-#[derive(Debug, Clone, Default)]
-pub struct PythonAdapter;
+#[derive(Clone, Default)]
+pub struct PythonAdapter {
+    project: Option<std::sync::Arc<dyn crate::analyzer::Project>>,
+}
+
+impl std::fmt::Debug for PythonAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonAdapter").finish_non_exhaustive()
+    }
+}
+
+impl PythonAdapter {
+    #[cfg(test)]
+    pub(crate) fn for_test_file(file: &ProjectFile) -> Self {
+        Self {
+            project: Some(std::sync::Arc::new(crate::analyzer::TestProject::new(
+                file.root(),
+                Language::Python,
+            ))),
+        }
+    }
+
+    pub(super) fn shared_project(&self) -> std::sync::Arc<dyn crate::analyzer::Project> {
+        std::sync::Arc::clone(
+            self.project
+                .as_ref()
+                .expect("Python adapter is project bound"),
+        )
+    }
+
+    pub(super) fn project(&self) -> &dyn crate::analyzer::Project {
+        self.project
+            .as_deref()
+            .expect("Python adapter must be bound to its selected project")
+    }
+}
 
 impl LanguageAdapter for PythonAdapter {
+    fn for_project(&self, project: std::sync::Arc<dyn crate::analyzer::Project>) -> Option<Self> {
+        Some(Self {
+            project: Some(project),
+        })
+    }
+
     fn supports_structural_line_data(&self) -> bool {
         true
     }
@@ -67,7 +107,7 @@ impl LanguageAdapter for PythonAdapter {
     }
 
     fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
-        python_module_name(file)
+        python_module_name(self.project(), file)
     }
 
     fn default_package_anchor(&self) -> Option<crate::analyzer::PackageAnchor> {
@@ -83,7 +123,9 @@ impl LanguageAdapter for PythonAdapter {
         file: &ProjectFile,
     ) -> Option<crate::analyzer::FqName> {
         match anchor {
-            crate::analyzer::PackageAnchor::OwnModule { pop: 0 } => Some(python_module_fq(file)),
+            crate::analyzer::PackageAnchor::OwnModule { pop: 0 } => {
+                Some(python_module_fq(self.project(), file))
+            }
             _ => None,
         }
     }
@@ -98,8 +140,7 @@ impl LanguageAdapter for PythonAdapter {
         source: &str,
         state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
     ) {
-        let module_fq = python_module_name(file);
-        let Some(module) = module_code_unit(file, &module_fq) else {
+        let Some(module) = module_code_unit(self.project(), file) else {
             return;
         };
         state.top_level_declarations.insert(0, module.clone());
@@ -120,7 +161,7 @@ impl LanguageAdapter for PythonAdapter {
     }
 
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
-        module_code_unit(file, &python_module_name(file))
+        module_code_unit(self.project(), file)
     }
 
     fn has_path_synthetic_module_units(&self) -> bool {
@@ -155,7 +196,7 @@ impl LanguageAdapter for PythonAdapter {
         source: &str,
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-        parse_python_file(file, source, tree)
+        parse_python_file(self.project(), file, source, tree)
     }
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {

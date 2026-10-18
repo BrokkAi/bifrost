@@ -96,7 +96,7 @@ const GO_POINT_NULL_RECEIVER_FRONTIER: &str = r#"
 SELECT DISTINCT obligation.receiver_slot
 FROM temp.selected_resolution_mounts mounted
 JOIN main.go_context_source_files selected_file
-  ON selected_file.file_version_id=mounted.file_version_id AND selected_file.context_id=?4
+  ON selected_file.file_version_id=mounted.file_version_id AND selected_file.context_id=?4 AND selected_file.source_role<>'ignored'
 JOIN main.resolution_sites site
   ON site.blob_id=mounted.blob_id AND site.start_byte=?2 AND site.end_byte=?3
  AND site.receiver_origin IS NOT NULL
@@ -393,7 +393,8 @@ WITH RECURSIVE package_files(mount_ordinal,blob_id) AS (
   SELECT package_file.mount_ordinal,package_file.blob_id,member.definition_key,
          domain.shared_identity,member.namespace,lookup.shared_identity
   FROM package_files package_file
-  JOIN main.resolution_package_members member ON member.blob_id=package_file.blob_id
+  -- A namespace auto-index otherwise scans members from every stored blob.
+  CROSS JOIN main.resolution_package_members member ON member.blob_id=package_file.blob_id
   JOIN main.resolution_semantic_catalog lookup
     ON lookup.blob_id=member.blob_id AND lookup.local_key=member.lookup_key
   JOIN main.resolution_semantic_catalog domain
@@ -467,8 +468,10 @@ WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
 
 // The anchor reference identifies one expression occurrence, not merely the
 // declaration it binds to. Its projection and construction rows therefore
-// select the literal's own value slot, even for repeated literals of one type.
-const GO_POINT_EXPRESSION_VALUE_SLOT_AT: &str = r#"
+// select the expression's own value slot, even for repeated literals of one type.
+// An independent construction value takes precedence over a call-result slot:
+// constructor applicability may be open while the created type is already known.
+const POINT_EXPRESSION_VALUE_SLOT_AT: &str = r#"
 WITH anchors AS (
   SELECT mounted.blob_id, semantic.semantic_key
   FROM temp.selected_resolution_mounts mounted
@@ -477,24 +480,42 @@ WITH anchors AS (
   JOIN main.resolution_semantic_sites semantic
     ON semantic.blob_id=site.blob_id AND semantic.source_site=site.site
    AND semantic.semantic_role='reference'
-  WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
+  WHERE mounted.mount_ordinal=?1 AND mounted.storage_language=?4
+), expression_values AS (
+  SELECT transfer.target_slot AS slot
+  FROM anchors
+  JOIN main.resolution_binding_projections projection
+    ON projection.blob_id=anchors.blob_id AND projection.reference=anchors.semantic_key
+  JOIN main.resolution_type_transfers transfer
+    ON transfer.blob_id=projection.blob_id AND transfer.source_slot=projection.output_slot
+   AND transfer.kind=10 -- Construction in ALL_RESOLUTION_TYPE_TRANSFER_KINDS
+  JOIN main.resolution_type_frontiers frontier
+    ON frontier.blob_id=transfer.blob_id AND frontier.slot=transfer.target_slot
+   AND frontier.role=7 -- ExpressionValue in ALL_RESOLUTION_TYPE_SLOT_ROLES
 )
+SELECT slot FROM expression_values
+UNION
 SELECT obligation.result_slot
 FROM anchors
 JOIN main.resolution_call_obligations obligation
   ON obligation.blob_id=anchors.blob_id
  AND obligation.callee_reference=anchors.semantic_key
-UNION
-SELECT transfer.target_slot
-FROM anchors
-JOIN main.resolution_binding_projections projection
-  ON projection.blob_id=anchors.blob_id AND projection.reference=anchors.semantic_key
-JOIN main.resolution_type_transfers transfer
-  ON transfer.blob_id=projection.blob_id AND transfer.source_slot=projection.output_slot
- AND transfer.kind=10 -- Construction in ALL_RESOLUTION_TYPE_TRANSFER_KINDS
-JOIN main.resolution_type_frontiers frontier
-  ON frontier.blob_id=transfer.blob_id AND frontier.slot=transfer.target_slot
- AND frontier.role=7 -- ExpressionValue in ALL_RESOLUTION_TYPE_SLOT_ROLES
+WHERE NOT EXISTS (SELECT 1 FROM expression_values)
+"#;
+
+const POINT_CALL_ARGUMENT_SLOT_AT: &str = r#"
+SELECT argument.value->>2
+FROM temp.selected_resolution_mounts mounted
+JOIN main.resolution_sites site
+  ON site.blob_id=mounted.blob_id AND site.start_byte=?2 AND site.end_byte=?3
+JOIN main.resolution_semantic_sites semantic
+  ON semantic.blob_id=site.blob_id AND semantic.source_site=site.site
+ AND semantic.semantic_role='reference'
+JOIN main.resolution_call_obligations obligation
+  ON obligation.blob_id=semantic.blob_id AND obligation.callee_reference=semantic.semantic_key
+JOIN json_each(obligation.argument_slots, '$[0]') argument
+  ON argument.value->>0=0 AND argument.value->>1=?5
+WHERE mounted.mount_ordinal=?1 AND mounted.storage_language=?4
 "#;
 
 const GO_POINT_CALLABLE_RESULT_SLOT: &str = r#"
@@ -505,6 +526,8 @@ JOIN main.resolution_call_obligations obligation
 WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
 "#;
 
+// Package files must drive both callable reads. Reordering these joins builds
+// a name auto-index over callables outside the requested package (#5658).
 const GO_RECEIVER_ANCHOR_MEMBER: &str = r#"
 WITH RECURSIVE package_files(mount_ordinal,blob_id) AS (
   SELECT mounted.mount_ordinal,mounted.blob_id
@@ -558,7 +581,7 @@ WITH RECURSIVE package_files(mount_ordinal,blob_id) AS (
 ), callable_receiver_types(mount_ordinal,blob_id,declaration_id,type_id) AS (
   SELECT package_file.mount_ordinal,package_file.blob_id,callable.declaration_id,callable.receiver_type_id
   FROM package_files package_file
-  JOIN main.source_go_callables callable ON callable.blob_id=package_file.blob_id
+  CROSS JOIN main.source_go_callables callable ON callable.blob_id=package_file.blob_id
   JOIN selected_type selected ON 1=1
   WHERE callable.name=?6 AND callable.is_method=1
     AND callable.receiver_type_id IS NOT NULL
@@ -571,7 +594,7 @@ WITH RECURSIVE package_files(mount_ordinal,blob_id) AS (
 ), member_declarations(blob_id,declaration_id) AS (
   SELECT callable.blob_id,callable.declaration_id
   FROM package_files package_file
-  JOIN main.source_go_callables callable ON callable.blob_id=package_file.blob_id
+  CROSS JOIN main.source_go_callables callable ON callable.blob_id=package_file.blob_id
   JOIN selected_type selected ON 1=1
   WHERE callable.name=?6
     AND (callable.owner_type_id=selected.type_id OR EXISTS (
@@ -685,21 +708,36 @@ impl SelectedResolutionOperation<'_, '_> {
         end_byte: usize,
         cancellation: &CancellationToken,
     ) -> Result<Option<SemanticId>> {
+        self.point_expression_value_slot_at("go", caller_path, start_byte, end_byte, cancellation)
+    }
+
+    pub(crate) fn point_expression_value_slot_at(
+        &self,
+        storage_language: &str,
+        caller_path: &str,
+        start_byte: usize,
+        end_byte: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SemanticId>> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let Some(caller) = self.mount_table().mount_for_path("go", caller_path)? else {
+        let Some(caller) = self
+            .mount_table()
+            .mount_for_path(storage_language, caller_path)?
+        else {
             return Ok(None);
         };
         let mut statement = self
             .ready
             .inventory
             .connection()
-            .prepare_cached(GO_POINT_EXPRESSION_VALUE_SLOT_AT)?;
+            .prepare_cached(POINT_EXPRESSION_VALUE_SLOT_AT)?;
         let mut rows = statement.query(rusqlite::params![
             caller.ordinal().get(),
-            i64::try_from(start_byte).expect("Go source offsets fit SQLite integers"),
-            i64::try_from(end_byte).expect("Go source offsets fit SQLite integers")
+            i64::try_from(start_byte).expect("source offsets fit SQLite integers"),
+            i64::try_from(end_byte).expect("source offsets fit SQLite integers"),
+            storage_language
         ])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
@@ -710,7 +748,50 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         Ok(Some(SemanticId::local(
             caller.ordinal().get(),
-            u32::try_from(slot).expect("a Go expression slot has a nonnegative local identity"),
+            u32::try_from(slot).expect("an expression slot has a nonnegative local identity"),
+        )))
+    }
+
+    pub(crate) fn point_call_argument_slot_at(
+        &self,
+        storage_language: &str,
+        caller_path: &str,
+        start_byte: usize,
+        end_byte: usize,
+        ordinal: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SemanticId>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(caller) = self
+            .mount_table()
+            .mount_for_path(storage_language, caller_path)?
+        else {
+            return Ok(None);
+        };
+        let mut statement = self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(POINT_CALL_ARGUMENT_SLOT_AT)?;
+        let mut rows = statement.query(rusqlite::params![
+            caller.ordinal().get(),
+            i64::try_from(start_byte).expect("source offsets fit SQLite integers"),
+            i64::try_from(end_byte).expect("source offsets fit SQLite integers"),
+            storage_language,
+            ordinal
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let slot: i64 = row.get(0)?;
+        if rows.next()?.is_some() || cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(SemanticId::local(
+            caller.ordinal().get(),
+            u32::try_from(slot).expect("an argument slot has a nonnegative local identity"),
         )))
     }
 

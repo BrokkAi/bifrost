@@ -220,9 +220,15 @@ pub(crate) const DECLARATION_TYPES_BY_SLOT_SQL: &str = "SELECT definition, role,
 /// is already a row keyed exactly as the reader asks.
 // Keep the composite requested key together: separate blob equality and a key
 // IN list let the canonical view arm scan every declaration in the blob first.
-pub(crate) const DECLARATION_VISIBILITIES_BY_DEFINITION_SQL: &str = "SELECT definition_semantic_key, visibility \
-     FROM resolution_declaration_visibility_properties \
-     WHERE (blob_id, definition_semantic_key) IN (SELECT ?1, value FROM json_each(?2))";
+// Bound the right-hand view before the LEFT JOIN: SQLite may otherwise
+// materialize every workspace boundary while answering one definition page.
+pub(crate) const DECLARATION_VISIBILITIES_BY_DEFINITION_SQL: &str = "WITH requested_boundaries AS MATERIALIZED ( \
+       SELECT * FROM resolution_declaration_access_boundaries \
+       WHERE (blob_id, definition_semantic_key) IN (SELECT ?1, value FROM json_each(?2)) \
+     ) SELECT visibility.definition_semantic_key, visibility.visibility, boundary.boundary_kind, boundary.package_region, boundary.template_semantic_key \
+     FROM resolution_declaration_visibility_properties AS visibility \
+     LEFT JOIN requested_boundaries AS boundary ON boundary.blob_id=visibility.blob_id AND boundary.definition_semantic_key=visibility.definition_semantic_key \
+     WHERE (visibility.blob_id, visibility.definition_semantic_key) IN (SELECT ?1, value FROM json_each(?2))";
 
 /// Questions 46 and 47 keep the tier 1 table they already have, for the same
 /// reason as question 45: it holds the fact under the key the reader holds,
@@ -1347,6 +1353,7 @@ pub(crate) fn value_transform_code(transform: TypeTransferValueTransform) -> i64
         TypeTransferValueTransform::AddressableRuntimeOnly => 5,
         TypeTransferValueTransform::AddressableOperandOnly => 6,
         TypeTransferValueTransform::RuntimeOnly => 7,
+        TypeTransferValueTransform::StaticTypeObject => 8,
     }
 }
 
@@ -1360,6 +1367,7 @@ pub(crate) fn value_transform_from_code(value: i64) -> TypeTransferValueTransfor
         5 => TypeTransferValueTransform::AddressableRuntimeOnly,
         6 => TypeTransferValueTransform::AddressableOperandOnly,
         7 => TypeTransferValueTransform::RuntimeOnly,
+        8 => TypeTransferValueTransform::StaticTypeObject,
         other => {
             panic!("stored type transfer value transform code {other} is outside its vocabulary")
         }

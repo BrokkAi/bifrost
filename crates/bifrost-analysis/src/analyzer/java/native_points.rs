@@ -13,7 +13,7 @@ use crate::analyzer::native_points::{
 use crate::analyzer::resolve_analyzer;
 use crate::analyzer::semantic_model::{SemanticModelCallableKey, SemanticModelSymbolKind, TypeRef};
 use crate::analyzer::store::resolution_operation::{
-    JavaExternalStaticImportBoundary, JavaImportContext, NativeExternalMemberTarget,
+    JavaExternalStaticImportBoundary, JavaImportContext,
 };
 use crate::analyzer::usages::call_conversion::{CallArgumentConversionProver, ConversionUnknown};
 use crate::analyzer::usages::get_definition::{
@@ -339,6 +339,13 @@ fn java_scoped_external_type_route(
         return None;
     }
 
+    // An unresolved simple prefix is still a PackageOrTypeName. An
+    // unindexed on-demand import may supply an obscuring type (#5556), so
+    // absence from the workspace does not prove an external package route.
+    if qualifier.kind() == "type_identifier" {
+        return None;
+    }
+
     let definitions = AnalyzerDefinitionLookup::new(query.analyzer, Language::Java);
     let qualifier_is_in_workspace =
         definitions.package_exists(qualifier_text) || definitions.fqn_prefix_exists(qualifier_text);
@@ -566,7 +573,7 @@ fn java_native_call_evidence(
             let external_call = if receiver.is_some() {
                 match receiver_type.as_ref() {
                     Some(JavaNativeReceiverResolution::External { owner, form }) => {
-                        java_native_external_method_proof(
+                        java_native_external_method_resolution(
                             java,
                             query,
                             token,
@@ -591,7 +598,7 @@ fn java_native_call_evidence(
                 } else {
                     boundary.and_then(|boundary| {
                         let owner = java_native_external_type(java, query, token, &boundary.owner)?;
-                        java_native_external_method_proof(
+                        java_native_external_method_resolution(
                             java,
                             query,
                             token,
@@ -618,7 +625,7 @@ fn java_native_call_evidence(
                 if selected_member != member_name {
                     return None;
                 }
-                java_native_external_method_proof(
+                java_native_external_method_resolution(
                     java,
                     query,
                     token,
@@ -628,7 +635,7 @@ fn java_native_call_evidence(
                     JavaNativeReceiverForm::BoundValue,
                 )
                 .or_else(|| {
-                    java_native_external_method_proof(
+                    java_native_external_method_resolution(
                         java,
                         query,
                         token,
@@ -639,17 +646,39 @@ fn java_native_call_evidence(
                     )
                 })
             });
-            if let Some((proof, owner, member, dispatch_closed)) = external_call {
-                if let Some(proof) = proof {
-                    publish_java_external_call_boundary(query, outcome, &proof, &owner, &member);
-                    evidence = evidence.with_native_java_external_call(
+            if let Some(JavaNativeExternalMethodResolution {
+                owner,
+                member,
+                invocation,
+            }) = external_call
+            {
+                match invocation {
+                    JavaNativeExternalInvocation::Selected {
                         proof,
-                        &owner,
-                        &member,
                         dispatch_closed,
-                    );
-                } else {
-                    publish_java_external_member_identity(query, outcome, &owner, &member);
+                    } => {
+                        publish_java_external_call_boundary(
+                            query, outcome, &proof, &owner, &member,
+                        );
+                        evidence = evidence.with_native_java_external_call(
+                            *proof,
+                            &owner,
+                            &member,
+                            dispatch_closed,
+                        );
+                    }
+                    JavaNativeExternalInvocation::Witnessed => {
+                        publish_java_external_incomplete_member_identity(
+                            query, outcome, &owner, &member,
+                        );
+                        evidence =
+                            evidence.with_native_java_external_member_identity(&owner, &member);
+                    }
+                    JavaNativeExternalInvocation::Rejected => {
+                        // A known inapplicable member can still be named for
+                        // navigation, without becoming a structured call identity.
+                        publish_java_external_member_identity(query, outcome, &owner, &member);
+                    }
                 }
             } else if receiver.is_some()
                 && matches!(receiver_type, Some(JavaNativeReceiverResolution::Untyped))
@@ -907,9 +936,9 @@ fn java_native_external_receiver(
     if !matches!(from_site_type, JavaNativeReceiverResolution::Untyped) {
         return from_site_type;
     }
-    // Keep these routes for the uncovered local call-result initializer,
-    // java.lang type-qualifier, and fully qualified path shapes tracked in
-    // `.agents/plans/j6-unindexed-jvm-imports.md`.
+    // Preserve established parameter/local and type-qualifier receiver binding.
+    // Actual applicability and selected external call-result typing are separate
+    // claims; neither is inferred by these receiver-binding routes.
     if let Some(receiver) =
         java_native_external_receiver_from_identifier(java, query, token, receiver)
     {
@@ -996,10 +1025,27 @@ fn java_native_external_receiver_from_site_type(
     query: BoundedReceiverQuery<'_>,
     token: crate::analyzer::QueryToken<'_>,
     receiver: Node<'_>,
-    enclosing_call: Node<'_>,
+    _enclosing_call: Node<'_>,
 ) -> JavaNativeReceiverResolution {
     if matches!(receiver.kind(), "this" | "super") {
         return JavaNativeReceiverResolution::Typed;
+    }
+    if receiver.kind() == "method_invocation" {
+        return match java_native_argument_type(java, query, token, receiver) {
+            Some(TypeRef::Named {
+                name, arguments, ..
+            }) if arguments.is_empty() => {
+                match java_native_static_external_type(java, query, &name) {
+                    Some(owner) => JavaNativeReceiverResolution::External {
+                        owner: owner.fqn().to_owned(),
+                        form: JavaNativeReceiverForm::BoundValue,
+                    },
+                    None => JavaNativeReceiverResolution::Typed,
+                }
+            }
+            Some(TypeRef::Declared { .. }) => JavaNativeReceiverResolution::Typed,
+            _ => JavaNativeReceiverResolution::Untyped,
+        };
     }
     let Some(site_node) = java_native_receiver_type_site_node(receiver) else {
         return JavaNativeReceiverResolution::Untyped;
@@ -1008,32 +1054,21 @@ fn java_native_external_receiver_from_site_type(
         return JavaNativeReceiverResolution::Untyped;
     };
     let receiver_target_kind = value.value_types.target_kind.clone();
-    let call_target = java_native_receiver_type_site_node(enclosing_call)
-        .and_then(|site| java_native_expression_value_type_at_node(query, site))
-        .and_then(|lookup| lookup.direct_target);
-    let value = value.value_types;
-    if let Some(NativeExternalMemberTarget::Indexed(target)) = call_target.as_ref()
-        && (receiver_target_kind == TypeLookupTargetKind::TypeReference
-            || (value.types.is_empty() && matches!(receiver.kind(), "identifier" | "field_access")))
-    {
-        return JavaNativeReceiverResolution::External {
-            owner: target.owner.owner_fqn.to_string(),
-            form: JavaNativeReceiverForm::TypeQualifier,
+    let static_type = value.static_type;
+    let Some(TypeRef::Named {
+        name, arguments, ..
+    }) = static_type
+    else {
+        return if matches!(static_type, Some(TypeRef::Declared { .. })) {
+            JavaNativeReceiverResolution::Typed
+        } else {
+            JavaNativeReceiverResolution::Untyped
         };
-    }
-    if !matches!(
-        value.status,
-        crate::analyzer::usages::get_type::TypeLookupStatus::Resolved
-            | crate::analyzer::usages::get_type::TypeLookupStatus::Incomplete
-    ) || value.types.len() != 1
-    {
-        return JavaNativeReceiverResolution::Untyped;
-    }
-    let ty = &value.types[0];
-    if !ty.definitions.is_empty() {
+    };
+    if !arguments.is_empty() {
         return JavaNativeReceiverResolution::Typed;
     }
-    let Some(owner) = java_native_external_type(java, query, token, &ty.fqn) else {
+    let Some(owner) = java_native_static_external_type(java, query, &name) else {
         return JavaNativeReceiverResolution::Typed;
     };
     JavaNativeReceiverResolution::External {
@@ -1046,14 +1081,14 @@ fn java_native_external_receiver_from_site_type(
     }
 }
 
-fn java_native_expression_value_type_at_node(
+fn java_native_reference_site_at_node(
     query: BoundedReceiverQuery<'_>,
     node: Node<'_>,
-) -> Option<NativeExpressionValueTypeLookup> {
+) -> Option<ResolvedReferenceSite> {
     let text = node_text_for_query(node, query.source)?;
     let start = node.start_position();
     let end = node.end_position();
-    let site = ResolvedReferenceSite {
+    Some(ResolvedReferenceSite {
         path: query.site.path.clone(),
         text: text.to_owned(),
         range: crate::analyzer::Range {
@@ -1064,7 +1099,14 @@ fn java_native_expression_value_type_at_node(
         },
         focus_start_byte: node.start_byte(),
         focus_end_byte: node.end_byte(),
-    };
+    })
+}
+
+fn java_native_expression_value_type_at_node(
+    query: BoundedReceiverQuery<'_>,
+    node: Node<'_>,
+) -> Option<NativeExpressionValueTypeLookup> {
+    let site = java_native_reference_site_at_node(query, node)?;
     let type_query = BoundedReceiverQuery {
         analyzer: query.analyzer,
         file: query.file,
@@ -1125,7 +1167,42 @@ fn java_native_external_type(
     }
 }
 
-fn java_native_external_method_proof(
+/// This name already came from a complete native static-type result or the
+/// selected declaration's return term. Do not replay caller scope lookup on
+/// a declaration-owned FQN; raw constructor spellings use the scope resolver.
+fn java_native_static_external_type(
+    java: &JavaAnalyzer,
+    query: BoundedReceiverQuery<'_>,
+    fqn: &str,
+) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
+    let selected = java_selected_jdk_artifact(java, query);
+    let surface = match selected
+        .as_ref()
+        .and_then(|evidence| evidence.artifact_sha256.as_deref())
+    {
+        Some(digest) => java
+            .external_declarations_for_source_jdk(query.analyzer.semantic_model_overlay(), digest),
+        None => java.external_declarations(query.analyzer.semantic_model_overlay()),
+    };
+    surface.get(fqn)
+}
+
+enum JavaNativeExternalInvocation {
+    Selected {
+        proof: Box<ExactExternalCallProof>,
+        dispatch_closed: bool,
+    },
+    Witnessed,
+    Rejected,
+}
+
+struct JavaNativeExternalMethodResolution {
+    owner: String,
+    member: String,
+    invocation: JavaNativeExternalInvocation,
+}
+
+fn java_native_external_method_resolution(
     java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
     token: crate::analyzer::QueryToken<'_>,
@@ -1133,7 +1210,7 @@ fn java_native_external_method_proof(
     member: &str,
     actual_types: &[TypeRef],
     form: JavaNativeReceiverForm,
-) -> Option<(Option<ExactExternalCallProof>, String, String, bool)> {
+) -> Option<JavaNativeExternalMethodResolution> {
     let canonical = format!("{owner}.{member}");
     let selected = java_selected_jdk_artifact(java, query);
     let resolved: JvmExternalMember = java.resolve_member_name_with_selected_jdk(
@@ -1145,17 +1222,41 @@ fn java_native_external_method_proof(
             .as_ref()
             .and_then(|evidence| evidence.artifact_sha256.as_deref()),
     )?;
-    if resolved.fqn() != canonical {
-        return None;
-    }
+    // The written receiver can inherit this member from another declaring owner.
+    // Canonical declaration identity and bound-receiver dispatch are independent.
+    let (owner, declared_member) = resolved.fqn().rsplit_once('.')?;
+    debug_assert_eq!(declared_member, member);
+    let member = declared_member;
     let bound_receiver = matches!(form, JavaNativeReceiverForm::BoundValue);
     if resolved.is_static() == bound_receiver {
         return None;
     }
-    let Some(parameter_count) =
-        resolved.applicable_parameter_count_for_argument_types(bound_receiver, actual_types)
-    else {
-        return Some((None, owner.to_owned(), member.to_owned(), false));
+    let surface = match selected
+        .as_ref()
+        .and_then(|artifact| artifact.artifact_sha256.as_deref())
+    {
+        Some(digest) => java
+            .external_declarations_for_source_jdk(query.analyzer.semantic_model_overlay(), digest),
+        None => java.external_declarations(query.analyzer.semantic_model_overlay()),
+    };
+    let Some(parameter_count) = resolved.applicable_parameter_count_for_argument_types(
+        bound_receiver,
+        actual_types,
+        Some(&surface),
+    ) else {
+        return Some(JavaNativeExternalMethodResolution {
+            owner: owner.to_owned(),
+            member: member.to_owned(),
+            invocation: if resolved.may_apply_to_argument_types(
+                bound_receiver,
+                actual_types,
+                Some(&surface),
+            ) {
+                JavaNativeExternalInvocation::Witnessed
+            } else {
+                JavaNativeExternalInvocation::Rejected
+            },
+        });
     };
     let proof = match form {
         JavaNativeReceiverForm::BoundValue => {
@@ -1174,10 +1275,15 @@ fn java_native_external_method_proof(
                     snapshot.active_models(),
                     bound_receiver,
                     actual_types,
+                    Some(&surface),
                 )
             })
             .or_else(|| {
-                resolved.direct_inventory_identity_for_argument_types(bound_receiver, actual_types)
+                resolved.direct_inventory_identity_for_argument_types(
+                    bound_receiver,
+                    actual_types,
+                    Some(&surface),
+                )
             }),
     )
     .with_source_jdk_artifact(selected.filter(|artifact| {
@@ -1185,14 +1291,16 @@ fn java_native_external_method_proof(
             && resolved.jdk_artifact_sha256().is_some()
     }));
     let dispatch_closed = resolved
-        .non_overridable_for_argument_types(bound_receiver, actual_types)
+        .non_overridable_for_argument_types(bound_receiver, actual_types, Some(&surface))
         .is_some();
-    Some((
-        Some(proof),
-        owner.to_owned(),
-        member.to_owned(),
-        dispatch_closed,
-    ))
+    Some(JavaNativeExternalMethodResolution {
+        owner: owner.to_owned(),
+        member: member.to_owned(),
+        invocation: JavaNativeExternalInvocation::Selected {
+            proof: Box::new(proof),
+            dispatch_closed,
+        },
+    })
 }
 
 fn publish_java_external_member_identity(
@@ -1237,17 +1345,62 @@ fn java_native_call_argument_types(
         return None;
     }
     let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .filter(|argument| !argument.is_extra())
-        .map(|argument| java_native_argument_type(java, query, token, argument))
-        .collect()
+    Some(
+        arguments
+            .named_children(&mut cursor)
+            .filter(|argument| !argument.is_extra())
+            .map(|argument| {
+                java_native_argument_type(java, query, token, argument).unwrap_or(TypeRef::Unknown)
+            })
+            .collect(),
+    )
+}
+
+/// The conversion consumer uses the same expression and slot query as native
+/// overload selection. The supplied source must still be the selected snapshot.
+pub(super) fn java_native_model_argument_type(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    expression: Node<'_>,
+    source: &str,
+) -> Option<TypeRef> {
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
+    let tree = crate::analyzer::usages::get_definition::parse_tree_for_language(
+        file,
+        Language::Java,
+        source,
+    )?;
+    let text = source.get(expression.byte_range())?;
+    let site = ResolvedReferenceSite {
+        path: crate::path_utils::rel_path_string(file),
+        text: text.to_owned(),
+        range: crate::analyzer::Range {
+            start_byte: expression.start_byte(),
+            end_byte: expression.end_byte(),
+            start_line: expression.start_position().row + 1,
+            end_line: expression.end_position().row + 1,
+        },
+        focus_start_byte: expression.start_byte(),
+        focus_end_byte: expression.end_byte(),
+    };
+    let cancellation = analyzer.active_query_cancellation();
+    let query = BoundedReceiverQuery {
+        analyzer,
+        file,
+        source,
+        tree: Some(&tree),
+        site: &site,
+        budget: Default::default(),
+        cancellation: cancellation.as_ref(),
+    };
+    let scope = AnalyzerQueryScope::new(java);
+    java_native_argument_type(java, query, scope.token(), expression)
 }
 
 fn java_native_argument_type(
-    java: &JavaAnalyzer,
+    _java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
-    token: crate::analyzer::QueryToken<'_>,
+    _token: crate::analyzer::QueryToken<'_>,
     mut expression: Node<'_>,
 ) -> Option<TypeRef> {
     if expression.has_error() || expression.is_missing() {
@@ -1256,145 +1409,117 @@ fn java_native_argument_type(
     while expression.kind() == "parenthesized_expression" {
         expression = expression.named_child(0)?;
     }
-    if let Some(primitive) = super::primitive_actual_type_from_syntax(expression, query.source) {
-        return Some(java_native_primitive_type_ref(primitive));
+    if let Some(intrinsic) =
+        super::call_conversion::intrinsic_argument_type(expression, query.source)
+    {
+        return Some(intrinsic);
     }
-    match expression.kind() {
-        "string_literal" | "text_block" => Some(TypeRef::Named {
-            name: "java.lang.String".into(),
-            arguments: Vec::new(),
-            nullable: false,
-        }),
-        "null_literal" => Some(TypeRef::Named {
-            name: "<null>".into(),
-            arguments: Vec::new(),
-            nullable: false,
-        }),
-        "identifier" => {
-            let name = node_text_for_query(expression, query.source)?;
-            let declaration = find_nearest_declaration_from_node(expression, name, query.source)?;
-            if !matches!(
-                declaration.kind,
-                DeclarationKind::Parameter
-                    | DeclarationKind::ReceiverParameter
-                    | DeclarationKind::LocalVariable
-                    | DeclarationKind::CatchParameter
-                    | DeclarationKind::EnhancedForVariable
-                    | DeclarationKind::LambdaParameter
-                    | DeclarationKind::PatternVariable
-                    | DeclarationKind::ResourceVariable
-                    | DeclarationKind::Field
-            ) {
+    if expression.kind() == "method_invocation" {
+        // Each nested query descends to a strict argument/receiver child.
+        // Bound the remaining resolver call stack by the existing Java
+        // expression budget; deeper expressions retain an unknown type.
+        let mut nesting = 0;
+        let mut ancestor = expression.parent();
+        while let Some(node) = ancestor {
+            if node.kind() == "method_invocation" {
+                nesting += 1;
+            }
+            if nesting >= super::call_conversion::JAVA_EXPRESSION_DEPTH_LIMIT {
                 return None;
             }
-            let root = query.tree?.root_node();
-            let declaration_node = root.named_descendant_for_byte_range(
-                declaration.range.start_byte,
-                declaration.range.end_byte,
-            )?;
-            let type_declaration = declaration_node
-                .parent()
-                .filter(|parent| parent.kind() == "variable_declarator")
-                .unwrap_or(declaration_node);
-            let type_node = super::declared_type_node(type_declaration)?;
-            java_native_type_ref_from_type_node(java, query, token, type_node)
+            ancestor = node.parent();
         }
-        "cast_expression" => {
-            let type_node = expression.child_by_field_name("type")?;
-            java_native_type_ref_from_type_node(java, query, token, type_node)
+        let member = expression.child_by_field_name("name")?;
+        let site = java_native_reference_site_at_node(query, member)?;
+        let call_query = BoundedReceiverQuery {
+            analyzer: query.analyzer,
+            file: query.file,
+            source: query.source,
+            tree: query.tree,
+            site: &site,
+            budget: query.budget,
+            cancellation: query.cancellation,
+        };
+        match resolve_java_definition_with_evidence_bounded(call_query, || {}) {
+            BoundedResolution::Complete { value, .. } => {
+                if let Some(proof) = value.evidence.exact_external_call() {
+                    let identity = proof.external_member_identity()?;
+                    return match _java
+                        .inner
+                        .analyzer_store()
+                        .selected_external_member_return_type(identity)
+                    {
+                        Ok(ty) => ty.map(|term| {
+                            crate::analyzer::jvm::external::normalize_jvm_model_type_ref(
+                                query.analyzer.semantic_model_overlay().as_deref(),
+                                &term,
+                            )
+                        }),
+                        Err(error) => {
+                            eprintln!(
+                                "selected external result type read failed for {identity:?}: {error}"
+                            );
+                            None
+                        }
+                    };
+                }
+            }
+            BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
+                return None;
+            }
         }
-        "object_creation_expression" => {
-            let type_node = expression.child_by_field_name("type")?;
-            java_native_type_ref_from_type_node(java, query, token, type_node)
-        }
-        _ => None,
     }
-}
-
-fn java_native_type_ref_from_type_node(
-    java: &JavaAnalyzer,
-    query: BoundedReceiverQuery<'_>,
-    token: crate::analyzer::QueryToken<'_>,
-    type_node: Node<'_>,
-) -> Option<TypeRef> {
-    let mut base = type_node;
-    let mut dimensions = 0_usize;
-    while base.kind() == "array_type" {
-        let mut cursor = base.walk();
-        let array_dimensions = base
-            .named_children(&mut cursor)
-            .filter(|child| child.kind() == "dimensions")
-            .count();
-        dimensions = dimensions
-            .checked_add(array_dimensions.max(1))
-            .expect("Java array dimension count must fit usize");
-        base = base.child_by_field_name("element")?;
-    }
-    let mut resolved = if let Some(primitive) = super::primitive_type(base) {
-        java_native_primitive_type_ref(primitive)
-    } else {
-        let type_name = java_type_name_from_node(base, query.source)?;
-        java_native_type_ref(java, query, token, &type_name)?
-    };
-    for _ in 0..dimensions {
-        resolved = TypeRef::Array {
-            element: Box::new(resolved),
+    if let Some((callee, ordinal)) = java_native_argument_projection(expression) {
+        let site = java_native_reference_site_at_node(query, callee)?;
+        let argument_query = BoundedReceiverQuery {
+            site: &site,
+            ..query
+        };
+        return match crate::analyzer::native_points::resolve_native_call_argument_type_bounded(
+            &_java.inner,
+            argument_query,
+            ordinal,
+            prepare_context,
+            || {},
+        ) {
+            BoundedResolution::Complete { value, .. } => value.static_type,
+            BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => None,
         };
     }
-    Some(resolved)
+    let site = java_native_receiver_type_site_node(expression).unwrap_or(expression);
+    java_native_expression_value_type_at_node(query, site)?.static_type
 }
 
-fn java_native_primitive_type_ref(
-    primitive: crate::analyzer::usages::call_conversion::JavaPrimitive,
-) -> TypeRef {
-    use crate::analyzer::usages::call_conversion::JavaPrimitive;
-    let name = match primitive {
-        JavaPrimitive::Boolean => "boolean",
-        JavaPrimitive::Byte => "byte",
-        JavaPrimitive::Short => "short",
-        JavaPrimitive::Char => "char",
-        JavaPrimitive::Int => "int",
-        JavaPrimitive::Long => "long",
-        JavaPrimitive::Float => "float",
-        JavaPrimitive::Double => "double",
+/// Recover only the structured call coordinate. The stored producer slot,
+/// not this syntax walk, supplies the expression's static type.
+fn java_native_argument_projection(mut expression: Node<'_>) -> Option<(Node<'_>, u32)> {
+    while let Some(parent) = expression.parent() {
+        if parent.kind() != "parenthesized_expression" {
+            break;
+        }
+        expression = parent;
+    }
+    let arguments = expression.parent()?;
+    if arguments.kind() != "argument_list" {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    let ordinal = arguments
+        .named_children(&mut cursor)
+        .filter(|argument| !argument.is_extra())
+        .position(|argument| argument == expression)?;
+    let call = arguments.parent()?;
+    let callee = match call.kind() {
+        "method_invocation" => call.child_by_field_name("name")?,
+        "object_creation_expression" => {
+            java_constructor_type_terminal(call.child_by_field_name("type")?)?
+        }
+        _ => return None,
     };
-    TypeRef::Named {
-        name: name.into(),
-        arguments: Vec::new(),
-        nullable: false,
-    }
-}
-
-fn java_native_type_ref(
-    java: &JavaAnalyzer,
-    query: BoundedReceiverQuery<'_>,
-    token: crate::analyzer::QueryToken<'_>,
-    spelling: &str,
-) -> Option<TypeRef> {
-    if let Some(primitive) = super::primitive_for_name(spelling) {
-        return Some(java_native_primitive_type_ref(primitive));
-    }
-    let selected = java_selected_jdk_artifact(java, query);
-    match java.resolve_type_name_with_selected_jdk(
-        token,
-        query.analyzer.semantic_model_overlay(),
-        query.file,
-        spelling,
-        selected
-            .as_ref()
-            .and_then(|evidence| evidence.artifact_sha256.as_deref()),
-    )? {
-        JavaTypeResolution::Source(unit) => Some(TypeRef::Declared {
-            id: unit.declaration_id().as_str().to_owned(),
-            arguments: Vec::new(),
-            nullable: false,
-        }),
-        JavaTypeResolution::External(external) => Some(TypeRef::Named {
-            name: external.fqn().to_owned(),
-            arguments: Vec::new(),
-            nullable: false,
-        }),
-    }
+    Some((
+        callee,
+        u32::try_from(ordinal).expect("Java actual ordinal fits u32"),
+    ))
 }
 
 enum JavaNativeConstructorSelection {
@@ -1692,7 +1817,7 @@ fn resolve_java_expression_value_type_bounded(
                     "native_analyzer_unavailable",
                     "Java analyzer is unavailable".into(),
                 ),
-                direct_target: None,
+                static_type: None,
             },
             work: ReceiverAnalysisWork::default(),
         };

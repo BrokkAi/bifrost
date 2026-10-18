@@ -2793,7 +2793,7 @@ fn apply_pipeline_step_general<'a>(
             }
             continue;
         }
-        let expansions = match (&row.value, step) {
+        let mut expansions = match (&row.value, step) {
             (PipelineValue::ConfigurationFact(value), QueryStep::ConfigurationAbsence(filter)) => {
                 configuration_absence::expansions(value, filter, diagnostics)
             }
@@ -5652,6 +5652,28 @@ fn apply_pipeline_step_general<'a>(
             }
             _ => unreachable!("query step domains are validated before execution"),
         };
+        // Canonical endpoint identity is fixed before row keys or deduplication.
+        for expansion in &mut expansions {
+            if let PipelineValue::PythonRuleFact(value) = &mut expansion.value {
+                let premises = std::mem::take(&mut value.hierarchy_premises);
+                if let Some((PipelineTraceValue::PythonRuleFact(traced), _)) =
+                    expansion.trace.last_mut()
+                {
+                    traced.hierarchy_premises.clear();
+                }
+                python_class_hierarchy::attach_hierarchy_premises(expansion, &premises);
+            }
+            if let PipelineValue::PythonHierarchyFact(value) = &mut expansion.value {
+                value.finalize_endpoints(analyzer);
+                // Producers attach the final basis/coverage after constructing
+                // the expansion. Refresh its retained step value as well.
+                if let Some((PipelineTraceValue::PythonHierarchyFact(traced), _)) =
+                    expansion.trace.last_mut()
+                {
+                    *traced = value.clone();
+                }
+            }
+        }
         // Record every produced fact before downstream filters can discard partial rows.
         for expansion in &expansions {
             if let PipelineValue::PythonHierarchyFact(value) = &expansion.value {

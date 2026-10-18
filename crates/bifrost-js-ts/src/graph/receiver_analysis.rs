@@ -1704,6 +1704,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let function = jsts_indexed_callable_node(function).unwrap_or(function);
         if depth > MAX_JSTS_RECEIVER_RECURSION {
             return ReceiverAnalysisOutcome::ExceededBudget {
                 limit: "receiver_recursion",

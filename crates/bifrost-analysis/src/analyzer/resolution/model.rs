@@ -1985,6 +1985,7 @@ pub enum TypeTransferValueTransform {
     AddressableRuntimeOnly,
     AddressableOperandOnly,
     RuntimeOnly,
+    StaticTypeObject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2099,7 +2100,8 @@ impl TypeTransferRule {
                 | (
                     TypeTransferValueTransform::AddressableRuntimeOnly
                         | TypeTransferValueTransform::AddressableOperandOnly
-                        | TypeTransferValueTransform::RuntimeOnly,
+                        | TypeTransferValueTransform::RuntimeOnly
+                        | TypeTransferValueTransform::StaticTypeObject,
                     ResolutionSlotValue::TypeObject(_)
                 )
         ) || matches!(
@@ -2148,7 +2150,8 @@ impl TypeTransferRule {
             TypeTransferValueTransform::ToRuntime { addressable } => {
                 ResolutionSlotValue::runtime(adjusted, addressable)
             }
-            TypeTransferValueTransform::TypeObjectOnly => {
+            TypeTransferValueTransform::TypeObjectOnly
+            | TypeTransferValueTransform::StaticTypeObject => {
                 ResolutionSlotValue::type_object(adjusted)
             }
             TypeTransferValueTransform::AddressableRuntimeOnly => {

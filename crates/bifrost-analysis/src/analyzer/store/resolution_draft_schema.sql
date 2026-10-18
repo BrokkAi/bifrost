@@ -222,7 +222,7 @@ CREATE TABLE resolution_type_transfers (
   source_slot INTEGER NOT NULL, rule INTEGER NOT NULL,
   target_slot INTEGER NOT NULL, kind INTEGER NOT NULL,
   indirection_delta INTEGER NOT NULL, reference_indirection_delta INTEGER NOT NULL,
-  value_transform INTEGER NOT NULL,
+  value_transform INTEGER NOT NULL CHECK(value_transform BETWEEN 0 AND 8),
   completion BLOB CHECK(completion IS NULL OR json_valid(completion, 8)),
   PRIMARY KEY(blob_id, source_slot, rule)
 --+fk   , FOREIGN KEY(blob_id, source_slot) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED

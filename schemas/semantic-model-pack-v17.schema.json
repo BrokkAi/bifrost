@@ -4146,7 +4146,8 @@
           "default": false
         },
         "passing_mode": {
-          "$ref": "#/$defs/ParameterPassingMode"
+          "$ref": "#/$defs/ParameterPassingMode",
+          "default": "positional_or_named"
         },
         "role": {
           "anyOf": [
@@ -7786,7 +7787,8 @@
             },
             "reference_kind": {
               "description": "The reference category, when the source language distinguishes\nlvalue and rvalue references. Existing producers omit this field\nand therefore retain the historical lvalue-reference meaning.",
-              "$ref": "#/$defs/TypeRefReferenceKind"
+              "$ref": "#/$defs/TypeRefReferenceKind",
+              "default": "lvalue"
             }
           },
           "additionalProperties": false,

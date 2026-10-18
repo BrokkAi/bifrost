@@ -26,12 +26,29 @@ impl WorkspaceConfigurationInput {
     }
 
     pub(crate) fn include_native_metadata_paths(
-        root: &std::path::Path,
+        project: &dyn crate::analyzer::Project,
+        files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
         language: crate::analyzer::Language,
         inputs: &mut std::collections::BTreeSet<crate::analyzer::ProjectFile>,
     ) -> std::io::Result<()> {
         use crate::analyzer::{Language, ProjectFile};
         use std::collections::BTreeSet;
+        let root = project.root();
+        // Metadata can be readable by path even when ignore rules omit it
+        // from enumeration. Membership still belongs to the selected Project.
+        if language == Language::Python {
+            for directory in metadata_ancestor_directories(files.iter().filter(|file| {
+                file.rel_path()
+                    .extension()
+                    .is_some_and(|extension| extension == "py")
+            })) {
+                for name in ["pyproject.toml", "setup.py", "__init__.py"] {
+                    if let Some(file) = project.file_by_rel_path(&directory.join(name)) {
+                        inputs.insert(file);
+                    }
+                }
+            }
+        }
         if matches!(
             language,
             Language::Java | Language::Kotlin | Language::Scala
@@ -47,20 +64,11 @@ impl WorkspaceConfigurationInput {
             }
         }
         if language == Language::Rust {
-            let mut directories = BTreeSet::from([std::path::PathBuf::new()]);
-            for input in inputs.iter() {
-                if input
-                    .rel_path()
+            let directories = metadata_ancestor_directories(inputs.iter().filter(|file| {
+                file.rel_path()
                     .file_name()
-                    .is_some_and(|n| n == "Cargo.toml")
-                {
-                    let mut directory = input.rel_path().parent();
-                    while let Some(path) = directory {
-                        directories.insert(path.to_path_buf());
-                        directory = path.parent();
-                    }
-                }
-            }
+                    .is_some_and(|name| name == "Cargo.toml")
+            }));
             for directory in directories {
                 for name in ["Cargo.lock", ".cargo/config.toml", ".cargo/config"] {
                     let file = ProjectFile::new(root, directory.join(name));
@@ -71,18 +79,11 @@ impl WorkspaceConfigurationInput {
             }
         }
         if matches!(language, Language::JavaScript | Language::TypeScript) {
-            let mut directories = BTreeSet::from([std::path::PathBuf::new()]);
-            for input in inputs.iter().filter(|file| {
+            let directories = metadata_ancestor_directories(inputs.iter().filter(|file| {
                 file.rel_path()
                     .file_name()
-                    .is_some_and(|n| n == "package.json")
-            }) {
-                let mut directory = input.rel_path().parent();
-                while let Some(path) = directory {
-                    directories.insert(path.to_path_buf());
-                    directory = path.parent();
-                }
-            }
+                    .is_some_and(|name| name == "package.json")
+            }));
             for directory in directories {
                 for name in [
                     "package.json",
@@ -188,6 +189,21 @@ impl WorkspaceConfigurationInput {
     }
 }
 
+/// Ancestors of selected inputs, including the workspace root.
+fn metadata_ancestor_directories<'a>(
+    files: impl Iterator<Item = &'a crate::analyzer::ProjectFile>,
+) -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::iter::once(std::path::PathBuf::new())
+        .chain(files.flat_map(|file| {
+            file.rel_path()
+                .parent()
+                .into_iter()
+                .flat_map(std::path::Path::ancestors)
+                .map(std::path::Path::to_path_buf)
+        }))
+        .collect()
+}
+
 /// Digest of one revision's complete configuration partition. Inputs must be
 /// ordered by relative path, the order SQL `ORDER BY rel_path` also yields.
 pub(crate) fn configuration_digest<'a>(
@@ -225,6 +241,28 @@ pub(crate) enum NativeConfigurationOverlayAuthority {
 }
 
 impl super::AnalyzerStore {
+    /// Exact configuration bytes, including absence, selected by this revision.
+    pub(crate) fn selected_configuration_source(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        relative_path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.read_conn()?
+            .query_row(
+                SELECTED_CONFIGURATION_BYTES_SQL,
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.lang,
+                    snapshot.generation.get(),
+                    relative_path,
+                    snapshot.revision
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Return the first native configuration overlay that cannot use the disk
     /// context selected by this exact workspace revision. Bytes live in SQL;
     /// this check retains only one input for the duration of the request.

@@ -179,7 +179,7 @@ pub fn collect_python_semantic_diagnostics(
         file,
         source,
         line_starts: &line_starts,
-        module_name: crate::declarations::python_module_name(file),
+        module_name: crate::declarations::python_module_name(py.project(), file),
         module_binders: HashMap::default(),
         report,
     };

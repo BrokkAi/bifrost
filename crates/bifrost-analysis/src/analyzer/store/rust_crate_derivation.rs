@@ -5,6 +5,8 @@ use rusqlite::types::Value;
 
 pub(super) const RESTRICTION_INPUTS_SQL: &str = include_str!("rust_crate_visibility_inputs.sql");
 pub(super) const RESTRICTIONS_SQL: &str = include_str!("rust_crate_visibility_routes.sql");
+pub(super) const CONSTRUCTOR_VISIBILITIES_SQL: &str =
+    include_str!("rust_crate_constructor_visibility.sql");
 pub(super) const RESTRICTION_GAPS_SQL: &str = "INSERT INTO cr_gaps
  SELECT 'unresolved_visibility', module_path,
  json_object('visibility', visibility, 'reason', 'UnresolvedVisibility')
@@ -24,10 +26,17 @@ pub(super) const MACRO_ITEM_ROWS_SQL: &str = "INSERT INTO cr_macro_items(module_
         declaration_id, declaration_kind IN (4, 5)
  FROM cr_macro_item_candidates WHERE declarable = 1 AND activation = 1
  UNION ALL
- SELECT module_path, 'value', name, visibility, restricted_module_path, blob_id,
-        invocation_occurrence_id, declaration_id, 0
- FROM cr_macro_item_candidates
- WHERE declarable = 1 AND activation = 1 AND declaration_kind = 0 AND value_constructor = 1
+ SELECT candidate.module_path, 'value', candidate.name, constructor.visibility,
+        constructor.restricted_module_path, candidate.blob_id,
+        candidate.invocation_occurrence_id, candidate.declaration_id, 0
+ FROM cr_macro_item_candidates AS candidate
+ CROSS JOIN cr_constructor_visibilities AS constructor
+   ON constructor.module_path = candidate.module_path
+  AND constructor.blob_id = candidate.blob_id
+  AND constructor.declaration_id = candidate.declaration_id
+ WHERE candidate.declarable = 1 AND candidate.activation = 1
+   AND candidate.declaration_kind = 0 AND candidate.value_constructor = 1
+   AND constructor.visibility IS NOT NULL
  ON CONFLICT DO NOTHING";
 pub(super) const MACRO_ITEM_COVERAGE_SQL: &str = include_str!("rust_crate_macro_item_coverage.sql");
 pub(super) const SELECT_MACRO_ITEMS_SQL: &str = "SELECT module_path, namespace, name, visibility, restricted_module_path, blob_id, invocation_occurrence_id, declaration_id, module_item FROM cr_macro_items ORDER BY module_path, namespace, name, blob_id, declaration_id";
@@ -60,6 +69,59 @@ pub(super) static ROOT_ROUTES_SQL: std::sync::LazyLock<String> = std::sync::Lazy
     )
 });
 pub(super) const ROOT_SOURCES_SQL: &str = include_str!("rust_crate_root_sources.sql");
+pub(super) const PUBLIC_SURFACE_BINDINGS_SQL: &str = include_str!("rust_crate_public_surface.sql");
+const PUBLIC_SURFACE_ALIAS_TEMPLATE: &str = include_str!("rust_crate_public_surface_aliases.sql");
+fn public_surface_aliases(
+    frontier: &str,
+    output: &str,
+    owner_columns: &str,
+    name_predicate: &str,
+    origin_column: &str,
+) -> String {
+    PUBLIC_SURFACE_ALIAS_TEMPLATE
+        .replace("{frontier}", frontier)
+        .replace("{output}", output)
+        .replace("{owner_columns}", owner_columns)
+        .replace("{name_predicate}", name_predicate)
+        .replace("{origin_column}", origin_column)
+}
+pub(super) static PUBLIC_SURFACE_ALIASES_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        public_surface_aliases("cr_surface_frontier", "cr_surface_aliases", "", "", "")
+    });
+pub(super) const PUBLIC_SURFACE_LOOKUP_SQL: &str =
+    include_str!("rust_crate_public_surface_lookup.sql");
+pub(super) static PUBLIC_SURFACE_LOOKUP_ALIASES_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        public_surface_aliases(
+            "cr_surface_pending",
+            "cr_surface_lookup",
+            "demand.owner_crate_key, demand.owner_module_path, demand.owner_namespace, demand.owner_name, ",
+            "AND demand.owner_namespace = 'type' AND routes.bound_name = demand.name",
+            ", 'reexport'",
+        )
+    });
+pub(super) const PUBLIC_SURFACE_CANDIDATES_SQL: &str =
+    include_str!("rust_crate_public_surface_candidates.sql");
+pub(super) const PUBLIC_SURFACE_GLOBS_SQL: &str =
+    include_str!("rust_crate_public_surface_globs.sql");
+pub(super) const PUBLIC_SURFACE_TERMINALS_SQL: &str =
+    include_str!("rust_crate_public_surface_terminals.sql");
+pub(super) const PUBLIC_SURFACE_NAMED_REQUESTS_SQL: &str =
+    include_str!("rust_crate_public_surface_named_requests.sql");
+pub(super) const PUBLIC_SURFACE_PRUNE_TERMINALS_SQL: &str =
+    include_str!("rust_crate_public_surface_prune_terminals.sql");
+pub(super) const PUBLIC_SURFACE_FACTS_SQL: &str =
+    include_str!("rust_crate_public_surface_facts.sql");
+pub(super) const PUBLIC_SURFACE_INVENTORIES_SQL: &str =
+    include_str!("rust_crate_public_surface_inventories.sql");
+pub(super) const PUBLIC_SURFACE_GAPS_SQL: &str = include_str!("rust_crate_public_surface_gaps.sql");
+pub(super) const PUBLIC_SURFACE_REACHABILITY_SQL: &str =
+    include_str!("rust_crate_public_surface_reachability.sql");
+pub(super) const INSERT_PUBLIC_MODULE_REACHABILITY_SQL: &str = "INSERT INTO rust_crate_public_module_reachability(topology_id, target_crate_key, target_module_path) VALUES(?1,?2,?3)";
+pub(super) const PUBLIC_SURFACE_SELECT_SQL: &str = "SELECT kind, crate_key, module_path,
+    namespace, name, target_crate_key, target_module_path FROM cr_surface_facts
+    ORDER BY kind, crate_key, module_path, namespace, name, target_crate_key, target_module_path";
 
 // A type path in an impl header is lexical in every edition: Rust 2015's
 // crate-root-relative rule governs `use` declarations, not paths written in an
@@ -302,43 +364,112 @@ const SEED_EXPORT_DELTA_SQL: &str = "INSERT INTO cr_export_delta SELECT * FROM c
 const ADVANCE_EXPORT_DELTA_SQL: &str = "DELETE FROM cr_export_delta; INSERT INTO cr_export_delta SELECT * FROM cr_export_delta_next; DELETE FROM cr_export_delta_next";
 #[cfg(test)]
 const LEGACY_FIXPOINT_SQL: &str = r#"
+WITH candidates(module_path, namespace, name, origin, source_visibility,
+                source_restricted_module_path, target_crate_key, target_module_path,
+                target_visibility, target_restricted_module_path,
+                declaration_blob_id, declaration_site) AS (
+    SELECT source.module_path, target.namespace,
+           CASE WHEN source.is_glob = 1 THEN target.name ELSE source.bound_name END,
+           CASE WHEN source.is_glob = 1 THEN 'glob_reexport' ELSE 'reexport' END,
+           source.visibility,
+           (SELECT restricted_module_path FROM cr_restrictions
+            WHERE module_path = source.module_path AND visibility = source.visibility),
+           target.crate_key, target.module_path, target.visibility, target.restricted_module_path,
+           target.declaration_blob_id, target.declaration_site
+    FROM cr_module_imports AS source
+    JOIN cr_routes AS route ON route.blob_id = source.blob_id AND route.import_ordinal = source.import_ordinal AND route.module_path = source.module_path
+    JOIN cr_exports AS target ON target.crate_key = route.target_crate_key
+      AND target.module_path = route.target_module_path
+      AND (source.is_glob = 1 OR target.name = source.imported_name)
+    WHERE (cr_visibility(source.visibility) <> 'restricted' OR EXISTS(
+           SELECT 1 FROM cr_restrictions WHERE module_path = source.module_path
+             AND visibility = source.visibility AND restricted_module_path IS NOT NULL))
+      AND source.visibility <> 'private'
+      AND (source.is_glob = 1 OR source.bound_name IS NOT NULL)
+      AND (source.is_glob = 0 OR NOT EXISTS(
+           SELECT 1 FROM cr_module_imports AS explicit
+           WHERE explicit.module_path = source.module_path
+             AND explicit.is_glob = 0 AND explicit.bound_name = target.name))
+), domains AS (
+    -- NULL is the public domain. All other paths are structured module
+    -- identities, not source syntax. A restricted path must be resolved.
+    SELECT candidate.*,
+           CASE cr_visibility(source_visibility)
+             WHEN 'public' THEN NULL
+             WHEN 'private' THEN module_path
+             WHEN 'crate' THEN 'crate'
+             ELSE source_restricted_module_path END AS source_domain,
+           CASE target_visibility
+             WHEN 'public' THEN NULL
+             WHEN 'private' THEN target_module_path
+             WHEN 'crate' THEN 'crate'
+             WHEN 'restricted' THEN target_restricted_module_path END AS target_domain
+    FROM candidates AS candidate
+), intersections AS (
+    SELECT domains.*,
+           CASE WHEN source_domain IS NULL THEN target_domain
+                WHEN target_domain IS NULL THEN source_domain
+                WHEN source_domain = target_domain
+                  OR substr(source_domain, 1, length(target_domain) + 2) = target_domain || '::'
+                  THEN source_domain
+                WHEN substr(target_domain, 1, length(source_domain) + 2) = source_domain || '::'
+                  THEN target_domain END AS domain_path
+    FROM domains
+    WHERE (cr_visibility(source_visibility) <> 'restricted' OR source_domain IS NOT NULL)
+      -- A lexical module path alone cannot grant access across crate keys.
+      -- Within this crate the importing module must lie in the target domain.
+      AND (target_visibility = 'public'
+           OR (target_crate_key = ?1 AND target_domain IS NOT NULL
+               AND (module_path = target_domain
+                    OR substr(module_path, 1, length(target_domain) + 2) = target_domain || '::')))
+)
 INSERT INTO cr_exports(crate_key, module_path, namespace, name, origin, visibility,
                        restricted_module_path, declaration_blob_id, declaration_site)
-SELECT ?1, source.module_path, target.namespace,
-       CASE WHEN source.is_glob = 1 THEN target.name ELSE source.bound_name END,
-       CASE WHEN source.is_glob = 1 THEN 'glob_reexport' ELSE 'reexport' END,
-       cr_visibility(source.visibility),
-       (SELECT restricted_module_path FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility),
-       target.declaration_blob_id, target.declaration_site
-FROM cr_source_imports AS source
-JOIN cr_members AS member ON member.module_path = source.module_path AND member.blob_id = source.blob_id
-JOIN cr_routes AS route ON route.blob_id = source.blob_id AND route.import_ordinal = source.import_ordinal AND route.module_path = source.module_path
-JOIN cr_exports AS target ON target.crate_key = route.target_crate_key
- AND target.module_path = route.target_module_path
- AND (source.is_glob = 1 OR target.name = source.imported_name)
-WHERE (cr_visibility(source.visibility)<>'restricted' OR EXISTS(SELECT 1 FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility AND restricted_module_path IS NOT NULL))
- AND source.visibility <> 'private'
- AND (source.is_glob = 1 OR source.bound_name IS NOT NULL)
- AND (source.is_glob = 0 OR target.visibility <> 'private')
- AND (source.is_glob = 0 OR NOT EXISTS(
-       SELECT 1 FROM cr_source_imports AS explicit
-       WHERE explicit.module_path = source.module_path
-         AND explicit.is_glob = 0 AND explicit.bound_name = target.name))
- AND NOT EXISTS(SELECT 1 FROM cr_exports AS present
-                WHERE present.crate_key = ?1
-                  AND present.module_path = source.module_path AND present.namespace = target.namespace
-                  AND present.name = CASE WHEN source.is_glob = 1 THEN target.name ELSE source.bound_name END
-                  AND (present.origin <> 'glob_reexport' OR source.is_glob = 1))
+SELECT ?1, candidate.module_path, candidate.namespace, candidate.name, candidate.origin,
+       CASE WHEN candidate.domain_path IS NULL THEN 'public'
+            WHEN candidate.domain_path = 'crate' THEN 'crate'
+            WHEN candidate.domain_path = candidate.module_path THEN 'private'
+            ELSE 'restricted' END,
+       CASE WHEN candidate.domain_path <> 'crate'
+                  AND candidate.domain_path <> candidate.module_path
+            THEN candidate.domain_path END,
+       candidate.declaration_blob_id, candidate.declaration_site
+FROM intersections AS candidate
+-- Disjoint domains have no intersection, unlike two public domains.
+WHERE (candidate.domain_path IS NOT NULL
+       OR (candidate.source_domain IS NULL AND candidate.target_domain IS NULL))
+  AND NOT EXISTS (
+    SELECT 1 FROM cr_exports AS present
+    WHERE present.crate_key = ?1
+      AND present.module_path = candidate.module_path
+      AND present.namespace = candidate.namespace
+      AND present.name = candidate.name
+      AND present.origin NOT IN ('glob_reexport', 'reexport')
+)
 ON CONFLICT(crate_key, module_path, namespace, name) DO UPDATE SET
   origin = excluded.origin, visibility = excluded.visibility,
   restricted_module_path = excluded.restricted_module_path,
   declaration_blob_id = excluded.declaration_blob_id,
   declaration_site = excluded.declaration_site
-WHERE cr_exports.origin = 'glob_reexport' AND excluded.origin = 'reexport';
+WHERE (cr_exports.origin = 'glob_reexport' AND excluded.origin = 'reexport')
+   OR (cr_exports.origin = excluded.origin
+           AND cr_exports.origin IN ('glob_reexport', 'reexport')
+           AND cr_exports.declaration_blob_id = excluded.declaration_blob_id
+           AND cr_exports.declaration_site = excluded.declaration_site
+           -- Accessible domains are ancestors of this same importing module.
+           -- Their union is the broader domain; equal domains add no delta.
+           AND ((excluded.visibility = 'public' AND cr_exports.visibility <> 'public')
+                OR (excluded.visibility = 'crate' AND cr_exports.visibility IN ('private', 'restricted'))
+                OR (excluded.visibility = 'restricted'
+                    AND (cr_exports.visibility = 'private'
+                         OR (cr_exports.visibility = 'restricted'
+                             AND length(excluded.restricted_module_path)
+                                 < length(cr_exports.restricted_module_path))))));
 "#;
 
 pub(super) struct ExportRows {
     containers: Vec<Vec<Value>>,
+    public_module_reachability: Vec<Vec<Value>>,
     container_sources: Vec<Vec<Value>>,
     exports: Vec<Vec<Value>>,
     macro_items: Vec<Vec<Value>>,
@@ -590,7 +721,6 @@ pub(super) fn derive_exports(
     modules: &[Member],
     gate_decisions: &[super::ItemMacroDecision],
     cfg: &str,
-    complete: &HashMap<CrateKey, DerivedCrate>,
 ) -> Result<ExportRows> {
     #[cfg(test)]
     let derive_started = std::time::Instant::now();
@@ -638,24 +768,22 @@ pub(super) fn derive_exports(
         conn.execute(POPULATE_MEMBER_BLOBS_SQL, [])?;
         conn.execute(POPULATE_SCOPES_SQL, [])?;
         conn.execute(INSERT_IDENTITY_SQL, [item.key.as_slice()])?;
-        for (key, dependency) in complete {
-            debug_assert_ne!(
-                *key, item.key,
-                "a crate is published only after its own derivation returns"
-            );
-            conn.execute(
-                INSERT_FOREIGN_SQL,
-                params![key.as_slice(), dependency.topology_id],
-            )?;
-        }
+        conn.execute(INSERT_FOREIGN_SQL, [])?;
         for (name, _, key) in &item.dependencies {
             conn.execute(
                 SQL_CR_DEPENDENCIES_3,
                 params![
                     name,
                     key.map(|key| key.to_vec()),
-                    key.and_then(|key| complete.get(&key))
-                        .map(|dependency| dependency.topology_id)
+                    key.map(|key| conn
+                        .query_row(
+                            "SELECT topology_id FROM temp.rust_schedule_live WHERE crate_key = ?1",
+                            [key.as_slice()],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .optional())
+                        .transpose()?
+                        .flatten()
                 ],
             )?;
         }
@@ -667,6 +795,7 @@ pub(super) fn derive_exports(
         conn.execute(RESTRICTION_INPUTS_SQL, [])?;
         conn.execute(RESTRICTIONS_SQL, [])?;
         conn.execute(RESTRICTION_GAPS_SQL, [])?;
+        conn.execute(CONSTRUCTOR_VISIBILITIES_SQL, [])?;
         conn.execute(DECLARATIONS_SQL, [])?;
         conn.execute(MACRO_ITEMS_SQL, [cfg])?;
         conn.execute(MACRO_ITEM_ROWS_SQL, [])?;
@@ -907,13 +1036,13 @@ pub(super) fn derive_exports(
         conn.execute(SQL_CR_GAPS_9, [])?;
         conn.execute(
             OPEN_INVENTORY_SQL,
-            [crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+            params![crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
                 crate::analyzer::resolution::LoweringGapOrigin::Extracted(
                     brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedImplMacro,
                 ),
-            )],
+            ), cfg],
         )?;
-        conn.execute(UNKNOWN_EXPORTS_SQL, [])?;
+        conn.execute(UNKNOWN_EXPORTS_SQL, [cfg])?;
     }
     {
         let _timing = stage("root_references");
@@ -947,12 +1076,17 @@ pub(super) fn derive_exports(
     }
     let mut digest = Sha256::new();
     {
+        let _timing = stage("public_module_surface");
+        derive_public_module_surface(conn)?;
+    }
+    {
         let _timing = stage("surface_digest");
         for sql in [
             SQL_CR_EXPORTS_10,
             SQL_CR_REEXPORTS_11,
             GLOB_SURFACE_SQL,
             MACRO_ITEM_SURFACE_SQL,
+            PUBLIC_SURFACE_SELECT_SQL,
         ] {
             for row in query_values(conn, sql)? {
                 for value in row {
@@ -974,6 +1108,10 @@ pub(super) fn derive_exports(
         };
         ExportRows {
             containers: collect("collect_rows.containers", ENUM_CONTAINER_ROWS_SQL)?,
+            public_module_reachability: collect(
+                "collect_rows.public_module_reachability",
+                PUBLIC_SURFACE_REACHABILITY_SQL,
+            )?,
             container_sources: collect("collect_rows.container_sources", ENUM_SOURCE_ROWS_SQL)?,
             exports: collect("collect_rows.exports", SQL_CR_EXPORTS_12)?,
             macro_items: collect("collect_rows.macro_items", SELECT_MACRO_ITEMS_SQL)?,
@@ -1019,6 +1157,91 @@ pub(super) fn derive_exports(
         }
     }
     Ok(result)
+}
+
+/// Project the published module graph, not dependency digests or declaration
+/// evidence. Nodes are canonical containers; alias paths never become nodes.
+/// Both worklists live in SQLite and deduplicate finite keys, so public alias
+/// cycles and glob diamonds need neither recursion nor a depth limit.
+fn derive_public_module_surface(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO cr_surface_nodes SELECT crate_key, 'crate', 0 FROM cr_identity",
+        [],
+    )?;
+    loop {
+        conn.execute_batch(
+            "DELETE FROM cr_surface_frontier;
+             DELETE FROM cr_surface_bindings;
+             DELETE FROM cr_surface_aliases;
+             DELETE FROM cr_surface_requests;
+             DELETE FROM cr_surface_candidates;",
+        )?;
+        if conn.execute(
+            "INSERT INTO cr_surface_frontier
+             SELECT crate_key, module_path FROM cr_surface_nodes WHERE visited = 0",
+            [],
+        )? == 0
+        {
+            break;
+        }
+        conn.execute(
+            "UPDATE cr_surface_nodes SET visited = 1 WHERE visited = 0",
+            [],
+        )?;
+        conn.execute(PUBLIC_SURFACE_BINDINGS_SQL, [])?;
+        conn.execute(&PUBLIC_SURFACE_ALIASES_SQL, [])?;
+        conn.execute(
+            "INSERT OR IGNORE INTO cr_surface_bindings
+             SELECT crate_key, module_path, 'type', name, 'reexport', 1 FROM cr_surface_aliases",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO cr_surface_requests
+             SELECT crate_key, module_path, namespace, name, crate_key, module_path, name, 0
+             FROM cr_surface_bindings",
+            [],
+        )?;
+        loop {
+            conn.execute_batch(
+                "DELETE FROM cr_surface_pending;
+                 DELETE FROM cr_surface_lookup;",
+            )?;
+            if conn.execute(
+                "INSERT INTO cr_surface_pending
+                 SELECT owner_crate_key, owner_module_path, owner_namespace, owner_name,
+                        crate_key, module_path, name FROM cr_surface_requests WHERE visited = 0",
+                [],
+            )? == 0
+            {
+                break;
+            }
+            conn.execute(
+                "UPDATE cr_surface_requests SET visited = 1 WHERE visited = 0",
+                [],
+            )?;
+            conn.execute(PUBLIC_SURFACE_LOOKUP_SQL, [])?;
+            conn.execute(&PUBLIC_SURFACE_LOOKUP_ALIASES_SQL, [])?;
+            conn.execute(PUBLIC_SURFACE_CANDIDATES_SQL, [])?;
+            conn.execute(PUBLIC_SURFACE_TERMINALS_SQL, [])?;
+            conn.execute(PUBLIC_SURFACE_NAMED_REQUESTS_SQL, [])?;
+            conn.execute(PUBLIC_SURFACE_GLOBS_SQL, [])?;
+        }
+        conn.execute(PUBLIC_SURFACE_PRUNE_TERMINALS_SQL, [])?;
+        conn.execute(
+            "UPDATE cr_surface_facts SET kind = 'public_module_terminal'
+             WHERE kind = 'public_module_named_terminal'",
+            [],
+        )?;
+        conn.execute(PUBLIC_SURFACE_FACTS_SQL, [])?;
+        conn.execute(PUBLIC_SURFACE_INVENTORIES_SQL, [])?;
+        conn.execute(
+            "INSERT OR IGNORE INTO cr_surface_nodes
+             SELECT target_crate_key, target_module_path, 0 FROM cr_surface_candidates",
+            [],
+        )?;
+    }
+    conn.execute(PUBLIC_SURFACE_GAPS_SQL, [])?;
+    Ok(())
 }
 
 fn query_values(conn: &Connection, sql: &str) -> Result<Vec<Vec<Value>>> {
@@ -1101,6 +1324,10 @@ impl ExportRows {
     ) -> Result<CrateKey> {
         for (sql, rows) in [
             (INSERT_ENUM_CONTAINER_SQL, self.containers),
+            (
+                INSERT_PUBLIC_MODULE_REACHABILITY_SQL,
+                self.public_module_reachability,
+            ),
             (INSERT_ENUM_SOURCE_SQL, self.container_sources),
             (SQL_RUST_CRATE_EXPORTS_17, self.exports),
             (INSERT_MACRO_ITEMS_SQL, self.macro_items),
@@ -1146,6 +1373,7 @@ DELETE FROM temp.cr_macro_item_candidates;
 DELETE FROM temp.cr_macro_item_covered;
 DELETE FROM temp.cr_member_blobs;
 DELETE FROM temp.cr_source_declarations;
+DELETE FROM temp.cr_constructor_visibilities;
 DELETE FROM temp.cr_dependencies;
 DELETE FROM temp.cr_identity;
 DELETE FROM temp.cr_foreign;
@@ -1154,6 +1382,15 @@ DELETE FROM temp.cr_reexport_steps;
 DELETE FROM temp.cr_reexport_closure;
 DELETE FROM temp.cr_glob_steps;
 DELETE FROM temp.cr_glob_closure;
+DELETE FROM temp.cr_surface_nodes;
+DELETE FROM temp.cr_surface_frontier;
+DELETE FROM temp.cr_surface_bindings;
+DELETE FROM temp.cr_surface_aliases;
+DELETE FROM temp.cr_surface_requests;
+DELETE FROM temp.cr_surface_pending;
+DELETE FROM temp.cr_surface_lookup;
+DELETE FROM temp.cr_surface_candidates;
+DELETE FROM temp.cr_surface_facts;
 DELETE FROM temp.cr_restrictions;
 DELETE FROM temp.cr_exports;
 DELETE FROM temp.cr_export_sources;
@@ -1243,6 +1480,12 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
             ON cr_source_declarations(module_path, activation, nearest_declaration_boundary);
         CREATE INDEX IF NOT EXISTS cr_source_declarations_declaration
             ON cr_source_declarations(blob_id, declaration_id);
+        -- Regular additional namespaces and item-macro constructors share this
+        -- resolved domain. NULL visibility records an unresolved constraint.
+        CREATE TEMP TABLE IF NOT EXISTS cr_constructor_visibilities(
+            module_path TEXT NOT NULL, blob_id INTEGER NOT NULL,
+            declaration_id INTEGER NOT NULL, visibility TEXT, restricted_module_path TEXT,
+            PRIMARY KEY(module_path, blob_id, declaration_id)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_dependencies(extern_name TEXT PRIMARY KEY, dependency_crate_key BLOB, topology_id INTEGER) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS cr_dependencies_key ON cr_dependencies(dependency_crate_key);
         CREATE TEMP TABLE IF NOT EXISTS cr_identity(crate_key BLOB PRIMARY KEY) WITHOUT ROWID;
@@ -1269,6 +1512,47 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
         CREATE TEMP TABLE IF NOT EXISTS cr_restrictions(module_path TEXT NOT NULL,
             visibility TEXT NOT NULL, restricted_module_path TEXT,
             PRIMARY KEY(module_path, visibility)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_nodes(crate_key BLOB NOT NULL,
+            module_path TEXT NOT NULL, visited INTEGER NOT NULL,
+            PRIMARY KEY(crate_key, module_path)) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS cr_surface_nodes_pending ON cr_surface_nodes(visited);
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_frontier(crate_key BLOB NOT NULL,
+            module_path TEXT NOT NULL, PRIMARY KEY(crate_key, module_path)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_bindings(crate_key BLOB NOT NULL,
+            module_path TEXT NOT NULL, namespace TEXT NOT NULL, name TEXT NOT NULL,
+            origin TEXT NOT NULL, module_expected INTEGER NOT NULL,
+            PRIMARY KEY(crate_key, module_path, namespace, name)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_aliases(crate_key BLOB NOT NULL,
+            module_path TEXT NOT NULL, name TEXT NOT NULL,
+            PRIMARY KEY(crate_key, module_path, name)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_requests(owner_crate_key BLOB NOT NULL,
+            owner_module_path TEXT NOT NULL, owner_namespace TEXT NOT NULL, owner_name TEXT NOT NULL,
+            crate_key BLOB NOT NULL, module_path TEXT NOT NULL, name TEXT NOT NULL,
+            visited INTEGER NOT NULL,
+            PRIMARY KEY(owner_crate_key, owner_module_path, owner_namespace, owner_name,
+                        crate_key, module_path, name)) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS cr_surface_requests_pending ON cr_surface_requests(visited);
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_pending(owner_crate_key BLOB NOT NULL,
+            owner_module_path TEXT NOT NULL, owner_namespace TEXT NOT NULL, owner_name TEXT NOT NULL,
+            crate_key BLOB NOT NULL, module_path TEXT NOT NULL, name TEXT NOT NULL,
+            PRIMARY KEY(owner_crate_key, owner_module_path, owner_namespace, owner_name,
+                        crate_key, module_path, name)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_lookup(owner_crate_key BLOB NOT NULL,
+            owner_module_path TEXT NOT NULL, owner_namespace TEXT NOT NULL, owner_name TEXT NOT NULL,
+            crate_key BLOB NOT NULL, module_path TEXT NOT NULL, name TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            PRIMARY KEY(owner_crate_key, owner_module_path, owner_namespace, owner_name,
+                        crate_key, module_path, name)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_candidates(crate_key BLOB NOT NULL,
+            module_path TEXT NOT NULL, name TEXT NOT NULL, target_crate_key BLOB NOT NULL,
+            target_module_path TEXT NOT NULL,
+            PRIMARY KEY(crate_key, module_path, name,
+                        target_crate_key, target_module_path)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS cr_surface_facts(kind TEXT NOT NULL,
+            crate_key BLOB NOT NULL, module_path TEXT NOT NULL, namespace TEXT NOT NULL,
+            name TEXT NOT NULL, target_crate_key BLOB NOT NULL, target_module_path TEXT NOT NULL,
+            PRIMARY KEY(kind, crate_key, module_path, namespace, name,
+                        target_crate_key, target_module_path)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_exports(crate_key BLOB NOT NULL, module_path TEXT, namespace TEXT, name TEXT, origin TEXT,
             visibility TEXT, restricted_module_path TEXT, declaration_blob_id INTEGER,
             declaration_site INTEGER, PRIMARY KEY(crate_key, module_path, namespace, name)) WITHOUT ROWID;
@@ -1316,6 +1600,37 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
             is_glob INTEGER, visibility TEXT, head_segment TEXT, is_macro_use INTEGER,
             PRIMARY KEY(blob_id, import_ordinal, module_path)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS cr_source_imports_name ON cr_source_imports(module_path, bound_name, is_glob);
+        -- Outer local extents can enclose a legal module. Its native scope,
+        -- rather than the absence of a local extent, identifies module imports.
+        CREATE TEMP VIEW IF NOT EXISTS cr_module_imports AS
+            SELECT source.* FROM cr_source_imports AS source
+            JOIN cr_members AS member
+              ON member.module_path = source.module_path AND member.blob_id = source.blob_id
+            JOIN main.source_rust_module_scopes AS scope
+              ON scope.blob_id = member.blob_id AND scope.ordinal = member.scope_ordinal
+             AND scope.resolution_scope = source.binder_scope;
+        -- Share exact module ownership before cfg selection. Unknown imports
+        -- cannot bind names, but must retain their conditional name surface.
+        CREATE TEMP VIEW IF NOT EXISTS cr_member_imports AS
+            SELECT imports.blob_id, imports.ordinal AS import_ordinal,
+                   members.module_path, imports.native_scope AS binder_scope,
+                   imports.bound_name, imports.imported_name, imports.is_glob,
+                   imports.visibility, imports.cfg_condition, imports.is_macro_use,
+                   imports.local_start
+            FROM cr_members AS members
+            CROSS JOIN source_rust_import_targets AS imports ON imports.blob_id=members.blob_id
+            CROSS JOIN source_imports AS declaration
+              ON declaration.blob_id=imports.blob_id AND declaration.import_id=imports.source_import_id
+            WHERE imports.native_scope IS NOT NULL
+              AND declaration.declaration_start_byte>=members.start_byte
+              AND declaration.declaration_end_byte<=members.end_byte
+              AND NOT EXISTS(SELECT 1 FROM cr_scopes AS inner_module
+                  WHERE inner_module.blob_id=members.blob_id
+                    AND inner_module.scope_ordinal<>members.scope_ordinal
+                    AND inner_module.start_byte>=members.start_byte
+                    AND inner_module.end_byte<=members.end_byte
+                    AND declaration.declaration_start_byte>=inner_module.start_byte
+                    AND declaration.declaration_end_byte<=inner_module.end_byte);
         CREATE TEMP TABLE IF NOT EXISTS cr_routes(blob_id INTEGER, import_ordinal INTEGER,
             module_path TEXT, target_crate_key BLOB, target_module_path TEXT,
             PRIMARY KEY(blob_id, import_ordinal, module_path)) WITHOUT ROWID;
@@ -1346,11 +1661,13 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
             PRIMARY KEY(module_path, bound_name)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_glob_reexports AS SELECT module_path, target_crate_key,
             target_module_path, visibility, restricted_module_path FROM rust_crate_glob_reexport_routes WHERE 0;
+        CREATE INDEX IF NOT EXISTS cr_glob_reexports_module ON cr_glob_reexports(module_path);
         CREATE TEMP TABLE IF NOT EXISTS cr_imports AS SELECT module_path, namespace, bound_name, blob_id, import_ordinal,
             binder_scope, target_crate_key, target_module_path, target_name FROM rust_crate_imports WHERE 0;
         CREATE TEMP TABLE IF NOT EXISTS cr_globs AS SELECT module_path, blob_id, import_ordinal, binder_scope,
             target_crate_key, target_module_path FROM rust_crate_glob_imports WHERE 0;
         CREATE TEMP TABLE IF NOT EXISTS cr_gaps(gap_kind TEXT, subject TEXT, detail TEXT);
+        CREATE INDEX IF NOT EXISTS cr_gaps_subject ON cr_gaps(gap_kind, subject);
         CREATE INDEX IF NOT EXISTS cr_imports_name ON cr_imports(module_path, namespace, bound_name);
         CREATE INDEX IF NOT EXISTS cr_globs_module ON cr_globs(module_path);
         CREATE TEMP TABLE IF NOT EXISTS cr_impl_sources(blob_id INTEGER NOT NULL,
@@ -1448,7 +1765,8 @@ pub(super) const INSERT_IDENTITY_SQL: &str = "INSERT INTO cr_identity VALUES(?1)
 // topology whose rows they published. A route that leaves this crate names one
 // of them; every crate it can reach is a dependency, so it is derived already.
 pub(super) const INSERT_FOREIGN_SQL: &str = "INSERT INTO cr_foreign
-    SELECT ?1, ?2, crate_name FROM rust_crate_topologies WHERE topology_id = ?2";
+    SELECT live.crate_key, live.topology_id, topologies.crate_name
+    FROM temp.rust_schedule_live AS live JOIN rust_crate_topologies AS topologies USING(topology_id)";
 // Every container a route may step into, this crate's pending ones and the
 // derived crates' published ones, under the crate key that owns it.
 pub(super) const CONTAINERS_SQL: &str = "INSERT OR IGNORE INTO cr_containers_all
@@ -1639,40 +1957,42 @@ pub(super) const INSERT_ENUM_SOURCE_SQL: &str =
 pub(super) const SQL_CR_EXPORTS_4: &str = "INSERT OR IGNORE INTO cr_exports
         SELECT exports.crate_key, exports.module_path, CASE WHEN additional.namespace = 'macro' THEN 'macro'
                WHEN additional.namespace = 'type' THEN 'type' ELSE 'value' END,
-               exports.name, exports.origin, exports.visibility, exports.restricted_module_path,
+               exports.name, exports.origin,
+               CASE WHEN additional.namespace = 'value' AND constructor.declaration_id IS NOT NULL
+                    THEN constructor.visibility ELSE exports.visibility END,
+               CASE WHEN additional.namespace = 'value' AND constructor.declaration_id IS NOT NULL
+                    THEN constructor.restricted_module_path ELSE exports.restricted_module_path END,
                exports.declaration_blob_id, exports.declaration_site
         FROM cr_exports AS exports
         -- Start from this crate's exports; workspace semantic facts must not drive the per-crate expansion.
         CROSS JOIN resolution_semantic_sites AS site ON site.blob_id = exports.declaration_blob_id AND site.source_site = exports.declaration_site
-        CROSS JOIN resolution_additional_definition_namespaces AS additional ON additional.blob_id = site.blob_id AND additional.definition_semantic_key = site.semantic_key";
+        CROSS JOIN resolution_additional_definition_namespaces AS additional ON additional.blob_id = site.blob_id AND additional.definition_semantic_key = site.semantic_key
+        LEFT JOIN source_native_declaration_bridges AS bridge
+          ON bridge.blob_id = site.blob_id AND bridge.source_site = site.source_site
+        LEFT JOIN cr_constructor_visibilities AS constructor
+          ON constructor.module_path = exports.module_path AND constructor.blob_id = bridge.blob_id
+         AND constructor.declaration_id = bridge.declaration_id
+        WHERE additional.namespace <> 'value' OR constructor.declaration_id IS NULL
+           OR constructor.visibility IS NOT NULL";
 pub(super) const SQL_CR_SOURCE_IMPORTS_5: &str = "INSERT INTO cr_source_imports
-        SELECT DISTINCT imports.blob_id, imports.ordinal, members.module_path,
-               imports.native_scope, imports.bound_name, imports.imported_name,
+        SELECT DISTINCT imports.blob_id, imports.import_ordinal, imports.module_path,
+               imports.binder_scope, imports.bound_name, imports.imported_name,
                imports.is_glob, imports.visibility,
                (SELECT segment.segment
                 FROM source_rust_import_module_segments AS segment
                 WHERE segment.blob_id=imports.blob_id
-                  AND segment.import_ordinal=imports.ordinal
+                  AND segment.import_ordinal=imports.import_ordinal
                   AND segment.ordinal=0),
                imports.is_macro_use
-        FROM cr_members AS members
-        -- cr_members has no statistics; each unit must visit only its own imports, not the workspace.
-        CROSS JOIN source_rust_import_targets AS imports ON imports.blob_id = members.blob_id
-        CROSS JOIN source_imports AS declaration ON declaration.blob_id = imports.blob_id AND declaration.import_id = imports.source_import_id
-        WHERE cr_cfg(imports.cfg_condition, ?1) = 1 AND imports.native_scope IS NOT NULL
-          AND declaration.declaration_start_byte >= members.start_byte AND declaration.declaration_end_byte <= members.end_byte
-          AND NOT EXISTS(SELECT 1 FROM cr_scopes AS inner_module WHERE inner_module.blob_id = members.blob_id
-              AND inner_module.scope_ordinal <> members.scope_ordinal
-              AND inner_module.start_byte >= members.start_byte AND inner_module.end_byte <= members.end_byte
-              AND declaration.declaration_start_byte >= inner_module.start_byte AND declaration.declaration_end_byte <= inner_module.end_byte)";
+        FROM cr_member_imports AS imports
+        WHERE cr_cfg(imports.cfg_condition, ?1) = 1";
 pub(super) const SQL_CR_REEXPORTS_6: &str = "INSERT OR IGNORE INTO cr_reexports
         SELECT source.module_path, source.bound_name,
                COALESCE(root.dependency_crate_key, route.target_crate_key),
                CASE WHEN root.dependency_crate_key IS NOT NULL THEN 'crate' ELSE route.target_module_path END,
                CASE WHEN root.dependency_crate_key IS NOT NULL THEN 'self' ELSE source.imported_name END,
                cr_visibility(source.visibility), (SELECT restricted_module_path FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility)
-        FROM cr_source_imports AS source JOIN cr_routes AS route USING(blob_id, import_ordinal, module_path)
-        JOIN cr_members AS member ON member.module_path = source.module_path AND member.blob_id = source.blob_id
+        FROM cr_module_imports AS source JOIN cr_routes AS route USING(blob_id, import_ordinal, module_path)
         LEFT JOIN cr_dependencies AS root ON source.head_segment IS NULL
           AND root.extern_name = source.imported_name AND root.dependency_crate_key IS NOT NULL
         WHERE (cr_visibility(source.visibility)<>'restricted' OR EXISTS(SELECT 1 FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility AND restricted_module_path IS NOT NULL)) AND source.visibility <> 'private' AND source.is_glob = 0 AND source.bound_name IS NOT NULL";
@@ -1762,7 +2082,10 @@ pub(super) const SQL_CR_GAPS_9: &str = "INSERT INTO cr_gaps
                           WHERE dependency.extern_name=COALESCE(source.head_segment, source.imported_name)
                             AND dependency.dependency_crate_key IS NULL))
                THEN 'external_dependency'
-               WHEN source.visibility = 'private' THEN 'unresolved_import' ELSE 'unresolved_reexport' END,
+               WHEN source.visibility = 'private' OR NOT EXISTS(SELECT 1 FROM cr_module_imports AS module_import
+                     WHERE module_import.blob_id = source.blob_id
+                       AND module_import.import_ordinal = source.import_ordinal
+                       AND module_import.module_path = source.module_path) THEN 'unresolved_import' ELSE 'unresolved_reexport' END,
                source.module_path || '::' || COALESCE(source.bound_name, '*'),
                json_patch(
                  json_object('import_ordinal', source.import_ordinal, 'imported_name', source.imported_name),
@@ -1778,9 +2101,15 @@ pub(super) const SQL_CR_GAPS_9: &str = "INSERT INTO cr_gaps
                WHERE root.extern_name = source.imported_name AND root.dependency_crate_key IS NOT NULL))
           AND ((source.is_glob = 0 AND source.bound_name IS NULL)
            OR NOT EXISTS(SELECT 1 FROM cr_routes AS route WHERE route.blob_id = source.blob_id AND route.import_ordinal = source.import_ordinal AND route.module_path = source.module_path)
-           OR (source.is_glob = 0 AND source.visibility = 'private' AND NOT EXISTS(
+           OR (source.is_glob = 0 AND (source.visibility = 'private' OR NOT EXISTS(SELECT 1 FROM cr_module_imports AS module_import
+                     WHERE module_import.blob_id = source.blob_id
+                       AND module_import.import_ordinal = source.import_ordinal
+                       AND module_import.module_path = source.module_path)) AND NOT EXISTS(
                SELECT 1 FROM cr_imports AS imports WHERE imports.module_path = source.module_path AND imports.blob_id = source.blob_id AND imports.import_ordinal = source.import_ordinal))
-           OR (source.is_glob = 0 AND source.visibility <> 'private' AND NOT EXISTS(
+           OR (source.is_glob = 0 AND source.visibility <> 'private' AND EXISTS(SELECT 1 FROM cr_module_imports AS module_import
+                     WHERE module_import.blob_id = source.blob_id
+                       AND module_import.import_ordinal = source.import_ordinal
+                       AND module_import.module_path = source.module_path) AND NOT EXISTS(
                SELECT 1 FROM cr_exports AS exports WHERE exports.crate_key = (SELECT crate_key FROM cr_identity)
                  AND exports.module_path = source.module_path AND exports.name = source.bound_name)))";
 pub(super) const SQL_CR_EXPORTS_10: &str = "SELECT exports.module_path, exports.namespace, exports.name, exports.origin, definition.module_path, definition.name FROM cr_exports AS exports JOIN cr_exports AS definition ON definition.declaration_blob_id = exports.declaration_blob_id AND definition.declaration_site = exports.declaration_site AND definition.namespace = exports.namespace AND definition.origin = 'declaration' AND definition.crate_key = exports.crate_key WHERE exports.crate_key = (SELECT crate_key FROM cr_identity) AND exports.visibility = 'public' ORDER BY 1, 2, 3, 5, 6";
@@ -1820,8 +2149,84 @@ pub(super) const ROOT_REFERENCES_INSERT_SQL: &str =
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
     vec![
+        (
+            "rust_crate_public_surface_bindings",
+            PUBLIC_SURFACE_BINDINGS_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_aliases",
+            PUBLIC_SURFACE_ALIASES_SQL.as_str(),
+            0,
+        ),
+        (
+            "rust_crate_public_surface_lookup",
+            PUBLIC_SURFACE_LOOKUP_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_lookup_aliases",
+            PUBLIC_SURFACE_LOOKUP_ALIASES_SQL.as_str(),
+            0,
+        ),
+        (
+            "rust_crate_public_surface_candidates",
+            PUBLIC_SURFACE_CANDIDATES_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_globs",
+            PUBLIC_SURFACE_GLOBS_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_terminals",
+            PUBLIC_SURFACE_TERMINALS_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_named_requests",
+            PUBLIC_SURFACE_NAMED_REQUESTS_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_prune_terminals",
+            PUBLIC_SURFACE_PRUNE_TERMINALS_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_facts",
+            PUBLIC_SURFACE_FACTS_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_inventories",
+            PUBLIC_SURFACE_INVENTORIES_SQL,
+            0,
+        ),
+        ("rust_crate_public_surface_gaps", PUBLIC_SURFACE_GAPS_SQL, 0),
+        (
+            "rust_crate_public_surface_select",
+            PUBLIC_SURFACE_SELECT_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_surface_reachability",
+            PUBLIC_SURFACE_REACHABILITY_SQL,
+            0,
+        ),
+        (
+            "rust_crate_public_module_reachability_insert",
+            INSERT_PUBLIC_MODULE_REACHABILITY_SQL,
+            3,
+        ),
         ("rust_crate_visibility_routes", RESTRICTIONS_SQL, 0),
         ("rust_crate_visibility_inputs", RESTRICTION_INPUTS_SQL, 0),
+        (
+            "rust_crate_constructor_visibility",
+            CONSTRUCTOR_VISIBILITIES_SQL,
+            0,
+        ),
         ("rust_crate_visibility_gaps", RESTRICTION_GAPS_SQL, 0),
         ("rust_crate_glob_reexport_derive", GLOB_REEXPORTS_SQL, 0),
         ("rust_crate_glob_reexport_surface", GLOB_SURFACE_SQL, 0),
@@ -1874,7 +2279,7 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             1,
         ),
         ("rust_crate_insert_identity", INSERT_IDENTITY_SQL, 1),
-        ("rust_crate_insert_foreign", INSERT_FOREIGN_SQL, 2),
+        ("rust_crate_insert_foreign", INSERT_FOREIGN_SQL, 0),
         ("rust_crate_containers_all", CONTAINERS_SQL, 0),
         (
             "rust_crate_foreign_reexport_steps",
@@ -1939,8 +2344,8 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             0,
         ),
         ("rust_crate_derivation_sql_cr_gaps_9", SQL_CR_GAPS_9, 0),
-        ("rust_crate_open_export_inventory", OPEN_INVENTORY_SQL, 1),
-        ("rust_crate_unknown_exports", UNKNOWN_EXPORTS_SQL, 0),
+        ("rust_crate_open_export_inventory", OPEN_INVENTORY_SQL, 2),
+        ("rust_crate_unknown_exports", UNKNOWN_EXPORTS_SQL, 1),
         (
             "rust_crate_derivation_sql_cr_exports_10",
             SQL_CR_EXPORTS_10,
@@ -2089,10 +2494,473 @@ pub(super) const DELETE_IMPORT_CONFLICTS_SQL: &str = "DELETE FROM cr_imports WHE
 pub(super) const GLOB_REEXPORTS_SQL: &str = "INSERT INTO cr_glob_reexports
     SELECT source.module_path, route.target_crate_key, route.target_module_path,
            cr_visibility(source.visibility), (SELECT restricted_module_path FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility)
-    FROM cr_source_imports AS source JOIN cr_routes AS route USING(blob_id, import_ordinal, module_path)
-    JOIN cr_members AS member ON member.module_path = source.module_path AND member.blob_id = source.blob_id
+    FROM cr_module_imports AS source JOIN cr_routes AS route USING(blob_id, import_ordinal, module_path)
     WHERE (cr_visibility(source.visibility)<>'restricted' OR EXISTS(SELECT 1 FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility AND restricted_module_path IS NOT NULL)) AND source.visibility <> 'private' AND source.is_glob = 1";
 pub(super) const GLOB_SURFACE_SQL: &str = "SELECT module_path, target_crate_key, target_module_path FROM cr_glob_reexports WHERE visibility = 'public' ORDER BY 1, 2, 3";
 pub(super) const SELECT_GLOB_REEXPORTS_SQL: &str = "SELECT * FROM cr_glob_reexports";
 pub(super) const INSERT_GLOB_REEXPORTS_SQL: &str =
     "INSERT OR IGNORE INTO rust_crate_glob_reexport_routes VALUES(?1,?2,?3,?4,?5,?6)";
+
+#[cfg(test)]
+mod public_surface_plan_tests {
+    use super::*;
+    use crate::analyzer::store::AnalyzerStore;
+    use crate::analyzer::store::planner_statistics::pinned_plans::{explain_pin, pinned_queries};
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#5133: forwarded module surfaces need bounded exact-topology reads")]
+    fn public_module_surface_statements_seek_reached_keys_in_both_statistics_states() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        // This schema/SQL boundary fixture needs no source producer. Keep the
+        // real table shapes and checks; unrelated manifest FKs are immaterial.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        prepare_tables(&conn).unwrap();
+        let local = [1_u8; 32];
+        let foreign = [2_u8; 32];
+        conn.execute("INSERT INTO cr_identity VALUES(?1)", [local.as_slice()])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO cr_foreign VALUES(?1, 10, 'foreign')",
+            [foreign.as_slice()],
+        )
+        .unwrap();
+        for key in [local, foreign] {
+            conn.execute(
+                "INSERT INTO cr_surface_frontier VALUES(?1, 'crate')",
+                [key.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cr_surface_pending VALUES(?1, 'crate', 'type', 'api', ?2, 'crate', 'api')",
+                params![local.as_slice(), key.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cr_surface_lookup VALUES(?1, 'crate', 'type', 'api', ?2, 'crate', 'api', 'glob_reexport')",
+                params![local.as_slice(), key.as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cr_containers_all VALUES(?1, 'crate'), (?1, 'crate::api')",
+                [key.as_slice()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO cr_exports VALUES(?1, 'crate', 'type', 'api', 'glob_reexport', 'public', NULL, 1, 1)",
+            [local.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cr_glob_reexports VALUES('crate', ?1, 'crate', 'public', NULL)",
+            [foreign.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cr_reexports VALUES('crate', 'root_alias', ?1, 'crate', 'self', 'public', NULL)",
+            [foreign.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rust_crate_reexport_routes VALUES(10, 'crate', 'root_alias', ?1, 'crate', 'self', 'public', NULL)",
+            [foreign.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rust_crate_glob_reexport_routes VALUES(10, 'crate', ?1, 'crate', 'public', NULL)",
+            [foreign.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cr_reexport_closure VALUES(?1, 'crate', 'root_alias', ?2, 'crate')",
+            params![local.as_slice(), foreign.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cr_surface_lookup VALUES(?1, 'crate', 'type', 'root_alias', ?1, 'crate', 'root_alias', 'reexport')",
+            [local.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cr_surface_lookup SET origin = 'declaration' WHERE crate_key = ?1 AND name = 'api'",
+            [foreign.as_slice()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO rust_crate_exports VALUES(10, 'crate', 'type', 'api', 'declaration', 'public', NULL, 2, 2);
+             INSERT INTO source_fact_manifests(
+               blob_id, facts_version, source_bytes, occurrence_count, declaration_count,
+               declaration_unit_count, node_count, role_count, occurrence_role_count,
+               logical_rows, payload_bytes, publication_state, native_bridge_count,
+               rust_declaration_property_count)
+             SELECT blob_id, 1, 0, 0, 1, 0, 0, 0, 0, 3, 0, 'building', 1, 1
+             FROM (SELECT 1 AS blob_id UNION ALL SELECT 2);
+             INSERT INTO source_native_declaration_bridges VALUES(1, 1, 1), (2, 2, 2);
+             INSERT INTO source_rust_declaration_properties(blob_id, declaration_id, visibility, cfg_condition, declaration_kind)
+               VALUES(1, 1, 'public', 'true', 4), (2, 2, 'public', 'true', 4);",
+        )
+        .unwrap();
+        conn.execute(PUBLIC_SURFACE_BINDINGS_SQL, []).unwrap();
+        conn.execute(PUBLIC_SURFACE_CANDIDATES_SQL, []).unwrap();
+        conn.execute(PUBLIC_SURFACE_TERMINALS_SQL, []).unwrap();
+        conn.execute(PUBLIC_SURFACE_FACTS_SQL, []).unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for pin in pinned_queries()
+                .into_iter()
+                .filter(|pin| pin.name.starts_with("rust_crate_public_surface_"))
+            {
+                // Parameters are finite, populated frontier rows, not NULLs.
+                assert!(
+                    pin.params.is_empty(),
+                    "{}: unexpected SQL parameters",
+                    pin.name
+                );
+                let plan = explain_pin(&conn, &pin);
+                for forbidden in [
+                    "AUTOMATIC",
+                    "SCAN exports",
+                    "SCAN foreign_crate",
+                    "SCAN bridge",
+                    "SCAN properties",
+                    "SCAN routes",
+                    "SCAN named",
+                    "SCAN target",
+                ] {
+                    assert!(
+                        !plan.iter().any(|row| row.contains(forbidden)),
+                        "{state:?} {} must seek reached keys, not {forbidden}: {plan:?}",
+                        pin.name
+                    );
+                }
+                if matches!(
+                    pin.name.as_str(),
+                    "rust_crate_public_surface_bindings" | "rust_crate_public_surface_lookup"
+                ) {
+                    assert!(
+                        plan.iter().any(|row| row.contains(
+                            "SEARCH exports USING PRIMARY KEY (topology_id=? AND module_path=?"
+                        )),
+                        "{state:?} {} must seek the exact foreign topology/module: {plan:?}",
+                        pin.name
+                    );
+                }
+                if pin.name == "rust_crate_public_surface_reachability" {
+                    for keyed_read in [
+                        "SEARCH edge USING PRIMARY KEY (kind=? AND crate_key=? AND module_path=? AND namespace=?",
+                        "SEARCH uncertainty USING PRIMARY KEY (kind=? AND crate_key=? AND module_path=? AND namespace=? AND name=?",
+                    ] {
+                        assert!(
+                            plan.iter().any(|row| row.contains(keyed_read)),
+                            "{state:?} {} must seek graph owner keys: {plan:?}",
+                            pin.name
+                        );
+                    }
+                    assert!(
+                        !plan.iter().any(
+                            |row| row.contains("SCAN edge") || row.contains("SCAN uncertainty")
+                        ),
+                        "{state:?} {} must not scan graph facts: {plan:?}",
+                        pin.name
+                    );
+                }
+                if pin.name == "rust_crate_public_surface_lookup" {
+                    assert!(
+                        plan.iter().any(|row| row.contains(
+                            "topology_id=? AND module_path=? AND namespace=? AND name=?"
+                        )),
+                        "{state:?} {} must seek the selected foreign namespace/name: {plan:?}",
+                        pin.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#5133: a module edge hid a competing glob-exported type and falsely proved membership"
+    )]
+    fn public_module_surface_preserves_mixed_type_ambiguity() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        prepare_tables(&conn).unwrap();
+        let local = [1_u8; 32];
+        conn.execute("INSERT INTO cr_identity VALUES(?1)", [local.as_slice()])
+            .unwrap();
+        // Schema boundary: private a exports a module, private b exports a struct,
+        // and the root globs both. Feed selected structured rows directly because
+        // naming collision::Event in this surface is rejected by rustc (E0659).
+        for path in ["crate", "crate::a", "crate::b", "crate::a::collision"] {
+            conn.execute(
+                "INSERT INTO cr_containers_all VALUES(?1, ?2)",
+                params![local.as_slice(), path],
+            )
+            .unwrap();
+        }
+        for path in ["crate::a", "crate::b"] {
+            conn.execute(
+                "INSERT INTO cr_glob_reexports VALUES('crate', ?1, ?2, 'public', NULL)",
+                params![local.as_slice(), path],
+            )
+            .unwrap();
+        }
+        for (module, name, origin, blob, site) in [
+            ("crate", "collision", "glob_reexport", 1, 1),
+            ("crate::a", "collision", "declaration", 1, 1),
+            ("crate::b", "collision", "declaration", 2, 2),
+            ("crate::a::collision", "Event", "declaration", 1, 3),
+        ] {
+            conn.execute(
+                "INSERT INTO cr_exports VALUES(?1, ?2, 'type', ?3, ?4, 'public', NULL, ?5, ?6)",
+                params![local.as_slice(), module, name, origin, blob, site],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO source_fact_manifests(
+               blob_id, facts_version, source_bytes, occurrence_count, declaration_count,
+               declaration_unit_count, node_count, role_count, occurrence_role_count,
+               logical_rows, payload_bytes, publication_state, native_bridge_count,
+               rust_declaration_property_count)
+             SELECT blob_id, 1, 0, 0, 2, 0, 0, 0, 0, 5, 0, 'building', 2, 2
+             FROM (SELECT 1 AS blob_id UNION ALL SELECT 2);
+             INSERT INTO source_native_declaration_bridges VALUES(1, 1, 1), (2, 2, 2), (1, 3, 3);
+             INSERT INTO source_rust_declaration_properties(blob_id, declaration_id, visibility, cfg_condition, declaration_kind)
+               VALUES(1, 1, 'public', 'true', 4), (2, 2, 'public', 'true', 0), (1, 3, 'public', 'true', 0);",
+        )
+        .unwrap();
+        let project = || {
+            conn.execute_batch(
+                "DELETE FROM cr_surface_nodes; DELETE FROM cr_surface_facts; DELETE FROM cr_gaps;",
+            )
+            .unwrap();
+            derive_public_module_surface(&conn).unwrap();
+        };
+        let surface_digest = || {
+            let mut digest = Sha256::new();
+            for row in query_values(&conn, PUBLIC_SURFACE_SELECT_SQL).unwrap() {
+                for value in row {
+                    match value {
+                        Value::Text(text) => hash_cell(&mut digest, text.as_bytes()),
+                        Value::Blob(bytes) => hash_cell(&mut digest, &bytes),
+                        other => panic!("unexpected graph cell {other:?}"),
+                    }
+                }
+            }
+            <[u8; 32]>::from(digest.finalize())
+        };
+        let root = vec![Value::Blob(local.to_vec()), Value::Text("crate".into())];
+        let module = vec![
+            Value::Blob(local.to_vec()),
+            Value::Text("crate::a::collision".into()),
+        ];
+        project();
+        let ambiguous_digest = surface_digest();
+        assert_eq!(
+            query_values(&conn, PUBLIC_SURFACE_REACHABILITY_SQL).unwrap(),
+            vec![root.clone()]
+        );
+        assert_eq!(
+            query_values(
+                &conn,
+                "SELECT gap_kind, json_extract(detail, '$.reason') FROM cr_gaps",
+            )
+            .unwrap(),
+            vec![vec![
+                Value::Text("open_export_inventory".into()),
+                Value::Text("public_module_ambiguous".into()),
+            ]]
+        );
+        assert_eq!(
+            query_values(
+                &conn,
+                "SELECT json_extract(candidate.value, '$.module_path')
+                 FROM cr_gaps AS gap, json_each(gap.detail, '$.candidates') AS candidate ORDER BY 1",
+            )
+            .unwrap(),
+            vec![
+                vec![Value::Text("crate::a::collision".into())],
+                vec![Value::Text("crate::b::collision".into())],
+            ]
+        );
+        // Withdrawing only the competing declaration must change the graph digest
+        // and permit the previously ambiguous first-hop membership proof.
+        conn.execute("DELETE FROM cr_exports WHERE module_path = 'crate::b'", [])
+            .unwrap();
+        project();
+        let unambiguous_digest = surface_digest();
+        assert_ne!(ambiguous_digest, unambiguous_digest);
+        assert_eq!(
+            query_values(&conn, PUBLIC_SURFACE_REACHABILITY_SQL).unwrap(),
+            vec![root.clone(), module.clone()]
+        );
+        assert!(
+            query_values(&conn, "SELECT * FROM cr_gaps")
+                .unwrap()
+                .is_empty()
+        );
+        // Two public routes to the same canonical module are one candidate.
+        conn.execute(
+            "INSERT INTO cr_exports VALUES(?1, 'crate::b', 'type', 'collision', 'reexport', 'public', NULL, 1, 1)",
+            [local.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cr_reexport_steps VALUES(?1, 'crate::b', 'collision', ?1, 'crate::a', 'collision')",
+            [local.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cr_reexport_closure VALUES(?1, 'crate::b', 'collision', ?1, 'crate::a::collision')",
+            [local.as_slice()],
+        )
+        .unwrap();
+        project();
+        assert_eq!(surface_digest(), unambiguous_digest);
+        assert!(
+            query_values(&conn, "SELECT * FROM cr_gaps")
+                .unwrap()
+                .is_empty()
+        );
+        // A same-spelling function occupies value, never the module's type key.
+        conn.execute_batch(
+            "UPDATE source_rust_declaration_properties SET declaration_kind = 6 WHERE blob_id = 2 AND declaration_id = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cr_exports VALUES(?1, 'crate', 'value', 'collision', 'glob_reexport', 'public', NULL, 2, 2),
+                                          (?1, 'crate::b', 'value', 'collision', 'declaration', 'public', NULL, 2, 2)",
+            [local.as_slice()],
+        )
+        .unwrap();
+        project();
+        assert_eq!(
+            query_values(&conn, PUBLIC_SURFACE_REACHABILITY_SQL).unwrap(),
+            vec![root, module]
+        );
+        assert!(
+            query_values(&conn, "SELECT * FROM cr_gaps")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[hardwon("#5133: ambiguous module candidates cannot prove first-hop membership")]
+    fn public_module_membership_requires_a_proven_path_through_cycles_and_diamonds() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        prepare_tables(&conn).unwrap();
+        let local = [1_u8; 32];
+        let foreign = [2_u8; 32];
+        let remote = [3_u8; 32];
+        conn.execute("INSERT INTO cr_identity VALUES(?1)", [local.as_slice()])
+            .unwrap();
+        // Both sides of the diamond reach one canonical module. The public
+        // cycle returns to the root, so UNION must deduplicate whole nodes.
+        for (owner, module, name, target, target_module) in [
+            (local, "crate", "api", foreign, "crate::api"),
+            (local, "crate", "left", local, "crate::left"),
+            (local, "crate", "right", local, "crate::right"),
+            (local, "crate::left", "shared", foreign, "crate::diamond"),
+            (local, "crate::right", "shared", foreign, "crate::diamond"),
+            (foreign, "crate::api", "back", local, "crate"),
+            (local, "crate", "blocked", foreign, "crate::blocked_a"),
+            (local, "crate", "blocked", foreign, "crate::blocked_b"),
+            (foreign, "crate::blocked_a", "leak", foreign, "crate::leak"),
+            (local, "crate", "uncertain", remote, "crate::rescued"),
+            (local, "crate", "uncertain", remote, "crate::rejected"),
+            // The same candidate has a different proven path outside its
+            // physical subtree. Uncertainty belongs to a binding, not a node.
+            (foreign, "crate::api", "alias", remote, "crate::rescued"),
+            (
+                remote,
+                "crate::rescued",
+                "child",
+                remote,
+                "crate::rescued::child",
+            ),
+            (local, "crate", "unavailable", foreign, "crate::unavailable"),
+        ] {
+            conn.execute(
+                "INSERT INTO cr_surface_facts VALUES('public_module_edge', ?1, ?2, 'type', ?3, ?4, ?5)",
+                params![owner.as_slice(), module, name, target.as_slice(), target_module],
+            )
+            .unwrap();
+        }
+        for (kind, owner, name) in [
+            ("public_module_ambiguous", local, "blocked"),
+            ("public_module_ambiguous", local, "uncertain"),
+            ("public_module_unavailable", local, "unavailable"),
+            // A marker on another owner must not poison the root's api edge.
+            ("public_module_ambiguous", foreign, "api"),
+        ] {
+            conn.execute(
+                "INSERT INTO cr_surface_facts VALUES(?1, ?2, 'crate', 'type', ?3, X'', '')",
+                params![kind, owner.as_slice(), name],
+            )
+            .unwrap();
+        }
+        let rows = query_values(&conn, PUBLIC_SURFACE_REACHABILITY_SQL).unwrap();
+        let expected = [
+            (local, "crate"),
+            (local, "crate::left"),
+            (local, "crate::right"),
+            (foreign, "crate::api"),
+            (foreign, "crate::diamond"),
+            (remote, "crate::rescued"),
+            (remote, "crate::rescued::child"),
+        ]
+        .into_iter()
+        .map(|(key, module)| vec![Value::Blob(key.to_vec()), Value::Text(module.into())])
+        .collect::<Vec<_>>();
+        assert_eq!(rows, expected);
+        let tx = conn.unchecked_transaction().unwrap();
+        for row in &rows {
+            tx.execute(
+                INSERT_PUBLIC_MODULE_REACHABILITY_SQL,
+                params![10, row[0], row[1]],
+            )
+            .unwrap();
+        }
+        // Membership is selected by topology; unrelated publications coexist.
+        tx.execute(
+            INSERT_PUBLIC_MODULE_REACHABILITY_SQL,
+            params![11, foreign.as_slice(), "crate::decoy"],
+        )
+        .unwrap();
+        assert_eq!(
+            query_values(
+                &tx,
+                "SELECT target_crate_key, target_module_path FROM rust_crate_public_module_reachability WHERE topology_id = 10 ORDER BY target_crate_key, target_module_path",
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            tx.execute(
+                INSERT_PUBLIC_MODULE_REACHABILITY_SQL,
+                params![10, local.as_slice(), "crate"],
+            )
+            .unwrap_err()
+            .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+        tx.rollback().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM rust_crate_public_module_reachability",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+}

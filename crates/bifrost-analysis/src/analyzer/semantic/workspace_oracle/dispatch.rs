@@ -6259,7 +6259,8 @@ fn python_external_class_result_call(
                 crate::analyzer::semantic::ClassIdentity::External { symbol_id, .. } => {
                     Some(symbol_id.as_ref())
                 }
-                crate::analyzer::semantic::ClassIdentity::Workspace(_) => None,
+                crate::analyzer::semantic::ClassIdentity::Workspace(_)
+                | crate::analyzer::semantic::ClassIdentity::Intrinsic { .. } => None,
             });
     let direct_class = match exact_records.as_slice() {
         [class]
@@ -6551,47 +6552,8 @@ pub(crate) fn python_workspace_module_member_mutation_free(
     max_nodes: usize,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<bool> {
-    let Ok(files) = analyzer.project().all_files_shared() else {
-        return Some(false);
-    };
-    for file in files.iter() {
-        if !keep_going() {
-            return None;
-        }
-        if crate::analyzer::common::language_for_file(file) != Language::Python {
-            continue;
-        }
-        let Ok(source) = file.read_to_string() else {
-            return Some(false);
-        };
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .is_err()
-        {
-            return Some(false);
-        }
-        let Some(tree) = parser.parse(&source, None) else {
-            return Some(false);
-        };
-        if tree.root_node().has_error() {
-            return Some(false);
-        }
-        let source_module = brokk_bifrost_python::declarations::python_module_name(file);
-        if brokk_bifrost_python::runtime_values::python_module_member_mutation(
-            tree.root_node(),
-            &source,
-            &source_module,
-            module,
-            member,
-            max_nodes,
-        )
-        .is_some()
-        {
-            return Some(false);
-        }
-    }
-    keep_going().then_some(true)
+    language_support(Language::Python)?
+        .workspace_module_member_mutation_free(analyzer, module, member, max_nodes, keep_going)
 }
 
 /// Whether a low-level external boundary is only a syntax-derived placeholder
@@ -7519,6 +7481,29 @@ pub fn procedures_for_source_ranges(
         for range in ranges {
             if let Err(status) = progress.examine() {
                 return progress.failed(status);
+            }
+            if range.start_byte < span.start_byte() as usize
+                || (span.end_byte() as usize) < range.end_byte
+            {
+                continue;
+            }
+            let mut excluded = false;
+            for hole in procedure.source_range_holes() {
+                if let Err(status) = progress.examine() {
+                    return progress.failed(status);
+                }
+                // A surrounding call or declaration can contain a nested
+                // body's span and still be owned here. Exclude only inputs
+                // inside that unlowered body, not their enclosing syntax.
+                if hole.start_byte() as usize <= range.start_byte
+                    && range.end_byte <= hole.end_byte() as usize
+                {
+                    excluded = true;
+                    break;
+                }
+            }
+            if excluded {
+                continue;
             }
             if range.start_byte == span.start_byte() as usize
                 && range.end_byte == span.end_byte() as usize

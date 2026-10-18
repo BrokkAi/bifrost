@@ -1162,13 +1162,20 @@ impl AnalyzerStoreContext {
     pub(crate) fn for_second_build(&self, project: &dyn Project) -> Self {
         let mut context = store_context_from_shared_store(project, Arc::clone(&self.store), false);
         if self.workspace_id != context.workspace_id {
-            context.workspace_id = crate::analyzer::store::WorkspaceId::for_session();
-            context._projection_lease =
-                Some(Arc::new(crate::analyzer::WorkspaceProjectionLease::new(
-                    Arc::clone(&context.store),
-                    context.workspace_id.clone(),
-                )));
+            context = context.isolated_projection();
         }
+        context
+    }
+
+    fn isolated_projection(&self) -> Self {
+        let mut context = self.clone();
+        // The original workspace owns collection; a request owns only its lease.
+        context.gc = Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::disabled());
+        context.workspace_id = crate::analyzer::store::WorkspaceId::for_session();
+        context._projection_lease = Some(Arc::new(crate::analyzer::WorkspaceProjectionLease::new(
+            Arc::clone(&context.store),
+            context.workspace_id.clone(),
+        )));
         context
     }
 }
@@ -1673,6 +1680,15 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// Expected Java type-construction metadata contract, distinct from an
     /// absent constructor shape in a legacy or non-Java publication.
     fn java_type_constructor_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    /// Bind path-derived placement to the same project view as source reads.
+    /// Content-local adapters need no additional context.
+    fn for_project(&self, _project: Arc<dyn Project>) -> Option<Self>
+    where
+        Self: Sized,
+    {
         None
     }
 
@@ -4082,6 +4098,9 @@ impl<A> TreeSitterAnalyzer<A> {
         A: LanguageAdapter,
     {
         let mut snapshot = self.clone();
+        if let Some(adapter) = snapshot.adapter.for_project(Arc::clone(&project)) {
+            snapshot.adapter = Arc::new(adapter);
+        }
         snapshot.project = project;
         snapshot.dependency_evidence_overlay = Self::capture_dependency_overlay(
             snapshot.project.as_ref(),
@@ -4107,6 +4126,12 @@ impl<A> TreeSitterAnalyzer<A> {
         snapshot.snapshot_caches = Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
             self.config.memo_cache_budget_bytes() / 8,
         ));
+        snapshot.adapter = Self::bind_selected_adapter(
+            &snapshot.project,
+            Arc::clone(&snapshot.adapter),
+            &snapshot.store_context,
+            &snapshot.selected_workspace_snapshots(),
+        );
         snapshot
     }
 }
@@ -4115,6 +4140,30 @@ impl<A> TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn bind_selected_adapter(
+        project: &Arc<dyn Project>,
+        adapter: Arc<A>,
+        context: &AnalyzerStoreContext,
+        snapshots: &WorkspaceSnapshots,
+    ) -> Arc<A> {
+        let Some(snapshot) = snapshots.get(adapter.language().config_label()) else {
+            return adapter;
+        };
+        let selected = Arc::new(
+            crate::analyzer::workspace::SelectedConfigurationProject::new(
+                Arc::clone(project),
+                adapter.language(),
+                Arc::clone(&context.store),
+                snapshot.clone(),
+                context._projection_lease.clone(),
+            ),
+        );
+        adapter
+            .for_project(selected)
+            .map(Arc::new)
+            .unwrap_or(adapter)
+    }
+
     fn capture_dependency_overlay(
         project: &dyn Project,
         language: Language,
@@ -4200,9 +4249,23 @@ where
         Ok(wrap(construct(config)?, memo_budget))
     }
 
+    /// Reconcile request placement without replacing the live workspace head.
+    /// The lease removes this projection after its last snapshot owner drops;
+    /// content publications remain shared with the original analyzer.
+    pub(crate) fn reproject_workspace(&self) -> Self {
+        let mut request = self.clone();
+        request.store_context = self.store_context.isolated_projection();
+        request.update_all_with_progress(None)
+    }
+
     pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
         #[cfg(test)]
         count_full_update_for_test(self.project.root());
+        let adapter = self
+            .adapter
+            .for_project(Arc::clone(&self.project))
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::clone(&self.adapter));
         let mut store_context = self.store_context.clone();
         store_context.live_paths = Arc::new(
             self.store_context
@@ -4217,7 +4280,7 @@ where
         store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
         let mut state = Self::build_state(
             self.project.as_ref(),
-            self.adapter.as_ref(),
+            adapter.as_ref(),
             &self.config,
             progress,
             &store_context,
@@ -4245,7 +4308,7 @@ where
         }
         Self::from_state(
             Arc::clone(&self.project),
-            Arc::clone(&self.adapter),
+            adapter,
             self.config.clone(),
             state,
             Arc::clone(&self.structural_cache),
@@ -4285,7 +4348,7 @@ where
         progress: Option<BuildProgress>,
         store_context: Option<AnalyzerStoreContext>,
     ) -> std::result::Result<Self, StoreError> {
-        let adapter = Arc::new(adapter);
+        let adapter = Arc::new(adapter.for_project(Arc::clone(&project)).unwrap_or(adapter));
         // A supplied store can still belong to a directly constructed analyzer.
         // Only a workspace build snapshot delegates crate publication to the
         // WorkspaceAnalyzer boundary after its language workers finish.
@@ -4389,6 +4452,12 @@ where
             project.as_ref(),
             adapter.language(),
             &store_context.store,
+            &relational_workspace_snapshots,
+        );
+        let adapter = Self::bind_selected_adapter(
+            &project,
+            adapter,
+            &store_context,
             &relational_workspace_snapshots,
         );
         Ok(Self {
@@ -5123,6 +5192,12 @@ where
             project.as_ref(),
             adapter.language(),
             &store_context.store,
+            &relational_workspace_snapshots,
+        );
+        let adapter = Self::bind_selected_adapter(
+            &project,
+            adapter,
+            &store_context,
             &relational_workspace_snapshots,
         );
         Self {
@@ -6633,6 +6708,7 @@ where
         matches!(
             language,
             Language::Rust
+                | Language::Python
                 | Language::Go
                 | Language::Java
                 | Language::Kotlin
@@ -6647,8 +6723,9 @@ where
             || WorkspaceConfigurationInput::is_native_input(adapter.language(), file.rel_path())
     }
 
-    /// Capture filesystem configuration once for the persisted revision. Request
-    /// overlays remain transient and cannot replace this input authority.
+    /// Capture configuration once for the selected revision. Disk-owned
+    /// contexts retain filesystem bytes; Python placement retains the project
+    /// snapshot bytes its naming and binding evidence consume.
     fn workspace_configuration_inputs(
         project: &dyn Project,
         adapter: &A,
@@ -6667,13 +6744,25 @@ where
             .cloned()
             .collect::<BTreeSet<_>>();
         WorkspaceConfigurationInput::include_native_metadata_paths(
-            project.root(),
+            project,
+            &files,
             adapter.language(),
             &mut inputs,
         )?;
         inputs
             .iter()
             .map(|file| {
+                // Python roots and marker evidence are selected from the
+                // project snapshot, including unsaved configuration. Retain
+                // those exact inputs with the existing workspace relation.
+                if adapter.language() == Language::Python {
+                    return project.read_source(file).map(|source| {
+                        Some(WorkspaceConfigurationInput::new(
+                            crate::path_utils::rel_path_string(file),
+                            source.into_bytes().into_boxed_slice(),
+                        ))
+                    });
+                }
                 match std::fs::read(file.abs_path()) {
                     Ok(bytes) => Ok(Some(WorkspaceConfigurationInput::new(
                         crate::path_utils::rel_path_string(file),
@@ -6696,6 +6785,27 @@ where
             })
             .collect::<std::io::Result<Vec<_>>>()
             .map(|inputs| inputs.into_iter().flatten().collect())
+    }
+
+    /// Compare exact configuration inputs with the placement this analyzer
+    /// selected. A failed read takes the full reconciliation path, where the
+    /// normal configuration diagnostic marks the inventory incomplete.
+    pub(crate) fn workspace_configuration_changed(&self) -> bool {
+        let Ok(inputs) = Self::workspace_configuration_inputs(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            None,
+        ) else {
+            return true;
+        };
+        let mut ordered = inputs.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|input| input.relative_path());
+        let digest = crate::analyzer::store::configuration_digest(
+            ordered
+                .into_iter()
+                .map(|input| (input.relative_path(), input.content_oid())),
+        );
+        self.state.workspace_configuration_digest != Some(digest)
     }
 
     /// Every workspace file whose extension no language claims: the universe
@@ -11303,6 +11413,81 @@ where
                 None
             }
         }
+    }
+
+    /// Bounded sibling of the path-first module lookup. Dirty candidates and
+    /// nonmatching rows count before hydration; no workspace vector is built.
+    pub(crate) fn lookup_path_modules_by_fqn_limited(
+        &self,
+        fqn: &str,
+        limit: usize,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        if limit == 0 || !continue_query() {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        if !self.workspace_declaration_identities_authoritative()
+            || !self.adapter.has_path_synthetic_module_units()
+        {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
+        let normalized = self.adapter.normalize_full_name(fqn);
+        let batch = self
+            .store_query_or_record(
+                |sink| {
+                    sink.push(ReadKey::index(IndexFamily::PathSymbol, fqn));
+                    sink.push(ReadKey::index(IndexFamily::PathSymbol, &normalized));
+                },
+                self.store_context
+                    .store
+                    .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                        self.selected_workspace_snapshots().as_ref(),
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                        (fqn, &normalized),
+                        limit,
+                        &mut continue_query,
+                    ),
+                format!("querying bounded path-backed module `{fqn}`"),
+            )
+            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
+        if !batch.complete {
+            return LimitedQueryRows::incomplete(Vec::new(), batch.inspected);
+        }
+        let mut inspected = batch.inspected;
+        let snapshot = self.live_snapshot();
+        let mut units = Vec::new();
+        for (lang, row) in batch.rows {
+            if !continue_query() {
+                return LimitedQueryRows::incomplete(Vec::new(), inspected);
+            }
+            if let Some(unit) = self.live_path_symbol_unit(&lang, &row, &snapshot)
+                && (unit.fq_name() == fqn
+                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
+            {
+                units.push(unit);
+            }
+        }
+        let dirty = self
+            .state
+            .dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned");
+        for (lang, row) in dirty.values() {
+            if inspected == limit || !continue_query() {
+                return LimitedQueryRows::incomplete(Vec::new(), inspected);
+            }
+            inspected += 1;
+            if let Some(unit) = self.live_path_symbol_unit(lang, row, &snapshot)
+                && (unit.fq_name() == fqn
+                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
+            {
+                units.push(unit);
+            }
+        }
+        units.sort();
+        units.dedup();
+        LimitedQueryRows::complete(units, inspected)
     }
 
     fn filter_declarations_named<'a>(
@@ -18298,7 +18483,7 @@ mod tests {
             .expect("write Python fixture");
         let python_project: Arc<dyn Project> =
             Arc::new(TestProject::new(&python_root, Language::Python));
-        let python_analyzer = TreeSitterAnalyzer::new(python_project, PythonAdapter);
+        let python_analyzer = TreeSitterAnalyzer::new(python_project, PythonAdapter::default());
         let module = python_analyzer
             .get_all_declarations()
             .into_iter()
@@ -20522,12 +20707,99 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3673: cold exact lookup must retain the selected manifest after a disk edit"
+    )]
+    fn python_retained_exact_lookup_keeps_selected_configuration() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Python)
+            .file(
+                "pyproject.toml",
+                "[tool.setuptools.packages.find]\nwhere = ['source']\n",
+            )
+            .file("source/pkg/model.py", "class Widget:\n    pass\n")
+            .build();
+        let retained = TreeSitterAnalyzer::new(fixture.project_dyn(), PythonAdapter::default());
+        std::fs::write(
+            fixture.root().join("pyproject.toml"),
+            "[tool.setuptools.packages.find]\nwhere = ['.']\n",
+        )
+        .unwrap();
+        let names = retained.get_definitions("pkg.model.Widget");
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert_eq!(names[0].fq_name(), "pkg.model.Widget");
+        assert!(
+            retained
+                .get_definitions("source.pkg.model.Widget")
+                .is_empty()
+        );
+        let fresh = TreeSitterAnalyzer::new(fixture.project_dyn(), PythonAdapter::default());
+        let names = fresh.get_definitions("source.pkg.model.Widget");
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(fresh.get_definitions("pkg.model.Widget").is_empty());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3673: request root reprojection must not replace the live workspace head"
+    )]
+    fn python_request_root_projection_keeps_the_live_workspace_head() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Python)
+            .file("source/pkg/model.py", "class Widget:\n    pass\n")
+            .build();
+        let disk = TreeSitterAnalyzer::new(fixture.project_dyn(), PythonAdapter::default());
+        let original = disk.selected_workspace_snapshots();
+        let original_python = original.get("python").expect("Python workspace snapshot");
+        let overlay = OverlayProject::new(fixture.project_dyn());
+        assert!(overlay.set(
+            fixture.root().join("pyproject.toml"),
+            "[tool.setuptools.packages.find]\nwhere = ['source']\n".to_string()
+        ));
+        let request = disk
+            .clone_with_project(Arc::new(overlay.snapshot()))
+            .reproject_workspace();
+        let current = disk
+            .store_context
+            .store
+            .workspace_snapshots_for_langs(
+                &disk.store_context.workspace_id,
+                &["python".to_string()],
+                disk.store_context.generations.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(current.get("python"), Some(original_python));
+        assert_ne!(
+            request.store_context.workspace_id,
+            disk.store_context.workspace_id
+        );
+        let projected_definitions = request.get_definitions("pkg.model.Widget");
+        assert_eq!(projected_definitions.len(), 1, "{projected_definitions:?}");
+        let original_definitions = disk.get_definitions("source.pkg.model.Widget");
+        assert_eq!(original_definitions.len(), 1, "{original_definitions:?}");
+        let request_id = request.store_context.workspace_id.clone();
+        drop(request);
+        let remaining = disk
+            .store_context
+            .store
+            .workspace_snapshots_for_langs(
+                &request_id,
+                &["python".to_string()],
+                disk.store_context.generations.as_ref(),
+            )
+            .unwrap();
+        assert!(remaining.is_empty(), "{remaining:?}");
+        assert_eq!(
+            disk.get_definitions("source.pkg.model.Widget"),
+            original_definitions
+        );
+    }
+
+    #[test]
     fn prepared_source_above_batch_targets_publishes_queryable_facts() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let source = "class Published:\n    pass\n".to_string();
         let file = ProjectFile::new(root, "published.py");
-        let adapter = PythonAdapter;
+        let adapter = PythonAdapter::for_test_file(&file);
         let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
             adapter.parser_language_for_file(&file),
         );
@@ -20793,7 +21065,7 @@ mod tests {
     #[test]
     fn issue_1774_one_request_walks_the_live_path_set_once_for_many_lookups() {
         let (_temp, project) = workspace_scan_probe_project(3);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
 
         let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         analyzer.begin_query(&scope);
@@ -20821,7 +21093,7 @@ mod tests {
     #[test]
     fn issue_1774_a_later_request_walks_the_live_path_set_again() {
         let (_temp, project) = workspace_scan_probe_project(2);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
 
         analyzer.reset_workspace_path_scan_count_for_test();
         for _ in 0..2 {
@@ -20846,7 +21118,7 @@ mod tests {
     #[test]
     fn issue_1774_memoized_walk_answers_each_name_with_its_own_narrowed_result() {
         let (_temp, project) = workspace_scan_probe_project(3);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
 
         let unscoped: Vec<BTreeSet<CodeUnit>> = (0..3)
             .map(|index| {
@@ -20879,7 +21151,7 @@ mod tests {
     #[test]
     fn issue_1748_repeated_definition_lookups_in_one_request_charge_one_store_read() {
         let (_temp, project) = workspace_scan_probe_project(1);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
 
         let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         analyzer.begin_query(&scope);
@@ -20906,7 +21178,7 @@ mod tests {
         const WORKERS: usize = 8;
 
         let (_temp, project) = shared_short_name_project(64);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
         let fq_name = "pkg.mod_0.Shared";
         let expected: Vec<CodeUnit> = CodeUnitIndex::definitions(&analyzer, fq_name).collect();
 
@@ -20943,7 +21215,7 @@ mod tests {
     #[test]
     fn issue_1748_definition_lookups_outside_a_request_are_not_memoized() {
         let (_temp, project) = workspace_scan_probe_project(1);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
 
         analyzer.reset_definition_candidates_query_count_for_test();
         let _ = CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").count();
@@ -20969,7 +21241,7 @@ mod tests {
     #[test]
     fn issue_1839_distinct_fq_names_sharing_a_short_name_read_the_rows_once() {
         let (_temp, project) = shared_short_name_project(6);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
         let names: Vec<String> = (0..6)
             .map(|index| format!("pkg.mod_{index}.Shared"))
             .collect();
@@ -21010,7 +21282,7 @@ mod tests {
         const WORKERS: usize = 8;
 
         let (_temp, project) = shared_short_name_project(WORKERS);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
         let names: Vec<String> = (0..WORKERS)
             .map(|index| format!("pkg.mod_{index}.Shared"))
             .collect();
@@ -21056,7 +21328,7 @@ mod tests {
     #[test]
     fn issue_1748_prefetched_definitions_match_the_point_lookups_they_replace() {
         let (_temp, project) = workspace_scan_probe_project(4);
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
         let names: Vec<String> = (0..4)
             .map(|index| format!("pkg.mod_{index}.Widget{index}"))
             .collect();
@@ -21096,7 +21368,7 @@ mod tests {
         let file = ProjectFile::new(root.clone(), "dirty.py");
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
         let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
             analyzer.adapter.parser_language_for_file(&file),
         );
@@ -21169,17 +21441,43 @@ mod tests {
         std::fs::write(root.join("pkg/util.py"), source).unwrap();
         let file = ProjectFile::new(root.clone(), "pkg/util.py");
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
-        let adapter = Arc::new(PythonAdapter);
+        let adapter = Arc::new(PythonAdapter::for_test_file(&file));
         let row = TreeSitterAnalyzer::<PythonAdapter>::path_symbol_row(&*adapter, &file, oid)
             .expect("python path projection");
         let mut dirty_path_symbol_rows = HashMap::default();
-        dirty_path_symbol_rows.insert(file.clone(), ("python".to_string(), row));
+        dirty_path_symbol_rows.insert(file.clone(), ("python".to_string(), row.clone()));
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
         let live_paths = Arc::new(LivePathMap::default());
         live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
+        let generation = store
+            .ensure_language_epoch_value("python", "bounded-paths")
+            .unwrap();
+        let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
+            adapter.parser_language_for_file(&file),
+        );
+        let parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
+            &mut parser,
+            &*adapter,
+            &file,
+            source.to_owned(),
+        )
+        .expect("Python fixture parses")
+        .state;
+        store
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "python",
+                generation,
+                &*adapter,
+                &parsed,
+            )
+            .unwrap();
+        let workspace_id = crate::analyzer::store::WorkspaceId::for_root(project.root());
         let store_context = AnalyzerStoreContext {
-            store: Arc::new(AnalyzerStore::open_ephemeral().unwrap()),
+            store: Arc::clone(&store),
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
@@ -21188,10 +21486,7 @@ mod tests {
             workspace_listing_complete: true,
             revision_blobs: None,
             live_paths,
-            generations: Arc::new(HashMap::from_iter([(
-                "python".to_string(),
-                GenerationId::BOOTSTRAP,
-            )])),
+            generations: Arc::new(HashMap::from_iter([("python".to_string(), generation)])),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
@@ -21216,7 +21511,7 @@ mod tests {
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
                 &config,
             )),
-            TreeSitterAnalyzer::build_content_identity_base(&config, &PythonAdapter),
+            TreeSitterAnalyzer::build_content_identity_base(&config, &PythonAdapter::default()),
             crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
                 config.memo_cache_budget_bytes() / 8,
             ),
@@ -21232,6 +21527,112 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["pkg.util".to_string()]
         );
+
+        let selected = store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "python",
+                generation,
+                &[crate::analyzer::store::WorkspaceFileRow {
+                    rel_path: row.rel_path.clone(),
+                    blob_oid: oid,
+                }],
+                std::slice::from_ref(&row),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        analyzer
+            .relational_workspace_snapshots
+            .store(Arc::new(HashMap::from_iter([(
+                "python".to_string(),
+                selected,
+            )])));
+
+        // The same exact/normalized module is present in SQLite and the dirty
+        // projection. Hydration must deduplicate the two admitted rows.
+        let hit = analyzer.lookup_path_modules_by_fqn_limited("pkg.util", 8, || true);
+        assert!(hit.complete);
+        assert_eq!(hit.inspected, 2);
+        assert_eq!(hit.rows.len(), 1);
+        assert_eq!(hit.rows[0].fq_name(), "pkg.util");
+        let absent = analyzer.lookup_path_modules_by_fqn_limited("pkg.absent", 8, || true);
+        assert!(absent.complete);
+        assert!(absent.rows.is_empty());
+
+        for limit in [0, 1] {
+            let capped = analyzer.lookup_path_modules_by_fqn_limited("pkg.util", limit, || true);
+            assert!(!capped.complete);
+            assert!(capped.rows.is_empty());
+            assert!(capped.inspected <= limit);
+        }
+        let stopped = analyzer.lookup_path_modules_by_fqn_limited("pkg.util", 8, || false);
+        assert!(!stopped.complete);
+        assert!(stopped.rows.is_empty());
+        assert_eq!(stopped.inspected, 0);
+        let mut polls = 0;
+        let interrupted = analyzer.lookup_path_modules_by_fqn_limited("pkg.util", 8, || {
+            polls += 1;
+            polls <= 3
+        });
+        assert!(!interrupted.complete);
+        assert!(interrupted.rows.is_empty());
+        assert_eq!(interrupted.inspected, 1);
+
+        let replacement_source = "def replacement():\n    pass\n";
+        let replacement_oid =
+            Oid::hash_object(ObjectType::Blob, replacement_source.as_bytes()).unwrap();
+        analyzer
+            .store_context
+            .live_paths
+            .refresh([LivePathEntry::overlay(file.clone(), replacement_oid)]);
+        let stale = analyzer.lookup_path_modules_by_fqn_limited("pkg.util", 8, || true);
+        assert!(stale.complete);
+        assert!(
+            stale.rows.is_empty(),
+            "neither stale persisted nor stale dirty OID is live"
+        );
+        let replacement = TreeSitterAnalyzer::<PythonAdapter>::path_symbol_row(
+            &*analyzer.adapter,
+            &file,
+            replacement_oid,
+        )
+        .unwrap();
+        analyzer
+            .state
+            .dirty_path_symbol_rows
+            .lock()
+            .unwrap()
+            .insert(file, ("python".to_string(), replacement));
+        let replaced = analyzer.lookup_path_modules_by_fqn_limited("pkg.util", 8, || true);
+        assert!(replaced.complete);
+        assert_eq!(replaced.rows.len(), 1);
+        assert_eq!(replaced.rows[0].fq_name(), "pkg.util");
+
+        let other = ProjectFile::new(analyzer.project.root().to_path_buf(), "pkg/other.py");
+        std::fs::write(other.abs_path(), source).unwrap();
+        let other_row =
+            TreeSitterAnalyzer::<PythonAdapter>::path_symbol_row(&*analyzer.adapter, &other, oid)
+                .unwrap();
+        analyzer
+            .store_context
+            .live_paths
+            .refresh([LivePathEntry::overlay(other.clone(), oid)]);
+        analyzer
+            .state
+            .dirty_path_symbol_rows
+            .lock()
+            .unwrap()
+            .insert(other, ("python".to_string(), other_row));
+        let exhausted_dirty = analyzer.lookup_path_modules_by_fqn_limited("pkg.absent", 1, || true);
+        assert!(
+            !exhausted_dirty.complete,
+            "SQL absence cannot bypass unvisited dirty rows"
+        );
+        assert_eq!(exhausted_dirty.inspected, 1);
+        assert!(exhausted_dirty.rows.is_empty());
     }
 
     fn analyzer_with_retryable_dirty_python_file(
@@ -21251,7 +21652,7 @@ mod tests {
         std::fs::write(file.abs_path(), source).unwrap();
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
-        let adapter = Arc::new(PythonAdapter);
+        let adapter = Arc::new(PythonAdapter::for_test_file(&file));
         let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
             adapter.parser_language_for_file(&file),
         );
@@ -21312,7 +21713,7 @@ mod tests {
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
                 &config,
             )),
-            TreeSitterAnalyzer::build_content_identity_base(&config, &PythonAdapter),
+            TreeSitterAnalyzer::build_content_identity_base(&config, &PythonAdapter::default()),
             crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
                 config.memo_cache_budget_bytes() / 8,
             ),
@@ -21394,7 +21795,7 @@ mod tests {
 
         let python_file = temp_file(&root, "pkg/service.py");
         python_file.write("class Service:\n    pass\n").unwrap();
-        let python = PythonAdapter;
+        let python = PythonAdapter::for_test_file(&python_file);
         let python_unit = CodeUnit::new(
             python_file.clone(),
             CodeUnitType::Class,
@@ -24886,7 +25287,7 @@ mod tests {
 
         let _cold = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
-            PythonAdapter,
+            PythonAdapter::default(),
             config.clone(),
             store_context.clone(),
             None,
@@ -24897,7 +25298,7 @@ mod tests {
         let warm_progress_count = Arc::clone(&warm_parse_count);
         let warm = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
-            PythonAdapter,
+            PythonAdapter::default(),
             config.clone(),
             store_context.clone(),
             Some(Arc::new(move |event| {
@@ -24918,7 +25319,7 @@ mod tests {
         let progress_count = Arc::clone(&parse_count);
         let recovered = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
-            PythonAdapter,
+            PythonAdapter::default(),
             config,
             store_context,
             Some(Arc::new(move |event| {

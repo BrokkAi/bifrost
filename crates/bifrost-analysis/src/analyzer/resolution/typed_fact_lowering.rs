@@ -648,10 +648,12 @@ impl LoweredDeclarationTypeProperty {
 /// declaration public: it can also mean that a producer or persisted rowset
 /// omitted the access-control family. Consumers may discharge Java visibility
 /// evidence only after reading this row and observing [`DeclaredVisibility::Public`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoweredDeclarationVisibilityProperty {
     definition: SemanticId,
     visibility: DeclaredVisibility,
+    boundary:
+        Option<brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary<SemanticId>>,
 }
 
 impl LoweredDeclarationVisibilityProperty {
@@ -659,7 +661,25 @@ impl LoweredDeclarationVisibilityProperty {
         Self {
             definition,
             visibility,
+            boundary: None,
         }
+    }
+
+    pub fn with_boundary(
+        mut self,
+        boundary: Option<
+            brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary<SemanticId>,
+        >,
+    ) -> Self {
+        self.boundary = boundary;
+        self
+    }
+
+    pub fn boundary(
+        &self,
+    ) -> Option<&brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary<SemanticId>>
+    {
+        self.boundary.as_ref()
     }
 
     pub const fn definition(&self) -> SemanticId {
@@ -2376,6 +2396,12 @@ impl LoweredTypedFragment {
                 transfer_accepts_output_role(transfer.kind, output_role),
                 "type-transfer kind and output role disagree"
             );
+            validate_operand_promotion_rule(
+                transfer.kind,
+                transfer.rule.indirection_delta(),
+                transfer.rule.reference_indirection_delta(),
+                transfer.rule.value_transform(),
+            );
             match transfer.kind {
                 ResolutionTypeTransferKind::TypeIdentity
                 | ResolutionTypeTransferKind::TypeUnion
@@ -2406,7 +2432,16 @@ impl LoweredTypedFragment {
                     ),
                     "contextual type transfer input must retain a proven surrounding value type"
                 ),
-                ResolutionTypeTransferKind::ExpressionResult => assert!(
+                ResolutionTypeTransferKind::ValueJoin => validate_value_join_transfer(
+                    source_role,
+                    output_role,
+                    transfer.rule.indirection_delta(),
+                    transfer.rule.reference_indirection_delta(),
+                    transfer.rule.value_transform(),
+                ),
+                ResolutionTypeTransferKind::ExpressionResult
+                | ResolutionTypeTransferKind::NumericPromotion
+                | ResolutionTypeTransferKind::StringConcatenation => assert!(
                     matches!(
                         source_role,
                         ResolutionTypeSlotRole::ExpressionValue
@@ -2416,15 +2451,12 @@ impl LoweredTypedFragment {
                 ),
                 ResolutionTypeTransferKind::ComponentElement
                 | ResolutionTypeTransferKind::ComponentKey
-                | ResolutionTypeTransferKind::ComponentValue => assert!(
-                    matches!(
-                        source_role,
-                        ResolutionTypeSlotRole::TargetTypeIdentity
-                            | ResolutionTypeSlotRole::DeclaredValue
-                            | ResolutionTypeSlotRole::ExpressionValue
-                            | ResolutionTypeSlotRole::CallResult
-                    ),
-                    "component transfer input must retain a resolved type or value"
+                | ResolutionTypeTransferKind::ComponentValue => validate_component_transfer(
+                    source_role,
+                    output_role,
+                    transfer.rule.indirection_delta(),
+                    transfer.rule.reference_indirection_delta(),
+                    transfer.rule.value_transform(),
                 ),
                 ResolutionTypeTransferKind::Unwrap => assert!(
                     matches!(
@@ -2590,6 +2622,9 @@ impl LoweredTypedFragment {
                 match property.role {
                     DeclarationTypeRole::Identity | DeclarationTypeRole::NominalIdentity =>
                         ResolutionTypeSlotRole::TargetTypeIdentity,
+                    DeclarationTypeRole::ObservedValue => {
+                        ResolutionTypeSlotRole::AssignmentValue
+                    }
                     _ => ResolutionTypeSlotRole::DeclaredValue,
                 },
                 "declaration type property must retain its declared category"
@@ -2762,7 +2797,9 @@ impl LoweredTypedFragment {
                 }
                 _ => true,
             };
-            let valid_gap_count = if file_private_kotlin {
+            let valid_gap_count = if file_private_kotlin
+                || (contextual_jvm_visibility && property.boundary().is_none())
+            {
                 gap_sources.len() <= 1
             } else {
                 gap_sources.len() == usize::from(requires_gap)
@@ -3146,22 +3183,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             })
         })
         .collect::<HashSet<_>>();
-    let generic_callable_owners = facts
-        .generic_formals
-        .iter()
-        .map(|formal| formal.owner)
-        .collect::<HashSet<_>>();
-    let generic_callable_result_slots = facts
-        .callable_signatures
-        .iter()
-        .filter(|signature| generic_callable_owners.contains(&signature.callable))
-        .flat_map(|signature| {
-            signature
-                .result_types
-                .iter()
-                .map(|result| result.value_type)
-        })
-        .collect::<HashSet<_>>();
+    let independent_results =
+        super::fact_lowering::applicability_independent_result_slots(language, facts);
     let projected_outputs = facts
         .binding_projections
         .iter()
@@ -3360,10 +3383,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         // evidence. Input-frontier uncertainty still propagates normally.
         let callee_sites = &callee_sites;
         let argument_independent_calls = &argument_independent_calls;
-        let generic_callable_result_slots = &generic_callable_result_slots;
-        let generic_callable_result = language == Language::Go
-            && fact.kind == ResolutionTypeTransferKind::DeclaredType
-            && generic_callable_result_slots.contains(&fact.output);
+        let independent_result = fact.kind == ResolutionTypeTransferKind::DeclaredType
+            && independent_results.contains(&fact.output);
         let completion = completion_for_gaps(
             identities,
             [input.site, output.site].into_iter().flat_map(|site| {
@@ -3377,7 +3398,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                                 || (fact.kind == ResolutionTypeTransferKind::Receiver
                                     && site == output.site
                                     && argument_independent_calls.contains(&site))
-                                || (generic_callable_result && site == output.site))))
+                                || (independent_result && site == output.site))))
                             .then_some((site, kind))
                     })
             }),
@@ -3406,7 +3427,16 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         let output = index.slot(fact.output);
         let spelling = index.name(fact.name);
         let identity = if fact.kind == IntrinsicTypeKind::Structural {
-            identities.semantic(type_slot_semantic_identity(fact.output))
+            if index.site(output.site).kind == ResolutionSiteKind::TypeDeclaration {
+                // A declaration-backed structural type owns the same identity
+                // as its source field/member metadata. Expression-only shapes
+                // such as arrays and functions keep their slot identity.
+                assert_eq!(output.role, ResolutionTypeSlotRole::TargetTypeIdentity);
+                validate_type_definition(output.site, &index);
+                identities.source_definition_semantic(output.site)
+            } else {
+                identities.semantic(type_slot_semantic_identity(fact.output))
+            }
         } else {
             identities.shared_name(super::universe::intrinsic_type_identity_digest(
                 language, fact.kind, spelling,
@@ -3594,6 +3624,54 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             identities.semantic(type_slot_semantic_identity(fact.slot)),
             fact.role,
         ));
+    }
+    for binder in &facts.binders {
+        if !matches!(
+            binder.kind,
+            ResolutionBinderKind::Local | ResolutionBinderKind::Pattern
+        ) {
+            continue;
+        }
+        let identifier = index
+            .identifiers
+            .get(&binder.declaration)
+            .unwrap_or_else(|| panic!("local or pattern binder has no identifier: {binder:?}"));
+        assert_eq!(
+            identifier.role,
+            ResolutionIdentifierRole::Declaration,
+            "local or pattern binder must identify a declaration"
+        );
+        assert!(
+            matches!(
+                index.site(binder.declaration).kind,
+                ResolutionSiteKind::ValueDeclaration | ResolutionSiteKind::Pattern
+            ),
+            "local or pattern binder must be attached to its declaration site: {binder:?}"
+        );
+        let assignment_slots = index
+            .slots_by_site
+            .get(&binder.declaration)
+            .into_iter()
+            .flatten()
+            .filter(|slot| index.slot(**slot).role == ResolutionTypeSlotRole::AssignmentValue)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            assignment_slots.len() <= 1,
+            "one AssignmentValue slot per local or pattern binder is required: {binder:?}"
+        );
+        if let Some(&slot) = assignment_slots.first() {
+            assert!(
+                declaration_role_keys
+                    .insert((binder.declaration, DeclarationTypeRole::ObservedValue)),
+                "one observed-value property per binder is required: {binder:?}"
+            );
+            declaration_types.push(LoweredDeclarationTypeProperty::new(
+                identities.source_definition_semantic(binder.declaration),
+                identities.semantic(type_slot_semantic_identity(slot)),
+                DeclarationTypeRole::ObservedValue,
+            ));
+        }
     }
 
     let member_scopes = lower_member_scope_properties(identities, &index);
@@ -4161,6 +4239,24 @@ fn lower_declaration_visibility_properties(
     facts: &FileResolutionFacts,
     index: &TypedFactIndex<'_>,
 ) -> Vec<LoweredDeclarationVisibilityProperty> {
+    let boundary_declarations = facts
+        .declaration_access_boundaries
+        .iter()
+        .map(|fact| fact.declaration)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        boundary_declarations.len(),
+        facts.declaration_access_boundaries.len(),
+        "one access boundary per declaration: {:?}",
+        facts.declaration_access_boundaries
+    );
+    assert!(
+        boundary_declarations.iter().all(|declaration| facts
+            .declaration_visibilities
+            .iter()
+            .any(|visibility| visibility.declaration == *declaration)),
+        "an access boundary supplements a declared visibility row"
+    );
     let mut eligible = HashSet::default();
     for eligibility in &facts.visibility_eligibilities {
         index.definition_identifier(eligibility.declaration);
@@ -4180,10 +4276,30 @@ fn lower_declaration_visibility_properties(
             eligible.contains(&fact.declaration),
             "visibility row must name a supported type, callable, constructor, or field: {fact:?}"
         );
-        properties.push(LoweredDeclarationVisibilityProperty::new(
-            identities.source_definition_semantic(fact.declaration),
-            fact.visibility,
-        ));
+        let boundary = facts
+            .declaration_access_boundaries
+            .iter()
+            .find(|boundary| boundary.declaration == fact.declaration)
+            .map(|fact| {
+                use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+                match &fact.boundary {
+                    DeclarationAccessBoundary::Package(package) => {
+                        DeclarationAccessBoundary::Package(package.clone())
+                    }
+                    DeclarationAccessBoundary::Template(owner) => {
+                        DeclarationAccessBoundary::Template(
+                            identities.source_definition_semantic(*owner),
+                        )
+                    }
+                }
+            });
+        properties.push(
+            LoweredDeclarationVisibilityProperty::new(
+                identities.source_definition_semantic(fact.declaration),
+                fact.visibility,
+            )
+            .with_boundary(boundary),
+        );
     }
 
     if language == Language::Java {
@@ -4926,7 +5042,10 @@ impl<'facts> TypedFactIndex<'facts> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypedOutputProducerFamily {
+    ValueJoin,
     ExpressionResult,
+    NumericPromotion,
+    StringConcatenation,
     UnaryIndirection,
     Transfer,
     TypeUnion,
@@ -4952,6 +5071,9 @@ fn validate_output_producer_rows<Slot>(
                 || !matches!(
                     family,
                     TypedOutputProducerFamily::ExpressionResult
+                        | TypedOutputProducerFamily::ValueJoin
+                        | TypedOutputProducerFamily::NumericPromotion
+                        | TypedOutputProducerFamily::StringConcatenation
                         | TypedOutputProducerFamily::TypeUnion
                         | TypedOutputProducerFamily::UnaryIndirection
                 ))
@@ -4967,6 +5089,13 @@ fn validate_output_producer_rows<Slot>(
             slot,
             match kind {
                 ResolutionTypeTransferKind::TypeUnion => TypedOutputProducerFamily::TypeUnion,
+                ResolutionTypeTransferKind::ValueJoin => TypedOutputProducerFamily::ValueJoin,
+                ResolutionTypeTransferKind::NumericPromotion => {
+                    TypedOutputProducerFamily::NumericPromotion
+                }
+                ResolutionTypeTransferKind::StringConcatenation => {
+                    TypedOutputProducerFamily::StringConcatenation
+                }
                 ResolutionTypeTransferKind::UnaryIndirection => {
                     TypedOutputProducerFamily::UnaryIndirection
                 }
@@ -5017,8 +5146,9 @@ fn validate_indirection_producers<Slot: Copy + Eq + std::hash::Hash + std::fmt::
     }
 }
 
-/// A typed slot has one affirmative producer. TypeUnion and ExpressionResult
-/// combine their declared inputs; UnaryIndirection combines its validated
+/// A typed slot has one affirmative producer. ValueJoin, TypeUnion,
+/// ExpressionResult and operand-promotion rules combine their declared inputs;
+/// UnaryIndirection combines its validated
 /// disjoint category pair. Every other producer remains exclusive.
 fn validate_output_producers(facts: &FileResolutionFacts, index: &TypedFactIndex<'_>) {
     validate_indirection_producers(
@@ -5104,6 +5234,26 @@ fn normalized_callable_parameters<'facts>(
     by_callable
 }
 
+fn validate_operand_promotion_rule(
+    kind: ResolutionTypeTransferKind,
+    delta: i64,
+    reference_delta: i64,
+    transform: TypeTransferValueTransform,
+) {
+    if kind.is_operand_promotion() {
+        assert_eq!(
+            (delta, reference_delta),
+            (0, 0),
+            "promotion does not adjust type layers"
+        );
+        assert_eq!(
+            transform,
+            TypeTransferValueTransform::RuntimeOnly,
+            "promotion explicitly admits runtime operands"
+        );
+    }
+}
+
 fn validate_transfer_roles(
     fact: ResolutionTypeTransferFact,
     input: ResolutionTypeSlotRole,
@@ -5112,6 +5262,12 @@ fn validate_transfer_roles(
     assert!(
         transfer_accepts_output_role(fact.kind, output),
         "type-transfer kind and output role disagree: {fact:?}"
+    );
+    validate_operand_promotion_rule(
+        fact.kind,
+        i64::from(fact.indirection_delta),
+        i64::from(fact.reference_indirection_delta),
+        lower_value_transform(fact.value_transform),
     );
     match fact.kind {
         ResolutionTypeTransferKind::TypeIdentity
@@ -5148,7 +5304,16 @@ fn validate_transfer_roles(
             ),
             "contextual type transfer input must retain a proven surrounding value type: {fact:?}"
         ),
-        ResolutionTypeTransferKind::ExpressionResult => assert!(
+        ResolutionTypeTransferKind::ValueJoin => validate_value_join_transfer(
+            input,
+            output,
+            i64::from(fact.indirection_delta),
+            i64::from(fact.reference_indirection_delta),
+            lower_value_transform(fact.value_transform),
+        ),
+        ResolutionTypeTransferKind::ExpressionResult
+        | ResolutionTypeTransferKind::NumericPromotion
+        | ResolutionTypeTransferKind::StringConcatenation => assert!(
             matches!(
                 input,
                 ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
@@ -5164,15 +5329,12 @@ fn validate_transfer_roles(
         ),
         ResolutionTypeTransferKind::ComponentElement
         | ResolutionTypeTransferKind::ComponentKey
-        | ResolutionTypeTransferKind::ComponentValue => assert!(
-            matches!(
-                input,
-                ResolutionTypeSlotRole::TargetTypeIdentity
-                    | ResolutionTypeSlotRole::DeclaredValue
-                    | ResolutionTypeSlotRole::ExpressionValue
-                    | ResolutionTypeSlotRole::CallResult
-            ),
-            "component transfer input must retain a resolved type or value: {fact:?}"
+        | ResolutionTypeTransferKind::ComponentValue => validate_component_transfer(
+            input,
+            output,
+            i64::from(fact.indirection_delta),
+            i64::from(fact.reference_indirection_delta),
+            lower_value_transform(fact.value_transform),
         ),
         ResolutionTypeTransferKind::Assignment
         | ResolutionTypeTransferKind::Construction
@@ -5252,23 +5414,80 @@ fn validate_transfer_roles(
     }
 }
 
+fn validate_component_transfer(
+    input: ResolutionTypeSlotRole,
+    output: ResolutionTypeSlotRole,
+    delta: i64,
+    reference_delta: i64,
+    transform: TypeTransferValueTransform,
+) {
+    assert!(
+        matches!(
+            input,
+            ResolutionTypeSlotRole::TargetTypeIdentity
+                | ResolutionTypeSlotRole::DeclaredValue
+                | ResolutionTypeSlotRole::ExpressionValue
+                | ResolutionTypeSlotRole::CallResult
+        ),
+        "component transfer input must retain a resolved type or value"
+    );
+    if output == ResolutionTypeSlotRole::ExpressionValue {
+        assert_eq!(
+            (delta, reference_delta),
+            (0, 0),
+            "runtime component projection preserves component indirection"
+        );
+        assert!(
+            matches!(transform, TypeTransferValueTransform::ToRuntime { .. }),
+            "runtime component projection must convert the component to a runtime value"
+        );
+    }
+}
+
+fn validate_value_join_transfer(
+    input: ResolutionTypeSlotRole,
+    output: ResolutionTypeSlotRole,
+    delta: i64,
+    reference_delta: i64,
+    transform: TypeTransferValueTransform,
+) {
+    assert!(
+        matches!(
+            input,
+            ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+        ),
+        "value join requires a runtime expression input"
+    );
+    assert_eq!(output, ResolutionTypeSlotRole::ExpressionValue);
+    assert_eq!(
+        (delta, reference_delta),
+        (0, 0),
+        "value join preserves indirection"
+    );
+    assert_eq!(
+        transform,
+        TypeTransferValueTransform::Preserve,
+        "value join preserves value category"
+    );
+}
+
 fn validate_address_of_transfer(
     delta: i64,
     reference_delta: i64,
     transform: TypeTransferValueTransform,
 ) {
-    assert_eq!(
-        (delta, reference_delta),
-        (1, 0),
-        "address-of adds one pointer layer"
-    );
     assert!(
         matches!(
-            transform,
-            TypeTransferValueTransform::AddressableOperandOnly
-                | TypeTransferValueTransform::RuntimeOnly
+            (delta, reference_delta, transform),
+            (1, 0, TypeTransferValueTransform::AddressableOperandOnly)
+                | (1, 0, TypeTransferValueTransform::RuntimeOnly)
+                | (
+                    1,
+                    1,
+                    TypeTransferValueTransform::ToRuntime { addressable: false }
+                )
         ),
-        "address-of must filter its runtime operand and produce a non-addressable value"
+        "address-of transfer must use an approved pointer/reference tuple"
     );
 }
 
@@ -5283,13 +5502,18 @@ fn transfer_accepts_output_role(
         ResolutionTypeTransferKind::DeclaredType => ResolutionTypeSlotRole::DeclaredValue,
         ResolutionTypeTransferKind::Initialization => ResolutionTypeSlotRole::DeclaredValue,
         ResolutionTypeTransferKind::Contextual => ResolutionTypeSlotRole::ExpressionValue,
-        ResolutionTypeTransferKind::ExpressionResult => ResolutionTypeSlotRole::ExpressionValue,
+        ResolutionTypeTransferKind::ExpressionResult
+        | ResolutionTypeTransferKind::NumericPromotion
+        | ResolutionTypeTransferKind::StringConcatenation
+        | ResolutionTypeTransferKind::ValueJoin => ResolutionTypeSlotRole::ExpressionValue,
         ResolutionTypeTransferKind::ComponentElement
         | ResolutionTypeTransferKind::ComponentKey
         | ResolutionTypeTransferKind::ComponentValue => {
             return matches!(
                 output,
-                ResolutionTypeSlotRole::DeclaredValue | ResolutionTypeSlotRole::TargetTypeIdentity
+                ResolutionTypeSlotRole::DeclaredValue
+                    | ResolutionTypeSlotRole::TargetTypeIdentity
+                    | ResolutionTypeSlotRole::ExpressionValue
             );
         }
         ResolutionTypeTransferKind::Unwrap => ResolutionTypeSlotRole::CallResult,
@@ -5334,6 +5558,9 @@ const fn lower_value_transform(
         }
         ResolutionTypeTransferValueTransform::RuntimeOnly => {
             TypeTransferValueTransform::RuntimeOnly
+        }
+        ResolutionTypeTransferValueTransform::StaticTypeObject => {
+            TypeTransferValueTransform::StaticTypeObject
         }
     }
 }
@@ -5457,6 +5684,7 @@ fn validate_declaration_type(fact: DeclarationTypeSlotFact, index: &TypedFactInd
         match fact.role {
             DeclarationTypeRole::Identity | DeclarationTypeRole::NominalIdentity =>
                 ResolutionTypeSlotRole::TargetTypeIdentity,
+            DeclarationTypeRole::ObservedValue => ResolutionTypeSlotRole::AssignmentValue,
             _ => ResolutionTypeSlotRole::DeclaredValue,
         }
     );
@@ -5469,6 +5697,12 @@ fn validate_declaration_type(fact: DeclarationTypeSlotFact, index: &TypedFactInd
         }
         DeclarationTypeRole::Value | DeclarationTypeRole::Parameter => {
             assert_eq!(declaration.kind, ResolutionSiteKind::ValueDeclaration);
+        }
+        DeclarationTypeRole::ObservedValue => {
+            assert!(matches!(
+                declaration.kind,
+                ResolutionSiteKind::ValueDeclaration | ResolutionSiteKind::Pattern
+            ));
         }
         DeclarationTypeRole::Return | DeclarationTypeRole::CallableFirstResult => {
             assert_eq!(declaration.kind, ResolutionSiteKind::CallableDeclaration);
@@ -6172,6 +6406,9 @@ fn transfer_rule_semantic_identity(fact: ResolutionTypeTransferFact) -> Resoluti
         ResolutionTypeTransferValueTransform::RuntimeOnly => {
             hasher.field("value_transform", b"runtime-only");
         }
+        ResolutionTypeTransferValueTransform::StaticTypeObject => {
+            hasher.field("value_transform", b"static-type-object");
+        }
     }
     hasher.field(
         "indirection_delta",
@@ -6232,6 +6469,11 @@ const fn transfer_kind_rank(kind: ResolutionTypeTransferKind) -> u8 {
         ResolutionTypeTransferKind::ComponentValue => 15,
         ResolutionTypeTransferKind::Contextual => 16,
         ResolutionTypeTransferKind::ExpressionResult => 17,
+        // ValueJoin is appended after the existing operand-promotion ranks so
+        // the combined order keeps every persisted identity stable.
+        ResolutionTypeTransferKind::ValueJoin => 20,
+        ResolutionTypeTransferKind::NumericPromotion => 18,
+        ResolutionTypeTransferKind::StringConcatenation => 19,
     }
 }
 
@@ -7134,9 +7376,7 @@ mod tests {
             reversed(lowered.declaration_types().iter().map(|row| {
                 LoweredDeclarationTypeProperty::new(row.definition(), row.slot(), row.role())
             })),
-            reversed(lowered.declaration_visibilities().iter().map(|row| {
-                LoweredDeclarationVisibilityProperty::new(row.definition(), row.visibility())
-            })),
+            reversed(lowered.declaration_visibilities().iter().cloned()),
             reversed(lowered.member_scopes().iter().map(|row| {
                 LoweredMemberScopeProperty::owned(
                     row.definition(),

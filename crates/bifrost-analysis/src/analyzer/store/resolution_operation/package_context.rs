@@ -97,6 +97,29 @@ WHERE selected.mount_ordinal=?1
   )
 "#;
 
+const STAGED_REFERENCE_BY_TOKEN: &str = r#"
+SELECT p.token_key,p.domain_shared,p.reference_key,p.choice_key,p.source_site,p.root_scope_key,p.namespace,p.lookup_shared
+FROM temp.selected_resolution_scope_mounts selected
+JOIN temp.selected_resolution_stage_package_references p ON p.host_ordinal=selected.mount_ordinal
+WHERE selected.mount_ordinal=?1 AND p.token_key=?2
+"#;
+
+const ORDINARY_REFERENCE_BY_TOKEN: &str = r#"
+SELECT p.token_key,d.shared_identity,p.reference_key,p.choice_key,p.source_site,p.root_scope_key,p.namespace,l.shared_identity
+FROM temp.selected_resolution_scope_mounts selected
+JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=selected.mount_ordinal
+JOIN main.resolution_package_references p ON p.blob_id=mounted.blob_id AND p.token_key=?2
+JOIN main.resolution_semantic_catalog d ON d.blob_id=p.blob_id AND d.local_key=p.domain_key
+JOIN main.resolution_semantic_catalog l ON l.blob_id=p.blob_id AND l.local_key=p.lookup_key
+WHERE selected.mount_ordinal=?1
+  AND NOT EXISTS (
+    SELECT 1 FROM temp.selected_resolution_stage_package_references staged
+    WHERE staged.host_ordinal=selected.mount_ordinal
+      AND staged.reference_key=?3+p.reference_key
+      AND staged.namespace=p.namespace
+  )
+"#;
+
 const PACKAGE_REFERENCE_EXISTS: &str = r#"
 SELECT EXISTS(
     SELECT 1
@@ -404,27 +427,71 @@ impl SelectedResolutionOperation<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(SelectedPackageRows::Cancelled);
         }
+        self.selected_package_reference_rows(
+            mount,
+            reference,
+            STAGED_REFERENCE_BY_SITE,
+            ORDINARY_REFERENCE_BY_SITE,
+            cancellation,
+        )
+    }
+
+    pub(crate) fn selected_package_reference_for_token(
+        &self,
+        mount: SelectedResolutionMountOrdinal,
+        token: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedPackageRows<Vec<LoweredPackageReference>>> {
+        self.selected_package_reference_rows(
+            mount,
+            token,
+            STAGED_REFERENCE_BY_TOKEN,
+            ORDINARY_REFERENCE_BY_TOKEN,
+            cancellation,
+        )
+    }
+
+    // Both readers preserve staged replacement by reference/namespace while
+    // seeking only the source identity already established by the demand.
+    fn selected_package_reference_rows(
+        &self,
+        mount: SelectedResolutionMountOrdinal,
+        reference: SemanticId,
+        staged_sql: &str,
+        ordinary_sql: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedPackageRows<Vec<LoweredPackageReference>>> {
+        if cancellation.is_cancelled() {
+            return Ok(SelectedPackageRows::Cancelled);
+        }
         let local_key = reference
             .local_key()
-            .expect("a persisted Go type reference has fragment-local identity");
+            .filter(|_| reference.ordinal() == Some(mount.get()));
         let staged_key = codec::encode_semantic(reference);
         let local_base = codec::encode_semantic(SemanticId::local(mount.get(), 0));
         let connection = self.ready.inventory.connection();
         let names = self.ready.shared_names();
         let mut result = BTreeMap::new();
         {
-            let mut statement = connection.prepare_cached(STAGED_REFERENCE_BY_SITE)?;
+            let mut statement = connection.prepare_cached(staged_sql)?;
             let mut rows = statement.query(rusqlite::params![mount.get(), staged_key])?;
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
                     return Ok(SelectedPackageRows::Cancelled);
                 }
                 let fact = PackageCoordinates::staged(row)?.reference();
-                result.insert((fact.reference, fact.namespace), fact);
+                if result
+                    .insert((fact.reference, fact.namespace), fact)
+                    .is_some_and(|previous| previous != fact)
+                {
+                    return Err(StoreError::corrupt(
+                        "contradictory staged package references",
+                    ));
+                }
             }
         }
         {
-            let mut statement = connection.prepare_cached(ORDINARY_REFERENCE_BY_SITE)?;
+            let mut statement = connection.prepare_cached(ordinary_sql)?;
             let mut rows =
                 statement.query(rusqlite::params![mount.get(), local_key, local_base])?;
             while let Some(row) = rows.next()? {

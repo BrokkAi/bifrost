@@ -105,44 +105,6 @@ impl GoDemandLanguage<'_, '_, '_> {
         ))
     }
 
-    /// The mounts that can hold the source half of a universal-root endpoint:
-    /// the packages that import its first symbol and the mount that published
-    /// it. `None` when no demanded or publishing mount is known: the endpoint
-    /// then has no source half to discover, and reading every selected mount
-    /// for one would make a request cost scale with the workspace's file count.
-    fn root_source_mounts(
-        &self,
-        endpoint: &EndpointSignature,
-    ) -> Result<Option<Vec<SelectedResolutionMountOrdinal>>> {
-        let Some(root_semantic) = endpoint
-            .symbols()
-            .fixed()
-            .first()
-            .map(|symbol| symbol.symbol())
-        else {
-            return Ok(None);
-        };
-        let mut source_mounts = self
-            .demand
-            .import_packages
-            .keys()
-            .filter_map(|(mount, semantic)| (*semantic == root_semantic).then_some(*mount))
-            .collect::<Vec<_>>();
-        let lexical = self.operation.ready.lexical_source();
-        match lexical.semantic_provenance(root_semantic, self.cancellation)? {
-            Some(SelectedSemanticProvenance::FragmentLocal(provenance)) => {
-                source_mounts.push(provenance.mount().ordinal());
-            }
-            Some(SelectedSemanticProvenance::Stage(provenance)) => {
-                source_mounts.push(provenance.mount().ordinal());
-            }
-            Some(SelectedSemanticProvenance::Shared(_)) | None => {}
-        }
-        source_mounts.sort_unstable();
-        source_mounts.dedup();
-        Ok((!source_mounts.is_empty()).then_some(source_mounts))
-    }
-
     fn source_demand(&mut self, endpoint: &EndpointSignature) -> Result<Option<GoSourceDemand>> {
         if endpoint.node() == BindingNodeId::universal_root()
             && endpoint.symbols().fixed().is_empty()
@@ -616,10 +578,10 @@ impl DemandLanguage for GoDemandLanguage<'_, '_, '_> {
         if endpoints.is_empty() {
             return Ok(());
         }
-        // Reverse confirmation has a finite caller context: its selected
-        // caller mounts and their imported Go package mounts. Forward demand
-        // can admit more packages as roots are discovered, so it has no
-        // bounded mount set to pass to the root visit.
+        // Reverse confirmation retains its existing caller admission bound;
+        // forward demand leaves admission unrestricted as packages are reached.
+        // Shared discovery separately narrows either read by proven source
+        // provenance. That bound never changes target package visibility.
         let mounts = self.root_source_mount_scope(endpoints)?;
         let halves = super::source_demand::root_source_halves_in_mounts(
             &self.operation.ready,

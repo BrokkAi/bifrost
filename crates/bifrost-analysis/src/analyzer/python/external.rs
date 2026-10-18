@@ -4,6 +4,7 @@
 //! configured directories and distribution metadata, returning exact local
 //! files for the shared semantic-pack coordinator to hash and consume later.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,8 @@ use crate::analyzer::semantic_model::{
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
     SemanticModelActivationEvidence, Signature, StandardLibraryPackExpectation,
     SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
-    member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    member_declaration_id, read_exact_artifact_while, read_exact_source_closure_while,
+    source_set_diagnostic, source_set_path_exists, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Language, Project, PythonAnalyzerConfig, PythonEnvironmentConfig};
@@ -188,6 +190,80 @@ crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
 );
 
 impl PythonArtifactPackProducer {
+    /// Acquire the deterministic local import closure of seed stubs. The root
+    /// is one pinned import tree (for example typeshed's stdlib directory), not
+    /// a Python environment: no imports execute and no network resolver runs.
+    /// Absent dependencies remain named references in declaration production.
+    pub fn read_stub_source_closure(
+        &self,
+        root: &Path,
+        seeds: &[PathBuf],
+        max_files: usize,
+        max_path_depth: usize,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ExactArtifact, ProducerDiagnostic> {
+        read_exact_source_closure_while(
+            root,
+            seeds,
+            max_files,
+            max_path_depth,
+            limits,
+            || cancellation.is_some_and(CancellationToken::is_cancelled),
+            |entry| {
+                let relative = Path::new(entry.relative_path());
+                if relative
+                    .extension()
+                    .is_none_or(|extension| extension != "pyi")
+                {
+                    return Err(source_set_diagnostic(
+                        "python.stub_path",
+                        relative,
+                        "Python stub inputs must be .pyi files",
+                        limits,
+                    ));
+                }
+                let mut paths = Vec::new();
+                // An explicitly selected submodule also reads its enclosing
+                // package initializers, including their imports and exports.
+                for parent in relative.parent().into_iter().flat_map(Path::ancestors) {
+                    if parent.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let initializer = parent.join("__init__.pyi");
+                    if source_set_path_exists(root, &initializer, limits)? {
+                        paths.push(initializer);
+                    }
+                }
+                // Preserve the producer's structured encoding/parse rejects:
+                // unreadable syntax stays in the exact input, and extraction
+                // accounts for it instead of pretending to discover imports.
+                let Ok(source) = std::str::from_utf8(entry.bytes()) else {
+                    return Ok(paths);
+                };
+                let Some(tree) = brokk_bifrost_python::declarations::parse_python_tree(source)
+                else {
+                    return Ok(paths);
+                };
+                for module in python_stub_import_modules(
+                    tree.root_node(),
+                    source,
+                    relative,
+                    limits,
+                    cancellation,
+                )? {
+                    paths.extend(python_stub_module_paths(
+                        root,
+                        &module,
+                        limits,
+                        cancellation,
+                    )?);
+                }
+                Ok(paths)
+            },
+        )
+    }
+
     fn produce(
         &self,
         request: &ArtifactProductionRequest,
@@ -532,6 +608,123 @@ impl PythonArtifactPackProducer {
             diagnostics,
             suppressed_diagnostics,
         }
+    }
+}
+
+/// Read dependency module names from AST import facts. Imported members may
+/// themselves be submodules; acquisition probes that possibility against the
+/// pinned tree, while ordinary class/function imports need no invented file.
+fn python_stub_import_modules(
+    root: Node<'_>,
+    source: &str,
+    relative: &Path,
+    limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
+) -> Result<BTreeSet<String>, ProducerDiagnostic> {
+    use brokk_bifrost_python::imports::{
+        PythonImportDetails, python_import_details, python_import_infos_from_node,
+        resolve_python_relative_module_from_package,
+    };
+
+    let Some(module) = python_module_name_from_relative(relative) else {
+        // A root-level __init__.pyi has no module identity in this import
+        // tree. Keep it for the producer's python.artifact_module reject.
+        return Ok(BTreeSet::new());
+    };
+    let package = python_stub_package(&module, relative);
+    let package_depth = package.split('.').filter(|part| !part.is_empty()).count();
+    let mut modules = BTreeSet::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(source_set_diagnostic(
+                "artifact.cancelled",
+                relative,
+                "Python stub import discovery was cancelled",
+                limits,
+            ));
+        }
+        for import in python_import_infos_from_node(node, source) {
+            match python_import_details(&import) {
+                Some(PythonImportDetails::Import { module, .. }) => {
+                    modules.insert(module);
+                }
+                Some(PythonImportDetails::FromImport {
+                    module,
+                    name,
+                    wildcard,
+                    ..
+                }) => {
+                    // A relative import cannot escape its containing package.
+                    // The shared resolver also serves best-effort workspace
+                    // queries; exact acquisition requires a package at each
+                    // relative level, including the first.
+                    if module.chars().take_while(|ch| *ch == '.').count() > package_depth {
+                        continue;
+                    }
+                    let Some(module) =
+                        resolve_python_relative_module_from_package(package, &module)
+                    else {
+                        continue;
+                    };
+                    if !module.is_empty() {
+                        if !wildcard {
+                            modules.insert(format!("{module}.{name}"));
+                        }
+                        modules.insert(module);
+                    }
+                }
+                None => {}
+            }
+        }
+        push_named_children_reversed_as(node, &mut pending, |child| child);
+    }
+    Ok(modules)
+}
+
+fn python_stub_module_paths(
+    root: &Path,
+    module: &str,
+    limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<PathBuf>, ProducerDiagnostic> {
+    let mut paths = Vec::new();
+    let mut prefix = PathBuf::new();
+    // `module` is the canonical name from structured import facts, never a
+    // source snippet. Package initializers precede same-named module files;
+    // a module file cannot contain an importable child module.
+    for segment in module.split('.') {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(source_set_diagnostic(
+                "artifact.cancelled",
+                root,
+                "Python stub module resolution was cancelled",
+                limits,
+            ));
+        }
+        prefix.push(segment);
+        let initializer = prefix.join("__init__.pyi");
+        if source_set_path_exists(root, &initializer, limits)? {
+            paths.push(initializer);
+            continue;
+        }
+        let stub = prefix.with_extension("pyi");
+        if source_set_path_exists(root, &stub, limits)? {
+            paths.push(stub);
+            break;
+        }
+        if !source_set_path_exists(root, &prefix, limits)? {
+            break;
+        }
+    }
+    Ok(paths)
+}
+
+fn python_stub_package<'a>(module: &'a str, relative: &Path) -> &'a str {
+    if relative.file_stem().is_some_and(|stem| stem == "__init__") {
+        module
+    } else {
+        module.rsplit_once('.').map_or("", |(package, _)| package)
     }
 }
 
@@ -1320,13 +1513,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
     /// `__init__` is its own package; any other module resolves against the
     /// package that contains it.
     fn current_package(&self) -> &str {
-        if self.path.file_stem().is_some_and(|stem| stem == "__init__") {
-            self.module
-        } else {
-            self.module
-                .rsplit_once('.')
-                .map_or("", |(package, _)| package)
-        }
+        python_stub_package(self.module, self.path)
     }
 
     fn record_hierarchy_binding(
@@ -3920,6 +4107,200 @@ mod tests {
         ActivationSelector, CompilerOptions, compile_pack, read_exact_source_set,
     };
     use tempfile::{TempDir, tempdir};
+
+    #[test]
+    #[hardwon("#4627: stub input discovery must follow structured imports and their aliases")]
+    fn stub_import_discovery_reads_ast_imports_in_nested_suites() {
+        let source = r#"import _thread as thread, _io
+if enabled:
+    from .impl import Widget as Public
+try:
+    from .. import common
+except ImportError:
+    from fallback import *
+class Nested:
+    import inside
+text = "import phantom"
+# import phantom_comment
+from ...escape import Bad
+"#;
+        let tree = brokk_bifrost_python::declarations::parse_python_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let modules = python_stub_import_modules(
+            tree.root_node(),
+            source,
+            Path::new("pkg/sub/api.pyi"),
+            &ArtifactProducerLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            modules.into_iter().collect::<Vec<_>>(),
+            [
+                "_io",
+                "_thread",
+                "fallback",
+                "inside",
+                "pkg",
+                "pkg.common",
+                "pkg.sub.impl",
+                "pkg.sub.impl.Widget",
+            ]
+        );
+    }
+
+    #[test]
+    fn stub_source_closure_keeps_acquisition_bounds_and_missing_dependencies() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir_all(root.join("pkg/sub")).unwrap();
+        fs::write(
+            root.join("seed.pyi"),
+            "from pkg.sub import api\nimport absent\n",
+        )
+        .unwrap();
+        fs::write(root.join("pkg/__init__.pyi"), "class Package: ...\n").unwrap();
+        fs::write(root.join("pkg/sub/api.pyi"), "from .. import base\n").unwrap();
+        fs::write(root.join("pkg/base.pyi"), "class Base: ...\n").unwrap();
+        let seeds = [PathBuf::from("seed.pyi")];
+        let limits = ArtifactProducerLimits::default();
+        let exact = PythonArtifactPackProducer
+            .read_stub_source_closure(root, &seeds, 4, 3, &limits, None)
+            .unwrap();
+        assert_eq!(
+            exact
+                .source_entries()
+                .iter()
+                .map(|entry| entry.relative_path())
+                .collect::<Vec<_>>(),
+            [
+                "pkg/__init__.pyi",
+                "pkg/base.pyi",
+                "pkg/sub/api.pyi",
+                "seed.pyi"
+            ]
+        );
+        for (max_files, max_depth, limits, expected) in [
+            (3, 3, limits, "limit.source_files"),
+            (4, 2, limits, "limit.source_path_depth"),
+            (
+                4,
+                3,
+                ArtifactProducerLimits {
+                    max_artifact_bytes: exact.bytes().len() as u64 - 1,
+                    ..limits
+                },
+                "limit.artifact_bytes",
+            ),
+        ] {
+            let error = PythonArtifactPackProducer
+                .read_stub_source_closure(root, &seeds, max_files, max_depth, &limits, None)
+                .unwrap_err();
+            assert_eq!(error.code, expected, "{error:?}");
+        }
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert_eq!(
+            PythonArtifactPackProducer
+                .read_stub_source_closure(root, &seeds, 4, 3, &limits, Some(&cancellation))
+                .unwrap_err()
+                .code,
+            "artifact.cancelled"
+        );
+        assert_eq!(
+            PythonArtifactPackProducer
+                .read_stub_source_closure(root, &[], 4, 3, &limits, None)
+                .unwrap_err()
+                .code,
+            "artifact.source_set_empty"
+        );
+        assert_eq!(
+            PythonArtifactPackProducer
+                .read_stub_source_closure(
+                    root,
+                    &[PathBuf::from("../escape.pyi")],
+                    4,
+                    3,
+                    &limits,
+                    None
+                )
+                .unwrap_err()
+                .code,
+            "artifact.source_path"
+        );
+        assert_eq!(
+            PythonArtifactPackProducer
+                .read_stub_source_closure(
+                    root,
+                    &[PathBuf::from("missing.pyi")],
+                    4,
+                    3,
+                    &limits,
+                    None
+                )
+                .unwrap_err()
+                .code,
+            "artifact.metadata"
+        );
+    }
+
+    #[test]
+    fn stub_source_closure_respects_package_precedence_and_module_boundaries() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        fs::create_dir_all(root.join("plain")).unwrap();
+        fs::write(
+            root.join("seed.pyi"),
+            "from pkg import api\nfrom plain import fake\n",
+        )
+        .unwrap();
+        fs::write(root.join("pkg.pyi"), "import must_not_load\n").unwrap();
+        fs::write(root.join("pkg/__init__.pyi"), "class Package: ...\n").unwrap();
+        fs::write(root.join("pkg/api.pyi"), "class Api: ...\n").unwrap();
+        fs::write(root.join("plain.pyi"), "class Plain: ...\n").unwrap();
+        fs::write(root.join("plain/fake.pyi"), "class NotImportable: ...\n").unwrap();
+        let exact = PythonArtifactPackProducer
+            .read_stub_source_closure(
+                root,
+                &[PathBuf::from("seed.pyi")],
+                8,
+                4,
+                &ArtifactProducerLimits::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            exact
+                .source_entries()
+                .iter()
+                .map(|entry| entry.relative_path())
+                .collect::<Vec<_>>(),
+            ["pkg/__init__.pyi", "pkg/api.pyi", "plain.pyi", "seed.pyi"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stub_source_closure_rejects_discovered_symlinks() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path();
+        fs::write(root.join("seed.pyi"), "import linked.child\n").unwrap();
+        // Even a dangling directory link is an unsafe input, not a missing
+        // module that the producer may silently leave unresolved.
+        std::os::unix::fs::symlink(root.join("absent"), root.join("linked")).unwrap();
+        let error = PythonArtifactPackProducer
+            .read_stub_source_closure(
+                root,
+                &[PathBuf::from("seed.pyi")],
+                4,
+                3,
+                &ArtifactProducerLimits::default(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "artifact.symlink");
+    }
 
     #[test]
     fn version_file_declarations_pin_exact_cpython_versions() {

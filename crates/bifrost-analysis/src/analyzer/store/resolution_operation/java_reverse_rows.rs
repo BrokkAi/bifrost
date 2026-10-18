@@ -407,13 +407,15 @@ impl SelectedResolutionOperation<'_, '_> {
             let include = match visibility {
                 Some(DeclaredVisibility::Public) => true,
                 Some(DeclaredVisibility::Private) => {
-                    storage_language == "java" && path == relative_path
+                    storage_language == "scala"
+                        || (storage_language == "java" && path == relative_path)
                 }
                 Some(DeclaredVisibility::PackagePrivate) => {
                     package.is_none() || package == Some(target_package)
                 }
                 Some(DeclaredVisibility::Protected) => {
-                    package.is_none()
+                    storage_language == "scala"
+                        || package.is_none()
                         || package == Some(target_package)
                         || subclass_paths.contains(&(storage_language.clone(), path.clone()))
                 }

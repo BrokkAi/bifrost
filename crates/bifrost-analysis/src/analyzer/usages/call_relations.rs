@@ -3563,6 +3563,11 @@ pub fn formal_owner_for_callee(
                     .is_callable()
                     .then(|| (initializer.member.clone(), true));
             }
+            // A retained __new__ does not establish absence of __init__ on
+            // an unknown external member surface earlier in the full MRO.
+            if answer.outcome != PythonHierarchyOutcome::Complete {
+                return None;
+            }
             if let Some(allocation) = answer
                 .members
                 .iter()

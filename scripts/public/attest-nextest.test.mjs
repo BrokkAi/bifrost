@@ -34,9 +34,17 @@ function installAttest(f) {
     if (process.argv[2] === 'run') {
       if (process.env.ATTEST_ENV_LOG) fs.writeFileSync(process.env.ATTEST_ENV_LOG, process.env.BIFROST_OPEN_PACKS_DISABLE ?? '<unset>');
       const output = process.argv[process.argv.indexOf('--output') + 1];
+      if (process.env.FAKE_PREFLIGHT_FAILURE) process.exit(125);
+      if (process.env.FAKE_COMPLETE_REUSE) {
+        fs.writeFileSync(output + '/result.json', JSON.stringify({
+          complete: true, mode: process.env.ATTEST_MODE, suite: 'unit', exit_code: 0,
+        }));
+        process.exit(0);
+      }
       fs.writeFileSync(output + '/execution.started', 'started');
-      fs.writeFileSync(output + '/native-exit.json', JSON.stringify({ exit_code: 0 }));
-      process.exit(125);
+      fs.writeFileSync(output + '/native-exit.json', JSON.stringify({ exit_code: Number(process.env.FAKE_NATIVE_EXIT ?? 0) }));
+      if (process.env.FAKE_RECEIPT) fs.writeFileSync(output + '/result.json', process.env.FAKE_RECEIPT);
+      process.exit(Number(process.env.FAKE_ATTEST_EXIT ?? 125));
     }
     process.exit(2);
   `);
@@ -83,4 +91,58 @@ test('explicit zero and empty values are preserved and select native fallback on
     assert.equal(readFileSync(envLog, 'utf8'), value);
     assert.equal(existsSync(attestRunLog), false, 'environment mismatch must select fallback before Attest run');
   }
+});
+
+test('live reuse accepts all-cache-hit coverage without native execution or fallback', () => {
+  const f = fixture();
+  installAttest(f);
+  spawnSync('git', ['init', '-q'], { cwd: f.root });
+  writeFileSync(join(f.root, 'attest.toml'), 'version=1');
+  f.env.ATTEST_MODE = 'reuse';
+  f.env.FAKE_COMPLETE_REUSE = '1';
+  f.env.FAKE_CARGO_ENV = join(f.root, 'native-ran');
+  const result = run(f);
+  assert.equal(result.status, 0, result.stderr.toString());
+  assert.equal(existsSync(f.env.FAKE_CARGO_ENV), false, 'all cached tests must not fall back to native execution');
+});
+
+test('live and force modes retain failures and require complete receipts without rerunning tests', () => {
+  const complete = { complete: true, mode: 'reuse', suite: 'unit', exit_code: 0 };
+  for (const scenario of [
+    { name: 'incomplete collection despite a native pass', native: 0, attest: 125, status: 125 },
+    { name: 'native test failure', native: 7, attest: 7, status: 7 },
+    { name: 'missing receipt after execution', attest: 0, status: 125 },
+    { name: 'malformed receipt', attest: 0, receipt: '{', status: 125 },
+    ...[
+      { complete: false }, { mode: 'shadow' }, { suite: 'different' }, { exit_code: 7 },
+    ].map((change) => ({ name: JSON.stringify(change), attest: 0, receipt: JSON.stringify({ ...complete, ...change }), status: 125 })),
+    { name: 'complete live execution', attest: 0, receipt: JSON.stringify(complete), status: 0 },
+    { name: 'force mode also fails incomplete collection', mode: 'force', native: 0, attest: 125, status: 125 },
+  ]) {
+    const f = fixture();
+    installAttest(f);
+    spawnSync('git', ['init', '-q'], { cwd: f.root });
+    writeFileSync(join(f.root, 'attest.toml'), 'version=1');
+    f.env.ATTEST_MODE = scenario.mode ?? 'reuse';
+    f.env.FAKE_NATIVE_EXIT = String(scenario.native ?? 0);
+    f.env.FAKE_ATTEST_EXIT = String(scenario.attest);
+    if (scenario.receipt) f.env.FAKE_RECEIPT = scenario.receipt;
+    f.env.FAKE_CARGO_ENV = join(f.root, 'native-ran');
+    const result = run(f);
+    assert.equal(result.status, scenario.status, `${scenario.name}: ${result.stderr.toString()}`);
+    assert.equal(existsSync(f.env.FAKE_CARGO_ENV), false, scenario.name + ': no native rerun after execution');
+  }
+});
+
+test('live preflight failure falls back to the original command before any test execution', () => {
+  const f = fixture();
+  installAttest(f);
+  spawnSync('git', ['init', '-q'], { cwd: f.root });
+  writeFileSync(join(f.root, 'attest.toml'), 'version=1');
+  f.env.ATTEST_MODE = 'reuse';
+  f.env.FAKE_PREFLIGHT_FAILURE = '1';
+  f.env.FAKE_CARGO_ENV = join(f.root, 'native-ran');
+  const result = run(f);
+  assert.equal(result.status, 7, result.stderr.toString());
+  assert.equal(readFileSync(f.env.FAKE_CARGO_ENV, 'utf8'), '1');
 });

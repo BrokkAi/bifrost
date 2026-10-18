@@ -60,5 +60,6 @@ pub mod workspace_packages;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+mod commonjs;
 mod primary;
 mod type_source;

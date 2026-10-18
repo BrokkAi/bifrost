@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::Language;
 use crate::analyzer::store::resolution_selection::tests::SelectionFixture;
+use brokk_bifrost_test_macros::hardwon;
 
 fn seed_fragment(slot: SemanticId, identity: SemanticId) -> LoweredTypedFragment {
     let frontier = LoweredTypedFrontier::new(slot, ResolutionTypeSlotRole::ExpressionValue);
@@ -191,6 +192,298 @@ fn unary_indirection_stage_roundtrip_preserves_both_category_transfers() {
         &ResolutionCompletion::Complete
     );
     connection.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+#[hardwon(
+    "#5015: local writes need one multi-input value producer without weakening Assignment exclusivity"
+)]
+fn value_join_stage_roundtrip_retains_inputs_completion_and_exclusive_assignment() {
+    let collection = SemanticId::context_local(5009);
+    let borrowed_operand = SemanticId::context_local(5008);
+    let initializer = SemanticId::context_local(5010);
+    let write = SemanticId::context_local(5011);
+    let joined = SemanticId::context_local(5012);
+    let assignment = SemanticId::context_local(5013);
+    let unsupported = SemanticId::context_local(5014);
+    let initializer_assignment = SemanticId::context_local(5024);
+    let joined_definition = SemanticId::context_local(5025);
+    let initializer_definition = SemanticId::context_local(5026);
+    let declaration_types = vec![
+        LoweredDeclarationTypeProperty::new(
+            joined_definition,
+            assignment,
+            DeclarationTypeRole::ObservedValue,
+        ),
+        LoweredDeclarationTypeProperty::new(
+            joined_definition,
+            SemanticId::context_local(5027),
+            DeclarationTypeRole::Value,
+        ),
+        LoweredDeclarationTypeProperty::new(
+            initializer_definition,
+            initializer_assignment,
+            DeclarationTypeRole::ObservedValue,
+        ),
+    ];
+    let frontiers = vec![
+        LoweredTypedFrontier::new(collection, ResolutionTypeSlotRole::TargetTypeIdentity),
+        LoweredTypedFrontier::new(borrowed_operand, ResolutionTypeSlotRole::ExpressionValue),
+        LoweredTypedFrontier::new(initializer, ResolutionTypeSlotRole::ExpressionValue),
+        LoweredTypedFrontier::new(write, ResolutionTypeSlotRole::CallResult),
+        LoweredTypedFrontier::new(joined, ResolutionTypeSlotRole::ExpressionValue),
+        LoweredTypedFrontier::new(assignment, ResolutionTypeSlotRole::AssignmentValue),
+        LoweredTypedFrontier::new(
+            initializer_assignment,
+            ResolutionTypeSlotRole::AssignmentValue,
+        ),
+        LoweredTypedFrontier::new(
+            SemanticId::context_local(5027),
+            ResolutionTypeSlotRole::DeclaredValue,
+        ),
+    ];
+    let seed = LoweredIntrinsicSeed::new(
+        IntrinsicTypeKind::Primitive,
+        "int",
+        TypedFrontierState::new(
+            collection,
+            vec![ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                SemanticId::context_local(5015),
+                0,
+            ))],
+            ResolutionCompletion::Complete,
+        ),
+    );
+    let rebuild = |transfers| {
+        LoweredTypedFragment::new(
+            BindingFragmentId::at_ordinal(7),
+            Language::Go,
+            frontiers.clone(),
+            transfers,
+            vec![seed.clone()],
+            vec![],
+            vec![],
+            declaration_types.clone(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+    };
+    for completion in [
+        ResolutionCompletion::Complete,
+        ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+            unsupported,
+        )]),
+    ] {
+        let fragment = rebuild(vec![
+            LoweredTypeTransfer::new(
+                borrowed_operand,
+                ResolutionTypeTransferKind::AddressOf,
+                TypeTransferRule::new_with_reference_indirection(
+                    SemanticId::context_local(5029),
+                    write,
+                    1,
+                    1,
+                    TypeTransferValueTransform::ToRuntime { addressable: false },
+                    ResolutionCompletion::Complete,
+                ),
+            ),
+            LoweredTypeTransfer::new(
+                collection,
+                ResolutionTypeTransferKind::ComponentValue,
+                TypeTransferRule::new(
+                    SemanticId::context_local(5019),
+                    initializer,
+                    0,
+                    TypeTransferValueTransform::ToRuntime { addressable: true },
+                    ResolutionCompletion::Complete,
+                ),
+            ),
+            LoweredTypeTransfer::new(
+                initializer,
+                ResolutionTypeTransferKind::Assignment,
+                TypeTransferRule::new(
+                    SemanticId::context_local(5028),
+                    initializer_assignment,
+                    0,
+                    TypeTransferValueTransform::Preserve,
+                    ResolutionCompletion::Complete,
+                ),
+            ),
+            LoweredTypeTransfer::new(
+                initializer,
+                ResolutionTypeTransferKind::ValueJoin,
+                TypeTransferRule::new(
+                    SemanticId::context_local(5020),
+                    joined,
+                    0,
+                    TypeTransferValueTransform::Preserve,
+                    ResolutionCompletion::Complete,
+                ),
+            ),
+            LoweredTypeTransfer::new(
+                write,
+                ResolutionTypeTransferKind::ValueJoin,
+                TypeTransferRule::new(
+                    SemanticId::context_local(5021),
+                    joined,
+                    0,
+                    TypeTransferValueTransform::Preserve,
+                    completion.clone(),
+                ),
+            ),
+            LoweredTypeTransfer::new(
+                joined,
+                ResolutionTypeTransferKind::Assignment,
+                TypeTransferRule::new(
+                    SemanticId::context_local(5022),
+                    assignment,
+                    0,
+                    TypeTransferValueTransform::Preserve,
+                    ResolutionCompletion::Complete,
+                ),
+            ),
+        ]);
+        let fixture = SelectionFixture::shared_blob(16);
+        let selection = fixture.open_ready(&[]);
+        let connection = begin_projection(&selection);
+        assert!(
+            insert_typed_fragment(
+                connection,
+                1,
+                SelectedResolutionMountOrdinal::new(7),
+                &fragment,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        );
+        let mut statement = connection
+            .prepare("SELECT *,json(completion) AS completion_json FROM temp.selected_resolution_stage_type_transfers ORDER BY sequence")
+            .unwrap();
+        let decoded = statement
+            .query_map([], |row| Ok(decode_transfer(row).unwrap()))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(decoded, fragment.transfers());
+        let mut statement = connection
+            .prepare(
+                "SELECT * FROM temp.selected_resolution_stage_declaration_types ORDER BY sequence",
+            )
+            .unwrap();
+        let decoded_properties = statement
+            .query_map([], |row| Ok(decode_declaration_type(row).unwrap()))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(decoded_properties, fragment.declaration_types());
+        assert!(decoded_properties.iter().any(|property| {
+            property.definition() == initializer_definition
+                && property.slot() == initializer_assignment
+                && property.role() == DeclarationTypeRole::ObservedValue
+        }));
+        assert!(decoded_properties.iter().any(|property| {
+            property.definition() == joined_definition
+                && property.slot() == SemanticId::context_local(5027)
+                && property.role() == DeclarationTypeRole::Value
+        }));
+        let hydrated = rebuild(decoded);
+        assert_eq!(hydrated, fragment);
+        for (sql, slots, expected_count) in [
+            (
+                VISIT_TYPE_TRANSFER_PAGES_FROM_SOURCES_SQL,
+                vec![initializer, write, borrowed_operand],
+                4,
+            ),
+            (VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL, vec![joined], 2),
+            (
+                VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL,
+                vec![initializer],
+                1,
+            ),
+            (
+                VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL,
+                vec![initializer_assignment],
+                1,
+            ),
+            (
+                VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL,
+                vec![assignment],
+                1,
+            ),
+        ] {
+            let mut statement = connection.prepare(sql).unwrap();
+            let rows = statement
+                .query_map(
+                    [semantic_request_json(TypedFactRequest::new(&slots))],
+                    |row| Ok(decode_transfer(row).unwrap()),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows.len(), expected_count);
+            for row in rows {
+                assert!(fragment.transfers().contains(&row));
+                if row.source_slot() == write {
+                    assert_eq!(row.rule().completion(), &completion);
+                }
+            }
+        }
+        for (source, target, kind) in [
+            (write, assignment, ResolutionTypeTransferKind::Assignment),
+            (write, joined, ResolutionTypeTransferKind::ExpressionResult),
+        ] {
+            let mut invalid = hydrated.transfers().to_vec();
+            invalid.push(LoweredTypeTransfer::new(
+                source,
+                kind,
+                TypeTransferRule::new(
+                    SemanticId::context_local(5023),
+                    target,
+                    0,
+                    TypeTransferValueTransform::Preserve,
+                    ResolutionCompletion::Complete,
+                ),
+            ));
+            assert!(
+                std::panic::catch_unwind(|| rebuild(invalid)).is_err(),
+                "hydration must reject a second producer: {kind:?}"
+            );
+        }
+        let invalid_address_of = hydrated
+            .transfers()
+            .iter()
+            .cloned()
+            .map(|transfer| {
+                if transfer.kind() != ResolutionTypeTransferKind::AddressOf {
+                    return transfer;
+                }
+                LoweredTypeTransfer::new(
+                    transfer.source_slot(),
+                    transfer.kind(),
+                    TypeTransferRule::new_with_reference_indirection(
+                        transfer.rule().semantic(),
+                        transfer.rule().target_slot(),
+                        1,
+                        1,
+                        TypeTransferValueTransform::RuntimeOnly,
+                        transfer.rule().completion().clone(),
+                    ),
+                )
+            })
+            .collect();
+        assert!(
+            std::panic::catch_unwind(|| rebuild(invalid_address_of)).is_err(),
+            "address-of must reject a cross-product of pointer and reference transforms"
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
+    }
 }
 
 #[test]

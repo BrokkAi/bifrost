@@ -63,13 +63,13 @@ SELECT mounted.mount_ordinal
 FROM main.go_context_source_files AS source
 JOIN temp.selected_resolution_mounts AS mounted
   ON mounted.file_version_id=source.file_version_id
-WHERE source.context_id=?1 AND source.package_id=?2
+WHERE source.context_id=?1 AND source.package_id=?2 AND source.source_role<>'ignored'
 UNION
 SELECT placed.mount_ordinal
 FROM main.go_context_source_files AS source
 JOIN temp.selected_go_transient_placements AS placed
   ON placed.file_version_id=source.file_version_id
-WHERE source.context_id=?1 AND source.package_id=?2
+WHERE source.context_id=?1 AND source.package_id=?2 AND source.source_role<>'ignored'
 ORDER BY 1
 "#;
 

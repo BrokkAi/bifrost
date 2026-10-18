@@ -1167,6 +1167,17 @@ pub(super) fn remount_declaration_visibility(
         translation.semantic(property.definition()),
         property.visibility(),
     )
+    .with_boundary(property.boundary().map(|boundary| {
+        use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+        match boundary {
+            DeclarationAccessBoundary::Package(package) => {
+                DeclarationAccessBoundary::Package(package.clone())
+            }
+            DeclarationAccessBoundary::Template(owner) => {
+                DeclarationAccessBoundary::Template(translation.semantic(*owner))
+            }
+        }
+    }))
 }
 
 pub(super) fn remount_member_scope(

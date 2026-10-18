@@ -3,7 +3,7 @@ title: Python
 description: Query Python comparisons by operand binding identity alongside calls, decorators, assignments, and callable containment.
 ---
 
-> Last verified end to end: 2026-10-09 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-18 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
@@ -537,6 +537,32 @@ class ShadowedChild(Base):
             {
               "op": "python_attribute_shadows_method",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "hierarchy",
+                "id": "<public-id>",
+                "outcome": "complete",
+                "owner_id": null,
+                "path": "python/attribute_shadow.py",
+                "range": {
+                  "end_column": 17,
+                  "end_line": 7,
+                  "start_column": 1,
+                  "start_line": 5
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
+            {
+              "op": "python_attribute_shadows_method",
+              "result": {
                 "id": "<public-id>",
                 "outcome": "issue",
                 "path": "python/attribute_shadow.py",
@@ -957,7 +983,139 @@ The `inference_failure` fact identifies a particular written base the analyzer c
 
 <!-- code-query-case:failed-inheritance-inference:expected -->
 ```json
-{"diagnostics":[{"code":"python_hierarchy_derivation_incomplete","impact":"incomplete","language":"python","message":"Python class hierarchy is open: unresolved_base","source":{"end_byte":70,"path":"python/inference.py","range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"start_byte":27}}],"results":[{"base_resolution":"unresolved","base_spelling":"MissingBase","coverage":"complete","fact_kind":"inference_failure","id":"<public-id>","language":"python","ordinal":0,"outcome":"unresolved","path":"python/inference.py","provenance":[{"seed":{"end_line":5,"kind":"class","path":"python/inference.py","result_type":"structural_match","start_line":4},"steps":[{"op":"enclosing_decl","result":{"end_line":5,"fq_name":"python.inference.UnresolvedBase","kind":"class","path":"python/inference.py","result_type":"declaration","start_line":4}},{"op":"class_hierarchy","result":{"fact_kind":"inference_failure","id":"<public-id>","outcome":"unresolved","path":"python/inference.py","range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"result_type":"python_hierarchy_fact","root_id":"<public-id>"}},{"op":"filter","result":{"fact_kind":"inference_failure","id":"<public-id>","outcome":"unresolved","path":"python/inference.py","range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"result_type":"python_hierarchy_fact","root_id":"<public-id>"}}]}],"range":{"end_column":9,"end_line":5,"start_column":1,"start_line":4},"reason":"unresolved_base","result_type":"python_hierarchy_fact","root":{"end_line":5,"fq_name":"python.inference.UnresolvedBase","kind":"class","language":"python","path":"python/inference.py","signature":"class UnresolvedBase(MissingBase):","start_line":4},"root_declaration_id":"<public-id>","root_id":"<public-id>"}],"truncated":false}
+{
+  "diagnostics": [
+    {
+      "code": "python_hierarchy_derivation_incomplete",
+      "impact": "incomplete",
+      "language": "python",
+      "message": "Python class hierarchy is open: unresolved_base",
+      "source": {
+        "end_byte": 70,
+        "path": "python/inference.py",
+        "range": {
+          "end_column": 9,
+          "end_line": 5,
+          "start_column": 1,
+          "start_line": 4
+        },
+        "start_byte": 27
+      }
+    }
+  ],
+  "results": [
+    {
+      "ancestry_basis": {
+        "claims": []
+      },
+      "base_resolution": "unresolved",
+      "base_spelling": "MissingBase",
+      "coverage": "complete",
+      "fact_kind": "inference_failure",
+      "id": "<public-id>",
+      "language": "python",
+      "ordinal": 0,
+      "outcome": "unresolved",
+      "path": "python/inference.py",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 5,
+            "kind": "class",
+            "path": "python/inference.py",
+            "result_type": "structural_match",
+            "start_line": 4
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 5,
+                "fq_name": "python.inference.UnresolvedBase",
+                "kind": "class",
+                "path": "python/inference.py",
+                "result_type": "declaration",
+                "start_line": 4
+              }
+            },
+            {
+              "op": "class_hierarchy",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "inference_failure",
+                "id": "<public-id>",
+                "outcome": "unresolved",
+                "owner_id": null,
+                "path": "python/inference.py",
+                "range": {
+                  "end_column": 9,
+                  "end_line": 5,
+                  "start_column": 1,
+                  "start_line": 4
+                },
+                "reason": "unresolved_base",
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
+            {
+              "op": "filter",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "inference_failure",
+                "id": "<public-id>",
+                "outcome": "unresolved",
+                "owner_id": null,
+                "path": "python/inference.py",
+                "range": {
+                  "end_column": 9,
+                  "end_line": 5,
+                  "start_column": 1,
+                  "start_line": 4
+                },
+                "reason": "unresolved_base",
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            }
+          ]
+        }
+      ],
+      "range": {
+        "end_column": 9,
+        "end_line": 5,
+        "start_column": 1,
+        "start_line": 4
+      },
+      "reason": "unresolved_base",
+      "result_type": "python_hierarchy_fact",
+      "root": {
+        "end_line": 5,
+        "fq_name": "python.inference.UnresolvedBase",
+        "kind": "class",
+        "language": "python",
+        "path": "python/inference.py",
+        "signature": "class UnresolvedBase(MissingBase):",
+        "start_line": 4
+      },
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
+    }
+  ],
+  "truncated": false
+}
 ```
 
 ## Narrow A Member Call
@@ -999,15 +1157,22 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
 {
   "results": [
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 7,
-        "fq_name": "python.lifecycle.LifecycleLeaf.__init__",
-        "kind": "function",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "(self)",
-        "start_line": 6
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 7,
+          "fq_name": "python.lifecycle.LifecycleLeaf.__init__",
+          "kind": "function",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "(self)",
+          "start_line": 6
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "call_lifecycle",
@@ -1018,13 +1183,17 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "ordinal": 1,
       "outcome": "called",
       "owner": {
-        "end_line": 7,
-        "fq_name": "python.lifecycle.LifecycleLeaf",
-        "kind": "class",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "class LifecycleLeaf(LifecycleBase):",
-        "start_line": 5
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 7,
+          "fq_name": "python.lifecycle.LifecycleLeaf",
+          "kind": "class",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "class LifecycleLeaf(LifecycleBase):",
+          "start_line": 5
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
@@ -1052,9 +1221,41 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
             {
               "op": "python_call_relations",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "hierarchy",
+                "id": "<public-id>",
+                "outcome": "complete",
+                "owner_id": null,
+                "path": "python/lifecycle.py",
+                "range": {
+                  "end_column": 27,
+                  "end_line": 7,
+                  "start_column": 1,
+                  "start_line": 5
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
+            {
+              "op": "python_call_relations",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "call_lifecycle",
                 "id": "<public-id>",
                 "outcome": "called",
+                "owner_id": "<public-id>",
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 27,
@@ -1062,16 +1263,25 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 5,
                   "start_line": 6
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": "<public-id>",
+                "target_owner_id": "<public-id>"
               }
             },
             {
               "op": "filter",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "call_lifecycle",
                 "id": "<public-id>",
                 "outcome": "called",
+                "owner_id": "<public-id>",
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 27,
@@ -1079,8 +1289,11 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 5,
                   "start_line": 6
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": "<public-id>",
+                "target_owner_id": "<public-id>"
               }
             }
           ]
@@ -1105,36 +1318,51 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "root_declaration_id": "<public-id>",
       "root_id": "<public-id>",
       "target": {
-        "end_line": 3,
-        "fq_name": "python.lifecycle.LifecycleBase.__init__",
-        "kind": "function",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "(self)",
-        "start_line": 2
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 3,
+          "fq_name": "python.lifecycle.LifecycleBase.__init__",
+          "kind": "function",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "(self)",
+          "start_line": 2
+        },
+        "kind": "source"
       },
       "target_id": "<public-id>",
       "target_owner": {
-        "end_line": 3,
-        "fq_name": "python.lifecycle.LifecycleBase",
-        "kind": "class",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "class LifecycleBase:",
-        "start_line": 1
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 3,
+          "fq_name": "python.lifecycle.LifecycleBase",
+          "kind": "class",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "class LifecycleBase:",
+          "start_line": 1
+        },
+        "kind": "source"
       },
       "target_owner_id": "<public-id>"
     },
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 7,
-        "fq_name": "python.lifecycle.LifecycleLeaf.__init__",
-        "kind": "function",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "(self)",
-        "start_line": 6
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 7,
+          "fq_name": "python.lifecycle.LifecycleLeaf.__init__",
+          "kind": "function",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "(self)",
+          "start_line": 6
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "call_lifecycle",
@@ -1143,13 +1371,17 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "member_name": "__init__",
       "outcome": "no_issue",
       "owner": {
-        "end_line": 7,
-        "fq_name": "python.lifecycle.LifecycleLeaf",
-        "kind": "class",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "class LifecycleLeaf(LifecycleBase):",
-        "start_line": 5
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 7,
+          "fq_name": "python.lifecycle.LifecycleLeaf",
+          "kind": "class",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "class LifecycleLeaf(LifecycleBase):",
+          "start_line": 5
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
@@ -1177,9 +1409,41 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
             {
               "op": "python_call_relations",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "hierarchy",
+                "id": "<public-id>",
+                "outcome": "complete",
+                "owner_id": null,
+                "path": "python/lifecycle.py",
+                "range": {
+                  "end_column": 27,
+                  "end_line": 7,
+                  "start_column": 1,
+                  "start_line": 5
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
+            {
+              "op": "python_call_relations",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "call_lifecycle",
                 "id": "<public-id>",
                 "outcome": "no_issue",
+                "owner_id": "<public-id>",
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 27,
@@ -1187,16 +1451,25 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 5,
                   "start_line": 6
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             },
             {
               "op": "filter",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "call_lifecycle",
                 "id": "<public-id>",
                 "outcome": "no_issue",
+                "owner_id": "<public-id>",
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 27,
@@ -1204,8 +1477,11 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 5,
                   "start_line": 6
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             }
           ]
@@ -1231,6 +1507,9 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "root_id": "<public-id>"
     },
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "fact_kind": "call_lifecycle",
       "id": "<public-id>",
@@ -1238,13 +1517,17 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "member_name": "__del__",
       "outcome": "no_issue",
       "owner": {
-        "end_line": 7,
-        "fq_name": "python.lifecycle.LifecycleLeaf",
-        "kind": "class",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "class LifecycleLeaf(LifecycleBase):",
-        "start_line": 5
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 7,
+          "fq_name": "python.lifecycle.LifecycleLeaf",
+          "kind": "class",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "class LifecycleLeaf(LifecycleBase):",
+          "start_line": 5
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
@@ -1272,9 +1555,15 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
             {
               "op": "python_call_relations",
               "result": {
-                "fact_kind": "call_lifecycle",
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "hierarchy",
                 "id": "<public-id>",
-                "outcome": "no_issue",
+                "outcome": "complete",
+                "owner_id": null,
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 27,
@@ -1282,16 +1571,51 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 1,
                   "start_line": 5
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
+            {
+              "op": "python_call_relations",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "call_lifecycle",
+                "id": "<public-id>",
+                "outcome": "no_issue",
+                "owner_id": "<public-id>",
+                "path": "python/lifecycle.py",
+                "range": {
+                  "end_column": 27,
+                  "end_line": 7,
+                  "start_column": 1,
+                  "start_line": 5
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             },
             {
               "op": "filter",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
                 "fact_kind": "call_lifecycle",
                 "id": "<public-id>",
                 "outcome": "no_issue",
+                "owner_id": "<public-id>",
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 27,
@@ -1299,8 +1623,11 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 1,
                   "start_line": 5
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             }
           ]
@@ -1350,15 +1677,22 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
 {
   "results": [
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 15,
-        "fq_name": "python.lifecycle.CleanupLeaf.__del__",
-        "kind": "function",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "(self)",
-        "start_line": 14
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 15,
+          "fq_name": "python.lifecycle.CleanupLeaf.__del__",
+          "kind": "function",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "(self)",
+          "start_line": 14
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "call_context",
@@ -1368,13 +1702,17 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "mro_rank": 1,
       "outcome": "approved_cleanup",
       "owner": {
-        "end_line": 15,
-        "fq_name": "python.lifecycle.CleanupLeaf",
-        "kind": "class",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "class CleanupLeaf(CleanupBase):",
-        "start_line": 13
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 15,
+          "fq_name": "python.lifecycle.CleanupLeaf",
+          "kind": "class",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "class CleanupLeaf(CleanupBase):",
+          "start_line": 13
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/lifecycle.py",
@@ -1402,9 +1740,41 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
             {
               "op": "python_call_relations",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "hierarchy",
+                "id": "<public-id>",
+                "outcome": "complete",
+                "owner_id": null,
+                "path": "python/lifecycle.py",
+                "range": {
+                  "end_column": 26,
+                  "end_line": 15,
+                  "start_column": 1,
+                  "start_line": 13
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
+            {
+              "op": "python_call_relations",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "call_context",
                 "id": "<public-id>",
                 "outcome": "approved_cleanup",
+                "owner_id": "<public-id>",
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 26,
@@ -1412,16 +1782,25 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 9,
                   "start_line": 15
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": "<public-id>",
+                "target_owner_id": "<public-id>"
               }
             },
             {
               "op": "filter",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "call_context",
                 "id": "<public-id>",
                 "outcome": "approved_cleanup",
+                "owner_id": "<public-id>",
                 "path": "python/lifecycle.py",
                 "range": {
                   "end_column": 26,
@@ -1429,8 +1808,11 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_column": 9,
                   "start_line": 15
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": "<public-id>",
+                "target_owner_id": "<public-id>"
               }
             }
           ]
@@ -1455,23 +1837,31 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "root_declaration_id": "<public-id>",
       "root_id": "<public-id>",
       "target": {
-        "end_line": 11,
-        "fq_name": "python.lifecycle.CleanupBase.__del__",
-        "kind": "function",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "(self)",
-        "start_line": 10
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 11,
+          "fq_name": "python.lifecycle.CleanupBase.__del__",
+          "kind": "function",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "(self)",
+          "start_line": 10
+        },
+        "kind": "source"
       },
       "target_id": "<public-id>",
       "target_owner": {
-        "end_line": 11,
-        "fq_name": "python.lifecycle.CleanupBase",
-        "kind": "class",
-        "language": "python",
-        "path": "python/lifecycle.py",
-        "signature": "class CleanupBase:",
-        "start_line": 9
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 11,
+          "fq_name": "python.lifecycle.CleanupBase",
+          "kind": "class",
+          "language": "python",
+          "path": "python/lifecycle.py",
+          "signature": "class CleanupBase:",
+          "start_line": 9
+        },
+        "kind": "source"
       },
       "target_owner_id": "<public-id>"
     }
@@ -1564,9 +1954,11 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "conversion_status": "unknown",
       "coverage": "exhaustive",
       "declared_target_id": "decl:v1:<public-id>",
-      "dispatch_coverage": "open",
-      "dispatch_outcome": "unknown",
-      "dispatch_target_count": 0,
+      "dispatch_completeness": "complete",
+      "dispatch_coverage": "exhaustive",
+      "dispatch_outcome": "resolved",
+      "dispatch_proof": "proven",
+      "dispatch_target_count": 1,
       "dispatch_targets_truncated": false,
       "formal_index": 0,
       "formal_layout_id": "<public-id>",
@@ -1618,6 +2010,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 21
                 },
                 "result_type": "call_binding",
+                "semantic_target_id": "<public-id>",
                 "site_id": "<public-id>",
                 "target_origin": "source"
               }
@@ -1637,6 +2030,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 21
                 },
                 "result_type": "call_binding",
+                "semantic_target_id": "<public-id>",
                 "site_id": "<public-id>",
                 "target_origin": "source"
               }
@@ -1656,6 +2050,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
                   "start_line": 21
                 },
                 "result_type": "call_binding",
+                "semantic_target_id": "<public-id>",
                 "site_id": "<public-id>",
                 "target_origin": "source"
               }
@@ -1672,6 +2067,7 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "result_type": "call_binding",
       "selector_exact": true,
       "selector_proof": "derived",
+      "semantic_target_id": "<public-id>",
       "signature_id": "<public-id>",
       "site_ast_id": "<public-id>",
       "site_id": "<public-id>",
@@ -1733,15 +2129,22 @@ class Derived(Base):
 {
   "results": [
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 7,
-        "fq_name": "python.overrides.Derived.process",
-        "kind": "function",
-        "language": "python",
-        "path": "python/overrides.py",
-        "signature": "(self, value, label)",
-        "start_line": 6
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 7,
+          "fq_name": "python.overrides.Derived.process",
+          "kind": "function",
+          "language": "python",
+          "path": "python/overrides.py",
+          "signature": "(self, value, label)",
+          "start_line": 6
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "override_signature",
@@ -1751,13 +2154,17 @@ class Derived(Base):
       "mro_rank": 1,
       "outcome": "overrides",
       "owner": {
-        "end_line": 7,
-        "fq_name": "python.overrides.Derived",
-        "kind": "class",
-        "language": "python",
-        "path": "python/overrides.py",
-        "signature": "class Derived(Base):",
-        "start_line": 5
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 7,
+          "fq_name": "python.overrides.Derived",
+          "kind": "class",
+          "language": "python",
+          "path": "python/overrides.py",
+          "signature": "class Derived(Base):",
+          "start_line": 5
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/overrides.py",
@@ -1785,9 +2192,15 @@ class Derived(Base):
             {
               "op": "python_override_signatures",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "override_signature",
                 "id": "<public-id>",
                 "outcome": "overrides",
+                "owner_id": "<public-id>",
                 "path": "python/overrides.py",
                 "range": {
                   "end_column": 28,
@@ -1795,8 +2208,11 @@ class Derived(Base):
                   "start_column": 5,
                   "start_line": 6
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": "<public-id>",
+                "target_owner_id": "<public-id>"
               }
             }
           ]
@@ -1827,23 +2243,31 @@ class Derived(Base):
       "source_signature_ordinal": 0,
       "source_total_arity": 3,
       "target": {
-        "end_line": 3,
-        "fq_name": "python.overrides.Base.process",
-        "kind": "function",
-        "language": "python",
-        "path": "python/overrides.py",
-        "signature": "(self, value)",
-        "start_line": 2
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 3,
+          "fq_name": "python.overrides.Base.process",
+          "kind": "function",
+          "language": "python",
+          "path": "python/overrides.py",
+          "signature": "(self, value)",
+          "start_line": 2
+        },
+        "kind": "source"
       },
       "target_id": "<public-id>",
       "target_owner": {
-        "end_line": 3,
-        "fq_name": "python.overrides.Base",
-        "kind": "class",
-        "language": "python",
-        "path": "python/overrides.py",
-        "signature": "class Base:",
-        "start_line": 1
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 3,
+          "fq_name": "python.overrides.Base",
+          "kind": "class",
+          "language": "python",
+          "path": "python/overrides.py",
+          "signature": "class Base:",
+          "start_line": 1
+        },
+        "kind": "source"
       },
       "target_owner_id": "<public-id>",
       "target_repeated_arity": false,
@@ -5269,6 +5693,9 @@ field to equal `false`; an absent value means the import context was unavailable
 {
   "results": [
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "fact_kind": "hierarchy",
       "id": "<public-id>",
@@ -5299,9 +5726,15 @@ field to equal `false`; an absent value means the import context was unavailable
             {
               "op": "class_hierarchy",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
                 "fact_kind": "hierarchy",
                 "id": "<public-id>",
                 "outcome": "complete",
+                "owner_id": null,
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 23,
@@ -5309,8 +5742,11 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_column": 1,
                   "start_line": 38
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             }
           ]
@@ -5355,6 +5791,9 @@ field to equal `false`; an absent value means the import context was unavailable
 {
   "results": [
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "base_resolution": "resolved",
       "base_spelling": "Parent",
       "coverage": "complete",
@@ -5388,9 +5827,15 @@ field to equal `false`; an absent value means the import context was unavailable
             {
               "op": "class_bases",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
                 "fact_kind": "base",
                 "id": "<public-id>",
                 "outcome": "resolved",
+                "owner_id": null,
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 23,
@@ -5398,8 +5843,11 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_column": 1,
                   "start_line": 38
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": "<public-id>",
+                "target_owner_id": null
               }
             }
           ]
@@ -5424,13 +5872,17 @@ field to equal `false`; an absent value means the import context was unavailable
       "root_declaration_id": "<public-id>",
       "root_id": "<public-id>",
       "target": {
-        "end_line": 36,
-        "fq_name": "python.public-vocabulary.Parent",
-        "kind": "class",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "class Parent:",
-        "start_line": 34
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 36,
+          "fq_name": "python.public-vocabulary.Parent",
+          "kind": "class",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "class Parent:",
+          "start_line": 34
+        },
+        "kind": "source"
       },
       "target_id": "<public-id>"
     }
@@ -5454,15 +5906,22 @@ field to equal `false`; an absent value means the import context was unavailable
 {
   "results": [
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 40,
-        "fq_name": "python.public-vocabulary.Child",
-        "kind": "class",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "class Child(Parent):",
-        "start_line": 38
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 40,
+          "fq_name": "python.public-vocabulary.Child",
+          "kind": "class",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "class Child(Parent):",
+          "start_line": 38
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "mro",
@@ -5496,9 +5955,15 @@ field to equal `false`; an absent value means the import context was unavailable
             {
               "op": "class_mro",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "mro",
                 "id": "<public-id>",
                 "outcome": "complete",
+                "owner_id": null,
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 23,
@@ -5506,8 +5971,11 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_column": 1,
                   "start_line": 38
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             }
           ]
@@ -5533,15 +6001,22 @@ field to equal `false`; an absent value means the import context was unavailable
       "root_id": "<public-id>"
     },
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 36,
-        "fq_name": "python.public-vocabulary.Parent",
-        "kind": "class",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "class Parent:",
-        "start_line": 34
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 36,
+          "fq_name": "python.public-vocabulary.Parent",
+          "kind": "class",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "class Parent:",
+          "start_line": 34
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "mro",
@@ -5575,9 +6050,15 @@ field to equal `false`; an absent value means the import context was unavailable
             {
               "op": "class_mro",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "mro",
                 "id": "<public-id>",
                 "outcome": "complete",
+                "owner_id": null,
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 23,
@@ -5585,8 +6066,98 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_column": 1,
                   "start_line": 38
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            }
+          ]
+        }
+      ],
+      "range": {
+        "end_column": 23,
+        "end_line": 40,
+        "start_column": 1,
+        "start_line": 38
+      },
+      "result_type": "python_hierarchy_fact",
+      "root": {
+        "end_line": 40,
+        "fq_name": "python.public-vocabulary.Child",
+        "kind": "class",
+        "language": "python",
+        "path": "python/public-vocabulary.py",
+        "signature": "class Child(Parent):",
+        "start_line": 38
+      },
+      "root_declaration_id": "<public-id>",
+      "root_id": "<public-id>"
+    },
+    {
+      "ancestry_basis": {
+        "claims": []
+      },
+      "coverage": "complete",
+      "declaration": {
+        "canonical_symbol_id": "python.intrinsic.builtins.object",
+        "kind": "external_class",
+        "qualified_name": "builtins.object"
+      },
+      "declaration_id": "python.intrinsic.builtins.object",
+      "fact_kind": "mro",
+      "id": "<public-id>",
+      "language": "python",
+      "mro_rank": 2,
+      "ordinal": 2,
+      "outcome": "complete",
+      "path": "python/public-vocabulary.py",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 40,
+            "kind": "class",
+            "path": "python/public-vocabulary.py",
+            "result_type": "structural_match",
+            "start_line": 38
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 40,
+                "fq_name": "python.public-vocabulary.Child",
+                "kind": "class",
+                "path": "python/public-vocabulary.py",
+                "result_type": "declaration",
+                "start_line": 38
+              }
+            },
+            {
+              "op": "class_mro",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "python.intrinsic.builtins.object",
+                "fact_kind": "mro",
+                "id": "<public-id>",
+                "outcome": "complete",
+                "owner_id": null,
+                "path": "python/public-vocabulary.py",
+                "range": {
+                  "end_column": 23,
+                  "end_line": 40,
+                  "start_column": 1,
+                  "start_line": 38
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             }
           ]
@@ -5631,38 +6202,48 @@ field to equal `false`; an absent value means the import context was unavailable
 {
   "results": [
     {
-      "coverage": "complete",
+      "ancestry_basis": {
+        "claims": []
+      },
       "base_branch_definition_count": 1,
-      "has_strict_ordering": false,
-      "has_non_strict_ordering": false,
-      "inherited_ne_delegates": false,
-      "inherited_ne_present": false,
-      "total_ordering_decorator": false,
+      "coverage": "complete",
       "declaration": {
-        "end_line": 40,
-        "fq_name": "python.public-vocabulary.Child.describe",
-        "kind": "function",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "(self)",
-        "start_line": 39
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 40,
+          "fq_name": "python.public-vocabulary.Child.describe",
+          "kind": "function",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "(self)",
+          "start_line": 39
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "member",
+      "has_non_strict_ordering": false,
+      "has_strict_ordering": false,
       "id": "<public-id>",
+      "inherited_ne_delegates": false,
+      "inherited_ne_present": false,
       "language": "python",
       "member_name": "describe",
       "mro_rank": 0,
       "ordinal": 0,
       "outcome": "selected",
       "owner": {
-        "end_line": 40,
-        "fq_name": "python.public-vocabulary.Child",
-        "kind": "class",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "class Child(Parent):",
-        "start_line": 38
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 40,
+          "fq_name": "python.public-vocabulary.Child",
+          "kind": "class",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "class Child(Parent):",
+          "start_line": 38
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
@@ -5690,9 +6271,15 @@ field to equal `false`; an absent value means the import context was unavailable
             {
               "op": "mro_members",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "member",
                 "id": "<public-id>",
                 "outcome": "selected",
+                "owner_id": "<public-id>",
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 23,
@@ -5700,8 +6287,11 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_column": 1,
                   "start_line": 38
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             }
           ]
@@ -5724,7 +6314,8 @@ field to equal `false`; an absent value means the import context was unavailable
         "start_line": 38
       },
       "root_declaration_id": "<public-id>",
-      "root_id": "<public-id>"
+      "root_id": "<public-id>",
+      "total_ordering_decorator": false
     }
   ],
   "truncated": false
@@ -5746,15 +6337,22 @@ field to equal `false`; an absent value means the import context was unavailable
 {
   "results": [
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 36,
-        "fq_name": "python.public-vocabulary.Parent.describe",
-        "kind": "function",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "(self)",
-        "start_line": 35
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 36,
+          "fq_name": "python.public-vocabulary.Parent.describe",
+          "kind": "function",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "(self)",
+          "start_line": 35
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "override",
@@ -5763,13 +6361,17 @@ field to equal `false`; an absent value means the import context was unavailable
       "member_name": "describe",
       "outcome": "no_override",
       "owner": {
-        "end_line": 36,
-        "fq_name": "python.public-vocabulary.Parent",
-        "kind": "class",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "class Parent:",
-        "start_line": 34
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 36,
+          "fq_name": "python.public-vocabulary.Parent",
+          "kind": "class",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "class Parent:",
+          "start_line": 34
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
@@ -5797,9 +6399,15 @@ field to equal `false`; an absent value means the import context was unavailable
             {
               "op": "python_overrides",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "override",
                 "id": "<public-id>",
                 "outcome": "no_override",
+                "owner_id": "<public-id>",
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 24,
@@ -5807,8 +6415,11 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_column": 5,
                   "start_line": 35
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
               }
             }
           ]
@@ -5834,15 +6445,22 @@ field to equal `false`; an absent value means the import context was unavailable
       "root_id": "<public-id>"
     },
     {
+      "ancestry_basis": {
+        "claims": []
+      },
       "coverage": "complete",
       "declaration": {
-        "end_line": 40,
-        "fq_name": "python.public-vocabulary.Child.describe",
-        "kind": "function",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "(self)",
-        "start_line": 39
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 40,
+          "fq_name": "python.public-vocabulary.Child.describe",
+          "kind": "function",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "(self)",
+          "start_line": 39
+        },
+        "kind": "source"
       },
       "declaration_id": "<public-id>",
       "fact_kind": "override",
@@ -5852,13 +6470,17 @@ field to equal `false`; an absent value means the import context was unavailable
       "mro_rank": 1,
       "outcome": "overrides",
       "owner": {
-        "end_line": 40,
-        "fq_name": "python.public-vocabulary.Child",
-        "kind": "class",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "class Child(Parent):",
-        "start_line": 38
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 40,
+          "fq_name": "python.public-vocabulary.Child",
+          "kind": "class",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "class Child(Parent):",
+          "start_line": 38
+        },
+        "kind": "source"
       },
       "owner_id": "<public-id>",
       "path": "python/public-vocabulary.py",
@@ -5886,9 +6508,15 @@ field to equal `false`; an absent value means the import context was unavailable
             {
               "op": "python_overrides",
               "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": "<public-id>",
                 "fact_kind": "override",
                 "id": "<public-id>",
                 "outcome": "overrides",
+                "owner_id": "<public-id>",
                 "path": "python/public-vocabulary.py",
                 "range": {
                   "end_column": 23,
@@ -5896,8 +6524,11 @@ field to equal `false`; an absent value means the import context was unavailable
                   "start_column": 5,
                   "start_line": 39
                 },
+                "reason": null,
                 "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>"
+                "root_id": "<public-id>",
+                "target_id": "<public-id>",
+                "target_owner_id": "<public-id>"
               }
             }
           ]
@@ -5922,23 +6553,31 @@ field to equal `false`; an absent value means the import context was unavailable
       "root_declaration_id": "<public-id>",
       "root_id": "<public-id>",
       "target": {
-        "end_line": 36,
-        "fq_name": "python.public-vocabulary.Parent.describe",
-        "kind": "function",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "(self)",
-        "start_line": 35
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 36,
+          "fq_name": "python.public-vocabulary.Parent.describe",
+          "kind": "function",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "(self)",
+          "start_line": 35
+        },
+        "kind": "source"
       },
       "target_id": "<public-id>",
       "target_owner": {
-        "end_line": 36,
-        "fq_name": "python.public-vocabulary.Parent",
-        "kind": "class",
-        "language": "python",
-        "path": "python/public-vocabulary.py",
-        "signature": "class Parent:",
-        "start_line": 34
+        "canonical_declaration_id": "<public-id>",
+        "declaration": {
+          "end_line": 36,
+          "fq_name": "python.public-vocabulary.Parent",
+          "kind": "class",
+          "language": "python",
+          "path": "python/public-vocabulary.py",
+          "signature": "class Parent:",
+          "start_line": 34
+        },
+        "kind": "source"
       },
       "target_owner_id": "<public-id>"
     }
@@ -7920,6 +8559,58 @@ def compare():
             "start_line": 10
           },
           "steps": [
+            {
+              "op": "python_comparison_using_is",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "member",
+                "id": "<public-id>",
+                "outcome": "complete",
+                "owner_id": null,
+                "path": "python/comparison-identity.py",
+                "range": {
+                  "end_column": 20,
+                  "end_line": 3,
+                  "start_column": 1,
+                  "start_line": 1
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
+            {
+              "op": "python_comparison_using_is",
+              "result": {
+                "ancestry_basis": {
+                  "claims": []
+                },
+                "coverage": "complete",
+                "declaration_id": null,
+                "fact_kind": "member",
+                "id": "<public-id>",
+                "outcome": "complete",
+                "owner_id": null,
+                "path": "python/comparison-identity.py",
+                "range": {
+                  "end_column": 20,
+                  "end_line": 3,
+                  "start_column": 1,
+                  "start_line": 1
+                },
+                "reason": null,
+                "result_type": "python_hierarchy_fact",
+                "root_id": "<public-id>",
+                "target_id": null,
+                "target_owner_id": null
+              }
+            },
             {
               "op": "python_comparison_using_is",
               "result": {

@@ -222,7 +222,7 @@ pub(crate) const RESOLUTION_SITES_BY_KEY_SQL: &str = "SELECT site, role, namespa
 
 /// Question 66, `lookup_recipe`: the recipe columns of a batch of shared
 /// names, keyed by the id a shared `SemanticId` carries.
-pub(crate) const RESOLUTION_IDENTITY_RECIPES_SQL: &str = "SELECT id, semantic_language, namespace, spelling \
+pub(crate) const RESOLUTION_IDENTITY_RECIPES_SQL: &str = "SELECT id, semantic_language, namespace, spelling, identity_digest \
      FROM resolution_identities \
      WHERE id IN (SELECT value FROM json_each(?1))";
 
@@ -1296,6 +1296,21 @@ pub(crate) fn decode_lookup_recipe(
         identity_domain_from_code(semantic_language),
         namespace_from_code(namespace),
         spelling,
+    )
+}
+
+/// A persisted recipe already carries the canonical digest used to intern it.
+pub(crate) fn decode_stored_lookup_recipe(
+    semantic_language: i64,
+    namespace: i64,
+    spelling: &str,
+    name_digest: [u8; 32],
+) -> ResolutionLookupSemanticRecipe {
+    ResolutionLookupSemanticRecipe::from_name_digest(
+        identity_domain_from_code(semantic_language),
+        namespace_from_code(namespace),
+        spelling,
+        name_digest,
     )
 }
 

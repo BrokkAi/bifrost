@@ -152,9 +152,9 @@ pub enum PinnedPackKind {
         crates: Vec<PinnedRustdocCrate>,
     },
     /// One pinned Python stub tree. The generate artifact argument names the
-    /// tree root directory; `stubs` lists the pinned `.pyi` files relative to
-    /// that root. The pinned artifact digest is the canonical source-set
-    /// digest over the listed paths and bytes.
+    /// tree root directory; `stubs` lists seed `.pyi` files relative to that
+    /// root. Generation discovers their local import closure and pins the
+    /// canonical source-set digest over all loaded paths and bytes.
     PythonStub {
         stubs: Vec<String>,
     },
@@ -924,9 +924,18 @@ fn generate_one(
             )
         }
     };
-    let compiled = compile_pack(&authored, &CompilerOptions::default()).map_err(|diagnostics| {
-        BundleError::new(format!("pack compilation failed: {diagnostics:#?}"))
-    })?;
+    let compiler_options = CompilerOptions::default();
+    let compiled = compile_pack(&authored, &compiler_options)
+        .and_then(|compiled| {
+            if matches!(&spec.kind, PinnedPackKind::PythonStub { .. }) {
+                compiled.with_source_set_inputs(&artifact, &compiler_options)
+            } else {
+                Ok(compiled)
+            }
+        })
+        .map_err(|diagnostics| {
+            BundleError::new(format!("pack compilation failed: {diagnostics:#?}"))
+        })?;
     let elapsed = started.elapsed();
     let runtime_measurement = measure_runtime(spec, &compiled, &cancellation)?;
 
@@ -1244,12 +1253,13 @@ fn read_pinned_artifact(
     match &spec.kind {
         PinnedPackKind::PythonStub { stubs } => {
             let relative_paths = stubs.iter().map(PathBuf::from).collect::<Vec<_>>();
-            read_exact_source_set(
+            PythonArtifactPackProducer.read_stub_source_closure(
                 artifact_path,
                 &relative_paths,
                 MAX_SOURCE_SET_FILES,
                 MAX_SOURCE_SET_PATH_DEPTH,
                 limits,
+                None,
             )
         }
         PinnedPackKind::NpmPackage {
@@ -2332,6 +2342,10 @@ fn verify_release_pack_metadata(
         || manifest.compatibility != pack.compatibility
         || manifest.provenance != pack.provenance
         || manifest.license != pack.license
+        || manifest
+            .source_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.sha256 != pack.artifact.sha256)
     {
         return Err(BundleError::new(format!(
             "release index metadata does not match manifest for {}@{}",

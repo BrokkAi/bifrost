@@ -677,6 +677,48 @@ pub struct CodeQueryMemberFamilyEdge {
     pub coverage: &'static str,
 }
 
+/// An honest class/member endpoint; an external class has no source location.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryPythonHierarchyEndpoint {
+    Source {
+        canonical_declaration_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        declaration: Option<CodeQueryDeclaration>,
+    },
+    ExternalClass {
+        canonical_symbol_id: String,
+        qualified_name: String,
+    },
+}
+
+impl CodeQueryPythonHierarchyEndpoint {
+    pub fn canonical_id(&self) -> &str {
+        match self {
+            Self::Source {
+                canonical_declaration_id,
+                ..
+            } => canonical_declaration_id,
+            Self::ExternalClass {
+                canonical_symbol_id,
+                ..
+            } => canonical_symbol_id,
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Source {
+                canonical_declaration_id,
+                declaration,
+            } => declaration
+                .as_ref()
+                .map_or(canonical_declaration_id, |declaration| &declaration.fq_name),
+            Self::ExternalClass { qualified_name, .. } => qualified_name,
+        }
+    }
+}
+
 /// One typed fact from Python's class hierarchy, C3 MRO, effective member or
 /// override selection, or a selected override paired with its signature rows.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -684,6 +726,7 @@ pub struct CodeQueryMemberFamilyEdge {
 pub struct CodeQueryPythonHierarchyFact {
     pub id: String,
     pub root_id: String,
+    pub ancestry_basis: crate::analyzer::usages::python_class_hierarchy::PythonAncestryBasis,
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
@@ -703,19 +746,19 @@ pub struct CodeQueryPythonHierarchyFact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_resolution: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub declaration: Option<CodeQueryDeclaration>,
+    pub declaration: Option<CodeQueryPythonHierarchyEndpoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner: Option<CodeQueryDeclaration>,
+    pub owner: Option<CodeQueryPythonHierarchyEndpoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<CodeQueryDeclaration>,
+    pub target: Option<CodeQueryPythonHierarchyEndpoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_owner: Option<CodeQueryDeclaration>,
+    pub target_owner: Option<CodeQueryPythonHierarchyEndpoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_owner_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

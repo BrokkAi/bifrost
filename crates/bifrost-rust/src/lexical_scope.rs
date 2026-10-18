@@ -346,6 +346,29 @@ pub(crate) fn parse_rust_range_tree(source: &str, range: tree_sitter::Range) -> 
     })
 }
 
+/// Parse several AST-delimited interiors without scanning their source prefixes.
+pub(crate) fn parse_rust_included_ranges_tree(
+    source: &str,
+    ranges: &[tree_sitter::Range],
+) -> Option<Tree> {
+    assert!(
+        !ranges.is_empty(),
+        "an embedded item parse has at least one range"
+    );
+    let bytes = ranges
+        .iter()
+        .map(|range| range.end_byte - range.start_byte)
+        .sum();
+    parse_rust_fragment_tree(bytes, || {
+        brokk_bifrost_core::analyzer::common::parse_source_with_cancellation(
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+            Some(ranges),
+            None,
+        )
+    })
+}
+
 fn parse_rust_fragment_tree(
     parse_bytes: usize,
     parse: impl FnOnce() -> Option<Tree>,

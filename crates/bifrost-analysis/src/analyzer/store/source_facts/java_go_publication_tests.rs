@@ -222,6 +222,22 @@ fn assert_published_canonical_source<A: LanguageAdapter>(
         .expect("hydrate published file")
         .expect("published file state");
     assert_eq!(hydrated.imports, expected_generic_imports);
+    if let Some(expected) = facts.go.as_ref() {
+        let source = reopened
+            .go_source_facts(
+                oid,
+                generation,
+                adapter,
+                &fixture.file(relative_path),
+                &|| true,
+            )
+            .expect("hydrate Go source properties")
+            .expect("published Go source properties");
+        assert_eq!(
+            &source.facts, expected,
+            "Go source properties survive reopening"
+        );
+    }
 }
 
 #[test]
@@ -294,6 +310,36 @@ func use() { value := helper(1); _ = value; var thing Thing; _ = thing.Field }
     assert!(!facts.structural.nodes().is_empty());
     assert!(!facts.native_declaration_sources.is_empty());
     assert_published_canonical_source(&fixture, "pkg/sample.go", "go", &GoAdapter, &state);
+}
+
+#[test]
+#[hardwon("#5074: anonymous struct fields and decoded tags did not survive source publication")]
+fn go_anonymous_struct_fields_and_tags_survive_reopening() {
+    let source = r#"package p
+ type Options struct{}
+ func TestCreate() {
+     tests := []struct {
+         opts *Options `json:"opts"`
+         ctx struct { Client *Options }
+     }{}
+     for _, tt := range tests { _ = tt.opts; _ = tt.ctx.Client }
+     type localOptions struct { opts *Options }
+     _ = localOptions{}
+ }
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/test\n")
+        .file("pkg/sample_test.go", source)
+        .build();
+    let state = parse_state(&GoAdapter, &fixture.file("pkg/sample_test.go"));
+    let go = state.source_facts.as_ref().unwrap().go.as_ref().unwrap();
+    assert_eq!(go.fields.len(), 4, "{go:#?}");
+    assert!(
+        go.fields
+            .iter()
+            .any(|field| field.tag.as_deref() == Some(b"json:\"opts\""))
+    );
+    assert_published_canonical_source(&fixture, "pkg/sample_test.go", "go", &GoAdapter, &state);
 }
 
 #[test]

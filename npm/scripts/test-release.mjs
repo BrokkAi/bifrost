@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -5,10 +6,12 @@ import { fileURLToPath } from "node:url";
 
 import { platformPackageName } from "../launcher/bifrost.js";
 import { ROOT_PACKAGE, tarballBasename, versionFromTag } from "./package-release.mjs";
-import { spawnSyncUtf8 } from "../../scripts/command.mjs";
 
 function run(command, args, options = {}) {
-  const result = spawnSyncUtf8(command, args, options);
+  const result = spawnSync(command, args, { encoding: "utf8", ...options });
+  if (result.error) {
+    throw result.error;
+  }
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
   }

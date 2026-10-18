@@ -15,9 +15,9 @@ use crate::analyzer::go::dependency_discovery::GoPackageDiscovery;
 use crate::analyzer::{Language, Project};
 use brokk_bifrost_core::analyzer::go_facts::GO_BUILD_SELECTION_FACTS_VERSION;
 
-/// Version 7 retains source-inventory placements for files without tool records
-/// after a failed discovery run, preserving explicit tool admission/exclusion.
-pub(crate) const DERIVATION_VERSION: i64 = 7;
+/// Version 9 publishes explicit selected-build exclusions as ignored memberships
+/// so graph admission can distinguish exclusion from missing placement.
+pub(crate) const DERIVATION_VERSION: i64 = 9;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct GoContextIdentity {
@@ -193,7 +193,8 @@ impl AnalyzerStore {
             .cloned()
             .collect::<BTreeSet<_>>();
         WorkspaceConfigurationInput::include_native_metadata_paths(
-            project.root(),
+            project,
+            &files,
             Language::Go,
             &mut configuration,
         )?;
@@ -508,7 +509,8 @@ impl AnalyzerStore {
             let mut members = Vec::new();
             // GoFiles/CgoFiles are the files compiled for this exact tool
             // instance. TestGoFiles/XTestGoFiles alone describe possible tests;
-            // they do not select an internal or external test variant.
+            // they do not select an internal or external test variant. Ignored
+            // paths record exclusion evidence without admitting source or imports.
             let selected_paths = if source_less_provider {
                 BTreeSet::new()
             } else {
@@ -516,9 +518,11 @@ impl AnalyzerStore {
                     .go_files
                     .iter()
                     .chain(&package.cgo_files)
+                    .chain(&package.ignored_go_files)
                     .collect::<BTreeSet<_>>()
             };
             for path in selected_paths {
+                let ignored = package.ignored_go_files.contains(path);
                 let absolute = package.dir.join(path);
                 let relative = absolute.strip_prefix(&root).ok().and_then(|path| {
                     crate::path_utils::workspace_rel_path(&path.to_string_lossy())
@@ -547,14 +551,17 @@ impl AnalyzerStore {
                     None
                 };
                 let Some((id, oid, declared, state, version)) = member else {
-                    gaps.push(
-                        json!({"code":"unselected_source_input", "evidence":{"path":absolute}}),
-                    );
+                    if !ignored {
+                        gaps.push(
+                            json!({"code":"unselected_source_input", "evidence":{"path":absolute}}),
+                        );
+                    }
                     continue;
                 };
-                if declared.as_deref() != Some(package.name.as_str())
-                    || state.as_deref() != Some("complete")
-                    || version != Some(super::source_facts::SOURCE_FACTS_VERSION)
+                if !ignored
+                    && (declared.as_deref() != Some(package.name.as_str())
+                        || state.as_deref() != Some("complete")
+                        || version != Some(super::source_facts::SOURCE_FACTS_VERSION))
                 {
                     gaps.push(json!({"code":"package_source_identity_mismatch", "evidence":{"path":absolute,"declared":declared,"tool_name":package.name,"source_state":state,"source_version":version}}));
                     continue;
@@ -563,8 +570,12 @@ impl AnalyzerStore {
                     root.clone(),
                     relative.expect("selected source has a workspace-relative path"),
                 );
-                let role = brokk_bifrost_go::packages::source_inventory_role(&file, &package.name);
-                if role != "go" && package.for_test.is_empty() {
+                let role = if ignored {
+                    "ignored"
+                } else {
+                    brokk_bifrost_go::packages::source_inventory_role(&file, &package.name)
+                };
+                if role != "go" && role != "ignored" && package.for_test.is_empty() {
                     gaps.push(json!({"code":"test_variant_unselected", "evidence":{"path":absolute,"role":role,"package":package.import_path}}));
                     continue;
                 }
@@ -573,7 +584,7 @@ impl AnalyzerStore {
                 publication.field("source-path", absolute.as_os_str().as_encoded_bytes());
                 publication.field("source-oid", oid.as_bytes());
             }
-            if members.is_empty() && !source_less_provider {
+            if members.iter().all(|(_, role)| *role == "ignored") && !source_less_provider {
                 gaps.push(json!({"code":"missing_selected_package_source", "evidence":package.import_path}));
             }
             // Keep dependency evidence, but consume its incompleteness only
@@ -604,6 +615,7 @@ impl AnalyzerStore {
             let admitted_roles = members
                 .iter()
                 .map(|(_, role)| *role)
+                .filter(|role| *role != "ignored")
                 .collect::<BTreeSet<_>>();
             for role in &admitted_roles {
                 for import in package.imports.iter().collect::<BTreeSet<_>>() {
@@ -1217,7 +1229,7 @@ mod tests {
         let conn = fixture.store().read_conn().unwrap();
         let placements = conn
             .prepare(
-                "SELECT f.rel_path,p.provider_provenance,p.complete,json(p.gaps)
+                "SELECT f.rel_path,p.provider_provenance,p.complete,json(p.gaps),pf.source_role
              FROM go_package_instances p JOIN go_package_files pf USING(package_id)
              JOIN workspace_file_versions f USING(file_version_id)
              WHERE p.context_id=?1 ORDER BY f.rel_path",
@@ -1229,6 +1241,7 @@ mod tests {
                     row.get::<_, String>(1)?,
                     row.get::<_, bool>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .unwrap()
@@ -1237,9 +1250,13 @@ mod tests {
         assert_eq!(
             placements
                 .iter()
-                .map(|row| row.0.as_str())
+                .map(|row| (row.0.as_str(), row.4.as_str()))
                 .collect::<Vec<_>>(),
-            ["consumer/use.go", "provider/item.go"]
+            [
+                ("consumer/use.go", "go"),
+                ("provider/ignored.go", "ignored"),
+                ("provider/item.go", "go")
+            ]
         );
         assert_eq!(placements[0].1, "source_inventory");
         assert!(
@@ -1266,9 +1283,9 @@ mod tests {
             excluded_imports, 0,
             "an excluded file cannot contribute import rows"
         );
-        assert_eq!(placements[1].1, "go_tool");
+        assert_eq!(placements[2].1, "go_tool");
         assert!(
-            placements[1].2,
+            placements[2].2,
             "another failed root must not poison a file the tool placed"
         );
     }

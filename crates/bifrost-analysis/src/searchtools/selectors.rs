@@ -648,7 +648,9 @@ impl DefinitionCandidateRenderCache {
     ) -> Option<(Range, Option<(usize, usize)>)> {
         if unit.is_module()
             && crate::analyzer::languages::language_support(language_for_target(unit))
-                .and_then(|support| support.path_synthetic_module_unit(unit.source()))
+                .and_then(|support| {
+                    support.path_synthetic_module_unit(analyzer.project(), unit.source())
+                })
                 .as_ref()
                 == Some(unit)
         {

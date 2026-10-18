@@ -20,7 +20,7 @@ use crate::analyzer::{CodeUnitIndex, IAnalyzer, Language, ProjectFile, resolve_a
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
-pub(super) struct GoNativeWorkspaceGraphProvider;
+pub(crate) struct GoNativeWorkspaceGraphProvider;
 
 impl NativeWorkspaceGraphProvider for GoNativeWorkspaceGraphProvider {
     fn id(&self) -> EdgePassId {
@@ -96,8 +96,8 @@ impl NativeWorkspaceGraphProvider for GoNativeWorkspaceGraphProvider {
     }
 }
 
-/// Project outgoing edges from the admitted Go caller files through one
-/// selected operation. Rust and other language files are outside this pass.
+/// Classify requested Go callers, then project admitted files' outgoing edges
+/// through one selected operation. Rust and other languages are outside this pass.
 pub(crate) fn build_go_native_workspace_graph_for_files(
     go: &GoAnalyzer,
     caller_files: &[ProjectFile],
@@ -181,9 +181,9 @@ pub(crate) fn build_go_native_workspace_graph_for_files(
         if cancellation.is_cancelled() {
             return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
         }
-        if go.inner.is_analyzed(file) {
-            admitted_callers.insert(file.clone());
-        }
+        // Admission, including a missing selected mount, is classified by the
+        // stage. Filtering here would lose the requested caller's evidence.
+        admitted_callers.insert(file.clone());
     }
     let mut declarations = Vec::new();
     for file in &admitted_callers {
@@ -295,8 +295,8 @@ pub(crate) fn build_go_native_workspace_graph_for_files(
             Ok(())
         },
     )?;
-    let mut summary = match staged {
-        SelectedResolutionOperationOutcome::Native(result) => result.summary,
+    let (mut summary, skipped) = match staged {
+        SelectedResolutionOperationOutcome::Native(result) => (result.summary, result.skipped),
         SelectedResolutionOperationOutcome::Cancelled(_) => {
             return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
         }
@@ -309,6 +309,8 @@ pub(crate) fn build_go_native_workspace_graph_for_files(
             ));
         }
     };
+    admitted_callers.retain(|file| !skipped.contains_key(file));
+    declarations.retain(|(unit, _)| !skipped.contains_key(unit.source()));
     assert_eq!(reference_count, summary.reference_count());
     assert_eq!(batch_count, summary.batch_count());
     let completion = summary
@@ -350,6 +352,7 @@ pub(crate) fn build_go_native_workspace_graph_for_files(
     ) else {
         return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
     };
+    accumulator.record_skipped_callers(skipped);
     if !accumulator.stage(&rows, cancellation) {
         return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
     }

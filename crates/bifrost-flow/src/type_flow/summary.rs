@@ -4677,6 +4677,10 @@ pub(super) fn class_atom_fingerprint(atom: &ClassAtom) -> StableDigest {
             digest.push(qualified_name.as_bytes());
             digest.push(symbol_id.as_bytes());
         }
+        ClassAtom::Class(ClassIdentity::Intrinsic { qualified_name }) => {
+            digest.push(b"intrinsic-class");
+            digest.push(qualified_name.as_bytes());
+        }
         ClassAtom::Unknown(reason) => {
             digest.push(b"unknown");
             digest.push(reason.to_string().as_bytes());

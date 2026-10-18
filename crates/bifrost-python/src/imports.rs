@@ -897,7 +897,7 @@ pub fn resolve_imports_batched(
 ) -> Vec<Vec<(String, CodeUnit)>> {
     let primary_fqns: Vec<Option<String>> = imports
         .iter()
-        .map(|import| primary_module_fqn(file, import))
+        .map(|import| primary_module_fqn(python, file, import))
         .collect();
     let to_resolve: Vec<String> = primary_fqns.iter().flatten().cloned().collect();
     let mut batch_results =
@@ -938,7 +938,7 @@ pub fn resolve_import_files_batched(
                 ..
             }) => {
                 let resolved_module = if module.starts_with('.') {
-                    resolve_python_relative_module(file, &module)
+                    resolve_python_relative_module(python.project(), file, &module)
                 } else {
                     Some(module)
                 };
@@ -969,7 +969,11 @@ pub fn resolve_import_files_batched(
 /// The module FQN `resolve_import`'s fast path checks first, if any -- must stay in sync with the
 /// two `resolve_module_code_unit` call sites in `resolve_import_with_hint` below, since it's what
 /// lets `resolve_import_target_files` batch-resolve them ahead of the serial fallback logic.
-fn primary_module_fqn(file: &ProjectFile, import: &ImportInfo) -> Option<String> {
+fn primary_module_fqn(
+    python: &dyn PythonSource,
+    file: &ProjectFile,
+    import: &ImportInfo,
+) -> Option<String> {
     match python_import_details(import)? {
         PythonImportDetails::Import { module, alias } => Some(python_namespace_binding_module(
             import,
@@ -985,7 +989,7 @@ fn primary_module_fqn(file: &ProjectFile, import: &ImportInfo) -> Option<String>
             if wildcard {
                 return None;
             }
-            let resolved_module = resolve_python_module_specifier(file, &module);
+            let resolved_module = resolve_python_module_specifier(python.project(), file, &module);
             resolved_module.map(|resolved_module| format!("{resolved_module}.{name}"))
         }
     }
@@ -1027,7 +1031,8 @@ fn resolve_import_with_hint(
                 alias,
                 wildcard,
             } => {
-                let resolved_module = resolve_python_module_specifier(file, &module);
+                let resolved_module =
+                    resolve_python_module_specifier(python.project(), file, &module);
                 let Some(resolved_module) = resolved_module else {
                     return Vec::new();
                 };
@@ -1272,7 +1277,8 @@ fn resolve_module_files_for_export(
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
-    let resolved_module = resolve_python_module_specifier(importing_file, module_specifier);
+    let resolved_module =
+        resolve_python_module_specifier(python.project(), importing_file, module_specifier);
     let Some(resolved_module) = resolved_module else {
         return Vec::new();
     };
@@ -1651,19 +1657,24 @@ pub fn python_namespace_binding_module(
 }
 
 pub fn resolve_python_relative_module(
+    project: &dyn brokk_bifrost_core::analyzer::project::Project,
     source_file: &ProjectFile,
     module_expr: &str,
 ) -> Option<String> {
-    resolve_python_relative_module_from_package(&python_current_package(source_file), module_expr)
+    resolve_python_relative_module_from_package(
+        &python_current_package(project, source_file),
+        module_expr,
+    )
 }
 
 /// Resolve a relative Python module specifier against the importing file.
 pub fn resolve_python_module_specifier(
+    project: &dyn brokk_bifrost_core::analyzer::project::Project,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
     if module_specifier.starts_with('.') {
-        resolve_python_relative_module(importing_file, module_specifier)
+        resolve_python_relative_module(project, importing_file, module_specifier)
     } else {
         Some(module_specifier.to_string())
     }
@@ -1698,8 +1709,11 @@ pub fn resolve_python_relative_module_from_package(
     Some(parts.join("."))
 }
 
-fn python_current_package(source_file: &ProjectFile) -> String {
-    let module = python_module_name(source_file);
+fn python_current_package(
+    project: &dyn brokk_bifrost_core::analyzer::project::Project,
+    source_file: &ProjectFile,
+) -> String {
+    let module = python_module_name(project, source_file);
     if source_file
         .rel_path()
         .file_name()

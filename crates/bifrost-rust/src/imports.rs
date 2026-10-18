@@ -146,11 +146,19 @@ pub enum RustImportOwner {
     },
 }
 
+impl RustImportOwner {
+    pub(crate) fn module(&self) -> &str {
+        match self {
+            Self::Module { module, .. } | Self::LocalOnly { module, .. } => module,
+        }
+    }
+}
+
 #[derive(Clone)]
-struct RustImportOwnerProjection<'tree> {
-    owner_scope: Option<Node<'tree>>,
+pub(crate) struct RustImportOwnerProjection<'tree> {
+    pub(crate) owner_scope: Option<Node<'tree>>,
     local_scope: Option<Node<'tree>>,
-    owner: RustImportOwner,
+    pub(crate) owner: RustImportOwner,
 }
 
 #[derive(Debug, Clone)]
@@ -356,7 +364,7 @@ pub fn rust_module_extents(
     extents
 }
 
-fn rust_import_owner<'tree>(
+pub(crate) fn rust_import_owner<'tree>(
     node: Node<'tree>,
     source: &str,
     base_module: &str,

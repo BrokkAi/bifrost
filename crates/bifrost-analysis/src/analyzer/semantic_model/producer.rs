@@ -7,6 +7,7 @@ use super::{
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
 use crate::analyzer::common::bounded_message;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -354,6 +355,83 @@ pub fn read_exact_source_set(
     )
 }
 
+/// Expand selected sources using dependencies read from the very bytes that
+/// will be hashed and produced. Each file is read once; all state belongs to
+/// this acquisition. Missing optional dependencies are the resolver's decision,
+/// while selected files retain the exact source-set reader's error contract.
+pub(crate) fn read_exact_source_closure_while(
+    root: &Path,
+    seeds: &[PathBuf],
+    max_files: usize,
+    max_path_depth: usize,
+    limits: &ArtifactProducerLimits,
+    mut is_cancelled: impl FnMut() -> bool,
+    mut dependencies: impl FnMut(&ExactSourceEntry) -> Result<Vec<PathBuf>, ProducerDiagnostic>,
+) -> Result<ExactArtifact, ProducerDiagnostic> {
+    let mut pending = BTreeSet::new();
+    for seed in seeds {
+        pending.insert(normalize_source_set_path(seed, max_path_depth, limits)?.0);
+        if pending.len() > max_files {
+            return Err(source_set_diagnostic(
+                "limit.source_files",
+                root,
+                format!("exact source closure exceeds {max_files} selected files"),
+                limits,
+            ));
+        }
+    }
+    let mut visited = BTreeSet::new();
+    let mut entries = Vec::new();
+    let mut consumed = 0_u64;
+    while let Some(relative) = pending.pop_first() {
+        assert!(visited.insert(relative.clone()));
+        let remaining_limits = ArtifactProducerLimits {
+            max_artifact_bytes: limits.max_artifact_bytes.saturating_sub(consumed),
+            ..*limits
+        };
+        let artifact = read_exact_source_set_while(
+            root,
+            &[PathBuf::from(relative)],
+            1,
+            max_path_depth,
+            &remaining_limits,
+            &mut is_cancelled,
+        )?;
+        let mut acquired = artifact.source_entries;
+        let entry = acquired
+            .pop()
+            .expect("one selected file yields one exact source entry");
+        assert!(acquired.is_empty());
+        for dependency in dependencies(&entry)? {
+            let (relative, _) = normalize_source_set_path(&dependency, max_path_depth, limits)?;
+            if !visited.contains(&relative) {
+                pending.insert(relative);
+                if visited.len() + pending.len() > max_files {
+                    return Err(source_set_diagnostic(
+                        "limit.source_files",
+                        root,
+                        format!("exact source closure exceeds {max_files} selected files"),
+                        limits,
+                    ));
+                }
+            }
+        }
+        // Keep the shared source-set header in every remaining read budget;
+        // only entry framing and content have already consumed that budget.
+        consumed += 16 + entry.relative_path.len() as u64 + entry.bytes.len() as u64;
+        entries.push((entry.relative_path, entry.bytes));
+    }
+    if is_cancelled() {
+        return Err(source_set_diagnostic(
+            "artifact.cancelled",
+            root,
+            "exact source closure read was cancelled",
+            limits,
+        ));
+    }
+    ExactArtifact::from_source_entries(root.to_owned(), entries, max_path_depth, limits)
+}
+
 pub(crate) fn read_exact_artifact_while(
     path: &Path,
     limits: &ArtifactProducerLimits,
@@ -537,7 +615,7 @@ pub(crate) fn read_exact_source_set_while(
             ));
         }
         let path = root.join(&relative);
-        reject_symlink_components(root, &relative, limits)?;
+        source_set_path_exists(root, &relative, limits)?;
         let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
             source_set_diagnostic(
                 "artifact.metadata",
@@ -726,25 +804,37 @@ fn normalize_source_set_path(
     Ok((normalized, relative))
 }
 
-fn reject_symlink_components(
+/// Probe an optional source without following symlinks or hiding I/O errors.
+/// Inspect parents even when the leaf is missing, so dangling symlinks cannot
+/// masquerade as unresolved dependencies.
+pub(crate) fn source_set_path_exists(
     root: &Path,
     relative: &Path,
     limits: &ArtifactProducerLimits,
-) -> Result<(), ProducerDiagnostic> {
+) -> Result<bool, ProducerDiagnostic> {
     let mut current = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(segment) = component else {
-            unreachable!("source path was normalized before symlink validation");
+            return Err(source_set_diagnostic(
+                "artifact.source_path",
+                relative,
+                "selected source paths must be relative and cannot contain parent traversal",
+                limits,
+            ));
         };
         current.push(segment);
-        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
-            source_set_diagnostic(
-                "artifact.metadata",
-                &current,
-                format!("could not inspect exact source path component: {error}"),
-                limits,
-            )
-        })?;
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(source_set_diagnostic(
+                    "artifact.metadata",
+                    &current,
+                    format!("could not inspect exact source path component: {error}"),
+                    limits,
+                ));
+            }
+        };
         if metadata.file_type().is_symlink() {
             return Err(source_set_diagnostic(
                 "artifact.symlink",
@@ -754,10 +844,10 @@ fn reject_symlink_components(
             ));
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-fn source_set_diagnostic(
+pub(crate) fn source_set_diagnostic(
     code: &str,
     path: &Path,
     message: impl Into<String>,

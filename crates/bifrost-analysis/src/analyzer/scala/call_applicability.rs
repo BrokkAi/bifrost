@@ -6,7 +6,7 @@ use crate::analyzer::resolution::{
     StateMap, TypeInCallPosition,
 };
 use crate::analyzer::store::Result;
-use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionEngineRuleKind};
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 
 pub(super) static SCALA_CALL_APPLICABILITY_ADAPTER: ScalaCallApplicabilityAdapter =
@@ -105,6 +105,41 @@ impl CallApplicabilityAdapter for ScalaCallApplicabilityAdapter {
         call: &LoweredCallApplicabilityObligation,
         signature: &LoweredCallableSignatureProperty,
     ) -> MappingAssessment {
+        let omitted_arguments;
+        let call = if call
+            .eligible_rules()
+            .contains(&ResolutionEngineRuleKind::DefaultConstruction)
+        {
+            if signature.parameter_lists().is_empty() {
+                // A constructor declared without a parameter list takes `new C`,
+                // but not `new C()`. This is not application of its result.
+                return if call.argument_lists().is_empty() {
+                    debug_assert!(call.arguments().is_empty());
+                    debug_assert!(signature.parameters().is_empty());
+                    MappingAssessment::Mapped {
+                        bindings: Vec::new(),
+                        used_defaults: 0,
+                        used_vararg: false,
+                        result_application_lists: Vec::new(),
+                    }
+                } else {
+                    MappingAssessment::Inapplicable(CallableRejectionReason::ListShapeMismatch)
+                };
+            }
+            if call.argument_lists().is_empty() {
+                // Scala also permits omission of an empty constructor list.
+                // Map it as zero arguments through the existing assessor, so
+                // required parameters, defaults and contextual lists still apply.
+                omitted_arguments =
+                    call.clone()
+                        .with_argument_shape(call.language(), Vec::new(), vec![0]);
+                &omitted_arguments
+            } else {
+                call
+            }
+        } else {
+            call
+        };
         crate::analyzer::resolution::map_scala_call_shape(
             call,
             signature,

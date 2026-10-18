@@ -1643,6 +1643,9 @@ fn workspace_surface_closure(
         ) {
             Ok(ClassIdentity::Workspace(base)) => stack.push(base),
             Ok(base @ ClassIdentity::External { .. }) => external_bases.push(base),
+            Ok(ClassIdentity::Intrinsic { .. }) => {
+                unreachable!("JavaScript and TypeScript have no intrinsic class roots")
+            }
             Err(reason) => coverage.include(JsTsSurfaceCoverage::Open(reason)),
         }
     }
@@ -2330,6 +2333,7 @@ fn member_lookup_with_surface_limit(
             }
             modeled
         }
+        ClassIdentity::Intrinsic { .. } => MemberLookup::Unknown(UnknownReason::ExternalNotModeled),
     }
 }
 

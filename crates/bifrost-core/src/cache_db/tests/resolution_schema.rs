@@ -2460,3 +2460,146 @@ fn optional_inline_ends_and_lines_have_the_occurrence_id_nullability() {
         );
     }
 }
+
+#[test]
+#[hardwon("#5147: shared summary validity keys and Rust foreign keys omitted the context profile")]
+fn unit_summary_profile_migration_preserves_rust_and_rebinds_go() {
+    let mut upgraded = create_current_baseline_without_migration();
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 181)
+    {
+        upgraded.execute_batch(migration.sql).unwrap();
+    }
+    upgraded.pragma_update(None, "user_version", 181).unwrap();
+    upgraded.execute_batch(
+        "INSERT INTO resolution_unit_summaries(
+           summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,
+           derivation_version,complete,output_digest,publication_state)
+         VALUES(1,'rust','rust_crate',zeroblob(32),zeroblob(32),'test',1,1,zeroblob(32),'complete'),
+               (2,'go','go_package',zeroblob(32),randomblob(32),'test',1,1,zeroblob(32),'complete');
+         INSERT INTO resolution_unit_summary_versions
+         VALUES(printf('%064d',1),'rust',0,zeroblob(32),1,NULL,1),
+               (printf('%064d',1),'go',0,zeroblob(32),1,NULL,2);
+         INSERT INTO rust_crate_topologies(topology_digest,crate_key,producer_epoch,
+           target_kind,crate_name,edition,prelude,cfg_atoms,inventory_complete,publication_state)
+         VALUES(zeroblob(32),zeroblob(32),'test','lib','sample','2021','std',jsonb('[]'),1,'building');
+         INSERT INTO rust_resolution_unit_summary_versions
+         VALUES(printf('%064d',1),'rust',0,zeroblob(32),1,1,NULL,1);"
+    ).unwrap();
+    migrate(&mut upgraded).unwrap();
+    assert_eq!(upgraded.query_row(
+        "SELECT count(*) FROM resolution_unit_summary_versions WHERE lang='rust' AND profile_digest=zeroblob(32)",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    assert_eq!(upgraded.query_row(
+        "SELECT summary_id FROM rust_resolution_unit_summary_versions WHERE profile_digest=zeroblob(32)",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    assert_eq!(
+        upgraded
+            .query_row(
+                "SELECT count(*) FROM resolution_unit_summary_versions WHERE lang='go'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "legacy Go intervals are re-established by context reconciliation"
+    );
+    assert_eq!(
+        upgraded
+            .query_row(
+                "SELECT count(*) FROM resolution_unit_summaries",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2,
+        "content-addressed headers remain reusable"
+    );
+    assert!(
+        upgraded
+            .execute(
+                "UPDATE rust_resolution_unit_summary_versions SET profile_digest=randomblob(32)",
+                [],
+            )
+            .is_err(),
+        "Rust must remain in its singleton profile"
+    );
+    upgraded
+        .execute(
+            "DELETE FROM resolution_unit_summary_versions WHERE lang='rust'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        upgraded
+            .query_row(
+                "SELECT count(*) FROM rust_resolution_unit_summary_versions",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "the extended Rust foreign key must still cascade"
+    );
+
+    for conn in [upgraded, open_in_memory_cache()] {
+        conn.execute(
+            "INSERT INTO resolution_unit_summaries(lang,unit_kind,unit_key,summary_digest,producer_epoch,
+               derivation_version,complete,output_digest,publication_state)
+             VALUES('go','go_package',zeroblob(32),randomblob(32),'test',1,1,zeroblob(32),'complete')", [],
+        ).unwrap();
+        let summary = conn.last_insert_rowid();
+        for profile in [[1_u8; 32], [2; 32]] {
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_versions(
+                   workspace_id,lang,generation,unit_key,profile_digest,valid_from,summary_id)
+                 VALUES(printf('%064d',1),'go',0,zeroblob(32),?1,1,?2)",
+                params![profile.as_slice(), summary],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summary_versions WHERE lang='go'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "both profiles bind the same unit at the same revision"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_versions(
+               workspace_id,lang,generation,unit_key,profile_digest,valid_from,summary_id)
+             VALUES(printf('%064d',1),'go',0,zeroblob(32),?1,1,?2)",
+                params![[1_u8; 32].as_slice(), summary],
+            )
+            .is_err(),
+            "a duplicate version within one profile is rejected"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE resolution_unit_summary_versions SET profile_digest=x'01'
+                 WHERE lang='go' AND profile_digest=?1",
+                [[1_u8; 32].as_slice()],
+            )
+            .is_err(),
+            "profile digests are fixed-width scalar keys"
+        );
+        assert!(
+            !conn
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+}

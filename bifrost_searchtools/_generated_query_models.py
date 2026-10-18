@@ -59,6 +59,12 @@ def _decode_tagged_variant(decoder: Any, data: Any, tag: str, class_name: str) -
     return decoder(payload, class_name)
 
 
+class ChannelDirection(StrEnum):
+    BIDIRECTIONAL = 'bidirectional'
+    RECEIVE = 'receive'
+    SEND = 'send'
+
+
 class CodeQueryAbsentMemberWitnessStatus(StrEnum):
     AVAILABLE = 'available'
     TRUNCATED = 'truncated'
@@ -311,6 +317,16 @@ class JavaAnnotationTypeStatus(StrEnum):
     CANCELLED = 'cancelled'
 
 
+class ParameterPassingMode(StrEnum):
+    POSITIONAL_ONLY = 'positional_only'
+    POSITIONAL_OR_NAMED = 'positional_or_named'
+    NAMED_ONLY = 'named_only'
+
+
+class ParameterRole(StrEnum):
+    REQUEST = 'request'
+
+
 class SemanticModelCompleteness(StrEnum):
     PARTIAL = 'partial'
     COMPLETE = 'complete'
@@ -329,6 +345,17 @@ class SemanticModelProof(StrEnum):
     AUTHORED_ANCHOR = 'authored_anchor'
     EXACT_ARTIFACT = 'exact_artifact'
     PACK_FACT = 'pack_fact'
+
+
+class TypeRefReferenceKind(StrEnum):
+    LVALUE = 'lvalue'
+    RVALUE = 'rvalue'
+
+
+class WildcardVariance(StrEnum):
+    ANY = 'any'
+    EXTENDS = 'extends'
+    SUPER = 'super'
 
 
 @dataclass(frozen=True)
@@ -2603,12 +2630,33 @@ class CodeQueryProvenanceStep:
 
 
 @dataclass(frozen=True)
+class CodeQueryPythonHierarchyEndpointVariant1:
+    canonical_declaration_id: str
+    declaration: CodeQueryDeclaration2 | None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryPythonHierarchyEndpointVariant1:
+        return _decode_code_query_python_hierarchy_endpoint_variant1(data, 'CodeQueryPythonHierarchyEndpointVariant1')
+
+
+@dataclass(frozen=True)
+class CodeQueryPythonHierarchyEndpointVariant2:
+    canonical_symbol_id: str
+    qualified_name: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryPythonHierarchyEndpointVariant2:
+        return _decode_code_query_python_hierarchy_endpoint_variant2(data, 'CodeQueryPythonHierarchyEndpointVariant2')
+
+
+@dataclass(frozen=True)
 class CodeQueryPythonHierarchyFact:
+    ancestry_basis: PythonAncestryBasis
     base_branch_definition_count: int | None
     base_resolution: str | None
     base_spelling: str | None
     coverage: str
-    declaration: CodeQueryDeclaration2 | None
+    declaration: CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None
     declaration_id: str | None
     fact_kind: str
     has_non_strict_ordering: bool | None
@@ -2621,7 +2669,7 @@ class CodeQueryPythonHierarchyFact:
     mro_rank: int | None
     ordinal: int | None
     outcome: str
-    owner: CodeQueryDeclaration2 | None
+    owner: CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None
     owner_id: str | None
     path: str
     range: CodeQueryRange
@@ -2635,10 +2683,10 @@ class CodeQueryPythonHierarchyFact:
     source_signature_id: str | None
     source_signature_ordinal: int | None
     source_total_arity: int | None
-    target: CodeQueryDeclaration2 | None
+    target: CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None
     target_id: str | None
     target_non_trivial: bool | None
-    target_owner: CodeQueryDeclaration2 | None
+    target_owner: CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None
     target_owner_id: str | None
     target_reads_self: bool | None
     target_repeated_arity: bool | None
@@ -3410,12 +3458,19 @@ class CodeQueryResultRefVariant27:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant28:
+    ancestry_basis: PythonAncestryBasis
+    coverage: str
+    declaration_id: str | None
     fact_kind: str
     id: str
     outcome: str
+    owner_id: str | None
     path: str
     range: CodeQueryRange
+    reason: str | None
     root_id: str
+    target_id: str | None
+    target_owner_id: str | None
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant28:
@@ -4955,6 +5010,52 @@ class ConfigurationRouteSelectorVariant2:
 
 
 @dataclass(frozen=True)
+class Parameter:
+    name: str | None
+    optional: bool
+    passing_mode: ParameterPassingMode
+    role: ParameterRole | None
+    type: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    variadic: bool
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Parameter:
+        return _decode_parameter(data, 'Parameter')
+
+
+@dataclass(frozen=True)
+class PythonAncestryBasis:
+    claims: list[PythonRuntimeBaseClaim]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> PythonAncestryBasis:
+        return _decode_python_ancestry_basis(data, 'PythonAncestryBasis')
+
+
+@dataclass(frozen=True)
+class PythonModeledClassIdentity:
+    qualified_name: str
+    symbol_id: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> PythonModeledClassIdentity:
+        return _decode_python_modeled_class_identity(data, 'PythonModeledClassIdentity')
+
+
+@dataclass(frozen=True)
+class PythonRuntimeBaseClaim:
+    bases: list[PythonModeledClassIdentity | None]
+    class_: PythonModeledClassIdentity | None
+    declared_bases: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
+    declared_class: PythonModeledClassIdentity
+    provenance: SemanticModelProvenance
+
+    @classmethod
+    def from_dict(cls, data: Any) -> PythonRuntimeBaseClaim:
+        return _decode_python_runtime_base_claim(data, 'PythonRuntimeBaseClaim')
+
+
+@dataclass(frozen=True)
 class SemanticModelActivationProvenance:
     matched_evidence: SemanticModelMatchedEvidence
     reason: str
@@ -5021,6 +5122,138 @@ class SubsetCoverage:
     @classmethod
     def from_dict(cls, data: Any) -> SubsetCoverage:
         return _decode_subset_coverage(data, 'SubsetCoverage')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant1:
+    pass
+
+
+@dataclass(frozen=True)
+class TypeRefVariant10:
+    key: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    value: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant10:
+        return _decode_type_ref_variant10(data, 'TypeRefVariant10')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant11:
+    direction: ChannelDirection
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant11:
+        return _decode_type_ref_variant11(data, 'TypeRefVariant11')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant12:
+    bound: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None
+    variance: WildcardVariance
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant12:
+        return _decode_type_ref_variant12(data, 'TypeRefVariant12')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant13:
+    elements: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant13:
+        return _decode_type_ref_variant13(data, 'TypeRefVariant13')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant14:
+    parameters: list[Parameter]
+    result: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant14:
+        return _decode_type_ref_variant14(data, 'TypeRefVariant14')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant2:
+    arguments: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
+    name: str
+    nullable: bool
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant2:
+        return _decode_type_ref_variant2(data, 'TypeRefVariant2')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant3:
+    arguments: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
+    id: str
+    nullable: bool
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant3:
+        return _decode_type_ref_variant3(data, 'TypeRefVariant3')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant4:
+    name: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant4:
+        return _decode_type_ref_variant4(data, 'TypeRefVariant4')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant5:
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant5:
+        return _decode_type_ref_variant5(data, 'TypeRefVariant5')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant6:
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    reference_kind: TypeRefReferenceKind
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant6:
+        return _decode_type_ref_variant6(data, 'TypeRefVariant6')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant7:
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant7:
+        return _decode_type_ref_variant7(data, 'TypeRefVariant7')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant8:
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant8:
+        return _decode_type_ref_variant8(data, 'TypeRefVariant8')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant9:
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    length: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant9:
+        return _decode_type_ref_variant9(data, 'TypeRefVariant9')
 
 def _decode_code_query_absent_member_finding(value: Any, prefix: str = 'CodeQueryAbsentMemberFinding') -> CodeQueryAbsentMemberFinding:
     if not isinstance(value, dict):
@@ -13387,10 +13620,63 @@ def _decode_code_query_provenance_step(value: Any, prefix: str = 'CodeQueryProve
         via=via_value,
     )
 
+def _decode_code_query_python_hierarchy_endpoint_variant1(value: Any, prefix: str = 'CodeQueryPythonHierarchyEndpointVariant1') -> CodeQueryPythonHierarchyEndpointVariant1:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'canonical_declaration_id',
+        'declaration',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'canonical_declaration_id',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    canonical_declaration_id_value = _decode_string(value['canonical_declaration_id'], f"{prefix}.canonical_declaration_id")
+    if 'declaration' in value:
+        declaration_value = _decode_defs_code_query_python_hierarchy_endpoint_union_0_properties_declaration(value['declaration'], f"{prefix}.declaration")
+    else:
+        declaration_value = None
+    return CodeQueryPythonHierarchyEndpointVariant1(
+        canonical_declaration_id=canonical_declaration_id_value,
+        declaration=declaration_value,
+    )
+
+def _decode_code_query_python_hierarchy_endpoint_variant2(value: Any, prefix: str = 'CodeQueryPythonHierarchyEndpointVariant2') -> CodeQueryPythonHierarchyEndpointVariant2:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'canonical_symbol_id',
+        'qualified_name',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'canonical_symbol_id',
+        'qualified_name',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    canonical_symbol_id_value = _decode_string(value['canonical_symbol_id'], f"{prefix}.canonical_symbol_id")
+    qualified_name_value = _decode_string(value['qualified_name'], f"{prefix}.qualified_name")
+    return CodeQueryPythonHierarchyEndpointVariant2(
+        canonical_symbol_id=canonical_symbol_id_value,
+        qualified_name=qualified_name_value,
+    )
+
 def _decode_code_query_python_hierarchy_fact(value: Any, prefix: str = 'CodeQueryPythonHierarchyFact') -> CodeQueryPythonHierarchyFact:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'ancestry_basis',
         'base_branch_definition_count',
         'base_resolution',
         'base_spelling',
@@ -13443,6 +13729,7 @@ def _decode_code_query_python_hierarchy_fact(value: Any, prefix: str = 'CodeQuer
     if unexpected:
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
+        'ancestry_basis',
         'coverage',
         'fact_kind',
         'id',
@@ -13455,6 +13742,7 @@ def _decode_code_query_python_hierarchy_fact(value: Any, prefix: str = 'CodeQuer
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    ancestry_basis_value = _decode_python_ancestry_basis(value['ancestry_basis'], f"{prefix}.ancestry_basis")
     if 'base_branch_definition_count' in value:
         base_branch_definition_count_value = _decode_defs_code_query_result_item_union_55_properties_base_branch_definition_count(value['base_branch_definition_count'], f"{prefix}.base_branch_definition_count")
     else:
@@ -13616,6 +13904,7 @@ def _decode_code_query_python_hierarchy_fact(value: Any, prefix: str = 'CodeQuer
     else:
         provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
     return CodeQueryPythonHierarchyFact(
+        ancestry_basis=ancestry_basis_value,
         base_branch_definition_count=base_branch_definition_count_value,
         base_resolution=base_resolution_value,
         base_spelling=base_spelling_value,
@@ -16432,41 +16721,69 @@ def _decode_code_query_result_ref_variant28(value: Any, prefix: str = 'CodeQuery
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'ancestry_basis',
+        'coverage',
+        'declaration_id',
         'fact_kind',
         'id',
         'outcome',
+        'owner_id',
         'path',
         'range',
+        'reason',
         'root_id',
+        'target_id',
+        'target_owner_id',
     }
     actual = set(value)
     unexpected = actual - expected
     if unexpected:
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
+        'ancestry_basis',
+        'coverage',
+        'declaration_id',
         'fact_kind',
         'id',
         'outcome',
+        'owner_id',
         'path',
         'range',
+        'reason',
         'root_id',
+        'target_id',
+        'target_owner_id',
     }
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    ancestry_basis_value = _decode_python_ancestry_basis(value['ancestry_basis'], f"{prefix}.ancestry_basis")
+    coverage_value = _decode_string(value['coverage'], f"{prefix}.coverage")
+    declaration_id_value = _decode_defs_code_query_result_ref_union_27_properties_declaration_id(value['declaration_id'], f"{prefix}.declaration_id")
     fact_kind_value = _decode_string(value['fact_kind'], f"{prefix}.fact_kind")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     outcome_value = _decode_string(value['outcome'], f"{prefix}.outcome")
+    owner_id_value = _decode_defs_code_query_result_ref_union_27_properties_owner_id(value['owner_id'], f"{prefix}.owner_id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    reason_value = _decode_defs_code_query_result_ref_union_27_properties_reason(value['reason'], f"{prefix}.reason")
     root_id_value = _decode_string(value['root_id'], f"{prefix}.root_id")
+    target_id_value = _decode_defs_code_query_result_ref_union_27_properties_target_id(value['target_id'], f"{prefix}.target_id")
+    target_owner_id_value = _decode_defs_code_query_result_ref_union_27_properties_target_owner_id(value['target_owner_id'], f"{prefix}.target_owner_id")
     return CodeQueryResultRefVariant28(
+        ancestry_basis=ancestry_basis_value,
+        coverage=coverage_value,
+        declaration_id=declaration_id_value,
         fact_kind=fact_kind_value,
         id=id_value,
         outcome=outcome_value,
+        owner_id=owner_id_value,
         path=path_value,
         range=range_value,
+        reason=reason_value,
         root_id=root_id_value,
+        target_id=target_id_value,
+        target_owner_id=target_owner_id_value,
     )
 
 def _decode_code_query_result_ref_variant29(value: Any, prefix: str = 'CodeQueryResultRefVariant29') -> CodeQueryResultRefVariant29:
@@ -21231,6 +21548,12 @@ def _decode_configuration_route_selector_variant2(value: Any, prefix: str = 'Con
         _Index=_Index_value,
     )
 
+def _decode_defs_channel_direction(value: Any, prefix: str = 'ChannelDirection') -> ChannelDirection:
+    values_repr = "['bidirectional', 'receive', 'send']"
+    if value not in ('bidirectional', 'receive', 'send'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return ChannelDirection(value)
+
 def _decode_defs_code_query_absent_member_witness_status(value: Any, prefix: str = 'CodeQueryAbsentMemberWitnessStatus') -> CodeQueryAbsentMemberWitnessStatus:
     values_repr = "['available', 'truncated', 'unavailable']"
     if value not in ('available', 'truncated', 'unavailable'):
@@ -22624,6 +22947,46 @@ def _decode_defs_code_query_provenance_step_properties_via(value: Any, prefix: s
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+class CodeQueryPythonHierarchyEndpoint(metaclass=_TaggedUnionMeta):
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryPythonHierarchyEndpoint:
+        if not isinstance(data, dict):
+            raise TypeDecoderError("expected tagged object")
+        if 'kind' not in data:
+            raise DecoderError(f"missing discriminator 'kind'")
+        tag_value = data['kind']
+        decoder = _code_query_python_hierarchy_endpoint_decoders.get(tag_value)
+        if decoder is None:
+            raise DecoderError(f"unknown discriminator {tag_value!r}")
+        return decoder(data)
+
+def _decode_defs_code_query_python_hierarchy_endpoint(value: Any, prefix: str = 'CodeQueryPythonHierarchyEndpoint') -> CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2:
+    return CodeQueryPythonHierarchyEndpoint.from_dict(value)
+
+def _decode_defs_code_query_python_hierarchy_endpoint_union_0_properties_declaration(value: Any, prefix: str = "union") -> CodeQueryDeclaration2 | None:
+    errors = []
+    try:
+        return _decode_code_query_declaration2(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_python_hierarchy_endpoint_union_0_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'source'"
+    if value != 'source':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_python_hierarchy_endpoint_union_1_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'external_class'"
+    if value != 'external_class':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
 
 def _decode_defs_code_query_python_import_leaf_properties_alias(value: Any, prefix: str = "union") -> str | None:
     if value is None:
@@ -27353,10 +27716,10 @@ def _decode_defs_code_query_result_item_union_55_properties_base_spelling(value:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_55_properties_declaration(value: Any, prefix: str = "union") -> CodeQueryDeclaration2 | None:
+def _decode_defs_code_query_result_item_union_55_properties_declaration(value: Any, prefix: str = "union") -> CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None:
     errors = []
     try:
-        return _decode_code_query_declaration2(value, prefix)
+        return _decode_defs_code_query_python_hierarchy_endpoint(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     try:
@@ -27457,10 +27820,10 @@ def _decode_defs_code_query_result_item_union_55_properties_ordinal_union_0(valu
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
-def _decode_defs_code_query_result_item_union_55_properties_owner(value: Any, prefix: str = "union") -> CodeQueryDeclaration2 | None:
+def _decode_defs_code_query_result_item_union_55_properties_owner(value: Any, prefix: str = "union") -> CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None:
     errors = []
     try:
-        return _decode_code_query_declaration2(value, prefix)
+        return _decode_defs_code_query_python_hierarchy_endpoint(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     try:
@@ -27603,10 +27966,10 @@ def _decode_defs_code_query_result_item_union_55_properties_source_total_arity_u
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
-def _decode_defs_code_query_result_item_union_55_properties_target(value: Any, prefix: str = "union") -> CodeQueryDeclaration2 | None:
+def _decode_defs_code_query_result_item_union_55_properties_target(value: Any, prefix: str = "union") -> CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None:
     errors = []
     try:
-        return _decode_code_query_declaration2(value, prefix)
+        return _decode_defs_code_query_python_hierarchy_endpoint(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     try:
@@ -27635,10 +27998,10 @@ def _decode_defs_code_query_result_item_union_55_properties_target_non_trivial(v
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_55_properties_target_owner(value: Any, prefix: str = "union") -> CodeQueryDeclaration2 | None:
+def _decode_defs_code_query_result_item_union_55_properties_target_owner(value: Any, prefix: str = "union") -> CodeQueryPythonHierarchyEndpointVariant1 | CodeQueryPythonHierarchyEndpointVariant2 | None:
     errors = []
     try:
-        return _decode_code_query_declaration2(value, prefix)
+        return _decode_defs_code_query_python_hierarchy_endpoint(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     try:
@@ -31247,11 +31610,61 @@ def _decode_defs_code_query_result_ref_union_26_properties_result_type(value: An
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_code_query_result_ref_union_27_properties_declaration_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_ref_union_27_properties_owner_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_ref_union_27_properties_reason(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_ref_union_27_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'python_hierarchy_fact'"
     if value != 'python_hierarchy_fact':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
+
+def _decode_defs_code_query_result_ref_union_27_properties_target_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_ref_union_27_properties_target_owner_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_result_ref_union_28_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'call_shape'"
@@ -32473,6 +32886,88 @@ def _decode_defs_java_annotation_type_status(value: Any, prefix: str = 'JavaAnno
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return JavaAnnotationTypeStatus(value)
 
+def _decode_defs_parameter_passing_mode(value: Any, prefix: str = 'ParameterPassingMode') -> ParameterPassingMode:
+    values_repr = "['positional_only', 'positional_or_named', 'named_only']"
+    if value not in ('positional_only', 'positional_or_named', 'named_only'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return ParameterPassingMode(value)
+
+def _decode_defs_parameter_properties_name(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_parameter_properties_role(value: Any, prefix: str = "union") -> ParameterRole | None:
+    errors = []
+    try:
+        return _decode_defs_parameter_role(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_parameter_role(value: Any, prefix: str = 'ParameterRole') -> ParameterRole:
+    values_repr = "['request']"
+    if value not in ('request',):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return ParameterRole(value)
+
+def _decode_defs_python_ancestry_basis_properties_claims(value: Any, prefix: str = "array") -> list[PythonRuntimeBaseClaim]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_python_runtime_base_claim(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_python_runtime_base_claim_properties_bases(value: Any, prefix: str = "array") -> list[PythonModeledClassIdentity | None]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_python_runtime_base_claim_properties_bases_items(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_python_runtime_base_claim_properties_bases_items(value: Any, prefix: str = "union") -> PythonModeledClassIdentity | None:
+    errors = []
+    try:
+        return _decode_python_modeled_class_identity(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_python_runtime_base_claim_properties_class(value: Any, prefix: str = "union") -> PythonModeledClassIdentity | None:
+    errors = []
+    try:
+        return _decode_python_modeled_class_identity(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_python_runtime_base_claim_properties_declared_bases(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_type_ref_13(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
 def _decode_defs_semantic_model_completeness(value: Any, prefix: str = 'SemanticModelCompleteness') -> SemanticModelCompleteness:
     values_repr = "['partial', 'complete']"
     if value not in ('partial', 'complete'):
@@ -32583,6 +33078,225 @@ def _decode_defs_subset_coverage_properties_files(value: Any, prefix: str = 'int
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
+class TypeRef(metaclass=_TaggedUnionMeta):
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRef:
+        if not isinstance(data, dict):
+            raise TypeDecoderError("expected tagged object")
+        if 'kind' not in data:
+            raise DecoderError(f"missing discriminator 'kind'")
+        tag_value = data['kind']
+        decoder = _type_ref_decoders.get(tag_value)
+        if decoder is None:
+            raise DecoderError(f"unknown discriminator {tag_value!r}")
+        return decoder(data)
+
+def _decode_defs_type_ref_13(value: Any, prefix: str = 'TypeRef') -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14:
+    return TypeRef.from_dict(value)
+
+def _decode_defs_type_ref_reference_kind(value: Any, prefix: str = 'TypeRefReferenceKind') -> TypeRefReferenceKind:
+    values_repr = "['lvalue', 'rvalue']"
+    if value not in ('lvalue', 'rvalue'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return TypeRefReferenceKind(value)
+
+def _decode_defs_type_ref_union_0_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'unknown'"
+    if value != 'unknown':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_10_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'channel'"
+    if value != 'channel':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_11_properties_bound(value: Any, prefix: str = "union") -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None:
+    errors = []
+    try:
+        return _decode_defs_type_ref_3(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_type_ref_union_11_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'wildcard'"
+    if value != 'wildcard':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_12_properties_elements(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_type_ref_2(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_type_ref_union_12_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'tuple'"
+    if value != 'tuple':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_13_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'function'"
+    if value != 'function':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_13_properties_parameters(value: Any, prefix: str = "array") -> list[Parameter]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_parameter(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_type_ref_union_13_properties_result(value: Any, prefix: str = "union") -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None:
+    errors = []
+    try:
+        return _decode_defs_type_ref(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_type_ref_union_1_properties_arguments(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_type_ref_12(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_type_ref_union_1_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'named'"
+    if value != 'named':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_2_properties_arguments(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_type_ref_11(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_type_ref_union_2_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'declared'"
+    if value != 'declared':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_3_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'type_parameter'"
+    if value != 'type_parameter':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_4_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'array'"
+    if value != 'array':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_5_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'by_ref'"
+    if value != 'by_ref':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_6_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'pointer'"
+    if value != 'pointer':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_7_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'slice'"
+    if value != 'slice':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_8_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'fixed_array'"
+    if value != 'fixed_array':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_9_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'map'"
+    if value != 'map':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_wildcard_variance(value: Any, prefix: str = 'WildcardVariance') -> WildcardVariance:
+    values_repr = "['any', 'extends', 'super']"
+    if value not in ('any', 'extends', 'super'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return WildcardVariance(value)
+
+def _decode_parameter(value: Any, prefix: str = 'Parameter') -> Parameter:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'name',
+        'optional',
+        'passing_mode',
+        'role',
+        'type',
+        'variadic',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'type',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'name' in value:
+        name_value = _decode_defs_parameter_properties_name(value['name'], f"{prefix}.name")
+    else:
+        name_value = None
+    if 'optional' in value:
+        optional_value = _decode_boolean(value['optional'], f"{prefix}.optional")
+    else:
+        optional_value = _decode_boolean(False, f"{prefix}.optional")
+    if 'passing_mode' in value:
+        passing_mode_value = _decode_defs_parameter_passing_mode(value['passing_mode'], f"{prefix}.passing_mode")
+    else:
+        passing_mode_value = _decode_defs_parameter_passing_mode('positional_or_named', f"{prefix}.passing_mode")
+    if 'role' in value:
+        role_value = _decode_defs_parameter_properties_role(value['role'], f"{prefix}.role")
+    else:
+        role_value = None
+    type_value = _decode_defs_type_ref_13(value['type'], f"{prefix}.type")
+    if 'variadic' in value:
+        variadic_value = _decode_boolean(value['variadic'], f"{prefix}.variadic")
+    else:
+        variadic_value = _decode_boolean(False, f"{prefix}.variadic")
+    return Parameter(
+        name=name_value,
+        optional=optional_value,
+        passing_mode=passing_mode_value,
+        role=role_value,
+        type=type_value,
+        variadic=variadic_value,
+    )
+
 def _decode_properties_diagnostics(value: Any, prefix: str = "array") -> list[CodeQueryDiagnostic]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
@@ -32610,6 +33324,89 @@ def _decode_properties_session_subset(value: Any, prefix: str = "union") -> Subs
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_python_ancestry_basis(value: Any, prefix: str = 'PythonAncestryBasis') -> PythonAncestryBasis:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'claims',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'claims',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    claims_value = _decode_defs_python_ancestry_basis_properties_claims(value['claims'], f"{prefix}.claims")
+    return PythonAncestryBasis(
+        claims=claims_value,
+    )
+
+def _decode_python_modeled_class_identity(value: Any, prefix: str = 'PythonModeledClassIdentity') -> PythonModeledClassIdentity:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'qualified_name',
+        'symbol_id',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'qualified_name',
+        'symbol_id',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    qualified_name_value = _decode_string(value['qualified_name'], f"{prefix}.qualified_name")
+    symbol_id_value = _decode_string(value['symbol_id'], f"{prefix}.symbol_id")
+    return PythonModeledClassIdentity(
+        qualified_name=qualified_name_value,
+        symbol_id=symbol_id_value,
+    )
+
+def _decode_python_runtime_base_claim(value: Any, prefix: str = 'PythonRuntimeBaseClaim') -> PythonRuntimeBaseClaim:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'bases',
+        'class',
+        'declared_bases',
+        'declared_class',
+        'provenance',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'bases',
+        'class',
+        'declared_bases',
+        'declared_class',
+        'provenance',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    bases_value = _decode_defs_python_runtime_base_claim_properties_bases(value['bases'], f"{prefix}.bases")
+    class__value = _decode_defs_python_runtime_base_claim_properties_class(value['class'], f"{prefix}.class")
+    declared_bases_value = _decode_defs_python_runtime_base_claim_properties_declared_bases(value['declared_bases'], f"{prefix}.declared_bases")
+    declared_class_value = _decode_python_modeled_class_identity(value['declared_class'], f"{prefix}.declared_class")
+    provenance_value = _decode_semantic_model_provenance(value['provenance'], f"{prefix}.provenance")
+    return PythonRuntimeBaseClaim(
+        bases=bases_value,
+        class_=class__value,
+        declared_bases=declared_bases_value,
+        declared_class=declared_class_value,
+        provenance=provenance_value,
+    )
 
 def _decode_semantic_model_activation_provenance(value: Any, prefix: str = 'SemanticModelActivationProvenance') -> SemanticModelActivationProvenance:
     if not isinstance(value, dict):
@@ -32828,6 +33625,348 @@ def _decode_subset_coverage(value: Any, prefix: str = 'SubsetCoverage') -> Subse
         files=files_value,
     )
 
+def _decode_type_ref_variant1(value: Any, prefix: str = 'TypeRefVariant1') -> TypeRefVariant1:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = set()
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = set()
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    return TypeRefVariant1(
+    )
+
+def _decode_type_ref_variant10(value: Any, prefix: str = 'TypeRefVariant10') -> TypeRefVariant10:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'key',
+        'value',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'key',
+        'value',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    key_value = _decode_defs_type_ref_13(value['key'], f"{prefix}.key")
+    value_value = _decode_defs_type_ref_13(value['value'], f"{prefix}.value")
+    return TypeRefVariant10(
+        key=key_value,
+        value=value_value,
+    )
+
+def _decode_type_ref_variant11(value: Any, prefix: str = 'TypeRefVariant11') -> TypeRefVariant11:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'direction',
+        'element',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'direction',
+        'element',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    direction_value = _decode_defs_channel_direction(value['direction'], f"{prefix}.direction")
+    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    return TypeRefVariant11(
+        direction=direction_value,
+        element=element_value,
+    )
+
+def _decode_type_ref_variant12(value: Any, prefix: str = 'TypeRefVariant12') -> TypeRefVariant12:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'bound',
+        'variance',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'variance',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'bound' in value:
+        bound_value = _decode_defs_type_ref_union_11_properties_bound(value['bound'], f"{prefix}.bound")
+    else:
+        bound_value = None
+    variance_value = _decode_defs_wildcard_variance(value['variance'], f"{prefix}.variance")
+    return TypeRefVariant12(
+        bound=bound_value,
+        variance=variance_value,
+    )
+
+def _decode_type_ref_variant13(value: Any, prefix: str = 'TypeRefVariant13') -> TypeRefVariant13:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'elements',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'elements',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    elements_value = _decode_defs_type_ref_union_12_properties_elements(value['elements'], f"{prefix}.elements")
+    return TypeRefVariant13(
+        elements=elements_value,
+    )
+
+def _decode_type_ref_variant14(value: Any, prefix: str = 'TypeRefVariant14') -> TypeRefVariant14:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'parameters',
+        'result',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'parameters',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    parameters_value = _decode_defs_type_ref_union_13_properties_parameters(value['parameters'], f"{prefix}.parameters")
+    if 'result' in value:
+        result_value = _decode_defs_type_ref_union_13_properties_result(value['result'], f"{prefix}.result")
+    else:
+        result_value = None
+    return TypeRefVariant14(
+        parameters=parameters_value,
+        result=result_value,
+    )
+
+def _decode_type_ref_variant2(value: Any, prefix: str = 'TypeRefVariant2') -> TypeRefVariant2:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'arguments',
+        'name',
+        'nullable',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'name',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'arguments' in value:
+        arguments_value = _decode_defs_type_ref_union_1_properties_arguments(value['arguments'], f"{prefix}.arguments")
+    else:
+        arguments_value = _decode_defs_type_ref_union_1_properties_arguments([], f"{prefix}.arguments")
+    name_value = _decode_string(value['name'], f"{prefix}.name")
+    if 'nullable' in value:
+        nullable_value = _decode_boolean(value['nullable'], f"{prefix}.nullable")
+    else:
+        nullable_value = _decode_boolean(False, f"{prefix}.nullable")
+    return TypeRefVariant2(
+        arguments=arguments_value,
+        name=name_value,
+        nullable=nullable_value,
+    )
+
+def _decode_type_ref_variant3(value: Any, prefix: str = 'TypeRefVariant3') -> TypeRefVariant3:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'arguments',
+        'id',
+        'nullable',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'id',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'arguments' in value:
+        arguments_value = _decode_defs_type_ref_union_2_properties_arguments(value['arguments'], f"{prefix}.arguments")
+    else:
+        arguments_value = _decode_defs_type_ref_union_2_properties_arguments([], f"{prefix}.arguments")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    if 'nullable' in value:
+        nullable_value = _decode_boolean(value['nullable'], f"{prefix}.nullable")
+    else:
+        nullable_value = _decode_boolean(False, f"{prefix}.nullable")
+    return TypeRefVariant3(
+        arguments=arguments_value,
+        id=id_value,
+        nullable=nullable_value,
+    )
+
+def _decode_type_ref_variant4(value: Any, prefix: str = 'TypeRefVariant4') -> TypeRefVariant4:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'name',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'name',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    name_value = _decode_string(value['name'], f"{prefix}.name")
+    return TypeRefVariant4(
+        name=name_value,
+    )
+
+def _decode_type_ref_variant5(value: Any, prefix: str = 'TypeRefVariant5') -> TypeRefVariant5:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'element',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'element',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    return TypeRefVariant5(
+        element=element_value,
+    )
+
+def _decode_type_ref_variant6(value: Any, prefix: str = 'TypeRefVariant6') -> TypeRefVariant6:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'element',
+        'reference_kind',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'element',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    if 'reference_kind' in value:
+        reference_kind_value = _decode_defs_type_ref_reference_kind(value['reference_kind'], f"{prefix}.reference_kind")
+    else:
+        reference_kind_value = _decode_defs_type_ref_reference_kind('lvalue', f"{prefix}.reference_kind")
+    return TypeRefVariant6(
+        element=element_value,
+        reference_kind=reference_kind_value,
+    )
+
+def _decode_type_ref_variant7(value: Any, prefix: str = 'TypeRefVariant7') -> TypeRefVariant7:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'element',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'element',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    return TypeRefVariant7(
+        element=element_value,
+    )
+
+def _decode_type_ref_variant8(value: Any, prefix: str = 'TypeRefVariant8') -> TypeRefVariant8:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'element',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'element',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    return TypeRefVariant8(
+        element=element_value,
+    )
+
+def _decode_type_ref_variant9(value: Any, prefix: str = 'TypeRefVariant9') -> TypeRefVariant9:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'element',
+        'length',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'element',
+        'length',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    length_value = _decode_string(value['length'], f"{prefix}.length")
+    return TypeRefVariant9(
+        element=element_value,
+        length=length_value,
+    )
+
 TAGGED_UNION_VARIANTS = {}
 
 _code_query_candidate_ref_decoders = {
@@ -33000,6 +34139,19 @@ TAGGED_UNION_VARIANTS['CodeQueryOccurrenceTarget'] = (
         'lexical': CodeQueryOccurrenceTargetVariant3,
         'unresolved': CodeQueryOccurrenceTargetVariant4,
         'not_derived': CodeQueryOccurrenceTargetVariant5,
+    },
+)
+
+_code_query_python_hierarchy_endpoint_decoders = {
+    'source': lambda data: _decode_tagged_variant(_decode_code_query_python_hierarchy_endpoint_variant1, data, 'kind', 'CodeQueryPythonHierarchyEndpointVariant1'),
+    'external_class': lambda data: _decode_tagged_variant(_decode_code_query_python_hierarchy_endpoint_variant2, data, 'kind', 'CodeQueryPythonHierarchyEndpointVariant2'),
+}
+CodeQueryPythonHierarchyEndpoint._variant_types = (CodeQueryPythonHierarchyEndpointVariant1, CodeQueryPythonHierarchyEndpointVariant2,)
+TAGGED_UNION_VARIANTS['CodeQueryPythonHierarchyEndpoint'] = (
+    'kind',
+    {
+        'source': CodeQueryPythonHierarchyEndpointVariant1,
+        'external_class': CodeQueryPythonHierarchyEndpointVariant2,
     },
 )
 
@@ -33407,6 +34559,43 @@ TAGGED_UNION_VARIANTS['CodeQueryTypestateWitnessStepKind'] = (
         'seed': CodeQueryTypestateWitnessStepKindVariant1,
         'edge': CodeQueryTypestateWitnessStepKindVariant2,
         'end_summary_gap': CodeQueryTypestateWitnessStepKindVariant3,
+    },
+)
+
+_type_ref_decoders = {
+    'unknown': lambda data: _decode_tagged_variant(_decode_type_ref_variant1, data, 'kind', 'TypeRefVariant1'),
+    'named': lambda data: _decode_tagged_variant(_decode_type_ref_variant2, data, 'kind', 'TypeRefVariant2'),
+    'declared': lambda data: _decode_tagged_variant(_decode_type_ref_variant3, data, 'kind', 'TypeRefVariant3'),
+    'type_parameter': lambda data: _decode_tagged_variant(_decode_type_ref_variant4, data, 'kind', 'TypeRefVariant4'),
+    'array': lambda data: _decode_tagged_variant(_decode_type_ref_variant5, data, 'kind', 'TypeRefVariant5'),
+    'by_ref': lambda data: _decode_tagged_variant(_decode_type_ref_variant6, data, 'kind', 'TypeRefVariant6'),
+    'pointer': lambda data: _decode_tagged_variant(_decode_type_ref_variant7, data, 'kind', 'TypeRefVariant7'),
+    'slice': lambda data: _decode_tagged_variant(_decode_type_ref_variant8, data, 'kind', 'TypeRefVariant8'),
+    'fixed_array': lambda data: _decode_tagged_variant(_decode_type_ref_variant9, data, 'kind', 'TypeRefVariant9'),
+    'map': lambda data: _decode_tagged_variant(_decode_type_ref_variant10, data, 'kind', 'TypeRefVariant10'),
+    'channel': lambda data: _decode_tagged_variant(_decode_type_ref_variant11, data, 'kind', 'TypeRefVariant11'),
+    'wildcard': lambda data: _decode_tagged_variant(_decode_type_ref_variant12, data, 'kind', 'TypeRefVariant12'),
+    'tuple': lambda data: _decode_tagged_variant(_decode_type_ref_variant13, data, 'kind', 'TypeRefVariant13'),
+    'function': lambda data: _decode_tagged_variant(_decode_type_ref_variant14, data, 'kind', 'TypeRefVariant14'),
+}
+TypeRef._variant_types = (TypeRefVariant1, TypeRefVariant2, TypeRefVariant3, TypeRefVariant4, TypeRefVariant5, TypeRefVariant6, TypeRefVariant7, TypeRefVariant8, TypeRefVariant9, TypeRefVariant10, TypeRefVariant11, TypeRefVariant12, TypeRefVariant13, TypeRefVariant14,)
+TAGGED_UNION_VARIANTS['TypeRef'] = (
+    'kind',
+    {
+        'unknown': TypeRefVariant1,
+        'named': TypeRefVariant2,
+        'declared': TypeRefVariant3,
+        'type_parameter': TypeRefVariant4,
+        'array': TypeRefVariant5,
+        'by_ref': TypeRefVariant6,
+        'pointer': TypeRefVariant7,
+        'slice': TypeRefVariant8,
+        'fixed_array': TypeRefVariant9,
+        'map': TypeRefVariant10,
+        'channel': TypeRefVariant11,
+        'wildcard': TypeRefVariant12,
+        'tuple': TypeRefVariant13,
+        'function': TypeRefVariant14,
     },
 )
 

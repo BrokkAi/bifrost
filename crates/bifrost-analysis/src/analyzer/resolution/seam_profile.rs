@@ -136,8 +136,10 @@ seam_methods! {
     ScopeReverseInventoryCompletion => "scope_reverse_inventory_completion", "BatchResolutionFragmentSource";
     GeneratedItemsCannotShadowBindings => "generated_items_cannot_shadow_bindings", "SelectedTypedFactSource";
     UniverseEntry => "universe_entry", "BatchResolutionFragmentSource";
+    SemanticLanguageOf => "semantic_language_of", "BatchResolutionFragmentSource";
     InternSharedNameDigest => "intern_shared_name_digest", "BatchResolutionFragmentSource";
     SharedNameDigestForIdentity => "shared_name_digest_for_identity", "BatchResolutionFragmentSource";
+    SupportsDirectTypeShapes => "supports_direct_type_shapes", "BatchResolutionFragmentSource";
     SupportsGoUniverse => "supports_go_universe", "BatchResolutionFragmentSource";
     GoPackageInventoryComplete => "go_package_inventory_complete", "BatchResolutionFragmentSource";
     GoPackageInventoryCompleteForFragment => "go_package_inventory_complete_for_fragment", "BatchResolutionFragmentSource";
@@ -415,6 +417,8 @@ struct Profile {
     go_reverse: GoReverseCounters,
     rename_phases: [RenamePhaseCounters; 4],
     output: Mutex<std::fs::File>,
+    root_source_bounded: AtomicU64,
+    root_source_universal: AtomicU64,
     requests: AtomicU64,
     /// Nonzero while a request boundary is open. The per-request deltas are a
     /// difference of two process-wide snapshots, which is exact only while one
@@ -427,6 +431,8 @@ impl Profile {
     fn open(path: &std::path::Path) -> Option<Self> {
         match std::fs::File::create(path) {
             Ok(output) => Some(Self {
+                root_source_bounded: AtomicU64::new(0),
+                root_source_universal: AtomicU64::new(0),
                 started: Instant::now(),
                 methods: std::array::from_fn(|_| MethodCounters::default()),
                 go_reverse: GoReverseCounters::default(),
@@ -505,6 +511,19 @@ pub(crate) fn record_jvm_operation_reads(reads: serde_json::Value) {
             })
             .to_string(),
         );
+    }
+}
+
+/// Count the source-provenance decision for one eligible root endpoint.
+pub(crate) fn record_root_source_horizon(bounded: bool) {
+    if let Some(profile) = profile() {
+        let counter = if bounded {
+            &profile.root_source_bounded
+        } else {
+            &profile.root_source_universal
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        profile.dirty.store(true, Ordering::Relaxed);
     }
 }
 
@@ -769,6 +788,7 @@ struct OpenRequest {
     started: Instant,
     before: Vec<(u64, u64, u64)>,
     sql_before: Option<(u64, u64, u128)>,
+    root_source_before: [u64; 2],
     go_reverse_before: [u64; 18],
     rename_phase_before: [[u64; 5]; 4],
     overlapped: bool,
@@ -787,6 +807,10 @@ pub fn request_scope(tool: &str) -> RequestScope {
             started: Instant::now(),
             before: profile.snapshot(),
             sql_before: brokk_bifrost_core::cache_db::sql_profile::totals_with_rows(),
+            root_source_before: [
+                profile.root_source_bounded.load(Ordering::Relaxed),
+                profile.root_source_universal.load(Ordering::Relaxed),
+            ],
             go_reverse_before: profile.go_reverse_snapshot(),
             rename_phase_before: profile.rename_phase_snapshot(),
             overlapped,
@@ -811,6 +835,10 @@ impl Drop for RequestScope {
             "wall_ms": open.started.elapsed().as_secs_f64() * 1000.0,
             "overlapped": overlapped,
             "methods": method_object(&now, Some(&open.before)),
+        });
+        line["root_source_horizons"] = serde_json::json!({
+            "bounded": profile.root_source_bounded.load(Ordering::Relaxed) - open.root_source_before[0],
+            "universal": profile.root_source_universal.load(Ordering::Relaxed) - open.root_source_before[1],
         });
         let go_reverse: [u64; 18] =
             std::array::from_fn(|index| go_reverse_now[index] - open.go_reverse_before[index]);
@@ -1007,6 +1035,20 @@ where
         self.inner.scope_reverse_inventory_completion(completion)
     }
 
+    fn semantic_language_of(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::Language>> {
+        record_call(SeamMethod::SemanticLanguageOf, 1);
+        let language = self.inner.semantic_language_of(identity, cancellation)?;
+        record_rows(
+            SeamMethod::SemanticLanguageOf,
+            usize::from(language.is_some()),
+        );
+        Ok(language)
+    }
+
     fn universe_entry(
         &self,
         reference: SemanticId,
@@ -1052,6 +1094,19 @@ where
             usize::from(digest.is_some()),
         );
         Ok(digest)
+    }
+
+    fn supports_direct_type_shapes(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        record_call(SeamMethod::SupportsDirectTypeShapes, 1);
+        let supported = self
+            .inner
+            .supports_direct_type_shapes(reference, cancellation)?;
+        record_rows(SeamMethod::SupportsDirectTypeShapes, 1);
+        Ok(supported)
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -2104,7 +2159,7 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 31, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(batch.len(), 33, "BatchResolutionFragmentSource: {batch:?}");
         assert_eq!(typed.len(), 79, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
@@ -2124,7 +2179,7 @@ mod tests {
             declared, forwarded,
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
-        assert_eq!(METHOD_COUNT, 110);
+        assert_eq!(METHOD_COUNT, 112);
     }
 
     /// The instrument is off unless the variable names a file, and nothing in

@@ -3100,6 +3100,7 @@ func use() {
 }
 
 #[test]
+#[hardwon("#5015: reassignment joins changed the Loader method-value work frontier")]
 fn go_native_propagates_options_result_to_loader_method_value() {
     // The `go test` oracle below compiles the fixture with the host compiler.
     if !go_toolchain_available() {
@@ -3192,8 +3193,11 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
         panic!("default owner budget must complete the method-value query");
     };
     assert_eq!(default_value.status, DefinitionLookupStatus::Resolved);
-    // Receiver argument recovery also reads application arguments and defaults.
-    assert_eq!(default_work.resolution_rounds, 67);
+    // The local value join follows both the options initializer and the
+    // applyOptions write, including receiver arguments and defaults. Keep an
+    // exact work pin so repeated expansion of that frontier remains visible.
+    let expected_resolution_rounds = 131;
+    assert_eq!(default_work.resolution_rounds, expected_resolution_rounds);
     let wide_method_value = resolve_at(
         method_value_start,
         ReceiverAnalysisBudget {
@@ -3206,13 +3210,17 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
         BoundedResolution::Complete { value, work } => (value, work),
         other => panic!("wide-budget method-value query did not finish: {other:?}"),
     };
-    assert_eq!(method_value_work.resolution_rounds, 67);
+    assert_eq!(
+        method_value_work.resolution_rounds,
+        expected_resolution_rounds
+    );
     assert_eq!(
         method_value.status,
         DefinitionLookupStatus::Resolved,
         "the exact generic Loader receiver resolves without call applicability: {method_value:?}"
     );
     assert_eq!(method_value.definitions.len(), 1, "{method_value:?}");
+    assert_eq!(default_value.definitions, method_value.definitions);
     assert_eq!(
         method_value.definitions[0].fq_name().to_string(),
         "example.test/native.Loader.Load",
@@ -3410,4 +3418,59 @@ fn go_native_type_name_site_answers_no_type_like_the_incumbent() {
         value.diagnostics[0].message, "`Item` does not have a supported explicit Go type",
         "{value:?}"
     );
+}
+
+#[test]
+#[hardwon(
+    "#5074: anonymous table row receivers had no source field bridge and local test owners had no projection"
+)]
+fn go_native_point_resolves_anonymous_table_rows_and_local_type_owners() {
+    let source = r#"package consumer
+ type Options struct{}
+ func (*Options) Run() {}
+ type Client struct{}
+ func (*Client) Send() {}
+ func TestCreate() {
+     tests := []struct { opts *Options; ctx struct { Client *Client } }{}
+     for _, tt := range tests {
+         opts := tt.opts
+         opts.Run()
+         tt.ctx.Client.Send()
+     }
+     type localOptions struct { opts *Options }
+     local := localOptions{}
+     local.opts.Run()
+ }
+"#;
+    let (fixture, analyzer) = fixture(source);
+    for (start, needle, expected) in [
+        (
+            source.find("opts.Run").unwrap() + "opts.".len(),
+            "Run",
+            "example.test/native/consumer.Options.Run",
+        ),
+        (
+            source.find("Client.Send").unwrap() + "Client.".len(),
+            "Send",
+            "example.test/native/consumer.Client.Send",
+        ),
+        (
+            source.rfind("local.opts.Run").unwrap() + "local.opts.".len(),
+            "Run",
+            "example.test/native/consumer.Options.Run",
+        ),
+    ] {
+        let outcome = resolve_at(&analyzer, &fixture, CALLER, source, start, needle);
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{outcome:#?}"
+        );
+        assert_eq!(outcome.definitions.len(), 1, "{outcome:#?}");
+        assert_eq!(outcome.definitions[0].fq_name().to_string(), expected);
+    }
+    let owner = resolve_last(&analyzer, &fixture, CALLER, source, "localOptions");
+    assert_eq!(owner.status, DefinitionLookupStatus::Resolved, "{owner:#?}");
+    assert_eq!(owner.definitions.len(), 1, "{owner:#?}");
+    assert_eq!(owner.definitions[0].identifier(), "localOptions");
 }

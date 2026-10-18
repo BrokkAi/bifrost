@@ -157,8 +157,10 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 // handler uncertainty. Recompute cached partial-discovery products.
 // #5496: Rust branch distinctions now consume exact definition lookup evidence.
 // #5534: Tuple-only absence and membership proofs replace cached open facts.
+// #5511: Recompute implicit-root, modeled hierarchy and retained ancestry evidence, including no-model inputs.
 // #5532: Nested-header yields change generator invocation and return facts.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof";
+// #5598: Recompute module-body flow and enclosing-procedure ownership.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {
@@ -1850,6 +1852,50 @@ impl PolicyIncrementalReview {
 mod tests {
     use super::*;
     use crate::retained::RetainedSize;
+
+    #[test]
+    fn modeled_python_hierarchy_invalidates_units_and_heads_with_unchanged_models() {
+        let registry = crate::test_support::registry_with_policy(
+            "test:hierarchy-epoch",
+            r#"(policy :id "test.hierarchy-epoch" :name "Epoch" :message "Epoch"
+                :severity warning :analysis (analysis :type match
+                  :selector (rql (language python (class)))))"#,
+            "valid key-boundary policy",
+        );
+        let policy = registry.policies().next().unwrap();
+        let component = "-5511-python-modeled-runtime-ancestry";
+        assert_eq!(POLICY_SUBSTRATE_EPOCH.matches(component).count(), 1);
+        let old_substrate = POLICY_SUBSTRATE_EPOCH.replacen(component, "", 1);
+        let old_epoch =
+            StableDigest::sha256(format!("{old_substrate}\u{1}{}", analysis_epoch_digest()));
+        for models in [
+            StableDigest::sha256(NO_ACTIVE_MODELS),
+            StableDigest::sha256("same active model set"),
+        ] {
+            let current = WorkspaceUnitInputs {
+                configuration: StableDigest::sha256("same configuration"),
+                models,
+                epoch: policy_substrate_epoch(),
+            };
+            let old = WorkspaceUnitInputs {
+                epoch: old_epoch,
+                ..current
+            };
+            let current_key = current.unit_key(policy, UnitPartition::Whole);
+            let old_key = old.unit_key(policy, UnitPartition::Whole);
+            assert_eq!(current_key.models, old_key.models);
+            assert_ne!(
+                row_key(&current_key),
+                row_key(&old_key),
+                "persisted unit lookup must miss an old hierarchy product"
+            );
+            assert_ne!(
+                current.head_inputs(policy).epoch,
+                old.head_inputs(policy).epoch,
+                "aggregate evaluation/read verification must not reuse old hierarchy semantics"
+            );
+        }
+    }
 
     /// The reuse review is charged to the report's retention budget, so its
     /// retained size must not say how the run executed. Two reviews of one

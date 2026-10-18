@@ -127,7 +127,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 None
             };
             if let Some(name) = binding_pattern
-                && let Some((scope_start, scope_end)) = js_ts_local_scope(node)
+                && js_ts_local_scope(node).is_some()
             {
                 let names = if name.kind() == "identifier" {
                     vec![name]
@@ -147,10 +147,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let Some(text) = node_text(self.prepared.source(), name) else {
                         continue;
                     };
+                    let scope = self
+                        .lexical_bindings
+                        .binding_scope_for_binder(name)
+                        .ok_or_else(|| {
+                            TsLoweringError::Invalid(format!(
+                                "local binding `{text}` has no lexical environment"
+                            ))
+                        })?;
                     if self.locals.get(text).is_some_and(|bindings| {
-                        bindings.iter().any(|binding| {
-                            binding.scope_start == scope_start && binding.scope_end == scope_end
-                        })
+                        bindings.iter().any(|binding| binding.scope == scope)
                     }) {
                         continue;
                     }
@@ -162,7 +168,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                     let binding = self
                         .lexical_bindings
-                        .binding_identifier_ranges_at(text, name.start_byte())
+                        .binding_identifier_ranges_for_binder(text, name)
                         .into_iter()
                         .find(|range| {
                             range.start_byte == name.start_byte()
@@ -178,8 +184,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         .or_default()
                         .push(LocalBinding {
                             binding,
-                            scope_start,
-                            scope_end,
+                            scope,
                             value,
                         });
                     // Function-scoped `var` exists as undefined before the
@@ -1129,11 +1134,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     pub(super) fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding> {
+        let scope = self.lexical_bindings.binding_scope_at(name, byte)?;
         self.locals
             .get(name)?
             .iter()
-            .filter(|binding| binding.scope_start <= byte && byte < binding.scope_end)
-            .min_by_key(|binding| binding.scope_end - binding.scope_start)
+            .find(|binding| binding.scope == scope)
     }
 
     pub(super) fn stable_binding_value(&self, binding: &Range) -> Option<ValueId> {

@@ -2362,7 +2362,6 @@ mod tests {
             );
         };
 
-        let adapter = PythonAdapter;
         let module_name = RelationalName::stable(parse_symbol_path_fq(
             Language::Python,
             "pkg.service",
@@ -2377,6 +2376,7 @@ mod tests {
             std::env::current_dir().expect("test working directory must be available"),
             "pkg/service.py".to_string(),
         );
+        let adapter = PythonAdapter::for_test_file(&file);
         let short = "idx_workspace_file_path_symbol_rows_short";
         let package = "idx_workspace_file_path_symbol_rows_package";
         let normalized = "idx_workspace_file_path_symbol_rows_normalized";

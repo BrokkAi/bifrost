@@ -197,11 +197,11 @@ pub(crate) struct LoweredPackageRoute {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LoweredReferenceLookupIdentity {
-    /// The qualified terminal reference that owns the stored root route.
+    /// The reference whose source spelling must remain candidate-visible.
     pub(crate) reference: SemanticId,
-    /// The source reference for the route's first prefix segment.
+    /// Its qualified prefix, or the reference itself for a structural binding.
     pub(crate) prefix_reference: SemanticId,
-    /// The Type lookup identity of the route's first prefix segment.
+    /// The lookup identity of that spelling in its source namespace.
     pub(crate) lookup: SemanticId,
 }
 
@@ -1298,9 +1298,8 @@ pub(crate) fn lower_common_resolution_facts(
             "one root reference route holds one segment per position"
         );
     }
-    // Only Rust reverse resolution reads these rows (rust_reverse_rows.rs), so
-    // other languages publish none. Other languages' root route prefixes also
-    // use other namespaces, such as Go's TypeOrValue.
+    // Rust root prefixes need a Type lookup header. Structural owner
+    // references below need a header too, without inventing a lexical path.
     let mut reference_lookup_identities = Vec::new();
     let rust_root_references = if language == Language::Rust {
         facts.root_references.as_slice()
@@ -1333,6 +1332,22 @@ pub(crate) fn lower_common_resolution_facts(
             reference: identities.source_reference_semantic(route.reference),
             prefix_reference: identities.source_reference_semantic(prefix_reference),
             lookup: identities.lookup_semantic(language, prefix.namespace, prefix_name),
+        });
+    }
+    // A structural owner reference reaches its definition without a symbol
+    // lookup path, but inverse candidate enumeration still needs its spelling.
+    for owner in &facts.lexical_owner_references {
+        let identifier = identifiers
+            .get(&owner.reference)
+            .expect("an owner reference has an identifier");
+        let name = names
+            .get(&identifier.name)
+            .expect("an owner reference has a name");
+        let reference = identities.source_reference_semantic(owner.reference);
+        reference_lookup_identities.push(LoweredReferenceLookupIdentity {
+            reference,
+            prefix_reference: reference,
+            lookup: identities.lookup_semantic(language, identifier.namespace, name),
         });
     }
     let rust_reverse_gap_candidates = if language == Language::Rust {
@@ -1371,6 +1386,23 @@ pub(crate) fn lower_common_resolution_facts(
                 macro_frontier_sites.insert(gap.site);
             }
         }
+        // This index belongs only to this blob lowering. Each gap visits the
+        // identifiers starting inside its span instead of the whole file.
+        let mut identifiers_by_start = facts
+            .identifiers
+            .iter()
+            .map(|identifier| {
+                let source = sites.get(&identifier.site).unwrap_or_else(|| {
+                    panic!("identifier names unknown site {:?}", identifier.site)
+                });
+                assert!(
+                    source.start_byte <= source.end_byte,
+                    "unordered site: {source:?}"
+                );
+                (*source, identifier)
+            })
+            .collect::<Vec<_>>();
+        identifiers_by_start.sort_unstable_by_key(|(source, _)| source.start_byte);
         let mut gap_candidates =
             BTreeMap::<ResolutionSiteId, BTreeSet<(String, Option<ResolutionNamespace>)>>::new();
         for gap_site in &gap_sites {
@@ -1378,12 +1410,18 @@ pub(crate) fn lower_common_resolution_facts(
                 .get(gap_site)
                 .unwrap_or_else(|| panic!("reverse inventory gap names unknown site {gap_site}"));
             let candidates = gap_candidates.entry(*gap_site).or_default();
-            for identifier in facts.identifiers.iter().filter(|identifier| {
-                let source = sites.get(&identifier.site).unwrap_or_else(|| {
-                    panic!("identifier names unknown site {:?}", identifier.site)
-                });
-                gap_span.start_byte <= source.start_byte && source.end_byte <= gap_span.end_byte
-            }) {
+            assert!(
+                gap_span.start_byte <= gap_span.end_byte,
+                "unordered gap: {gap_span:?}"
+            );
+            let first = identifiers_by_start
+                .partition_point(|(source, _)| source.start_byte < gap_span.start_byte);
+            let last = identifiers_by_start
+                .partition_point(|(source, _)| source.start_byte <= gap_span.end_byte);
+            for (_, identifier) in identifiers_by_start[first..last]
+                .iter()
+                .filter(|(source, _)| source.end_byte <= gap_span.end_byte)
+            {
                 candidates.insert((
                     names[&identifier.name].to_owned(),
                     Some(identifier.namespace),
@@ -1634,10 +1672,130 @@ mod tests {
         ResolutionRelationMemberFact, ResolutionScopeId, ResolutionSiteFact, ResolutionSiteKind,
         ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
     use crate::analyzer::resolution::BindingFragmentId;
     use crate::analyzer::resolution::positioned_identifier_for_test as identifier;
+
+    #[test]
+    #[hardwon(
+        "27545b68d0c1: avoid quadratic Rust gap scans while preserving inclusive containment"
+    )]
+    fn reverse_gap_identifier_spans_preserve_boundaries_overlap_and_namespaces() {
+        use ResolutionNamespace::{Type, Value};
+        let gap_spans = [
+            (10, 30),
+            (15, 25),
+            (25, 40),
+            (30, 30),
+            (usize::MAX, usize::MAX),
+            (2, 4),
+        ];
+        let identifier_spans = [
+            (10, 30),
+            (10, 10),
+            (30, 30),
+            (25, 35),
+            (16, 20),
+            (0, 50),
+            (usize::MAX, usize::MAX),
+            (31, 31),
+        ];
+        let sites = gap_spans
+            .iter()
+            .chain(&identifier_spans)
+            .enumerate()
+            .map(|(id, &(start_byte, end_byte))| ResolutionSiteFact {
+                id: ResolutionSiteId::new(id.try_into().unwrap()),
+                scope: ResolutionScopeId::new(0),
+                kind: if id < gap_spans.len() {
+                    ResolutionSiteKind::UnsupportedDeclaration
+                } else {
+                    ResolutionSiteKind::ValueReference
+                },
+                start_byte,
+                end_byte,
+            })
+            .collect();
+        let mut identifiers = identifier_spans
+            .iter()
+            .enumerate()
+            .map(|(id, _)| {
+                identifier(
+                    (gap_spans.len() + id).try_into().unwrap(),
+                    id.try_into().unwrap(),
+                    ResolutionIdentifierRole::Reference,
+                    if matches!(id, 1 | 3) { Type } else { Value },
+                )
+            })
+            .collect::<Vec<_>>();
+        let duplicate = identifiers[4];
+        identifiers.extend([
+            duplicate,
+            PositionedIdentifierFact {
+                namespace: Type,
+                ..duplicate
+            },
+        ]);
+        let facts = FileResolutionFacts {
+            sites,
+            identifiers,
+            names: [
+                "edge", "start", "end", "cross", "inner", "outer", "max", "after",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(id, spelling)| ResolutionNameFact {
+                id: ResolutionNameId::new(id.try_into().unwrap()),
+                spelling: spelling.to_owned(),
+            })
+            .collect(),
+            gaps: gap_spans
+                .iter()
+                .enumerate()
+                .map(|(id, _)| ResolutionGapFact {
+                    site: ResolutionSiteId::new(id.try_into().unwrap()),
+                    kind: ResolutionGapKind::UnsupportedScopeOrBinder,
+                })
+                .collect(),
+            ..FileResolutionFacts::default()
+        };
+        let mut identities = ResolutionIdentityCatalogBuilder::new(
+            BindingFragmentId::for_test(b"rust-gap-span-containment"),
+            crate::analyzer::resolution::test_shared_names(),
+        );
+        let lowered = lower_common_resolution_facts(&mut identities, Language::Rust, &facts);
+        let candidates = lowered
+            .rust_reverse_gap_candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.site.get(),
+                    candidate.name.as_deref(),
+                    candidate.namespace,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates,
+            [
+                (0, Some("edge"), Some(Value)),
+                (0, Some("end"), Some(Value)),
+                (0, Some("inner"), Some(Type)),
+                (0, Some("inner"), Some(Value)),
+                (0, Some("start"), Some(Type)),
+                (1, Some("inner"), Some(Type)),
+                (1, Some("inner"), Some(Value)),
+                (2, Some("after"), Some(Value)),
+                (2, Some("cross"), Some(Type)),
+                (2, Some("end"), Some(Value)),
+                (3, Some("end"), Some(Value)),
+                (4, Some("max"), Some(Value)),
+                (5, None, None),
+            ]
+        );
+    }
 
     #[test]
     fn scala_extractor_roles_lower_on_the_pattern_head_reference() {

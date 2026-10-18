@@ -24,6 +24,18 @@ SCHEMA = {
         "name": {"type": "string"},
         "level": {"type": "integer", "default": 7},
         "note": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "primary_mode": {"$ref": "#/$defs/SharedMode", "default": "second"},
+        "secondary_mode": {"$ref": "#/$defs/SharedMode", "default": "third"},
+        "required_mode": {"$ref": "#/$defs/SharedMode"},
+        "definition_override_mode": {"$ref": "#/$defs/DefaultedMode", "default": "third"},
+        "definition_required_mode": {"$ref": "#/$defs/DefaultedMode"},
+        "definition_optional_mode": {"$ref": "#/$defs/DefaultedMode"},
+        "definition_flag": {"$ref": "#/$defs/DefaultedFlag"},
+        "default_note": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+        "default_flag": {"$ref": "#/$defs/SharedFlag"},
+        "required_flag": {"$ref": "#/$defs/SharedFlag"},
+        "default_items": {"type": "array", "items": {"type": "string"}},
+        "default_map": {"type": "object", "additionalProperties": {"type": "string"}},
         "entries": {"type": "array", "items": {"$ref": "#/$defs/Entry"}},
         "entries-by-name": {
             "type": "object",
@@ -46,9 +58,16 @@ SCHEMA = {
             ]
         },
     },
-    "required": ["name", "level", "entries", "entries-by-name", "flattened"],
+    "required": [
+        "name", "level", "entries", "entries-by-name", "flattened", "required_mode", "default_note",
+        "definition_required_mode", "required_flag",
+    ],
     "additionalProperties": False,
     "$defs": {
+        "SharedMode": {"type": "string", "enum": ["first", "second", "third"]},
+        "DefaultedMode": {"type": "string", "enum": ["first", "second", "third"], "default": "second"},
+        "DefaultedFlag": {"type": "boolean", "default": True},
+        "SharedFlag": {"type": "boolean"},
         "Entry": {
             "title": "Entry",
             "oneOf": [
@@ -87,6 +106,8 @@ SCHEMA = {
 
 DOCUMENT = {
     "name": "workspace",
+    "required_mode": "first",
+    "required_flag": True,
     "entries": [
         {"kind": "score", "value": 2, "direction": "up"},
         {"kind": "labels", "values": {"a": "b"}},
@@ -307,6 +328,38 @@ class GeneratePythonQueryModelsTest(unittest.TestCase):
             decoded = models.Root.from_dict(DOCUMENT)
             self.assertEqual(decoded.name, "workspace")
             self.assertEqual(decoded.level, 7)
+            # #5687: shared $ref plans lost property defaults or leaked them to required fields.
+            self.assertIs(decoded.primary_mode, models.SharedMode.SECOND)
+            self.assertIs(decoded.secondary_mode, models.SharedMode.THIRD)
+            self.assertIs(decoded.required_mode, models.SharedMode.FIRST)
+            self.assertIs(decoded.definition_required_mode, models.DefaultedMode.SECOND)
+            self.assertIs(decoded.definition_optional_mode, models.DefaultedMode.SECOND)
+            self.assertIs(decoded.definition_override_mode, models.DefaultedMode.THIRD)
+            self.assertIs(decoded.definition_flag, True)
+            self.assertIs(decoded.required_flag, True)
+            self.assertIsNone(decoded.default_note)
+            self.assertIs(decoded.default_flag, False)
+            self.assertEqual(decoded.default_items, [])
+            self.assertEqual(decoded.default_map, {})
+            overridden = models.Root.from_dict(
+                {**DOCUMENT, "primary_mode": "third", "secondary_mode": "second"}
+            )
+            self.assertIs(overridden.primary_mode, models.SharedMode.THIRD)
+            self.assertIs(overridden.secondary_mode, models.SharedMode.SECOND)
+            for field in ("required_mode", "required_flag"):
+                missing_required = dict(DOCUMENT)
+                del missing_required[field]
+                with self.subTest(missing=field):
+                    with self.assertRaises(models.MissingKeyError):
+                        models.Root.from_dict(missing_required)
+            for field in (
+                "primary_mode", "secondary_mode", "required_mode", "definition_required_mode",
+                "definition_optional_mode", "definition_override_mode",
+            ):
+                for invalid in (None, "invalid", 17):
+                    with self.subTest(field=field, invalid=invalid):
+                        with self.assertRaises(models.DecoderError):
+                            models.Root.from_dict({**DOCUMENT, field: invalid})
             self.assertIsNone(decoded.note)
             # Hard-won: canonical Rust PythonRuleFact emitted owner_id=null,
             # which the generated nullable-string decoder rejected.

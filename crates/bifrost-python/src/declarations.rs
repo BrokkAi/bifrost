@@ -12,6 +12,7 @@ use brokk_bifrost_core::analyzer::model::{
 use brokk_bifrost_core::analyzer::parsed_file::{
     ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink, SourceImportFact,
 };
+use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::python_facts::{PythonCallableReturnFact, PythonSourceFacts};
 use brokk_bifrost_core::analyzer::rust_facts::RustItemSourceFacts;
 use brokk_bifrost_core::analyzer::source_facts::{
@@ -44,12 +45,12 @@ use crate::structural::{PYTHON_STRUCTURAL_SPEC, python_parenthesized_expression_
 /// Build the structured name from the file path's original components so
 /// hidden-directory segments stay intact in cold extraction, synthesized module
 /// units, and persisted reconstruction.
-pub fn python_module_fq(file: &ProjectFile) -> FqName {
-    FqName::from_package_components(&python_module_components(file))
+pub fn python_module_fq(project: &dyn Project, file: &ProjectFile) -> FqName {
+    FqName::from_package_components(&python_module_components(project, file))
 }
 
-fn python_module_components(file: &ProjectFile) -> Vec<String> {
-    python_module_components_from_root(file, &python_import_root(file))
+fn python_module_components(project: &dyn Project, file: &ProjectFile) -> Vec<String> {
+    python_module_components_from_root(file, &python_import_root(project, file))
 }
 
 /// The module-name components `file`'s path yields when it is named from the
@@ -93,7 +94,7 @@ fn python_module_components_from_root(file: &ProjectFile, import_root_rel: &Path
 /// `registry/purview-registry/registry/models.py` and
 /// `registry/sql-registry/registry/models.py` are both the module
 /// `registry.models`, but they belong to different roots (#3475).
-pub fn python_import_root(file: &ProjectFile) -> PathBuf {
+pub fn python_import_root(project: &dyn Project, file: &ProjectFile) -> PathBuf {
     let Some(parent_rel) = file.rel_path().parent() else {
         return PathBuf::new();
     };
@@ -101,14 +102,17 @@ pub fn python_import_root(file: &ProjectFile) -> PathBuf {
         return PathBuf::new();
     }
 
-    if let Some(import_root_rel) = python_configured_import_root(file, parent_rel) {
+    if let Some(import_root_rel) = python_configured_import_root(project, file, parent_rel) {
         return import_root_rel;
     }
 
     let mut effective_package_root_rel: Option<&Path> = None;
     let mut current_rel = Some(parent_rel);
     while let Some(path) = current_rel {
-        if file.root().join(path).join("__init__.py").exists() {
+        if project
+            .file_by_rel_path(&path.join("__init__.py"))
+            .is_some()
+        {
             effective_package_root_rel = Some(path);
         }
         current_rel = path.parent();
@@ -137,11 +141,17 @@ fn python_package_components_for_file(file: &ProjectFile, import_root_rel: &Path
 /// `pyproject.toml` roots take precedence over legacy `setup.py` evidence at
 /// each ancestor. An unrelated or malformed packaging file does not change the
 /// existing `__init__.py` package-root convention.
-fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Option<PathBuf> {
+fn python_configured_import_root(
+    project: &dyn Project,
+    file: &ProjectFile,
+    parent_rel: &Path,
+) -> Option<PathBuf> {
     let mut manifest_dir_rel = Some(parent_rel);
     while let Some(directory) = manifest_dir_rel {
         let manifest_dir = file.root().join(directory);
-        let mut roots = setuptools_where_entries(&manifest_dir.join("pyproject.toml"))
+        let mut roots = snapshot_source(project, &directory.join("pyproject.toml"))
+            .map(|source| parse_setuptools_where_entries(&source))
+            .unwrap_or_default()
             .iter()
             .map(|entry| manifest_dir.join(entry).normalize())
             .filter_map(|root| root.strip_prefix(file.root()).ok().map(Path::to_path_buf))
@@ -151,7 +161,9 @@ fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Optio
         if let Some(root) = roots.pop() {
             return Some(root);
         }
-        if let Some(package_dir) = setuptools_setup_py_import_root(&manifest_dir.join("setup.py")) {
+        if let Some(package_dir) = snapshot_source(project, &directory.join("setup.py"))
+            .and_then(|source| parse_setuptools_setup_py_import_root(&source))
+        {
             let root = manifest_dir.join(package_dir).normalize();
             if let Ok(root) = root.strip_prefix(file.root())
                 && parent_rel.starts_with(root)
@@ -175,12 +187,12 @@ fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Optio
 /// shorter spelling below that root names a different arrangement of the same
 /// directories. Only a project whose packaging configuration does not cover
 /// this file answers `None` (#3506).
-pub fn python_declared_import_root(file: &ProjectFile) -> Option<PathBuf> {
+pub fn python_declared_import_root(project: &dyn Project, file: &ProjectFile) -> Option<PathBuf> {
     let parent_rel = file.rel_path().parent()?;
     if parent_rel.as_os_str().is_empty() {
         return None;
     }
-    python_configured_import_root(file, parent_rel)
+    python_configured_import_root(project, file, parent_rel)
 }
 
 /// The directory the package a repeated spelling starts from has to add to its
@@ -222,116 +234,27 @@ pub(crate) fn python_repeated_root_extension_dir(
     Some(source_root_rel.join(implied_rel))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
+// Root selection is snapshot placement, not a content-only source fact. Read
+// through the selected project and keep the parsed roots within this operation.
+fn snapshot_source(project: &dyn Project, relative_path: &Path) -> Option<String> {
+    let file = project.file_by_rel_path(relative_path)?;
+    project.read_source(&file).ok()
 }
 
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(FileStamp {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
-}
-
-/// One manifest's memoized `tool.setuptools.packages.find.where` entries.
-///
-/// The stamp is what the memo is validated against, so a manifest edited in a
-/// long-running server is re-read instead of being answered from a stale parse.
-struct ManifestWhereEntries {
-    stamp: FileStamp,
-    entries: Vec<String>,
-}
-
-/// Read the setuptools package-discovery roots declared by one `pyproject.toml`.
-///
-/// Module identity is resolved once per declaration, not once per file, so this
-/// sits on a hot path: a full read plus TOML parse per call made every Python
-/// identity question proportional to the size of the nearest manifest. The
-/// parse is therefore memoized per manifest and revalidated with one `stat`,
-/// which keeps an edited manifest honored while the steady-state cost is a
-/// metadata probe. An absent, unreadable, malformed, or non-setuptools manifest
-/// declares no roots and leaves the `__init__.py` package-root convention in
-/// charge.
-fn setuptools_where_entries(manifest: &Path) -> Vec<String> {
-    static MEMO: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<PathBuf, ManifestWhereEntries>>,
-    > = std::sync::OnceLock::new();
-    let memo = MEMO.get_or_init(Default::default);
-
-    let Some(stamp) = file_stamp(manifest) else {
-        return Vec::new();
-    };
-    if let Some(cached) = memo.read().expect("manifest memo").get(manifest)
-        && cached.stamp == stamp
-    {
-        return cached.entries.clone();
-    }
-
-    let entries = parse_setuptools_where_entries(manifest);
-    memo.write().expect("manifest memo").insert(
-        manifest.to_path_buf(),
-        ManifestWhereEntries {
-            stamp,
-            entries: entries.clone(),
-        },
-    );
-    entries
-}
-
-/// A memoized static package root recovered from one legacy `setup.py`.
-/// `Some(PathBuf::new())` represents the setup script's directory, which is
-/// setuptools' default when no `package_dir` is supplied.
-struct SetupPyImportRoot {
-    stamp: FileStamp,
-    package_dir: Option<PathBuf>,
-}
-
-/// Read a legacy setuptools import root without executing `setup.py`.
-///
-/// This is intentionally narrower than Python's runtime packaging semantics:
-/// a direct top-level call to an imported setuptools or distutils.core
-/// `setup` binding must provide a `packages` argument. A literal `package_dir`
-/// establishes the root regardless of the package expression; without one,
-/// the package expression must be either a nonempty literal collection or a
-/// supported setuptools discovery call. Unsupported argument shapes or a
-/// shadowed import leave the source path-derived.
-fn setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
-    static MEMO: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<PathBuf, SetupPyImportRoot>>,
-    > = std::sync::OnceLock::new();
-    let memo = MEMO.get_or_init(Default::default);
-
-    let stamp = file_stamp(setup_py)?;
-    if let Some(cached) = memo.read().expect("setup.py memo").get(setup_py)
-        && cached.stamp == stamp
-    {
-        return cached.package_dir.clone();
-    }
-
-    let package_dir = parse_setuptools_setup_py_import_root(setup_py);
-    memo.write().expect("setup.py memo").insert(
-        setup_py.to_path_buf(),
-        SetupPyImportRoot {
-            stamp,
-            package_dir: package_dir.clone(),
-        },
-    );
-    package_dir
-}
-
-fn parse_setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
-    let source = std::fs::read_to_string(setup_py).ok()?;
-    let tree = parse_python_tree(&source)?;
+/// Interpret a legacy setuptools root statically, without executing setup.py.
+/// A direct top-level call to an imported setuptools or distutils.core setup
+/// binding must supply packages. A literal package_dir establishes the root;
+/// otherwise packages must be a nonempty literal collection or supported
+/// discovery call. Unsupported shapes and shadowed imports declare no root.
+fn parse_setuptools_setup_py_import_root(source: &str) -> Option<PathBuf> {
+    let tree = parse_python_tree(source)?;
     let root = tree.root_node();
     if root.has_error() {
         return None;
     }
     let mut import_root = None;
-    for (call, setup_bindings) in setup_py_setup_calls(&source, root) {
-        let candidate = setup_py_import_root_from_call(call, &source, &setup_bindings)?;
+    for (call, setup_bindings) in setup_py_setup_calls(source, root) {
+        let candidate = setup_py_import_root_from_call(call, source, &setup_bindings)?;
         if import_root
             .replace(candidate.clone())
             .is_some_and(|root| root != candidate)
@@ -780,10 +703,7 @@ fn setup_py_unwrap_parenthesized(node: Node<'_>) -> Node<'_> {
     )
 }
 
-fn parse_setuptools_where_entries(manifest: &Path) -> Vec<String> {
-    let Ok(source) = std::fs::read_to_string(manifest) else {
-        return Vec::new();
-    };
+fn parse_setuptools_where_entries(source: &str) -> Vec<String> {
     let Ok(document) = source.parse::<toml::Value>() else {
         return Vec::new();
     };
@@ -859,6 +779,9 @@ where
     source_imports: Vec<SourceImportFact>,
     generic_imports: Vec<SourceImportId>,
     source_declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
+    // Source links can outlive the indexed unit when an enclosing class is replaced.
+    // This membership belongs only to the current file walk.
+    source_declaration_unit_keys: HashSet<CodeUnit>,
     python_source_facts: PythonSourceFacts,
     python_callable_return_by_node: HashMap<usize, usize>,
     overload_metadata: Vec<(CodeUnit, usize, Vec<PythonOverloadDecoratorName>)>,
@@ -1048,17 +971,7 @@ where
         metadata_ordinal: Option<usize>,
     ) -> SourceDeclarationId {
         let declaration = self.source_facts.declare_node(declaration_node, name_node);
-        self.source_declaration_units
-            .push((declaration, unit.clone()));
-        if let Some(metadata_ordinal) = metadata_ordinal {
-            self.parsed
-                .source_declaration_metadata
-                .push(SourceDeclarationMetadataLink {
-                    declaration,
-                    unit,
-                    metadata_ordinal,
-                });
-        }
+        self.link_source_declaration(declaration, unit, metadata_ordinal);
         declaration
     }
 
@@ -1111,6 +1024,7 @@ where
         unit: CodeUnit,
         metadata_ordinal: Option<usize>,
     ) {
+        self.source_declaration_unit_keys.insert(unit.clone());
         self.source_declaration_units
             .push((declaration, unit.clone()));
         if let Some(metadata_ordinal) = metadata_ordinal {
@@ -1390,8 +1304,22 @@ where
                 false,
                 fq.clone(),
             );
-            self.parsed
-                .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
+            // Only a redefinition can invalidate earlier declaration links.
+            // Scanning every prior link for each fresh function is quadratic.
+            let replaces_declaration = self.parsed.contains_declaration(&code_unit);
+            let replaces_links = self.source_declaration_unit_keys.contains(&code_unit);
+            if replaces_declaration {
+                self.parsed.replace_code_unit(
+                    code_unit.clone(),
+                    range_node,
+                    self.source,
+                    None,
+                    None,
+                );
+            } else {
+                self.parsed
+                    .add_code_unit(code_unit.clone(), range_node, self.source, None, None);
+            }
             let signature = python_function_signature(node, self.source);
             let fact_index = *self
                 .python_callable_return_by_node
@@ -1414,18 +1342,20 @@ where
                     return_type_identity,
                 ),
             );
-            self.overload_metadata
-                .retain(|(existing, _, _)| existing != &code_unit);
+            if replaces_links {
+                self.overload_metadata
+                    .retain(|(existing, _, _)| existing != &code_unit);
+                self.source_declaration_units
+                    .retain(|(_, existing)| existing != &code_unit);
+                self.parsed
+                    .source_declaration_metadata
+                    .retain(|link| link.unit != code_unit);
+            }
             self.overload_metadata.push((
                 code_unit.clone(),
                 metadata_ordinal,
                 PythonOverloadDecoratorBindings::overload_decorator_names(node, self.source),
             ));
-            self.source_declaration_units
-                .retain(|(_, existing)| existing != &code_unit);
-            self.parsed
-                .source_declaration_metadata
-                .retain(|link| link.unit != code_unit);
             self.link_source_declaration(
                 return_declaration,
                 code_unit.clone(),
@@ -1722,8 +1652,13 @@ where
 /// Build the [`ParsedFile`] for one Python source file: module unit, type
 /// identifiers, and the declaration walk. `analyzer/python/adapter.rs`'s
 /// `LanguageAdapter::parse_file` is the only caller.
-pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
-    let module_components = python_module_components(file);
+pub fn parse_python_file(
+    project: &dyn Project,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+) -> ParsedFile {
+    let module_components = python_module_components(project, file);
     let module_name = module_components.join(".");
     let module_fq = FqName::from_package_components(&module_components);
     let mut parsed = ParsedFile::new(module_name.clone());
@@ -1763,6 +1698,7 @@ pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         source_imports: Vec::new(),
         generic_imports: Vec::new(),
         source_declaration_units: Vec::new(),
+        source_declaration_unit_keys: HashSet::default(),
         python_source_facts: PythonSourceFacts::default(),
         python_callable_return_by_node: HashMap::default(),
         overload_metadata: Vec::new(),
@@ -1775,20 +1711,12 @@ pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
 
 pub use brokk_bifrost_core::analyzer::common::node_source_text as py_node_text;
 
-pub fn python_module_name(file: &ProjectFile) -> String {
-    python_module_components(file).join(".")
+pub fn python_module_name(project: &dyn Project, file: &ProjectFile) -> String {
+    python_module_components(project, file).join(".")
 }
 
-pub fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit> {
-    if module_fq.is_empty() {
-        return None;
-    }
-    let components = python_module_components(file);
-    debug_assert_eq!(
-        module_fq,
-        components.join("."),
-        "module_code_unit must be built from the file's path-derived Python module name"
-    );
+pub fn module_code_unit(project: &dyn Project, file: &ProjectFile) -> Option<CodeUnit> {
+    let components = python_module_components(project, file);
     let structured_fq = FqName::from_package_components(&components);
     module_code_unit_from_fq(file, &components, structured_fq)
 }
@@ -2367,7 +2295,46 @@ mod primary_tests {
     fn parse(source: &str) -> ParsedFile {
         let file = ProjectFile::new(std::env::temp_dir(), "m4.py");
         let tree = parse_python_tree(source).expect("Python fixture tree");
-        parse_python_file(&file, source, &tree)
+        parse_python_file(
+            &brokk_bifrost_core::analyzer::project::TestProject::new(
+                file.root(),
+                brokk_bifrost_core::analyzer::Language::Python,
+            ),
+            &file,
+            source,
+            &tree,
+        )
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3673: declarations ignored an overlay-only setuptools manifest"
+    )]
+    fn snapshot_root_declaration_witness() {
+        use brokk_bifrost_core::analyzer::Language;
+        use brokk_bifrost_core::analyzer::project::{OverlayProject, Project, TestProject};
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let disk = Arc::new(TestProject::new(root.path(), Language::Python));
+        let overlay = OverlayProject::new(disk);
+        let manifest = ProjectFile::new(root.path(), "pyproject.toml");
+        assert!(overlay.set(
+            manifest.abs_path(),
+            "[tool.setuptools.packages.find]\nwhere = ['source']\n".to_string()
+        ));
+        let file = ProjectFile::new(root.path(), "source/pkg/model.py");
+        assert!(overlay.set(file.abs_path(), "class Widget:\n    pass\n".to_string()));
+        let snapshot = overlay.snapshot();
+        assert!(snapshot.read_source(&manifest).unwrap().contains("source"));
+        let source = snapshot.read_source(&file).unwrap();
+        let tree = parse_python_tree(&source).unwrap();
+        let parsed = parse_python_file(&snapshot, &file, &source, &tree);
+        let names: Vec<_> = parsed
+            .declarations()
+            .iter()
+            .map(CodeUnit::fq_name)
+            .collect();
+        assert!(names.contains(&"pkg.model.Widget".to_string()), "{names:?}");
     }
 
     #[test]
@@ -2396,7 +2363,7 @@ mod primary_tests {
     )]
     fn replacing_a_class_withdraws_descendant_metadata_links() {
         let parsed = parse(
-            "class Replaced:\n    def obsolete(self): pass\n    class Nested:\n        def stale(self): pass\n\nclass Kept:\n    def stable(self): pass\n\nclass Replaced:\n    def current(self): pass\n",
+            "from typing import overload\nclass Replaced:\n    def obsolete(self): pass\n    @overload\n    def current(self): pass\n    class Nested:\n        def stale(self): pass\n\nclass Kept:\n    def stable(self): pass\n\nclass Replaced:\n    def current(self): pass\n",
         );
         let mut names = parsed
             .source_declaration_metadata
@@ -2413,6 +2380,25 @@ mod primary_tests {
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["Kept.stable", "Replaced.current"]);
+        let current = parsed
+            .source_declaration_metadata
+            .iter()
+            .find(|link| link.unit.short_name() == "Replaced.current")
+            .unwrap();
+        assert!(
+            !parsed.signature_metadata[&current.unit][current.metadata_ordinal]
+                .is_declaration_only(),
+            "a withdrawn overload must not mark the new implementation"
+        );
+        assert_eq!(
+            parsed
+                .source_declaration_units
+                .iter()
+                .filter(|(_, unit)| unit.short_name() == "Replaced.current")
+                .count(),
+            1,
+            "the new method replaces even an already-withdrawn source link"
+        );
     }
 
     #[test]
@@ -3021,7 +3007,15 @@ mod callable_modifier_tests {
         let source = "def free(value):\n    return value\n\nclass Widget:\n    def __init__(self, spec):\n        self.spec = spec\n\n    def render(self, target):\n        return target\n\n    @staticmethod\n    def build(spec):\n        return spec\n\n    @classmethod\n    def measure(cls, target):\n        return target\n\n    @property\n    def label(self):\n        return \"widget\"\n\nasync def fetch_all(url):\n    return url\n\ndef outer(seed):\n    def inner(value):\n        return value\n    return inner(seed)\n\nassigned = lambda value: value\n";
         let file = ProjectFile::new(std::env::temp_dir(), "widget.py");
         let tree = parse_python_tree(source).expect("parse the Python fixture");
-        let parsed = parse_python_file(&file, source, &tree);
+        let parsed = parse_python_file(
+            &brokk_bifrost_core::analyzer::project::TestProject::new(
+                file.root(),
+                brokk_bifrost_core::analyzer::Language::Python,
+            ),
+            &file,
+            source,
+            &tree,
+        );
 
         let entry = |fq_name: &str| {
             parsed

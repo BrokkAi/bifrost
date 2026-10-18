@@ -1398,7 +1398,7 @@ mod tests {
         let (temp, project) = crate::analyzer::test_support::python_package_project(
             (0..count).map(|_| "class Shared:\n    pass\n".to_string()),
         );
-        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
         (temp, analyzer)
     }
 

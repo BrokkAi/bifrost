@@ -60,7 +60,7 @@ pub(crate) fn cost(facts: &GoSourceFacts) -> (usize, usize) {
     bytes += facts
         .fields
         .iter()
-        .map(|fact| fact.name.len())
+        .map(|fact| fact.name.len() + fact.tag.as_ref().map_or(0, Vec::len))
         .sum::<usize>();
     for callable in &facts.callables {
         bytes += callable.name.len();
@@ -256,7 +256,7 @@ fn insert(
     }
     drop(statement);
     let mut statement = tx.prepare_cached("INSERT INTO source_go_fields
-        (blob_id, declaration_id, owner_type_id, type_id, name, embedded) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?;
+        (blob_id, declaration_id, owner_type_id, type_id, name, embedded, tag) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
     for fact in &facts.fields {
         check_cancelled(cancellation)?;
         statement.execute(params![
@@ -265,7 +265,8 @@ fn insert(
             fact.owner.get(),
             fact.ty.map(GoSourceTypeId::get),
             fact.name,
-            fact.embedded
+            fact.embedded,
+            fact.tag
         ])?;
     }
     drop(statement);

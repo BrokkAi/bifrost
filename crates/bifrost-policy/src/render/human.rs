@@ -3001,6 +3001,19 @@ fn write_query_result_detail<W: Write>(
                 .map_err(map_io_error)?;
             }
         }
+        PolicyQueryResultRef::PythonHierarchyFact {
+            fact_kind,
+            ancestry_basis,
+            ..
+        } => {
+            write!(
+                output,
+                " Python {} ({} retained runtime claims)",
+                escape_terminal_text(fact_kind),
+                ancestry_basis.claims.len()
+            )
+            .map_err(map_io_error)?;
+        }
         PolicyQueryResultRef::StructuralMatch { kind, .. } => {
             write!(output, " {}", escape_terminal_text(kind)).map_err(map_io_error)?;
         }
@@ -4108,6 +4121,7 @@ const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
         PolicyQueryResultRef::GenerationSite { .. } => "generation_site",
         PolicyQueryResultRef::Export { .. } => "export",
         PolicyQueryResultRef::CrossDomain { .. } => "cross_domain",
+        PolicyQueryResultRef::PythonHierarchyFact { .. } => "python_hierarchy_fact",
         PolicyQueryResultRef::StructuralMatch { .. } => "structural_match",
         PolicyQueryResultRef::Binding { .. } => "binding",
         PolicyQueryResultRef::LexicalScope { .. } => "lexical_scope",

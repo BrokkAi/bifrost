@@ -3440,10 +3440,24 @@ pub struct UsageGraphTruncatedSymbol {
     pub limit: usize,
 }
 
+pub use crate::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason;
+
+/// A requested file deliberately omitted from the selected graph, with evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphFileNote {
+    pub path: String,
+    #[serde(flatten)]
+    pub reason: GraphFileSkipReason,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageGraphIncompleteReason {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_path: Option<String>,
 }
 
 /// The resolved definition/reference graph for the whole workspace.
@@ -3459,6 +3473,8 @@ pub struct UsageGraphResult {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub truncated_symbols: Vec<UsageGraphTruncatedSymbol>,
     pub incomplete_reasons: Vec<UsageGraphIncompleteReason>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_notes: Vec<UsageGraphFileNote>,
 }
 
 /// Atomic selected-Java result for the exact whole-workspace usage-graph
@@ -3607,10 +3623,17 @@ pub(crate) fn selected_usage_graph_result(
         forward_completeness,
         kind_projection_complete,
         unresolved_names,
+        skipped_callers,
         ..
     } = projection;
     let mut incomplete = BTreeSet::new();
-    if !projection_complete {
+    if !projection_complete
+        && (!skipped_callers
+            .values()
+            .any(GraphFileSkipReason::opens_incompleteness)
+            || !forward_completeness.is_complete()
+            || !kind_projection_complete)
+    {
         incomplete.insert((
             "selected_reference_graph_incomplete".to_string(),
             format!(
@@ -3670,13 +3693,14 @@ pub(crate) fn selected_usage_graph_result(
     if cancellation.is_cancelled() {
         return None;
     }
-    finalize_selected_usage_graph_result(
+    let mut result = finalize_selected_usage_graph_result(
         catalog,
         edge_sites,
         truncated_by_id,
         incomplete,
         cancellation,
-    )
+    )?;
+    record_graph_skipped_callers(&mut result, skipped_callers, cancellation).then_some(result)
 }
 
 type UsageGraphSiteKey = (String, usize, String, String);
@@ -4176,6 +4200,7 @@ fn usage_graph_with_passes(
     let mut layer_catalog_once: Option<(usize, WorkspaceUsageCatalog)> = None;
     let mut native_projections: Vec<SelectedWorkspaceUsageGraphProjection> = Vec::new();
     let mut native_admitted_callers = HashSet::default();
+    let mut skipped_callers = std::collections::BTreeMap::new();
 
     for layer in 0..params.depth {
         if cancellation.is_cancelled() {
@@ -4317,13 +4342,18 @@ fn usage_graph_with_passes(
                         );
                     }
                     let expected_callers = files.into_iter().collect::<HashSet<_>>();
-                    assert_eq!(
-                        projection.admitted_callers(),
-                        &expected_callers,
-                        "native graph providers must retain exact caller admission"
-                    );
+                    projection.certify_callers(&expected_callers);
                     native_admitted_callers.extend(expected_callers);
-                    if !complete {
+                    skipped_callers.extend(projection.skipped_callers.clone());
+                    // Skipped modules have dedicated structured reasons below.
+                    if !complete
+                        && (!projection
+                            .skipped_callers
+                            .values()
+                            .any(GraphFileSkipReason::opens_incompleteness)
+                            || !projection.forward_completeness.is_complete()
+                            || !projection.kind_projection_complete)
+                    {
                         incomplete.insert((
                             "selected_reference_graph_incomplete".into(),
                             format!(
@@ -5201,10 +5231,11 @@ fn usage_graph_with_passes(
             "workspace changed during usage graph construction".into(),
         );
     }
+    declarations.retain(|(unit, _)| !skipped_callers.contains_key(unit.source()));
     let Some(catalog) = WorkspaceUsageCatalog::from_declarations(declarations, cancellation) else {
         return cancelled();
     };
-    let result = finalize_usage_graph_result(
+    let mut result = finalize_usage_graph_result(
         analyzer,
         &unmatched_paths,
         catalog,
@@ -5212,6 +5243,9 @@ fn usage_graph_with_passes(
         truncated_by_id,
         incomplete,
     );
+    if !record_graph_skipped_callers(&mut result, skipped_callers, cancellation) {
+        return cancelled();
+    }
     if let Some(error) = _analyzer_query.store_error() {
         return unavailable_usage_graph_result(
             analyzer,
@@ -5232,6 +5266,45 @@ fn usage_graph_with_passes(
         );
     }
     result
+}
+
+fn record_graph_skipped_callers(
+    result: &mut UsageGraphResult,
+    skipped_callers: crate::analyzer::store::resolution_operation::graph_stage::GraphSkippedCallers,
+    cancellation: &CancellationToken,
+) -> bool {
+    let mut missing_modules = HashSet::default();
+    for (file, reason) in skipped_callers {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let path = rel_path_string(&file);
+        match &reason {
+            GraphFileSkipReason::ExcludedBuildSelection => {}
+            GraphFileSkipReason::OutsideSelectedModules { module_path } => {
+                if missing_modules.insert(module_path.clone()) {
+                    result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                        code: "outside_selected_modules".into(),
+                        message: "module has no packages in the selected tool context (#5664)"
+                            .into(),
+                        path: None,
+                        module_path: Some(module_path.clone()),
+                    });
+                }
+            }
+            GraphFileSkipReason::Unplaced => {
+                result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                    code: "unplaced_graph_caller".into(),
+                    message: "requested file has no selected graph placement".into(),
+                    path: Some(path.clone()),
+                    module_path: None,
+                })
+            }
+        }
+        result.file_notes.push(UsageGraphFileNote { path, reason });
+    }
+    result.complete = result.incomplete_reasons.is_empty();
+    true
 }
 
 fn unavailable_usage_graph_result(
@@ -5365,10 +5438,17 @@ fn finalize_usage_graph_result(
 
     let mut incomplete_reasons = incomplete
         .into_iter()
-        .map(|(code, message)| UsageGraphIncompleteReason { code, message })
+        .map(|(code, message)| UsageGraphIncompleteReason {
+            code,
+            message,
+            path: None,
+            module_path: None,
+        })
         .collect::<Vec<_>>();
     if !truncated_symbols.is_empty() {
         incomplete_reasons.push(UsageGraphIncompleteReason {
+            path: None,
+            module_path: None,
             code: "callsites_truncated".to_string(),
             message: "one or more symbols exceeded the call-site enumeration limit".to_string(),
         });
@@ -5382,6 +5462,7 @@ fn finalize_usage_graph_result(
             .map(|count| format!(" (+{count} more)"))
             .unwrap_or_default();
         incomplete_reasons.push(UsageGraphIncompleteReason {
+            path: None, module_path: None,
             code: "unmatched_paths".to_string(),
             message: format!(
                 "these `paths` selectors name no workspace file or directory, so they contributed no graph roots: {}{more}",
@@ -5396,6 +5477,7 @@ fn finalize_usage_graph_result(
         edges,
         truncated_symbols,
         incomplete_reasons,
+        file_notes: Vec::new(),
     }
 }
 
@@ -5575,10 +5657,17 @@ fn finalize_selected_usage_graph_result(
         if cancellation.is_cancelled() {
             return None;
         }
-        incomplete_reasons.push(UsageGraphIncompleteReason { code, message });
+        incomplete_reasons.push(UsageGraphIncompleteReason {
+            code,
+            message,
+            path: None,
+            module_path: None,
+        });
     }
     if !truncated_symbols.is_empty() {
         incomplete_reasons.push(UsageGraphIncompleteReason {
+            path: None,
+            module_path: None,
             code: "callsites_truncated".to_string(),
             message: "one or more symbols exceeded the call-site enumeration limit".to_string(),
         });
@@ -5593,6 +5682,7 @@ fn finalize_selected_usage_graph_result(
         edges,
         truncated_symbols,
         incomplete_reasons,
+        file_notes: Vec::new(),
     })
 }
 
@@ -7830,6 +7920,7 @@ mod tests {
             nodes,
             raw_proven_inbound,
             admitted_callers: HashSet::from_iter([caller_file]),
+            skipped_callers: Default::default(),
             unresolved_names: Some(std::collections::BTreeSet::new()),
             edges: vec![CanonicalWorkspaceUsageProjectedEdge {
                 from: caller_index,
@@ -8558,6 +8649,7 @@ mod tests {
                         edges,
                         raw_proven_inbound,
                         admitted_callers: HashSet::from_iter(admitted_callers.iter().cloned()),
+                        skipped_callers: Default::default(),
                         unresolved_names: Some(std::collections::BTreeSet::new()),
                         forward_completeness: EdgeCompleteness::Complete,
                         kind_projection_complete: true,
@@ -8953,13 +9045,24 @@ mod tests {
         analyzer
             .test_hooks()
             .reset_resolve_definition_batch_with_source_call_count_for_test();
-        let graph = usage_graph(
+        // This is a native-provider control, independent of the production
+        // backend selected for Go's staged graph rollout.
+        let graph = usage_graph_with_passes(
             analyzer,
             UsageGraphParams {
                 include_tests: false,
                 paths: None,
                 depth: 1,
             },
+            &[crate::analyzer::languages::EdgePassEntry {
+                id: crate::analyzer::languages::EdgePassId::Go,
+                ecosystem: UsageEcosystem::Go,
+                languages: vec![Language::Go],
+                backend: crate::analyzer::languages::LanguageGraphBackend::Native(
+                    &crate::analyzer::GoNativeWorkspaceGraphProvider,
+                ),
+            }],
+            &CancellationToken::default(),
         );
         let calls = analyzer
             .test_hooks()

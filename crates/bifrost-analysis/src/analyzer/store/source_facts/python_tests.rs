@@ -15,7 +15,7 @@ fn python_return_facts_reopen_source_free_at_two_mounts_and_cancel_hydration() {
         .build();
     let file = fixture.file("first/source.py");
     let other = fixture.file("second/source.py");
-    let state = parse_state(&PythonAdapter, &file);
+    let state = parse_state(&PythonAdapter::for_test_file(&file), &file);
     let expected = state.source_facts.as_ref().unwrap();
     let facts = expected.python.as_ref().unwrap();
     assert_eq!(facts.callable_returns.len(), 9);
@@ -43,7 +43,7 @@ fn python_return_facts_reopen_source_free_at_two_mounts_and_cancel_hydration() {
     {
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         store
-            .write_parsed_blob(oid, "python", &PythonAdapter, &state)
+            .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
             .unwrap();
     }
     std::fs::remove_file(file.abs_path()).unwrap();
@@ -82,19 +82,19 @@ fn python_return_publication_requires_empty_marker_and_seals_rows() {
         .file("empty.py", "")
         .build();
     let file = fixture.file("empty.py");
-    let mut state = parse_state(&PythonAdapter, &file);
+    let mut state = parse_state(&PythonAdapter::for_test_file(&file), &file);
     let oid = oid_for(b"");
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let generation = store.current_generation("python").unwrap();
     let facts = state.source_facts.as_mut().unwrap().python.take().unwrap();
     assert!(
         store
-            .write_parsed_blob(oid, "python", &PythonAdapter, &state)
+            .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
             .is_err()
     );
     state.source_facts.as_mut().unwrap().python = Some(facts);
     store
-        .write_parsed_blob(oid, "python", &PythonAdapter, &state)
+        .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
         .unwrap();
     assert!(
         store
@@ -117,7 +117,7 @@ fn python_return_publication_requires_empty_marker_and_seals_rows() {
             .is_err()
     );
     store
-        .write_parsed_blob(oid, "python", &PythonAdapter, &state)
+        .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
         .unwrap();
     assert!(
         store
@@ -133,19 +133,19 @@ fn python_return_rows_have_indexed_access_exact_accounting_and_immutable_links()
         .file("source.py", SOURCE)
         .build();
     let file = fixture.file("source.py");
-    let state = parse_state(&PythonAdapter, &file);
+    let state = parse_state(&PythonAdapter::for_test_file(&file), &file);
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let oid = oid_for(SOURCE.as_bytes());
     let generation = store.current_generation("python").unwrap();
     store
-        .write_parsed_blob(oid, "python", &PythonAdapter, &state)
+        .write_parsed_blob(oid, "python", &PythonAdapter::for_test_file(&file), &state)
         .unwrap();
     for index in 0..32 {
         store
             .write_parsed_blob(
                 oid_for(format!("publication {index}").as_bytes()),
                 "python",
-                &PythonAdapter,
+                &PythonAdapter::for_test_file(&file),
                 &state,
             )
             .unwrap();

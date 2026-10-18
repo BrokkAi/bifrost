@@ -633,7 +633,9 @@ pub fn is_language_configuration_input(language: Language, file: &ProjectFile) -
         Language::JavaScript | Language::TypeScript => is_js_ts_config_file(file),
         Language::Go => is_go_module_manifest(file),
         Language::Rust => crate::analyzer::rust::is_cargo_evidence_input(file),
-        Language::Php | Language::Python | Language::Ruby | Language::None => false,
+        Language::Python => crate::analyzer::languages::language_support(language)
+            .is_some_and(|support| support.is_configuration_input_path(file.rel_path())),
+        Language::Php | Language::Ruby | Language::None => false,
     }
 }
 

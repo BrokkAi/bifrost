@@ -126,17 +126,19 @@ fn activate_go_context_with(workspace: &WorkspaceAnalyzer, config: &AnalyzerConf
     assert!(!discovery.contains("go.unit_summary_failed"), "{discovery}");
 }
 
-/// Build a Go workspace and publish its dependency context. `None` when this
-/// host has no Go toolchain: without `go list` the context is the partial
-/// source-inventory one, which is not summarized.
+fn go_toolchain_available() -> bool {
+    std::process::Command::new("go")
+        .arg("version")
+        .output()
+        .is_ok()
+}
+
+/// Build a Go workspace and publish its tool context. `None` when the host
+/// lacks the Go toolchain needed for this publication.
 fn published_go_workspace(
     files: &[(&str, &str)],
 ) -> Option<(BuiltInlineTestProject, WorkspaceAnalyzer)> {
-    if std::process::Command::new("go")
-        .arg("version")
-        .output()
-        .is_err()
-    {
+    if !go_toolchain_available() {
         return None;
     }
     let mut project = InlineTestProject::with_language(Language::Go);
@@ -247,12 +249,13 @@ fn assert_summaries_match_incumbent_readers(workspace: &WorkspaceAnalyzer) -> Di
 
     // The incumbent's units: the package placement of every selected file under
     // the role the file declares.
+    // Ignored-role memberships are build exclusions published as rows and never have a package placement; see docs/src/content/docs/design/usage-analysis.md#selected-graph-caller-admission.
     let mut files = Vec::new();
     {
         let mut statement = connection
             .prepare(
                 "SELECT file_version_id, source_role, rel_path FROM main.go_context_source_files
-                 WHERE context_id = ?1 ORDER BY rel_path, source_role",
+                 WHERE context_id = ?1 AND source_role <> 'ignored' ORDER BY rel_path, source_role",
             )
             .unwrap();
         let mut rows = statement.query([context_id]).unwrap();
@@ -333,8 +336,13 @@ fn assert_summaries_match_incumbent_readers(workspace: &WorkspaceAnalyzer) -> Di
     let live_versions: i64 = connection
         .query_row(
             "SELECT count(*) FROM main.resolution_unit_summary_versions
-             WHERE workspace_id = ?1 AND lang = 'go' AND generation = ?2 AND valid_until IS NULL",
-            rusqlite::params![snapshot.workspace_id.as_str(), snapshot.generation.get()],
+             WHERE workspace_id = ?1 AND lang = 'go' AND generation = ?2 AND valid_until IS NULL
+               AND profile_digest = ?3",
+            rusqlite::params![
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.get(),
+                profile.as_slice()
+            ],
             |row| row.get(0),
         )
         .unwrap();
@@ -835,14 +843,18 @@ fn go_test_unit_aliases_reach_imports_from_package_files() {
         return;
     };
     let connection = workspace.store().unwrap().read_conn().unwrap();
+    let profile = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
+        .unwrap()
+        .native_context_profile()
+        .unwrap();
     let summary_id: i64 = connection
         .query_row(
             "SELECT members.summary_id
              FROM resolution_unit_summary_members AS members
              JOIN resolution_unit_summary_versions AS versions
                ON versions.summary_id=members.summary_id AND versions.valid_until IS NULL
-             WHERE members.rel_path='api/api_internal_test.go'",
-            [],
+             WHERE members.rel_path='api/api_internal_test.go' AND versions.profile_digest=?1",
+            [profile.as_slice()],
             |row| row.get(0),
         )
         .expect("the internal test variant has a live unit summary");
@@ -887,10 +899,13 @@ fn open_units(workspace: &WorkspaceAnalyzer) -> std::collections::BTreeMap<Strin
                     versions.valid_from, versions.summary_id, summaries.summary_digest, summaries.output_digest
              FROM resolution_unit_summary_versions AS versions
              JOIN resolution_unit_summaries AS summaries ON summaries.summary_id = versions.summary_id
-             WHERE versions.lang = 'go' AND versions.valid_until IS NULL",
+             WHERE versions.lang = 'go' AND versions.valid_until IS NULL
+               AND versions.profile_digest = ?1",
         )
         .unwrap();
-    let mut rows = statement.query([]).unwrap();
+    let go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()).unwrap();
+    let profile = go.native_context_profile().unwrap();
+    let mut rows = statement.query([profile.as_slice()]).unwrap();
     let mut units = std::collections::BTreeMap::new();
     while let Some(row) = rows.next().unwrap() {
         let label: String = row.get(0).unwrap();
@@ -1089,7 +1104,7 @@ fn go_unit_summary_readers_seek_in_both_statistics_states() {
         else {
             panic!("the Go point request is unavailable");
         };
-        let (operation, _) = request.oracle_for_test();
+        let (operation, inventory_context_id) = request.oracle_for_test();
         let connection = operation.ready.inventory.connection();
         super::super::go_unit_summaries::register_go_summary_sql_functions(connection).unwrap();
         let epoch: String = connection
@@ -1101,29 +1116,19 @@ fn go_unit_summary_readers_seek_in_both_statistics_states() {
             .unwrap();
         // The unit with the most dependents and exports in the fixture is the
         // util package, so its rows are the realistic bindings.
+        let profile = go.native_context_profile().unwrap().to_vec();
         let (summary_id, unit_key): (i64, Vec<u8>) = connection
             .query_row(
                 "SELECT versions.summary_id, versions.unit_key
                  FROM resolution_unit_summary_versions AS versions
                  JOIN resolution_unit_summary_members AS members ON members.summary_id = versions.summary_id
-                 WHERE versions.valid_until IS NULL AND members.rel_path = 'util/util.go'",
-                [],
+                 WHERE versions.valid_until IS NULL AND members.rel_path = 'util/util.go'
+                   AND versions.profile_digest = ?1",
+                [profile.as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         let unit_key_array: [u8; 32] = unit_key.clone().try_into().unwrap();
-        let profile: Vec<u8> = connection
-            .query_row(
-                "SELECT selections.profile_digest FROM main.go_context_selections AS selections
-                 WHERE selections.workspace_id = ?1 AND selections.generation = ?2 AND selections.revision = ?3",
-                rusqlite::params![
-                    snapshot.workspace_id.as_str(),
-                    snapshot.generation.get(),
-                    snapshot.revision
-                ],
-                |row| row.get(0),
-            )
-            .unwrap();
         let (namespace, identity_id): (String, i64) = connection
             .query_row(
                 "SELECT namespace, identity_id FROM resolution_unit_summary_exports
@@ -1161,8 +1166,9 @@ fn go_unit_summary_readers_seek_in_both_statistics_states() {
                  WHERE versions.workspace_id=?1 AND versions.lang='go'
                    AND versions.generation=?2 AND versions.valid_from<=?3
                    AND (versions.valid_until IS NULL OR ?3<versions.valid_until)
+                   AND versions.profile_digest=?4
                  LIMIT 1",
-                params![workspace_id, snapshot.generation.get(), snapshot.revision],
+                params![workspace_id, snapshot.generation.get(), snapshot.revision, profile.as_slice()],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -1175,16 +1181,6 @@ fn go_unit_summary_readers_seek_in_both_statistics_states() {
             )
             .unwrap();
         let caller_unit_key: [u8; 32] = caller_unit_key.try_into().unwrap();
-        let inventory_context_id: i64 = connection
-            .query_row(
-                "SELECT heads.context_id FROM main.go_context_selections AS selections
-                 JOIN main.go_context_heads AS heads USING(selection_id)
-                 WHERE selections.workspace_id=?1 AND selections.generation=?2
-                   AND selections.revision=?3 LIMIT 1",
-                params![workspace_id, snapshot.generation.get(), snapshot.revision],
-                |row| row.get(0),
-            )
-            .unwrap();
         let (caller_package_id, caller_summary_role): (i64, String) = connection
             .query_row(
                 "SELECT package.package_id,
@@ -1338,6 +1334,46 @@ fn go_unit_summary_readers_seek_in_both_statistics_states() {
         uses(&plan, "profile EXISTS USING INDEX", "live version");
         uses(&plan, "summaries USING INTEGER PRIMARY KEY", "live version");
 
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS unit_summary_order(
+               ordinal INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL UNIQUE, unit_key BLOB UNIQUE
+             ) STRICT;",
+            )
+            .unwrap();
+        for name in [
+            "unit_summary_open_version",
+            "unit_summary_close_version",
+            "unit_summary_withdraw_version",
+            "unit_summary_withdraw_unsettled",
+            "unit_summary_close_unsettled",
+            "unit_summary_later_open_version",
+        ] {
+            let mut values = vec![
+                Value::Text(workspace_id.clone()),
+                Value::Text("go".into()),
+                Value::Integer(snapshot.generation.get()),
+            ];
+            if matches!(
+                name,
+                "unit_summary_open_version"
+                    | "unit_summary_close_version"
+                    | "unit_summary_withdraw_version"
+            ) {
+                values.push(Value::Blob(unit_key.clone()));
+            }
+            if name != "unit_summary_open_version" {
+                values.push(Value::Integer(snapshot.revision));
+            }
+            values.push(Value::Blob(profile.clone()));
+            let plan = bind(name, values);
+            uses(&plan, "resolution_unit_summary_versions USING", name);
+            assert!(
+                plan.iter().any(|step| step.contains("profile_digest=?")),
+                "{name} with {statistics} must seek its profile: {plan:?}"
+            );
+        }
+
         let plan = bind(
             "unit_summary_export_point",
             vec![
@@ -1355,6 +1391,7 @@ fn go_unit_summary_readers_seek_in_both_statistics_states() {
                 Value::Text(workspace_id.clone()),
                 Value::Text("go".into()),
                 Value::Integer(snapshot.generation.get()),
+                Value::Blob(profile.clone()),
             ],
         );
         assert!(
@@ -1638,6 +1675,10 @@ fn measure_go_unit_summary_reconcile_on_a_corpus() {
             return;
         };
         let conn = store.read_conn().unwrap();
+        let profile = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
+            .unwrap()
+            .native_context_profile()
+            .unwrap();
         let mut lines = Vec::new();
         let mut statement = conn
             .prepare(
@@ -1658,10 +1699,11 @@ fn measure_go_unit_summary_reconcile_on_a_corpus() {
                  FROM resolution_unit_summary_versions AS versions
                  JOIN resolution_unit_summaries AS summaries ON summaries.summary_id = versions.summary_id
                  WHERE versions.lang = 'go' AND versions.valid_until IS NULL
+                   AND versions.profile_digest=?1
                  ORDER BY 2, 1",
             )
             .unwrap();
-        let mut rows = statement.query([]).unwrap();
+        let mut rows = statement.query([profile.as_slice()]).unwrap();
         while let Some(row) = rows.next().unwrap() {
             let columns: Vec<String> = (0..8)
                 .map(|index| {
@@ -1920,6 +1962,7 @@ fn live_summaries_of_profile(workspace: &WorkspaceAnalyzer, profile: [u8; 32]) -
     conn.query_row(
         "SELECT count(*) FROM resolution_unit_summary_versions AS versions
          WHERE versions.lang = 'go' AND versions.valid_until IS NULL
+           AND versions.profile_digest=?1
            AND EXISTS (SELECT 1 FROM resolution_unit_summary_reads AS reads
                        WHERE reads.summary_id = versions.summary_id
                          AND reads.kind = 'context_publication' AND reads.digest = ?1)",
@@ -1966,18 +2009,305 @@ fn a_summary_records_the_profile_of_the_publication_it_derives_from() {
                 .is_none()
         );
     }
-    if std::process::Command::new("go")
-        .arg("version")
-        .output()
-        .is_err()
-    {
+    if !go_toolchain_available() {
         return;
     }
-    // The tool context replaces the inventory summaries: one live summary per
-    // unit key, and each records the profile its publication came from.
+    // Tool and inventory intervals coexist, each recording its own profile.
     activate_go_context(&workspace);
     assert_eq!(open_units(&workspace).len(), 7);
-    // A unit key that both profiles define is rebound to the tool summary; the
-    // inventory-only keys (its test units) are closed.
-    assert_eq!(live_summaries_of_profile(&workspace, inventory), 0);
+    // Even inventory-only test-unit keys remain live for retained queries.
+    assert_eq!(live_summaries_of_profile(&workspace, inventory), before);
+}
+
+#[brokk_bifrost_test_macros::hardwon(
+    "#5147: same-revision tool publication withdrew a retained inventory snapshot's summary"
+)]
+#[test]
+fn go_summary_profiles_survive_same_revision_publication() {
+    use crate::analyzer::CodeUnitIndex;
+    use crate::analyzer::store::go_package_context::source_inventory_profile;
+
+    if !go_toolchain_available() {
+        return;
+    }
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/isolation\n\ngo 1.22\n")
+        .file("api/api.go", "package api\n\nfunc Public() {}\n")
+        .file(
+            "cmd/main.go",
+            r#"package main
+
+import "example.test/isolation/api"
+
+func main() { api.Public() }
+"#,
+        )
+        .build();
+    let workspace = fixture.workspace_analyzer(go_full_production_config());
+    let retained = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
+        .unwrap()
+        .clone();
+    let snapshot = retained.selected_snapshot_for_test().unwrap();
+    let profile = retained.native_context_profile().unwrap();
+    assert_eq!(profile, source_inventory_profile());
+    let store = workspace.store().unwrap();
+    let conn = store.read_conn().unwrap();
+    let epoch: String = conn
+        .query_row(
+            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang = 'go'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let key = go_unit_key("example.test/isolation/api", "", "go");
+    let before = go_live_summary(&conn, &snapshot, &epoch, &key, &profile)
+        .unwrap()
+        .unwrap();
+    drop(conn);
+    activate_go_context(&workspace);
+    let tool_profile = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
+        .unwrap()
+        .native_context_profile()
+        .unwrap();
+    assert_ne!(
+        tool_profile, profile,
+        "the tool context must actually activate"
+    );
+    assert!(
+        go_live_summary(
+            &store.read_conn().unwrap(),
+            &snapshot,
+            &epoch,
+            &key,
+            &tool_profile
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(retained.selected_snapshot_for_test().unwrap(), snapshot);
+    assert_eq!(retained.native_context_profile(), Some(profile));
+    let conn = store.read_conn().unwrap();
+    assert_eq!(
+        go_live_summary(&conn, &snapshot, &epoch, &key, &profile).unwrap(),
+        Some(before),
+        "retained inventory snapshot lost its live summary after tool publication"
+    );
+    drop(conn);
+    let target = retained
+        .declarations(&fixture.file("api/api.go"))
+        .into_iter()
+        .find(|unit| unit.terminal_name() == "Public")
+        .unwrap();
+    use crate::analyzer::go::selected_reverse::{
+        GoSelectedReverseOutcome, go_selected_inverse_for,
+    };
+    let GoSelectedReverseOutcome::Ready(answer) =
+        go_selected_inverse_for(&retained, &target, &CancellationToken::new())
+    else {
+        panic!("retained inventory query must remain available after tool publication");
+    };
+    assert_eq!(
+        answer.completeness,
+        crate::analyzer::structural::reference_edges::EdgeCompleteness::Complete,
+        "{answer:#?}"
+    );
+    assert!(
+        answer
+            .edges
+            .iter()
+            .any(|edge| edge.site.file == fixture.file("cmd/main.go")),
+        "retained inventory query must find the caller: {answer:#?}"
+    );
+}
+
+#[brokk_bifrost_test_macros::hardwon(
+    "#5147: summary replacement, cancellation and revision guards crossed Go context profiles"
+)]
+#[test]
+fn go_summary_profile_interleavings_reopen_and_withdraw() {
+    use crate::analyzer::store::WorkspaceSnapshotId;
+    use crate::analyzer::store::go_package_context::source_inventory_profile;
+    use crate::analyzer::store::go_unit_summaries::GoUnitSummaries;
+
+    if !go_toolchain_available() {
+        return;
+    }
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/isolation\n\ngo 1.22\n")
+        .file("api/api.go", "package api\n\nfunc Public() {}\n")
+        .file("cmd/main.go", "package main\n\nimport \"example.test/isolation/api\"\n\nfunc main() { api.Public() }\n")
+        .with_git()
+        .build();
+    let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+        fixture.project_dyn(),
+        go_full_production_config(),
+    )
+    .unwrap();
+    let path = workspace.persisted_store_path().unwrap();
+    let inventory_go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
+        .unwrap()
+        .clone();
+    let snapshot = inventory_go.selected_snapshot_for_test().unwrap();
+    let inventory = source_inventory_profile();
+    let store = workspace.store().unwrap();
+    let key = go_unit_key("example.test/isolation/api", "", "go");
+    let epoch: String = store
+        .read_conn()
+        .unwrap()
+        .query_row(
+            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='go'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let read = |store: &AnalyzerStore, snapshot: &WorkspaceSnapshotId, profile: &[u8; 32]| {
+        go_live_summary(&store.read_conn().unwrap(), snapshot, &epoch, &key, profile).unwrap()
+    };
+    let reconcile = |store: &AnalyzerStore,
+                     snapshot: &WorkspaceSnapshotId,
+                     profile: [u8; 32],
+                     cancellation: &CancellationToken| {
+        let context = store
+            .selected_go_context(snapshot, &profile)
+            .unwrap()
+            .unwrap();
+        let report = store
+            .reconcile_unit_summaries(
+                snapshot,
+                GoUnitSummaries {
+                    context_id: context.context_id,
+                    profile,
+                },
+                cancellation,
+            )
+            .unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        report
+    };
+    let inventory_first = read(store, &snapshot, &inventory).unwrap();
+    activate_go_context(&workspace);
+    let tool_go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
+        .unwrap()
+        .clone();
+    let tool = tool_go.native_context_profile().unwrap();
+    assert_ne!(inventory, tool);
+    let tool_first = read(store, &snapshot, &tool).unwrap();
+    assert_ne!(inventory_first.0, tool_first.0);
+    assert_eq!(
+        read(store, &snapshot, &inventory),
+        Some(inventory_first.clone())
+    );
+    let cancellation = CancellationToken::new();
+
+    // Reversing publication order must retain the tool summary too. A cancelled
+    // pass withdraws rows opened at this revision; re-publication rebinds the
+    // same content-addressed header instead of replacing the other profile.
+    for profile in [inventory, tool] {
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let report = reconcile(store, &snapshot, profile, &cancelled);
+        assert!(
+            report.cancelled && report.closed_versions == 2,
+            "{report:?}"
+        );
+        assert_eq!(read(store, &snapshot, &profile), None);
+        let (other, expected) = if profile == inventory {
+            (tool, &tool_first)
+        } else {
+            (inventory, &inventory_first)
+        };
+        assert_eq!(read(store, &snapshot, &other), Some(expected.clone()));
+        let report = reconcile(store, &snapshot, profile, &cancellation);
+        assert_eq!(report.rebound, 2, "{report:?}");
+        assert_eq!(
+            read(store, &snapshot, &inventory),
+            Some(inventory_first.clone())
+        );
+        assert_eq!(read(store, &snapshot, &tool), Some(tool_first.clone()));
+    }
+
+    std::fs::write(
+        fixture.root().join("api/api.go"),
+        "package api\n\nfunc Public() { println(1) }\n",
+    )
+    .unwrap();
+    let updated = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+        fixture.project_dyn(),
+        go_full_production_config(),
+    )
+    .unwrap();
+    let next = resolve_analyzer::<GoAnalyzer>(updated.analyzer())
+        .unwrap()
+        .selected_snapshot_for_test()
+        .unwrap();
+    assert_eq!(snapshot.generation, next.generation);
+    assert!(snapshot.revision < next.revision);
+    let inventory_next = read(store, &next, &inventory).unwrap();
+    assert_ne!(inventory_next.0, inventory_first.0);
+    // The other profile has no later open interval yet. Its old reconcile must
+    // not be rejected by the newer inventory profile's revision guard.
+    reconcile(store, &snapshot, tool, &cancellation);
+    activate_go_context(&updated);
+    let tool_next = read(store, &next, &tool).unwrap();
+    assert_ne!(tool_next.0, tool_first.0);
+    assert_eq!(inventory_go.native_context_profile(), Some(inventory));
+    assert_eq!(tool_go.native_context_profile(), Some(tool));
+    assert_eq!(
+        read(store, &snapshot, &inventory),
+        Some(inventory_first.clone())
+    );
+    assert_eq!(read(store, &snapshot, &tool), Some(tool_first.clone()));
+
+    // Drop every owner, then reopen actual persisted rows without rebuilding.
+    drop(inventory_go);
+    drop(tool_go);
+    drop(updated);
+    drop(workspace);
+    let reopened = AnalyzerStore::open_persistent(&path).unwrap();
+    assert_eq!(
+        read(&reopened, &snapshot, &inventory),
+        Some(inventory_first)
+    );
+    assert_eq!(read(&reopened, &snapshot, &tool), Some(tool_first));
+    assert_eq!(
+        read(&reopened, &next, &inventory),
+        Some(inventory_next.clone())
+    );
+    assert_eq!(read(&reopened, &next, &tool), Some(tool_next.clone()));
+
+    // At a later revision, cleanup closes earlier intervals instead of deleting
+    // them, leaving old readers valid and the other profile untouched.
+    let mut withdrawal = next.clone();
+    withdrawal.revision += 1;
+    let context = reopened.selected_go_context(&next, &tool).unwrap().unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let report = reopened
+        .reconcile_unit_summaries(
+            &withdrawal,
+            GoUnitSummaries {
+                context_id: context.context_id,
+                profile: tool,
+            },
+            &cancelled,
+        )
+        .unwrap();
+    assert!(
+        report.cancelled && report.closed_versions == 2,
+        "{report:?}"
+    );
+    assert_eq!(read(&reopened, &withdrawal, &tool), None);
+    assert_eq!(read(&reopened, &next, &tool), Some(tool_next));
+    assert_eq!(
+        read(&reopened, &withdrawal, &inventory),
+        Some(inventory_next)
+    );
+    let conn = reopened.read_conn().unwrap();
+    assert!(
+        !conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
 }

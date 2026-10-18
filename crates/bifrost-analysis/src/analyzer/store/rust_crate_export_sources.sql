@@ -6,8 +6,7 @@ SELECT source.module_path, source.blob_id, source.import_ordinal, source.bound_n
        (SELECT restricted_module_path FROM cr_restrictions
         WHERE module_path=source.module_path AND visibility=source.visibility),
        route.target_crate_key, route.target_module_path
-FROM cr_source_imports AS source
-JOIN cr_members AS member ON member.module_path = source.module_path AND member.blob_id = source.blob_id
+FROM cr_module_imports AS source
 JOIN cr_routes AS route ON route.blob_id = source.blob_id
  AND route.import_ordinal = source.import_ordinal AND route.module_path = source.module_path
 WHERE (cr_visibility(source.visibility)<>'restricted' OR EXISTS(

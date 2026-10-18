@@ -10367,9 +10367,11 @@ mod tests {
             PreparedSourceOrigin::Disk,
             None,
         );
-        let file = ProjectFile::new(std::env::temp_dir(), "fixture.cpp");
+        let root = tempfile::tempdir().expect("isolated C++ lowering project");
+        let file = ProjectFile::new(root.path(), "fixture.cpp");
+        std::fs::write(file.abs_path(), source).expect("write the C++ lowering input");
         let analyzer =
-            CppAnalyzer::from_project(crate::TestProject::new(std::env::temp_dir(), Language::Cpp));
+            CppAnalyzer::from_project(crate::TestProject::new(root.path(), Language::Cpp));
         let SemanticOutcome::Complete { value, .. } = CppSemanticLowerer::new(&analyzer)
             .lower(
                 &file,

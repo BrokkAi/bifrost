@@ -53,6 +53,48 @@ value or program-point ID from being paired with rows from another partial
 materialization. Dense IDs are compact implementation coordinates; artifact
 keys provide the public cross-run identity.
 
+### Module initializers and source ownership
+
+Python gives module statements a synthetic `<file>` initializer when a module
+contains a direct statement other than a function or class definition. Decorated
+definitions are still definitions, and comments do not count. Imports,
+assignments and control-flow statements do count. This makes module-level calls
+available to the same value-flow and taint analyses as calls inside functions,
+without adding a frame to files that contain only definitions.
+
+Top-level definitions and the initializer are siblings under the file root.
+The initializer is not the lexical parent of a top-level function: making it
+one would incorrectly turn the function into a nested local function and change
+closure and `nonlocal` behavior. Module names are locals within the initializer.
+Sibling functions retain their structured proofs about module globals, such as
+an unchanged global initializer or a known global callable. This does not imply
+general flow of mutable global state between procedures. Analyses specific to
+function locals, such as uninitialized-local detection, keep their function and
+method scope.
+
+Imports and definition-time expressions retain explicit semantic gaps. The
+initializer does not simulate module loading, decorator execution, default
+argument or annotation evaluation, or class creation. The guard
+`if __name__ == "__main__":` is an ordinary conditional; there is no separate
+script or import execution mode. A policy that distinguishes those contexts
+must establish the distinction from the available structure.
+
+Python class bodies are not lowered. Their execution needs class-namespace and
+metaclass semantics beyond the module initializer's local bindings. Methods
+remain separate procedures, so a call inside a method has that method as its
+owner even though a call directly in the class body has no enclosing procedure.
+
+A procedure owns its source span minus the holes declared by its language
+adapter for nested bodies it does not lower. The inventory carries these holes
+into the in-memory artifact, and shared source-range lookup respects them
+before choosing the enclosing procedure. Python excludes class-body blocks and
+nested callable bodies from ancestor ownership. Independently lowered nested
+procedures can still own their bodies; a class-body call cannot fall back to an
+outer function or the file initializer. A range wholly inside a hole is excluded,
+while a surrounding call or declaration that contains the hole can still belong
+to the enclosing procedure. These ownership facts do not change the persisted
+IR format.
+
 ## Demand-materialized ICFG
 
 Procedure CFGs remain immutable and local. The ICFG provider consults the

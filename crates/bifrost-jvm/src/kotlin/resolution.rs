@@ -9,10 +9,11 @@ use super::declarations::{
 };
 use super::syntax::{
     KOTLIN_TYPE_NODE_KINDS, KotlinScalarType, kotlin_call_with_callee, kotlin_callee,
-    kotlin_declared_scalar_type, kotlin_enclosing_import_header, kotlin_import_header_segments,
-    kotlin_is_declaration_name, kotlin_is_navigation_kind, kotlin_literal_scalar_type,
-    kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
-    kotlin_owner_label_matches, kotlin_parameter_default, kotlin_user_type_segments,
+    kotlin_declared_scalar_type, kotlin_enclosing_import_header, kotlin_first_token,
+    kotlin_import_header_segments, kotlin_is_declaration_name, kotlin_is_navigation_kind,
+    kotlin_literal_scalar_type, kotlin_named_argument_label, kotlin_navigation_member,
+    kotlin_navigation_receiver, kotlin_owner_label_matches, kotlin_parameter_default,
+    kotlin_user_type_segments,
 };
 use crate::constructor_site::ConstructorSite;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, DeclarationKind, ProjectFile};
@@ -178,6 +179,8 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     /// Declared value slots whose type comes from an initializer or an
     /// expression body, with the expression and its context.
     pending_initializers: Vec<(ResolutionTypeSlotId, Node<'source>, WalkContext)>,
+    pending_initializer_values: Vec<(ResolutionTypeSlotId, Node<'source>, WalkContext)>,
+    pending_writes: Vec<(Node<'source>, WalkContext)>,
     package_scope: ResolutionScopeId,
     package_names: Vec<ResolutionNameId>,
     facade_name: Option<ResolutionNameId>,
@@ -228,6 +231,8 @@ pub(super) fn extract_kotlin_resolution<'source>(
         pending_constructor_properties: Vec::new(),
         pending_constructors: Vec::new(),
         pending_initializers: Vec::new(),
+        pending_initializer_values: Vec::new(),
+        pending_writes: Vec::new(),
         package_scope: ResolutionScopeId::new(0),
         package_names: Vec::new(),
         facade_name: None,
@@ -364,6 +369,12 @@ impl<'source, 'collector, 'declarations>
                     }
                 }
                 "property_declaration" => self.record_property(node, context),
+                "assignment" => self.pending_writes.push((node, context)),
+                "prefix_expression" | "postfix_expression"
+                    if matches!(kotlin_first_token(node), Some("++" | "--")) =>
+                {
+                    self.pending_writes.push((node, context));
+                }
                 "parameter" | "class_parameter" => self.record_parameter(node, context),
                 "type_parameter" => self.record_type_parameter(node, context),
                 "user_type" => {
@@ -415,6 +426,7 @@ impl<'source, 'collector, 'declarations>
         self.finish_constructors();
         self.finish_initializers();
         self.finish_calls();
+        self.finish_writes();
         self.finish_import_demands();
         self.finish_supertypes(root);
         self.finish_package_references();
@@ -1569,6 +1581,39 @@ impl<'source, 'collector, 'declarations>
                     }
                 }
             }
+            if local && let Some(expression) = kotlin_expression_after_equals(node) {
+                let output = self.add_slot(site, ResolutionTypeSlotRole::AssignmentValue);
+                if variable.parent() == Some(node) {
+                    self.pending_initializer_values
+                        .push((output, expression, context));
+                } else {
+                    // Each destructured entry receives a component, not the
+                    // whole initializer. Keep that unknown runtime input
+                    // separate from the entry's written declaration type.
+                    assert!(
+                        variable.parent().is_some_and(|parent| {
+                            parent.kind() == "multi_variable_declaration"
+                        })
+                    );
+                    let incoming = self.add_site(
+                        name_node,
+                        ResolutionSiteKind::UnsupportedExpression,
+                        context.scope,
+                    );
+                    assert_ne!(incoming, site);
+                    self.facts
+                        .add_gap(incoming, ResolutionGapKind::InferredType);
+                    let input = self.add_slot(incoming, ResolutionTypeSlotRole::ExpressionValue);
+                    self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                        input,
+                        output,
+                        kind: ResolutionTypeTransferKind::Assignment,
+                        indirection_delta: 0,
+                        reference_indirection_delta: 0,
+                        value_transform: ResolutionTypeTransferValueTransform::Preserve,
+                    });
+                }
+            }
             if context.callable.is_none()
                 && variable
                     .parent()
@@ -2685,6 +2730,16 @@ impl<'source, 'collector, 'declarations>
         {
             expression = lambda;
         }
+        if let Some(slot) = self
+            .expression_slots_by_node
+            .get(&(expression.id(), role))
+            .or_else(|| self.call_result_slots.get(&expression.id()))
+            .copied()
+        {
+            self.expression_slots_by_node
+                .insert((node.id(), role), slot);
+            return slot;
+        }
         let scope = context.scope;
         let slot = if let Some(site) = self.sites_by_node.get(&expression.id()).copied() {
             self.add_slot(site, role)
@@ -3283,6 +3338,82 @@ impl<'source, 'collector, 'declarations>
                 reference_indirection_delta: 0,
                 value_transform: ResolutionTypeTransferValueTransform::Preserve,
             });
+        }
+        for (output, expression, context) in std::mem::take(&mut self.pending_initializer_values) {
+            let input =
+                self.expression_slot(expression, context, ResolutionTypeSlotRole::ExpressionValue);
+            self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                input,
+                output,
+                kind: ResolutionTypeTransferKind::Assignment,
+                indirection_delta: 0,
+                reference_indirection_delta: 0,
+                value_transform: ResolutionTypeTransferValueTransform::Preserve,
+            });
+        }
+    }
+
+    fn finish_writes(&mut self) {
+        for (node, context) in std::mem::take(&mut self.pending_writes) {
+            let children = named_children(node)
+                .into_iter()
+                .filter(|child| !child.is_extra())
+                .collect::<Vec<_>>();
+            let left = children.first().copied();
+            // A directly assignable wrapper can also contain navigation,
+            // indexing or postfix operators. Only its bare identifier is a
+            // lexical write target; a selected member is never a local.
+            let target = left
+                .and_then(|left| match left.kind() {
+                    "simple_identifier" => Some(left),
+                    "directly_assignable_expression" if kotlin_first_token(left).is_none() => {
+                        let children = named_children(left)
+                            .into_iter()
+                            .filter(|child| !child.is_extra())
+                            .collect::<Vec<_>>();
+                        match children.as_slice() {
+                            [identifier] if identifier.kind() == "simple_identifier" => {
+                                Some(*identifier)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .filter(|target| !target.is_missing() && !target.has_error());
+            let value = if node.kind() == "assignment"
+                && kotlin_first_token(node) == Some("=")
+                && target.is_some()
+                && let Some(right) = children.get(1).copied()
+            {
+                self.expression_slot(right, context, ResolutionTypeSlotRole::ExpressionValue)
+            } else {
+                // Compound assignments and updates do not copy the RHS.
+                // Keep an empty input carrying the unsupported operation.
+                let site = self.add_site(
+                    node,
+                    ResolutionSiteKind::UnsupportedExpression,
+                    context.scope,
+                );
+                self.facts.gaps.push(ResolutionGapFact {
+                    site,
+                    kind: ResolutionGapKind::UnsupportedExpression,
+                });
+                self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue)
+            };
+            if let Some(target) = target {
+                if let Some(target) = self.sites_by_node.get(&target.id()).copied() {
+                    self.facts
+                        .local_writes
+                        .push(ResolutionLocalWriteFact { target, value });
+                } else {
+                    let site = self.facts.type_slots[value.index()].site;
+                    self.facts.gaps.push(ResolutionGapFact {
+                        site,
+                        kind: ResolutionGapKind::UnsupportedScopeOrBinder,
+                    });
+                }
+            }
         }
     }
 
@@ -4250,6 +4381,118 @@ fun use(bytes: ByteArray, owner: Holder?) {
     }
 
     #[test]
+    #[hardwon("#5015: Kotlin assignments and typed local initializers had no observed value facts")]
+    fn local_writes_keep_initializer_values_and_isolate_labels_and_members() {
+        let source = r#"
+class Box(var member: String)
+fun consume(value: String) {}
+fun use(box: Box, items: Array<String>) {
+    var typed: String = "first"
+    var inferred = "second"
+    var count = 0
+    typed /* lhs */ = /* rhs */ (inferred)
+    inferred = items[0]
+    consume(value = typed)
+    Box(member = typed)
+    count += 1
+    ++count
+    count--
+    box.member = typed
+    items[0] = inferred
+}
+"#;
+        let parsed = parse(source, "Writes.kt");
+        let facts = &parsed.resolution_facts;
+        let mut writes = facts.local_writes.iter().collect::<Vec<_>>();
+        writes.sort_unstable_by_key(|write| facts.sites[write.target.index()].start_byte);
+        let targets = writes
+            .iter()
+            .map(|write| {
+                let identifier = facts
+                    .identifiers
+                    .iter()
+                    .find(|identifier| identifier.site == write.target)
+                    .expect("write keeps the positioned LHS reference");
+                assert_eq!(identifier.role, ResolutionIdentifierRole::Reference);
+                assert!(identifier.qualifier.is_none());
+                spelling(facts, identifier.name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets, ["typed", "inferred", "count", "count", "count"]);
+        assert!(
+            facts
+                .binding_projections
+                .iter()
+                .any(|projection| projection.output == writes[0].value)
+        );
+        for write in &writes[1..] {
+            let site = facts.type_slots[write.value.index()].site;
+            assert!(
+                facts.gaps.iter().any(|gap| gap.site == site),
+                "{:?}",
+                facts.gaps
+            );
+            assert!(
+                !facts
+                    .type_transfers
+                    .iter()
+                    .any(|transfer| transfer.output == write.value)
+            );
+        }
+        for (name, kind) in [
+            ("typed", ResolutionTypeTransferKind::DeclaredType),
+            ("inferred", ResolutionTypeTransferKind::Initialization),
+            ("count", ResolutionTypeTransferKind::Initialization),
+        ] {
+            let binder = facts
+                .binders
+                .iter()
+                .find(|binder| {
+                    binder.kind == ResolutionBinderKind::Local
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == binder.declaration
+                                && spelling(facts, identifier.name) == name
+                        })
+                })
+                .expect("local binder");
+            let declared = facts
+                .declaration_type_slots
+                .iter()
+                .find(|slot| slot.declaration == binder.declaration)
+                .expect("declared value");
+            assert!(
+                facts
+                    .type_transfers
+                    .iter()
+                    .any(|transfer| { transfer.output == declared.slot && transfer.kind == kind })
+            );
+            let observations = facts
+                .type_transfers
+                .iter()
+                .filter(|transfer| {
+                    let output = facts.type_slots[transfer.output.index()];
+                    transfer.kind == ResolutionTypeTransferKind::Assignment
+                        && output.site == binder.declaration
+                        && output.role == ResolutionTypeSlotRole::AssignmentValue
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 1, "{name}: {observations:?}");
+            assert_ne!(observations[0].output, declared.slot);
+        }
+        for spelling in ["box.member = typed", "items[0] = inferred"] {
+            assert!(
+                facts.gaps.iter().any(|gap| {
+                    let site = facts.sites[gap.site.index()];
+                    gap.kind == ResolutionGapKind::UnsupportedExpression
+                        && &source[site.start_byte..site.end_byte] == spelling
+                }),
+                "{:?}",
+                facts.gaps
+            );
+        }
+    }
+
+    #[test]
     fn inferred_kotlin_declarations_take_their_type_from_the_initializer() {
         let parsed = parse(
             "fun infer(value: String) = value\nval inferred = infer(\"x\")\nval delegated by lazy { 1 }\n",
@@ -4328,6 +4571,91 @@ fun use(bytes: ByteArray, owner: Holder?) {
         assert!(facts.gaps.iter().any(|gap| {
             gap.site == delegated.site && gap.kind == ResolutionGapKind::InferredType
         }));
+    }
+
+    #[test]
+    #[hardwon("#5015: typed destructuring lost unknown incoming values before reassignment")]
+    fn destructured_local_inputs_keep_static_types_and_uninitialized_shadow_separate() {
+        let parsed = parse(
+            "class Box\nfun use(parameter: Box) {\n\
+             var (current: Box, n) = Pair(Box(), 0)\n\
+             current = Box()\n\
+             run { var current: Box; current = Box() }\n\
+             var pending: Box\n}\n",
+            "DestructuredInputs.kt",
+        );
+        let facts = &parsed.resolution_facts;
+        let mut currents = facts
+            .binders
+            .iter()
+            .filter(|binder| {
+                facts.identifiers.iter().any(|identifier| {
+                    identifier.site == binder.declaration
+                        && spelling(facts, identifier.name) == "current"
+                })
+            })
+            .collect::<Vec<_>>();
+        currents.sort_unstable_by_key(|binder| facts.sites[binder.declaration.index()].start_byte);
+        assert_eq!(currents.len(), 2);
+        for (index, binder) in currents.iter().enumerate() {
+            let declared = facts
+                .declaration_type_slots
+                .iter()
+                .find(|row| row.declaration == binder.declaration)
+                .expect("typed binding keeps its declared slot");
+            assert!(facts.type_transfers.iter().any(|row| {
+                row.output == declared.slot && row.kind == ResolutionTypeTransferKind::DeclaredType
+            }));
+            assert!(!facts.gaps.iter().any(|gap| gap.site == binder.declaration));
+            let observations = facts
+                .type_transfers
+                .iter()
+                .filter(|row| {
+                    row.kind == ResolutionTypeTransferKind::Assignment
+                        && facts.type_slots[row.output.index()].site == binder.declaration
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), usize::from(index == 0));
+            if let Some(observation) = observations.first() {
+                let incoming = facts.type_slots[observation.input.index()].site;
+                assert_ne!(incoming, binder.declaration);
+                assert_eq!(
+                    facts.type_slots[observation.output.index()].role,
+                    ResolutionTypeSlotRole::AssignmentValue
+                );
+                assert!(facts.gaps.contains(&ResolutionGapFact {
+                    site: incoming,
+                    kind: ResolutionGapKind::InferredType,
+                }));
+                assert!(
+                    !facts
+                        .type_transfers
+                        .iter()
+                        .any(|row| row.output == observation.input)
+                );
+            }
+        }
+        for name in ["n", "pending", "parameter"] {
+            let declaration = facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Declaration
+                        && spelling(facts, identifier.name) == name
+                })
+                .expect("binding declaration")
+                .site;
+            if name == "n" {
+                assert!(facts.gaps.contains(&ResolutionGapFact {
+                    site: declaration,
+                    kind: ResolutionGapKind::InferredType,
+                }));
+            } else {
+                assert!(!facts.type_slots.iter().any(|slot| {
+                    slot.site == declaration && slot.role == ResolutionTypeSlotRole::AssignmentValue
+                }));
+            }
+        }
     }
 
     #[test]

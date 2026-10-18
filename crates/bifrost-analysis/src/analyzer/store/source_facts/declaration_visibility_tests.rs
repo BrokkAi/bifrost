@@ -1314,7 +1314,7 @@ fn declaration_visibility_key_batches_seek_without_same_blob_fanout() {
     use rusqlite::StatementStatus;
 
     let mut baseline_work = HashMap::new();
-    for declarations in [256, 2048] {
+    for declarations in [256, 2048, 4096] {
         // Bound physical lines so publication reaches the planner-work assertions.
         let methods = (0..declarations)
             .map(|index| format!("public void method{index}() {{}}\n"))
@@ -1382,7 +1382,19 @@ fn declaration_visibility_key_batches_seek_without_same_blob_fanout() {
                         .collect::<rusqlite::Result<Vec<_>>>()
                         .unwrap();
                     let work_key = (format!("{statistics:?}"), arity, case);
-                    if let Some(baseline) = baseline_work.get(&work_key) {
+                    // SQLite's captured statistics move one constant-cost
+                    // manifest lookup ahead of the boundary seek once the blob
+                    // crosses 2048 declarations. That is a fixed planner cost:
+                    // 2048 and 4096 report the same VmStep count. Keep the
+                    // 256-vs-2048 comparison under the statistics-free planner,
+                    // and compare 2048 with 4096 under both planners, so this
+                    // pin still rejects work that grows with unrelated
+                    // declarations without pinning the planner's constant join
+                    // order.
+                    if statistics == PlannerStatisticsState::Representative && declarations == 2048
+                    {
+                        baseline_work.insert(work_key, vm);
+                    } else if let Some(baseline) = baseline_work.get(&work_key) {
                         assert_eq!(
                             vm, *baseline,
                             "same requested batch must not grow with unrelated declarations: {statistics:?}, declarations={declarations}, keys={keys:?}: {plan:?}"
@@ -1401,12 +1413,28 @@ fn declaration_visibility_key_batches_seek_without_same_blob_fanout() {
                             "{statistics:?}, keys={keys:?}: {required}: {plan:?}"
                         );
                     }
+                    // The materialized requested_boundaries CTE holds only the
+                    // requested json_each keys. Each visibility compound arm may
+                    // seek that bounded input through a transient covering index;
+                    // this is the one automatic index shape the pin allows.
+                    let boundary_seek = "SEARCH boundary USING AUTOMATIC COVERING INDEX (blob_id=? AND definition_semantic_key=?) LEFT-JOIN";
+                    assert!(
+                        plan.iter()
+                            .any(|step| step.contains("MATERIALIZE requested_boundaries")),
+                        "{statistics:?}, keys={keys:?}: bounded boundary materialization: {plan:?}"
+                    );
+                    for automatic in plan.iter().filter(|step| step.contains("AUTOMATIC")) {
+                        assert_eq!(
+                            automatic.as_str(),
+                            boundary_seek,
+                            "{statistics:?}, keys={keys:?}: automatic index over unbounded input: {plan:?}"
+                        );
+                    }
                     for forbidden in [
                         "SCAN site",
                         "SCAN legacy",
                         "SCAN native",
                         "SCAN visibility",
-                        "AUTOMATIC",
                         "CO-ROUTINE",
                         "TEMP B-TREE",
                     ] {

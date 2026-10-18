@@ -629,6 +629,7 @@ pub use results::CodeQueryProgramPointBoundary;
 pub use results::CodeQueryProgramPointRef;
 pub use results::CodeQueryProvenance;
 pub use results::CodeQueryProvenanceStep;
+pub use results::CodeQueryPythonHierarchyEndpoint;
 pub use results::CodeQueryPythonHierarchyFact;
 pub use results::CodeQueryPythonImportLeaf;
 pub use results::CodeQueryPythonImportSite;
@@ -6430,6 +6431,15 @@ fn detailed_evidence_for_pipeline_value(
                 key: DetailedCodeQueryKey::PythonHierarchyFact {
                     id: value.id(),
                     root_id: value.root_id.clone(),
+                    declaration_id: value.endpoint_ids[0].clone(),
+                    owner_id: value.endpoint_ids[1].clone(),
+                    target_id: value.endpoint_ids[2].clone(),
+                    target_owner_id: value.endpoint_ids[3].clone(),
+                    fact_kind: value.fact_kind.to_owned(),
+                    outcome: value.outcome.to_owned(),
+                    coverage: value.coverage.to_owned(),
+                    reason: value.reason.map(str::to_owned),
+                    ancestry_basis: value.ancestry_basis.clone(),
                 },
                 file: value.file().clone(),
                 source_slice_sha256: retained_source
@@ -7769,6 +7779,15 @@ fn detailed_trace_provenance_ref(
             DetailedCodeQueryKey::PythonHierarchyFact {
                 id: value.id(),
                 root_id: value.root_id.clone(),
+                declaration_id: value.endpoint_ids[0].clone(),
+                owner_id: value.endpoint_ids[1].clone(),
+                target_id: value.endpoint_ids[2].clone(),
+                target_owner_id: value.endpoint_ids[3].clone(),
+                fact_kind: value.fact_kind.to_owned(),
+                outcome: value.outcome.to_owned(),
+                coverage: value.coverage.to_owned(),
+                reason: value.reason.map(str::to_owned),
+                ancestry_basis: value.ancestry_basis.clone(),
             },
             value.file(),
             value.site_range.unwrap_or(value.root.range),

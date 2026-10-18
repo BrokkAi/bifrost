@@ -325,6 +325,14 @@ pub(super) fn describe_ref(value: &PolicyQueryResultRef) -> String {
             domain,
             ..
         } => format!("cross_domain {operator} {domain} {id}"),
+        PolicyQueryResultRef::PythonHierarchyFact {
+            fact_kind,
+            ancestry_basis,
+            ..
+        } => format!(
+            "python_hierarchy_fact {fact_kind}; {} retained runtime claims",
+            ancestry_basis.claims.len()
+        ),
         PolicyQueryResultRef::StructuralMatch { kind, .. } => format!("structural_match {kind}"),
         PolicyQueryResultRef::Binding { id, name, .. } => format!("binding {name} {id}"),
         PolicyQueryResultRef::LexicalScope { id, index, .. } => {

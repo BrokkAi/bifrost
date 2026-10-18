@@ -75,6 +75,10 @@ pub struct CompiledPackManifest {
     /// sources keep byte-identical manifests and digests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_sources: Vec<String>,
+    /// Exact generation inputs, independent of navigation/source locators.
+    /// Omitted for packs that do not record a source-set acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_inputs: Option<SourceSetInputs>,
     /// Exact native C/C++ portability evidence retained at pack scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpp_portability: Option<CppPortabilityEvidence>,
@@ -84,6 +88,23 @@ pub struct CompiledPackManifest {
     pub semantic_sha256: String,
     pub content_sha256: String,
     pub shards: Vec<CompiledShardDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSetInputs {
+    /// Digest of the canonical exact source set, including paths and bytes.
+    pub sha256: String,
+    /// Actual loaded closure, in strictly ascending relative-path order.
+    pub files: Vec<SourceInputFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceInputFile {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 impl CompiledPackManifest {
@@ -1171,6 +1192,28 @@ pub fn decode_manifest(
             ));
         }
     }
+    if let Some(inputs) = &manifest.source_inputs {
+        if !is_lower_sha256(&inputs.sha256)
+            || inputs.files.is_empty()
+            || inputs
+                .files
+                .windows(2)
+                .any(|pair| pair[0].path >= pair[1].path)
+        {
+            return Err(ArtifactError::InvalidDescriptor(
+                "source inputs require a SHA-256 and unique ascending files".to_owned(),
+            ));
+        }
+        for file in &inputs.files {
+            validate_text(&file.path, limits, "source input path")?;
+            if !is_canonical_relative_path(&file.path) || !is_lower_sha256(&file.sha256) {
+                return Err(ArtifactError::InvalidDescriptor(
+                    "source inputs require canonical relative paths and lowercase SHA-256 digests"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
     if manifest
         .shards
         .windows(2)
@@ -1686,6 +1729,8 @@ pub(crate) fn manifest_content_digest(
         python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
         #[serde(skip_serializing_if = "<[String]>::is_empty")]
         carried_sources: &'a [String],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_inputs: &'a Option<SourceSetInputs>,
         semantic_sha256: &'a str,
         shards: &'a [CompiledShardDescriptor],
     }
@@ -1704,6 +1749,7 @@ pub(crate) fn manifest_content_digest(
         cpp_portability: &manifest.cpp_portability,
         python_correspondence: &manifest.python_correspondence,
         carried_sources: &manifest.carried_sources,
+        source_inputs: &manifest.source_inputs,
         semantic_sha256: &manifest.semantic_sha256,
         shards: &manifest.shards,
     })?;

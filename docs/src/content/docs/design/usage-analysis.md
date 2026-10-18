@@ -88,6 +88,38 @@ find-references includes binding and self-reference sites for navigation;
 external usage, call-graph, and relevance surfaces omit them. Classification
 happens once, so every surface uses the same resolution rules.
 
+## Selected graph caller admission
+
+Native graph admission is separate from reference resolution. For every requested
+caller, the shared driver records either an admitted resolution unit or an explicit
+skipped classification. Admitted and skipped files are disjoint and together cover
+the exact requested caller set, including empty files. That evidence survives unit
+staging, projection, and graph aggregation; a skipped file does not erase the graph
+assembled from admitted callers.
+
+The native Go graph covers the selected Go-tool profile. Its package-context
+publication records `IgnoredGoFiles` as `ignored`-role package memberships. These
+rows are evidence of deliberate build exclusion, never semantic candidates, unit
+members, import sources, reverse-reference sites, or rename targets. A change to
+this publication contract advances the Go context derivation version so retained
+contexts acquire the new evidence.
+
+Go admission distinguishes three skipped outcomes. `excluded_build_selection`
+means the tool explicitly ignored the file for this build; it is a structured
+`file_notes` entry and does not make the graph incomplete. `outside_selected_modules`
+means source inventory places the file in a module whose packages are absent from
+the selected tool context; the product preserves a note for each file and one
+incomplete reason per module import path. Acquiring those modules as independently
+selected contexts is tracked by #5664. `unplaced` means no supported placement is
+available; the product records one incomplete reason per file. Missing caller
+authority cannot prove that any declaration has no inbound references. A missing
+selected context itself remains a whole-operation failure.
+
+Rust retains its existing treatment of files outside selected crates: an explicit
+admitted unit resolves them with an empty crate-key context. The shared admission
+contract does not require a language to discard structured resolution that it can
+already perform for such files.
+
 ## Exact identity across languages
 
 Workspace graph nodes are keyed by an exact `DeclarationId`, with the ecosystem
@@ -180,13 +212,17 @@ the completed graph unpublished.
 
 ## Persisted inputs and compositional usage facts
 
-> **Current:** Rust resolves through the
+> **Current:** Rust target-directed references resolve through the
 > [Name Resolution Engine](../name-resolution/), which stores immutable
 > file-local facts by content identity and composes them with build-unit
-> context in each query. For other languages, Bifrost persists declaration and
-> identifier projections, owns language-specific indexes and prepared facts,
-> builds target-directed or bulk usage products on demand, and retains only
-> complete workspace ranking graphs under exact content keys.
+> context in each query. Go's point navigation, calls, rename, selected
+> target-directed references, and rooted and whole-workspace graphs retain the
+> incumbent backend. `BIFROST_TRIAL_NATIVE_GO=1` selects the native point
+> consumers and graph for trial runs; `BIFROST_TRIAL_NATIVE_GO_GRAPH=1` selects
+> the graph alone. Other languages persist declaration and identifier
+> projections, own language-specific indexes and prepared facts, and build
+> target-directed or bulk usage products on demand. Only complete workspace
+> ranking graphs are retained under exact content keys.
 
 Languages other than Rust assemble workspace graphs by revisiting their
 resolution process. Some analyzers cache or persist file-derived inputs, and the
@@ -219,8 +255,9 @@ Safe composition depends on complete dependency identity. Import aliases,
 conditional includes, macro environments, inheritance, package graphs, and
 dynamic receiver evidence can all affect what a fact means. A compositional
 design must identify each dependency precisely and decline reuse when it cannot.
-A language's existing resolver remains authoritative until the language moves
-onto the engine with all of its consumers.
+Each consumer has one selected authority. During a staged rollout, a language's
+remaining incumbent consumers keep their existing resolver until their own
+cutover; native consumers do not fall back to it.
 
 ## Boundaries and evaluation
 

@@ -284,6 +284,17 @@ fn encode_rows(
         let mut row = EncodedRow::new();
         row.semantic("definition", item.definition());
         row.cell("visibility", item.visibility().label());
+        use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+        let (kind, package, template) = match item.boundary() {
+            None => (None, None, None),
+            Some(DeclarationAccessBoundary::Package(package)) => {
+                (Some(0), Some(package.as_str()), None)
+            }
+            Some(DeclarationAccessBoundary::Template(template)) => (Some(1), None, Some(*template)),
+        };
+        row.cell("boundary_kind", json!(kind));
+        row.cell("boundary_package", json!(package));
+        row.optional_semantic("boundary_template", template);
         emit("declaration_visibilities", sequence, row)?;
     }
     for (sequence, item) in typed.member_scopes().iter().enumerate() {
@@ -527,7 +538,7 @@ pub(in crate::analyzer::store) fn typed_fragment_digest(
     cancellation: &CancellationToken,
 ) -> Result<Option<[u8; 32]>> {
     use crate::analyzer::resolution::CanonicalIdentityHasher;
-    let mut digest = CanonicalHasher::new(b"bifrost-selected-stage-typed:v1");
+    let mut digest = CanonicalHasher::new(b"bifrost-selected-stage-typed:v2-access-boundaries");
     digest.identity_field("fragment", fragment.fragment(), |_| Ok(fragment_content))?;
     digest.field("language", fragment.language().config_label().as_bytes());
     let completed = encode_rows(fragment, cancellation, |family, sequence, row| {
@@ -850,10 +861,23 @@ fn decode_declaration_type(row: &Row<'_>) -> Result<LoweredDeclarationTypeProper
 }
 fn decode_visibility(row: &Row<'_>) -> Result<LoweredDeclarationVisibilityProperty> {
     let visibility: String = row.get("visibility")?;
+    use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+    let boundary = match row.get::<_, Option<i64>>("boundary_kind")? {
+        None => None,
+        Some(0) => Some(DeclarationAccessBoundary::Package(
+            row.get("boundary_package")?,
+        )),
+        Some(1) => Some(DeclarationAccessBoundary::Template(row_semantic(
+            row,
+            "boundary_template",
+        )?)),
+        kind => panic!("stage access boundary kind is valid: {kind:?}"),
+    };
     Ok(LoweredDeclarationVisibilityProperty::new(
         row_semantic(row, "definition")?,
         DeclaredVisibility::from_label(&visibility).expect("stage visibility is valid"),
-    ))
+    )
+    .with_boundary(boundary))
 }
 fn decode_member_scope(row: &Row<'_>) -> Result<LoweredMemberScopeProperty> {
     Ok(LoweredMemberScopeProperty::new(

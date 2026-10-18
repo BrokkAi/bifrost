@@ -565,3 +565,75 @@ fn an_unread_cargo_configuration_edit_changes_nothing() {
          [target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n",
     );
 }
+
+#[test]
+#[hardwon("#5172: cfg_if arms did not follow selected Cargo context changes")]
+fn cfg_if_context_changes_match_fresh_module_placements() {
+    let lib = r#"cfg_if::cfg_if! {
+    if #[cfg(windows)] { pub mod win; }
+    else if #[cfg(any(windows, unix))] { pub mod nix; }
+    else { pub mod other; }
+}
+pub fn caller() { win::run(); nix::run(); other::run(); }
+"#;
+    let project = fixture(&[
+        ("Cargo.toml", WORKSPACE),
+        ("app/Cargo.toml", APP_MANIFEST_WITHOUT_DEP),
+        ("dep/Cargo.toml", DEP_MANIFEST),
+        ("dep/src/lib.rs", DEP_LIB),
+        ("app/src/lib.rs", lib),
+        ("app/src/win.rs", "pub fn run() {}"),
+        ("app/src/nix.rs", "pub fn run() {}"),
+        ("app/src/other.rs", "pub fn run() {}"),
+        (
+            ".cargo/config.toml",
+            "[build]\ntarget = [\"x86_64-pc-windows-msvc\", \"x86_64-unknown-linux-gnu\"]\n",
+        ),
+    ]);
+    for (target, selected) in [
+        ("x86_64-pc-windows-msvc", "win"),
+        ("x86_64-unknown-linux-gnu", "nix"),
+        ("wasm32-unknown-unknown", "other"),
+    ] {
+        let config = format!("[build]\ntarget = {target:?}\n");
+        let (before, after) = assert_configuration_edit_matches_a_fresh_build(
+            &project,
+            ".cargo/config.toml",
+            &config,
+        );
+        if selected == "win" {
+            for name in ["win", "nix", "other"] {
+                assert!(
+                    has_gap(&before, "unknown_activation", &format!("crate::{name}")),
+                    "{:?}",
+                    before.gaps
+                );
+            }
+        }
+        for name in ["win", "nix", "other"] {
+            assert_eq!(
+                has_module(&after, &format!("crate::{name}")),
+                name == selected,
+                "{target}: {:?}",
+                after.modules
+            );
+            if name != selected {
+                assert!(
+                    has_gap(&after, "inactive_placement", &format!("crate::{name}")),
+                    "{target}: {:?}",
+                    after.gaps
+                );
+            }
+        }
+        assert!(
+            !has_gap(&after, "open_export_inventory", "crate"),
+            "{target}: {:?}",
+            after.gaps
+        );
+        assert!(
+            has_edge(&after, "caller", &format!("{selected}.run")),
+            "{target}: {:?}",
+            after.edges
+        );
+    }
+}

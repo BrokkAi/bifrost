@@ -2423,12 +2423,28 @@ fn compare_finding_order(
                     symbol_id: second, ..
                 },
             ) => first.cmp(second),
-            (ClassIdentity::Workspace(_), ClassIdentity::External { .. }) => {
+            (
+                ClassIdentity::Workspace(_),
+                ClassIdentity::External { .. } | ClassIdentity::Intrinsic { .. },
+            ) => std::cmp::Ordering::Less,
+            (
+                ClassIdentity::External { .. } | ClassIdentity::Intrinsic { .. },
+                ClassIdentity::Workspace(_),
+            ) => std::cmp::Ordering::Greater,
+            (ClassIdentity::External { .. }, ClassIdentity::Intrinsic { .. }) => {
                 std::cmp::Ordering::Less
             }
-            (ClassIdentity::External { .. }, ClassIdentity::Workspace(_)) => {
+            (ClassIdentity::Intrinsic { .. }, ClassIdentity::External { .. }) => {
                 std::cmp::Ordering::Greater
             }
+            (
+                ClassIdentity::Intrinsic {
+                    qualified_name: first,
+                },
+                ClassIdentity::Intrinsic {
+                    qualified_name: second,
+                },
+            ) => first.cmp(second),
         })
         .then_with(|| first.origin.file.cmp(&second.origin.file))
         .then_with(|| first.origin.span.cmp(&second.origin.span))

@@ -214,7 +214,7 @@ const TYPED_FAMILIES: &[TypedFamily] = &[
     TypedFamily {
         name: "declaration_visibilities",
         semantics: &["definition"],
-        columns: "visibility TEXT NOT NULL",
+        columns: "visibility TEXT NOT NULL, boundary_template_key INTEGER CHECK(boundary_template_key IS NULL OR boundary_template_key>=0), boundary_template_shared INTEGER CHECK(boundary_template_shared IS NULL OR boundary_template_shared>0), boundary_kind INTEGER CHECK(boundary_kind IN (0,1)), boundary_package TEXT, CHECK(boundary_template_key IS NULL OR boundary_template_shared IS NULL), CHECK((boundary_kind IS NULL AND boundary_package IS NULL AND boundary_template_key IS NULL AND boundary_template_shared IS NULL) OR (boundary_kind IS 0 AND boundary_package IS NOT NULL AND boundary_template_key IS NULL AND boundary_template_shared IS NULL) OR (boundary_kind IS 1 AND boundary_package IS NULL AND ((boundary_template_key IS NULL)<>(boundary_template_shared IS NULL))))",
         unique: &[&["definition"]],
         seeks: &[&["definition"]],
     },

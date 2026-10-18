@@ -36,6 +36,14 @@ pub(crate) fn declare_primary_node(
 /// owns the source arena, so this collector never creates a second identity
 /// space for unnamed impls or malformed declarations.
 pub(crate) trait RustItemSourceSink: SourceOccurrenceSink {
+    fn cfg_condition(
+        &mut self,
+        node: Node<'_>,
+        source: &str,
+    ) -> crate::lexical_scope::RustCfgCondition {
+        crate::lexical_scope::rust_effective_cfg_condition(node, source)
+    }
+
     fn declare_node(&mut self, node: Node<'_>) -> SourceDeclarationId;
 }
 
@@ -77,6 +85,7 @@ impl RustItemSourceCollector {
                 self.facts.macro_inputs.push(
                     brokk_bifrost_core::analyzer::rust_facts::RustMacroInvocationInputSourceFact {
                         invocation,
+                        cfg_condition: sink.cfg_condition(node, source),
                         native_frontier: None,
                         tree,
                         occurrences,

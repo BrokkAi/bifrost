@@ -10,10 +10,9 @@ pub use call_conversion::{JavaLocalAssignmentConversionProver, JavaLocalAssignme
 mod checked_exceptions;
 pub(crate) use call_conversion::{
     JavaFormalShape, declaration_declares_array, declared_type_node, formal_shapes,
-    parse_declaring_file, primitive_actual_type, primitive_converts, primitive_for_name,
+    legacy_static_argument_type, parse_declaring_file, primitive_actual_type, primitive_converts,
+    primitive_for_name,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use call_conversion::{primitive_actual_type_from_syntax, primitive_type};
 mod clones;
 pub(crate) mod diagnostics;
 mod hierarchy;
@@ -1291,6 +1290,51 @@ fn statement_nested_procedure(node: tree_sitter::Node<'_>) -> bool {
 pub(crate) struct JavaSupport;
 
 impl LanguageSupport for JavaSupport {
+    fn numeric_promotion(&self, operands: &[Option<&str>]) -> Option<&'static str> {
+        // JLS 5.6.1/5.6.2: unbox, then promote byte/short/char to int;
+        // otherwise double, float and long dominate in that order.
+        // JLS 15.22.2 also admits the all-boolean bitwise case.
+        let mut rank = 0;
+        let mut booleans = 0;
+        for operand in operands {
+            let next = match (*operand)? {
+                "byte"
+                | "short"
+                | "char"
+                | "int"
+                | "java.lang.Byte"
+                | "java.lang.Short"
+                | "java.lang.Character"
+                | "java.lang.Integer" => 1,
+                "long" | "java.lang.Long" => 2,
+                "float" | "java.lang.Float" => 3,
+                "double" | "java.lang.Double" => 4,
+                "boolean" | "java.lang.Boolean" => {
+                    booleans += 1;
+                    continue;
+                }
+                _ => return None,
+            };
+            rank = rank.max(next);
+        }
+        if booleans != 0 {
+            return (booleans == operands.len()).then_some("boolean");
+        }
+        match rank {
+            1 => Some("int"),
+            2 => Some("long"),
+            3 => Some("float"),
+            4 => Some("double"),
+            _ => None,
+        }
+    }
+
+    fn string_concatenation_operand(&self, operands: &[Option<&str>]) -> Option<usize> {
+        operands
+            .iter()
+            .position(|operand| *operand == Some("java.lang.String"))
+    }
+
     fn native_member_attribution(
         &self,
         context: &crate::analyzer::store::resolution_operation::ProjectedNativeMemberContext,

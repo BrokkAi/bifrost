@@ -306,6 +306,9 @@ labelled_enum! {
         // has no single Return row, so a binder of its first result reads this.
         // Appended last: the persisted role code is this enum's index.
         CallableFirstResult => "callable_first_result",
+        // Unordered observed runtime values of a local or pattern binder.
+        // Appended to preserve every existing persisted role index.
+        ObservedValue => "observed_value",
     }
 }
 
@@ -425,6 +428,10 @@ labelled_enum! {
         Argument => "argument",
         Return => "return",
         UnaryIndirection => "unary_indirection",
+        /// Construct a pointer or reference value from a runtime operand.
+        /// Validated tuples distinguish ordinary addressable/runtime-only
+        /// pointers from a borrowed runtime reference that adds a reference
+        /// indirection while converting the operand to a non-addressable value.
         AddressOf => "address_of",
         /// Apply a proven surrounding type to an expression whose language
         /// syntax takes its type from context, such as Go's untyped nil.
@@ -432,10 +439,22 @@ labelled_enum! {
         /// Carry an operand's proven type into a unary or binary expression
         /// whose result type is determined by that operand.
         ExpressionResult => "expression_result",
+        /// Combine runtime operand types through the language's numeric rule.
+        NumericPromotion => "numeric_promotion",
+        /// A proven String operand decides concatenation; otherwise promote.
+        StringConcatenation => "string_concatenation",
+        /// Unordered union of observed runtime values from an initializer and
+        /// local writes. All inputs contribute values and completion; this is
+        /// one producer and does not apply type-union trait-bound semantics.
+        ValueJoin => "value_join",
     }
 }
 
 impl ResolutionTypeTransferKind {
+    pub const fn is_operand_promotion(self) -> bool {
+        matches!(self, Self::NumericPromotion | Self::StringConcatenation)
+    }
+
     pub const fn component_kind(self) -> Option<ResolutionTypeComponentKind> {
         match self {
             Self::ComponentElement => Some(ResolutionTypeComponentKind::Element),
@@ -470,6 +489,8 @@ pub enum ResolutionTypeTransferValueTransform {
     AddressableOperandOnly,
     /// Admit any runtime operand and produce a non-addressable value.
     RuntimeOnly,
+    /// Admit a runtime operand and publish the type object of its static type.
+    StaticTypeObject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1538,12 +1559,39 @@ pub struct ResolutionDeclarationVisibilityFact {
     pub visibility: DeclaredVisibility,
 }
 
+/// A declaration's explicit lexical access region, resolved by the producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionDeclarationAccessBoundaryFact {
+    pub declaration: ResolutionSiteId,
+    pub boundary: crate::analyzer::source_facts::DeclarationAccessBoundary<ResolutionSiteId>,
+}
+
+/// A reference which structurally names an enclosing owner. It bypasses ordinary
+/// name lookup, so an inner alias cannot capture an access qualifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionLexicalOwnerReferenceFact {
+    pub reference: ResolutionSiteId,
+    /// None records an invalid qualifier with no matching lexical owner. The
+    /// producer supplies incomplete evidence; lowering never looks it up by name.
+    pub declaration: Option<ResolutionSiteId>,
+}
+
 /// Producer-owned permission for one declaration to carry visibility facts.
 ///
 /// This keeps source-language declaration-kind policy out of common lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionVisibilityEligibilityFact {
     pub declaration: ResolutionSiteId,
+}
+
+/// A structurally selected bare local write awaiting exact lexical attachment.
+///
+/// The target is an existing positioned LHS reference, never a member or index.
+/// An unsupported RHS retains its empty, gap-bearing runtime value slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionLocalWriteFact {
+    pub target: ResolutionSiteId,
+    pub value: ResolutionTypeSlotId,
 }
 
 /// One source file's normalized, target-independent resolution rows.
@@ -1582,6 +1630,7 @@ pub struct FileResolutionFacts {
     pub declaration_type_slots: Vec<DeclarationTypeSlotFact>,
     pub binding_projections: Vec<BindingProjectionFact>,
     pub type_transfers: Vec<ResolutionTypeTransferFact>,
+    pub local_writes: Vec<ResolutionLocalWriteFact>,
     pub type_components: Vec<ResolutionTypeComponentFact>,
     pub type_productions: Vec<ResolutionTypeProductionFact>,
     pub declared_type_arguments: Vec<ResolutionDeclaredTypeArgumentFact>,
@@ -1639,6 +1688,8 @@ pub struct FileResolutionFacts {
     pub reference_owners: Vec<ResolutionReferenceOwnerFact>,
     pub visibility_eligibilities: Vec<ResolutionVisibilityEligibilityFact>,
     pub declaration_visibilities: Vec<ResolutionDeclarationVisibilityFact>,
+    pub declaration_access_boundaries: Vec<ResolutionDeclarationAccessBoundaryFact>,
+    pub lexical_owner_references: Vec<ResolutionLexicalOwnerReferenceFact>,
     pub supertypes: Vec<ResolutionSupertypeFact>,
     pub construction_requirements: Vec<ResolutionConstructionRequirementFact>,
     pub reference_enumeration_gaps: Vec<ResolutionReferenceEnumerationGapFact>,
@@ -1941,6 +1992,8 @@ impl FileResolutionFacts {
             && self.reference_owners.is_empty()
             && self.visibility_eligibilities.is_empty()
             && self.declaration_visibilities.is_empty()
+            && self.declaration_access_boundaries.is_empty()
+            && self.lexical_owner_references.is_empty()
             && self.supertypes.is_empty()
             && self.construction_requirements.is_empty()
             && self.reference_enumeration_gaps.is_empty()
@@ -2191,6 +2244,19 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.reference_owners))
             .saturating_add(rows(&self.visibility_eligibilities))
             .saturating_add(rows(&self.declaration_visibilities))
+            .saturating_add(rows(&self.declaration_access_boundaries))
+            .saturating_add(
+                self.declaration_access_boundaries
+                    .iter()
+                    .map(|fact| match &fact.boundary {
+                        crate::analyzer::source_facts::DeclarationAccessBoundary::Package(
+                            package,
+                        ) => package.capacity(),
+                        _ => 0,
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(rows(&self.lexical_owner_references))
             .saturating_add(rows(&self.supertypes))
             .saturating_add(rows(&self.construction_requirements))
             .saturating_add(rows(&self.reference_enumeration_gaps))

@@ -1,5 +1,6 @@
 use super::environment::{BINDING_QUERY_AXES, BindingValue, EnvironmentTraversalCache};
 use super::occurrences::OccurrenceTraversalCache;
+use super::python_class_hierarchy::{HierarchyDecision, attach_hierarchy_premises, member_premise};
 use super::row_relations::binding_of_expansions;
 use super::{PipelineExpansion, PipelineValue, SeedMatch, pipeline_expansion, rel_path_string};
 use crate::analyzer::IAnalyzer;
@@ -160,6 +161,9 @@ pub(super) fn comparison_using_is_expansions(
         cancellation,
         diagnostics,
     );
+    let mut premises = left_class.premises;
+    premises.extend(right_class.premises);
+    let (left_class, right_class) = (left_class.value, right_class.value);
     if matches!(left_class, OperandClass::Singleton)
         || matches!(right_class, OperandClass::Singleton)
     {
@@ -173,9 +177,12 @@ pub(super) fn comparison_using_is_expansions(
         );
     }
     if comparison_has_value_equality(left_class, right_class) {
-        return vec![pipeline_expansion(PipelineValue::StructuralMatch(
-            Arc::clone(seed),
-        ))];
+        return {
+            let mut expansion =
+                pipeline_expansion(PipelineValue::StructuralMatch(Arc::clone(seed)));
+            attach_hierarchy_premises(&mut expansion, &premises);
+            vec![expansion]
+        };
     }
     Vec::new()
 }
@@ -225,7 +232,7 @@ pub(super) fn comparison_using_is_non_portable_expansions(
     }
 
     let left_class = if matches!(left_interning, LiteralInterning::CpythonOnly) {
-        OperandClass::ValueEquality
+        HierarchyDecision::plain(OperandClass::ValueEquality)
     } else {
         operand_class(
             analyzer,
@@ -237,7 +244,7 @@ pub(super) fn comparison_using_is_non_portable_expansions(
         )
     };
     let right_class = if matches!(right_interning, LiteralInterning::CpythonOnly) {
-        OperandClass::ValueEquality
+        HierarchyDecision::plain(OperandClass::ValueEquality)
     } else {
         operand_class(
             analyzer,
@@ -248,6 +255,9 @@ pub(super) fn comparison_using_is_non_portable_expansions(
             diagnostics,
         )
     };
+    let mut premises = left_class.premises;
+    premises.extend(right_class.premises);
+    let (left_class, right_class) = (left_class.value, right_class.value);
     if matches!(left_class, OperandClass::Singleton)
         || matches!(right_class, OperandClass::Singleton)
     {
@@ -263,9 +273,9 @@ pub(super) fn comparison_using_is_non_portable_expansions(
     if !comparison_has_value_equality(left_class, right_class) {
         return Vec::new();
     }
-    vec![pipeline_expansion(PipelineValue::StructuralMatch(
-        Arc::clone(seed),
-    ))]
+    let mut expansion = pipeline_expansion(PipelineValue::StructuralMatch(Arc::clone(seed)));
+    attach_hierarchy_premises(&mut expansion, &premises);
+    vec![expansion]
 }
 
 fn comparison_has_value_equality(left: OperandClass, right: OperandClass) -> bool {
@@ -565,73 +575,93 @@ fn operand_class(
     operand: Node<'_>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<super::results::CodeQueryDiagnostic>,
-) -> OperandClass {
-    let mut expression = operand;
-    while expression.kind() == "parenthesized_expression" {
-        let Some(inner) = expression.named_child(0) else {
-            return unresolved_operand_class(seed, diagnostics, "a parenthesized operand is empty");
+) -> HierarchyDecision<OperandClass> {
+    let mut unwrapped = operand;
+    while unwrapped.kind() == "parenthesized_expression" {
+        let Some(inner) = unwrapped.named_child(0) else {
+            break;
         };
-        expression = inner;
+        unwrapped = inner;
     }
-    match expression.kind() {
-        "none" | "true" | "false" | "ellipsis" => OperandClass::Singleton,
-        "integer"
-        | "float"
-        | "string"
-        | "concatenated_string"
-        | "tuple"
-        | "list"
-        | "dictionary"
-        | "set" => OperandClass::ValueEquality,
-        "binary_operator" if python_string_expression(expression) => OperandClass::ValueEquality,
-        "identifier"
-            if matches!(
-                node_text(seed.facts.source(), expression),
-                Some("NotImplemented" | "Ellipsis")
-            ) =>
-        {
-            let expected_identity = format!(
-                "builtins.{}",
-                node_text(seed.facts.source(), expression).expect("guard matched an identifier")
-            );
-            match super::python_rule_facts::builtin_value_identity_at_range(
-                analyzer,
-                environment_cache,
-                &seed.file,
-                seed.facts.source(),
-                expression.start_byte(),
-                expression.end_byte(),
-                cancellation,
-                diagnostics,
-            ) {
-                Ok(Some(identity)) if identity == expected_identity => OperandClass::Singleton,
-                Ok(Some(_)) => unresolved_operand_class(
-                    seed,
-                    diagnostics,
-                    "the NotImplemented spelling resolved to a different builtin",
-                ),
-                Ok(None) => unresolved_operand_class(
-                    seed,
-                    diagnostics,
-                    "NotImplemented is not proven to be the builtin singleton",
-                ),
-                Err(reason) => unresolved_operand_class(seed, diagnostics, &reason),
-            }
-        }
-        "call" => class_of_constructor_call(
+    if unwrapped.kind() == "call" {
+        return class_of_constructor_call(
             analyzer,
             environment_cache,
             seed,
-            expression,
+            unwrapped,
             cancellation,
             diagnostics,
-        ),
-        _ => unresolved_operand_class(
-            seed,
-            diagnostics,
-            "the operand form does not establish a runtime class",
-        ),
+        );
     }
+    let value = (|| {
+        let mut expression = operand;
+        while expression.kind() == "parenthesized_expression" {
+            let Some(inner) = expression.named_child(0) else {
+                return unresolved_operand_class(
+                    seed,
+                    diagnostics,
+                    "a parenthesized operand is empty",
+                );
+            };
+            expression = inner;
+        }
+        match expression.kind() {
+            "none" | "true" | "false" | "ellipsis" => OperandClass::Singleton,
+            "integer"
+            | "float"
+            | "string"
+            | "concatenated_string"
+            | "tuple"
+            | "list"
+            | "dictionary"
+            | "set" => OperandClass::ValueEquality,
+            "binary_operator" if python_string_expression(expression) => {
+                OperandClass::ValueEquality
+            }
+            "identifier"
+                if matches!(
+                    node_text(seed.facts.source(), expression),
+                    Some("NotImplemented" | "Ellipsis")
+                ) =>
+            {
+                let expected_identity = format!(
+                    "builtins.{}",
+                    node_text(seed.facts.source(), expression)
+                        .expect("guard matched an identifier")
+                );
+                match super::python_rule_facts::builtin_value_identity_at_range(
+                    analyzer,
+                    environment_cache,
+                    &seed.file,
+                    seed.facts.source(),
+                    expression.start_byte(),
+                    expression.end_byte(),
+                    cancellation,
+                    diagnostics,
+                ) {
+                    Ok(Some(identity)) if identity == expected_identity => OperandClass::Singleton,
+                    Ok(Some(_)) => unresolved_operand_class(
+                        seed,
+                        diagnostics,
+                        "the NotImplemented spelling resolved to a different builtin",
+                    ),
+                    Ok(None) => unresolved_operand_class(
+                        seed,
+                        diagnostics,
+                        "NotImplemented is not proven to be the builtin singleton",
+                    ),
+                    Err(reason) => unresolved_operand_class(seed, diagnostics, &reason),
+                }
+            }
+            "call" => unreachable!("constructor handled before literal classification"),
+            _ => unresolved_operand_class(
+                seed,
+                diagnostics,
+                "the operand form does not establish a runtime class",
+            ),
+        }
+    })();
+    HierarchyDecision::plain(value)
 }
 
 fn proven_singleton_operand(
@@ -684,77 +714,92 @@ fn class_of_constructor_call(
     call: Node<'_>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<super::results::CodeQueryDiagnostic>,
-) -> OperandClass {
-    let Some(function) = call.child_by_field_name("function") else {
-        return unresolved_operand_class(seed, diagnostics, "a constructor call has no callee");
-    };
-    if function.kind() == "identifier"
-        && let Ok(Some(identity)) = super::python_rule_facts::builtin_value_identity_at_range(
+) -> HierarchyDecision<OperandClass> {
+    let mut premises = Vec::new();
+    let value = (|| {
+        let Some(function) = call.child_by_field_name("function") else {
+            return unresolved_operand_class(seed, diagnostics, "a constructor call has no callee");
+        };
+        if function.kind() == "identifier"
+            && let Ok(Some(identity)) = super::python_rule_facts::builtin_value_identity_at_range(
+                analyzer,
+                environment_cache,
+                &seed.file,
+                seed.facts.source(),
+                function.start_byte(),
+                function.end_byte(),
+                cancellation,
+                diagnostics,
+            )
+            && let Some(class) = builtin_value_class(&identity)
+        {
+            return class;
+        }
+        let fallback = CancellationToken::default();
+        let lookup = resolve_definition_batch_with_source_and_cancellation(
             analyzer,
-            environment_cache,
-            &seed.file,
-            seed.facts.source(),
-            function.start_byte(),
-            function.end_byte(),
-            cancellation,
-            diagnostics,
-        )
-        && let Some(class) = builtin_value_class(&identity)
-    {
-        return class;
-    }
-    let fallback = CancellationToken::default();
-    let lookup = resolve_definition_batch_with_source_and_cancellation(
-        analyzer,
-        vec![DefinitionLookupRequest {
-            file: seed.file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(function.start_byte()),
-            end_byte: Some(function.end_byte()),
-        }],
-        seed.file.clone(),
-        Arc::<str>::from(seed.facts.source()),
-        cancellation.unwrap_or(&fallback),
-    );
-    let [outcome] = lookup.as_slice() else {
-        return unresolved_operand_class(
-            seed,
-            diagnostics,
-            "the constructor target lookup is missing",
+            vec![DefinitionLookupRequest {
+                file: seed.file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(function.start_byte()),
+                end_byte: Some(function.end_byte()),
+            }],
+            seed.file.clone(),
+            Arc::<str>::from(seed.facts.source()),
+            cancellation.unwrap_or(&fallback),
         );
-    };
-    if outcome.status != DefinitionLookupStatus::Resolved || outcome.definitions.len() != 1 {
-        return unresolved_operand_class(
-            seed,
-            diagnostics,
-            "the constructor target is unresolved or ambiguous",
-        );
-    }
-    let class = &outcome.definitions[0];
-    if !class.is_class() {
-        return unresolved_operand_class(seed, diagnostics, "the call target is not a class");
-    }
-    let Some(provider) = analyzer.python_class_hierarchy_provider_for(class) else {
-        return unresolved_operand_class(
-            seed,
-            diagnostics,
-            "the class hierarchy provider is unavailable",
-        );
-    };
-    let answer = provider.mro_members(class, cancellation);
-    if answer.hierarchy.outcome != PythonHierarchyOutcome::Complete {
-        return unresolved_operand_class(seed, diagnostics, "the class MRO is incomplete");
-    }
-    if answer
-        .members
-        .iter()
-        .any(|member| member.name == "__eq__" && member.member.is_callable())
-    {
-        OperandClass::ValueEquality
-    } else {
-        OperandClass::IdentityOnly
-    }
+        let [outcome] = lookup.as_slice() else {
+            return unresolved_operand_class(
+                seed,
+                diagnostics,
+                "the constructor target lookup is missing",
+            );
+        };
+        if outcome.status != DefinitionLookupStatus::Resolved || outcome.definitions.len() != 1 {
+            return unresolved_operand_class(
+                seed,
+                diagnostics,
+                "the constructor target is unresolved or ambiguous",
+            );
+        }
+        let class = &outcome.definitions[0];
+        if !class.is_class() {
+            return unresolved_operand_class(seed, diagnostics, "the call target is not a class");
+        }
+        let Some(provider) = analyzer.python_class_hierarchy_provider_for(class) else {
+            return unresolved_operand_class(
+                seed,
+                diagnostics,
+                "the class hierarchy provider is unavailable",
+            );
+        };
+        let answer = provider.mro_members(class, cancellation);
+        let Some(premise) = member_premise(analyzer, class, &answer) else {
+            return unresolved_operand_class(
+                seed,
+                diagnostics,
+                "the class hierarchy source anchor is unavailable",
+            );
+        };
+        premises.push(premise);
+        if answer
+            .members
+            .iter()
+            .any(|member| member.name == "__eq__" && member.member.is_callable())
+        {
+            OperandClass::ValueEquality
+        } else if answer.outcome == PythonHierarchyOutcome::Complete {
+            OperandClass::IdentityOnly
+        } else {
+            unresolved_operand_class(
+                seed,
+                diagnostics,
+                "the class member inventory is incomplete",
+            )
+        }
+    })();
+    HierarchyDecision { value, premises }
 }
 
 fn builtin_value_class(identity: &str) -> Option<OperandClass> {

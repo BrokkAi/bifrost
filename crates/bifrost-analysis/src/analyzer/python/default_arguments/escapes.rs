@@ -61,7 +61,7 @@ pub(super) fn escaped_functions(
         let index = graph.add_scope(None, ScopeKind::Module, None, None);
         assert_eq!(index, prepared_files.len());
         graph.file_modules.insert(file.clone(), index);
-        let module = python_module_name(file);
+        let module = python_module_name(analyzer.project(), file);
         // These are structured module identities, not source spelling parses.
         *graph
             .module_tail_counts
@@ -73,7 +73,7 @@ pub(super) fn escaped_functions(
     // Namespace packages need identities too, but merely existing on disk
     // does not attach their children. Only imports add those namespace edges.
     for file in &files {
-        let mut module = python_module_name(file);
+        let mut module = python_module_name(analyzer.project(), file);
         while let Some((parent, _)) = module.rsplit_once('.') {
             consume(remaining_nodes)?;
             module = parent.to_owned();
@@ -640,7 +640,9 @@ impl<'tree> EscapeGraph<'tree> {
         for _ in &modules {
             consume(remaining)?;
         }
-        retain_modules_for_importer(&files[importer], &mut modules, |unit| unit.source());
+        retain_modules_for_importer(analyzer.project(), &files[importer], &mut modules, |unit| {
+            unit.source()
+        });
         if !modules.is_empty() {
             let mut targets = Vec::new();
             for unit in modules {
@@ -774,7 +776,11 @@ impl<'tree> EscapeGraph<'tree> {
                     wildcard,
                     ..
                 } => {
-                    let module = resolve_python_module_specifier(&files[import.file], &module)?;
+                    let module = resolve_python_module_specifier(
+                        analyzer.project(),
+                        &files[import.file],
+                        &module,
+                    )?;
                     self.attach_module(analyzer, files, import.file, &module, remaining)?;
                     let targets =
                         self.module_targets(analyzer, files, import.file, &module, remaining)?;

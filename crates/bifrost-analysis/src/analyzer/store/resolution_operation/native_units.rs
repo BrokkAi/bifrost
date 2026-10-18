@@ -113,7 +113,231 @@ type NativeReferenceUnitsOutcome =
 type NativeReferenceTypesOutcome =
     SelectedResolutionOperationOutcome<SelectedResolutionLocated<SelectedNativeReferenceTypes>>;
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct SelectedNativeAssignmentValue {
+    pub(crate) types: SelectedNativeReferenceTypes,
+    pub(crate) observed_frontier_complete: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type NativeAssignmentValueOutcome =
+    SelectedResolutionOperationOutcome<SelectedResolutionLocated<SelectedNativeAssignmentValue>>;
+
+/// Apply the session's cancellation and budget boundary even when setup or a
+/// projection returns an explicit missing-evidence error.
+#[cfg(any(test, feature = "test-support"))]
+fn finish_assignment_value_query<T>(
+    session: &ResolutionSession,
+    outcome: Result<T>,
+) -> Result<BoundedResolution<T>> {
+    Ok(match session.finish(outcome) {
+        BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
+            value: value?,
+            work,
+        },
+        BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+        BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn assignment_value_answer(
+    ready: &ReadySelectedResolution<'_, '_>,
+    answer: FactResolutionAnswer,
+    slot: SemanticId,
+    value_types: SelectedNativeTypes,
+) -> Result<SelectedNativeAssignmentValue> {
+    let frontier = answer
+        .projected_frontiers()
+        .iter()
+        .find(|frontier| frontier.slot() == slot)
+        .ok_or_else(|| StoreError::new("assignment-value probe has no observed frontier"))?;
+    let observed_frontier_complete = frontier.completion() == &ResolutionCompletion::Complete;
+    let named_reasons = named_reason_details(ready, answer.completion())?;
+    Ok(SelectedNativeAssignmentValue {
+        types: SelectedNativeReferenceTypes {
+            named_reasons,
+            answer,
+            value_types,
+            query_result_slot: Some(slot),
+            direct_target: None,
+        },
+        observed_frontier_complete,
+    })
+}
+
 impl SelectedResolutionOperation<'_, '_> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_native_assignment_value_bounded(
+        &mut self,
+        context: SelectedResolutionContextSet,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedResolution<NativeAssignmentValueOutcome>> {
+        let session = ResolutionSession::bounded(budget, Some(cancellation));
+        self.resolve_native_assignment_value_in_session(super::NativeReferenceQuery {
+            context,
+            locator,
+            cancellation,
+            context_metrics: &mut SelectedResolutionContextMetrics,
+            session: &session,
+            artifacts: None,
+            go_demand: None,
+            selected_import_gap: None,
+            go_receiver_overlay: None,
+            query_result_slot: None,
+            point_metrics: None,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_go_assignment_value_bounded(
+        &mut self,
+        prepared: super::GoPreparedImportContext,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedResolution<NativeAssignmentValueOutcome>> {
+        let session = ResolutionSession::bounded(budget, Some(cancellation));
+        self.resolve_native_assignment_value_in_session(super::NativeReferenceQuery {
+            context: prepared.context,
+            locator,
+            cancellation,
+            context_metrics: &mut SelectedResolutionContextMetrics,
+            session: &session,
+            artifacts: None,
+            go_demand: Some(prepared.demand),
+            selected_import_gap: None,
+            go_receiver_overlay: None,
+            query_result_slot: None,
+            point_metrics: None,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn resolve_native_assignment_value_in_session(
+        &mut self,
+        query: super::NativeReferenceQuery<'_>,
+    ) -> Result<BoundedResolution<NativeAssignmentValueOutcome>> {
+        let slot = std::cell::Cell::new(None);
+        assert!(query.query_result_slot.is_none());
+        let session = query.session;
+        let cancellation = query.cancellation;
+        let outcome = self.resolve_reference_with_projection_and_setup(
+            query,
+            |operation, reference| {
+                slot.set(Some(
+                    operation.select_native_assignment_value_slot(reference)?,
+                ));
+                Ok(())
+            },
+            |ready, operation, _, answer| {
+                let types = project_native_reference_types(
+                    ready,
+                    operation,
+                    &answer,
+                    cancellation,
+                    session,
+                )?;
+                assignment_value_answer(
+                    ready,
+                    answer,
+                    slot.get()
+                        .expect("assignment query setup selected its slot"),
+                    types,
+                )
+            },
+        );
+        finish_assignment_value_query(session, outcome)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_rust_assignment_value_bounded(
+        &mut self,
+        caller: &Path,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedResolution<NativeAssignmentValueOutcome>> {
+        let session = ResolutionSession::bounded(budget, Some(cancellation));
+        let slot = std::cell::Cell::new(None);
+        let outcome = self.resolve_rust_references_for_caller_with_setup(
+            caller,
+            &[locator],
+            cancellation,
+            &mut SelectedResolutionContextMetrics,
+            &mut ResolutionBatchMetrics::default(),
+            &session,
+            RustDeclarationAccessKind::Caller,
+            |operation, reference| {
+                if slot.get().is_some() {
+                    return Err(StoreError::new("assignment-value probe has ambiguous reference sites"));
+                }
+                slot.set(Some(operation.select_native_assignment_value_slot(reference)?));
+                Ok(())
+            },
+            |operation, answer, ready, mounts, session, cancellation| {
+                let types = match project_rust_reference_types(
+                    operation, answer, ready, mounts, session, cancellation, locator,
+                )? {
+                    SelectedResolutionOperationOutcome::Native(types) => types,
+                    SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                        return Ok(SelectedResolutionOperationOutcome::Unavailable(reason));
+                    }
+                    SelectedResolutionOperationOutcome::Stale(reason) => {
+                        return Ok(SelectedResolutionOperationOutcome::Stale(reason));
+                    }
+                    SelectedResolutionOperationOutcome::Cancelled(completion) => {
+                        return Ok(SelectedResolutionOperationOutcome::Cancelled(completion));
+                    }
+                };
+                let nominal = types.nominal_types.into_iter().map(|(identity, definition)| {
+                    let definition = match definition {
+                        SelectedRustSourceDefinition::Unit(unit) => SelectedNativeDefinition::Unit(unit),
+                        SelectedRustSourceDefinition::Lexical(definition) => SelectedNativeDefinition::Lexical(definition),
+                        SelectedRustSourceDefinition::UniverseEntry
+                        | SelectedRustSourceDefinition::WithoutUnit { .. } => return Err(StoreError::new("assignment-value nominal type has no source projection")),
+                    };
+                    Ok((identity, definition))
+                }).collect::<Result<Vec<_>>>()?;
+                Ok(SelectedResolutionOperationOutcome::Native(assignment_value_answer(
+                    ready,
+                    answer.clone(),
+                    slot.get().expect("assignment query setup selected its slot"),
+                    SelectedNativeTypes::Ready {
+                        nominal,
+                        intrinsic: types.intrinsic_types,
+                        external_owners: Vec::new(),
+                    },
+                )?))
+            },
+        ).and_then(|outcome| {
+            Ok(match outcome.into_single() {
+                SelectedRustCallerReferenceOutcome::UnsupportedCallerProfile => {
+                    return Err(StoreError::new("assignment-value probe has no supported Rust caller profile"));
+                }
+                SelectedRustCallerReferenceOutcome::Operation(outcome) => match outcome {
+                    SelectedResolutionOperationOutcome::Native(located) => {
+                        SelectedResolutionOperationOutcome::Native(match located {
+                            SelectedResolutionLocated::Missing => SelectedResolutionLocated::Missing,
+                            SelectedResolutionLocated::Found(mut answers) => {
+                                if answers.len() != 1 {
+                                    return Err(StoreError::new("assignment-value probe requires one exact Rust reference"));
+                                }
+                                SelectedResolutionLocated::Found(answers.remove(0).projection)
+                            }
+                        })
+                    }
+                    SelectedResolutionOperationOutcome::Unavailable(reason) => SelectedResolutionOperationOutcome::Unavailable(reason),
+                    SelectedResolutionOperationOutcome::Stale(reason) => SelectedResolutionOperationOutcome::Stale(reason),
+                    SelectedResolutionOperationOutcome::Cancelled(completion) => SelectedResolutionOperationOutcome::Cancelled(completion),
+                },
+            })
+        });
+        finish_assignment_value_query(&session, outcome)
+    }
+
     pub(crate) fn resolve_native_reference_types_bounded(
         mut self,
         context: SelectedResolutionContextSet,
@@ -122,6 +346,39 @@ impl SelectedResolutionOperation<'_, '_> {
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
     ) -> Result<BoundedResolution<NativeReferenceTypesOutcome>> {
+        let query_result_slot = match (locator.reference_range(), locator.call_argument_ordinal()) {
+            (Some((start, end)), Some(ordinal)) => self.point_call_argument_slot_at(
+                locator.storage_language(),
+                locator.relative_path(),
+                start,
+                end,
+                ordinal,
+                cancellation,
+            )?,
+            (Some((start, end)), None) if locator.storage_language() == "java" => self
+                .point_expression_value_slot_at(
+                    locator.storage_language(),
+                    locator.relative_path(),
+                    start,
+                    end,
+                    cancellation,
+                )?,
+            _ => None,
+        };
+        if locator.call_argument_ordinal().is_some() && query_result_slot.is_none() {
+            return Ok(if cancellation.is_cancelled() {
+                BoundedResolution::Cancelled {
+                    work: Default::default(),
+                }
+            } else {
+                BoundedResolution::Complete {
+                    value: SelectedResolutionOperationOutcome::Native(
+                        SelectedResolutionLocated::Missing,
+                    ),
+                    work: Default::default(),
+                }
+            });
+        }
         let session = ResolutionSession::bounded(budget, Some(cancellation));
         let outcome = self.resolve_reference_with_projection(
             super::NativeReferenceQuery {
@@ -134,7 +391,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 go_demand: None,
                 selected_import_gap: None,
                 go_receiver_overlay: None,
-                query_result_slot: None,
+                query_result_slot,
                 point_metrics: None,
             },
             |ready, operation, _, answer| {
@@ -150,7 +407,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 Ok(SelectedNativeReferenceTypes {
                     answer,
                     value_types: types,
-                    query_result_slot: None,
+                    query_result_slot,
                     direct_target,
                     named_reasons,
                 })

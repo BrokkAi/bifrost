@@ -28,6 +28,15 @@ pub(crate) fn cost(facts: &ScalaSourceFacts) -> (usize, usize) {
         bytes = bytes.saturating_add(expression.segments.iter().map(String::len).sum::<usize>());
     }
     for fact in &facts.declarations {
+        if let Some(boundary) = &fact.access_boundary {
+            rows = rows.saturating_add(1);
+            if let brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary::Package(
+                package,
+            ) = boundary
+            {
+                bytes = bytes.saturating_add(package.len());
+            }
+        }
         rows = rows
             .saturating_add(1)
             .saturating_add(fact.lexical_prefixes.len())
@@ -104,6 +113,28 @@ fn insert(
     );
     let expressions = ExpressionRows::from_facts(facts);
 
+    let mut access_boundaries = tx.prepare_cached(
+        "INSERT INTO source_declaration_access_boundaries(blob_id,declaration_id,boundary_kind,package_region,template_declaration_id) VALUES(?1,?2,?3,?4,?5)"
+    )?;
+    for fact in &facts.declarations {
+        use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+        let Some(boundary) = &fact.access_boundary else {
+            continue;
+        };
+        check_cancelled(cancellation)?;
+        let (kind, package, template) = match boundary {
+            DeclarationAccessBoundary::Package(package) => (0, Some(package.as_str()), None),
+            DeclarationAccessBoundary::Template(template) => (1, None, Some(template.get())),
+        };
+        access_boundaries.execute(params![
+            blob_id,
+            fact.declaration.get(),
+            kind,
+            package,
+            template
+        ])?;
+    }
+    drop(access_boundaries);
     let mut declarations = tx.prepare_cached(
         "INSERT INTO source_scala_declarations(
            blob_id, declaration_id, kind, visibility, callable_present,

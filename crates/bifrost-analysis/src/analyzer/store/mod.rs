@@ -47,6 +47,7 @@ pub(crate) mod go_unit_summaries;
 pub(crate) mod import_graph;
 pub(crate) mod jvm_external_inventory;
 pub(crate) mod rust_unit_summaries;
+mod unit_schedule;
 pub(crate) mod unit_summaries;
 pub(crate) use go_package_context::{GoContextHeadStatus, GoContextIdentity};
 pub(crate) use import_graph::{
@@ -2822,6 +2823,59 @@ impl AnalyzerStore {
         let out = path_symbol_rows_by_fqn_in_tx(&tx, langs, exact_fqn, normalized_fqn)?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// Existing path-symbol lookup with a source-row cap before hydration.
+    pub(crate) fn path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+        &self,
+        workspace_snapshots: &WorkspaceSnapshots,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        names: (&str, &str),
+        limit: usize,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> Result<LimitedQueryRows<(String, PathSymbolRow)>> {
+        let (exact_fqn, normalized_fqn) = names;
+        if limit == 0 || !continue_query() {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+        }
+        let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let mut rows = Vec::new();
+        for lang in langs {
+            for (sql, name) in std::iter::once((EXACT_PATH_SYMBOL_FQN_SQL, exact_fqn)).chain(
+                (normalized_fqn != exact_fqn)
+                    .then_some((NORMALIZED_PATH_SYMBOL_FQN_SQL, normalized_fqn)),
+            ) {
+                let remaining = limit - rows.len();
+                if remaining == 0 {
+                    return Ok(LimitedQueryRows::incomplete(rows, limit));
+                }
+                let sql = format!("{sql} LIMIT ?3");
+                let mut statement = tx.prepare_cached(&sql)?;
+                let mut source = statement.query(params![
+                    lang,
+                    name,
+                    i64::try_from(remaining).unwrap_or(i64::MAX)
+                ])?;
+                loop {
+                    if !continue_query() {
+                        let inspected = rows.len();
+                        return Ok(LimitedQueryRows::incomplete(rows, inspected));
+                    }
+                    let Some(row) = source.next()? else { break };
+                    rows.push((row.get::<_, String>(0)?, decode_path_symbol_row(row, 1)?));
+                }
+            }
+        }
+        tx.commit()?;
+        let inspected = rows.len();
+        Ok(if inspected == limit {
+            LimitedQueryRows::incomplete(rows, inspected)
+        } else {
+            LimitedQueryRows::complete(rows, inspected)
+        })
     }
 
     #[cfg(test)]
@@ -21687,8 +21741,8 @@ fn main() {}
             .write_parsed_blob(
                 python_oid,
                 "python",
-                &PythonAdapter,
-                &parse_state(&PythonAdapter, &python_file),
+                &PythonAdapter::for_test_file(&python_file),
+                &parse_state(&PythonAdapter::for_test_file(&python_file), &python_file),
             )
             .unwrap();
         store
@@ -23942,7 +23996,7 @@ fn main() {}
         let file = write_file(root, "pkg/corrupt.py", "class Corrupt:\n    pass\n");
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
-        let adapter = PythonAdapter;
+        let adapter = PythonAdapter::for_test_file(&file);
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
@@ -23988,8 +24042,8 @@ fn main() {}
             .write_parsed_blob(
                 oid,
                 "python",
-                &PythonAdapter,
-                &parse_state(&PythonAdapter, &file),
+                &PythonAdapter::for_test_file(&file),
+                &parse_state(&PythonAdapter::for_test_file(&file), &file),
             )
             .unwrap();
 
@@ -24008,7 +24062,7 @@ fn main() {}
 
         assert!(!store.contains_parsed_blob(oid, "python").unwrap());
         let error = store
-            .hydrate_file_state(oid, "python", &PythonAdapter, &file)
+            .hydrate_file_state(oid, "python", &PythonAdapter::for_test_file(&file), &file)
             .unwrap_err();
         assert!(error.to_string().contains("unknown optional analyzer fact"));
     }
@@ -24126,7 +24180,7 @@ fn main() {}
             assert_deleting_side_table_marks_incomplete(&RubyAdapter, "ruby", &ruby_file, table);
         }
         assert_deleting_side_table_marks_incomplete(
-            &PythonAdapter,
+            &PythonAdapter::for_test_file(&python_file),
             "python",
             &python_file,
             "import_statements",
@@ -25214,6 +25268,16 @@ fn main() {}
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3864: warm JS/TS blobs must not retain merged wrapper export identities"
+    )]
+    #[test]
+    fn jsts_bundled_export_owners_invalidate_prior_dialect_blobs() {
+        assert_ts_tsx_bump_invalidates_prior_dialect_blobs(
+            "jsts-commonjs-lexical-export-owners-3864-landing-2026-10-17",
+        );
+    }
+
     /// #3451: Python now records callable modifier metadata, and it recorded
     /// none before. A blob persisted under the prior epoch deserializes as
     /// "nobody read the modifiers", which is indistinguishable from a callable
@@ -25231,9 +25295,13 @@ fn main() {}
             "widget.py",
             "class Widget:\n    @staticmethod\n    def build(spec):\n        return spec\n\n    def render(self, target):\n        return target\n",
         );
-        let state = Arc::new(parse_state(&PythonAdapter, &file));
+        let state = Arc::new(parse_state(&PythonAdapter::for_test_file(&file), &file));
         let prior_epoch = epoch::python_epoch_before_callable_modifier_metadata();
-        assert_prior_parsed_blob_invalidated(&PythonAdapter, state.as_ref(), &prior_epoch);
+        assert_prior_parsed_blob_invalidated(
+            &PythonAdapter::for_test_file(&file),
+            state.as_ref(),
+            &prior_epoch,
+        );
     }
 
     /// #3455: Go now records callable modifier metadata, and it recorded none
@@ -25448,7 +25516,7 @@ fn main() {}
         let file = write_file(root, "pkg/side_effect_only.py", "import os\n");
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
-        let adapter = PythonAdapter;
+        let adapter = PythonAdapter::for_test_file(&file);
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
 
@@ -25776,6 +25844,173 @@ fn main() {}
             1
         );
 
+        // Keep both query sources nonempty: exact and normalized lookups must
+        // share one cap, including when they admit the same persisted row.
+        let normalized_row = PathSymbolRow {
+            normalized_fqn: "normalized.Model".to_string(),
+            ..row.clone()
+        };
+        let second_file = write_file(temp.path(), "Other.java", "class Model {}\n");
+        assert_eq!(
+            oid_for(second_file.read_to_string().unwrap().as_bytes()),
+            oid
+        );
+        let second_row = PathSymbolRow {
+            rel_path: "Other.java".to_string(),
+            ..normalized_row.clone()
+        };
+        let snapshot_a = store
+            .sync_workspace_snapshot(
+                "java",
+                a,
+                &[
+                    WorkspaceFileRow {
+                        rel_path: row.rel_path.clone(),
+                        blob_oid: oid,
+                    },
+                    WorkspaceFileRow {
+                        rel_path: second_row.rel_path.clone(),
+                        blob_oid: oid,
+                    },
+                ],
+                &[normalized_row.clone(), second_row],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let selected_a = HashMap::from_iter([("java".to_string(), snapshot_a)]);
+        let bounded = |limit, continue_query: &mut dyn FnMut() -> bool| {
+            store
+                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                    &selected_a,
+                    &langs,
+                    &a_map,
+                    ("Model", "normalized.Model"),
+                    limit,
+                    continue_query,
+                )
+                .unwrap()
+        };
+        let ample = bounded(5, &mut || true);
+        assert!(ample.complete);
+        assert_eq!(ample.inspected, 4);
+        assert_eq!(ample.rows.len(), 4);
+        assert!(ample.rows.iter().all(|(lang, item)| lang == "java"
+            && matches!(item.rel_path.as_str(), "Model.java" | "Other.java")
+            && item.blob_oid == oid));
+        for limit in [0, 1, 2, 3, 4] {
+            let capped = bounded(limit, &mut || true);
+            assert!(!capped.complete, "reaching the cap is not an absence proof");
+            assert_eq!(capped.inspected, limit);
+            assert_eq!(capped.rows.len(), limit);
+        }
+        let stopped = bounded(5, &mut || false);
+        assert!(!stopped.complete);
+        assert!(stopped.rows.is_empty());
+        assert_eq!(stopped.inspected, 0);
+        let mut polls = 0;
+        let interrupted = bounded(5, &mut || {
+            polls += 1;
+            polls <= 2
+        });
+        assert!(!interrupted.complete);
+        assert_eq!(interrupted.inspected, 1);
+        assert_eq!(interrupted.rows.len(), 1);
+        assert_eq!(interrupted.rows[0].1.rel_path, "Model.java");
+        let missing = store
+            .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                &selected_a,
+                &langs,
+                &a_map,
+                ("Missing", "normalized.Missing"),
+                3,
+                || true,
+            )
+            .unwrap();
+        assert!(missing.complete);
+        assert!(missing.rows.is_empty());
+        assert_eq!(missing.inspected, 0);
+
+        // These are generic storage rows, not Java/Python resolution. A second
+        // language proves the cap is not reset for each language's SQL cursor.
+        let python_file = write_file(temp.path(), "other.py", "pass\n");
+        let python_adapter = PythonAdapter::for_test_file(&python_file);
+        let python_oid = oid_for(python_file.read_to_string().unwrap().as_bytes());
+        let python_generation = store.ensure_language_epoch_value("python", "a").unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                python_oid,
+                "python",
+                python_generation,
+                &python_adapter,
+                &parse_state(&python_adapter, &python_file),
+            )
+            .unwrap();
+        let python_row = PathSymbolRow {
+            rel_path: "other.py".to_string(),
+            blob_oid: python_oid,
+            ..normalized_row.clone()
+        };
+        let python_snapshot = store
+            .sync_workspace_snapshot(
+                "python",
+                python_generation,
+                &[WorkspaceFileRow {
+                    rel_path: python_row.rel_path.clone(),
+                    blob_oid: python_oid,
+                }],
+                &[python_row],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let mut selected_both = selected_a.clone();
+        selected_both.insert("python".to_string(), python_snapshot);
+        let both_langs = vec!["java".to_string(), "python".to_string()];
+        let both_generations = HashMap::from_iter([
+            ("java".to_string(), a),
+            ("python".to_string(), python_generation),
+        ]);
+        let across_languages = |limit| {
+            store
+                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                    &selected_both,
+                    &both_langs,
+                    &both_generations,
+                    ("Model", "normalized.Model"),
+                    limit,
+                    || true,
+                )
+                .unwrap()
+        };
+        let capped_languages = across_languages(5);
+        assert!(!capped_languages.complete);
+        assert_eq!(capped_languages.inspected, 5);
+        assert_eq!(
+            capped_languages
+                .rows
+                .iter()
+                .map(|(lang, _)| lang.as_str())
+                .collect::<Vec<_>>(),
+            vec!["java", "java", "java", "java", "python"]
+        );
+        let all_languages = across_languages(7);
+        assert!(all_languages.complete);
+        assert_eq!(all_languages.inspected, 6);
+        assert_eq!(
+            all_languages
+                .rows
+                .iter()
+                .map(|(lang, _)| lang.as_str())
+                .collect::<Vec<_>>(),
+            vec!["java", "java", "java", "java", "python", "python"]
+        );
+
         let b = store.ensure_language_epoch_value("java", "b").unwrap();
         let b_map = HashMap::from_iter([("java".to_string(), b)]);
         assert!(
@@ -25795,6 +26030,99 @@ fn main() {}
                 .path_symbol_rows_by_fqn_for_langs(&langs, &b_map, "Model", "Model")
                 .unwrap()
                 .is_empty()
+        );
+
+        assert!(
+            store
+                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                    &selected_a,
+                    &langs,
+                    &a_map,
+                    ("Model", "normalized.Model"),
+                    8,
+                    || true,
+                )
+                .unwrap_err()
+                .is_stale_generation()
+        );
+        let after_cutover = store
+            .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                &selected_a,
+                &langs,
+                &b_map,
+                ("Model", "normalized.Model"),
+                8,
+                || true,
+            )
+            .unwrap();
+        assert!(after_cutover.complete);
+        assert!(after_cutover.rows.is_empty());
+        assert_eq!(after_cutover.inspected, 0);
+
+        let current_file = write_file(temp.path(), "Model.java", "class Model { int current; }\n");
+        let current_oid = oid_for(current_file.read_to_string().unwrap().as_bytes());
+        store
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                current_oid,
+                "java",
+                b,
+                &JavaAdapter,
+                &parse_state(&JavaAdapter, &current_file),
+            )
+            .unwrap();
+        let current_row = PathSymbolRow {
+            blob_oid: current_oid,
+            ..normalized_row
+        };
+        let snapshot_b = store
+            .sync_workspace_snapshot(
+                "java",
+                b,
+                &[WorkspaceFileRow {
+                    rel_path: current_row.rel_path.clone(),
+                    blob_oid: current_oid,
+                }],
+                &[current_row],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let selected_b = HashMap::from_iter([("java".to_string(), snapshot_b)]);
+        let current = store
+            .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                &selected_b,
+                &langs,
+                &b_map,
+                ("Model", "normalized.Model"),
+                8,
+                || true,
+            )
+            .unwrap();
+        assert!(current.complete);
+        assert_eq!(current.inspected, 2);
+        assert_eq!(current.rows.len(), 2);
+        assert!(
+            current
+                .rows
+                .iter()
+                .all(|(_, item)| item.blob_oid == current_oid)
+        );
+        assert_ne!(current_oid, oid);
+        assert!(
+            store
+                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+                    &selected_b,
+                    &langs,
+                    &a_map,
+                    ("Model", "normalized.Model"),
+                    8,
+                    || true,
+                )
+                .unwrap_err()
+                .is_stale_generation()
         );
     }
 
@@ -27549,7 +27877,11 @@ fn main() {}
         let _ = python_init;
 
         assert_round_trip(&JavaAdapter, "java", &java_file);
-        assert_round_trip(&PythonAdapter, "python", &python_file);
+        assert_round_trip(
+            &PythonAdapter::for_test_file(&python_file),
+            "python",
+            &python_file,
+        );
         assert_round_trip(&TypescriptAdapter, "typescript", &ts_file);
     }
 
@@ -27564,7 +27896,7 @@ fn main() {}
         );
         let source = python_file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
-        let adapter = PythonAdapter;
+        let adapter = PythonAdapter::for_test_file(&python_file);
         let parsed = parse_state(&adapter, &python_file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
@@ -27611,7 +27943,11 @@ fn main() {}
         assert_round_trip(&RubyAdapter, "ruby", &ruby_file);
         assert_round_trip(&ScalaAdapter, "scala", &scala_file);
         assert_round_trip(&CppAdapter, "cpp", &cpp_file);
-        assert_round_trip(&PythonAdapter, "python", &python_file);
+        assert_round_trip(
+            &PythonAdapter::for_test_file(&python_file),
+            "python",
+            &python_file,
+        );
 
         let source = python_file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
@@ -27620,8 +27956,8 @@ fn main() {}
             .write_parsed_blob(
                 oid,
                 "python",
-                &PythonAdapter,
-                &parse_state(&PythonAdapter, &python_file),
+                &PythonAdapter::for_test_file(&python_file),
+                &parse_state(&PythonAdapter::for_test_file(&python_file), &python_file),
             )
             .unwrap();
         let conn = store.conn.lock().unwrap();
@@ -27678,7 +28014,7 @@ fn main() {}
         let file_a = write_file(root, "pkg_a/mod.py", content);
         let file_b = write_file(root, "pkg_b/sub/mod.py", content);
         let oid = oid_for(content.as_bytes());
-        let adapter = PythonAdapter;
+        let adapter = PythonAdapter::for_test_file(&file_a);
         let state_a = parse_state(&adapter, &file_a);
         let state_b = parse_state(&adapter, &file_b);
         let store = AnalyzerStore::open_ephemeral().unwrap();

@@ -7045,6 +7045,15 @@ pub enum DetailedCodeQueryKey {
     PythonHierarchyFact {
         id: String,
         root_id: String,
+        declaration_id: Option<String>,
+        owner_id: Option<String>,
+        target_id: Option<String>,
+        target_owner_id: Option<String>,
+        fact_kind: String,
+        outcome: String,
+        coverage: String,
+        reason: Option<String>,
+        ancestry_basis: crate::analyzer::usages::python_class_hierarchy::PythonAncestryBasis,
     },
     CallShape {
         id: String,

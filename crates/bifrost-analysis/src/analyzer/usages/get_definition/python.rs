@@ -20,10 +20,11 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_python::bindings::{
-    PythonLexicalNameResolution, PythonLexicalScopeBindings, python_comprehension_binds_name_at,
+    PythonClassReferenceScope, PythonLexicalNameResolution, PythonLexicalScopeBindings,
+    python_comprehension_binds_name_at, python_comprehension_binds_name_at_bounded,
     python_direct_scope_bindings_bounded, python_executable_scope_children,
-    python_module_or_class_scope_binds_name_bounded, python_type_parameter_binds_name_at,
-    python_unambiguous_module_class_binding_bounded,
+    python_global_binding_is_untouched_bounded, python_type_parameter_binds_name_at,
+    python_type_parameter_binds_name_at_bounded, python_unambiguous_module_class_binding_bounded,
 };
 use brokk_bifrost_python::declarations::python_module_name;
 use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
@@ -38,7 +39,7 @@ use brokk_bifrost_python::imports::{
 use brokk_bifrost_python::source_facts::PythonSourceFactProvider;
 use brokk_bifrost_python::syntax::{
     leftmost_identifier, python_keyword_argument_label, python_reference_is_deferred_function_body,
-    python_static_attribute_path,
+    python_static_attribute_path, python_static_attribute_path_bounded,
 };
 use brokk_bifrost_python::usage_index::visible_module_binding_suffix;
 use std::cell::Cell;
@@ -199,6 +200,14 @@ impl<'a> PythonDefinitionProvider<'a> {
         }
     }
 
+    pub(crate) fn analyzer(&self) -> &PythonAnalyzer {
+        self.python
+    }
+
+    pub(crate) fn session(&self) -> &ResolutionSession {
+        self.session
+    }
+
     pub(crate) fn source_facts_unavailable(&self) -> bool {
         self.source_facts_unavailable.get()
     }
@@ -246,8 +255,8 @@ impl<'a> PythonDefinitionProvider<'a> {
     }
 
     /// Resolve one module identity through the request session. The source
-    /// trait intentionally exposes the path and definition lookups separately;
-    /// preserve their path-first semantics while charging each lookup.
+    /// module surface is path-backed. An incomplete bounded path query must
+    /// remain a session stop, not launch an allocating definition fallback.
     ///
     /// `importer` is the file whose import named `module`. Two sibling source
     /// roots can spell one module name, so the root that owns the importer is
@@ -255,14 +264,24 @@ impl<'a> PythonDefinitionProvider<'a> {
     /// containing root owns keeps every candidate and therefore no unique
     /// identity, which is the honest answer for an interactive lookup.
     fn module_code_unit(&self, importer: &ProjectFile, module: &str) -> Option<CodeUnit> {
-        let path = self.session.query(|| self.python.path_module_fqn(module))?;
-        let mut candidates = match path {
-            Some(units) => units,
-            None => self.session.query(|| self.python.definition_fqn(module))?,
-        };
-        retain_modules_for_importer(importer, &mut candidates, CodeUnit::source);
+        let mut candidates = self.module_candidates(module);
+        retain_modules_for_importer(
+            self.python.project(),
+            importer,
+            &mut candidates,
+            CodeUnit::source,
+        );
         let candidate = unique_python_candidate(candidates)?;
         candidate.is_module().then_some(candidate)
+    }
+
+    fn module_candidates(&self, module: &str) -> Vec<CodeUnit> {
+        self.session.query_limited_rows(|limit| {
+            self.python
+                .module_candidates_by_fqn_limited(module, limit, || {
+                    self.session.observe_cancellation()
+                })
+        })
     }
 
     pub(crate) fn members_for_owner(&self, owner: &CodeUnit, name: &str) -> Vec<CodeUnit> {
@@ -345,7 +364,7 @@ pub(crate) fn resolve_python_bounded(
             ),
         ));
     };
-    if let Some(module_fqn) = python_import_module_fqn(file, source, node)
+    if let Some(module_fqn) = python_import_module_fqn(python.project(), file, source, node)
         && let Some(Some(module)) =
             session.query(|| resolve_module_code_unit(python, Some(file), &module_fqn))
     {
@@ -772,7 +791,7 @@ pub(crate) fn python_namespace_imported_class_name_bounded(
     root: Node<'_>,
     expression: Node<'_>,
 ) -> Option<String> {
-    let path = python_static_attribute_path(expression)?;
+    let path = python_static_attribute_path_bounded(expression, || support.scope_step())?;
     if path.len() < 2 {
         return None;
     }
@@ -833,7 +852,7 @@ fn python_namespace_imported_module_path_bounded(
     root: Node<'_>,
     expression: Node<'_>,
 ) -> Option<Box<[Box<str>]>> {
-    let path = python_static_attribute_path(expression)?;
+    let path = python_static_attribute_path_bounded(expression, || support.scope_step())?;
     let local_name = python_slice(*path.first()?, source);
     if local_name.is_empty()
         || python_namespace_root_shadowed_bounded(support, local_name, expression, source)?
@@ -881,7 +900,7 @@ pub(crate) fn python_external_imported_symbol_bounded(
     if !support.python.indexed_source_matches(file, source) {
         return None;
     }
-    let path = python_static_attribute_path(expression)?;
+    let path = python_static_attribute_path_bounded(expression, || support.scope_step())?;
     let local_name = python_slice(*path.first()?, source);
     let binder = support.import_binder(token, file)?;
     let binding = binder.bindings.get(local_name)?;
@@ -946,18 +965,25 @@ pub(crate) fn python_external_imported_symbol_bounded(
     {
         return None;
     }
-    let workspace_modules = support
-        .session
-        .query(|| support.python.path_module_fqn(&module))??;
-    if !workspace_modules.is_empty()
-        || !support.fqn(&module).is_empty()
-        || !support.fqn(&format!("{module}.{member}")).is_empty()
-        || !support.scope_step()
+    if !python_external_model_namespace_available(support, &module, &member)
         || !support.python.indexed_source_matches(file, source)
     {
         return None;
     }
     Some((module, member))
+}
+
+/// A model cannot replace a workspace module/member whose source does not
+/// establish the requested external class object.
+pub(crate) fn python_external_model_namespace_available(
+    support: &PythonDefinitionProvider<'_>,
+    module: &str,
+    member: &str,
+) -> bool {
+    support.module_candidates(module).is_empty()
+        && support.fqn(module).is_empty()
+        && support.fqn(&format!("{module}.{member}")).is_empty()
+        && support.scope_step()
 }
 
 fn python_complete_external_module(
@@ -1262,8 +1288,10 @@ fn python_namespace_root_shadowed_bounded(
     reference: Node<'_>,
     source: &str,
 ) -> Option<bool> {
-    if python_comprehension_binds_name_at(name, reference, source)
-        || python_type_parameter_binds_name_at(name, reference, source)
+    if python_comprehension_binds_name_at_bounded(name, reference, source, || support.scope_step())?
+        || python_type_parameter_binds_name_at_bounded(name, reference, source, || {
+            support.scope_step()
+        })?
     {
         return Some(true);
     }
@@ -1280,23 +1308,49 @@ fn python_namespace_root_shadowed_bounded(
         if inside_body && matches!(parent.kind(), "function_definition" | "lambda") {
             let inventory =
                 python_lexical_scope_inventory_bounded(parent, source, || support.scope_step())?;
-            if inventory.has_runtime_callable_binding_at(name, reference)
+            let resolution =
+                inventory.name_resolution_at_bounded(name, reference, || support.scope_step())?;
+            if resolution == PythonLexicalNameResolution::Global {
+                return Some(!python_global_binding_is_untouched_bounded(
+                    name,
+                    reference,
+                    parent,
+                    source,
+                    || support.scope_step(),
+                )?);
+            }
+            if inventory
+                .has_runtime_callable_binding_at_bounded(name, reference, || support.scope_step())?
                 || matches!(
-                    inventory.name_resolution_at(name, reference),
+                    resolution,
                     PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal
                 )
             {
                 return Some(true);
             }
             crossed_callable_body = true;
-        } else if parent.kind() == "class_definition"
-            && !crossed_callable_body
-            && inside_body
-            && python_module_or_class_scope_binds_name_bounded(parent, name, source, || {
-                support.scope_step()
-            })?
-        {
-            return Some(true);
+        } else if parent.kind() == "class_definition" && !crossed_callable_body && inside_body {
+            let class_scope =
+                PythonClassReferenceScope::new_bounded(parent, reference, || support.scope_step())?;
+            let inventory = class_scope.collect_bounded(source, || support.scope_step())?;
+            let resolution =
+                inventory.name_resolution_at_bounded(name, reference, || support.scope_step())?;
+            if resolution == PythonLexicalNameResolution::Global {
+                return Some(!python_global_binding_is_untouched_bounded(
+                    name,
+                    reference,
+                    parent,
+                    source,
+                    || support.scope_step(),
+                )?);
+            }
+            if resolution == PythonLexicalNameResolution::Nonlocal
+                || class_scope.binds_name_bounded(name, source, || support.scope_step())?
+            {
+                return Some(true);
+            }
+            // Nested classes do not capture their enclosing class namespace.
+            crossed_callable_body = true;
         }
         current = parent;
     }
@@ -1476,7 +1530,8 @@ fn python_wildcard_imports_reexport_same_external_bounded(
         else {
             return Some(false);
         };
-        let Some(module) = resolve_python_relative_module(file, &module) else {
+        let Some(module) = resolve_python_relative_module(support.python.project(), file, &module)
+        else {
             return Some(false);
         };
         let Some(module_unit) = support
@@ -1626,7 +1681,9 @@ fn python_type_for_expression_bounded(
                     let name = python_slice(function, source);
                     let lexical_binding = python_lexical_binding_bounded(support, function, source);
                     match lexical_binding {
-                        PythonLexicalBinding::Other => return None,
+                        PythonLexicalBinding::Other | PythonLexicalBinding::LocalClass(_) => {
+                            return None;
+                        }
                         PythonLexicalBinding::LocalFunction(declaration) => {
                             return python_function_return_type_from_node_bounded(
                                 support,
@@ -1848,6 +1905,147 @@ fn python_assignment_bound_type_bounded(
             python_type_for_expression_bounded(support, token, file, source, root, value, depth)
         }),
     }
+}
+
+/// A selected runtime base must name the class object itself. Type inference
+/// for an instance/call/annotation is deliberately not used here.
+pub(crate) fn python_class_object_base_candidate(
+    support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    prepared: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
+    base: Node<'_>,
+) -> Option<CodeUnit> {
+    let source = prepared.source();
+    if base.kind() == "attribute" {
+        let path = python_static_attribute_path_bounded(base, || support.scope_step())?;
+        let root = *path.first()?;
+        if python_type_parameter_binds_name_at_bounded(
+            python_slice(root, source),
+            root,
+            source,
+            || support.scope_step(),
+        )? {
+            return None;
+        }
+        let canonical = python_namespace_imported_class_name_bounded(
+            support,
+            token,
+            file,
+            source,
+            prepared.tree().root_node(),
+            base,
+        )?;
+        let (module, member) = canonical.rsplit_once('.')?;
+        return python_imported_class_from_module(
+            support,
+            token,
+            file,
+            module.into(),
+            member.into(),
+        );
+    }
+    if base.kind() != "identifier" {
+        return None;
+    }
+    let name = python_slice(base, source);
+    // Only the nearest executing class body participates. C's own header
+    // executes outside C's body, and methods/lambdas do not capture a class
+    // namespace. Inspect this scope before an enclosing callable's bindings.
+    let mut current = base;
+    while let Some(parent) = current.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        let inside_body = parent.child_by_field_name("body").is_some_and(|body| {
+            body.start_byte() <= base.start_byte() && base.end_byte() <= body.end_byte()
+        });
+        if inside_body && matches!(parent.kind(), "function_definition" | "lambda") {
+            break;
+        }
+        if inside_body && parent.kind() == "class_definition" {
+            let class_scope =
+                PythonClassReferenceScope::new_bounded(parent, base, || support.scope_step())?;
+            let inventory = class_scope.collect_bounded(source, || support.scope_step())?;
+            let binds = class_scope.binds_name_bounded(name, source, || support.scope_step())?;
+            match inventory.name_resolution_at_bounded(name, base, || support.scope_step())? {
+                PythonLexicalNameResolution::Global => {
+                    // Skip outer locals, but never skip known writes to this
+                    // same global namespace in enclosing executing scopes.
+                    return if python_global_binding_is_untouched_bounded(
+                        name,
+                        base,
+                        parent,
+                        source,
+                        || support.scope_step(),
+                    )? {
+                        python_class_candidate_for_name(support, token, file, source, base, name)
+                    } else {
+                        None
+                    };
+                }
+                PythonLexicalNameResolution::Nonlocal => return None,
+                PythonLexicalNameResolution::Local => {
+                    let declaration =
+                        inventory
+                            .local_class_declaration_bounded(name, base, || support.scope_step())?;
+                    if declaration.parent() != parent.child_by_field_name("body")
+                        || declaration.end_byte() > base.start_byte()
+                    {
+                        return None;
+                    }
+                    return python_unit_for_class_declaration(
+                        support,
+                        file,
+                        source,
+                        base,
+                        declaration,
+                    );
+                }
+                PythonLexicalNameResolution::Unbound if binds => return None,
+                PythonLexicalNameResolution::Unbound => break,
+            }
+        }
+        current = parent;
+    }
+    if python_type_parameter_binds_name_at_bounded(name, base, source, || support.scope_step())? {
+        return None;
+    }
+    match python_lexical_declaration_binding_bounded(support, base, source) {
+        PythonLexicalBinding::LocalClass(declaration) => {
+            python_unit_for_class_declaration(support, file, source, base, declaration)
+        }
+        PythonLexicalBinding::UnboundOrGlobal => {
+            python_class_candidate_for_name(support, token, file, source, base, name)
+        }
+        PythonLexicalBinding::LocalFunction(_) | PythonLexicalBinding::Other => None,
+    }
+}
+
+fn python_unit_for_class_declaration(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    base: Node<'_>,
+    declaration: Node<'_>,
+) -> Option<CodeUnit> {
+    let name = python_slice(declaration.child_by_field_name("name")?, source);
+    let mut selected = None;
+    for candidate in support.file_identifier(file, name) {
+        if !support.scope_step() {
+            return None;
+        }
+        if candidate.is_class()
+            && python_class_node_for_candidate_bounded(support, source, base, &candidate)
+                == Some(declaration)
+        {
+            if selected.is_some() {
+                return None;
+            }
+            selected = Some(candidate);
+        }
+    }
+    selected
 }
 
 pub(crate) fn python_class_candidate_for_name(
@@ -2985,10 +3183,22 @@ fn python_has_lexical_binding_bounded(
 enum PythonLexicalBinding<'tree> {
     UnboundOrGlobal,
     LocalFunction(Node<'tree>),
+    LocalClass(Node<'tree>),
     Other,
 }
 
 fn python_lexical_binding_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    identifier: Node<'tree>,
+    source: &str,
+) -> PythonLexicalBinding<'tree> {
+    match python_lexical_declaration_binding_bounded(support, identifier, source) {
+        PythonLexicalBinding::LocalClass(_) => PythonLexicalBinding::Other,
+        binding => binding,
+    }
+}
+
+fn python_lexical_declaration_binding_bounded<'tree>(
     support: &PythonDefinitionProvider<'_>,
     identifier: Node<'tree>,
     source: &str,
@@ -3014,10 +3224,44 @@ fn python_lexical_binding_bounded<'tree>(
             else {
                 return PythonLexicalBinding::Other;
             };
-            match inventory.name_resolution_at(name, identifier) {
+            let Some(resolution) =
+                inventory.name_resolution_at_bounded(name, identifier, || support.scope_step())
+            else {
+                return PythonLexicalBinding::Other;
+            };
+            match resolution {
                 PythonLexicalNameResolution::Local => {
-                    let Some(declaration) = inventory.local_function_declaration(name, identifier)
-                    else {
+                    let declaration = if let Some(declaration) = inventory
+                        .local_function_declaration_bounded(name, identifier, || {
+                            support.scope_step()
+                        }) {
+                        declaration
+                    } else if let Some(declaration) =
+                        inventory.local_class_declaration_bounded(name, identifier, || {
+                            support.scope_step()
+                        })
+                    {
+                        // Class bases execute now. Prove a preceding class in
+                        // the identical immediate statement container; never
+                        // turn a parameter/assignment/conditional into a class.
+                        let mut statement = identifier;
+                        while statement.parent().is_some_and(|parent| {
+                            parent.kind() != "block" && parent.kind() != "module"
+                        }) {
+                            if !support.scope_step() {
+                                return PythonLexicalBinding::Other;
+                            }
+                            statement = statement.parent().expect("parent checked");
+                        }
+                        return if declaration.parent() == statement.parent()
+                            && declaration.end_byte() <= statement.start_byte()
+                            && declaration.parent() == candidate.child_by_field_name("body")
+                        {
+                            PythonLexicalBinding::LocalClass(declaration)
+                        } else {
+                            PythonLexicalBinding::Other
+                        };
+                    } else {
                         return PythonLexicalBinding::Other;
                     };
                     let Some(PythonFunctionDeclarationScope::Function(owner)) =
@@ -3039,7 +3283,18 @@ fn python_lexical_binding_bounded<'tree>(
                 }
                 PythonLexicalNameResolution::Nonlocal => unresolved_nonlocal = true,
                 PythonLexicalNameResolution::Global => {
-                    return PythonLexicalBinding::UnboundOrGlobal;
+                    return if python_global_binding_is_untouched_bounded(
+                        name,
+                        identifier,
+                        candidate,
+                        source,
+                        || support.scope_step(),
+                    ) == Some(true)
+                    {
+                        PythonLexicalBinding::UnboundOrGlobal
+                    } else {
+                        PythonLexicalBinding::Other
+                    };
                 }
                 PythonLexicalNameResolution::Unbound => {}
             }
@@ -3105,7 +3360,7 @@ pub(super) fn resolve_python(
             ),
         );
     };
-    if let Some(module_fqn) = python_import_module_fqn(file, source, node)
+    if let Some(module_fqn) = python_import_module_fqn(py.project(), file, source, node)
         && let Some(module) = resolve_module_code_unit(py, Some(file), &module_fqn)
     {
         return candidates_outcome(vec![module]);
@@ -3855,8 +4110,9 @@ fn python_function_import_binding_candidates(
         current = parent.parent();
     }
 
-    let qualified_name = resolve_python_relative_module(&context.file, &binding.qualified_name)
-        .unwrap_or_else(|| binding.qualified_name.clone());
+    let qualified_name =
+        resolve_python_relative_module(py.project(), &context.file, &binding.qualified_name)
+            .unwrap_or_else(|| binding.qualified_name.clone());
     Some(resolve_fqn_candidates(
         py,
         Some(&context.file),
@@ -4850,7 +5106,7 @@ fn python_source_root_spellings_excluding_installed_roots(
         .map(|candidate| {
             format!(
                 "{} ({})",
-                python_module_name(&candidate.file),
+                python_module_name(py.project(), &candidate.file),
                 rel_path_string(&candidate.file)
             )
         })
@@ -5381,7 +5637,12 @@ fn python_is_non_reference_context(node: Node<'_>) -> bool {
     false
 }
 
-fn python_import_module_fqn(file: &ProjectFile, source: &str, focus: Node<'_>) -> Option<String> {
+fn python_import_module_fqn(
+    project: &dyn crate::analyzer::Project,
+    file: &ProjectFile,
+    source: &str,
+    focus: Node<'_>,
+) -> Option<String> {
     let mut current = Some(focus);
     while let Some(node) = current {
         let module = match node.kind() {
@@ -5408,7 +5669,7 @@ fn python_import_module_fqn(file: &ProjectFile, source: &str, focus: Node<'_>) -
         {
             let raw = python_focused_import_module(module, focus, source)?;
             return if module.kind() == "relative_import" {
-                resolve_python_relative_module(file, &raw)
+                resolve_python_relative_module(project, file, &raw)
             } else {
                 Some(raw)
             };
@@ -6131,7 +6392,12 @@ def outer() -> None:
             focus_end_byte: end_byte,
         };
         let file = ProjectFile::new(std::env::temp_dir(), "caller.py");
-        let parsed = brokk_bifrost_python::declarations::parse_python_file(&file, source, &tree);
+        let parsed = brokk_bifrost_python::declarations::parse_python_file(
+            &crate::analyzer::TestProject::new(file.root(), Language::Python),
+            &file,
+            source,
+            &tree,
+        );
         exact_python_imported_call_selection(source, &tree, &site, &parsed.imports)
     }
 

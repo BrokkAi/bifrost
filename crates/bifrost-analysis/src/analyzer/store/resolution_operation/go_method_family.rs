@@ -79,8 +79,9 @@ impl SelectedResolutionOperation<'_, '_> {
               AND bridge.source_site=semantic.source_site
              JOIN main.source_go_callables AS callable ON callable.blob_id=bridge.blob_id
               AND callable.declaration_id=bridge.declaration_id AND callable.is_method=1
-             LEFT JOIN temp.selected_go_transient_placements AS placement ON placement.mount_ordinal=mount.mount_ordinal
-             JOIN main.go_package_files AS file ON file.file_version_id=coalesce(mount.file_version_id,placement.file_version_id)
+             JOIN main.go_package_files AS file ON file.file_version_id=coalesce(mount.file_version_id,
+               (SELECT placement.file_version_id FROM temp.selected_go_transient_placements AS placement
+                WHERE placement.mount_ordinal=mount.mount_ordinal)) AND file.source_role<>'ignored'
              JOIN main.go_package_instances AS package ON package.package_id=file.package_id
               AND package.context_id=?3 AND package.for_test=''
              WHERE mount.mount_ordinal=?1 LIMIT 1",
@@ -123,8 +124,9 @@ impl SelectedResolutionOperation<'_, '_> {
              SELECT DISTINCT mount.mount_ordinal,definition.semantic_key,package.package_id,
                     package.tool_import_path,declaration.name
              FROM temp.selected_resolution_mounts AS mount
-             LEFT JOIN temp.selected_go_transient_placements AS placement ON placement.mount_ordinal=mount.mount_ordinal
-             CROSS JOIN main.go_package_files AS file ON file.file_version_id=coalesce(mount.file_version_id,placement.file_version_id)
+             CROSS JOIN main.go_package_files AS file ON file.file_version_id=coalesce(mount.file_version_id,
+               (SELECT placement.file_version_id FROM temp.selected_go_transient_placements AS placement
+                WHERE placement.mount_ordinal=mount.mount_ordinal)) AND file.source_role<>'ignored'
              CROSS JOIN main.go_package_instances AS package ON package.package_id=file.package_id
               AND package.context_id=?1 AND package.for_test='' AND package.provider_kind='workspace'
              CROSS JOIN main.source_go_type_declarations AS declaration ON declaration.blob_id=mount.blob_id

@@ -1352,7 +1352,7 @@ pub(crate) struct SelectedResolutionMountInventory<'store> {
     generic_formal_defaults_schema_ready: Cell<bool>,
 }
 
-/// Freshness of the retained reader, excluding only its private request buffers.
+/// Freshness of the retained reader, excluding its private buffers and owned schema setup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SelectedResolutionReadStamp {
     main_data_version: i64,
@@ -1486,6 +1486,7 @@ pub(super) struct RetainedResolutionSelection {
     stamp: SelectedResolutionReadStamp,
     owned_change_baseline: u64,
     committed_request_changes: Cell<u64>,
+    committed_schema_changes: Cell<i64>,
 }
 
 impl RetainedResolutionSelection {
@@ -1498,11 +1499,13 @@ impl RetainedResolutionSelection {
     }
 
     fn current_stamp(&self, conn: &Connection) -> Result<SelectedResolutionReadStamp> {
-        read_change_stamp(
+        let mut stamp = read_change_stamp(
             conn,
             self.owned_change_baseline,
             self.committed_request_changes.get(),
-        )
+        )?;
+        stamp.temp_schema_version -= self.committed_schema_changes.get();
+        Ok(stamp)
     }
 
     fn is_current(&self, conn: &Connection) -> Result<bool> {
@@ -1962,7 +1965,10 @@ impl SelectedResolutionMountInventory<'_> {
             |row| row.get(0),
         )?;
         if !exists {
-            connection.execute_batch(super::resolution_stage::generic_formals_schema_sql())?;
+            self.initialize_owned_temp_schema(
+                connection,
+                super::resolution_stage::generic_formals_schema_sql(),
+            )?;
         }
         self.generic_formals_schema_ready.set(true);
         Ok(())
@@ -1981,10 +1987,32 @@ impl SelectedResolutionMountInventory<'_> {
             |row| row.get(0),
         )?;
         if !exists {
-            connection
-                .execute_batch(super::resolution_stage::generic_formal_defaults_schema_sql())?;
+            self.initialize_owned_temp_schema(
+                connection,
+                super::resolution_stage::generic_formal_defaults_schema_sql(),
+            )?;
         }
         self.generic_formal_defaults_schema_ready.set(true);
+        Ok(())
+    }
+
+    /// Account only the two fixed, owned CREATE TABLE/INDEX batches above.
+    /// These schemas do not change selected authority. Read both witnesses on
+    /// this same connection around the batch so earlier unowned schema changes
+    /// remain visible, as do all main-database and unowned row changes. A failed
+    /// batch is not accounted and conservatively invalidates retention.
+    fn initialize_owned_temp_schema(&self, connection: &Connection, sql: &str) -> Result<()> {
+        assert!(std::ptr::eq(connection, self.connection()));
+        let schema_version = || -> Result<i64> {
+            Ok(connection
+                .prepare_cached("PRAGMA temp.schema_version")?
+                .query_row([], |row| row.get(0))?)
+        };
+        let before = schema_version()?;
+        connection.execute_batch(sql)?;
+        let changes = schema_version()? - before;
+        let committed = &self.retained().committed_schema_changes;
+        committed.set(committed.get() + changes);
         Ok(())
     }
 
@@ -2759,6 +2787,7 @@ impl AnalyzerStore {
                     stamp,
                     owned_change_baseline,
                     committed_request_changes: Cell::new(0),
+                    committed_schema_changes: Cell::new(0),
                 };
                 let mount_rebaser =
                     MountRebaser::for_persisted_mount_count(retained.ready.persisted_mount_count);
@@ -3972,11 +4001,13 @@ fn usize_as_u64(value: usize) -> u64 {
 pub(super) mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use brokk_bifrost_test_macros::hardwon;
     use rusqlite::OptionalExtension;
     use tree_sitter::Parser;
 
     use crate::analyzer::ProjectFile;
     use crate::analyzer::cpp::CppAdapter;
+    use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::rust::RustAdapter;
     use crate::analyzer::tree_sitter_analyzer::{
@@ -4028,6 +4059,8 @@ pub(super) mod tests {
             Language::Java => ("src/Model.java", "package demo; class Model {}\n"),
             Language::TypeScript => ("src/Model.tsx", "export class Model {}\n"),
             Language::Cpp => ("src/Model.c", "class Model {};\n"),
+            Language::Go => ("src/model.go", "package demo\ntype Model struct {}\n"),
+            Language::Rust => ("src/model.rs", "struct Model;\n"),
             _ => panic!("selection fixture adapter is not defined for {semantic_language:?}"),
         };
         let result = match semantic_language {
@@ -4061,6 +4094,28 @@ pub(super) mod tests {
                     storage_language,
                     generation,
                     &CppAdapter,
+                    &state,
+                )
+            }
+            Language::Go => {
+                let state = parsed_fixture_state(&GoAdapter, relative_path, source);
+                store.write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
+                    Oid::from_str(oid).unwrap(),
+                    storage_language,
+                    generation,
+                    &GoAdapter,
+                    &state,
+                )
+            }
+            Language::Rust => {
+                let state = parsed_fixture_state(&RustAdapter, relative_path, source);
+                store.write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
+                    Oid::from_str(oid).unwrap(),
+                    storage_language,
+                    generation,
+                    &RustAdapter,
                     &state,
                 )
             }
@@ -4574,43 +4629,98 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[hardwon("d629d480653d: lazy generic TEMP schema discarded the first retained selection")]
     fn single_reader_exact_selection_key_reuses_materialization_and_changed_mask_rebuilds() {
-        let (_temp, mut fixture) = SelectionFixture::persistent(1);
-        // Force eviction to certify rematerialization separately from the
-        // multi-reader pool's retention of alternating exact selections.
-        fixture.store.active_readers.capacity = 1;
+        let mut receipts = Vec::new();
+        for (storage_language, semantic_language) in
+            [("go", Language::Go), ("rust", Language::Rust)]
         {
+            let temp = tempfile::tempdir().unwrap();
+            // Mount reuse does not depend on unique source contents. Publish
+            // one blob so the regression measures inventory work, not parsing.
+            let mut fixture = SelectionFixture::with_store(
+                AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap(),
+                256,
+                storage_language,
+                semantic_language,
+                true,
+                false,
+                None,
+            );
+            // Force eviction to certify rematerialization separately from the
+            // multi-reader pool's retention of alternating exact selections.
+            fixture.store.active_readers.capacity = 1;
+            {
+                let conn = fixture.store.active_read_conn().unwrap();
+                ensure_revisioned_workspace_views(&conn).unwrap();
+                conn.execute_batch(selected_resolution_temp_schema_sql())
+                    .unwrap();
+                conn.execute_batch(
+                    "CREATE TEMP TABLE selection_materialization_probe(insertions INTEGER NOT NULL);
+                     CREATE TEMP TRIGGER count_selected_resolution_materialization
+                     AFTER INSERT ON selected_resolution_context
+                     BEGIN
+                       INSERT INTO selection_materialization_probe VALUES(1);
+                     END;",
+                ).unwrap();
+            }
+            let (original, formals, defaults) = {
+                let mut ready = fixture.open_ready(&[]);
+                let original = ready.read_change_stamp().unwrap();
+                ready
+                    .ensure_generic_formals_schema(ready.connection())
+                    .unwrap();
+                let formals = ready.read_change_stamp().unwrap();
+                ready
+                    .ensure_generic_formal_defaults_schema(ready.connection())
+                    .unwrap();
+                let defaults = ready.read_change_stamp().unwrap();
+                assert!(matches!(
+                    ready.revalidate(&CancellationToken::default()).unwrap(),
+                    SelectedResolutionRevalidationOutcome::Current
+                ));
+                (original, formals, defaults)
+            };
+            for run in 0..3 {
+                let start = std::time::Instant::now();
+                let ready = fixture.open_ready(&[]);
+                eprintln!(
+                    "{storage_language} open {run}: {:?}; materializations={}",
+                    start.elapsed(),
+                    ready
+                        .connection()
+                        .query_row(
+                            "SELECT COUNT(*) FROM temp.selection_materialization_probe",
+                            [],
+                            |row| row.get::<_, usize>(0)
+                        )
+                        .unwrap()
+                );
+                drop(ready);
+            }
+            eprintln!(
+                "{storage_language} generic schema stamps: original={original:?}, formals={formals:?}, defaults={defaults:?}"
+            );
+            let removal = SelectedResolutionOverlayMask::removal(storage_language, "src/0000.java");
+            drop(fixture.open_ready(std::slice::from_ref(&removal)));
+            drop(fixture.open_ready(std::slice::from_ref(&removal)));
             let conn = fixture.store.active_read_conn().unwrap();
-            ensure_revisioned_workspace_views(&conn).unwrap();
-            conn.execute_batch(selected_resolution_temp_schema_sql())
-                .unwrap();
-            conn.execute_batch(
-                "CREATE TEMP TABLE selection_materialization_probe(insertions INTEGER NOT NULL);
-                 CREATE TEMP TRIGGER count_selected_resolution_materialization
-                 AFTER INSERT ON selected_resolution_context
-                 BEGIN
-                   INSERT INTO selection_materialization_probe VALUES(1);
-                 END;",
-            )
-            .unwrap();
+            receipts.push((
+                storage_language,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM temp.selection_materialization_probe",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+                formals == original,
+                defaults == original,
+            ));
         }
-
-        drop(fixture.open_ready(&[]));
-        drop(fixture.open_ready(&[]));
-        let removal = SelectedResolutionOverlayMask::removal("java", "src/0000.java");
-        drop(fixture.open_ready(std::slice::from_ref(&removal)));
-        drop(fixture.open_ready(std::slice::from_ref(&removal)));
-
-        let conn = fixture.store.active_read_conn().unwrap();
         assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM temp.selection_materialization_probe",
-                [],
-                |row| row.get::<_, usize>(0),
-            )
-            .unwrap(),
-            2,
-            "only each distinct exact selection key may materialize"
+            receipts,
+            [("go", 2, true, true), ("rust", 2, true, true)],
+            "only each distinct exact selection key may materialize, including after owned generic schema initialization"
         );
     }
 
@@ -5206,7 +5316,14 @@ pub(super) mod tests {
         let original = ready.read_change_stamp().unwrap();
         conn.execute_batch("CREATE TEMP TABLE validation_probe(value INTEGER)")
             .unwrap();
+        let before_owned_schema = ready.read_change_stamp().unwrap();
+        ready.ensure_generic_formals_schema(conn).unwrap();
+        ready.ensure_generic_formal_defaults_schema(conn).unwrap();
         let temp_schema = ready.read_change_stamp().unwrap();
+        assert_eq!(
+            temp_schema, before_owned_schema,
+            "owned DDL cannot hide earlier unowned schema drift"
+        );
         assert_ne!(
             temp_schema.temp_schema_version,
             original.temp_schema_version
@@ -5449,6 +5566,7 @@ pub(super) mod tests {
             .unwrap();
         let committed_before = ready.retained().committed_request_changes.get();
         let cancelled = ready.with_owned_temp_transaction(|connection| {
+            ready.ensure_generic_formals_schema(connection)?;
             let interrupted = with_resolution_read_progress_handler(connection, &cancellation, |connection| {
                 // Admission validation nests a handler on this same connection.
                 // Its removal must leave the outer DML cancellation active.
@@ -5468,6 +5586,19 @@ pub(super) mod tests {
             Ok(SelectedResolutionTempTransaction::Rollback(true))
         }).unwrap();
         assert!(cancelled);
+        let schema_survived: bool = ready.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE name='selected_resolution_stage_generic_formals')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            !schema_survived,
+            "cancellation rolls back the owned schema batch"
+        );
+        assert!(
+            !ready.retained().is_current(ready.connection()).unwrap(),
+            "rolled-back schema setup cannot authorize retention"
+        );
+
         assert!((128..100000).contains(&calls.load(Ordering::Relaxed)));
         assert_eq!(
             ready.retained().committed_request_changes.get(),

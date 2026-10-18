@@ -198,6 +198,7 @@ struct JvmIndexedOwnerSurface {
     /// artifact half of the pack half's `SemanticModelOverlay::owner_surface`
     /// closure.
     supertypes: Vec<String>,
+    hierarchy_complete: bool,
 }
 
 /// What one Java artifact's declaration-fact production yielded, indexed the
@@ -252,6 +253,11 @@ impl JavaArtifactFacts {
             .get(owner_fqn)
             .map(|fact| hierarchy_type_names(&fact.hierarchy))
             .unwrap_or_default();
+        let hierarchy_complete = self
+            .types
+            .get(owner_fqn)
+            .and_then(|fact| fact.jvm_inventory.as_ref())
+            .is_some_and(|inventory| inventory.supertypes_complete);
         let mut members = HashMap::default();
         for fact in self.members_by_owner.remove(owner_fqn).unwrap_or_default() {
             if !budget.take() {
@@ -261,6 +267,7 @@ impl JavaArtifactFacts {
             let is_constant = fact.member_kind == MemberKind::Constant;
             let shape = external_call_shape(
                 fact.member_kind,
+                semantic_visibility(fact.visibility),
                 is_static,
                 fact.signature.as_ref(),
                 fact.non_overridable,
@@ -292,6 +299,7 @@ impl JavaArtifactFacts {
         JvmIndexedOwnerSurface {
             members,
             supertypes,
+            hierarchy_complete,
         }
     }
 }
@@ -2132,6 +2140,7 @@ impl JvmExternalDeclarationIndex {
             for (owner_fqn, surface) in owners {
                 digest.push(b"owner");
                 digest.push(owner_fqn.as_bytes());
+                digest.push(&[u8::from(surface.hierarchy_complete)]);
                 digest.push(&(surface.supertypes.len() as u64).to_le_bytes());
                 for supertype in &surface.supertypes {
                     digest.push(b"supertype");
@@ -2177,6 +2186,8 @@ impl JvmExternalDeclarationIndex {
                     digest.push(&(member.call_shapes.len() as u64).to_le_bytes());
                     for shape in &member.call_shapes {
                         digest.push(&shape.parameter_count.to_le_bytes());
+                        digest.push(&[u8::from(shape.has_type_parameters)]);
+                        digest.push(&[shape.visibility as u8]);
                         digest.push(&[u8::from(shape.non_overridable.is_some())]);
                         digest.push(if shape.is_static {
                             b"static-shape"
@@ -2223,29 +2234,47 @@ impl JvmExternalDeclarationIndex {
     /// returns `None` for "not declared here" and for "never read" alike, and a
     /// caller that finds nothing keeps the status it had.
     fn member(&self, owner_fqn: &str, member_name: &str) -> Option<&JvmExternalMember> {
+        self.walk_owner_surfaces(owner_fqn, |_, surface| surface.members.get(member_name))
+            .0
+    }
+
+    fn walk_owner_surfaces<'a, T>(
+        &'a self,
+        owner_fqn: &str,
+        mut select: impl FnMut(&str, &'a JvmIndexedOwnerSurface) -> Option<T>,
+    ) -> (Option<T>, bool) {
         let mut visited = crate::hash::HashSet::default();
-        let mut queue = std::collections::VecDeque::new();
-        visited.insert(owner_fqn.to_owned());
-        queue.push_back(owner_fqn.to_owned());
-        let mut walked = 0usize;
-        while let Some(owner) = queue.pop_front() {
-            walked = walked.saturating_add(1);
-            if walked > MAX_MEMBER_SURFACE_OWNERS {
-                return None;
+        let mut queue =
+            std::collections::VecDeque::from([(owner_fqn.to_owned(), Vec::<String>::new())]);
+        let mut complete = true;
+        while let Some((owner, mut path)) = queue.pop_front() {
+            if path.contains(&owner) {
+                complete = false;
+                continue;
+            }
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            if visited.len() > MAX_MEMBER_SURFACE_OWNERS {
+                return (None, false);
             }
             let Some(surface) = self.members_by_owner.get(&owner) else {
+                complete = false;
                 continue;
             };
-            if let Some(member) = surface.members.get(member_name) {
-                return Some(member);
+            complete &= surface.hierarchy_complete;
+            if let Some(selected) = select(&owner, surface) {
+                return (Some(selected), complete);
             }
-            for supertype in &surface.supertypes {
-                if visited.insert(supertype.clone()) {
-                    queue.push_back(supertype.clone());
-                }
-            }
+            path.push(owner);
+            queue.extend(
+                surface
+                    .supertypes
+                    .iter()
+                    .map(|parent| (parent.clone(), path.clone())),
+            );
         }
-        None
+        (None, complete)
     }
 
     pub(crate) fn resolve_explicit_import(
@@ -2541,6 +2570,7 @@ impl JvmExternalDeclarationIndex {
                 let is_constant = member.member_kind == MemberKind::Constant;
                 let shape = external_call_shape(
                     member.member_kind,
+                    semantic_visibility(member.visibility),
                     is_static,
                     member.signature.as_ref(),
                     member.non_overridable,
@@ -2588,6 +2618,10 @@ impl JvmExternalDeclarationIndex {
                 JvmIndexedOwnerSurface {
                     members,
                     supertypes: hierarchy_type_names(&surface.hierarchy),
+                    hierarchy_complete: surface
+                        .jvm_inventory
+                        .as_ref()
+                        .is_some_and(|inventory| inventory.supertypes_complete),
                 },
             );
             self.insert(external_type);
@@ -2619,6 +2653,7 @@ impl JvmExternalDeclarationIndex {
             // keeps every positive declaration either read produced, which is
             // the only direction this surface ever moves.
             Some(existing) => {
+                existing.hierarchy_complete &= surface.hierarchy_complete;
                 for (name, member) in surface.members {
                     existing.members.entry(name).or_insert(member);
                 }
@@ -2928,6 +2963,61 @@ impl<'a> JvmExternalDeclarations<'a> {
             })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn java_nominal_widening(&self, actual: &TypeRef, formal: &TypeRef) -> Option<bool> {
+        let (source, target) = (
+            java_external_reference_name(actual)?,
+            java_external_reference_name(formal)?,
+        );
+        let source_type = self.get(source)?;
+        match &source_type.source {
+            JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } => {
+                let overlay = self.packs.as_ref()?;
+                let source_symbol = overlay
+                    .symbols_with_id(declaration_id)
+                    .records
+                    .into_iter()
+                    .find(|symbol| self.admits_pack_symbol(symbol))?;
+                let target_type = self.pack_declaration(target)?;
+                let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } =
+                    &target_type.source
+                else {
+                    return None;
+                };
+                let target_symbol = overlay
+                    .symbols_with_id(declaration_id)
+                    .records
+                    .into_iter()
+                    .find(|symbol| self.admits_pack_symbol(symbol))?;
+                let answer = overlay.java_reference_widening(
+                    source_symbol,
+                    target_symbol,
+                    MAX_MEMBER_SURFACE_OWNERS,
+                    None,
+                );
+                if answer.witness.is_some() {
+                    Some(true)
+                } else if answer.incomplete.is_empty() {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let (found, complete) = self
+                    .artifacts
+                    .walk_owner_surfaces(source, |owner, _| (owner == target).then_some(()));
+                if found.is_some() {
+                    Some(true)
+                } else if complete {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Whether no surface can answer anything, so a caller may skip the ladder
     /// altogether.
     pub(crate) fn is_empty(&self) -> bool {
@@ -3019,7 +3109,7 @@ impl<'a> JvmExternalDeclarations<'a> {
         let owner = resolve_owner(owner_spelling)?;
         self.artifact_member(&owner, member_name)
             .or_else(|| self.pack_member(&owner, member_name))
-            .filter(|member| member.is_accessible_from_package(access_package))
+            .and_then(|member| member.accessible_from_package(access_package))
     }
 
     /// The member the indexed artifacts declare on `owner` (#1900).
@@ -3134,8 +3224,9 @@ impl<'a> JvmExternalDeclarations<'a> {
                         continue;
                     };
                     if !symbol.callable_family_complete
-                        && symbol.provenance.completeness
-                            != crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+                        && !(declaring.jvm_owner_family_enumerated
+                            && symbol.provenance.completeness
+                                == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete)
                     {
                         call_shapes_incomplete = true;
                     }
@@ -3145,13 +3236,15 @@ impl<'a> JvmExternalDeclarations<'a> {
                         continue;
                     };
                     call_shapes.push(JvmExternalCallShape {
+                        visibility: semantic_visibility(symbol.visibility),
                         inventory_identity: None,
                         non_overridable: symbol.non_overridable,
                         parameter_count,
+                        has_type_parameters: !signature.type_parameters.is_empty(),
                         parameters: signature
                             .parameters
                             .iter()
-                            .map(|parameter| parameter.r#type.clone())
+                            .map(|parameter| normalize_jvm_model_type_ref(Some(overlay), &parameter.r#type))
                             .collect(),
                         is_static: symbol.is_static,
                         variadic: signature
@@ -3289,7 +3382,7 @@ pub(crate) struct JvmExternalMember {
     /// [`JvmIndexedOwnerSurface`] already applies to the member itself.
     /// A caller that needs the return type of the overload a written call
     /// *selects*, rather than a name to continue a ladder from, asks
-    /// [`JvmExternalMember::applicable_return_type_fqn`] instead (#3522).
+    /// [`JvmExternalMember::applicable_return_type`] instead (#3522).
     returns: Option<TypeRef>,
     /// Whether the declaring half marked this member `static` (#2538).
     is_static: bool,
@@ -3325,10 +3418,12 @@ pub(crate) struct JvmExternalMember {
 /// One callable overload retained beside the collapsed member name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JvmExternalCallShape {
+    visibility: JvmVisibility,
     inventory_identity: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
     non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
     parameter_count: u32,
     parameters: Vec<TypeRef>,
+    has_type_parameters: bool,
     is_static: bool,
     variadic: bool,
     /// The type this overload's own declaration writes as its return type.
@@ -3379,8 +3474,21 @@ impl JvmExternalMember {
         named_return_type_fqn(self.returns.as_ref())
     }
 
-    fn is_accessible_from_package(&self, package_name: &str) -> bool {
-        is_visible_from_package(self.visibility, &self.declaring_package, package_name)
+    fn accessible_from_package(mut self, package_name: &str) -> Option<Self> {
+        // Access is a property of each declaration, not the first overload in
+        // a name group. It is independent of the family's enumeration claim.
+        let declaring_package = &self.declaring_package;
+        self.call_shapes.retain(|shape| {
+            is_visible_from_package(shape.visibility, declaring_package, package_name)
+        });
+        if !is_visible_from_package(self.visibility, declaring_package, package_name) {
+            let shape = self.call_shapes.first()?;
+            self.visibility = shape.visibility;
+            self.is_static = shape.is_static;
+            self.returns = shape.returns.clone();
+            self.is_constant = false;
+        }
+        Some(self)
     }
 
     /// Whether the declaring half marked this member `static` (#2538).
@@ -3428,9 +3536,45 @@ impl JvmExternalMember {
         &self,
         instance_receiver: bool,
         actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<u32> {
-        self.applicable_shape_for_argument_types(instance_receiver, actuals)
+        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)
             .map(|shape| shape.parameter_count)
+    }
+
+    /// A declared member can remain a possible call when discovery or
+    /// conversions are unknown. A complete family that rejects every
+    /// invocation phase does not supply a call candidate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn may_apply_to_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> bool {
+        if self.call_shapes_incomplete {
+            return true;
+        }
+        self.call_shapes.iter().any(|shape| {
+            if shape.is_static == instance_receiver {
+                return false;
+            }
+            let signature = JavaExternalSignature {
+                parameters: &shape.parameters,
+                variadic: shape.variadic,
+                has_type_parameters: shape.has_type_parameters,
+            };
+            [
+                JavaExternalInvocationPhase::Strict,
+                JavaExternalInvocationPhase::Loose,
+                JavaExternalInvocationPhase::Variable,
+            ]
+            .into_iter()
+            .any(|phase| {
+                signature.applicability(actuals, phase, surface)
+                    != JavaExternalApplicability::Inapplicable
+            })
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3438,8 +3582,9 @@ impl JvmExternalMember {
         &self,
         instance_receiver: bool,
         actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<&crate::analyzer::semantic_model::NonOverridableEvidence> {
-        self.applicable_shape_for_argument_types(instance_receiver, actuals)?
+        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?
             .non_overridable
             .as_ref()
     }
@@ -3452,8 +3597,9 @@ impl JvmExternalMember {
         &self,
         instance_receiver: bool,
         actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<crate::analyzer::resolution::ExternalMemberIdentity> {
-        self.applicable_shape_for_argument_types(instance_receiver, actuals)?
+        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?
             .inventory_identity
             .clone()
     }
@@ -3464,18 +3610,27 @@ impl JvmExternalMember {
         active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
         instance_receiver: bool,
         actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<crate::analyzer::resolution::ExternalMemberIdentity> {
         use crate::analyzer::resolution::{ExternalMemberIdentity, ExternalOwnerIdentity};
-        let shape = self.applicable_shape_for_argument_types(instance_receiver, actuals)?;
+        let shape =
+            self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?;
         let (owner_fqn, member_name) = self.fqn.rsplit_once('.')?;
         let mut selected = None;
         for owner in active.types_named(owner_fqn).records {
-            if !owner.shard.independently_enumerates_jvm_owner(owner.record) {
+            if !owner.shard.admits_jvm_owner_declaration(owner.record) {
                 continue;
             }
             let (_, members, _) = owner.shard.shard.payload().declaration_facts()?;
             for (ordinal, member) in members
                 .iter()
+                .chain(
+                    owner
+                        .record
+                        .jvm_inventory
+                        .iter()
+                        .flat_map(|inventory| &inventory.additional_members),
+                )
                 .filter(|member| member.owner == owner.record.id && member.guard.is_none())
                 .enumerate()
             {
@@ -3486,11 +3641,14 @@ impl JvmExternalMember {
                     continue;
                 };
                 if signature.parameters.len() != shape.parameters.len()
-                    || !signature
-                        .parameters
-                        .iter()
-                        .zip(&shape.parameters)
-                        .all(|(formal, selected)| formal.r#type == *selected)
+                    || !signature.parameters.iter().zip(&shape.parameters).all(
+                        |(formal, selected)| {
+                            normalize_jvm_model_type_ref(
+                                surface.and_then(|surface| surface.packs.as_deref()),
+                                &formal.r#type,
+                            ) == *selected
+                        },
+                    )
                     || signature.parameters.iter().any(|formal| formal.variadic) != shape.variadic
                 {
                     continue;
@@ -3514,22 +3672,6 @@ impl JvmExternalMember {
             }
         }
         selected
-    }
-
-    /// The declared return type of the same one overload
-    /// [`Self::applicable_parameter_count`] selects (#3522).
-    ///
-    /// `None` whenever the surface cannot select exactly one applicable
-    /// signature, and whenever that signature's own declaration writes no
-    /// class name as its return type. A chained receiver cannot be typed from
-    /// this surface on a name-only reading of some other overload.
-    pub(crate) fn applicable_return_type_fqn(
-        &self,
-        instance_receiver: bool,
-        arity: usize,
-    ) -> Option<&str> {
-        self.applicable_shape(instance_receiver, arity)?
-            .declared_return_type_fqn()
     }
 
     /// Preserve the selected declaration's full return term for conversion.
@@ -3582,40 +3724,78 @@ impl JvmExternalMember {
         matched
     }
 
+    /// A fixed nongeneric signature equal to all known static actuals is
+    /// selected independently of family completeness. Receiver proof belongs
+    /// to the caller, and behavior-only summaries supply no call shape.
+    pub(crate) fn exact_return_type_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<&TypeRef> {
+        self.exact_shape_for_argument_types(instance_receiver, actuals)?
+            .returns
+            .as_ref()
+    }
+
+    fn exact_shape_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<&JvmExternalCallShape> {
+        let wants_static = !instance_receiver;
+        let mut exact = self
+            .call_shapes
+            .iter()
+            .filter(|shape| shape.is_static == wants_static && shape.java_exact_actuals(actuals));
+        let selected = exact.next()?;
+        // JLS 15.12.2 phase 1: no applicable overload can be strictly more
+        // specific than formals equal to every actual's static type, and
+        // two declarations with identical formals cannot coexist. Missing
+        // family members therefore cannot change this nongeneric, fixed
+        // selection. This says nothing about receiver dispatch or model
+        // provenance completeness.
+        exact.next().is_none().then_some(selected)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn applicable_shape_for_argument_types(
         &self,
         instance_receiver: bool,
         actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<&JvmExternalCallShape> {
+        if let Some(selected) = self.exact_shape_for_argument_types(instance_receiver, actuals) {
+            return Some(selected);
+        }
+        let wants_static = !instance_receiver;
         if self.call_shapes_incomplete {
             return None;
         }
-        let wants_static = !instance_receiver;
         let mut candidates = Vec::new();
         for shape in &self.call_shapes {
             if shape.is_static != wants_static {
                 continue;
             }
-            if shape.variadic {
-                let minimum = shape.parameter_count.saturating_sub(1) as usize;
-                if actuals.len() >= minimum {
-                    return None;
-                }
-                continue;
-            }
-            if shape.parameter_count as usize == actuals.len() {
+            if shape.parameter_count as usize == actuals.len()
+                || (shape.variadic
+                    && actuals.len() >= shape.parameter_count.saturating_sub(1) as usize)
+            {
                 candidates.push(shape);
             }
         }
-        let selected = select_java_external_signature(
+        let selected = select_java_external_invocation(
             actuals,
             &candidates
                 .iter()
-                .map(|shape| shape.parameters.as_slice())
+                .map(|shape| JavaExternalSignature {
+                    parameters: &shape.parameters,
+                    variadic: shape.variadic,
+                    has_type_parameters: shape.has_type_parameters,
+                })
                 .collect::<Vec<_>>(),
+            surface,
         )?;
-        candidates.get(selected).copied()
+        candidates.get(selected.0).copied()
     }
 }
 
@@ -3624,11 +3804,12 @@ impl JvmExternalMember {
 enum JavaExternalInvocationPhase {
     Strict,
     Loose,
+    Variable,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JavaExternalConversion {
+pub(crate) enum JavaExternalConversion {
     Strict,
     Loose,
     Inapplicable,
@@ -3640,53 +3821,170 @@ enum JavaExternalConversion {
 /// parameter types cannot decide applicability or specificity.
 #[cfg(any(test, feature = "test-support"))]
 fn select_java_external_signature(actuals: &[TypeRef], candidates: &[&[TypeRef]]) -> Option<usize> {
-    let mut applicable = Vec::new();
-    for (index, formals) in candidates.iter().enumerate() {
-        if formals.len() != actuals.len() {
+    select_java_external_invocation(
+        actuals,
+        &candidates
+            .iter()
+            .map(|parameters| JavaExternalSignature {
+                parameters,
+                variadic: false,
+                has_type_parameters: false,
+            })
+            .collect::<Vec<_>>(),
+        None,
+    )
+    .map(|(selected, _)| selected)
+}
+
+struct JavaExternalSignature<'a> {
+    parameters: &'a [TypeRef],
+    variadic: bool,
+    has_type_parameters: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaExternalApplicability {
+    Applicable,
+    Inapplicable,
+    Unknown,
+}
+
+impl JavaExternalSignature<'_> {
+    #[cfg(any(test, feature = "test-support"))]
+    fn applicability(
+        &self,
+        actuals: &[TypeRef],
+        phase: JavaExternalInvocationPhase,
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> JavaExternalApplicability {
+        use JavaExternalApplicability::{Applicable, Inapplicable, Unknown};
+        let expanded = phase == JavaExternalInvocationPhase::Variable;
+        let minimum = self.parameters.len().saturating_sub(1);
+        if expanded {
+            if !self.variadic || self.parameters.is_empty() || actuals.len() < minimum {
+                return Inapplicable;
+            }
+        } else if self.parameters.len() != actuals.len() {
+            return Inapplicable;
+        }
+        let tail = if expanded {
+            match self.parameters.last() {
+                Some(TypeRef::Array { element }) => Some(element.as_ref()),
+                _ => return Unknown,
+            }
+        } else {
+            None
+        };
+        let mut unknown = false;
+        for (ordinal, actual) in actuals.iter().enumerate() {
+            let formal = if expanded && ordinal >= minimum {
+                tail.expect("expanded signature has an element type")
+            } else {
+                &self.parameters[ordinal]
+            };
+            match java_external_conversion_in(actual, formal, surface) {
+                JavaExternalConversion::Strict => {}
+                JavaExternalConversion::Loose if phase != JavaExternalInvocationPhase::Strict => {}
+                JavaExternalConversion::Loose | JavaExternalConversion::Inapplicable => {
+                    return Inapplicable;
+                }
+                JavaExternalConversion::Unknown => unknown = true,
+            }
+        }
+        if unknown { Unknown } else { Applicable }
+    }
+
+    fn exact_actuals(&self, actuals: &[TypeRef]) -> bool {
+        !self.variadic
+            && !self.has_type_parameters
+            && self.parameters.len() == actuals.len()
+            && self
+                .parameters
+                .iter()
+                .zip(actuals)
+                .all(|(formal, actual)| java_external_same_static_type(formal, actual))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn select_java_external_invocation(
+    actuals: &[TypeRef],
+    candidates: &[JavaExternalSignature<'_>],
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> Option<(usize, JavaExternalInvocationPhase)> {
+    use JavaExternalInvocationPhase::{Loose, Strict, Variable};
+    for phase in [Strict, Loose, Variable] {
+        let mut applicable = Vec::new();
+        let mut uncertain = false;
+        for (index, candidate) in candidates.iter().enumerate() {
+            match candidate.applicability(actuals, phase, surface) {
+                JavaExternalApplicability::Applicable => applicable.push(index),
+                JavaExternalApplicability::Inapplicable => {}
+                JavaExternalApplicability::Unknown => uncertain = true,
+            }
+        }
+        // Unknown applicability in an earlier phase can change whether the
+        // later phase is reached; it must not be silently discarded.
+        if uncertain {
             return None;
         }
-        let mut phase = JavaExternalInvocationPhase::Strict;
-        let mut inapplicable = false;
-        for (actual, formal) in actuals.iter().zip(*formals) {
-            match java_external_conversion(actual, formal) {
-                JavaExternalConversion::Strict => {}
-                JavaExternalConversion::Loose => phase = JavaExternalInvocationPhase::Loose,
-                JavaExternalConversion::Inapplicable => {
-                    inapplicable = true;
+        if applicable.is_empty() {
+            continue;
+        }
+        let ranking_arity = if phase == Variable {
+            applicable
+                .iter()
+                .map(|&index| candidates[index].parameters.len())
+                .max()
+                .unwrap_or(0)
+                .max(actuals.len())
+        } else {
+            actuals.len()
+        };
+        let expanded_formals = |index: usize| -> Option<Vec<TypeRef>> {
+            let candidate = &candidates[index];
+            if phase != Variable {
+                return Some(candidate.parameters.to_vec());
+            }
+            let (last, prefix) = candidate.parameters.split_last()?;
+            let TypeRef::Array { element } = last else {
+                return None;
+            };
+            Some(
+                prefix
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::repeat_n(
+                        element.as_ref().clone(),
+                        ranking_arity - prefix.len(),
+                    ))
+                    .collect(),
+            )
+        };
+        let mut maximal = Vec::new();
+        for &index in &applicable {
+            let formals = expanded_formals(index)?;
+            let mut dominated = false;
+            for &other in &applicable {
+                if index == other {
+                    continue;
+                }
+                if java_external_more_specific(&expanded_formals(other)?, &formals, surface)? {
+                    dominated = true;
                     break;
                 }
-                JavaExternalConversion::Unknown => return None,
+            }
+            if !dominated {
+                maximal.push(index);
             }
         }
-        if !inapplicable {
-            applicable.push((index, phase, *formals));
-        }
+        return match maximal.as_slice() {
+            [selected] => Some((*selected, phase)),
+            _ => None,
+        };
     }
-    let earliest = applicable.iter().map(|(_, phase, _)| *phase).min()?;
-    let phase_candidates = applicable
-        .into_iter()
-        .filter(|(_, phase, _)| *phase == earliest)
-        .collect::<Vec<_>>();
-    let mut maximal = Vec::new();
-    for (index, _, formals) in &phase_candidates {
-        let mut dominated = false;
-        for (other_index, _, other_formals) in &phase_candidates {
-            if index == other_index {
-                continue;
-            }
-            if java_external_more_specific(other_formals, formals)? {
-                dominated = true;
-                break;
-            }
-        }
-        if !dominated {
-            maximal.push(*index);
-        }
-    }
-    match maximal.as_slice() {
-        [selected] => Some(*selected),
-        _ => None,
-    }
+    None
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -3698,8 +3996,97 @@ pub(crate) fn select_java_external_signature_for_types(
     select_java_external_signature(actuals, &candidates)
 }
 
+pub(crate) fn java_external_same_static_type(left: &TypeRef, right: &TypeRef) -> bool {
+    let mut pending = vec![(left, right)];
+    while let Some((left, right)) = pending.pop() {
+        let arguments = match (left, right) {
+            (
+                TypeRef::Named {
+                    name: left,
+                    arguments: left_args,
+                    ..
+                },
+                TypeRef::Named {
+                    name: right,
+                    arguments: right_args,
+                    ..
+                },
+            ) if !left.is_empty() && left != "void" && left == right => {
+                Some((left_args, right_args))
+            }
+            (
+                TypeRef::Declared {
+                    id: left,
+                    arguments: left_args,
+                    ..
+                },
+                TypeRef::Declared {
+                    id: right,
+                    arguments: right_args,
+                    ..
+                },
+            ) if !left.is_empty() && left == right => Some((left_args, right_args)),
+            (TypeRef::Array { element: left }, TypeRef::Array { element: right }) => {
+                pending.push((left, right));
+                None
+            }
+            _ => return false,
+        };
+        if let Some((left, right)) = arguments {
+            if left.len() != right.len() {
+                return false;
+            }
+            pending.extend(left.iter().zip(right));
+        }
+    }
+    true
+}
+
 #[cfg(any(test, feature = "test-support"))]
+fn java_known_ground_type(ty: &TypeRef) -> bool {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        match ty {
+            TypeRef::Named {
+                name, arguments, ..
+            } => {
+                if name.is_empty() || name == "void" {
+                    return false;
+                }
+                pending.extend(arguments);
+            }
+            TypeRef::Declared { id, arguments, .. } => {
+                if id.is_empty() {
+                    return false;
+                }
+                pending.extend(arguments);
+            }
+            TypeRef::Array { element } => pending.push(element),
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[cfg(test)]
 fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalConversion {
+    java_external_conversion_in(actual, formal, None)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn java_external_conversion_in(
+    actual: &TypeRef,
+    formal: &TypeRef,
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> JavaExternalConversion {
+    if (matches!(actual, TypeRef::Array { .. }) && java_external_primitive(formal).is_some())
+        || (java_external_primitive(actual).is_some() && matches!(formal, TypeRef::Array { .. }))
+    {
+        return JavaExternalConversion::Inapplicable;
+    }
+    if !java_known_ground_type(actual) || !java_known_ground_type(formal) {
+        return JavaExternalConversion::Unknown;
+    }
     let actual_primitive = java_external_primitive(actual);
     let formal_primitive = java_external_primitive(formal);
     match (actual_primitive, formal_primitive) {
@@ -3724,10 +4111,20 @@ fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalC
             } else if formal_name == "java.lang.String" {
                 JavaExternalConversion::Inapplicable
             } else {
-                JavaExternalConversion::Unknown
+                let Some(wrapper) = java_external_wrapper_name(actual) else {
+                    return JavaExternalConversion::Unknown;
+                };
+                match java_external_reference_conversion(&TypeRef::named(wrapper), formal, surface)
+                {
+                    JavaExternalConversion::Strict => JavaExternalConversion::Loose,
+                    conversion => conversion,
+                }
             };
         }
         (None, Some(formal)) => {
+            if matches!(actual, TypeRef::Named { name, .. } if name == "<null>") {
+                return JavaExternalConversion::Inapplicable;
+            }
             let Some(actual_name) = java_external_reference_name(actual) else {
                 return JavaExternalConversion::Unknown;
             };
@@ -3737,7 +4134,9 @@ fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalC
                 } else {
                     JavaExternalConversion::Inapplicable
                 }
-            } else if actual_name == "java.lang.String" {
+            } else if matches!(actual, TypeRef::Named { .. }) {
+                // Only the eight nominal wrapper types have an unboxing
+                // conversion; arrays and other ground reference types do not.
                 JavaExternalConversion::Inapplicable
             } else {
                 JavaExternalConversion::Unknown
@@ -3745,52 +4144,84 @@ fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalC
         }
         (None, None) => {}
     }
-    if actual == formal || matches!(actual, TypeRef::Named { name, .. } if name == "<null>") {
-        return JavaExternalConversion::Strict;
-    }
-    // Widening a nominal reference cannot produce an array. A competing
-    // array overload is inapplicable, rather than an unknown conversion.
-    if matches!(formal, TypeRef::Array { .. })
-        && matches!(actual, TypeRef::Named { .. } | TypeRef::Declared { .. })
-    {
-        return JavaExternalConversion::Inapplicable;
-    }
-    if java_external_reference_name(formal) == Some("java.lang.Object")
-        && java_external_reference_name(actual).is_some()
-    {
-        return JavaExternalConversion::Strict;
-    }
-    JavaExternalConversion::Unknown
+    java_external_reference_conversion(actual, formal, surface)
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn java_external_more_specific(left: &[TypeRef], right: &[TypeRef]) -> Option<bool> {
+fn java_external_reference_conversion(
+    mut actual: &TypeRef,
+    mut formal: &TypeRef,
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> JavaExternalConversion {
+    loop {
+        if java_external_same_static_type(actual, formal)
+            || matches!(actual, TypeRef::Named { name, .. } if name == "<null>")
+        {
+            return JavaExternalConversion::Strict;
+        }
+        match (actual, formal) {
+            (TypeRef::Array { element: source }, TypeRef::Array { element: target }) => {
+                if java_external_primitive(source).is_some()
+                    || java_external_primitive(target).is_some()
+                {
+                    return if java_external_same_static_type(source, target) {
+                        JavaExternalConversion::Strict
+                    } else {
+                        JavaExternalConversion::Inapplicable
+                    };
+                }
+                actual = source;
+                formal = target;
+            }
+            (TypeRef::Array { .. }, _) => {
+                return if matches!(
+                    java_external_reference_name(formal),
+                    Some("java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable")
+                ) {
+                    JavaExternalConversion::Strict
+                } else {
+                    JavaExternalConversion::Inapplicable
+                };
+            }
+            (_, TypeRef::Array { .. }) => return JavaExternalConversion::Inapplicable,
+            _ => {
+                return if java_external_reference_name(formal) == Some("java.lang.Object")
+                    && java_external_reference_name(actual).is_some()
+                {
+                    JavaExternalConversion::Strict
+                } else {
+                    match surface.and_then(|surface| surface.java_nominal_widening(actual, formal))
+                    {
+                        Some(true) => JavaExternalConversion::Strict,
+                        Some(false) => JavaExternalConversion::Inapplicable,
+                        None => JavaExternalConversion::Unknown,
+                    }
+                };
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_more_specific(
+    left: &[TypeRef],
+    right: &[TypeRef],
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> Option<bool> {
     if left.len() != right.len() {
         return None;
     }
     let mut strict = false;
     for (left, right) in left.iter().zip(right) {
-        if left == right {
+        if java_external_same_static_type(left, right) {
             continue;
         }
-        match (
-            java_external_primitive(left),
-            java_external_primitive(right),
-        ) {
-            (Some(left), Some(right)) => {
-                if !crate::analyzer::java::primitive_converts(left, right) {
-                    return Some(false);
-                }
-                strict = true;
-                continue;
+        match java_external_conversion_in(left, right, surface) {
+            JavaExternalConversion::Strict => strict = true,
+            JavaExternalConversion::Loose | JavaExternalConversion::Inapplicable => {
+                return Some(false);
             }
-            (None, None)
-                if java_external_reference_name(right) == Some("java.lang.Object")
-                    && java_external_reference_name(left).is_some() =>
-            {
-                strict = true;
-            }
-            _ => return None,
+            JavaExternalConversion::Unknown => return None,
         }
     }
     Some(strict)
@@ -3859,10 +4290,15 @@ fn java_external_wrapper_primitive(
 }
 
 impl JvmExternalCallShape {
-    /// The fully-qualified name this overload's declaration writes as its
-    /// return type, or `None` for a form that names no class.
-    fn declared_return_type_fqn(&self) -> Option<&str> {
-        named_return_type_fqn(self.returns.as_ref())
+    fn java_exact_actuals(&self, actuals: &[TypeRef]) -> bool {
+        // Type-use nullability is ignored, while declaration IDs and arguments
+        // must agree; unknown and type-variable terms never establish equality.
+        JavaExternalSignature {
+            parameters: &self.parameters,
+            variadic: self.variadic,
+            has_type_parameters: self.has_type_parameters,
+        }
+        .exact_actuals(actuals)
     }
 }
 
@@ -3885,6 +4321,7 @@ fn callable_member_kind(kind: MemberKind) -> bool {
 
 fn external_call_shape(
     kind: MemberKind,
+    visibility: JvmVisibility,
     is_static: bool,
     signature: Option<&Signature>,
     non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
@@ -3895,9 +4332,11 @@ fn external_call_shape(
     let signature = signature?;
     let parameter_count = u32::try_from(signature.parameters.len()).ok()?;
     Some(JvmExternalCallShape {
+        visibility,
         inventory_identity: None,
         non_overridable,
         parameter_count,
+        has_type_parameters: !signature.type_parameters.is_empty(),
         parameters: signature
             .parameters
             .iter()
@@ -5035,6 +5474,135 @@ fn enclosing_type_fqns(external_type: &JvmExternalType) -> Vec<String> {
     result
 }
 
+/// Model declaration IDs and source declaration IDs occupy distinct domains.
+/// Canonicalize model type declarations before comparing them with scope-proven
+/// nominal actuals; an unresolved or ambiguous model ID remains unknown.
+pub(crate) fn normalize_jvm_model_type_ref(
+    overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
+    reference: &TypeRef,
+) -> TypeRef {
+    let mut result = reference.clone();
+    let mut pending = vec![&mut result];
+    while let Some(term) = pending.pop() {
+        if let TypeRef::Declared {
+            id,
+            arguments,
+            nullable,
+        } = term
+        {
+            let selected = overlay.and_then(|overlay| {
+                let matched = overlay.symbols_with_id(id);
+                let [symbol] = matched.records.as_slice() else {
+                    return None;
+                };
+                (symbol.kind.is_type_declaration() && !symbol.provenance.ambiguous)
+                    .then(|| symbol.qualified_name.clone())
+            });
+            *term = match selected {
+                Some(name) => TypeRef::Named {
+                    name,
+                    arguments: std::mem::take(arguments),
+                    nullable: *nullable,
+                },
+                None => TypeRef::Unknown,
+            };
+        }
+        match term {
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments)
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => pending.push(element),
+            TypeRef::Map { key, value } => {
+                pending.push(key);
+                pending.push(value);
+            }
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref_mut()),
+            TypeRef::Tuple { elements } => pending.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter_mut().map(|parameter| &mut parameter.r#type));
+                pending.extend(result.as_deref_mut());
+            }
+            TypeRef::Unknown | TypeRef::TypeParameter { .. } => {}
+        }
+    }
+    result
+}
+
+/// Reuse the invocation phases for both member selection and conversion rows.
+/// The expanded layout names one formal term per written positional actual.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn select_java_external_model_invocation(
+    actuals: &[TypeRef],
+    signatures: &[crate::analyzer::semantic_model::Signature],
+    surface: &JvmExternalDeclarations<'_>,
+) -> Option<(usize, Vec<TypeRef>)> {
+    let parameters = signatures
+        .iter()
+        .map(|signature| {
+            signature
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    normalize_jvm_model_type_ref(surface.packs.as_deref(), &parameter.r#type)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let shapes = signatures
+        .iter()
+        .zip(&parameters)
+        .map(|(signature, parameters)| JavaExternalSignature {
+            parameters,
+            has_type_parameters: !signature.type_parameters.is_empty(),
+            variadic: signature
+                .parameters
+                .iter()
+                .any(|parameter| parameter.variadic),
+        })
+        .collect::<Vec<_>>();
+    let mut exact = shapes
+        .iter()
+        .enumerate()
+        .filter(|(_, shape)| shape.exact_actuals(actuals));
+    if let Some((selected, _)) = exact.next() {
+        return exact
+            .next()
+            .is_none()
+            .then(|| (selected, parameters[selected].clone()));
+    }
+    // Method inference is not a ground-formal conversion. Keep its candidate
+    // visible rather than erasing method type parameters from applicability.
+    if signatures
+        .iter()
+        .any(|signature| !signature.type_parameters.is_empty())
+    {
+        return None;
+    }
+    let (selected, phase) = select_java_external_invocation(actuals, &shapes, Some(surface))?;
+    let formals = &parameters[selected];
+    let layout = if phase == JavaExternalInvocationPhase::Variable {
+        let (TypeRef::Array { element }, prefix) = formals.split_last()? else {
+            return None;
+        };
+        prefix
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat_n(
+                element.as_ref().clone(),
+                actuals.len() - prefix.len(),
+            ))
+            .collect()
+    } else {
+        formals.clone()
+    };
+    Some((selected, layout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5054,6 +5622,269 @@ mod tests {
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
 
     use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon("ad9166babf21: exact external selection admitted an inaccessible private overload")]
+    fn java_external_exact_selection_rejects_inaccessible_overloads() {
+        use crate::analyzer::semantic_model::{
+            CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
+            SemanticModelActivationRequest, SemanticModelOverlay, SemanticModelResolutionOutcome,
+            SemanticModelRuntimeLimits, SemanticPackCatalog, SessionPackSource,
+            SessionPackSourceKind, SourceFormat, compile_source, resolve_active_semantic_models,
+        };
+        let method = |id: &str, visibility: &str, formal: &str| {
+            serde_json::json!({
+                "id": id, "owner": "type.overloads", "name": "pick", "member_kind": "method",
+                "visibility": visibility, "is_static": true, "is_abstract": false, "is_virtual": false,
+                "signature": {"type_parameters": [], "parameters": [{
+                    "name": "value", "type": TypeRef::named(formal), "optional": false, "variadic": false
+                }], "returns": TypeRef::named("void")},
+                "aliases": [], "locator": {"kind": "artifact", "path": "example/Overloads.class",
+                    "symbol": format!("example.Overloads.pick({formal})")}
+            })
+        };
+        let document = serde_json::json!({
+            "schema_version": 2, "pack_id": "test.jvm-private-overload", "version": "1.0.0",
+            "producer": {"name": "bifrost-test", "version": "1.0.0"},
+            "language": "java", "ecosystem": "jdk",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0", "toolchains": [{
+                "name": "jdk", "requirement": ">=17.0.0"
+            }]},
+            "provenance": {"source": "test:inline", "revision": "ad9166babf21"},
+            "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "decls", "activation": [{
+                "toolchain": {"name": "jdk", "version": ">=17.0.0"},
+                "targets": ["jvm"], "configurations": []
+            }], "payload": {"kind": "declaration_facts", "types": [{
+                "id": "type.overloads", "name": "example.Overloads", "type_kind": "class",
+                "visibility": "public", "is_abstract": false, "is_sealed": false,
+                "has_explicit_type_terms": false, "type_parameters": [], "type_parameter_constraints": [],
+                "embedded_types": [], "hierarchy": [], "aliases": [], "extension_surfaces": [],
+                "locator": {"kind": "artifact", "path": "example/Overloads.class", "symbol": "example.Overloads"}
+            }], "members": [method("member.a-public", "public", "int"),
+                method("member.z-private", "private", "java.lang.String")], "relations": []}}]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&document).expect("fixture JSON"),
+            &CompilerOptions::default(),
+        )
+        .expect("compile test-only declarations");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("fixture catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:private-overload".into(),
+                },
+            )
+            .expect("register declarations");
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".into(),
+                ecosystem: "jdk".into(),
+                package: None,
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: "jdk".into(),
+                    version: Some(semver::Version::new(21, 0, 0)),
+                }),
+                target: Some("jvm".into()),
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let cancellation = CancellationToken::default();
+        let active = match resolve_active_semantic_models(&catalog, &request, &cancellation) {
+            SemanticModelResolutionOutcome::Ready(active) => active,
+            other => panic!("fixture activation must be ready: {other:#?}"),
+        };
+        let root = tempfile::tempdir().expect("isolated Java project");
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root.path(), Language::Java));
+        let overlay = Arc::new(
+            SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 << 20)
+                .expect("fixture overlay"),
+        );
+        let artifacts = JvmExternalDeclarationIndex::default();
+        let surface = JvmExternalDeclarations::new(&artifacts, Some(overlay));
+        let member = surface
+            .resolve_member_spelling("example.Overloads.pick", "client", |name| surface.get(name))
+            .expect("the public overload remains visible");
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[TypeRef::named("int")],
+                Some(&surface)
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[TypeRef::named("java.lang.String")],
+                Some(&surface)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "0242909d77ed: Java census G16 (2026-10-15): variable arity discarded witnessed external overloads"
+    )]
+    fn java_external_varargs_selects_expanded_and_fixed_array_invocations() {
+        let signature: Signature = serde_json::from_value(serde_json::json!({
+            "parameters": [{"name": "values", "type": {"kind": "array", "element": TypeRef::named("java.lang.String")}, "variadic": true}]
+        })).expect("variadic declaration");
+        let mut member = JvmExternalMember {
+            fqn: "example.Api.accept".into(),
+            declaring_package: "example".into(),
+            visibility: JvmVisibility::Public,
+            returns: None,
+            is_static: true,
+            is_constant: false,
+            jdk_artifact_sha256: None,
+            call_shapes: vec![
+                external_call_shape(
+                    MemberKind::Method,
+                    JvmVisibility::Public,
+                    true,
+                    Some(&signature),
+                    None,
+                )
+                .expect("call shape"),
+            ],
+            call_shapes_incomplete: false,
+        };
+        for actuals in [
+            vec![],
+            vec![
+                TypeRef::named("java.lang.String"),
+                TypeRef::named("java.lang.String"),
+            ],
+            vec![TypeRef::Array {
+                element: Box::new(TypeRef::named("java.lang.String")),
+            }],
+        ] {
+            assert_eq!(
+                member.applicable_parameter_count_for_argument_types(false, &actuals, None),
+                Some(1),
+                "{actuals:?}"
+            );
+        }
+        member.call_shapes_incomplete = true;
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[TypeRef::named("java.lang.String")],
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            member.call_shapes.len(),
+            1,
+            "incomplete discovery retains its witnessed declaration"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "0242909d77ed: Java census G25 (2026-10-15): reference array widening was treated as unknown"
+    )]
+    fn java_external_array_covariance_preserves_primitive_array_invariance() {
+        let array = |name| TypeRef::Array {
+            element: Box::new(TypeRef::named(name)),
+        };
+        let actuals = [array("java.lang.String")];
+        let formals = [vec![array("java.lang.Object")]];
+        assert_eq!(
+            select_java_external_signature_for_types(&actuals, &formals),
+            Some(0)
+        );
+        assert_eq!(
+            java_external_conversion(&array("int"), &array("long")),
+            JavaExternalConversion::Inapplicable
+        );
+        assert_eq!(
+            java_external_conversion(&array("int"), &TypeRef::named("int")),
+            JavaExternalConversion::Inapplicable
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "0242909d77ed: Java census G15b (2026-10-15): partial families discarded exact ground overloads"
+    )]
+    fn partial_java_family_selects_exact_ground_formals_without_admitting_conversions() {
+        let named = |name| TypeRef::named(name);
+        let signatures =
+            ["java.lang.String", "java.lang.Integer", "example.Base"].map(|name| Signature {
+                type_parameters: Vec::new(),
+                parameters: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "name": "value", "type": named(name)
+                    }))
+                    .expect("test formal"),
+                ],
+                returns: Some(named("void")),
+            });
+        let member = JvmExternalMember {
+            fqn: "example.Api.accept".to_owned(),
+            declaring_package: "example".to_owned(),
+            visibility: JvmVisibility::Public,
+            returns: Some(named("void")),
+            is_static: true,
+            is_constant: false,
+            jdk_artifact_sha256: None,
+            call_shapes: signatures
+                .iter()
+                .map(|signature| {
+                    external_call_shape(
+                        MemberKind::Method,
+                        JvmVisibility::Public,
+                        true,
+                        Some(signature),
+                        None,
+                    )
+                    .expect("test method signature")
+                })
+                .collect(),
+            call_shapes_incomplete: true,
+        };
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[named("java.lang.String")],
+                None
+            ),
+            Some(1),
+            "an exact static type decides phase 1 without family closure"
+        );
+        for actual in [named("int"), named("example.Child"), TypeRef::Unknown] {
+            assert_eq!(
+                member.applicable_parameter_count_for_argument_types(
+                    false,
+                    std::slice::from_ref(&actual),
+                    None
+                ),
+                None,
+                "boxing, subtyping and unknown actuals stay unproved: {actual:?}"
+            );
+        }
+        assert_eq!(
+            member.non_overridable_for_argument_types(false, &[named("java.lang.String")], None),
+            None,
+            "selection must not fabricate independent finality evidence"
+        );
+    }
+
     #[test]
     #[hardwon(
         "#3699: Regression ensures array shape is preserved only for one complete matching overload, not ambiguous/incomplete calls"
@@ -5075,10 +5906,12 @@ mod tests {
             is_constant: false,
             jdk_artifact_sha256: None,
             call_shapes: vec![JvmExternalCallShape {
+                visibility: JvmVisibility::Public,
                 inventory_identity: None,
                 non_overridable: None,
                 parameter_count: 0,
                 parameters: Vec::new(),
+                has_type_parameters: false,
                 is_static: true,
                 variadic: false,
                 returns: Some(returned.clone()),
@@ -5086,7 +5919,10 @@ mod tests {
             call_shapes_incomplete: false,
         };
         assert_eq!(member.applicable_return_type(false, 0), Some(&returned));
-        assert_eq!(member.applicable_return_type_fqn(false, 0), None);
+        assert_eq!(
+            named_return_type_fqn(member.applicable_return_type(false, 0)),
+            None
+        );
         assert_eq!(member.applicable_return_type(true, 0), None);
         assert_eq!(member.applicable_return_type(false, 1), None);
         member.call_shapes_incomplete = true;
@@ -5233,6 +6069,7 @@ mod tests {
             .direct_inventory_identity_for_argument_types(
                 false,
                 &[TypeRef::named("java.lang.String")],
+                None,
             )
             .expect("direct overload has its durable member coordinate");
         assert_eq!(identity.owner.provider_id.as_ref(), provider);
@@ -5601,10 +6438,10 @@ mod tests {
             nullable: false,
         };
         let string_identity = member
-            .inventory_identity_for_argument_types(&active, true, &[string])
+            .inventory_identity_for_argument_types(&active, true, &[string], None)
             .unwrap();
         let integer_identity = member
-            .inventory_identity_for_argument_types(&active, true, &[integer])
+            .inventory_identity_for_argument_types(&active, true, &[integer], None)
             .unwrap();
         assert_eq!(string_identity.owner, integer_identity.owner);
         assert_ne!(

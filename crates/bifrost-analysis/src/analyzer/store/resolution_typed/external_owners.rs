@@ -174,6 +174,32 @@ impl SelectedResolutionTypedSource<'_, '_> {
         })
     }
 
+    fn external_owner_family_is_enumerated(&self, owner: &ExternalOwnerIdentity) -> bool {
+        let Some(models) = &self.external_models else {
+            return true;
+        };
+        // Artifact inventory providers are independent of model activation.
+        // A model provider's content rows survive activation changes, so its
+        // current source's enumeration authority must be checked at selection.
+        if !models
+            .shards()
+            .iter()
+            .any(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref())
+        {
+            return true;
+        }
+        models
+            .types_named(&owner.owner_fqn)
+            .records
+            .iter()
+            .any(|candidate| {
+                candidate.shard.manifest.semantic_sha256 == owner.provider_id.as_ref()
+                    && candidate
+                        .shard
+                        .independently_enumerates_jvm_owner(candidate.record)
+            })
+    }
+
     pub(super) fn visit_external_member_scopes(
         &self,
         definitions: &[SemanticId],
@@ -182,9 +208,15 @@ impl SelectedResolutionTypedSource<'_, '_> {
     ) -> StoreResult<TypedFactReadOutcome> {
         self.visit_external_rows(definitions,
             "SELECT 0,callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2 AND 0>?3 AND provider_id IN (SELECT value FROM json_each(?5)) LIMIT ?4",
-            cancellation, visitor, |owner, definition, row| Ok(SelectedTypedRow::external_owner(owner.clone(), LoweredMemberScopeProperty::external(definition, crate::analyzer::resolution::ExternalMemberCoverage {
-                callables_complete: row.get(1)?, values_complete: row.get(2)?, types_complete: row.get(3)?, supertypes_complete: row.get(4)?,
-            }))))
+            cancellation, visitor, |owner, definition, row| {
+                let enumerated = self.external_owner_family_is_enumerated(owner);
+                Ok(SelectedTypedRow::external_owner(owner.clone(), LoweredMemberScopeProperty::external(definition, crate::analyzer::resolution::ExternalMemberCoverage {
+                    callables_complete: enumerated && row.get(1)?,
+                    values_complete: enumerated && row.get(2)?,
+                    types_complete: enumerated && row.get(3)?,
+                    supertypes_complete: enumerated && row.get(4)?,
+                })))
+            })
     }
 
     pub(super) fn visit_external_member_owners(

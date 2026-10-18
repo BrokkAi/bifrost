@@ -199,6 +199,7 @@ pub mod pinned_plans {
         CLASS_SET_SUMMARY_PROCEDURE_SQL, DEPENDENCIES_SQL, DEPENDENCY_SOURCES_SQL, EXITS_SQL,
         FACTS_SQL, REACHED_SQL, READS_SQL,
     };
+    use super::super::resolution_operation::jvm_context::SELECTED_JVM_ALIAS_DECLARATION_GAPS;
     use super::super::resolution_operation::selected_rust_declaration_authority_sql;
     use super::super::{
         AnalyzerStore, EXACT_PATH_SYMBOL_FQN_SQL, NORMALIZED_PATH_SYMBOL_FQN_SQL,
@@ -408,7 +409,8 @@ pub mod pinned_plans {
         // Keep the registry self-contained for ephemeral planner-pin stores,
         // preserving the production mount table's WITHOUT ROWID key layout.
         conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS selected_resolution_overlay_masks(storage_language TEXT NOT NULL, persisted_relative_path TEXT NOT NULL, intent TEXT NOT NULL DEFAULT 'replacement', masked_file_version_id INTEGER, masked_blob_oid TEXT, masked_projection_digest BLOB, expected_transient_replacement_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(storage_language,persisted_relative_path)) WITHOUT ROWID;
+            "CREATE TEMP TABLE IF NOT EXISTS unit_summary_order(ordinal INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL UNIQUE, unit_key BLOB UNIQUE) STRICT;
+             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_overlay_masks(storage_language TEXT NOT NULL, persisted_relative_path TEXT NOT NULL, intent TEXT NOT NULL DEFAULT 'replacement', masked_file_version_id INTEGER, masked_blob_oid TEXT, masked_projection_digest BLOB, expected_transient_replacement_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(storage_language,persisted_relative_path)) WITHOUT ROWID;
              CREATE TEMP TABLE IF NOT EXISTS selected_resolution_mounts(
                 mount_ordinal INTEGER PRIMARY KEY,
                 file_version_id INTEGER UNIQUE,
@@ -2133,6 +2135,19 @@ pub mod pinned_plans {
             vec![integer(0), integer(11), integer(0), integer(17)],
         ));
         queries.push(pin(
+            "jvm_native_alias_declaration_gaps",
+            SELECTED_JVM_ALIAS_DECLARATION_GAPS,
+            vec![
+                integer(1),
+                integer(17),
+                integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                    crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedScopeOrBinder,
+                    ),
+                )),
+            ],
+        ));
+        queries.push(pin(
             "selected_definition_units",
             super::super::selected_definition::SELECTED_DEFINITION_UNITS_SQL.as_str(),
             vec![],
@@ -2384,6 +2399,78 @@ pub mod pinned_plans {
                 digest(3),
             ],
         ));
+        for (name, sql, params) in [
+            (
+                "unit_summary_open_version",
+                super::super::unit_summaries::OPEN_VERSION_SQL,
+                vec![
+                    text(&"7".repeat(64)),
+                    text("go"),
+                    integer(1),
+                    digest(1),
+                    digest(3),
+                ],
+            ),
+            (
+                "unit_summary_close_version",
+                super::super::unit_summaries::CLOSE_VERSION_SQL,
+                vec![
+                    text(&"7".repeat(64)),
+                    text("go"),
+                    integer(1),
+                    digest(1),
+                    integer(1),
+                    digest(3),
+                ],
+            ),
+            (
+                "unit_summary_withdraw_version",
+                super::super::unit_summaries::WITHDRAW_VERSION_SQL,
+                vec![
+                    text(&"7".repeat(64)),
+                    text("go"),
+                    integer(1),
+                    digest(1),
+                    integer(1),
+                    digest(3),
+                ],
+            ),
+            (
+                "unit_summary_withdraw_unsettled",
+                super::super::unit_summaries::WITHDRAW_UNSETTLED_SQL,
+                vec![
+                    text(&"7".repeat(64)),
+                    text("go"),
+                    integer(1),
+                    integer(1),
+                    digest(3),
+                ],
+            ),
+            (
+                "unit_summary_close_unsettled",
+                super::super::unit_summaries::CLOSE_UNSETTLED_SQL,
+                vec![
+                    text(&"7".repeat(64)),
+                    text("go"),
+                    integer(1),
+                    integer(1),
+                    digest(3),
+                ],
+            ),
+            (
+                "unit_summary_later_open_version",
+                super::super::unit_summaries::LATER_OPEN_VERSION_SQL,
+                vec![
+                    text(&"7".repeat(64)),
+                    text("go"),
+                    integer(1),
+                    integer(1),
+                    digest(3),
+                ],
+            ),
+        ] {
+            queries.push(pin(name, sql, params));
+        }
         queries.push(pin(
             "unit_summary_export_point",
             super::super::unit_summaries::UNIT_EXPORT_POINT_SQL,
@@ -2392,7 +2479,13 @@ pub mod pinned_plans {
         queries.push(pin(
             "unit_summary_dependents",
             super::super::unit_summaries::UNIT_DEPENDENTS_SQL,
-            vec![digest(1), text(&"7".repeat(64)), text("go"), integer(1)],
+            vec![
+                digest(1),
+                text(&"7".repeat(64)),
+                text("go"),
+                integer(1),
+                digest(3),
+            ],
         ));
         queries.push(pin(
             "rust_unit_summary_live_version",
@@ -2408,6 +2501,29 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
+            "rust_unit_summary_dependency_reexport_witness",
+            super::super::rust_unit_summaries::DEPENDENCY_REEXPORT_WITNESS_SQL,
+            vec![
+                text(&"7".repeat(64)),
+                text("rust"),
+                integer(1),
+                digest(1),
+                integer(1),
+                text("rust-resolution-epoch"),
+                integer(super::super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                digest(2),
+                text("crate::api::nested"),
+                text("value"),
+                text("item"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "rust_crate_named_reexport_targets",
+            super::super::rust_unit_summaries::NAMED_REEXPORT_TARGETS_SQL,
+            vec![integer(1), text("crate"), text("type"), text("selected")],
+        ));
+        queries.push(pin(
             "rust_unit_summary_export_point",
             super::super::unit_summaries::UNIT_EXPORT_POINT_SQL,
             vec![integer(1), text("type"), integer(1)],
@@ -2415,7 +2531,13 @@ pub mod pinned_plans {
         queries.push(pin(
             "rust_unit_summary_dependents",
             super::super::unit_summaries::UNIT_DEPENDENTS_SQL,
-            vec![digest(1), text(&"7".repeat(64)), text("rust"), integer(1)],
+            vec![
+                digest(1),
+                text(&"7".repeat(64)),
+                text("rust"),
+                integer(1),
+                digest(0),
+            ],
         ));
         queries.push(pin(
             "rust_unit_summary_import_graph_binding_surfaces",
@@ -4104,6 +4226,411 @@ pub(crate) mod tests {
                         && !row.contains("TEMP B-TREE")),
                 "{state}: {plan:?}"
             );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#5133: dependency export witnesses missed the alias-target index and scanned module exports"
+    )]
+    fn rust_dependency_reexport_witness_seeks_target_coordinates_in_both_statistics_states() {
+        use rusqlite::{params, params_from_iter};
+
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            let pin = pinned("rust_unit_summary_dependency_reexport_witness");
+            // A selected dependency among unrelated summaries, each with both
+            // declarations and aliases. Bind the registry's real target shape.
+            for summary in 1..=16 {
+                let key = vec![summary as u8; 32];
+                conn.execute(
+                    "INSERT INTO resolution_unit_summaries(
+                       summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,
+                       derivation_version,complete,output_digest,publication_state)
+                     VALUES(?1,'rust','rust_crate',?2,?2,?3,?4,1,?2,'complete')",
+                    params![summary, key, pin.params[5], pin.params[6]],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO resolution_unit_summary_versions
+                     (workspace_id,lang,generation,unit_key,valid_from,valid_until,summary_id)
+                     VALUES(?1,'rust',1,?2,1,NULL,?3)",
+                    params![pin.params[0], key, summary],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO rust_crate_topologies(
+                       topology_id,topology_digest,crate_key,producer_epoch,target_kind,
+                       crate_name,edition,prelude,cfg_atoms,inventory_complete,
+                       export_surface_digest,publication_state)
+                     VALUES(?1,?2,?2,'rust-resolution-epoch','lib','planner_fixture',
+                            '2021','std',jsonb('[]'),1,?2,'complete')",
+                    params![summary, key],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO rust_resolution_unit_summary_versions
+                     (workspace_id,lang,generation,unit_key,valid_from,summary_id,manifest_file_version_id,topology_id)
+                     VALUES(?1,'rust',1,?2,1,?3,NULL,?4)",
+                    params![pin.params[0], key, summary, summary + 1],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO rust_crate_versions
+                     VALUES(?1,'rust',1,?2,1,NULL,NULL,?3)",
+                    params![pin.params[0], key, summary],
+                )
+                .unwrap();
+                conn.execute(
+                    "WITH RECURSIVE names(n) AS (
+                       VALUES(1) UNION ALL SELECT n+1 FROM names WHERE n<128
+                     )
+                     INSERT INTO rust_resolution_unit_summary_exports(
+                       summary_id,module_path,namespace,name,identity_id,visibility,origin,
+                       target_unit_key,alias_identity_id,target_module_path,target_name)
+                     SELECT ?1,'crate','value','alias_'||n,1,'public','reexport',
+                            ?2,1,'crate::api::nested','item_'||n FROM names",
+                    params![summary, pin.params[7]],
+                )
+                .unwrap();
+                conn.execute(
+                    "WITH RECURSIVE names(n) AS (
+                       VALUES(1) UNION ALL SELECT n+1 FROM names WHERE n<128
+                     )
+                     INSERT INTO rust_resolution_unit_summary_exports(
+                       summary_id,module_path,namespace,name,identity_id,visibility,origin)
+                     SELECT ?1,'crate','value','local_'||n,1,'public','declaration' FROM names",
+                    [summary],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO rust_resolution_unit_summary_exports(
+                   summary_id,module_path,namespace,name,identity_id,visibility,origin,
+                   target_unit_key,alias_identity_id,target_module_path,target_name)
+                 VALUES(1,'crate','value','item',1,'public','reexport',
+                        ?1,1,'crate::api::nested','item')",
+                [&pin.params[7]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rust_crate_public_module_reachability
+                 VALUES(1,?1,'crate::api::nested')",
+                [&pin.params[7]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rust_crate_public_module_reachability
+                 VALUES(2,?1,'crate::api::nested'),(1,?2,'crate::api::decoy')",
+                params![pin.params[7], vec![99_u8; 32]],
+            )
+            .unwrap();
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pin);
+            for expected in [
+                "SEARCH versions USING PRIMARY KEY (workspace_id=? AND lang=? AND generation=? AND crate_key=? AND valid_from<?)",
+                "SEARCH topology USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH reachability USING PRIMARY KEY (topology_id=? AND target_crate_key=? AND target_module_path=?)",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(expected)),
+                    "{state} {expected}: {plan:?}"
+                );
+            }
+            assert!(
+                plan.iter().any(|row| {
+                    row.starts_with("SEARCH exports USING")
+                        && row.contains("(target_unit_key=? AND target_module_path=? AND target_name=? AND namespace=? AND alias_identity_id=? AND summary_id=?)")
+                }),
+                "{state}: alias witnesses must seek target coordinates in the selected summary: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|row| {
+                    ![
+                        "SCAN exports",
+                        "SCAN exported_module",
+                        "SCAN versions",
+                        "SCAN reachability",
+                        "AUTOMATIC",
+                        "TEMP B-TREE",
+                    ]
+                    .iter()
+                    .any(|forbidden| row.contains(forbidden))
+                }),
+                "{state} export witness must seek base rows without transient indexes: {plan:?}"
+            );
+            let witnessed = || {
+                conn.query_row(&pin.sql, params_from_iter(&pin.params), |row| {
+                    row.get::<_, bool>(0)
+                })
+                .unwrap()
+            };
+            assert!(witnessed(), "{state}: exact public alias");
+            conn.execute(
+                "DELETE FROM rust_resolution_unit_summary_exports WHERE name='item'",
+                [],
+            )
+            .unwrap();
+            assert!(
+                witnessed(),
+                "{state}: selected topology proves the canonical target module"
+            );
+            conn.execute(
+                "DELETE FROM rust_crate_public_module_reachability
+                 WHERE topology_id=1 AND target_crate_key=?1 AND target_module_path=?2",
+                params![pin.params[7], pin.params[8]],
+            )
+            .unwrap();
+            assert!(
+                !witnessed(),
+                "{state}: membership in another topology is not a proof"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_named_reexport_targets_seek_populated_binders_in_both_statistics_states() {
+        use rusqlite::{params, params_from_iter};
+
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            let pin = pinned("rust_crate_named_reexport_targets");
+            conn.execute_batch(
+                "INSERT INTO rust_crate_topologies VALUES(
+                   1,zeroblob(32),zeroblob(32),'test','lib','sample','2021','std',
+                   jsonb('[\"test\"]'),1,zeroblob(32),'complete');
+                 INSERT INTO rust_crate_containers VALUES(1,'crate','module','root');",
+            )
+            .unwrap();
+            for blob_id in 1..=16 {
+                conn.execute(
+                    "INSERT INTO rust_crate_container_sources
+                     VALUES(1,'crate',?1,0,?2,'declared',NULL,NULL)",
+                    params![blob_id, format!("src/lib_{blob_id}.rs")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO source_rust_module_scopes
+                     (blob_id,ordinal,parent_ordinal,declaration_id,module_name,imports_macros,resolution_scope)
+                     VALUES(?1,0,NULL,NULL,'crate',0,0)",
+                    [blob_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO source_rust_import_contexts
+                     (declaration_start_byte,declaration_end_byte,blob_id,declaration_occurrence_id,
+                      owner_module,owner_scope_occurrence_id,visibility,cfg_condition,native_scope,
+                      owner_scope_start_byte,owner_scope_end_byte)
+                     VALUES(0,0,?1,0,'crate',0,'public','always',0,0,0)",
+                    [blob_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO source_imports
+                     (blob_id,import_id,statement,is_wildcard,is_global,identifier,path_kind,
+                      declaration_occurrence_id,declaration_start_byte,declaration_end_byte)
+                     VALUES(?1,0,'use crate::dep::Target;',0,0,'Target','namespace',0,0,0)",
+                    [blob_id],
+                )
+                .unwrap();
+                for ordinal in 0..64 {
+                    let bound_name = if blob_id == 1 && ordinal == 0 {
+                        "selected".to_owned()
+                    } else {
+                        format!("decoy_{blob_id}_{ordinal}")
+                    };
+                    conn.execute(
+                        "INSERT INTO rust_import_targets
+                         (blob_id,lang,ordinal,source_import_id,source_context_occurrence_id,
+                          module_path,bound_name,imported_name,is_glob,visibility,cfg_condition,
+                          is_extern_crate,is_macro_use,leading_absolute)
+                         VALUES(?1,'rust',?2,0,0,'crate',?3,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
+                        params![blob_id, ordinal, bound_name],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO rust_crate_imports
+                         VALUES(1,'crate','type',?1,?2,?3,0,zeroblob(32),'crate::dep','Target')",
+                        params![bound_name, blob_id, ordinal],
+                    )
+                    .unwrap();
+                }
+            }
+
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pin);
+            for expected in [
+                "SEARCH target USING PRIMARY KEY (blob_id=? AND ordinal=?)",
+                "SEARCH member USING PRIMARY KEY (topology_id=? AND container_path=? AND blob_id=?)",
+                "SEARCH scope USING PRIMARY KEY (blob_id=? AND ordinal=?)",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(expected)),
+                    "{state} {expected}: {plan:?}"
+                );
+            }
+            assert!(
+                plan.iter().all(|row| {
+                    ![
+                        "SCAN imports",
+                        "SCAN target",
+                        "SCAN source",
+                        "SCAN context",
+                        "SCAN member",
+                        "SCAN scope",
+                        "AUTOMATIC",
+                    ]
+                    .iter()
+                    .any(|forbidden| row.contains(forbidden))
+                }),
+                "{state} named reexport target lookup must seek populated source rows: {plan:?}"
+            );
+            // Both the primary key and binder index bound work to this
+            // topology/module frame; their remaining columns differ.
+            assert!(
+                plan.iter().any(|row| {
+                    row.starts_with("SEARCH imports USING")
+                        && row.contains("(topology_id=? AND module_path=?")
+                }),
+                "{state}: imports must seek the selected topology and module: {plan:?}"
+            );
+            let targets = conn
+                .prepare(&pin.sql)
+                .unwrap()
+                .query_map(params_from_iter(&pin.params), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(targets.len(), 1, "{state}: selected binder only");
+            assert_eq!(targets[0].1, "crate::dep");
+            assert_eq!(targets[0].2, "Target");
+        }
+    }
+
+    #[test]
+    fn jvm_native_alias_declaration_gaps_use_keyed_reads_in_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            conn.execute_batch("PRAGMA foreign_keys=OFF;")
+                .expect("access-plan fixture does not publish fragments");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+
+            let unsupported_scope_or_binder =
+                super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                    crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedScopeOrBinder,
+                    ),
+                );
+            conn.execute_batch(
+                "INSERT INTO resolution_node_catalog(blob_id,local_key,identity_digest,source_scope,kind) VALUES
+                   (1,33,randomblob(32),33,0),(1,17,randomblob(32),NULL,1),
+                   (1,34,randomblob(32),34,0),(1,18,randomblob(32),NULL,1);",
+            )
+            .expect("matching declaration and unrelated scope");
+            conn.execute(
+                "INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_identity,start_lead_scoped,end_node,end_lead_scoped,body)
+                 VALUES(1,1,33,1,0,17,0,jsonb('[[],null,[],null,[],null,[],null,[],[],[]]'))",
+                [],
+            )
+            .expect("matching source-proven binder");
+            conn.execute(
+                "INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) VALUES
+                   (1,6,17,0,1,101),(1,5,33,0,2,102)",
+                [],
+            )
+            .expect("matching declaration and binder gaps");
+            conn.execute(
+                "INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) VALUES
+                   (1,101,17,?1),(1,102,33,?1)",
+                [unsupported_scope_or_binder],
+            )
+            .expect("matching gap provenance");
+
+            // Keep the target sparse among realistic keyed noise. Most rows
+            // belong to other blobs, definitions, and scopes; same-blob rows
+            // exercise the reverse index and gap/reason primary keys.
+            for index in 0..1024_i64 {
+                let blob = if index % 2 == 0 { 1 } else { 2 };
+                let start = 10_000 + index;
+                let end = 20_000 + index;
+                conn.execute(
+                    "INSERT INTO resolution_node_catalog(blob_id,local_key,identity_digest,source_scope,kind)
+                     VALUES(?1,?2,randomblob(32),?3,0)",
+                    rusqlite::params![blob, start, start],
+                )
+                .expect("unrelated scope and definition");
+                conn.execute(
+                    "INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_identity,start_lead_scoped,end_node,end_lead_scoped,body)
+                     VALUES(?1,?2,?3,?4,0,?5,0,jsonb('[[],null,[],null,[],null,[],null,[],[],[]]'))",
+                    rusqlite::params![blob, 10 + index, start, 10 + index, end],
+                )
+                .expect("unrelated binder path");
+                conn.execute(
+                    "INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) VALUES
+                       (?1,5,?2,0,?3,?4),(?1,6,?5,0,?3+1,?4)",
+                    rusqlite::params![blob, start, 10 + 2 * index, 10_000 + index, end],
+                )
+                .expect("unrelated scoped declaration gap");
+                conn.execute(
+                    "INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![blob, 10_000 + index, start, unsupported_scope_or_binder],
+                )
+                .expect("unrelated gap provenance");
+            }
+
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("jvm_native_alias_declaration_gaps"));
+
+            for required in [
+                "SEARCH binder USING INDEX resolution_paths_reverse (blob_id=? AND end_node=?",
+                "SEARCH gap USING PRIMARY KEY",
+                "SEARCH reason USING PRIMARY KEY",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(required)),
+                    "{state} must {required}: {plan:?}"
+                );
+            }
+            for forbidden in [
+                "SCAN binder",
+                "SCAN gap",
+                "SCAN reason",
+                "SCAN resolution_paths",
+                "AUTOMATIC",
+                "TEMP B-TREE",
+            ] {
+                assert!(
+                    !plan.iter().any(|row| row.contains(forbidden)),
+                    "{state} must not {forbidden}: {plan:?}"
+                );
+            }
+
+            let mut reasons = conn
+                .prepare(&pinned("jvm_native_alias_declaration_gaps").sql)
+                .expect("prepare selected reasons")
+                .query_map(
+                    rusqlite::params![1, 17, unsupported_scope_or_binder],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read selected reasons")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect selected reasons");
+            reasons.sort_unstable();
+            assert_eq!(reasons, [101, 102], "{state}: exact declaration gaps");
         }
     }
 

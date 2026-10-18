@@ -412,6 +412,9 @@ impl<'a> JavaResolutionSession<'a> {
                 &mut state.work.resolution_rounds,
                 budget.max_resolution_rounds,
             ),
+            ReceiverBudgetLimit::TotalWork => {
+                unreachable!("Java sessions do not opt into aggregate work")
+            }
         };
         if *used == maximum {
             state.stop = Some(JavaResolutionStop::Exceeded(limit));
@@ -2467,6 +2470,9 @@ struct JavaExternalOwner {
     non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
     fqn: String,
     member_declared: bool,
+    /// A named declaration and its actual applicability do not prove an
+    /// unresolved receiver produced by an earlier chained call.
+    receiver_proven: bool,
     form: JavaExternalReceiverForm,
     jdk_artifact_sha256: Option<String>,
     /// Present only when one recorded signature accepts this call's arity and
@@ -2475,6 +2481,11 @@ struct JavaExternalOwner {
 }
 
 impl JavaExternalOwner {
+    fn with_receiver_proof(mut self, receiver_proven: bool) -> Self {
+        self.receiver_proven = receiver_proven;
+        self
+    }
+
     fn with_non_overridable(
         mut self,
         non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
@@ -2488,6 +2499,7 @@ impl JavaExternalOwner {
         Self {
             fqn,
             member_declared: false,
+            receiver_proven: true,
             non_overridable: None,
             form,
             jdk_artifact_sha256: None,
@@ -2505,6 +2517,7 @@ impl JavaExternalOwner {
         Self {
             fqn,
             member_declared: true,
+            receiver_proven: true,
             non_overridable: None,
             form,
             jdk_artifact_sha256,
@@ -2700,13 +2713,12 @@ fn java_external_call_return_type_fqn(
         call,
         chain_budget,
     )?;
-    let instance_receiver = matches!(owner.form, JavaExternalReceiverForm::BoundValue);
-    if owner.applicable_parameter_count.is_some()
-        && let Some(selected) =
-            member.applicable_return_type_fqn(instance_receiver, argument_list_arity(call))
+    if let Some(crate::analyzer::semantic_model::TypeRef::Named { name, .. }) =
+        java_selected_external_invocation_return_type(analyzer, file, source, call, &owner, &member)
+        && !name.is_empty()
     {
         return Some(JavaExternalCallReturn {
-            fqn: selected.to_owned(),
+            fqn: name,
             proven: true,
         });
     }
@@ -2786,7 +2798,6 @@ pub(crate) fn java_external_invocation_return_type(
     while let Some(parent) = root.parent() {
         root = parent;
     }
-    let arity = argument_list_arity(call);
     let (owner, member) = java_external_invocation_member(
         java,
         token,
@@ -2798,13 +2809,60 @@ pub(crate) fn java_external_invocation_return_type(
         call,
         JAVA_CHAINED_RECEIVER_LIMIT,
     )?;
-    owner.applicable_parameter_count?;
-    member
-        .applicable_return_type(
-            matches!(owner.form, JavaExternalReceiverForm::BoundValue),
-            arity,
-        )
-        .cloned()
+    java_selected_external_invocation_return_type(java, file, source, call, &owner, &member)
+}
+
+/// Both return consumers preserve receiver proof and select the same declared
+/// return. Incomplete families can select only the shared exact-type case.
+fn java_selected_external_invocation_return_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    call: Node<'_>,
+    owner: &JavaExternalOwner,
+    member: &crate::analyzer::jvm::external::JvmExternalMember,
+) -> Option<crate::analyzer::semantic_model::TypeRef> {
+    use crate::analyzer::semantic_model::TypeRef;
+    if !owner.receiver_proven {
+        return None;
+    }
+    // Actual typing can re-enter this helper only for a strict child call.
+    // Count enclosing invocations as well as the receiver ladder's own bound,
+    // so a fresh argument query cannot reset an arbitrarily deep call chain.
+    let mut ancestor = Some(call);
+    let mut nesting = 0;
+    while let Some(node) = ancestor {
+        if node.kind() == "method_invocation" {
+            nesting += 1;
+            if nesting > JAVA_CHAINED_RECEIVER_LIMIT {
+                return None;
+            }
+        }
+        ancestor = node.parent();
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let actuals = arguments
+        .named_children(&mut cursor)
+        .filter(|actual| !actual.is_extra())
+        .map(|actual| {
+            crate::analyzer::java::legacy_static_argument_type(analyzer, file, actual, source)
+                .unwrap_or(TypeRef::Unknown)
+        })
+        .collect::<Vec<_>>();
+    let instance_receiver = matches!(owner.form, JavaExternalReceiverForm::BoundValue);
+    let returned = member
+        .exact_return_type_for_argument_types(instance_receiver, &actuals)
+        .or_else(|| {
+            owner.applicable_parameter_count?;
+            member.applicable_return_type(instance_receiver, actuals.len())
+        })?;
+    Some(
+        crate::analyzer::jvm::external::normalize_jvm_model_type_ref(
+            analyzer.semantic_model_overlay().as_deref(),
+            returned,
+        ),
+    )
 }
 
 /// The static type one chained call hands its outer receiver, and whether the
@@ -2872,20 +2930,19 @@ fn java_resolved_type_owner_fqn(
                     applicable,
                     member.jdk_artifact_sha256().map(str::to_owned),
                 )
-                .with_non_overridable(applicable.and(call_arity).and_then(
-                    |arity| {
-                        member.non_overridable_at(
-                            matches!(form, JavaExternalReceiverForm::BoundValue),
-                            arity,
-                        )
-                    },
-                )),
+                .with_receiver_proof(receiver_proven)
+                .with_non_overridable(applicable.and(call_arity).and_then(|arity| {
+                    member.non_overridable_at(
+                        matches!(form, JavaExternalReceiverForm::BoundValue),
+                        arity,
+                    )
+                })),
             );
         }
-        return Some(JavaExternalOwner::type_only(
-            external_type.fqn().to_owned(),
-            form,
-        ));
+        return Some(
+            JavaExternalOwner::type_only(external_type.fqn().to_owned(), form)
+                .with_receiver_proof(receiver_proven),
+        );
     }
     // The overlay and jar index can both be empty in an inline fixture. An
     // explicit single-type import is still file-local structured evidence of
@@ -2893,7 +2950,9 @@ fn java_resolved_type_owner_fqn(
     if let Some(imported) =
         session.query_optional_row(|| java.explicit_imported_type_fqn(token, file, normalized))
     {
-        return Some(JavaExternalOwner::type_only(imported, form));
+        return Some(
+            JavaExternalOwner::type_only(imported, form).with_receiver_proof(receiver_proven),
+        );
     }
 
     // java.lang is implicitly imported into every compilation unit. A golden
@@ -2911,7 +2970,10 @@ fn java_resolved_type_owner_fqn(
         .filter(|models| {
             models.has_receiverless_procedure_summary_member("java", &owner, member_name)
         })
-        .map(|_| JavaExternalOwner::with_declared_member(owner, form, None, None))
+        .map(|_| {
+            JavaExternalOwner::with_declared_member(owner, form, None, None)
+                .with_receiver_proof(receiver_proven)
+        })
 }
 
 /// The written bound of a type-parameter receiver whose bound this file imports

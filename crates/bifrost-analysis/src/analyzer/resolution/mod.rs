@@ -15,6 +15,7 @@ mod fact_reference_edges;
 mod fact_resolution;
 mod fact_source;
 mod local_identity;
+mod local_writes;
 mod model;
 mod mounted;
 mod remount;
@@ -250,7 +251,9 @@ fn positioned_identifier_for_test(
 fn partial_path_id_for_test(value: &str) -> PartialPathId {
     PartialPathId::for_test(value)
 }
-pub(crate) use fact_lowering::jvm_type_prefix_gap_origin_is_safe;
+pub(crate) use fact_lowering::{
+    jvm_terminal_type_gap_origin_is_safe, jvm_type_prefix_gap_origin_is_safe,
+};
 
 static GO_UNIVERSE_IDENTITY_DIGESTS: std::sync::LazyLock<HashSet<[u8; 32]>> =
     std::sync::LazyLock::new(|| {
@@ -373,6 +376,7 @@ pub(super) const fn declaration_type_role_rank(
         DeclarationTypeRole::Identity => 3,
         DeclarationTypeRole::NominalIdentity => 4,
         DeclarationTypeRole::CallableFirstResult => 5,
+        DeclarationTypeRole::ObservedValue => 6,
     }
 }
 
@@ -557,8 +561,8 @@ pub(crate) use selected_context::{
     SelectedRootBridgeDescriptor, SelectedRootBridgeProjection, SelectedRootImportAnchors,
     SelectedRootPathHalf, classify_selected_root_path_half, compile_selected_context_overlay,
     compile_selected_context_overlay_in_session, compile_selected_root_bridge,
-    visit_selected_root_export_half_pages, visit_selected_root_import_half_pages,
-    visit_selected_root_import_half_pages_with_targets,
+    selected_root_source_anchor, visit_selected_root_export_half_pages,
+    visit_selected_root_import_half_pages, visit_selected_root_import_half_pages_with_targets,
 };
 pub(crate) use selected_context::{
     SelectedGoImportBindingDescriptor, SelectedPackageBridgeDescriptor,
@@ -1083,11 +1087,22 @@ pub(crate) fn lower_resolution_facts_for_selection(
     facts: &brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts,
 ) -> LoweredResolutionFactsWithIdentityCatalog {
     let mut identities = ResolutionIdentityCatalogBuilder::new(fragment, names);
-    let lexical = fact_lowering::lower_file_resolution_facts_with_identities(
+    let mut lexical = fact_lowering::lower_file_resolution_facts_with_identities(
         &mut identities,
         language,
         facts,
     );
+    let normalized = local_writes::attach_local_writes(facts, &lexical, &mut identities);
+    let facts = normalized.as_ref();
+    if matches!(normalized, std::borrow::Cow::Owned(_)) {
+        // New join slots and failed attachment gaps must be published by both
+        // lexical coverage and typed lowering, under the same identity catalog.
+        lexical = fact_lowering::lower_file_resolution_facts_with_identities(
+            &mut identities,
+            language,
+            facts,
+        );
+    }
     let typed = typed_fact_lowering::lower_typed_resolution_facts_with_identities(
         &mut identities,
         language,

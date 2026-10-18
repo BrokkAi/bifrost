@@ -1688,6 +1688,173 @@ fn java_native_point_resolves_nested_unqualified_same_class_calls() {
 
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
+    "bd1ff8564f48: a qualified inner creation actual must not borrow an imported top-level type"
+)]
+fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
+    let source = r#"import decoy.Input;
+        class Holder { class Input { Input(byte[] bytes) {} } }
+        class Types { static class Nested { Nested() {} } }
+        class Stream { Stream(Object input) {} }
+        class Use {
+            void imported(Input value) { new Stream(value); }
+            void typeQualified() { new Stream(new Types.Nested()); }
+            void known(Holder holder, byte[] bytes) { new Stream(holder.new Input(bytes)); }
+            void unknownArgument(Holder holder, Missing bytes) { new Stream(holder.new Input(bytes)); }
+            void unknown(Missing holder, byte[] bytes) { new Stream(holder.new Input(bytes)); }
+        }"#;
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("Use.java", source)
+        .file(
+            "decoy/Input.java",
+            "package decoy; public class Input { public Input(byte[] bytes) {} }",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file("Use.java");
+    let tree = super::super::parse_tree(source).expect("nested construction fixture parses");
+    let mut pending = vec![tree.root_node()];
+    let mut creations = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.kind() == "object_creation_expression"
+            && node.child_by_field_name("type").is_some_and(|ty| {
+                ty.utf8_text(source.as_bytes()).expect("fixture type") == "Stream"
+            })
+        {
+            let actual = node
+                .child_by_field_name("arguments")
+                .and_then(|arguments| arguments.named_child(0))
+                .expect("one actual");
+            let mut ancestor = node.parent();
+            while let Some(parent) = ancestor {
+                if parent.kind() == "method_declaration" {
+                    let method = parent.child_by_field_name("name").expect("fixture method");
+                    creations.push((
+                        method
+                            .utf8_text(source.as_bytes())
+                            .expect("fixture method name"),
+                        actual,
+                    ));
+                    break;
+                }
+                ancestor = parent.parent();
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    assert_eq!(creations.len(), 5, "one Stream actual in each method");
+    let actual_type = |method: &str| {
+        let (_, expression) = creations
+            .iter()
+            .find(|(name, _)| *name == method)
+            .expect("fixture actual");
+        let expression = *expression;
+        let site = ResolvedReferenceSite {
+            path: file.to_string(),
+            text: expression
+                .utf8_text(source.as_bytes())
+                .expect("fixture actual")
+                .into(),
+            range: Range {
+                start_byte: expression.start_byte(),
+                end_byte: expression.end_byte(),
+                start_line: expression.start_position().row + 1,
+                end_line: expression.end_position().row + 1,
+            },
+            focus_start_byte: expression.start_byte(),
+            focus_end_byte: expression.end_byte(),
+        };
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let query = BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        };
+        let (callee, ordinal) = java_native_argument_projection(expression).expect("outer actual");
+        let callee_site = java_native_reference_site_at_node(query, callee).expect("outer callee");
+        let argument_query = BoundedReceiverQuery {
+            site: &callee_site,
+            ..query
+        };
+        let stored = crate::analyzer::native_points::resolve_native_call_argument_type_bounded(
+            &analyzer.inner,
+            argument_query,
+            ordinal,
+            prepare_context,
+            || {},
+        );
+        if let BoundedResolution::Complete { value, .. } = &stored {
+            eprintln!("nested {method} stored argument: {:?}", value.value_types);
+        }
+        let actual = java_native_argument_type(&analyzer, query, scope.token(), expression);
+        let value_site = java_native_receiver_type_site_node(expression).expect("value site");
+        let direct = java_native_expression_value_type_at_node(query, value_site)
+            .expect("the expression query completes");
+        eprintln!("nested {method} direct value: {:?}", direct.value_types);
+        assert_eq!(
+            direct.static_type, actual,
+            "expression and actual coordinates retain the same static type: {method}"
+        );
+        actual
+    };
+    let imported = actual_type("imported");
+    let type_qualified = actual_type("typeQualified");
+    let known_owner = actual_type("known");
+    let unknown_argument = actual_type("unknownArgument");
+    let unknown_owner = actual_type("unknown");
+    eprintln!(
+        "nested actual types: imported={imported:?}, known_owner={known_owner:?}, unknown_owner={unknown_owner:?}"
+    );
+    assert!(
+        imported.is_some(),
+        "the explicitly typed imported control has a static type"
+    );
+    assert!(
+        known_owner.is_some() && known_owner != imported,
+        "the known enclosing instance supplies Holder.Input, never the imported Input: {known_owner:?}"
+    );
+    assert!(
+        type_qualified.is_some() && type_qualified != imported && type_qualified != known_owner,
+        "a type-qualified creation supplies its own nested type: {type_qualified:?}"
+    );
+    // #5344: both focused selectors must finish, not just retain the right target.
+    let creation = source
+        .find("new Types.Nested()")
+        .expect("qualified creation");
+    for (offset, name, expected) in [
+        ("new ".len(), "Types", "Types"),
+        ("new Types.".len(), "Nested", "Types.Nested.Nested"),
+    ] {
+        let resolved = native_evidence_at(&analyzer, &file, source, creation + offset, name.len());
+        assert_eq!(
+            resolved.outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{resolved:?}"
+        );
+        let targets = resolved
+            .outcome
+            .definitions
+            .iter()
+            .map(|definition| definition.fq_name())
+            .collect::<Vec<_>>();
+        assert_eq!(targets, [expected], "{resolved:?}");
+    }
+    assert_eq!(
+        unknown_argument, known_owner,
+        "unknown constructor applicability cannot erase the known created type"
+    );
+    assert!(
+        unknown_owner.is_none(),
+        "an unknown enclosing instance must not supply an imported type: {unknown_owner:?}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
     "0242909d77ed: Java census G01 (2026-10-15) declaration names were reported as unavailable references"
 )]
 fn java_census_g01_declaration_name_is_not_a_reference() {
@@ -1776,5 +1943,289 @@ fn java_census_g02_import_target_has_a_native_reference() {
         answer.outcome.status,
         DefinitionLookupStatus::UnresolvableImportBoundary,
         "an import names an external boundary when no selected provider indexes it: {answer:?}",
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#5331: unsupported static getter aliases lost incomplete evidence"
+)]
+fn java_native_static_accessor_aliases_preserve_incomplete_evidence() {
+    for selector in ["getAnswer", "*"] {
+        let source = format!(
+            "package use; import static dep.AccessorsKt.{selector}; class Use {{ int run() {{ return getAnswer(); }} }}"
+        );
+        let fixture = InlineTestProject::new()
+            .file("pom.xml", "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>static-accessor</artifactId><version>1</version></project>")
+            .file("src/main/kotlin/dep/Accessors.kt", "package dep\nval answer: Int = 42\n")
+            .file(CALLER_PATH, source.as_str())
+            .build();
+        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let file = fixture.file(CALLER_PATH);
+        let focus = source.rfind("getAnswer").expect("accessor call");
+        let resolved = native_evidence_at(
+            workspace.analyzer(),
+            &file,
+            &source,
+            focus,
+            "getAnswer".len(),
+        );
+        let outcome = resolved.outcome;
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Incomplete,
+            "{outcome:#?}"
+        );
+        assert!(
+            outcome.definitions.is_empty(),
+            "a callable alias cannot resolve directly to a property: {outcome:#?}"
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "jvm-import-alias-route-open"),
+            "{outcome:#?}"
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != "java_static_import_external_boundary"),
+            "the published alias proves its owner exists: {outcome:#?}"
+        );
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "085f9a4e947b: a proved Java type prefix retained package ambiguity"
+)]
+fn java_native_type_prefix_obscures_package_only_after_complete_lookup() {
+    let source = "import absent.*; class Types { static class Nested { Nested() {} } } \
+        class Open extends Missing {} class Use { \
+        void known() { new Types.Nested(); } \
+        void unknown() { new MissingTypes.Nested(); } \
+        void hierarchy() { new Open.Nested(); } }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("Use.java", source)
+        .file(
+            "Types/Nested.java",
+            "package Types; public class Nested { public Nested() {} }",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file("Use.java");
+    let known = source.find("new Types.Nested()").expect("known creation");
+    for (offset, name, expected) in [(4, "Types", "Types"), (10, "Nested", "Types.Nested.Nested")] {
+        let result = native_evidence_at(&analyzer, &file, source, known + offset, name.len());
+        assert_eq!(
+            result.outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{result:?}"
+        );
+        assert_eq!(result.outcome.definitions.len(), 1, "{result:?}");
+        assert_eq!(
+            result.outcome.definitions[0].fq_name(),
+            expected,
+            "{result:?}"
+        );
+        assert_eq!(result.outcome.definitions[0].source(), &file, "{result:?}");
+    }
+    let member_at =
+        |analyzer: &JavaAnalyzer, file: &crate::analyzer::ProjectFile, creation: &str| {
+            let start = source.find(creation).expect("unproved creation");
+            let member = start + creation.find("Nested").expect("member identifier");
+            native_evidence_at(analyzer, file, source, member, "Nested".len())
+        };
+    let open = member_at(&analyzer, &file, "new Open.Nested()");
+    eprintln!("qualified unknown-base member: {open:?}");
+    assert_eq!(
+        open.outcome.status,
+        DefinitionLookupStatus::Incomplete,
+        "{open:?}"
+    );
+    let missing = member_at(&analyzer, &file, "new MissingTypes.Nested()");
+    eprintln!("qualified wildcard without workspace package: {missing:?}");
+    assert!(missing.outcome.definitions.is_empty(), "{missing:?}");
+    assert_eq!(
+        missing.outcome.status,
+        DefinitionLookupStatus::Incomplete,
+        "{missing:?}"
+    );
+    let binding = missing
+        .outcome
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.kind == "incomplete_binding")
+        .expect("unproved prefix retains its incompleteness reasons");
+    assert_eq!(
+        binding.message.matches("UnsupportedSemantic(").count(),
+        3,
+        "{missing:?}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#5556: an unindexed wildcard may obscure a workspace package prefix"
+)]
+#[ignore = "finds real bug: #5556 workspace package resolves although an unindexed wildcard may supply an obscuring type"]
+fn java_native_unindexed_wildcard_keeps_workspace_package_prefix_incomplete() {
+    let source = "import absent.*; class Use { void unknown() { new MissingTypes.Nested(); } }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("Use.java", source)
+        .file(
+            "MissingTypes/Nested.java",
+            "package MissingTypes; public class Nested { public Nested() {} }",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let member = source.find("Nested").expect("member identifier");
+    let answer = native_evidence_at(
+        &analyzer,
+        &fixture.file("Use.java"),
+        source,
+        member,
+        "Nested".len(),
+    );
+    assert_eq!(
+        answer.outcome.status,
+        DefinitionLookupStatus::Incomplete,
+        "a workspace package and an unindexed wildcard type must stay ambiguous: {answer:?}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "0242909d77ed: Java census G14 binary actuals lost static types or borrowed operand types"
+)]
+fn java_native_binary_actuals_promote_together_and_string_decides_unknown_operands() {
+    let source = r#"class Use {
+        void consume(Object value) {}
+        void small(byte left, short right) { consume(left + right); }
+        void shift(int left, long right) { consume(left << right); }
+        void wide(int left, long right) { consume(left + right); }
+        void decimal(float left, double right) { consume(left * right); }
+        void bits(boolean left, boolean right) { consume(left ^ right); }
+        void text(Missing value) { consume("prefix" + value); }
+        void unknown(int left, Missing right) { consume(left + right); }
+        void repeated(byte value) { consume(value + value); }
+        void comparison(Missing value) { consume(value == null); }
+        void instance(Missing value) { consume(value instanceof Object); }
+    }"#;
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("Use.java", source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file("Use.java");
+    let _scope = AnalyzerQueryScope::new(&analyzer);
+    let tree = super::super::parse_tree(source).expect("binary fixture parses");
+    let expected = [
+        ("small", Some("int")),
+        ("shift", Some("int")),
+        ("wide", Some("long")),
+        ("decimal", Some("double")),
+        ("bits", Some("boolean")),
+        ("text", Some("java.lang.String")),
+        ("unknown", None),
+        ("repeated", Some("int")),
+        ("comparison", Some("boolean")),
+        ("instance", Some("boolean")),
+    ];
+    let mut observed = std::collections::BTreeMap::new();
+    let mut failures = Vec::new();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "method_invocation"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| name.utf8_text(source.as_bytes()).unwrap() == "consume")
+        {
+            let actual = node
+                .child_by_field_name("arguments")
+                .and_then(|arguments| arguments.named_child(0))
+                .expect("one actual");
+            let mut ancestor = node.parent();
+            let method = loop {
+                let parent = ancestor.expect("call belongs to a fixture method");
+                if parent.kind() == "method_declaration" {
+                    break parent
+                        .child_by_field_name("name")
+                        .unwrap()
+                        .utf8_text(source.as_bytes())
+                        .unwrap();
+                }
+                ancestor = parent.parent();
+            };
+            let name = node.child_by_field_name("name").unwrap();
+            let site = ResolvedReferenceSite {
+                path: file.to_string(),
+                text: "consume".into(),
+                range: Range {
+                    start_byte: name.start_byte(),
+                    end_byte: name.end_byte(),
+                    start_line: name.start_position().row + 1,
+                    end_line: name.end_position().row + 1,
+                },
+                focus_start_byte: name.start_byte(),
+                focus_end_byte: name.end_byte(),
+            };
+            let query = BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            };
+            let answer = crate::analyzer::native_points::resolve_native_call_argument_type_bounded(
+                &analyzer.inner,
+                query,
+                0,
+                prepare_context,
+                || {},
+            );
+            let BoundedResolution::Complete { value, .. } = answer else {
+                panic!("{method}: bounded native query did not complete");
+            };
+            eprintln!(
+                "binary {method} {:?}: {:?}",
+                actual.utf8_text(source.as_bytes()).unwrap(),
+                value.value_types
+            );
+            let wanted = expected.iter().find(|(name, _)| *name == method).unwrap().1;
+            let names = value
+                .value_types
+                .types
+                .iter()
+                .map(|ty| ty.fqn.as_str())
+                .collect::<Vec<_>>();
+            let correct = if let Some(wanted) = wanted {
+                value.value_types.status
+                    == crate::analyzer::usages::get_type::TypeLookupStatus::Resolved
+                    && value.static_type.is_some()
+                    && names == [wanted]
+            } else {
+                value.static_type.is_none()
+                    && value.value_types.status
+                        == crate::analyzer::usages::get_type::TypeLookupStatus::Incomplete
+            };
+            if !correct {
+                failures.push(format!(
+                    "{method}: expected {wanted:?}, observed {:?}, static {:?}",
+                    value.value_types, value.static_type
+                ));
+            }
+            assert!(observed.insert(method, ()).is_none());
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    assert_eq!(observed.len(), expected.len());
+    assert!(
+        failures.is_empty(),
+        "binary actual mismatches: {failures:?}"
     );
 }

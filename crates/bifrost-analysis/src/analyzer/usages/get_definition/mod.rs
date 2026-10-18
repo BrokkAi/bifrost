@@ -429,7 +429,8 @@ pub(crate) use python::{
     python_attribute_callee_names_enclosing_nested_class_bounded,
     python_attribute_callee_reads_a_field_bounded,
     python_attribute_callee_uses_self_or_cls_bounded, python_class_candidate_for_name,
-    python_external_imported_symbol_bounded, python_namespace_imported_class_name_bounded,
+    python_class_object_base_candidate, python_external_imported_symbol_bounded,
+    python_external_model_namespace_available, python_namespace_imported_class_name_bounded,
     python_type_checking_imported_class_candidate, python_type_lookup_resolution_bounded,
     resolve_python_bounded,
 };
@@ -2159,7 +2160,7 @@ impl CallEvidence {
         self.dispatch_extensibility
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn exact_external_call(&self) -> Option<&ExactExternalCallProof> {
         self.exact_external_call.as_ref()
     }

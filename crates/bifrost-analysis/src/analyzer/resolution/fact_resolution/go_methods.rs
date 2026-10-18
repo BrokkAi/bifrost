@@ -93,6 +93,75 @@ impl FactReadSession<'_> {
 }
 
 impl FactEvaluation<'_, '_> {
+    /// A known method receiver admits a value receiver, or a pointer receiver
+    /// through a pointer value or an addressable operand. Without those facts,
+    /// preserve the declaration's applicability marker on the target binding.
+    pub(crate) fn go_receiver_binding_completion(
+        &mut self,
+        candidate: SemanticId,
+        call: &LoweredCallApplicabilityObligation,
+        signature: &LoweredCallableSignatureProperty,
+    ) -> StoreResult<Option<ResolutionCompletion>> {
+        let Some(reasons) = self.call_applicability_reasons([signature.completion()])? else {
+            return Ok(None);
+        };
+        if reasons.is_empty() {
+            return Ok(Some(ResolutionCompletion::Complete));
+        }
+        let read = self
+            .session
+            .deferred_member_owners_for_definitions(&[candidate])?;
+        let Some(owners) = self.accept_session_read(read) else {
+            return Ok(None);
+        };
+        assert!(
+            owners.len() <= 1,
+            "one method has one deferred receiver owner"
+        );
+        if owners.is_empty() {
+            // An invocation gap on a function literal is not a method-set
+            // requirement. Its signature still constrains call-result typing.
+            return Ok(Some(ResolutionCompletion::Complete));
+        }
+        // Member lookup records the actual selected receiver after promotion,
+        // including pointer embeddings of a non-addressable outer value.
+        if let Some(evidence) = self
+            .receiver_target_evidence
+            .get(&(call.callee_reference(), candidate))
+            && !evidence.category_open
+            && !evidence.values.is_empty()
+        {
+            let mut values = Vec::with_capacity(evidence.values.len());
+            for &value in &evidence.values {
+                if poll_cancelled(self.cancellation, &mut self.work) {
+                    self.cancellation_observed = true;
+                    return Ok(None);
+                }
+                values.push(value);
+            }
+            let mut definitions = vec![candidate];
+            definitions.extend(values.iter().map(|value| value.ty().identity()));
+            if !self.session.ensure_go_member_declarations(&definitions)? {
+                self.cancellation_observed = true;
+                return Ok(None);
+            }
+            if self.session.go_method_receiver(candidate).is_some()
+                && values.iter().all(|&value| {
+                    self.session
+                        .receiver_indirection_supported(candidate, value)
+                        && self.session.go_receiver_eligible(candidate, value)
+                })
+            {
+                return Ok(Some(ResolutionCompletion::Complete));
+            }
+        }
+        Ok(Some(ResolutionCompletion::incomplete(
+            reasons
+                .into_iter()
+                .map(ResolutionIncompleteReason::UnsupportedSemantic),
+        )))
+    }
+
     /// A negative owner proof needs every promotion edge, including paths that
     /// lose selector precedence. An unavailable edge makes the whole proof
     /// unknown; it must not turn an unrelated owner's incompleteness into a miss.
@@ -987,7 +1056,8 @@ impl FactResolutionOperation<'_> {
             &mut self.hierarchy,
             target,
             ResolutionAnswer::new([target], [], ResolutionCompletion::Complete),
-        );
+        )
+        .with_candidate_paths(&mut self.candidate_paths);
         evaluation.forward_candidate_artifacts = Some(&mut self.forward_candidate_artifacts);
         let mut closed_interfaces = Vec::new();
         let mut unclosed_interfaces = Vec::new();
@@ -1209,7 +1279,35 @@ impl FactEvaluation<'_, '_> {
                 {
                     match (a.possible_values(), b.possible_values()) {
                         ([a], [b]) if a.ty() == b.ty() => {}
-                        ([_], [_]) => return Ok(DoesNotSatisfy),
+                        ([a], [b]) => {
+                            // Anonymous structural identities identify occurrences,
+                            // not nominal types. Their inequality cannot disprove
+                            // signature equality without comparing the structure.
+                            let identities = [a.ty().identity(), b.ty().identity()];
+                            let read = self
+                                .session
+                                .declaration_types_for_definitions(&identities)?;
+                            let Some(declarations) = self.accept_session_read(read) else {
+                                return Ok(Inconclusive(GO_SIGNATURE_UNKNOWN));
+                            };
+                            let mut slots = identities.to_vec();
+                            slots.extend(declarations.iter().filter_map(|declaration| {
+                                let declaration = declaration.get(self.session).row();
+                                (declaration.role() == DeclarationTypeRole::Identity)
+                                    .then_some(declaration.slot())
+                            }));
+                            let read = self.session.intrinsics_for_slots(&slots)?;
+                            let Some(seeds) = self.accept_session_read(read) else {
+                                return Ok(Inconclusive(GO_SIGNATURE_UNKNOWN));
+                            };
+                            if seeds.iter().any(|seed| {
+                                seed.get(self.session).row().kind() == IntrinsicTypeKind::Structural
+                            }) {
+                                unknown = true;
+                            } else {
+                                return Ok(DoesNotSatisfy);
+                            }
+                        }
                         _ => unknown = true,
                     }
                 }

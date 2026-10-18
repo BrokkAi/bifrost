@@ -4,6 +4,12 @@ INSERT INTO cr_restrictions(module_path, visibility)
  FROM cr_source_declarations AS candidate
  WHERE cr_visibility(candidate.visibility)='restricted'
  UNION
+ SELECT candidate.module_path, field.visibility
+ FROM cr_source_declarations AS candidate
+ CROSS JOIN source_rust_constructor_fields AS field
+  ON field.blob_id=candidate.blob_id AND field.declaration_id=candidate.declaration_id
+ WHERE cr_visibility(field.visibility)='restricted'
+ UNION
  SELECT member.module_path, imports.visibility
  FROM cr_members AS member
  CROSS JOIN source_rust_import_targets AS imports ON imports.blob_id=member.blob_id

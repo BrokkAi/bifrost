@@ -251,6 +251,8 @@ pub struct ScalaDeclarationSourceFact {
     pub declaration: SourceDeclarationId,
     pub kind: ScalaDeclarationKind,
     pub visibility: ScalaDeclarationVisibility,
+    pub access_boundary:
+        Option<crate::analyzer::source_facts::DeclarationAccessBoundary<SourceDeclarationId>>,
     pub callable: Option<ScalaCallableSourceAlternative>,
     pub field_type_path: Option<Vec<String>>,
     pub type_alias_path: Option<Vec<String>>,
@@ -283,6 +285,12 @@ impl ScalaSourceFacts {
             .capacity()
             .saturating_mul(std::mem::size_of::<ScalaDeclarationSourceFact>());
         for fact in &self.declarations {
+            if let Some(crate::analyzer::source_facts::DeclarationAccessBoundary::Package(
+                package,
+            )) = &fact.access_boundary
+            {
+                bytes = bytes.saturating_add(package.capacity());
+            }
             bytes = bytes
                 .saturating_add(
                     fact.lexical_prefixes
@@ -346,6 +354,17 @@ impl ScalaSourceFacts {
                     .any(|scope| scope.index() >= source.occurrence_count())
                 || fact.lexical_prefixes.iter().any(String::is_empty)
             {
+                return false;
+            }
+            if match &fact.access_boundary {
+                Some(crate::analyzer::source_facts::DeclarationAccessBoundary::Package(
+                    package,
+                )) => package.is_empty(),
+                Some(crate::analyzer::source_facts::DeclarationAccessBoundary::Template(owner)) => {
+                    owner.index() >= source.declaration_count()
+                }
+                None => false,
+            } {
                 return false;
             }
             if let Some(owner) = &fact.generic_owner

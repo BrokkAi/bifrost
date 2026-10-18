@@ -267,6 +267,20 @@ impl SelectedRootImportAnchors for CatalogRootImportAnchors<'_> {
     }
 }
 
+/// Both source-half forms require the endpoint's first symbol to be a
+/// published import anchor. Discovery uses this same guard to prove that an
+/// eligible shared domain cannot match either source-half form.
+pub(crate) fn selected_root_source_anchor(
+    anchors: &dyn SelectedRootImportAnchors,
+    endpoint: &EndpointSignature,
+    cancellation: &CancellationToken,
+) -> StoreResult<Option<ResolutionRootImportAnchor>> {
+    let Some(first) = endpoint.symbols().fixed().first() else {
+        return Ok(None);
+    };
+    anchors.anchor_of(first.symbol(), cancellation)
+}
+
 pub(crate) fn classify_selected_root_path_half(
     anchors: &dyn SelectedRootImportAnchors,
     identity: CandidatePathIdentity,
@@ -330,7 +344,7 @@ pub(crate) fn classify_selected_root_path_half(
             _ => return Ok(None),
         };
         let anchor_semantic = end[0].symbol();
-        let Some(anchor) = anchors.anchor_of(anchor_semantic, cancellation)? else {
+        let Some(anchor) = selected_root_source_anchor(anchors, path.end(), cancellation)? else {
             return Ok(None);
         };
         return Ok(Some(SelectedRootPathHalf::Import {
@@ -374,7 +388,7 @@ pub(crate) fn classify_selected_root_path_half(
             return Ok(None);
         }
         let anchor_semantic = end[0].symbol();
-        let Some(anchor) = anchors.anchor_of(anchor_semantic, cancellation)? else {
+        let Some(anchor) = selected_root_source_anchor(anchors, path.end(), cancellation)? else {
             return Ok(None);
         };
         let (prefix_reference, route_start) = if lexical_scope_head.is_some() {
@@ -844,6 +858,12 @@ pub(crate) struct SelectedContextIdentities {
     jvm: Box<SelectedJvmContextIdentities>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JvmExternalTypeIdentityClaim {
+    Provider(SemanticId),
+    ImplicitFallback(SemanticId),
+}
+
 /// Request-local JVM metadata is grouped to keep ordinary context outcomes
 /// compact. Clones share the existing inner identity maps; isolated snapshots
 /// still copy their contents.
@@ -856,7 +876,7 @@ struct SelectedJvmContextIdentities {
     /// Bare TypeIdentity references whose unindexed implicit roots establish
     /// the same external type identity despite a complete-empty name answer.
     jvm_external_type_identities_by_reference:
-        Arc<std::sync::Mutex<HashMap<SemanticId, SemanticId>>>,
+        Arc<std::sync::Mutex<HashMap<SemanticId, JvmExternalTypeIdentityClaim>>>,
     /// The boundary to restore when an external-provider type is used for
     /// member enumeration, which remains open even though type equality is
     /// exact.
@@ -1485,9 +1505,10 @@ impl SelectedContextIdentities {
             .jvm_external_type_identities_by_reference
             .lock()
             .expect("external reference identities are not poisoned")
-            .insert(reference, target);
+            .insert(reference, JvmExternalTypeIdentityClaim::Provider(target));
         assert!(
-            old.is_none_or(|old| old == target),
+            old.is_none_or(|old| old == JvmExternalTypeIdentityClaim::Provider(target)
+                || matches!(old, JvmExternalTypeIdentityClaim::ImplicitFallback(_))),
             "one external hierarchy edge identifies one owner"
         );
     }
@@ -1568,11 +1589,42 @@ impl SelectedContextIdentities {
             .jvm_external_type_identities_by_reference
             .lock()
             .expect("the selected JVM external reference identities are not poisoned")
-            .insert(source_reference, identity);
+            .insert(
+                source_reference,
+                JvmExternalTypeIdentityClaim::Provider(identity),
+            );
         assert!(
-            previous.is_none_or(|previous| previous == identity),
+            previous.is_none_or(|previous| previous
+                == JvmExternalTypeIdentityClaim::Provider(identity)
+                || matches!(previous, JvmExternalTypeIdentityClaim::ImplicitFallback(_))),
             "one TypeIdentity reference names one external provider type"
         );
+        self.record_jvm_external_provider_type_boundary(identity, enumeration_boundary);
+    }
+
+    /// A complete-empty scope answer may use this provider name as its nominal
+    /// type. It is not a declaration and must not redirect hierarchy lookup
+    /// when structured resolution has already selected a source declaration.
+    pub(crate) fn record_jvm_implicit_nominal_fallback(
+        &self,
+        source_reference: SemanticId,
+        identity: SemanticId,
+        enumeration_boundary: SemanticId,
+    ) {
+        self.jvm
+            .jvm_external_type_identities_by_reference
+            .lock()
+            .expect("the selected JVM external reference identities are not poisoned")
+            .entry(source_reference)
+            .or_insert(JvmExternalTypeIdentityClaim::ImplicitFallback(identity));
+        self.record_jvm_external_provider_type_boundary(identity, enumeration_boundary);
+    }
+
+    fn record_jvm_external_provider_type_boundary(
+        &self,
+        identity: SemanticId,
+        enumeration_boundary: SemanticId,
+    ) {
         let mut boundaries = self
             .jvm
             .jvm_external_type_boundaries
@@ -1626,7 +1678,25 @@ impl SelectedContextIdentities {
             .lock()
             .expect("the selected JVM external reference identities are not poisoned")
             .get(&source_reference)
-            .copied()
+            .and_then(|claim| match claim {
+                JvmExternalTypeIdentityClaim::Provider(identity) => Some(*identity),
+                JvmExternalTypeIdentityClaim::ImplicitFallback(_) => None,
+            })
+    }
+
+    pub(crate) fn jvm_implicit_nominal_fallback(
+        &self,
+        source_reference: SemanticId,
+    ) -> Option<SemanticId> {
+        self.jvm
+            .jvm_external_type_identities_by_reference
+            .lock()
+            .expect("the selected JVM external reference identities are not poisoned")
+            .get(&source_reference)
+            .and_then(|claim| match claim {
+                JvmExternalTypeIdentityClaim::ImplicitFallback(identity) => Some(*identity),
+                JvmExternalTypeIdentityClaim::Provider(_) => None,
+            })
     }
 
     pub(crate) fn jvm_external_provider_type_boundaries(
@@ -2457,6 +2527,8 @@ pub(crate) enum SelectedJvmBridgeVisibility {
     Public,
     Protected,
     Package,
+    /// The selected lexical access region was checked for this caller.
+    Scoped,
     Open,
 }
 
@@ -3699,6 +3771,7 @@ fn bridge_digest(
                 SelectedJvmBridgeVisibility::Public => b"public".as_slice(),
                 SelectedJvmBridgeVisibility::Protected => b"protected".as_slice(),
                 SelectedJvmBridgeVisibility::Package => b"package".as_slice(),
+                SelectedJvmBridgeVisibility::Scoped => b"scoped".as_slice(),
                 SelectedJvmBridgeVisibility::Open => b"open".as_slice(),
             }),
         )?;

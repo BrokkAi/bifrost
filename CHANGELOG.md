@@ -7,14 +7,12 @@ projection and its commit history does not contain every source commit.
 
 ## Unreleased
 
-### Fixed
-
-- Python calls retain saved default arguments when a dynamic attribute write
-  cannot reach their function objects, including writes in settings helpers.
-
-## [0.13.1] - 2026-10-17
+## [0.13.1] - 2026-10-18
 
 ### Added
+
+- Python flow and taint analysis includes executable module-level statements.
+  Class-body execution and import execution remain unsupported.
 
 - RQL unions can combine rows of different kinds when subsequent filters and projections
   use fields shared by those rows. Selected-property reads, static Cargo dependency
@@ -44,6 +42,42 @@ projection and its commit history does not contain every source commit.
   was accepted for v0.13.1.
 
 ### Fixed
+
+- Python analysis admits bounded generated string and bytes literal lines, such
+  as protobuf descriptors, while retaining limits for executable structure.
+- Scala navigation respects qualified `private[X]` and `protected[X]` access
+  regions and distinguishes class visibility from primary-constructor visibility.
+- JavaScript and TypeScript member assignments keep consistent structural owners,
+  including bundled code and shadowed local bindings.
+- Rust analysis no longer fails on computed receiver calls inside macros in
+  conditional arms, while retaining incomplete-resolution diagnostics.
+- Policy evaluation loads rule-pack category metadata only for scopes that select categories.
+- Python packs generated from seed stubs include locally imported declarations
+  and record their exact transitive inputs for reproducible generation.
+- Cold Rust indexing avoids rescanning unrelated identifiers for resolution gaps.
+- Rust re-exports through dependency facades retain their targets and update when
+  forwarded public items change. Tuple constructors now respect field visibility,
+  including attributed public fields.
+- Cold Python indexing avoids repeated metadata scans in modules with many functions.
+- JavaScript and TypeScript bundled wrappers keep distinct export declarations
+  and navigate to their own returned members, while proved UMD exports retain
+  their module identity.
+- Go reference queries no longer lose analysis summaries when dependency discovery activates a new context.
+- Java static imports resolve Kotlin file-facade functions and `@JvmStatic`
+  methods, with explicit incomplete diagnostics for unsupported JVM aliases.
+- Go analysis resolves receiver chains through anonymous test-table structs and
+  local named types. Interface method families compare struct field types and
+  tags structurally, including equivalent tag escapes and formatting.
+- Python source-root naming and lookups honor unsaved packaging and package-marker
+  changes while preserving retained analyzer snapshots after disk edits.
+- Rust resolves ordinary modules, items and imports in the selected `cfg_if!`
+  arm using Cargo cfg evidence, while retaining uncertainty for unresolved
+  conditions and unsupported nested macros.
+- Python calls retain saved default arguments when a dynamic attribute write
+  cannot reach their function objects, including writes in settings helpers.
+- Native local-variable typing preserves initializer and reassignment alternatives
+  in Go, Rust, Java, Kotlin and Scala, including uncertainty from unsupported
+  writes. Explicitly declared types retain their member-lookup precedence.
 
 - Fresh Rust crate consumers can resolve the supported ZIP dependency; existing
   compression-backend behavior is preserved.
@@ -75,6 +109,14 @@ projection and its commit history does not contain every source commit.
 
 - C and C++ analysis admits bounded generated numeric initializer tables at the
   default setting while retaining physical-line limits for the remaining source.
+
+### Known limitations
+
+- This release qualifies the core engine without bundled product rules. The
+  engine's pack profile does not yet advertise the capabilities that current
+  host-acquired `bifrost-packs` rule releases require, so strict acquisition
+  reports no compatible release; release readiness does not qualify
+  host-acquired rules for 0.13.1. See issue #4709.
 
 ## [0.13.0] - 2026-10-06
 

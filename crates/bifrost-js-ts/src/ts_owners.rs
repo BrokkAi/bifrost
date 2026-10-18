@@ -1702,6 +1702,7 @@ pub(crate) fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>>
                     .find(|child| child.kind() == "variable_declarator")?
             }
             "variable_declarator" => node.child_by_field_name("value")?,
+            "assignment_expression" => node.child_by_field_name("right")?,
             _ => return None,
         };
     }
@@ -1765,6 +1766,7 @@ fn ts_function_return_property_owners_with_resolution(
     // workspace-package memos instead of building cold ones per call.
     let aliases = host.alias_resolver().as_ref();
     for node in ts_nodes_for_code_unit(host, function, tree.root_node()) {
+        let node = jsts_indexed_callable_node(node).unwrap_or(node);
         ts_collect_return_property_owners(
             host,
             support,

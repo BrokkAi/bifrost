@@ -41,8 +41,8 @@ pub use artifact::{
     CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
     CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
     CompiledSyncMapOperation, CompiledTaskSpawnCondition, DecodeLimits, PayloadKind,
-    compiled_flow_claims_agree, decode_manifest, decode_shard, decode_shard_for_manifest,
-    decode_validated_shard_for_manifest, validate_manifest_inventory,
+    SourceInputFile, SourceSetInputs, compiled_flow_claims_agree, decode_manifest, decode_shard,
+    decode_shard_for_manifest, decode_validated_shard_for_manifest, validate_manifest_inventory,
 };
 pub use authoring::*;
 pub use callable_values::*;
@@ -68,6 +68,7 @@ pub(crate) use overlay::tests::{
     go_external_receiver_test_overlay,
 };
 pub use overlay::*;
+pub(crate) use overlay::{activated_type_provenance, type_declarations_equivalent};
 pub(crate) use producer::failed_artifact_production;
 pub(crate) use producer::finish_authored_pack_production;
 pub(crate) use producer::read_exact_artifact_while;
@@ -76,6 +77,9 @@ pub use producer::{
     BoundedProducerDiagnostics, ExactArtifact, ExactSourceEntry, ExternalArtifactKind,
     ExternalArtifactPackProducer, ProducerDiagnostic, ProducerDiagnosticSeverity,
     read_exact_artifact, read_exact_source_set,
+};
+pub(crate) use producer::{
+    read_exact_source_closure_while, source_set_diagnostic, source_set_path_exists,
 };
 
 macro_rules! implement_external_artifact_pack_producer {

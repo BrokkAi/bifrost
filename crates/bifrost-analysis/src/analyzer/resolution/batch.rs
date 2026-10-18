@@ -3,8 +3,8 @@
 //! This module is the batch seam for the preload checkpoint. Candidate
 //! matching and path hydration are intentionally separate: a source first
 //! returns globally keyed rows, then the engine hydrates each distinct path at
-//! most once into an operation-local arena. The arena dies with the batch; it
-//! is neither a workspace snapshot nor a cache.
+//! most once into an immutable operation-owned store. Frames retain admitted
+//! identities; the store dies with the request.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,7 +39,7 @@ use super::model::{
 use super::saturation::{CycleCompletenessCertifier, SaturationBranch, SaturationDecision};
 use super::selected_context::SelectedContextOverlay;
 
-/// Hard upper bound on reference seeds sharing one operation-local arena.
+/// Hard upper bound on reference seeds sharing one lexical frame.
 pub const MAX_REFERENCE_SEEDS_PER_BATCH: usize = 256;
 
 /// Hard upper bound on definition seeds sharing one raw reverse traversal.
@@ -1030,29 +1030,68 @@ impl DemandedReferenceKey {
     }
 }
 
-/// Exhausted immutable forward-stitch artifacts shared by repeated
-/// state-dependent seeded requests in one top-level fact operation.
+/// Immutable candidate bodies retained by one operation identity domain.
+/// Frames retain only admitted keys; no candidate reference survives a poll.
+/// The store ends with its operation or with an independently numbered nested
+/// evaluation, and publishing an existing key never replaces its value.
+#[derive(Debug, Default)]
+pub(crate) struct CandidatePathStore {
+    paths: HashMap<CandidatePathIdentity, PartialPath>,
+}
+
+pub(super) enum CandidatePathStoreHandle<'a> {
+    Owned(CandidatePathStore),
+    Borrowed(&'a mut CandidatePathStore),
+}
+
+impl std::ops::Deref for CandidatePathStoreHandle<'_> {
+    type Target = CandidatePathStore;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(paths) => paths,
+            Self::Borrowed(paths) => paths,
+        }
+    }
+}
+
+impl std::ops::DerefMut for CandidatePathStoreHandle<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(paths) => paths,
+            Self::Borrowed(paths) => paths,
+        }
+    }
+}
+
+impl CandidatePathStore {
+    fn publish(&mut self, identity: CandidatePathIdentity, path: PartialPath) {
+        use std::collections::hash_map::Entry;
+        match self.paths.entry(identity) {
+            Entry::Occupied(existing) => {
+                debug_assert_eq!(
+                    existing.get(),
+                    &path,
+                    "one candidate identity has immutable content"
+                );
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(path);
+            }
+        }
+    }
+}
+
+/// Exhausted immutable endpoint artifacts and demanded answers retained by
+/// their existing optional operation/request owner. Candidate bodies live in
+/// the separate, mandatory CandidatePathStore, so uncached callers do not
+/// enable answer memoization or owner-frontier charge deduplication.
 ///
-/// This cache deliberately stops below answer selection. An endpoint match,
-/// hydrated persisted path, and endpoint-node classification depend only on
-/// the selected source snapshot and their exact request key; a stitched
-/// answer also depends on the caller's transient alternatives and must be
-/// recomputed. Cancelled/partial reads are never published here.
-///
-/// # Retention
-///
-/// One per top-level fact operation, except Go's native point request keeps one
-/// per caller file so immutable source artifacts can be shared by that file's
-/// point lookups. Each cache dies with its operation or request, and the file
-/// partition keeps selected-context artifacts from crossing caller contexts.
-/// Every map is bounded by the distinct artifacts touched during that owner:
-/// `demanded_reference_answers` by demanded references, the other maps by the
-/// endpoints, paths and nodes read. A `usage_graph` request still builds one
-/// operation per crate stage and drops each before the next.
+/// Go point requests can share this cache within a caller file; their fresh
+/// fact operations still own separate candidate stores. Every map is bounded
+/// by the endpoints, nodes, references or owner frontiers that request touches.
 #[derive(Debug, Default)]
 pub(crate) struct ForwardCandidateArtifactCache {
     endpoint_matches: HashMap<EndpointSignature, CachedForwardEndpointMatch>,
-    hydrated_paths: HashMap<CandidatePathIdentity, PartialPath>,
     endpoint_classifications: HashMap<BindingNodeId, BatchEndpointClassification>,
     unconditional_completion: Option<ResolutionCompletion>,
     /// The exhausted lexical answer of one demanded reference under one
@@ -1139,10 +1178,13 @@ impl ForwardCandidateArtifactCache {
 
 #[cfg(test)]
 impl ForwardCandidateArtifactCache {
-    pub(super) fn artifact_counts(&self) -> (usize, usize, usize) {
+    pub(super) fn artifact_counts(
+        &self,
+        candidate_paths: &CandidatePathStore,
+    ) -> (usize, usize, usize) {
         (
             self.endpoint_matches.len(),
-            self.hydrated_paths.len(),
+            candidate_paths.paths.len(),
             self.endpoint_classifications.len(),
         )
     }
@@ -2563,6 +2605,15 @@ pub trait BatchResolutionFragmentSource {
         Ok(None)
     }
 
+    /// The language of a selected source identity (including a typed slot).
+    fn semantic_language_of(
+        &self,
+        _identity: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::Language>> {
+        Ok(None)
+    }
+
     /// The language universe entry that an unqualified reference's exact
     /// parser-derived spelling names, in its own language's table. The engine
     /// uses this only after all selected source scopes have been exhausted
@@ -2596,6 +2647,16 @@ pub trait BatchResolutionFragmentSource {
         _cancellation: &CancellationToken,
     ) -> StoreResult<Option<[u8; 32]>> {
         Ok(None)
+    }
+
+    /// The producer publishes complete component rows for direct structured
+    /// type expressions (without requiring a generic substitution first).
+    fn supports_direct_type_shapes(
+        &self,
+        _reference: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(false)
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -3122,8 +3183,25 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
             })
     }
 
+    fn supports_direct_type_shapes(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.base
+            .supports_direct_type_shapes(reference, cancellation)
+    }
+
     fn supports_go_universe(&self) -> bool {
         self.go_package_inventory_complete.is_some() || self.base.supports_go_universe()
+    }
+
+    fn semantic_language_of(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::Language>> {
+        self.base.semantic_language_of(identity, cancellation)
     }
 
     fn universe_entry(
@@ -4724,6 +4802,14 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
             .go_package_inventory_complete_for_fragment(fragment)
     }
 
+    fn semantic_language_of(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::Language>> {
+        self.base.semantic_language_of(identity, cancellation)
+    }
+
     fn universe_entry(
         &self,
         reference: SemanticId,
@@ -4748,6 +4834,15 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
     ) -> StoreResult<Option<[u8; 32]>> {
         self.base
             .shared_name_digest_for_identity(identity, cancellation)
+    }
+
+    fn supports_direct_type_shapes(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.base
+            .supports_direct_type_shapes(reference, cancellation)
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -5460,7 +5555,7 @@ enum SeededBatchInitialization {
 // between evaluator tasks; those require an operation-owned scheduler.
 pub(super) struct DemandForwardBatchFrame {
     initialized: InitializedSeededBatch,
-    arena: HashMap<CandidatePathIdentity, PartialPath>,
+    admitted: HashSet<CandidatePathIdentity>,
     accounted_hydrated_completions: HashSet<(usize, CandidatePathIdentity)>,
     candidate_completion: OperationCandidateCompletionLedger,
     round: Option<DemandForwardRound>,
@@ -5656,7 +5751,7 @@ impl DemandForwardBatchFrame {
                 let seed_count = initialized.seeds.len();
                 DemandForwardBatchStart::Running(Box::new(Self {
                     initialized,
-                    arena: map_with_capacity(seed_count.saturating_mul(4)),
+                    admitted: HashSet::default(),
                     accounted_hydrated_completions: HashSet::default(),
                     candidate_completion: OperationCandidateCompletionLedger::new(seed_count),
                     round: None,
@@ -5691,7 +5786,7 @@ impl DemandForwardBatchFrame {
     /// Stop an operation-owned task without changing its caller's token or
     /// reading a pending candidate relation. Returned evidence survives even
     /// when the scheduler's shared work budget, rather than the token, stopped.
-    pub(super) fn cancel(mut self) -> ReferenceBatchAnswer {
+    pub(super) fn cancel(mut self, candidate_paths: &CandidatePathStore) -> ReferenceBatchAnswer {
         assert!(
             !self.terminal,
             "a terminal forward frame cannot be cancelled"
@@ -5702,7 +5797,8 @@ impl DemandForwardBatchFrame {
                 &mut self.initialized.seeds,
                 &round.expandable,
                 &round.matches,
-                &self.arena,
+                &self.admitted,
+                &candidate_paths.paths,
                 &mut self.accounted_hydrated_completions,
                 &cancellation,
                 &mut self.initialized.completion_work,
@@ -5725,16 +5821,25 @@ impl DemandForwardBatchFrame {
         &mut self,
         engine: &BatchResolutionEngine<'_, S>,
         artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
         readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandForwardBatchPoll> {
-        self.poll_with_selection_access(engine, artifact_cache, cancellation, None, readiness)
+        self.poll_with_selection_access(
+            engine,
+            artifact_cache,
+            candidate_paths,
+            cancellation,
+            None,
+            readiness,
+        )
     }
 
     pub(super) fn poll_with_selection_access<S: BatchResolutionFragmentSource + ?Sized>(
         &mut self,
         engine: &BatchResolutionEngine<'_, S>,
         artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
         readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
@@ -5743,6 +5848,7 @@ impl DemandForwardBatchFrame {
         let result = self.poll_active(
             engine,
             artifact_cache,
+            candidate_paths,
             cancellation,
             access_lookup,
             readiness,
@@ -5754,35 +5860,36 @@ impl DemandForwardBatchFrame {
         &mut self,
         engine: &BatchResolutionEngine<'_, S>,
         mut artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
         readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandForwardBatchPoll> {
         if self.initialized.cancelled || cancellation.is_cancelled() {
             self.initialized.cancelled = true;
-            return self.finish(engine, cancellation, access_lookup);
+            return self.finish(engine, cancellation, access_lookup, candidate_paths);
         }
         if self.round.is_none() {
             if self.initialized.frontier.is_empty() {
-                return self.finish(engine, cancellation, access_lookup);
+                return self.finish(engine, cancellation, access_lookup, candidate_paths);
             }
             self.round = self.prepare_round(engine, artifact_cache.as_deref_mut(), cancellation)?;
             if self.initialized.cancelled {
-                return self.finish(engine, cancellation, access_lookup);
+                return self.finish(engine, cancellation, access_lookup, candidate_paths);
             }
             return Ok(DemandForwardBatchPoll::Continue);
         }
         let round = self.round.as_ref().expect("the round is active");
         if round.request_base == round.expandable.len() {
             let round = self.round.take().expect("the round is active");
-            self.finish_round(engine, round, artifact_cache, cancellation)?;
+            self.finish_round(engine, round, candidate_paths, cancellation)?;
             if self.initialized.cancelled || self.initialized.frontier.is_empty() {
-                return self.finish(engine, cancellation, access_lookup);
+                return self.finish(engine, cancellation, access_lookup, candidate_paths);
             }
             return Ok(DemandForwardBatchPoll::Continue);
         }
         if !self.fill_request_page(cancellation) {
-            return self.finish(engine, cancellation, access_lookup);
+            return self.finish(engine, cancellation, access_lookup, candidate_paths);
         }
         let round = self.round.as_ref().expect("the round is active");
         // This gate precedes the ENTIRE artifact read, including cache-hit
@@ -5790,14 +5897,14 @@ impl DemandForwardBatchFrame {
         let ready = readiness(&round.request_page)?;
         if cancellation.is_cancelled() {
             self.initialized.cancelled = true;
-            return self.finish(engine, cancellation, access_lookup);
+            return self.finish(engine, cancellation, access_lookup, candidate_paths);
         }
         if ready == DemandForwardReadiness::AwaitingDependencies {
             return Ok(DemandForwardBatchPoll::AwaitingDependencies);
         }
         self.read_page(engine, artifact_cache, cancellation)?;
         if self.initialized.cancelled {
-            return self.finish(engine, cancellation, access_lookup);
+            return self.finish(engine, cancellation, access_lookup, candidate_paths);
         }
         let round = self.round.as_mut().expect("read page retains its round");
         round.request_base += round.request_page.len();
@@ -5881,10 +5988,10 @@ impl DemandForwardBatchFrame {
     /// The candidate paths this frame hydrates on its next poll.
     ///
     /// Empty unless the next poll finishes the round; the paths this frame's
-    /// arena or the operation's cache already holds are left out.
+    /// membership set or the operation's store already holds are left out.
     pub(super) fn round_candidate_hydrations(
         &self,
-        artifact_cache: &ForwardCandidateArtifactCache,
+        candidate_paths: &CandidatePathStore,
         candidates: &mut Vec<CandidatePathIdentity>,
     ) {
         if self.terminal || self.initialized.cancelled {
@@ -5898,8 +6005,8 @@ impl DemandForwardBatchFrame {
         }
         for matched in &round.matches {
             let candidate = matched.candidate();
-            if !self.arena.contains_key(&candidate)
-                && !artifact_cache.hydrated_paths.contains_key(&candidate)
+            if !self.admitted.contains(&candidate)
+                && !candidate_paths.paths.contains_key(&candidate)
             {
                 candidates.push(candidate);
             }
@@ -5911,6 +6018,7 @@ impl DemandForwardBatchFrame {
         engine: &BatchResolutionEngine<'_, S>,
         cancellation: &CancellationToken,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        candidate_paths: &CandidatePathStore,
     ) -> StoreResult<DemandForwardBatchPoll> {
         if self.initialized.cancelled
             && let Some(round) = &self.round
@@ -5919,7 +6027,8 @@ impl DemandForwardBatchFrame {
                 &mut self.initialized.seeds,
                 &round.expandable,
                 &round.matches,
-                &self.arena,
+                &self.admitted,
+                &candidate_paths.paths,
                 &mut self.accounted_hydrated_completions,
                 cancellation,
                 &mut self.initialized.completion_work,
@@ -6298,7 +6407,7 @@ impl DemandForwardBatchFrame {
         &mut self,
         engine: &BatchResolutionEngine<'_, S>,
         round: DemandForwardRound,
-        artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
     ) -> StoreResult<()> {
         let InitializedSeededBatch {
@@ -6309,7 +6418,7 @@ impl DemandForwardBatchFrame {
             cancelled,
             ..
         } = &mut self.initialized;
-        let arena = &mut self.arena;
+        let admitted = &mut self.admitted;
         let accounted_hydrated_completions = &mut self.accounted_hydrated_completions;
         let DemandForwardRound {
             expandable,
@@ -6325,11 +6434,11 @@ impl DemandForwardBatchFrame {
                 seeds,
                 expandable: &expandable,
                 matches: &matches,
-                arena,
+                admitted,
+                candidate_paths,
                 accounted_completions: accounted_hydrated_completions,
                 cancelled,
             },
-            artifact_cache.is_some(),
             cancellation,
         );
         if *cancelled {
@@ -6342,12 +6451,12 @@ impl DemandForwardBatchFrame {
                 seeds,
                 expandable: &expandable,
                 matches: &matches,
-                arena,
+                admitted,
+                candidate_paths,
                 accounted_completions: accounted_hydrated_completions,
                 cancelled,
             },
             &hydration_request,
-            artifact_cache,
             cancellation,
         )?;
         if *cancelled {
@@ -6363,13 +6472,20 @@ impl DemandForwardBatchFrame {
                 *cancelled = true;
                 break;
             }
+            debug_assert!(
+                admitted.contains(&matched.candidate()),
+                "composition requires frame admission"
+            );
             let parent = &expandable[matched.request_ordinal()];
-            let candidate = arena.get(&matched.candidate()).ok_or_else(|| {
-                StoreError::new(format!(
-                    "candidate {:?} was matched but not hydrated",
-                    matched.candidate()
-                ))
-            })?;
+            let candidate = candidate_paths
+                .paths
+                .get(&matched.candidate())
+                .ok_or_else(|| {
+                    StoreError::new(format!(
+                        "candidate {:?} was matched but not hydrated",
+                        matched.candidate()
+                    ))
+                })?;
             let composition = parent.path.concatenate_with_poll(candidate, &mut || {
                 poll_reverse_completion(cancellation, completion_work)
             });
@@ -6449,7 +6565,8 @@ impl DemandForwardBatchFrame {
                 seeds,
                 &expandable,
                 &matches,
-                arena,
+                admitted,
+                &candidate_paths.paths,
                 accounted_hydrated_completions,
                 cancellation,
                 completion_work,
@@ -6475,7 +6592,8 @@ impl DemandForwardBatchFrame {
                 seeds,
                 &expandable_seed_indices,
                 &matches,
-                arena,
+                admitted,
+                &candidate_paths.paths,
                 accounted_hydrated_completions,
                 cancellation,
                 completion_work,
@@ -6497,7 +6615,8 @@ struct ForwardHydrationContext<'a> {
     seeds: &'a mut [SeedState],
     expandable: &'a [BatchWorkPath],
     matches: &'a [BatchCandidateMatch],
-    arena: &'a mut HashMap<CandidatePathIdentity, PartialPath>,
+    admitted: &'a mut HashSet<CandidatePathIdentity>,
+    candidate_paths: &'a mut CandidatePathStore,
     accounted_completions: &'a mut HashSet<(usize, CandidatePathIdentity)>,
     cancelled: &'a mut bool,
 }
@@ -8223,10 +8342,12 @@ fn include_returned_hydrated_completions_after_cancellation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn include_forward_matched_hydrated_completions_after_cancellation(
     seeds: &mut [SeedState],
     expandable: &[BatchWorkPath],
     matches: &[BatchCandidateMatch],
+    admitted: &HashSet<CandidatePathIdentity>,
     arena: &crate::hash::HashMap<CandidatePathIdentity, PartialPath>,
     accounted: &mut crate::hash::HashSet<(usize, CandidatePathIdentity)>,
     cancellation: &CancellationToken,
@@ -8242,9 +8363,12 @@ fn include_forward_matched_hydrated_completions_after_cancellation(
         if accounted.contains(&key) {
             continue;
         }
-        let Some(candidate) = arena.get(&matched.candidate()) else {
+        if !admitted.contains(&matched.candidate()) {
             continue;
-        };
+        }
+        let candidate = arena
+            .get(&matched.candidate())
+            .expect("an admitted candidate remains in its operation store");
         let _ = seeds[seed]
             .observed_completion
             .include(candidate.completion(), cancellation, work);
@@ -8279,10 +8403,12 @@ fn include_forward_returned_hydrated_completions_after_cancellation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn include_forward_hydrated_completions_for_seed_indices_after_cancellation(
     seeds: &mut [SeedState],
     request_seed_indices: &[usize],
     matches: &[BatchCandidateMatch],
+    admitted: &HashSet<CandidatePathIdentity>,
     arena: &crate::hash::HashMap<CandidatePathIdentity, PartialPath>,
     accounted: &mut crate::hash::HashSet<(usize, CandidatePathIdentity)>,
     cancellation: &CancellationToken,
@@ -8297,9 +8423,12 @@ fn include_forward_hydrated_completions_for_seed_indices_after_cancellation(
         if accounted.contains(&key) {
             continue;
         }
-        let Some(candidate) = arena.get(&matched.candidate()) else {
+        if !admitted.contains(&matched.candidate()) {
             continue;
-        };
+        }
+        let candidate = arena
+            .get(&matched.candidate())
+            .expect("an admitted candidate remains in its operation store");
         let _ = seeds[seed]
             .observed_completion
             .include(candidate.completion(), cancellation, work);
@@ -9054,7 +9183,7 @@ pub(super) fn prefetch_forward_candidate_artifacts<S: BatchResolutionFragmentSou
 
 /// Classify one scheduler round's union of endpoint nodes in one statement
 /// set. Same contract as [`prefetch_forward_candidate_artifacts`]: publish to
-/// the operation's cache, charge nothing, publish nothing on cancellation.
+/// the operation's artifact cache, charge nothing, publish nothing on cancellation.
 pub(super) fn prefetch_endpoint_classifications<S: BatchResolutionFragmentSource + ?Sized>(
     source: &S,
     artifact_cache: &mut ForwardCandidateArtifactCache,
@@ -9099,17 +9228,17 @@ pub(super) fn prefetch_endpoint_classifications<S: BatchResolutionFragmentSource
 
 /// Hydrate one scheduler round's union of candidate paths in one statement
 /// set. Same contract as [`prefetch_forward_candidate_artifacts`]: publish to
-/// the operation's cache, charge nothing, publish nothing on cancellation.
+/// the operation's candidate store, charge nothing, publish nothing on cancellation.
 pub(super) fn prefetch_candidate_hydrations<S: BatchResolutionFragmentSource + ?Sized>(
     source: &S,
-    artifact_cache: &mut ForwardCandidateArtifactCache,
+    candidate_paths: &mut CandidatePathStore,
     candidates: &[CandidatePathIdentity],
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> StoreResult<()> {
     let mut unhydrated = BTreeSet::new();
     for &candidate in candidates {
-        if !artifact_cache.hydrated_paths.contains_key(&candidate) {
+        if !candidate_paths.paths.contains_key(&candidate) {
             unhydrated.insert(candidate);
         }
     }
@@ -9132,14 +9261,14 @@ pub(super) fn prefetch_candidate_hydrations<S: BatchResolutionFragmentSource + ?
         if observed || cancellation.is_cancelled() {
             return Ok(());
         }
+        crate::profiling::note_with(|| {
+            format!(
+                "resolution::hydration_measure_store_installs count={}",
+                hydrated.len()
+            )
+        });
         for (identity, path) in hydrated {
-            assert!(
-                artifact_cache
-                    .hydrated_paths
-                    .insert(identity, path)
-                    .is_none(),
-                "one cache-miss candidate path is published once"
-            );
+            candidate_paths.publish(identity, path);
         }
     }
     Ok(())
@@ -9230,15 +9359,15 @@ fn validate_hydration_with_poll(
     Ok(Some(()))
 }
 
-/// Read exact immutable candidate paths through the producer-owned artifact
-/// cache without retaining a stitched answer. Every cached or source-returned
+/// Read exact immutable candidate paths through the operation-owned candidate
+/// store without retaining a stitched answer. Every cached or source-returned
 /// path completion is copied into the returned cancellation ledger before a
 /// cancellable body clone or validation step. Cache publication is therefore
 /// exhausted and atomic, while cancellation can discard all affirmative rows
 /// without losing evidence that already crossed the source boundary.
 pub(super) fn read_hydrated_candidate_artifacts<S: BatchResolutionFragmentSource + ?Sized>(
     source: &S,
-    cache: &mut ForwardCandidateArtifactCache,
+    candidate_paths: &mut CandidatePathStore,
     requested: &[CandidatePathIdentity],
     cancellation: &CancellationToken,
     work: &mut usize,
@@ -9256,9 +9385,7 @@ pub(super) fn read_hydrated_candidate_artifacts<S: BatchResolutionFragmentSource
     let mut missing = Vec::new();
     for &identity in requested {
         *cancelled |= poll_reverse_completion(cancellation, work);
-        if let Some(path) = cache.hydrated_paths.get(&identity) {
-            #[cfg(test)]
-            cache.record_cache_hit();
+        if let Some(path) = candidate_paths.paths.get(&identity) {
             evidence.include(path.completion(), cancellation, work);
             hits.push(identity);
         } else if !*cancelled {
@@ -9272,8 +9399,8 @@ pub(super) fn read_hydrated_candidate_artifacts<S: BatchResolutionFragmentSource
 
     let mut paths = BTreeMap::new();
     for identity in hits {
-        let cached = cache
-            .hydrated_paths
+        let cached = candidate_paths
+            .paths
             .get(&identity)
             .expect("a classified hydration hit remains immutable");
         let Some(path) =
@@ -9320,11 +9447,14 @@ pub(super) fn read_hydrated_candidate_artifacts<S: BatchResolutionFragmentSource
             *cancelled = true;
             break;
         }
+        crate::profiling::note_with(|| {
+            format!(
+                "resolution::hydration_measure_store_installs count={}",
+                staged_cache.len()
+            )
+        });
         for (identity, path) in staged_cache {
-            assert!(
-                cache.hydrated_paths.insert(identity, path).is_none(),
-                "one missing candidate hydration is published once"
-            );
+            candidate_paths.publish(identity, path);
         }
         for (identity, path) in hydrated {
             assert!(
@@ -9585,76 +9715,39 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         query: ResolutionQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<ResolutionAnswer> {
-        self.resolve_reference_with_artifact_cache_and_metrics(query, cancellation, None, None)
-            .map(|(answer, _)| answer)
-    }
-
-    pub(super) fn resolve_reference_with_metrics(
-        &self,
-        query: ResolutionQuery,
-        cancellation: &CancellationToken,
-    ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
-        self.resolve_reference_with_artifact_cache_and_metrics(query, cancellation, None, None)
-    }
-
-    pub(super) fn resolve_reference_with_selection_access_and_metrics(
-        &self,
-        query: ResolutionQuery,
-        cancellation: &CancellationToken,
-        access_lookup: &mut SelectionAccessLookup<'_>,
-    ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
         self.resolve_reference_with_artifact_cache_and_metrics(
             query,
             cancellation,
             None,
-            Some(access_lookup),
+            &mut CandidatePathStore::default(),
+            None,
         )
+        .map(|(answer, _)| answer)
     }
 
-    pub(super) fn resolve_reference_cached(
-        &self,
-        query: ResolutionQuery,
-        cancellation: &CancellationToken,
-        cache: &mut ForwardCandidateArtifactCache,
-    ) -> StoreResult<ResolutionAnswer> {
-        self.resolve_reference_cached_with_metrics(query, cancellation, cache)
-            .map(|(answer, _)| answer)
-    }
-
+    #[cfg(test)]
     pub(super) fn resolve_reference_cached_with_metrics(
         &self,
         query: ResolutionQuery,
         cancellation: &CancellationToken,
         cache: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
     ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
         self.resolve_reference_with_artifact_cache_and_metrics(
             query,
             cancellation,
             Some(cache),
+            candidate_paths,
             None,
         )
     }
 
-    pub(super) fn resolve_reference_cached_with_selection_access_and_metrics(
-        &self,
-        query: ResolutionQuery,
-        cancellation: &CancellationToken,
-        cache: &mut ForwardCandidateArtifactCache,
-        access_lookup: &mut SelectionAccessLookup<'_>,
-    ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
-        self.resolve_reference_with_artifact_cache_and_metrics(
-            query,
-            cancellation,
-            Some(cache),
-            Some(access_lookup),
-        )
-    }
-
-    fn resolve_reference_with_artifact_cache_and_metrics(
+    pub(super) fn resolve_reference_with_artifact_cache_and_metrics(
         &self,
         query: ResolutionQuery,
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
     ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
         if cancellation.is_cancelled() {
@@ -9700,6 +9793,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             &request,
             cancellation,
             cache,
+            candidate_paths,
             access_lookup,
         )
     }
@@ -9728,74 +9822,58 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             request,
             cancellation,
             None,
+            &mut CandidatePathStore::default(),
             None,
         )
     }
 
-    pub(super) fn resolve_seeded_reference_with_selection_access_and_metrics(
-        &self,
-        request: &SeededReferenceRequest,
-        cancellation: &CancellationToken,
-        access_lookup: &mut SelectionAccessLookup<'_>,
-    ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
-        self.resolve_seeded_reference_with_artifact_cache_and_metrics(
-            request,
-            cancellation,
-            None,
-            Some(access_lookup),
-        )
-    }
-
+    #[cfg(test)]
     pub(super) fn resolve_seeded_reference_cached(
         &self,
         request: &SeededReferenceRequest,
         cancellation: &CancellationToken,
         cache: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
     ) -> StoreResult<ResolutionAnswer> {
-        self.resolve_seeded_reference_cached_with_metrics(request, cancellation, cache)
-            .map(|(answer, _)| answer)
+        self.resolve_seeded_reference_cached_with_metrics(
+            request,
+            cancellation,
+            cache,
+            candidate_paths,
+        )
+        .map(|(answer, _)| answer)
     }
 
+    #[cfg(test)]
     pub(super) fn resolve_seeded_reference_cached_with_metrics(
         &self,
         request: &SeededReferenceRequest,
         cancellation: &CancellationToken,
         cache: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
     ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
         self.resolve_seeded_reference_with_artifact_cache_and_metrics(
             request,
             cancellation,
             Some(cache),
+            candidate_paths,
             None,
         )
     }
 
-    pub(super) fn resolve_seeded_reference_cached_with_selection_access_and_metrics(
-        &self,
-        request: &SeededReferenceRequest,
-        cancellation: &CancellationToken,
-        cache: &mut ForwardCandidateArtifactCache,
-        access_lookup: &mut SelectionAccessLookup<'_>,
-    ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
-        self.resolve_seeded_reference_with_artifact_cache_and_metrics(
-            request,
-            cancellation,
-            Some(cache),
-            Some(access_lookup),
-        )
-    }
-
-    fn resolve_seeded_reference_with_artifact_cache_and_metrics(
+    pub(super) fn resolve_seeded_reference_with_artifact_cache_and_metrics(
         &self,
         request: &SeededReferenceRequest,
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
     ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
         let batch = self.resolve_seeded_reference_requests_with_selection_access(
             std::slice::from_ref(request),
             cancellation,
             cache,
+            candidate_paths,
             access_lookup,
         )?;
         assert_eq!(
@@ -9819,52 +9897,21 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         batch: &ReferenceSeedBatch,
         cancellation: &CancellationToken,
     ) -> StoreResult<ReferenceBatchAnswer> {
-        self.resolve_reference_batch_with_artifact_cache(batch, cancellation, None, None)
-    }
-
-    pub(super) fn resolve_reference_batch_with_selection_access(
-        &self,
-        batch: &ReferenceSeedBatch,
-        cancellation: &CancellationToken,
-        access_lookup: &mut SelectionAccessLookup<'_>,
-    ) -> StoreResult<ReferenceBatchAnswer> {
         self.resolve_reference_batch_with_artifact_cache(
             batch,
             cancellation,
             None,
-            Some(access_lookup),
+            &mut CandidatePathStore::default(),
+            None,
         )
     }
 
-    pub(super) fn resolve_reference_batch_cached(
-        &self,
-        batch: &ReferenceSeedBatch,
-        cancellation: &CancellationToken,
-        cache: &mut ForwardCandidateArtifactCache,
-    ) -> StoreResult<ReferenceBatchAnswer> {
-        self.resolve_reference_batch_with_artifact_cache(batch, cancellation, Some(cache), None)
-    }
-
-    pub(super) fn resolve_reference_batch_cached_with_selection_access(
-        &self,
-        batch: &ReferenceSeedBatch,
-        cancellation: &CancellationToken,
-        cache: &mut ForwardCandidateArtifactCache,
-        access_lookup: &mut SelectionAccessLookup<'_>,
-    ) -> StoreResult<ReferenceBatchAnswer> {
-        self.resolve_reference_batch_with_artifact_cache(
-            batch,
-            cancellation,
-            Some(cache),
-            Some(access_lookup),
-        )
-    }
-
-    fn resolve_reference_batch_with_artifact_cache(
+    pub(super) fn resolve_reference_batch_with_artifact_cache(
         &self,
         batch: &ReferenceSeedBatch,
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
     ) -> StoreResult<ReferenceBatchAnswer> {
         let mut work = 0_usize;
@@ -9917,6 +9964,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             &requests,
             cancellation,
             cache,
+            candidate_paths,
             access_lookup,
         )
     }
@@ -9927,42 +9975,21 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         batch: ReferenceSeedBatch,
         cancellation: &CancellationToken,
     ) -> StoreResult<ReferenceBatchAnswer> {
-        self.resolve_owned_reference_batch_with_artifact_cache(batch, cancellation, None, None)
-    }
-
-    pub(super) fn resolve_owned_reference_batch_with_selection_access(
-        &self,
-        batch: ReferenceSeedBatch,
-        cancellation: &CancellationToken,
-        access_lookup: &mut SelectionAccessLookup<'_>,
-    ) -> StoreResult<ReferenceBatchAnswer> {
         self.resolve_owned_reference_batch_with_artifact_cache(
             batch,
             cancellation,
             None,
-            Some(access_lookup),
-        )
-    }
-
-    pub(super) fn resolve_owned_reference_batch_cached(
-        &self,
-        batch: ReferenceSeedBatch,
-        cancellation: &CancellationToken,
-        cache: &mut ForwardCandidateArtifactCache,
-    ) -> StoreResult<ReferenceBatchAnswer> {
-        self.resolve_owned_reference_batch_with_artifact_cache(
-            batch,
-            cancellation,
-            Some(cache),
+            &mut CandidatePathStore::default(),
             None,
         )
     }
 
-    fn resolve_owned_reference_batch_with_artifact_cache(
+    pub(super) fn resolve_owned_reference_batch_with_artifact_cache(
         &self,
         batch: ReferenceSeedBatch,
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
     ) -> StoreResult<ReferenceBatchAnswer> {
         let seeds = batch.into_seeds().into_vec();
@@ -10011,6 +10038,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             &requests,
             cancellation,
             cache,
+            candidate_paths,
             access_lookup,
         )
     }
@@ -10148,7 +10176,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             context.seeds,
             context.expandable,
             context.matches,
-            context.arena,
+            context.admitted,
+            &context.candidate_paths.paths,
             context.accounted_completions,
             cancellation,
             context.completion_work,
@@ -10158,7 +10187,6 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
     fn prepare_forward_hydration(
         &self,
         mut context: ForwardHydrationContext<'_>,
-        artifact_cache_enabled: bool,
         cancellation: &CancellationToken,
     ) -> ForwardHydrationRequest {
         context.metrics.distinct_candidate_matches += context.matches.len();
@@ -10173,7 +10201,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                 *context.cancelled = true;
                 break;
             }
-            if !context.arena.contains_key(&matched.candidate()) {
+            if !context.admitted.contains(&matched.candidate()) {
                 hydration_set.insert(matched.candidate());
             }
         }
@@ -10187,7 +10215,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
 
         let mut seed_owners =
             HashMap::<CandidatePathIdentity, (HashSet<usize>, Vec<usize>)>::default();
-        if artifact_cache_enabled {
+        {
             // Candidate rows are canonical request-major. This linear owner
             // index avoids rescanning the full relation per hydrated path.
             for matched in context.matches {
@@ -10233,9 +10261,9 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         &self,
         mut context: ForwardHydrationContext<'_>,
         request: &ForwardHydrationRequest,
-        mut artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
         cancellation: &CancellationToken,
     ) -> StoreResult<()> {
+        let measurement_initial_installations = context.metrics.distinct_path_hydrations;
         if request.candidates.is_empty() {
             return Ok(());
         }
@@ -10244,87 +10272,59 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             Self::retain_forward_hydration_cancellation(&mut context, cancellation);
             return Ok(());
         }
-
-        let mut missing_hydrations = Vec::new();
-        if let Some(cache) = artifact_cache.as_deref() {
-            let mut cached_hydrations = Vec::new();
-            for &candidate in &request.candidates {
+        let mut missing = Vec::new();
+        let mut hits = Vec::new();
+        for &identity in &request.candidates {
+            *context.cancelled |= poll_reverse_completion(cancellation, context.completion_work);
+            if let Some(path) = context.candidate_paths.paths.get(&identity) {
+                *context.cancelled |= returned_completion_observes_cancellation(
+                    path.completion(),
+                    cancellation,
+                    context.completion_work,
+                );
+                hits.push(identity);
+            } else if !*context.cancelled {
+                missing.push(identity);
+            }
+        }
+        if !*context.cancelled {
+            for &identity in &hits {
                 *context.cancelled |=
                     poll_reverse_completion(cancellation, context.completion_work);
-                if let Some(cached) = cache.hydrated_paths.get(&candidate) {
-                    #[cfg(test)]
-                    cache.record_cache_hit();
-                    // Inspect each immutable path box exactly once before a
-                    // cancellable clone. Cancellation maps its raw evidence
-                    // through the linear seed-owner index below.
-                    *context.cancelled |= returned_completion_observes_cancellation(
-                        cached.completion(),
-                        cancellation,
-                        context.completion_work,
-                    );
-                    cached_hydrations.push(candidate);
-                } else if !*context.cancelled {
-                    missing_hydrations.push(candidate);
+                if *context.cancelled {
+                    break;
                 }
+                assert!(
+                    context.admitted.insert(identity),
+                    "one candidate is admitted once per frame"
+                );
+                context.metrics.distinct_path_hydrations += 1;
             }
-            if !*context.cancelled {
-                for &candidate in &cached_hydrations {
-                    let cached = cache
-                        .hydrated_paths
-                        .get(&candidate)
-                        .expect("a classified hydration hit remains immutable");
-                    let path = cached.clone_with_poll(&mut || {
-                        poll_reverse_completion(cancellation, context.completion_work)
-                    });
-                    let Some(path) = path else {
-                        *context.cancelled = true;
-                        break;
-                    };
-                    assert!(
-                        context.arena.insert(candidate, path).is_none(),
-                        "one cached candidate path is installed once per batch"
-                    );
-                    context.metrics.distinct_path_hydrations += 1;
-                }
-            }
-            if *context.cancelled {
-                for &candidate in &cached_hydrations {
-                    let cached = cache
-                        .hydrated_paths
-                        .get(&candidate)
-                        .expect("a returned hydration hit remains immutable");
-                    for &seed in &request
-                        .seed_owners
-                        .get(&candidate)
-                        .expect("a matched candidate has one seed-owner index")
-                        .1
-                    {
-                        let _ = poll_reverse_completion(cancellation, context.completion_work);
-                        if context.accounted_completions.insert((seed, candidate)) {
-                            let _ = context.seeds[seed].observed_completion.include(
-                                cached.completion(),
-                                cancellation,
-                                context.completion_work,
-                            );
-                        }
+        }
+        if *context.cancelled {
+            for identity in hits {
+                let path = &context.candidate_paths.paths[&identity];
+                for &seed in &request.seed_owners[&identity].1 {
+                    let _ = poll_reverse_completion(cancellation, context.completion_work);
+                    if context.accounted_completions.insert((seed, identity)) {
+                        let _ = context.seeds[seed].observed_completion.include(
+                            path.completion(),
+                            cancellation,
+                            context.completion_work,
+                        );
                     }
                 }
             }
-        } else {
-            missing_hydrations.extend_from_slice(&request.candidates);
-        }
-        if *context.cancelled {
             Self::retain_forward_hydration_cancellation(&mut context, cancellation);
             return Ok(());
         }
-
-        for requested in missing_hydrations.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
+        for requested in missing.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
             let hydrated = self
                 .source()
                 .hydrate_candidate_paths(requested, cancellation)?;
-            let mut hydration_cancelled = cancellation.is_cancelled();
-            if !hydration_cancelled {
-                hydration_cancelled = validate_hydration_with_poll(
+            let mut cancelled = cancellation.is_cancelled();
+            if !cancelled {
+                cancelled = validate_hydration_with_poll(
                     requested,
                     &hydrated,
                     cancellation,
@@ -10332,7 +10332,14 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                 )?
                 .is_none();
             }
-            if hydration_cancelled {
+            for (_, path) in &hydrated {
+                cancelled |= returned_completion_observes_cancellation(
+                    path.completion(),
+                    cancellation,
+                    context.completion_work,
+                );
+            }
+            if cancelled || cancellation.is_cancelled() {
                 include_forward_returned_hydrated_completions_after_cancellation(
                     context.seeds,
                     context.expandable,
@@ -10346,73 +10353,40 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                 *context.cancelled = true;
                 break;
             }
-            if artifact_cache.is_some() {
-                for (_, path) in &hydrated {
-                    hydration_cancelled |= returned_completion_observes_cancellation(
-                        path.completion(),
-                        cancellation,
-                        context.completion_work,
-                    );
-                }
-            }
-            let mut staged_cache_paths = Vec::with_capacity(hydrated.len());
-            if artifact_cache.is_some() {
-                for (identity, path) in &hydrated {
-                    if poll_reverse_completion(cancellation, context.completion_work) {
-                        hydration_cancelled = true;
-                        break;
-                    }
-                    let Some(path) = path.clone_with_poll(&mut || {
-                        poll_reverse_completion(cancellation, context.completion_work)
-                    }) else {
-                        hydration_cancelled = true;
-                        break;
-                    };
-                    staged_cache_paths.push((*identity, path));
-                }
-            }
-            if hydration_cancelled || cancellation.is_cancelled() {
-                include_forward_returned_hydrated_completions_after_cancellation(
-                    context.seeds,
-                    context.expandable,
-                    context.matches,
-                    &hydrated,
-                    context.accounted_completions,
-                    cancellation,
-                    context.completion_work,
-                );
-                Self::retain_forward_hydration_cancellation(&mut context, cancellation);
-                *context.cancelled = true;
-                break;
-            }
-            if let Some(cache) = artifact_cache.as_deref_mut() {
-                for (identity, path) in staged_cache_paths {
-                    assert!(
-                        cache.hydrated_paths.insert(identity, path).is_none(),
-                        "one cache-miss candidate path is published once"
-                    );
-                }
-            }
+            crate::profiling::note_with(|| {
+                format!(
+                    "resolution::hydration_measure_store_installs count={}",
+                    hydrated.len()
+                )
+            });
             for (identity, path) in hydrated {
-                hydration_cancelled |=
-                    poll_reverse_completion(cancellation, context.completion_work);
+                cancelled |= poll_reverse_completion(cancellation, context.completion_work);
+                context.candidate_paths.publish(identity, path);
                 assert!(
-                    context.arena.insert(identity, path).is_none(),
-                    "a candidate path is hydrated at most once per batch"
+                    context.admitted.insert(identity),
+                    "one candidate is admitted once per frame"
                 );
                 context.metrics.distinct_path_hydrations += 1;
             }
-            hydration_cancelled |= cancellation.is_cancelled();
-            if hydration_cancelled {
+            if cancelled || cancellation.is_cancelled() {
                 Self::retain_forward_hydration_cancellation(&mut context, cancellation);
                 *context.cancelled = true;
                 break;
             }
         }
         if !*context.cancelled {
-            context.metrics.peak_hydrated_paths =
-                context.metrics.peak_hydrated_paths.max(context.arena.len());
+            context.metrics.peak_hydrated_paths = context
+                .metrics
+                .peak_hydrated_paths
+                .max(context.admitted.len());
         }
+        crate::profiling::note_with(|| {
+            format!(
+                "resolution::hydration_measure_admissions installations={} frame_clones={}",
+                context.metrics.distinct_path_hydrations - measurement_initial_installations,
+                0,
+            )
+        });
         Ok(())
     }
 
@@ -10496,11 +10470,13 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         requests: &[SeededReferenceRequest],
         cancellation: &CancellationToken,
         artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
     ) -> StoreResult<ReferenceBatchAnswer> {
         self.resolve_seeded_reference_requests_with_selection_access(
             requests,
             cancellation,
             artifact_cache,
+            candidate_paths,
             None,
         )
     }
@@ -10510,6 +10486,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         requests: &[SeededReferenceRequest],
         cancellation: &CancellationToken,
         mut artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
+        candidate_paths: &mut CandidatePathStore,
         access_lookup: Option<&mut SelectionAccessLookup<'_>>,
     ) -> StoreResult<ReferenceBatchAnswer> {
         let InitializedSeededBatch {
@@ -10523,7 +10500,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             SeededBatchInitialization::Ready(initialized) => initialized,
             SeededBatchInitialization::Cancelled(answer) => return Ok(answer),
         };
-        let mut arena = map_with_capacity(requests.len().saturating_mul(4));
+        let mut admitted = HashSet::default();
         let mut accounted_hydrated_completions = crate::hash::HashSet::default();
         let mut candidate_completion = OperationCandidateCompletionLedger::new(seeds.len());
         while !cancelled && !frontier.is_empty() {
@@ -10859,7 +10836,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     &mut seeds,
                     &expandable,
                     &matches,
-                    &arena,
+                    &admitted,
+                    &candidate_paths.paths,
                     &mut accounted_hydrated_completions,
                     cancellation,
                     &mut completion_work,
@@ -10873,11 +10851,11 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     seeds: &mut seeds,
                     expandable: &expandable,
                     matches: &matches,
-                    arena: &mut arena,
+                    admitted: &mut admitted,
+                    candidate_paths,
                     accounted_completions: &mut accounted_hydrated_completions,
                     cancelled: &mut cancelled,
                 },
-                artifact_cache.is_some(),
                 cancellation,
             );
             if cancelled {
@@ -10890,12 +10868,12 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     seeds: &mut seeds,
                     expandable: &expandable,
                     matches: &matches,
-                    arena: &mut arena,
+                    admitted: &mut admitted,
+                    candidate_paths,
                     accounted_completions: &mut accounted_hydrated_completions,
                     cancelled: &mut cancelled,
                 },
                 &hydration_request,
-                artifact_cache.as_deref_mut(),
                 cancellation,
             )?;
             if cancelled {
@@ -10911,13 +10889,21 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     cancelled = true;
                     break;
                 }
+                debug_assert!(
+                    admitted.contains(&matched.candidate()),
+                    "composition requires frame admission"
+                );
                 let parent = &expandable[matched.request_ordinal()];
-                let candidate = arena.get(&matched.candidate()).ok_or_else(|| {
-                    StoreError::new(format!(
-                        "candidate {:?} was matched but not hydrated",
-                        matched.candidate()
-                    ))
-                })?;
+                let candidate =
+                    candidate_paths
+                        .paths
+                        .get(&matched.candidate())
+                        .ok_or_else(|| {
+                            StoreError::new(format!(
+                                "candidate {:?} was matched but not hydrated",
+                                matched.candidate()
+                            ))
+                        })?;
                 let composition = parent.path.concatenate_with_poll(candidate, &mut || {
                     poll_reverse_completion(cancellation, &mut completion_work)
                 });
@@ -10998,7 +10984,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     &mut seeds,
                     &expandable,
                     &matches,
-                    &arena,
+                    &admitted,
+                    &candidate_paths.paths,
                     &mut accounted_hydrated_completions,
                     cancellation,
                     &mut completion_work,
@@ -11024,7 +11011,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     &mut seeds,
                     &expandable_seed_indices,
                     &matches,
-                    &arena,
+                    &admitted,
+                    &candidate_paths.paths,
                     &mut accounted_hydrated_completions,
                     cancellation,
                     &mut completion_work,
@@ -13709,12 +13697,14 @@ mod tests {
         engine: &BatchResolutionEngine<'_, S>,
         requests: &[SeededReferenceRequest],
         cache: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
     ) -> StoreResult<ReferenceBatchAnswer> {
         drive_experimental_forward_start(
             engine,
             DemandForwardBatchFrame::start(engine, requests, cancellation),
             cache,
+            candidate_paths,
             cancellation,
         )
     }
@@ -13794,6 +13784,7 @@ mod tests {
         engine: &BatchResolutionEngine<'_, S>,
         start: DemandForwardBatchStart,
         cache: &mut ForwardCandidateArtifactCache,
+        candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
     ) -> StoreResult<ReferenceBatchAnswer> {
         let mut frame = match start {
@@ -13801,9 +13792,13 @@ mod tests {
             DemandForwardBatchStart::Ready(answer) => return Ok(answer),
         };
         for _ in 0..10_000 {
-            match frame.poll(engine, Some(&mut *cache), cancellation, &mut |_| {
-                Ok(DemandForwardReadiness::AwaitingDependencies)
-            })? {
+            match frame.poll(
+                engine,
+                Some(&mut *cache),
+                candidate_paths,
+                cancellation,
+                &mut |_| Ok(DemandForwardReadiness::AwaitingDependencies),
+            )? {
                 DemandForwardBatchPoll::Ready(answer) => return Ok(answer),
                 DemandForwardBatchPoll::Continue => continue,
                 DemandForwardBatchPoll::AwaitingDependencies => {}
@@ -13819,7 +13814,7 @@ mod tests {
             );
             let metrics = frame.initialized.metrics;
             let completion_work = frame.initialized.completion_work;
-            let cache_counts = cache.artifact_counts();
+            let cache_counts = cache.artifact_counts(candidate_paths);
             let charged = engine
                 .resolution_session
                 .map(|session| session.finish(()).work());
@@ -13828,16 +13823,22 @@ mod tests {
                 let mut arena = vec![frame];
                 frame = arena.pop().unwrap();
                 assert!(matches!(
-                    frame.poll(engine, Some(&mut *cache), cancellation, &mut |requests| {
-                        assert_eq!(requests, pending);
-                        Ok(DemandForwardReadiness::AwaitingDependencies)
-                    })?,
+                    frame.poll(
+                        engine,
+                        Some(&mut *cache),
+                        candidate_paths,
+                        cancellation,
+                        &mut |requests| {
+                            assert_eq!(requests, pending);
+                            Ok(DemandForwardReadiness::AwaitingDependencies)
+                        }
+                    )?,
                     DemandForwardBatchPoll::AwaitingDependencies
                 ));
                 assert_eq!(frame.pending_requests(), pending);
                 assert_eq!(frame.initialized.metrics, metrics);
                 assert_eq!(frame.initialized.completion_work, completion_work);
-                assert_eq!(cache.artifact_counts(), cache_counts);
+                assert_eq!(cache.artifact_counts(candidate_paths), cache_counts);
                 assert_eq!(
                     engine
                         .resolution_session
@@ -13845,10 +13846,16 @@ mod tests {
                     charged
                 );
             }
-            match frame.poll(engine, Some(&mut *cache), cancellation, &mut |requests| {
-                assert_eq!(requests, pending);
-                Ok(DemandForwardReadiness::Ready)
-            })? {
+            match frame.poll(
+                engine,
+                Some(&mut *cache),
+                candidate_paths,
+                cancellation,
+                &mut |requests| {
+                    assert_eq!(requests, pending);
+                    Ok(DemandForwardReadiness::Ready)
+                },
+            )? {
                 DemandForwardBatchPoll::Ready(answer) => return Ok(answer),
                 DemandForwardBatchPoll::Continue => {}
                 DemandForwardBatchPoll::AwaitingDependencies => {
@@ -15732,6 +15739,7 @@ mod tests {
                     &batch,
                     &cancellation,
                     Some(&mut ForwardCandidateArtifactCache::default()),
+                    &mut CandidatePathStore::default(),
                     None,
                 )
                 .unwrap();
@@ -15743,6 +15751,7 @@ mod tests {
                     &cancellation,
                 ),
                 &mut ForwardCandidateArtifactCache::default(),
+                &mut CandidatePathStore::default(),
                 &cancellation,
             )
             .unwrap();
@@ -15770,6 +15779,7 @@ mod tests {
                         query,
                         &cancellation,
                         &mut ForwardCandidateArtifactCache::default(),
+                        &mut CandidatePathStore::default(),
                     )
                     .unwrap();
                 let actual = drive_experimental_forward_start(
@@ -15777,6 +15787,7 @@ mod tests {
                     DemandForwardBatchFrame::start_query(&frame_engine, query, &cancellation)
                         .unwrap(),
                     &mut ForwardCandidateArtifactCache::default(),
+                    &mut CandidatePathStore::default(),
                     &cancellation,
                 )
                 .unwrap();
@@ -15808,7 +15819,9 @@ mod tests {
             BatchResolutionEngine::maybe_bounded(&eager_source, Some(&eager_session));
         let frame_engine =
             BatchResolutionEngine::maybe_bounded(&frame_source, Some(&frame_session));
+        let mut eager_cache_paths = CandidatePathStore::default();
         let mut eager_cache = ForwardCandidateArtifactCache::default();
+        let mut frame_cache_paths = CandidatePathStore::default();
         let mut frame_cache = ForwardCandidateArtifactCache::default();
         let mut first_closed = HashMap::default();
         for (round, reference) in [
@@ -15823,12 +15836,18 @@ mod tests {
             let reads_before = frame_source.forward_matches.get();
             let hydrated_before = frame_source.hydrated_candidates.borrow().len();
             let (eager, metrics) = eager_engine
-                .resolve_reference_cached_with_metrics(query, &cancellation, &mut eager_cache)
+                .resolve_reference_cached_with_metrics(
+                    query,
+                    &cancellation,
+                    &mut eager_cache,
+                    &mut eager_cache_paths,
+                )
                 .unwrap();
             let actual = drive_experimental_forward_start(
                 &frame_engine,
                 DemandForwardBatchFrame::start_query(&frame_engine, query, &cancellation).unwrap(),
                 &mut frame_cache,
+                &mut frame_cache_paths,
                 &cancellation,
             )
             .unwrap();
@@ -15895,7 +15914,9 @@ mod tests {
             )];
             let eager_source = FaultingSource::new(&fixture.source, TestFault::None);
             let frame_source = FaultingSource::new(&fixture.source, TestFault::None);
+            let mut eager_cache_paths = CandidatePathStore::default();
             let mut eager_cache = ForwardCandidateArtifactCache::default();
+            let mut frame_cache_paths = CandidatePathStore::default();
             let mut frame_cache = ForwardCandidateArtifactCache::default();
             for _ in 0..2 {
                 let cancellation = CancellationToken::new();
@@ -15913,12 +15934,14 @@ mod tests {
                             &requests,
                             &cancellation,
                             Some(&mut eager_cache),
+                            &mut eager_cache_paths,
                         )
                         .unwrap();
                 let actual = drive_experimental_forward(
                     &BatchResolutionEngine::maybe_bounded(&frame_source, Some(&frame_session)),
                     &requests,
                     &mut frame_cache,
+                    &mut frame_cache_paths,
                     &cancellation,
                 )
                 .unwrap();
@@ -15967,6 +15990,7 @@ mod tests {
                     &requests,
                     &cancellation,
                     Some(&mut ForwardCandidateArtifactCache::default()),
+                    &mut CandidatePathStore::default(),
                 )
                 .unwrap();
         let work = baseline_session.finish(()).work();
@@ -15985,12 +16009,14 @@ mod tests {
                     &requests,
                     &cancellation,
                     Some(&mut ForwardCandidateArtifactCache::default()),
+                    &mut CandidatePathStore::default(),
                 )
                 .unwrap();
             let actual = drive_experimental_forward(
                 &BatchResolutionEngine::maybe_bounded(&fixture.source, Some(&frame_session)),
                 &requests,
                 &mut ForwardCandidateArtifactCache::default(),
+                &mut CandidatePathStore::default(),
                 &cancellation,
             )
             .unwrap();
@@ -16038,20 +16064,31 @@ mod tests {
         else {
             panic!("live frame");
         };
+        let mut cache_paths = CandidatePathStore::default();
         let mut cache = ForwardCandidateArtifactCache::default();
         assert!(matches!(
             frame
-                .poll(&engine, Some(&mut cache), &cancellation, &mut |_| {
-                    panic!("round preparation does not enter the candidate readiness gate")
-                })
+                .poll(
+                    &engine,
+                    Some(&mut cache),
+                    &mut cache_paths,
+                    &cancellation,
+                    &mut |_| {
+                        panic!("round preparation does not enter the candidate readiness gate")
+                    }
+                )
                 .unwrap(),
             DemandForwardBatchPoll::Continue
         ));
         assert!(matches!(
             frame
-                .poll(&engine, Some(&mut cache), &cancellation, &mut |_| {
-                    Ok(DemandForwardReadiness::AwaitingDependencies)
-                })
+                .poll(
+                    &engine,
+                    Some(&mut cache),
+                    &mut cache_paths,
+                    &cancellation,
+                    &mut |_| { Ok(DemandForwardReadiness::AwaitingDependencies) }
+                )
                 .unwrap(),
             DemandForwardBatchPoll::AwaitingDependencies
         ));
@@ -16067,13 +16104,19 @@ mod tests {
         assert_eq!(frame.pending_requests().len(), MAX_SOURCE_ROWS_PER_BATCH);
         for _ in 0..10 {
             let polled = frame
-                .poll(&engine, Some(&mut cache), &cancellation, &mut |_| {
-                    Ok(if source.calls.get() == 0 {
-                        DemandForwardReadiness::Ready
-                    } else {
-                        DemandForwardReadiness::AwaitingDependencies
-                    })
-                })
+                .poll(
+                    &engine,
+                    Some(&mut cache),
+                    &mut cache_paths,
+                    &cancellation,
+                    &mut |_| {
+                        Ok(if source.calls.get() == 0 {
+                            DemandForwardReadiness::Ready
+                        } else {
+                            DemandForwardReadiness::AwaitingDependencies
+                        })
+                    },
+                )
                 .unwrap();
             if matches!(polled, DemandForwardBatchPoll::AwaitingDependencies) {
                 break;
@@ -16086,7 +16129,7 @@ mod tests {
         let pending = frame.pending_requests()[0].endpoint().clone();
         assert!(!cache.endpoint_matches.contains_key(&pending));
         let metrics = frame.initialized.metrics;
-        let answer = frame.cancel();
+        let answer = frame.cancel(&cache_paths);
         assert!(!cancellation.is_cancelled());
         assert_eq!(answer.metrics(), metrics);
         assert_eq!(source.calls.get(), 1);
@@ -16108,12 +16151,14 @@ mod tests {
                 &requests,
                 &retry_token,
                 Some(&mut ForwardCandidateArtifactCache::default()),
+                &mut CandidatePathStore::default(),
             )
             .unwrap();
         let retry = drive_experimental_forward(
             &engine,
             &requests,
             &mut ForwardCandidateArtifactCache::default(),
+            &mut CandidatePathStore::default(),
             &retry_token,
         )
         .unwrap();
@@ -16142,12 +16187,14 @@ mod tests {
                     &requests,
                     &CancellationToken::new(),
                     Some(&mut ForwardCandidateArtifactCache::default()),
+                    &mut CandidatePathStore::default(),
                 )
                 .unwrap();
             let actual = drive_experimental_forward(
                 &BatchResolutionEngine::new(&frame_source),
                 &requests,
                 &mut ForwardCandidateArtifactCache::default(),
+                &mut CandidatePathStore::default(),
                 &CancellationToken::new(),
             )
             .unwrap();
@@ -16168,6 +16215,7 @@ mod tests {
             &BatchResolutionEngine::new(&source),
             &requests,
             &mut ForwardCandidateArtifactCache::default(),
+            &mut CandidatePathStore::default(),
             &CancellationToken::new(),
         )
         .expect_err("a later source failure publishes no partial answer");
@@ -16183,6 +16231,7 @@ mod tests {
             &BatchResolutionEngine::new(&source),
             &requests,
             &mut ForwardCandidateArtifactCache::default(),
+            &mut CandidatePathStore::default(),
             &cancellation,
         )
         .unwrap();
@@ -16239,12 +16288,14 @@ mod tests {
                 &requests,
                 &cancellation,
                 Some(&mut ForwardCandidateArtifactCache::default()),
+                &mut CandidatePathStore::default(),
             )
             .unwrap();
         let actual = drive_experimental_forward(
             &engine,
             &requests,
             &mut ForwardCandidateArtifactCache::default(),
+            &mut CandidatePathStore::default(),
             &cancellation,
         )
         .unwrap();
@@ -16454,6 +16505,7 @@ mod tests {
             BatchCandidateRequest::new(0, hit_endpoint.clone()),
             BatchCandidateRequest::new(1, miss_endpoint.clone()),
         ];
+        let cache_paths = CandidatePathStore::default();
         let mut cache = ForwardCandidateArtifactCache {
             endpoint_matches: HashMap::from_iter([(
                 hit_endpoint,
@@ -16462,7 +16514,6 @@ mod tests {
                     branch_completion: hit_branch.clone(),
                 },
             )]),
-            hydrated_paths: HashMap::default(),
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(unconditional.clone()),
             demanded_reference_answers: HashMap::default(),
@@ -16498,7 +16549,7 @@ mod tests {
         }
         assert_eq!(cancelled_branches[0], hit_branch);
         assert_eq!(cancelled_branches[1], ResolutionCompletion::Complete);
-        assert_eq!(cache.artifact_counts(), (1, 0, 0));
+        assert_eq!(cache.artifact_counts(&cache_paths), (1, 0, 0));
 
         let retry_token = CancellationToken::new();
         let mut retry_work = 0_usize;
@@ -16519,7 +16570,7 @@ mod tests {
         assert_eq!(retry_unconditional, unconditional);
         assert_eq!(retry_branches[0], hit_branch);
         assert_eq!(retry_branches[1], ResolutionCompletion::Complete);
-        assert_eq!(cache.artifact_counts(), (2, 0, 0));
+        assert_eq!(cache.artifact_counts(&cache_paths), (2, 0, 0));
         assert_eq!(source.calls.get(), 2);
 
         let mut hit_work = 0_usize;
@@ -16550,6 +16601,7 @@ mod tests {
     fn bounded_forward_candidate_pages_and_cache_hits_stop_before_publication() {
         let fixture = shared_fixture(false);
         let requests = [BatchCandidateRequest::new(0, endpoint(fixture.first_node))];
+        let cache_paths = CandidatePathStore::default();
         let mut cache = ForwardCandidateArtifactCache::default();
         let caller = CancellationToken::new();
         let stopped_session = ResolutionSession::bounded(
@@ -16573,7 +16625,7 @@ mod tests {
         .expect("a bounded candidate stop is not a source failure");
         assert!(cancelled);
         assert!(matches.is_empty());
-        assert_eq!(cache.artifact_counts(), (0, 0, 0));
+        assert_eq!(cache.artifact_counts(&cache_paths), (0, 0, 0));
         assert!(!caller.is_cancelled());
         assert!(matches!(
             stopped_session.finish(()),
@@ -16609,7 +16661,7 @@ mod tests {
         .expect("an exact candidate budget retries from an empty cache");
         assert!(!exact_cancelled);
         assert_eq!(exact_matches.len(), 1);
-        assert_eq!(cache.artifact_counts(), (1, 0, 0));
+        assert_eq!(cache.artifact_counts(&cache_paths), (1, 0, 0));
         assert!(matches!(
             exact_session.finish(()),
             BoundedResolution::Complete {
@@ -16663,6 +16715,7 @@ mod tests {
         let source = PreloadedFragmentSource::new([], []);
         let endpoint = endpoint(node("bounded-completion-endpoint"));
         let completion = noncanonical_candidate_completion("bounded-completion");
+        let cache_paths = CandidatePathStore::default();
         let mut cache = ForwardCandidateArtifactCache {
             endpoint_matches: HashMap::from_iter([(
                 endpoint.clone(),
@@ -16671,7 +16724,6 @@ mod tests {
                     branch_completion: ResolutionCompletion::Complete,
                 },
             )]),
-            hydrated_paths: HashMap::default(),
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(completion.clone()),
             demanded_reference_answers: HashMap::default(),
@@ -16704,7 +16756,7 @@ mod tests {
         assert!(matches.is_empty());
         assert_eq!(returned, completion);
         assert_eq!(branches.as_ref(), &[ResolutionCompletion::Complete]);
-        assert_eq!(cache.artifact_counts(), (1, 0, 0));
+        assert_eq!(cache.artifact_counts(&cache_paths), (1, 0, 0));
         assert!(!caller.is_cancelled());
         assert!(matches!(
             stopped.finish(()),
@@ -16781,7 +16833,6 @@ mod tests {
                     },
                 ),
             ]),
-            hydrated_paths: HashMap::default(),
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(unconditional.clone()),
             demanded_reference_answers: HashMap::default(),
@@ -16824,20 +16875,26 @@ mod tests {
     }
 
     #[test]
-    fn cached_hydrated_path_clone_cancellation_retains_the_full_raw_path_box() {
+    fn cached_candidate_composition_cancellation_retains_the_full_raw_path_box() {
         let fixture = seeded_fixture(PrecedenceTier::LexicalBinding);
         let seed = reference_seed(&fixture.source, ResolutionQuery::new(fixture.reference));
         let request = seeded_reference_request(seed, [seeded_alternatives(&fixture)[0].clone()]);
         let source = FaultingSource::new(&fixture.source, TestFault::None);
+        let mut cache_paths = CandidatePathStore::default();
         let mut cache = ForwardCandidateArtifactCache::default();
         let engine = BatchResolutionEngine::new(&source);
 
         let warmed = engine
-            .resolve_seeded_reference_cached(&request, &CancellationToken::new(), &mut cache)
+            .resolve_seeded_reference_cached(
+                &request,
+                &CancellationToken::new(),
+                &mut cache,
+                &mut cache_paths,
+            )
             .expect("the initial producer stitch warms every immutable artifact");
         assert_eq!(warmed.targets(), &[fixture.first_target]);
         {
-            assert_eq!(cache.artifact_counts(), (1, 1, 2));
+            assert_eq!(cache.artifact_counts(&cache_paths), (1, 1, 2));
             assert_eq!(
                 cache.endpoint_classifications[&fixture.first_owner],
                 BatchEndpointClassification::new(fixture.first_owner, None, None),
@@ -16860,10 +16917,10 @@ mod tests {
         );
 
         // Find a token budget that is strictly larger than every check in the
-        // short all-hit replay. Replacing the one cached path with more than
-        // that many cancellation quanta of witness steps then makes the same
-        // budget expire inside `PartialPath::clone_with_poll`, rather than in
-        // its completion preflight or in later composition work.
+        // short all-hit replay. Start a separate store with more than that
+        // many cancellation quanta of witness steps, so the same budget
+        // expires during composition. The earlier domain has no live frame;
+        // no installed entry is changed while its domain is in use.
         let mut short_hit_budget = None;
         for checks in 1..=4096 {
             let answer = engine
@@ -16871,6 +16928,7 @@ mod tests {
                     &request,
                     &CancellationToken::cancel_after_checks_for_test(checks),
                     &mut cache,
+                    &mut cache_paths,
                 )
                 .expect("cache-hit cancellation is semantic control flow");
             if !answer
@@ -16900,8 +16958,8 @@ mod tests {
             .and_then(|iterations| iterations.checked_mul(2))
             .expect("the bounded cache-hit clone witness count must fit usize");
         let (candidate, long_path) = {
-            let (&candidate, cached) = cache
-                .hydrated_paths
+            let (&candidate, cached) = cache_paths
+                .paths
                 .iter()
                 .next()
                 .expect("the warm stitch cached one hydrated path");
@@ -16921,15 +16979,18 @@ mod tests {
                 ),
             )
         };
-        cache.hydrated_paths.insert(candidate, long_path.clone());
+        cache_paths = CandidatePathStore {
+            paths: [(candidate, long_path.clone())].into_iter().collect(),
+        };
 
         let cancelled = engine
             .resolve_seeded_reference_cached(
                 &request,
                 &CancellationToken::cancel_after_checks_for_test(short_hit_budget),
                 &mut cache,
+                &mut cache_paths,
             )
-            .expect("interrupted cached hydration cloning is semantic control flow");
+            .expect("interrupted candidate composition is semantic control flow");
         assert!(cancelled.targets().is_empty());
         assert!(cancelled.witnesses().is_empty());
         assert!(
@@ -16943,11 +17004,11 @@ mod tests {
         for reason in path_reasons.iter() {
             assert!(
                 cancelled.completion().contains_reason(*reason),
-                "an interrupted hit clone retains the complete cached raw path operand"
+                "interrupted composition retains the complete cached raw path operand"
             );
         }
-        assert_eq!(cache.hydrated_paths[&candidate], long_path);
-        assert_eq!(cache.artifact_counts(), (1, 1, 2));
+        assert_eq!(cache_paths.paths[&candidate], long_path);
+        assert_eq!(cache.artifact_counts(&cache_paths), (1, 1, 2));
         assert_eq!(
             (
                 source.forward_matches.get(),
@@ -16959,11 +17020,16 @@ mod tests {
         );
 
         let retried = engine
-            .resolve_seeded_reference_cached(&request, &CancellationToken::new(), &mut cache)
+            .resolve_seeded_reference_cached(
+                &request,
+                &CancellationToken::new(),
+                &mut cache,
+                &mut cache_paths,
+            )
             .expect("a fresh cache-hit retry is exact");
         assert_eq!(retried.targets(), &[fixture.first_target]);
         assert_eq!(retried.completion(), &path_gap);
-        assert_eq!(cache.hydrated_paths[&candidate], long_path);
+        assert_eq!(cache_paths.paths[&candidate], long_path);
         assert_eq!(
             (
                 source.forward_matches.get(),

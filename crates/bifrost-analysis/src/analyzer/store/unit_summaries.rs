@@ -115,6 +115,8 @@ pub(crate) struct UnitOutputs {
     pub imports: Vec<UnitImport>,
     pub gaps: Vec<UnitGap>,
     pub complete: bool,
+    /// Published semantic output supplement, not input or provenance; `None` keeps the encoding.
+    pub public_surface_digest: Option<[u8; 32]>,
 }
 
 /// What a language supplies. Every method runs on the store's writer
@@ -123,6 +125,12 @@ pub(crate) trait UnitSummaryLanguage {
     fn lang(&self) -> &'static str;
     fn unit_kind(&self) -> &'static str;
     fn derivation_version(&self) -> i64;
+
+    /// Context selection whose revision intervals this pass may change.
+    /// Languages with one profile use the schema's singleton zero digest.
+    fn profile_digest(&self) -> [u8; 32] {
+        [0; 32]
+    }
 
     /// Fill `temp.unit_summary_work` with one row per unit and
     /// `temp.unit_summary_edges` with one row per consumed workspace unit. Both
@@ -247,26 +255,26 @@ pub(crate) struct UnitSummaryReconciliation {
 
 /// The select the validity predicate is written in, once. A version row open at
 /// the selected revision, a complete summary, and the active producer epoch and
-/// derivation version. A language that records more than one live profile adds
-/// its own conjunct to this text (`GO_LIVE_SUMMARY_SQL` adds the profile read);
+/// derivation version, within the selected profile. The language supplies the
+/// profile expression (`GO_LIVE_SUMMARY_SQL` also checks the recorded input);
 /// the writer and every reader use that one statement.
 macro_rules! live_summary_select {
-    () => {
-        "SELECT versions.summary_id, summaries.output_digest
+    ($profile:literal) => {
+        concat!("SELECT versions.summary_id, summaries.output_digest
      FROM resolution_unit_summary_versions AS versions
      JOIN resolution_unit_summaries AS summaries ON summaries.summary_id = versions.summary_id
      WHERE versions.workspace_id = ?1 AND versions.lang = ?2 AND versions.generation = ?3
-       AND versions.unit_key = ?4
+       AND versions.unit_key = ?4 AND versions.profile_digest = ", $profile, "
        AND versions.valid_from <= ?5 AND (versions.valid_until IS NULL OR ?5 < versions.valid_until)
        AND summaries.publication_state = 'complete'
-       AND summaries.producer_epoch = ?6 AND summaries.derivation_version = ?7"
+       AND summaries.producer_epoch = ?6 AND summaries.derivation_version = ?7")
     };
 }
 pub(crate) use live_summary_select;
 
 /// The child's live summary for a language with one live profile. Go uses
 /// `GO_LIVE_SUMMARY_SQL`, which adds the profile read.
-pub(crate) const LIVE_SUMMARY_SQL: &str = live_summary_select!();
+pub(crate) const LIVE_SUMMARY_SQL: &str = live_summary_select!("zeroblob(32)");
 
 /// One name in one unit's export relation: the point reader's statement.
 #[cfg(any(test, feature = "test-support"))]
@@ -286,7 +294,8 @@ pub(crate) const UNIT_DEPENDENTS_SQL: &str = "SELECT versions.unit_key
      FROM resolution_unit_summary_dependencies AS dependencies
      CROSS JOIN resolution_unit_summary_versions AS versions ON versions.summary_id = dependencies.summary_id
      WHERE dependencies.dependency_unit_key = ?1 AND versions.workspace_id = ?2
-       AND versions.lang = ?3 AND versions.generation = ?4 AND versions.valid_until IS NULL";
+       AND versions.lang = ?3 AND versions.generation = ?4 AND versions.profile_digest = ?5
+       AND versions.valid_until IS NULL";
 
 /// The graph stage's join: each member's root-reaching reference paths against
 /// the unit's own export relation. `CROSS JOIN` fixes the order members, paths,
@@ -340,20 +349,22 @@ pub(super) const DELETE_STALE_GENERATION_VERSIONS_SQL: &str =
 
 pub(super) use brokk_bifrost_core::cache_gc::DELETE_UNBOUND_SUMMARIES_SQL;
 
-const OPEN_VERSION_SQL: &str = "SELECT summary_id, valid_from FROM resolution_unit_summary_versions
+pub(crate) const OPEN_VERSION_SQL: &str =
+    "SELECT summary_id, valid_from FROM resolution_unit_summary_versions
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND unit_key = ?4
-       AND valid_until IS NULL";
-const INSERT_VERSION_SQL: &str = "INSERT INTO resolution_unit_summary_versions(workspace_id, lang, generation, unit_key, valid_from, valid_until, summary_id)
-     VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6)";
-const CLOSE_VERSION_SQL: &str = "UPDATE resolution_unit_summary_versions SET valid_until = ?5
+       AND profile_digest = ?5 AND valid_until IS NULL";
+const INSERT_VERSION_SQL: &str = "INSERT INTO resolution_unit_summary_versions(workspace_id, lang, generation, unit_key, valid_from, valid_until, summary_id, profile_digest)
+     VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)";
+pub(crate) const CLOSE_VERSION_SQL: &str =
+    "UPDATE resolution_unit_summary_versions SET valid_until = ?5
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND unit_key = ?4
-       AND valid_until IS NULL";
+       AND profile_digest = ?6 AND valid_until IS NULL";
 // An open row that this very revision opened has the empty interval [R, R), which
 // the schema rejects; it is withdrawn instead (see `rust_crates.rs`
 // `end_open_crate_version`).
-const WITHDRAW_VERSION_SQL: &str = "DELETE FROM resolution_unit_summary_versions
+pub(crate) const WITHDRAW_VERSION_SQL: &str = "DELETE FROM resolution_unit_summary_versions
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND unit_key = ?4
-       AND valid_until IS NULL AND valid_from = ?5";
+       AND profile_digest = ?6 AND valid_until IS NULL AND valid_from = ?5";
 
 const FIND_SUMMARY_SQL: &str = "SELECT summary_id,
        publication_state = 'complete'
@@ -363,20 +374,27 @@ const FIND_SUMMARY_SQL: &str = "SELECT summary_id,
      FROM resolution_unit_summaries AS summaries WHERE summary_digest = ?1";
 
 // Close every open row this pass did not rebind. A row opened by this revision
-// is withdrawn; an earlier one is closed at this revision.
-const WITHDRAW_UNSETTLED_SQL: &str = "DELETE FROM resolution_unit_summary_versions
+// is withdrawn; an earlier one is closed at this revision. Pin the profile-leading
+// open index: otherwise SQLite chooses a primary-key range over every profile
+// of the workspace, because the unit key precedes the profile in that key.
+pub(crate) const WITHDRAW_UNSETTLED_SQL: &str = "DELETE FROM resolution_unit_summary_versions
+       INDEXED BY resolution_unit_summary_versions_open
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
-       AND valid_until IS NULL AND valid_from = ?4
+       AND profile_digest = ?5 AND valid_until IS NULL AND valid_from = ?4
        AND NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS settled
                        WHERE settled.unit_key = resolution_unit_summary_versions.unit_key)";
-const CLOSE_UNSETTLED_SQL: &str = "UPDATE resolution_unit_summary_versions SET valid_until = ?4
+pub(crate) const CLOSE_UNSETTLED_SQL: &str =
+    "UPDATE resolution_unit_summary_versions INDEXED BY resolution_unit_summary_versions_open
+       SET valid_until = ?4
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
-       AND valid_until IS NULL AND valid_from < ?4
+       AND profile_digest = ?5 AND valid_until IS NULL AND valid_from < ?4
        AND NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS settled
                        WHERE settled.unit_key = resolution_unit_summary_versions.unit_key)";
-const LATER_OPEN_VERSION_SQL: &str = "SELECT EXISTS(SELECT 1 FROM resolution_unit_summary_versions
+pub(crate) const LATER_OPEN_VERSION_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM resolution_unit_summary_versions
+       INDEXED BY resolution_unit_summary_versions_open
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
-       AND valid_until IS NULL AND valid_from > ?4)";
+       AND profile_digest = ?5 AND valid_until IS NULL AND valid_from > ?4)";
 
 const STAGING_SCHEMA_SQL: &str = "
 CREATE TEMP TABLE IF NOT EXISTS unit_summary_work(unit_id INTEGER PRIMARY KEY) STRICT;
@@ -422,26 +440,24 @@ DELETE FROM temp.unit_summary_unavailable;
 DELETE FROM temp.unit_summary_fixpoint;
 DELETE FROM temp.unit_summary_order;";
 
-// One wave of Kahn's algorithm: every unit all of whose consumed units are
-// already ordered. SQLite materializes this SELECT before inserting because the
-// target table is read in it, so a wave never sees its own rows.
-const ORDER_WAVE_SQL: &str = "INSERT INTO temp.unit_summary_order(unit_id)
-     SELECT work.unit_id FROM temp.unit_summary_work AS work
-     WHERE NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS ordered WHERE ordered.unit_id = work.unit_id)
-       AND NOT EXISTS (
-         SELECT 1 FROM temp.unit_summary_edges AS edges
-         WHERE edges.unit_id = work.unit_id AND edges.dependency_unit_id <> work.unit_id
-           AND edges.orders = 1
-           AND NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS ordered
-                           WHERE ordered.unit_id = edges.dependency_unit_id))
-     ORDER BY work.unit_id";
-// Units on a dependency cycle never become ready. They are ordered last and are
-// derived without consuming each other, because a dependency that is not settled
-// is unavailable to its dependents.
-const ORDER_REMAINDER_SQL: &str = "INSERT INTO temp.unit_summary_order(unit_id)
-     SELECT work.unit_id FROM temp.unit_summary_work AS work
-     WHERE NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS ordered WHERE ordered.unit_id = work.unit_id)
-     ORDER BY work.unit_id";
+/// Use dependency-first component waves for the ordered pass. Rust's topology
+/// forcing policy is separate from this driver's consumed-only-edge retries.
+fn order_units(conn: &Connection) -> Result<()> {
+    conn.execute_batch(super::unit_schedule::SCHEMA_SQL)?;
+    conn.execute_batch(super::unit_schedule::CLEAR_SQL)?;
+    conn.execute_batch("INSERT INTO temp.unit_schedule_units SELECT unit_id FROM temp.unit_summary_work;
+        INSERT INTO temp.unit_schedule_edges SELECT unit_id,dependency_unit_id,orders FROM temp.unit_summary_edges;")?;
+    super::unit_schedule::build(conn)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO temp.unit_summary_order(unit_id) {}",
+            super::unit_schedule::ORDER_SQL
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
 // A unit that consumed a dependency as unavailable is derived again once the
 // dependency has settled, and so is every unit that consumes a unit whose output
 // moved in the previous round. Bounded by FIXPOINT_ROUNDS.
@@ -587,11 +603,27 @@ fn reconcile(
     cancellation: &CancellationToken,
     statements: &StatementCounter,
 ) -> Result<UnitSummaryReconciliation> {
+    conn.execute_batch(super::unit_schedule::SCHEMA_SQL)?;
     conn.execute_batch(STAGING_SCHEMA_SQL)?;
     let outcome = reconcile_staged(conn, snapshot, language, cancellation, statements);
     // The staging rows are this pass's working set and never outlive it.
-    language.clear_stage(conn)?;
-    conn.execute_batch(CLEAR_STAGING_SQL)?;
+    let mut cleanup_errors = Vec::new();
+    for cleanup in [
+        language.clear_stage(conn),
+        conn.execute_batch(CLEAR_STAGING_SQL)
+            .map_err(StoreError::from),
+        conn.execute_batch(super::unit_schedule::CLEAR_SQL)
+            .map_err(StoreError::from),
+    ] {
+        if let Err(error) = cleanup {
+            cleanup_errors.push(error);
+        }
+    }
+    if !cleanup_errors.is_empty() {
+        return Err(StoreError::new(format!(
+            "unit summary cleanup failed: {cleanup_errors:?}; reconciliation: {outcome:?}"
+        )));
+    }
     outcome
 }
 
@@ -604,8 +636,7 @@ fn reconcile_staged(
 ) -> Result<UnitSummaryReconciliation> {
     let mut report = UnitSummaryReconciliation::default();
     language.stage(conn, snapshot)?;
-    while conn.execute(ORDER_WAVE_SQL, [])? > 0 {}
-    conn.execute(ORDER_REMAINDER_SQL, [])?;
+    order_units(conn)?;
     report.units = conn.query_row("SELECT count(*) FROM temp.unit_summary_order", [], |row| {
         row.get::<_, usize>(0)
     })?;
@@ -851,7 +882,8 @@ fn publish_unit(
                     snapshot.generation.get(),
                     unit.unit_key.as_slice(),
                     snapshot.revision,
-                    summary_id
+                    summary_id,
+                    language.profile_digest().as_slice()
                 ],
             )?;
             rows_written += 1;
@@ -952,7 +984,8 @@ fn open_version(
                 snapshot.workspace_id.as_str(),
                 language.lang(),
                 snapshot.generation.get(),
-                unit_key.as_slice()
+                unit_key.as_slice(),
+                language.profile_digest().as_slice()
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -974,7 +1007,8 @@ fn end_open_version(
                 language.lang(),
                 snapshot.generation.get(),
                 unit_key.as_slice(),
-                snapshot.revision
+                snapshot.revision,
+                language.profile_digest().as_slice()
             ],
         )?,
         std::cmp::Ordering::Equal => conn.execute(
@@ -984,7 +1018,8 @@ fn end_open_version(
                 language.lang(),
                 snapshot.generation.get(),
                 unit_key.as_slice(),
-                snapshot.revision
+                snapshot.revision,
+                language.profile_digest().as_slice()
             ],
         )?,
         std::cmp::Ordering::Greater => {
@@ -1021,7 +1056,8 @@ fn close_unsettled(
             snapshot.workspace_id.as_str(),
             language.lang(),
             snapshot.generation.get(),
-            snapshot.revision
+            snapshot.revision,
+            language.profile_digest().as_slice()
         ],
         |row| row.get(0),
     )?;
@@ -1042,12 +1078,13 @@ fn close_unsettled(
                 snapshot.workspace_id.as_str(),
                 language.lang(),
                 snapshot.generation.get(),
-                snapshot.revision
+                snapshot.revision,
+                language.profile_digest().as_slice()
             ],
         )?;
     }
     // Unbound content-addressed headers remain reusable by another build until
-    // periodic GC, including when this pass switches a same-revision profile.
+    // periodic GC. Other profiles keep their own independent intervals.
     tx.commit()?;
     Ok(())
 }
@@ -1236,6 +1273,9 @@ fn output_digest(dependencies: &[ConsumedDependency], outputs: &UnitOutputs) -> 
     conflicts.dedup();
     for subject in conflicts {
         hash.field("conflicting-subject", subject.as_bytes());
+    }
+    if let Some(digest) = outputs.public_surface_digest {
+        hash.field("language-public-surface:v1", &digest);
     }
     hash.finish()
 }

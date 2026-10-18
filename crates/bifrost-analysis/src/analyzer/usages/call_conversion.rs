@@ -29,9 +29,9 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
 use serde::{Deserialize, Serialize};
 
-/// Identity of an external declaration proved by a language resolver.
+/// Identity of an external declaration or a scope-proven static type.
 ///
-/// This stores generic declaration evidence only. The language-specific producer owns
+/// This stores resolver evidence only. The language-specific producer owns
 /// construction and interpretation (for example, Java decides which fully-qualified
 /// names are primitive wrappers); the shared relation never infers meaning from a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,13 @@ pub struct ExternalConversionIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExternalConversionProvenance {
+    /// A complete native scope result or selected declaration supplies a static
+    /// type term without claiming that an external class has been indexed.
+    #[cfg(any(test, feature = "test-support"))]
+    NativeStaticType {
+        term: TypeRef,
+        scope_identity: StableDigest,
+    },
     SourceJar {
         artifact_path: std::path::PathBuf,
         source_path: String,
@@ -144,6 +151,15 @@ impl ExternalConversionIdentity {
             None => digest.push(b"no-active-model-set"),
         }
         match &self.provenance {
+            #[cfg(any(test, feature = "test-support"))]
+            ExternalConversionProvenance::NativeStaticType {
+                term,
+                scope_identity,
+            } => {
+                digest.push(b"native-static-type");
+                digest.push(scope_identity.as_bytes());
+                digest.push(&serde_json::to_vec(term).expect("structured static type serializes"));
+            }
             ExternalConversionProvenance::SourceJar {
                 artifact_path,
                 source_path,
@@ -220,6 +236,20 @@ pub(crate) trait CallArgumentConversionProver: Send + Sync {
         _formal_type: &TypeRef,
     ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
         Err(ConversionUnknown::UnsupportedConversion)
+    }
+
+    /// A language with phased invocation rules selects its overload and supplies
+    /// the corresponding actual-to-formal type layout. The shared consumer
+    /// retains AST extraction, binding joins and conversion fact publication.
+    fn select_model_invocation(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _actuals: &[tree_sitter::Node<'_>],
+        _source: &str,
+        _signatures: &[Signature],
+    ) -> Option<Result<(usize, Vec<TypeRef>), ConversionUnknown>> {
+        None
     }
 
     /// An unsupported conversion is not a proof that an overload is inapplicable.
@@ -985,6 +1015,18 @@ impl CallConversionCache {
             written.push(actual);
         }
 
+        if let Some(selected) = prover.select_model_invocation(
+            analyzer,
+            &shape.outcome.file,
+            &written,
+            &source.source,
+            &candidates
+                .iter()
+                .map(|(_, signature)| signature.clone())
+                .collect::<Vec<_>>(),
+        ) {
+            return selected.map(|(index, _)| Some(candidates[index].clone()));
+        }
         let mut applicable = Vec::new();
         let mut failures = Vec::new();
         let application = SemanticModelCallApplication::positional(
@@ -1110,6 +1152,27 @@ impl CallConversionCache {
         let source = self
             .source(analyzer, &report.file)
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+        let invocation_formals = if signature.parameters.iter().any(|formal| formal.variadic) {
+            let actuals = report
+                .rows
+                .iter()
+                .filter(|row| is_explicit_conversion_row(row))
+                .map(|row| exact_argument_expression(&source, row))
+                .collect::<Result<Vec<_>, _>>()?;
+            match prover.select_model_invocation(
+                analyzer,
+                &report.file,
+                &actuals,
+                &source.source,
+                std::slice::from_ref(signature),
+            ) {
+                Some(result) => Some(result?.1),
+                None => return Err(ConversionUnknown::UnsupportedConversion),
+            }
+        } else {
+            None
+        };
+        let mut actual_ordinal = 0;
         let mut proofs = Vec::new();
         for (index, row) in report.rows.iter().enumerate() {
             if !is_explicit_conversion_row(row) {
@@ -1121,18 +1184,22 @@ impl CallConversionCache {
                     .parameters
                     .get(formal_index)
                     .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-                if formal.variadic {
-                    return Err(ConversionUnknown::UnsupportedConversion);
-                }
+                let formal_type = match &invocation_formals {
+                    Some(formals) => formals
+                        .get(actual_ordinal)
+                        .ok_or(ConversionUnknown::UnresolvedTargetType)?,
+                    None => &formal.r#type,
+                };
                 let actual = exact_argument_expression(&source, row)?;
                 prover.prove_model_argument(
                     analyzer,
                     &report.file,
                     actual,
                     &source.source,
-                    &formal.r#type,
+                    formal_type,
                 )
             })();
+            actual_ordinal += 1;
             proofs.push((index, proof));
         }
         if proofs.iter().any(|(_, proof)| proof.is_err())

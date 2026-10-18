@@ -26,7 +26,7 @@ impl AnalyzerStore {
         };
         let enumerated_types = types
             .iter()
-            .filter(|owner| shard.independently_enumerates_jvm_owner(owner))
+            .filter(|owner| shard.admits_jvm_owner_declaration(owner))
             .collect::<Vec<_>>();
         self.publish_jvm_external_inventory_facts(
             shard.manifest.semantic_sha256.clone(),
@@ -177,4 +177,27 @@ fn enum_label<T: serde::Serialize>(value: &T) -> Result<String> {
         .as_str()
         .expect("inventory enum vocabulary is a string")
         .to_owned())
+}
+
+impl AnalyzerStore {
+    /// Read the full structured result of the exact selected declaration.
+    /// Overload selection belongs to the caller; this point lookup never
+    /// chooses a member by name or treats a summary as a declaration.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn selected_external_member_return_type(
+        &self,
+        member: &crate::analyzer::resolution::ExternalMemberIdentity,
+    ) -> Result<Option<TypeRef>> {
+        use rusqlite::OptionalExtension;
+        let provider = member.owner.provider_id.to_string();
+        let owner = member.owner.owner_fqn.to_string();
+        let ordinal = member.ordinal;
+        self.conn.execute(move |connection| {
+            let encoded: Option<Option<String>> = connection.query_row(
+                "SELECT json(return_type_jsonb) FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3 AND signature_present=1",
+                params![provider, owner, ordinal], |row| row.get(0),
+            ).optional()?;
+            encoded.flatten().map(|value| serde_json::from_str(&value).map_err(|error| StoreError::new(error.to_string()))).transpose()
+        })
+    }
 }

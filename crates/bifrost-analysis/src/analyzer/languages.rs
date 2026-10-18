@@ -332,6 +332,41 @@ pub(crate) struct NativeMemberAttribution {
 }
 
 pub(crate) trait LanguageSupport: Send + Sync {
+    /// Whether source provenance proves a complete discovery horizon. This
+    /// limits source-half lookup, never declaration visibility or root closure.
+    fn root_source_horizon(
+        &self,
+        _source: Option<crate::analyzer::resolution::SelectedResolutionMountOrdinal>,
+        _has_transient_sources: bool,
+    ) -> crate::analyzer::store::resolution_operation::RootSourceHorizon {
+        crate::analyzer::store::resolution_operation::RootSourceHorizon::Universal
+    }
+
+    /// Prove that workspace writes and escapes cannot replace a module member.
+    /// None means the bounded query did not complete or has no language proof.
+    fn workspace_module_member_mutation_free(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _module: &str,
+        _member: &str,
+        _max_nodes: usize,
+        _keep_going: &dyn Fn() -> bool,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Promote the exact static operand type names for one numeric expression.
+    /// Names come from selected type descriptors, never source-text parsing.
+    fn numeric_promotion(&self, _operands: &[Option<&str>]) -> Option<&'static str> {
+        None
+    }
+
+    /// Select an operand whose static type proves string concatenation.
+    /// Other operands need not have known types once this witness exists.
+    fn string_concatenation_operand(&self, _operands: &[Option<&str>]) -> Option<usize> {
+        None
+    }
+
     /// Interpret only the selected route; an absent route never acquires an owner.
     fn native_member_attribution(
         &self,
@@ -347,6 +382,12 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// Whether an invocation may apply a value selected by lexical or member
     /// binding. The declared value type must still prove call applicability.
     fn call_may_apply_value(&self) -> bool {
+        false
+    }
+
+    /// Invocation validity cannot change a callable's written result type.
+    /// Binding and result projection retain every other kind of uncertainty.
+    fn callable_result_is_applicability_independent(&self) -> bool {
         false
     }
 
@@ -570,7 +611,11 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// Use the same constructor as the storage adapter's path module projection.
     /// Such a module has no declaration token and navigates to file start;
     /// source-declared modules use their ordinary declaration name ranges.
-    fn path_synthetic_module_unit(&self, _file: &ProjectFile) -> Option<CodeUnit> {
+    fn path_synthetic_module_unit(
+        &self,
+        _project: &dyn crate::analyzer::Project,
+        _file: &ProjectFile,
+    ) -> Option<CodeUnit> {
         None
     }
 
@@ -2191,7 +2236,7 @@ mod tests {
     const CAPABILITY_MATRIX: &str = "\
 language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow
 Java       | Jvm                  | Java   | legacy | .   | yes      | Java   | -    | -     | yes | -
-Go         | Go                   | Go     | native | /   | yes      | Go     | yes  | -     | yes | -
+Go         | Go                   | Go     | legacy | /   | yes      | Go     | yes  | -     | yes | -
 Cpp        | Cpp                  | Cpp    | legacy | ::  | -        | Cpp    | yes  | -     | yes | -
 JavaScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes
 TypeScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes

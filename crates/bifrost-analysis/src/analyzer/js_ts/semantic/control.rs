@@ -3069,7 +3069,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let binding_ranges = self
             .lexical_bindings
-            .binding_identifier_ranges_at(name, parameter.start_byte());
+            .binding_identifier_ranges_for_binder(name, parameter);
         let Some(binding) = binding_ranges.into_iter().find(|range| {
             range.start_byte == parameter.start_byte() && range.end_byte == parameter.end_byte()
         }) else {
@@ -3084,8 +3084,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .or_default()
             .push(LocalBinding {
                 binding,
-                scope_start: handler.start_byte(),
-                scope_end: handler.end_byte(),
+                scope: self
+                    .lexical_bindings
+                    .binding_scope_for_binder(parameter)
+                    .expect("exact catch binder has a lexical environment"),
                 value,
             });
         Ok(Some(value))

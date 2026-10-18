@@ -53,7 +53,7 @@ use std::sync::Arc;
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v46";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v47";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -110,7 +110,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer<'_> {
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let import_binder = PythonSource::import_binder_of(self.analyzer, file);
         let (
-            specs,
+            mut specs,
             module_bindings,
             module_has_wildcard_import,
             class_names,
@@ -153,6 +153,13 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer<'_> {
             }
         };
 
+        crate::profiling::note_with(|| {
+            format!(
+                "python.semantic.work file={:?} phase=inventory nested={}",
+                file.rel_path(),
+                initial_work.nested_entries,
+            )
+        });
         // Value mappings carry the structural identity of their own source
         // occurrence, so a query anchored on an ordinary structural row can
         // reach the executable value there. Without the index the lowering is
@@ -165,6 +172,12 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer<'_> {
             cancellation,
         )? {
             StructuralNodeIndexOutcome::Complete { index, work_items } => {
+                crate::profiling::note_with(|| {
+                    format!(
+                        "python.semantic.work file={:?} phase=structural_index nested={work_items}",
+                        file.rel_path(),
+                    )
+                });
                 initial_work = initial_work.conservative_add(SemanticWork {
                     nested_entries: work_items,
                     ..SemanticWork::default()
@@ -186,7 +199,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer<'_> {
         // initialize only after a procedure passes its existing admission work.
         let proven_instance_fields = OnceCell::new();
         lower_procedure_batch(
-            &specs,
+            &mut specs,
             initial_work,
             budget,
             cancellation,
@@ -235,6 +248,7 @@ struct ProcedureSpec<'tree> {
     kind: ProcedureKind,
     properties: ProcedureProperties,
     mutable_captures: HashSet<Box<str>>,
+    source_range_holes: Vec<SourceSpan>,
 }
 
 struct PythonProcedureInventory<'tree> {
@@ -306,9 +320,10 @@ fn enumerate_procedures<'tree>(
     let root = prepared.tree().root_node();
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "python-source", budget)?;
-    let mut specs = Vec::new();
+    let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
     let mut module_bindings: HashMap<Box<str>, PythonModuleBinding<'tree>> = HashMap::default();
     let mut module_wildcard_import = false;
+    let mut module_binding_steps = 0usize;
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
@@ -331,6 +346,7 @@ fn enumerate_procedures<'tree>(
             let mut binding_scan_exceeded = None;
             let bindings =
                 python_direct_scope_bindings_bounded(frame.node, prepared.source(), || {
+                    module_binding_steps += 1;
                     if cancellation.is_cancelled() {
                         binding_scan_cancelled = true;
                         return false;
@@ -396,6 +412,31 @@ fn enumerate_procedures<'tree>(
             }
         }
 
+        // The inventory already visits declarations to allocate their own
+        // procedures. Record ownership holes here without another tree walk.
+        if is_nested_execution_boundary(frame.node)
+            && let Some(body) = frame.node.child_by_field_name("body")
+            && let Some(owner) = frame.lexical_parent.or_else(|| {
+                specs
+                    .first()
+                    .filter(|spec| spec.kind == ProcedureKind::Initializer)
+                    .map(|spec| spec.id)
+            })
+        {
+            let hole = source_anchor(body, 0)
+                .map_err(SemanticProviderError::invalid_identity)?
+                .span();
+            let holes = &mut specs[owner.index()].source_range_holes;
+            // Preorder discovery makes nested bodies follow their containing
+            // hole. Retain only the outermost excluded body.
+            if !holes.last().is_some_and(|previous| {
+                previous.start_byte() <= hole.start_byte() && hole.end_byte() <= previous.end_byte()
+            }) {
+                // This vector moves into lowering, where retained entries are
+                // charged once alongside the rest of the procedure's rows.
+                holes.push(hole);
+            }
+        }
         let child_path = frame.declaration_path;
         let mut container_body_scope = None;
         if let Some(segment_kind) = declaration_container_kind(frame.node) {
@@ -438,8 +479,11 @@ fn enumerate_procedures<'tree>(
                 kind,
                 properties,
                 mutable_captures: HashSet::default(),
+                source_range_holes: Vec::new(),
             });
-            callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
+            if kind != ProcedureKind::Initializer {
+                callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
+            }
         }
 
         if frame.node.kind() == "nonlocal_statement"
@@ -569,6 +613,12 @@ fn enumerate_procedures<'tree>(
             Some((class.id(), spec.id))
         })
         .collect();
+    crate::profiling::note_with(|| {
+        format!(
+            "python.semantic.work file={:?} phase=inventory_bindings nested={module_binding_steps}",
+            file.rel_path(),
+        )
+    });
     Ok(inventory.complete(PythonProcedureInventory {
         specs,
         module_bindings,
@@ -783,6 +833,9 @@ fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> 
 use crate::analyzer::common::declaration_container_name;
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    if node.kind() == "module" {
+        return Some(FILE_INITIALIZER_SEGMENT_NAME.into());
+    }
     crate::analyzer::semantic::lowering::callable_name_with_binding(source, node, || {
         enclosing_binding_name(source, node)
     })
@@ -821,6 +874,32 @@ fn callable_shape<'tree>(
     Node<'tree>,
     ProcedureProperties,
 )> {
+    if node.kind() == "module" {
+        let has_statements = named_children(node).into_iter().any(|statement| {
+            let statement = if statement.kind() == "decorated_definition" {
+                statement
+                    .child_by_field_name("definition")
+                    .unwrap_or(statement)
+            } else {
+                statement
+            };
+            !matches!(
+                statement.kind(),
+                "comment" | "function_definition" | "class_definition"
+            )
+        });
+        return has_statements.then_some((
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node,
+            ProcedureProperties {
+                is_static: true,
+                is_synthetic: true,
+                invocation: ProcedureInvocationKind::Immediate,
+                ..ProcedureProperties::default()
+            },
+        ));
+    }
     let (kind, segment_kind, body) = match node.kind() {
         "function_definition" => {
             let kind = python_function_kind(node, lexical_parent);
@@ -1012,7 +1091,7 @@ fn body_contains_yield(body: Node<'_>) -> bool {
 fn body_observes_locals_dynamically(source: &str, body: Node<'_>) -> bool {
     let mut stack = vec![body];
     while let Some(node) = stack.pop() {
-        if node != body && is_callable_kind(node.kind()) {
+        if node != body && is_nested_execution_boundary(node) {
             continue;
         }
         if node.kind() == "call"
@@ -1159,7 +1238,7 @@ fn lower_procedure<'tree, 'targets>(
     analyzer: &'targets PythonAnalyzer,
     file: &'targets ProjectFile,
     prepared: &'tree PreparedSyntaxTree,
-    spec: &ProcedureSpec<'tree>,
+    spec: &mut ProcedureSpec<'tree>,
     module_bindings: &'targets HashMap<Box<str>, PythonModuleBinding<'tree>>,
     module_has_wildcard_import: bool,
     class_names: &'targets HashSet<Box<str>>,
@@ -1181,6 +1260,7 @@ fn lower_procedure<'tree, 'targets>(
     );
     parts.lexical_parent = spec.lexical_parent;
     parts.properties = spec.properties;
+    parts.source_range_holes = std::mem::take(&mut spec.source_range_holes);
     let ProcedureLoweringStart {
         mut builder,
         session,
@@ -1189,25 +1269,45 @@ fn lower_procedure<'tree, 'targets>(
         exceptional_exit,
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
+    report_python_procedure_work(
+        file,
+        spec,
+        "start",
+        builder.prospective_work().nested_entries,
+    );
     // Inventories contain syntax nodes from this prepared file. Own them for
     // this batch only, and charge the real walk once rather than rebuilding
     // an enclosing scope for every name in every nested callable.
     let mut current = Some(spec.callable);
     while let Some(node) = current {
         charge_python_binding_step(&mut builder, cancellation)?;
-        if matches!(node.kind(), "function_definition" | "lambda")
+        if (matches!(node.kind(), "function_definition" | "lambda")
+            || node == spec.callable && node.kind() == "module")
             && let std::collections::hash_map::Entry::Vacant(entry) =
                 binding_inventories.entry(node.id())
         {
+            let before = builder.prospective_work().nested_entries;
             entry.insert(collect_semantic_binding_inventory(
                 node,
                 prepared.source(),
                 &mut builder,
                 cancellation,
             )?);
+            report_python_procedure_work(
+                file,
+                spec,
+                "binding_collection",
+                builder.prospective_work().nested_entries - before,
+            );
         }
         current = node.parent();
     }
+    report_python_procedure_work(
+        file,
+        spec,
+        "bindings_end",
+        builder.prospective_work().nested_entries,
+    );
     let bindings = binding_inventories
         .get(&spec.callable.id())
         .expect("the callable inventory was prepared before lowering");
@@ -1285,6 +1385,12 @@ fn lower_procedure<'tree, 'targets>(
     context.known_binding_escapes_after = escapes_after;
     context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_local_bindings(&mut builder)?;
+    report_python_procedure_work(
+        file,
+        spec,
+        "inputs_end",
+        builder.prospective_work().nested_entries,
+    );
 
     if spec.properties.is_async {
         context.session.record_gap(
@@ -1331,7 +1437,14 @@ fn lower_procedure<'tree, 'targets>(
         .session
         .add_node_point(&mut builder, spec.body, Vec::new())?;
     let mut fallthrough_return = None;
-    let body_work = if spec.body.kind() == "block" {
+    let body_work = if spec.body.kind() == "module" {
+        Work::Statement {
+            node: spec.body,
+            entry: body_entry,
+            next: EdgeTarget::normal(normal_exit),
+            scope: function_scope,
+        }
+    } else if spec.body.kind() == "block" {
         // Only falling off the body returns this None. Explicit returns resolve
         // to normal_exit directly and must never acquire a default alternative.
         let fallthrough = context
@@ -1394,6 +1507,12 @@ fn lower_procedure<'tree, 'targets>(
         context.call_argument_materializations.is_empty(),
         "every aggregate call argument is lowered through its literal expression"
     );
+    report_python_procedure_work(
+        file,
+        spec,
+        "body_end",
+        builder.prospective_work().nested_entries,
+    );
     let reachable = builder
         .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
         .map_err(|_| ProcedureLoweringError::Cancelled(Box::new(builder.prospective_work())))?;
@@ -1403,9 +1522,27 @@ fn lower_procedure<'tree, 'targets>(
         context.publish_none_return(&mut builder, fallthrough)?;
     }
     let work_before_freeze = builder.prospective_work();
-    builder
+    let (parts, work) = builder
         .finish_with_work()
-        .map_err(|error| ProcedureLoweringError::Budget(error, Box::new(work_before_freeze)))
+        .map_err(|error| ProcedureLoweringError::Budget(error, Box::new(work_before_freeze)))?;
+    report_python_procedure_work(file, spec, "finish", work.nested_entries);
+    Ok((parts, work))
+}
+
+fn report_python_procedure_work(
+    file: &ProjectFile,
+    spec: &ProcedureSpec<'_>,
+    phase: &str,
+    nested: usize,
+) {
+    crate::profiling::note_with(|| {
+        format!(
+            "python.semantic.work file={:?} procedure={} kind={:?} phase={phase} nested={nested}",
+            file.rel_path(),
+            spec.id.index(),
+            spec.kind,
+        )
+    });
 }
 
 struct HeapBindingProofs {
@@ -3388,7 +3525,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return None;
         }
         let range = facts.initializer_range(name)?;
-        let module = python_module_name(self.file);
+        let module = python_module_name(self.analyzer.inner.adapter().project(), self.file);
         if !self.analyzer.cached_module_member_mutation_free(&module, name, || {
             crate::analyzer::semantic::workspace_oracle::python_workspace_module_member_mutation_free(
                 self.analyzer,
@@ -8901,13 +9038,8 @@ fn is_plain_binding(kind: &str) -> bool {
     matches!(kind, "identifier" | "keyword_identifier")
 }
 
-fn is_callable_kind(kind: &str) -> bool {
-    matches!(kind, "function_definition" | "lambda")
-}
-
-/// Procedure syntax roles for the Python lowering. Python has no module
-/// procedure, so assessment covers function and lambda bodies. Only `while`
-/// is a conditional loop; `for` iterates.
+/// Procedure syntax roles for Python function, lambda, and module bodies.
+/// Only `while` is a conditional loop; `for` iterates.
 pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
     crate::analyzer::languages::ProcedureSyntaxRoles {
         statement_kind: python_statement_kind,

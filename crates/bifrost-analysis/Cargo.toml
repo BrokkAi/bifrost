@@ -111,6 +111,7 @@ test-support = [
 ]
 
 [dev-dependencies]
+syn = { version = "2", features = ["extra-traits", "full", "visit"] }
 proptest = "1.11"
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
 # Cargo unifies this with the plain `[dependencies]` entry above for this

@@ -95,7 +95,11 @@ fn resolve_module(
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
-    let resolved_module = resolve_python_module_specifier(importing_file, module_specifier);
+    let Some(project) = module_spellings.project() else {
+        return Vec::new();
+    };
+    let resolved_module =
+        resolve_python_module_specifier(project, importing_file, module_specifier);
     let Some(resolved_module) = resolved_module else {
         return Vec::new();
     };
@@ -105,7 +109,7 @@ fn resolve_module(
         .unwrap_or_default();
     // Two sibling source roots can index the same module name, so the root
     // that owns the importing file decides which of them its import means.
-    retain_modules_for_importer(importing_file, &mut files, |file| file);
+    retain_modules_for_importer(project, importing_file, &mut files, |file| file);
     if files.is_empty() {
         // No module name in the index spells the specifier, because it is
         // written against a source root the workspace does not state (#3506).
@@ -167,7 +171,7 @@ impl PythonUsageIndex {
                         .find(|unit| unit.is_module())
                 })
                 .map(|unit| unit.fq_name().to_string())
-                .unwrap_or_else(|| python_module_name(file));
+                .unwrap_or_else(|| python_module_name(python.project(), file));
             module_index
                 .entry(module_name.clone())
                 .or_default()

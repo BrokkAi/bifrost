@@ -948,6 +948,7 @@ impl<'a> GoHierarchyBuilder<'a> {
         enum Part<'a> {
             Type(GoSourceTypeId),
             Text(&'a str),
+            Owned(String),
         }
         let mut pending = vec![Part::Type(id)];
         let mut output = String::new();
@@ -955,6 +956,10 @@ impl<'a> GoHierarchyBuilder<'a> {
             let current = match part {
                 Part::Text(text) => {
                     output.push_str(text);
+                    continue;
+                }
+                Part::Owned(text) => {
+                    output.push_str(&text);
                     continue;
                 }
                 Part::Type(current) => current,
@@ -1068,8 +1073,32 @@ impl<'a> GoHierarchyBuilder<'a> {
                     output.push('~');
                     pending.push(Part::Type(*inner));
                 }
+                GoSourceTypeShape::Struct { .. } => {
+                    output.push_str("struct{");
+                    pending.push(Part::Text("}"));
+                    for field in file
+                        .facts
+                        .facts
+                        .fields
+                        .iter()
+                        .filter(|field| field.owner == current)
+                        .rev()
+                    {
+                        let tag = field.tag.as_ref()?;
+                        pending.push(Part::Owned(format!("tag{tag:?};")));
+                        pending.push(Part::Type(field.ty?));
+                        let package = if go_identifier_is_exported(&field.name) {
+                            ""
+                        } else {
+                            &file.package_name
+                        };
+                        pending.push(Part::Owned(format!(
+                            "field({package:?},{:?},{})",
+                            field.name, field.embedded
+                        )));
+                    }
+                }
                 GoSourceTypeShape::ImplicitArray { text, .. }
-                | GoSourceTypeShape::Struct { text }
                 | GoSourceTypeShape::Interface { text, .. }
                 | GoSourceTypeShape::Opaque { text } => output.push_str(text.as_deref()?),
             }

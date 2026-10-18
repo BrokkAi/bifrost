@@ -1,4 +1,49 @@
-use tree_sitter::Node;
+use tree_sitter::{Node, TreeCursor};
+
+/// Direct tuple-field types and their optional preceding visibility modifiers.
+/// Other named children, including grouped attributes, are not fields.
+pub(crate) struct RustPositionalFields<'tree> {
+    cursor: TreeCursor<'tree>,
+    pending_visibility: Option<Node<'tree>>,
+    finished: bool,
+}
+
+/// Iterate only AST `type` fields in an ordered positional field list.
+pub(crate) fn rust_positional_fields(body: Node<'_>) -> RustPositionalFields<'_> {
+    assert_eq!(body.kind(), "ordered_field_declaration_list");
+    let mut cursor = body.walk();
+    let finished = !cursor.goto_first_child();
+    RustPositionalFields {
+        cursor,
+        pending_visibility: None,
+        finished,
+    }
+}
+
+impl<'tree> Iterator for RustPositionalFields<'tree> {
+    type Item = (Node<'tree>, Option<Node<'tree>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.finished {
+            let child = self.cursor.node();
+            let field_name = self.cursor.field_name();
+            if child.kind() == "visibility_modifier" {
+                self.pending_visibility = Some(child);
+            } else if field_name == Some("type") {
+                assert!(child.is_named());
+                let visibility = self.pending_visibility.take();
+                if !self.cursor.goto_next_sibling() {
+                    self.finished = true;
+                }
+                return Some((child, visibility));
+            }
+            if !self.cursor.goto_next_sibling() {
+                self.finished = true;
+            }
+        }
+        None
+    }
+}
 
 /// Node kinds the grammar uses to attach outer attributes to an item or
 /// expression. The payload is under a field, while the attributes themselves
@@ -240,6 +285,28 @@ mod tests {
         let body = module.child_by_field_name("body").expect("module body");
         let function = body.named_child(0).expect("function");
         assert_eq!(attribute_paths(function, source), ["inner"]);
+    }
+
+    #[test]
+    #[hardwon("#5133: grouped tuple-field attributes were counted as phantom native fields")]
+    fn positional_fields_select_only_direct_type_fields_after_grouped_attributes() {
+        let source = "struct S(#[first] pub u8, #[second] #[third] u16);";
+        let tree = parse(source);
+        let body = named_descendant(tree.root_node(), "ordered_field_declaration_list");
+        let fields = rust_positional_fields(body)
+            .enumerate()
+            .map(|(ordinal, (ty, visibility))| {
+                (ordinal, ty.kind(), visibility.map(|node| node.kind()))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            fields,
+            [
+                (0, "primitive_type", Some("visibility_modifier")),
+                (1, "primitive_type", None),
+            ]
+        );
     }
 
     #[test]

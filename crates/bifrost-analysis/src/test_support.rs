@@ -1157,6 +1157,14 @@ pub(crate) fn commit_all(repo: &git2::Repository, message: &str) -> git2::Oid {
     shared_git::commit_all_with_deletions(repo, message, &signature)
 }
 
+/// Inspect persisted rows without changing an ephemeral fixture into a disk-backed one.
+#[cfg(any(test, feature = "test-support"))]
+pub fn store_read_connection(
+    store: &crate::analyzer::store::AnalyzerStore,
+) -> impl std::ops::Deref<Target = rusqlite::Connection> + '_ {
+    store.read_conn().expect("open the analyzer store reader")
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn cache_row_count(root: &Path, table: &str) -> i64 {
     let connection = rusqlite::Connection::open(crate::analyzer::store::analyzer_db_path(root))

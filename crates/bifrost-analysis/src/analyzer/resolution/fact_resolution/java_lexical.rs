@@ -589,7 +589,8 @@ impl JavaLexicalReplay {
             inherited.cancel(evaluation);
         }
         if let Some(active) = self.active {
-            let (answers, completion, metrics) = active.cancel().into_parts();
+            let (answers, completion, metrics) =
+                active.cancel(&evaluation.candidate_paths).into_parts();
             evaluation.binding_metrics.accumulate(metrics);
             evaluation.observe_cancellation_completion(&completion);
             for answer in answers.into_vec() {
@@ -654,16 +655,19 @@ impl JavaLexicalReplay {
             // no member of that name (`language_implicit_root_member_names`).
             // The raw hierarchy branch is then retired without a replacement.
             // A lookup that finds no owner is absent from the indexed
-            // ancestry. The shared shape-specific closure searches every
-            // indexed parent alternative for this lookup, including plural
-            // edges. Unknown parents leave it open. Only a resolved answer
-            // can become complete this way:
+            // ancestry only when every authored edge and member inventory is
+            // complete. The language-defined implicit root may stay unindexed
+            // for a lookup outside its member-name table. Unknown authored
+            // parents remain open. Only a resolved answer can become complete:
             // a lookup nothing answers still reaches the compilation unit's
             // placement boundary, so it keeps this reason conservatively and
             // is not re-evaluated. A selected declaration in any namespace
             // must keep its hierarchy branch until the member bridges below
             // are added; otherwise an inherited field can lose to an enclosing
             // class's declaration (JLS 6.4.1).
+            // Reuse the published shape proof. Raw reference residuals may
+            // retain structural gaps already transferred by indexed lookup;
+            // the shared closure still rejects unindexed authored parents.
             if self.resolved
                 && selected.owners.is_empty()
                 && evaluation.hierarchy.hierarchy_closed(*shape, *owner)
@@ -798,6 +802,7 @@ impl JavaLexicalReplay {
         match self.active.as_mut().unwrap().poll(
             &engine,
             None,
+            &mut evaluation.candidate_paths,
             evaluation.cancellation,
             readiness,
         )? {

@@ -33,12 +33,13 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionDeclaredTypeRelationKind, ResolutionDeferredMemberOwnerFact,
     ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind, ResolutionGapFact,
     ResolutionGapKind, ResolutionGoPackageImportFact, ResolutionGoPackageImportKind,
-    ResolutionIdentifierRole, ResolutionMemberAccess, ResolutionMemberKind,
-    ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility, ResolutionNameId,
-    ResolutionNamespace, ResolutionPackageMemberFact, ResolutionReferenceOwnerFact,
-    ResolutionRootExportFact, ResolutionRootImportAnchor, ResolutionRootImportDemandTarget,
-    ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
-    ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
+    ResolutionIdentifierRole, ResolutionLocalWriteFact, ResolutionMemberAccess,
+    ResolutionMemberKind, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
+    ResolutionNameId, ResolutionNamespace, ResolutionPackageMemberFact,
+    ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
+    ResolutionRootImportDemandTarget, ResolutionRootImportDemandTargetFact,
+    ResolutionRootImportFact, ResolutionRootImportKind, ResolutionRootImportKindFact,
+    ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
     ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
     ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
     ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
@@ -752,7 +753,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                         ResolutionGapKind::MalformedSyntax,
                     );
                 };
-                self.lower_expression(operand);
+                self.publish_local_write(operand, None);
                 let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
                 self.add_gap(site, ResolutionGapKind::UnsupportedExpressionType);
                 TreeWalkAction::Skip
@@ -950,7 +951,22 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             qualifier: None,
         });
         let output = self.add_slot(declaration, ResolutionTypeSlotRole::TargetTypeIdentity);
-        self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
+        self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+            output,
+            name,
+            kind: IntrinsicTypeKind::Structural,
+            indirection: 0,
+        });
+        let source_declaration = self.declare_node(node, None);
+        self.declaration_sources
+            .push((declaration, source_declaration));
+        self.facts
+            .declaration_type_slots
+            .push(DeclarationTypeSlotFact {
+                declaration,
+                slot: output,
+                role: DeclarationTypeRole::Identity,
+            });
         let syntax = LoweredTypeSyntax {
             input: output,
             indirection_delta: 0,
@@ -1022,7 +1038,14 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
         if let Some(alias) = alias {
             let case_type = (types.len() == 1).then_some(types[0]);
-            self.add_clause_binder(alias, alias, scope, node.start_byte(), case_type);
+            if let Some(declaration) =
+                self.add_clause_binder(alias, alias, scope, node.start_byte(), case_type)
+            {
+                let input = self.attach_unknown_clause_initializer(declaration, node);
+                if case_type.is_none() {
+                    self.attach_initializer_type(declaration, input);
+                }
+            }
         }
         TreeWalkAction::DescendWithExit
     }
@@ -1031,8 +1054,12 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         let alias = self.type_switch_alias(node);
         let scope_start = alias.map_or(node.start_byte(), |alias| alias.start_byte());
         let scope = self.push_block_scope_from(node, scope_start);
-        if let Some(alias) = alias {
-            self.add_clause_binder(alias, alias, scope, node.start_byte(), None);
+        if let Some(alias) = alias
+            && let Some(declaration) =
+                self.add_clause_binder(alias, alias, scope, node.start_byte(), None)
+        {
+            let input = self.attach_unknown_clause_initializer(declaration, node);
+            self.attach_initializer_type(declaration, input);
         }
         TreeWalkAction::DescendWithExit
     }
@@ -1072,7 +1099,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     });
                     if short_declaration {
                         for name in bindings {
-                            self.add_clause_binder(
+                            let _declaration = self.add_clause_binder(
                                 communication,
                                 name,
                                 scope,
@@ -1082,7 +1109,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                         }
                     } else {
                         for target in bindings {
-                            self.lower_expression(target);
+                            self.publish_local_write(target, None);
                         }
                     }
                 }
@@ -1110,7 +1137,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         scope: ResolutionScopeId,
         activation_start: usize,
         declared_type: Option<Node<'tree>>,
-    ) {
+    ) -> Option<ResolutionSiteId> {
         if name.kind() != "identifier" || !is_spelled_identifier(name) {
             let site = self.add_site_in_scope(
                 declaration_node,
@@ -1125,12 +1152,12 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     ResolutionGapKind::UnsupportedScopeOrBinder
                 },
             );
-            return;
+            return None;
         }
         if go_node_text(name, self.source).trim() == "_" {
-            return;
+            return None;
         }
-        let Some(declaration) = self.add_declaration_identifier_site(
+        let declaration = self.add_declaration_identifier_site(
             declaration_node,
             name,
             ResolutionSiteKind::ValueDeclaration,
@@ -1138,9 +1165,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             ResolutionIdentifierRole::Declaration,
             ResolutionNamespace::Value,
             None,
-        ) else {
-            return;
-        };
+        )?;
         self.mark_lexical_declaration(declaration, DeclarationKind::LocalVariable);
         let scope_fact = *self.scope(scope);
         self.facts.binders.push(ResolutionBinderFact {
@@ -1157,6 +1182,26 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             self.add_gap(declaration, ResolutionGapKind::InferredType);
         }
         self.record_value_name(scope, name);
+        Some(declaration)
+    }
+
+    fn attach_unknown_clause_initializer(
+        &mut self,
+        declaration: ResolutionSiteId,
+        clause: Node<'tree>,
+    ) -> ResolutionTypeSlotId {
+        let unknown_site = self.add_site(clause, ResolutionSiteKind::UnsupportedExpression);
+        self.add_gap(unknown_site, ResolutionGapKind::UnsupportedExpressionType);
+        let input = self.add_slot(unknown_site, ResolutionTypeSlotRole::ExpressionValue);
+        let observed = self.add_slot(declaration, ResolutionTypeSlotRole::AssignmentValue);
+        self.add_transfer(
+            input,
+            observed,
+            ResolutionTypeTransferKind::Assignment,
+            0,
+            ResolutionTypeTransferValueTransform::ToRuntime { addressable: true },
+        );
+        input
     }
 
     pub(crate) fn exit(&mut self) {
@@ -2057,8 +2102,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             });
         let is_method = node.kind() == "method_declaration";
         if is_method {
-            // Owner identity is deferred correctly below. Pointer/addressable
-            // method-set applicability remains deliberately open.
+            // Owner identity is deferred below. The binding engine refines
+            // this obligation using receiver pointer depth and addressability;
+            // it does not constrain the method's declared result types.
             self.add_gap(declaration, ResolutionGapKind::UnsupportedCallApplicability);
         } else {
             let scope = *self.scope(binding_scope);
@@ -3094,7 +3140,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .any(|index| node.child(index).is_some_and(|child| child.kind() == ":="));
         if !short_declaration {
             for target in left {
-                self.lower_expression(target);
+                self.publish_local_write(target, None);
             }
             return;
         }
@@ -3131,22 +3177,24 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 activation_start: node.end_byte(),
                 activation_end: scope.end_byte,
             });
-            let output = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
-            self.facts
-                .declaration_type_slots
-                .push(DeclarationTypeSlotFact {
-                    declaration,
-                    slot: output,
-                    role: DeclarationTypeRole::Value,
-                });
+            let component = self.add_slot(declaration, ResolutionTypeSlotRole::ExpressionValue);
             self.add_transfer(
                 self.expression_slot(right),
-                output,
+                component,
                 if index == 0 {
                     ResolutionTypeTransferKind::ComponentKey
                 } else {
                     ResolutionTypeTransferKind::ComponentValue
                 },
+                0,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: true },
+            );
+            self.attach_initializer_type(declaration, component);
+            let observed = self.add_slot(declaration, ResolutionTypeSlotRole::AssignmentValue);
+            self.add_transfer(
+                component,
+                observed,
+                ResolutionTypeTransferKind::Assignment,
                 0,
                 ResolutionTypeTransferValueTransform::ToRuntime { addressable: true },
             );
@@ -3174,46 +3222,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .map(|value| self.lower_expression(value))
             .collect::<Vec<_>>();
         let one_to_one = lhs.len() == rhs_slots.len();
-        let multi_result_slots =
-            if rhs.len() == 1 && lhs_count > 1 && rhs[0].kind() == "call_expression" {
-                let call_node = rhs[0];
-                let call_result = self.expression_slot(call_node);
-                let call_site = self.slot(call_result).site;
-                let (call, callee, first_result) = self
-                    .facts
-                    .calls
-                    .iter()
-                    .find(|fact| fact.call == call_site)
-                    .map(|fact| (fact.call, fact.callee, fact.result))
-                    .expect("lowered Go call expression has a call fact");
-                let mut results = Vec::with_capacity(lhs_count);
-                results.push(first_result);
-                // The first result is the callee's declared result type. Later results
-                // get a projection of their own kind, which carries no declared type
-                // until an ordinal-carrying fact exists for them.
-                let callee_positioned = self.facts.sites[callee.index()].kind
-                    != ResolutionSiteKind::UnsupportedExpression;
-                for _ in 1..lhs_count {
-                    let output = self.add_slot(call, ResolutionTypeSlotRole::CallResult);
-                    if callee_positioned {
-                        self.facts.binding_projections.push(BindingProjectionFact {
-                            reference: callee,
-                            output,
-                            kind: BindingProjectionKind::TargetCallableLaterResultType,
-                        });
-                    }
-                    results.push(output);
-                }
-                self.facts
-                    .calls
-                    .iter_mut()
-                    .find(|fact| fact.call == call)
-                    .expect("the Go call fact remains present")
-                    .extra_result_slots = results[1..].to_vec();
-                Some(results)
-            } else {
-                None
-            };
+        let multi_result_slots = self.assignment_call_results(&rhs, lhs_count);
         let binding_scope = self.current_scope();
         let scope = *self.scope(binding_scope);
         for (index, name) in lhs.into_iter().enumerate() {
@@ -3242,17 +3251,17 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 continue;
             }
             if self.value_name_is_declared(binding_scope, spelling) {
-                let Some(reference) = self.add_identifier_site(
-                    name,
-                    ResolutionSiteKind::ValueReference,
-                    binding_scope,
-                    ResolutionIdentifierRole::Reference,
-                    ResolutionNamespace::Value,
-                    None,
-                ) else {
-                    continue;
-                };
-                self.add_gap(reference, ResolutionGapKind::UnsupportedExpressionType);
+                let input = multi_result_slots
+                    .as_ref()
+                    .map(|results| results[index])
+                    .or_else(|| one_to_one.then(|| rhs_slots[index]));
+                let target = self.lower_expression(name);
+                if let Some(input) = input
+                    && one_to_one
+                {
+                    self.contextualize_nil(rhs[index], input, target);
+                }
+                self.publish_local_write(name, input);
                 continue;
             }
             let Some(declaration) = self.add_declaration_identifier_site(
@@ -3532,6 +3541,53 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         );
     }
 
+    // Go permits a single call to supply multiple assignment positions. Preserve
+    // those result ordinals instead of copying the first result to every target.
+    fn assignment_call_results(
+        &mut self,
+        rhs: &[Node<'tree>],
+        lhs_count: usize,
+    ) -> Option<Vec<ResolutionTypeSlotId>> {
+        if rhs.len() != 1 || lhs_count <= 1 || rhs[0].kind() != "call_expression" {
+            return None;
+        }
+        let call_node = rhs[0];
+        let call_result = self.expression_slot(call_node);
+        let call_site = self.slot(call_result).site;
+        let (call, callee, first_result) = self
+            .facts
+            .calls
+            .iter()
+            .find(|fact| fact.call == call_site)
+            .map(|fact| (fact.call, fact.callee, fact.result))
+            .expect("lowered Go call expression has a call fact");
+        let mut results = Vec::with_capacity(lhs_count);
+        results.push(first_result);
+        // The first result is the callee's declared result type. Later results
+        // get a projection of their own kind, which carries no declared type
+        // until an ordinal-carrying fact exists for them.
+        let callee_positioned =
+            self.facts.sites[callee.index()].kind != ResolutionSiteKind::UnsupportedExpression;
+        for _ in 1..lhs_count {
+            let output = self.add_slot(call, ResolutionTypeSlotRole::CallResult);
+            if callee_positioned {
+                self.facts.binding_projections.push(BindingProjectionFact {
+                    reference: callee,
+                    output,
+                    kind: BindingProjectionKind::TargetCallableLaterResultType,
+                });
+            }
+            results.push(output);
+        }
+        self.facts
+            .calls
+            .iter_mut()
+            .find(|fact| fact.call == call)
+            .expect("the Go call fact remains present")
+            .extra_result_slots = results[1..].to_vec();
+        Some(results)
+    }
+
     fn lower_assignment_statement(&mut self, node: Node<'tree>) {
         let left = node
             .child_by_field_name("left")
@@ -3569,11 +3625,68 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 }
             }
         }
-        let references_lowered = simple_assignment && !left.is_empty() && left.len() == right_count;
+        let multi_result_slots = simple_assignment
+            .then(|| self.assignment_call_results(&right, left.len()))
+            .flatten();
+        let supported_arity = left.len() == right_count || multi_result_slots.is_some();
+        for (index, target) in left.iter().copied().enumerate() {
+            let input = (simple_assignment && supported_arity).then(|| {
+                multi_result_slots
+                    .as_ref()
+                    .map_or_else(|| right_slots[index], |results| results[index])
+            });
+            self.publish_local_write(target, input);
+        }
+        let references_lowered = simple_assignment && !left.is_empty() && supported_arity;
         if !only_blank_targets && !references_lowered {
             let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
             self.add_gap(site, ResolutionGapKind::UnsupportedExpressionType);
         }
+    }
+
+    fn publish_local_write(&mut self, target: Node<'tree>, value: Option<ResolutionTypeSlotId>) {
+        let target_slot = self.lower_expression(target);
+        let mut bare_target = target;
+        while bare_target.kind() == "parenthesized_expression" {
+            let Some(inner) = first_named_child(bare_target) else {
+                self.add_gap(
+                    self.slot(target_slot).site,
+                    ResolutionGapKind::UnsupportedExpressionType,
+                );
+                return;
+            };
+            bare_target = inner;
+        }
+        if bare_target.kind() == "identifier"
+            && go_node_text(bare_target, self.source).trim() == "_"
+        {
+            return;
+        }
+        // A member, index, or dereference mutates storage reached through the
+        // operand; it does not rebind that operand's lexical declaration.
+        if bare_target.kind() != "identifier" || !is_spelled_identifier(bare_target) {
+            // Keep mutation incompleteness off the selected member reference:
+            // that site also carries the receiver used for field resolution.
+            let site = self.add_site(target, ResolutionSiteKind::UnsupportedExpression);
+            self.add_gap(site, ResolutionGapKind::UnsupportedExpressionType);
+            return;
+        }
+        let target_site = self.slot(target_slot).site;
+        assert_eq!(
+            self.facts.sites[target_site.index()].kind,
+            ResolutionSiteKind::ValueReference
+        );
+        let value = value.unwrap_or_else(|| {
+            // Keep unsupported value evidence separate from the positioned
+            // reference so exact lexical attachment can still find its binder.
+            let site = self.add_site(bare_target, ResolutionSiteKind::UnsupportedExpression);
+            self.add_gap(site, ResolutionGapKind::UnsupportedExpressionType);
+            self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue)
+        });
+        self.facts.local_writes.push(ResolutionLocalWriteFact {
+            target: target_site,
+            value,
+        });
     }
 
     fn attach_declaration_type(
@@ -8725,7 +8838,7 @@ func use(x int, y int, text string, enabled bool, pointer *int) {
             let input = facts.type_slots[transfer.input.index()];
             assert_eq!(input.role, ResolutionTypeSlotRole::TargetTypeIdentity);
             if spelling == "Anonymous" {
-                assert!(facts.gaps.iter().any(|gap| gap.site == input.site
+                assert!(!facts.gaps.iter().any(|gap| gap.site == input.site
                     && gap.kind == ResolutionGapKind::UnsupportedExpressionType));
             } else {
                 assert!(
@@ -8856,6 +8969,444 @@ func use(x int, y int, text string, enabled bool, pointer *int) {
                 && projection.output == call.result
                 && projection.kind == BindingProjectionKind::TargetCallableResultType
         }));
+    }
+
+    #[test]
+    #[hardwon("#5015: Go writes and mixed short declarations lost runtime values and ordinals")]
+    fn local_writes_preserve_ordinals_mixed_declarations_and_shadowing() {
+        let source = r#"package p
+type Box struct { field *Box }
+func pair() (*Box, *Box) { return nil, nil }
+func use(first, second *Box) {
+    value := first
+    other := first
+    value, _, other = second, first, first
+    value, fresh := second, first
+    value, extra := pair()
+    value, fresh = pair()
+    {
+        value := value
+        value = first
+        _ = value
+    }
+    value = nil
+    ((value)) = second
+    (value) += 1
+    value.field = second
+    _, _ = fresh, extra
+}
+"#;
+        let tree = crate::parse::parse_go(source).expect("write fixture tree");
+        assert!(!tree.root_node().has_error());
+        let facts = output_from_tree(&tree, source).facts;
+        let text = |site: ResolutionSiteId| {
+            let site = facts.sites[site.index()];
+            &source[site.start_byte..site.end_byte]
+        };
+        let writes = facts
+            .local_writes
+            .iter()
+            .map(|write| {
+                (
+                    text(write.target),
+                    text(facts.type_slots[write.value.index()].site),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            writes,
+            vec![
+                ("value", "second"),
+                ("other", "first"),
+                ("value", "second"),
+                ("value", "pair()"),
+                ("value", "pair()"),
+                ("fresh", "pair()"),
+                ("value", "first"),
+                ("value", "nil"),
+                ("value", "second"),
+                ("value", "value"),
+            ]
+        );
+        let calls = facts
+            .calls
+            .iter()
+            .filter(|call| !call.extra_result_slots.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "mixed := and = preserve separate calls");
+        assert_eq!(facts.local_writes[3].value, calls[0].result);
+        assert_eq!(facts.local_writes[4].value, calls[1].result);
+        assert_eq!(facts.local_writes[5].value, calls[1].extra_result_slots[0]);
+        assert_ne!(calls[1].result, calls[1].extra_result_slots[0]);
+        let extra = declaration(&facts, "extra");
+        let extra_initializer = facts
+            .type_transfers
+            .iter()
+            .find(|transfer| {
+                transfer.kind == ResolutionTypeTransferKind::Assignment
+                    && facts.type_slots[transfer.output.index()].site == extra
+            })
+            .expect("new := binder retains the later call result");
+        assert_eq!(extra_initializer.input, calls[0].extra_result_slots[0]);
+        let value_binders = facts
+            .binders
+            .iter()
+            .filter(|binder| {
+                facts.identifiers.iter().any(|identifier| {
+                    identifier.site == binder.declaration
+                        && name(&facts, identifier.name) == "value"
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(value_binders.len(), 2, "mixed := reuses the current binder");
+        assert_ne!(value_binders[0].scope, value_binders[1].scope);
+        assert_eq!(
+            facts.sites[facts.local_writes[6].target.index()].scope,
+            value_binders[1].scope
+        );
+        assert_eq!(
+            facts.sites[facts.local_writes[7].target.index()].scope,
+            value_binders[0].scope
+        );
+        let inner_initializer = facts
+            .type_transfers
+            .iter()
+            .find(|transfer| {
+                facts.type_slots[transfer.output.index()].site == value_binders[1].declaration
+                    && transfer.kind == ResolutionTypeTransferKind::Initialization
+            })
+            .expect("inner initializer");
+        let initializer_site = facts.sites[facts.type_slots[inner_initializer.input.index()]
+            .site
+            .index()];
+        assert_eq!(
+            &source[initializer_site.start_byte..initializer_site.end_byte],
+            "value"
+        );
+        assert!(
+            initializer_site.start_byte < value_binders[1].activation_start,
+            "a shadowing declaration's own RHS precedes its activation"
+        );
+        assert_eq!(
+            facts
+                .type_transfers
+                .iter()
+                .filter(|transfer| { transfer.kind == ResolutionTypeTransferKind::Assignment })
+                .count(),
+            5,
+            "raw producer retains only initializer Assignment rows"
+        );
+        let nil_input = facts.local_writes[7].value;
+        assert!(facts.type_transfers.iter().any(|transfer| {
+            transfer.output == nil_input && transfer.kind == ResolutionTypeTransferKind::Contextual
+        }));
+        assert!(!facts.gaps.iter().any(|gap| {
+            gap.site == facts.type_slots[nil_input.index()].site
+                && gap.kind == ResolutionGapKind::UnsupportedExpressionType
+        }));
+        let parenthesized_compound = facts.local_writes[9];
+        let compound_input = facts.type_slots[parenthesized_compound.value.index()];
+        assert!(facts.gaps.iter().any(|gap| {
+            gap.site == compound_input.site
+                && gap.kind == ResolutionGapKind::UnsupportedExpressionType
+        }));
+        ast_reference_oracle(tree.root_node(), source, &facts, "write fixture")
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    #[hardwon("#5015: unsupported Go writes erased incompleteness behind known initializers")]
+    fn unsupported_local_writes_retain_empty_gap_inputs_without_rebinding_receivers() {
+        let source = r#"package p
+type Box struct { field int }
+func use(values []int, channel chan int, box *Box, pointer *int) {
+    value := 1
+    other := 2
+    value += 1
+    value++
+    value--
+    for value = range values { }
+    select { case value = <-channel: }
+    value, other = values[0]
+    value, fresh := values[0]
+    value = values[0]
+    box.field = 1
+    *pointer = 1
+    box.field += 1
+    values[0]++
+    *box = Box{}
+    _ = fresh
+}
+"#;
+        let tree = crate::parse::parse_go(source).expect("unsupported write fixture tree");
+        assert!(!tree.root_node().has_error());
+        let facts = output_from_tree(&tree, source).facts;
+        assert_eq!(
+            facts.local_writes.len(),
+            9,
+            "retain every bare target, including unsupported arity"
+        );
+        for write in &facts.local_writes {
+            let target = facts.sites[write.target.index()];
+            assert!(matches!(
+                &source[target.start_byte..target.end_byte],
+                "value" | "other"
+            ));
+            let slot = facts.type_slots[write.value.index()];
+            assert_ne!(
+                slot.site, write.target,
+                "RHS incompleteness must not block lexical attachment"
+            );
+            assert_eq!(slot.role, ResolutionTypeSlotRole::ExpressionValue);
+            assert!(
+                facts.gaps.iter().any(|gap| {
+                    gap.site == slot.site
+                        && gap.kind == ResolutionGapKind::UnsupportedExpressionType
+                }),
+                "unsupported input needs a gap: {write:?}"
+            );
+            assert!(
+                !facts
+                    .type_transfers
+                    .iter()
+                    .any(|transfer| transfer.output == slot.id)
+            );
+            assert!(
+                !facts
+                    .binding_projections
+                    .iter()
+                    .any(|projection| projection.output == slot.id),
+                "the incomplete write must not copy the target's previous value"
+            );
+        }
+        for (unsupported_target, target) in
+            [("box.field = 1", "box.field"), ("*pointer = 1", "*pointer")]
+        {
+            let assignment_start = source
+                .find(unsupported_target)
+                .expect("unsupported assignment is in the fixture");
+            let target_end = assignment_start + target.len();
+            assert!(
+                facts.gaps.iter().any(|gap| {
+                    let site = facts.sites[gap.site.index()];
+                    gap.kind == ResolutionGapKind::UnsupportedExpressionType
+                        && site.kind == ResolutionSiteKind::UnsupportedExpression
+                        && site.start_byte == assignment_start
+                        && site.end_byte == target_end
+                }),
+                "unsupported mutation needs an isolated target gap: {unsupported_target}"
+            );
+            assert!(
+                !facts.gaps.iter().any(|gap| {
+                    let site = facts.sites[gap.site.index()];
+                    gap.kind == ResolutionGapKind::UnsupportedExpressionType
+                        && site.kind == ResolutionSiteKind::MemberReference
+                        && site.start_byte >= assignment_start
+                        && site.end_byte <= target_end
+                }),
+                "unsupported mutation must not poison member resolution: {unsupported_target}"
+            );
+        }
+        assert!(
+            !facts.local_writes.iter().any(|write| {
+                let target = facts.sites[write.target.index()];
+                matches!(
+                    &source[target.start_byte..target.end_byte],
+                    "box" | "pointer"
+                )
+            }),
+            "member and dereference writes must not rebind their operands"
+        );
+        assert!(
+            facts.reference_enumeration_gaps.is_empty(),
+            "all references remain enumerated: {:?}",
+            facts.reference_enumeration_gaps
+        );
+        ast_reference_oracle(
+            tree.root_node(),
+            source,
+            &facts,
+            "unsupported write fixture",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    #[hardwon(
+        "#5015: range binders lost their component initializer when later writes were joined"
+    )]
+    fn range_writes_observe_runtime_components_before_binding_initialization() {
+        let source = r#"package p
+type Box struct{}
+func use(rows map[*Box]*Box, items []*Box, channel chan *Box, replacement *Box) {
+    for key, value := range rows { key = replacement; value = replacement }
+    for _, item := range items { item = replacement }
+    for received := range channel { received = replacement }
+}
+"#;
+        let facts = facts(source);
+        assert_eq!(facts.local_writes.len(), 4);
+        for (binding, kind, collection) in [
+            ("key", ResolutionTypeTransferKind::ComponentKey, "rows"),
+            ("value", ResolutionTypeTransferKind::ComponentValue, "rows"),
+            ("item", ResolutionTypeTransferKind::ComponentValue, "items"),
+            (
+                "received",
+                ResolutionTypeTransferKind::ComponentKey,
+                "channel",
+            ),
+        ] {
+            let declaration = declaration(&facts, binding);
+            let declared = declaration_slot(&facts, declaration, DeclarationTypeRole::Value);
+            let initialization = transfer_to(&facts, declared);
+            assert_eq!(
+                initialization.kind,
+                ResolutionTypeTransferKind::Initialization
+            );
+            let component = initialization.input;
+            assert_eq!(
+                facts.type_slots[component.index()].role,
+                ResolutionTypeSlotRole::ExpressionValue
+            );
+            let projection = transfer_to(&facts, component);
+            assert_eq!(projection.kind, kind);
+            assert_eq!(
+                projection.value_transform,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: true }
+            );
+            let collection_site =
+                facts.sites[facts.type_slots[projection.input.index()].site.index()];
+            assert_eq!(
+                &source[collection_site.start_byte..collection_site.end_byte],
+                collection
+            );
+            let observed = facts
+                .type_slots
+                .iter()
+                .find(|slot| {
+                    slot.site == declaration && slot.role == ResolutionTypeSlotRole::AssignmentValue
+                })
+                .expect("range initializer observation");
+            let assignment = transfer_to(&facts, observed.id);
+            assert_eq!(assignment.kind, ResolutionTypeTransferKind::Assignment);
+            assert_eq!(
+                assignment.input, component,
+                "observe the component, not the collection"
+            );
+            assert_ne!(assignment.input, projection.input);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#5015: Go type-switch writes hid the unknown runtime value of a typed clause binder"
+    )]
+    fn typed_type_switch_binder_keeps_unknown_initial_value_and_later_write() {
+        let source = r#"package p
+type Base interface { Summary() }
+type Body struct{}
+func (Body) Summary() {}
+type Other struct{}
+func (Other) Summary() {}
+func use(incoming Base) {
+    switch current := incoming.(type) {
+    case Base:
+        current = Other{}
+        current.Summary()
+    }
+}
+"#;
+        let facts = facts(source);
+        let current = declaration(&facts, "current");
+        let body = facts
+            .declaration_type_slots
+            .iter()
+            .filter(|property| property.declaration == current)
+            .map(|property| property.slot)
+            .find(|slot| {
+                transfer_to(&facts, *slot).kind == ResolutionTypeTransferKind::DeclaredType
+            })
+            .expect("the typed case's static declared type remains known");
+        let body_type_site = facts.type_slots[transfer_to(&facts, body).input.index()].site;
+        assert_eq!(
+            name(
+                &facts,
+                facts
+                    .identifiers
+                    .iter()
+                    .find(|identifier| {
+                        identifier.site == body_type_site
+                            && identifier.role == ResolutionIdentifierRole::Reference
+                    })
+                    .expect("type reference")
+                    .name
+            ),
+            "Base"
+        );
+        let incoming = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && name(&facts, identifier.name) == "incoming"
+            })
+            .expect("the type-switch receiver remains a supported reference");
+        assert_eq!(incoming.namespace, ResolutionNamespace::Value);
+        assert!(!facts.gaps.iter().any(|gap| gap.site == incoming.site));
+
+        let properties = facts
+            .declaration_type_slots
+            .iter()
+            .filter(|property| property.declaration == current)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            properties.len(),
+            1,
+            "unknown observations must not extend the static type"
+        );
+        assert_eq!(properties[0].slot, body);
+        let observations = facts
+            .type_slots
+            .iter()
+            .filter(|slot| {
+                slot.site == current && slot.role == ResolutionTypeSlotRole::AssignmentValue
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observations.len(),
+            1,
+            "one assignment observation per binder"
+        );
+        let initial_observation = transfer_to(&facts, observations[0].id);
+        assert_eq!(
+            initial_observation.kind,
+            ResolutionTypeTransferKind::Assignment
+        );
+        let unknown_site = facts.type_slots[initial_observation.input.index()].site;
+        assert_eq!(
+            facts.sites[unknown_site.index()].kind,
+            ResolutionSiteKind::UnsupportedExpression
+        );
+        assert!(facts.gaps.contains(&ResolutionGapFact {
+            site: unknown_site,
+            kind: ResolutionGapKind::UnsupportedExpressionType,
+        }));
+        assert_ne!(unknown_site, current);
+        assert!(!facts.gaps.iter().any(|gap| gap.site == current));
+
+        let later_write = facts
+            .local_writes
+            .iter()
+            .find(|write| {
+                facts.identifiers.iter().any(|identifier| {
+                    identifier.site == write.target
+                        && identifier.role == ResolutionIdentifierRole::Reference
+                        && name(&facts, identifier.name) == "current"
+                })
+            })
+            .expect("later assignment is published as a local write");
+        assert_ne!(later_write.value, initial_observation.input);
+        assert_ne!(body, initial_observation.output);
     }
 
     #[test]
@@ -9278,7 +9829,7 @@ var items = []Item{{Field: "value"}}
                     && scope.start_byte == declaration.start_byte
                     && scope.end_byte == declaration.end_byte
             }));
-            assert!(facts.gaps.iter().any(|gap| {
+            assert!(!facts.gaps.iter().any(|gap| {
                 gap.site == owner && gap.kind == ResolutionGapKind::UnsupportedExpressionType
             }));
         }
