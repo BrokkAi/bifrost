@@ -125,6 +125,7 @@ jobs:
         run: |
           python3 - <<'PYTEST'
           import json
+          import os
           import subprocess
 
           metadata = json.loads(subprocess.check_output([
