@@ -404,7 +404,7 @@ jobs:
     name: build binary (${{ matrix.target }})
     needs: [preflight, notices]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       # Start every remaining target immediately. The paid macOS and Windows pools have
@@ -753,6 +753,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
       - name: Download all wheel artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
