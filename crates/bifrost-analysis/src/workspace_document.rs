@@ -47,6 +47,21 @@ impl WorkspaceRoot {
         })
     }
 
+    /// The root directory itself, for documents that sit directly under it.
+    pub fn root_directory(&self) -> Result<WorkspaceDirectory, WorkspaceDocumentError> {
+        let directory =
+            self.directory
+                .try_clone()
+                .map_err(|source| WorkspaceDocumentError::ReadDirectory {
+                    path: PathBuf::new(),
+                    source,
+                })?;
+        Ok(WorkspaceDirectory {
+            relative_path: PathBuf::new(),
+            directory,
+        })
+    }
+
     /// Open a workspace-relative directory without intentionally traversing a
     /// symlink. Each component is looked up directly from its parent handle,
     /// classified without following links, and atomically opened no-follow;
@@ -454,7 +469,8 @@ fn read_opened_workspace_document(
     })
 }
 
-pub(crate) fn validate_workspace_relative_path(
+#[doc(hidden)]
+pub fn validate_workspace_relative_path(
     relative_path: &Path,
 ) -> Result<PathBuf, WorkspaceDocumentError> {
     if relative_path.as_os_str().is_empty() {
@@ -500,17 +516,7 @@ pub(crate) fn validate_workspace_relative_path(
     Ok(normalized)
 }
 
-/// Whether `path` starts with a Windows drive, rooted, UNC, or device prefix.
-///
-/// `std::path` interprets prefixes for the host platform, so Unix would
-/// otherwise accept spellings such as `C:query.rql` as ordinary relative file
-/// names. Workspace paths are a portable wire contract and reject those
-/// prefixes consistently on every host.
-pub fn has_portable_windows_path_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-        || bytes.first() == Some(&b'\\')
-}
+pub use crate::analyzer::semantic::workspace_document::has_portable_windows_path_prefix;
 
 fn validate_extension(
     relative_path: &Path,

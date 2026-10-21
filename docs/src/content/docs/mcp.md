@@ -52,7 +52,7 @@ policy rules are distributed by
 [Bifrost-packs](https://github.com/BrokkAi/bifrost-packs), independently from
 engine releases. When a `bifrost` MCP or policy command starts without an
 explicit `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` or
-`BIFROST_OPEN_POLICY_PACK_ROOT`, the binary selects, verifies, and caches a
+`BIFROST_POLICY_PACK_ROOT`, the binary selects, verifies, and caches a
 compatible open release pair before catalog activation. This acquisition runs
 outside the analysis library; local dependency generation still uses exact
 artifact identity.

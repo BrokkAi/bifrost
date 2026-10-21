@@ -1,8 +1,8 @@
 //! The Rust selected-root demand engine.
 //!
-//! Production Rust prefix resolution runs here. The eager whole-inventory
-//! prefix compiler in `resolution_operation.rs` is retained only as the test
-//! oracle the demand answers are certified against.
+//! Production Rust prefix resolution runs here. Demand, outgoing and graph-stage
+//! operations read the same published own-binding authority; their scheduling
+//! and selected-content projections remain request-local.
 //!
 //! Three pieces: `inventory` indexes the immutable selected root halves and
 //! answers "what does this one demand need"; `forward` prepares one caller's
@@ -13,4 +13,5 @@ pub(crate) mod forward;
 pub(crate) mod inventory;
 pub(crate) mod relations;
 
-pub(super) mod rows;
+#[doc(hidden)]
+pub mod rows;

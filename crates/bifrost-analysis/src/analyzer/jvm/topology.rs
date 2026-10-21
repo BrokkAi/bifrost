@@ -22,13 +22,13 @@
 //! Kotlin build script, and reading it means either running Gradle or
 //! string-scanning a program; both are excluded here, so a Gradle-only
 //! workspace gets an incomplete topology that says so rather than an empty one
-//! that reads as clean.
+//! that reads as clean. Source visibility domains below are separate path and
+//! package evidence; they do not claim to recover the Gradle build model.
 
 use std::path::{Path, PathBuf};
 
-use super::dependency_discovery::{
-    MAX_BUILD_METADATA_BYTES, expand_maven_value, is_maven_pom, maven_project_properties, parse_xml,
-};
+use super::dependency_discovery::MAX_BUILD_METADATA_BYTES;
+use super::dependency_discovery::is_maven_pom;
 use crate::analyzer::Project;
 use crate::analyzer::topology::{
     BuildModelProvider, DependencyScope, FileOwnership, FileOwnershipState, TopologyAxis,
@@ -59,72 +59,6 @@ impl BuildModelProvider for JvmBuildModel {
     fn topology(&self, project: &dyn Project) -> WorkspaceTopology {
         maven_topology(project)
     }
-}
-
-/// The `src/main` and `src/test` roles Maven's default lifecycle fixes.
-const MAVEN_SOURCE_SETS: [(&str, &str); 2] = [("main", "src/main"), ("test", "src/test")];
-
-/// A declared value retains failed interpolation separately from absence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MavenValue {
-    Missing,
-    Unresolved,
-    Resolved(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MavenModelLimitation {
-    ParentModel,
-    Profiles,
-    DependencyManagement,
-    CustomSourceRoots,
-    BuildPlugins,
-}
-
-/// Direct declarations in one selected pom, not an effective Maven model.
-/// The caller retains the selected configuration file-version/content identity.
-#[derive(Debug)]
-pub(crate) struct MavenConfigurationFacts {
-    pub(crate) directory: PathBuf,
-    pub(crate) group_id: String,
-    pub(crate) artifact_id: String,
-    pub(crate) version: MavenValue,
-    pub(crate) modules: Vec<MavenValue>,
-    pub(crate) dependencies: Vec<MavenDependencyFacts>,
-    pub(crate) limitations: Vec<MavenModelLimitation>,
-}
-
-impl MavenConfigurationFacts {
-    pub(crate) fn default_source_roots(&self) -> [(&'static str, PathBuf); 2] {
-        MAVEN_SOURCE_SETS.map(|(role, relative)| (role, self.directory.join(relative)))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct MavenDependencyFacts {
-    pub(crate) ordinal: u32,
-    pub(crate) group_id: MavenValue,
-    pub(crate) artifact_id: MavenValue,
-    pub(crate) version: MavenValue,
-    pub(crate) artifact_type: MavenValue,
-    pub(crate) classifier: MavenValue,
-    pub(crate) scope: MavenValue,
-    pub(crate) optional: MavenValue,
-    // Keep the established display topology's literal optional interpretation.
-    topology_kind: DependencyScope,
-}
-
-/// Parse one exact configuration without consulting other files or the host.
-/// Absence, malformed XML, invalid UTF-8, an oversized input or an unresolved
-/// required project coordinate cannot supply a named Maven project.
-pub(crate) fn maven_configuration_from_bytes(
-    pom_path: &Path,
-    source: &[u8],
-) -> Option<MavenConfigurationFacts> {
-    if source.len() > MAX_BUILD_METADATA_BYTES {
-        return None;
-    }
-    read_maven_configuration(pom_path, std::str::from_utf8(source).ok()?)
 }
 
 /// One pom, read.
@@ -430,132 +364,13 @@ fn read_maven_project(path: &Path, source: &str) -> Option<MavenProject> {
     })
 }
 
-fn maven_value(value: Option<&str>, properties: &HashMap<String, String>) -> MavenValue {
-    match value {
-        None => MavenValue::Missing,
-        Some(value) => expand_maven_value(value, properties)
-            .map(MavenValue::Resolved)
-            .unwrap_or(MavenValue::Unresolved),
-    }
-}
-
-fn read_maven_configuration(path: &Path, source: &str) -> Option<MavenConfigurationFacts> {
-    let node = parse_xml(source)?;
-    if node.name != "project" {
-        return None;
-    }
-    let properties = maven_project_properties(&node);
-    let parent = node.child("parent");
-    let MavenValue::Resolved(group_id) = maven_value(
-        node.child_text("groupId")
-            .or_else(|| parent.and_then(|parent| parent.child_text("groupId"))),
-        &properties,
-    ) else {
-        return None;
-    };
-    let MavenValue::Resolved(artifact_id) = maven_value(node.child_text("artifactId"), &properties)
-    else {
-        return None;
-    };
-    if group_id.is_empty() || artifact_id.is_empty() {
-        return None;
-    }
-    let version = maven_value(
-        node.child_text("version")
-            .or_else(|| parent.and_then(|parent| parent.child_text("version"))),
-        &properties,
-    );
-    let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let modules = node
-        .child("modules")
-        .map(|modules| {
-            modules
-                .children_named("module")
-                .map(|module| maven_value(Some(module.text.trim()), &properties))
-                .collect()
-        })
-        .unwrap_or_default();
-    let dependencies = node
-        .child("dependencies")
-        .map(|dependencies| {
-            dependencies
-                .children_named("dependency")
-                .enumerate()
-                .map(|(ordinal, dependency)| {
-                    let scope = maven_value(dependency.child_text("scope"), &properties);
-                    let optional_literal = dependency
-                        .child_text("optional")
-                        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-                    let topology_kind = if optional_literal {
-                        DependencyScope::Optional
-                    } else {
-                        maven_scope_edge_kind(match &scope {
-                            MavenValue::Resolved(value) => Some(value),
-                            _ => None,
-                        })
-                    };
-                    MavenDependencyFacts {
-                        ordinal: u32::try_from(ordinal)
-                            .expect("bounded XML node inventory fits u32"),
-                        group_id: maven_value(dependency.child_text("groupId"), &properties),
-                        artifact_id: maven_value(dependency.child_text("artifactId"), &properties),
-                        version: maven_value(dependency.child_text("version"), &properties),
-                        artifact_type: maven_value(dependency.child_text("type"), &properties),
-                        classifier: maven_value(dependency.child_text("classifier"), &properties),
-                        scope,
-                        optional: maven_value(dependency.child_text("optional"), &properties),
-                        topology_kind,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut limitations = Vec::new();
-    if parent.is_some() {
-        limitations.push(MavenModelLimitation::ParentModel);
-    }
-    if node.child("profiles").is_some() {
-        limitations.push(MavenModelLimitation::Profiles);
-    }
-    if node.child("dependencyManagement").is_some() {
-        limitations.push(MavenModelLimitation::DependencyManagement);
-    }
-    if let Some(build) = node.child("build") {
-        if build.child("sourceDirectory").is_some() || build.child("testSourceDirectory").is_some()
-        {
-            limitations.push(MavenModelLimitation::CustomSourceRoots);
-        }
-        if build.child("plugins").is_some()
-            || build.child("pluginManagement").is_some()
-            || build.child("extensions").is_some()
-        {
-            limitations.push(MavenModelLimitation::BuildPlugins);
-        }
-    }
-    Some(MavenConfigurationFacts {
-        directory,
-        group_id,
-        artifact_id,
-        version,
-        modules,
-        dependencies,
-        limitations,
-    })
-}
-
-/// The Maven scope vocabulary as topology edge kinds. An absent scope is
-/// `compile` by Maven's own default; a scope this reader does not model stays
-/// [`DependencyScope::Unknown`] rather than being folded into the nearest
-/// match.
-pub(crate) fn maven_scope_edge_kind(scope: Option<&str>) -> DependencyScope {
-    match scope.map(str::trim) {
-        None | Some("") | Some("compile") => DependencyScope::Compile,
-        Some("runtime") => DependencyScope::Runtime,
-        Some("test") => DependencyScope::Test,
-        Some("provided") => DependencyScope::Provided,
-        Some(_) => DependencyScope::Unknown,
-    }
-}
+// Preserve the engine paths while store consumers use the lower owner.
+#[allow(unused_imports)]
+pub use crate::analyzer::store::maven::{
+    JvmSourceDomain, MAVEN_SOURCE_SETS, MavenConfigurationFacts, MavenDependencyFacts,
+    MavenModelLimitation, MavenValue, maven_configuration_from_bytes, maven_scope_edge_kind,
+    maven_value, read_maven_configuration, source_set, source_set_sees,
+};
 
 #[cfg(test)]
 mod tests {

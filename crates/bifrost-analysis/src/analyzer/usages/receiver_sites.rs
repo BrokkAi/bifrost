@@ -21,7 +21,8 @@ pub(crate) enum ReceiverSiteKind {
 
 /// How an input range relates to the receiver site being requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ReceiverSiteInputMode {
+#[doc(hidden)]
+pub enum ReceiverSiteInputMode {
     /// The input is the receiver expression itself.
     Expression,
     /// The input identifies the containing call/member site or its member token.

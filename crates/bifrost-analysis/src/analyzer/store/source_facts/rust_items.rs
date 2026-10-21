@@ -18,10 +18,14 @@ use rusqlite::{Transaction, params};
 use super::super::{Result, usize_to_i64};
 use super::check_cancelled;
 
-pub(in crate::analyzer) const RUST_ITEM_SOURCE_FACTS_VERSION: i64 = 1;
-pub(in crate::analyzer) const RUST_MACRO_FACTS_VERSION: i64 = 1;
-pub(in crate::analyzer) const RUST_TYPE_FORMS_VERSION: i64 = 1;
-pub(in crate::analyzer) const RUST_MACRO_CONTEXTS_VERSION: i64 = 1;
+#[doc(hidden)]
+pub const RUST_ITEM_SOURCE_FACTS_VERSION: i64 = 1;
+#[doc(hidden)]
+pub const RUST_MACRO_FACTS_VERSION: i64 = 1;
+#[doc(hidden)]
+pub const RUST_TYPE_FORMS_VERSION: i64 = 1;
+#[doc(hidden)]
+pub const RUST_MACRO_CONTEXTS_VERSION: i64 = 1;
 
 /// Stable discriminators for the schema54 source-owned item rows.
 fn context_kind(kind: RustSourceContextKind) -> i64 {
@@ -124,7 +128,8 @@ fn macro_repetition_operator(operator: RustMacroRepetitionOperator) -> i64 {
 
 /// Exact physical rows and UTF-8 string payload for this extension, including
 /// its marker. Read validation and publication use the same accounting.
-pub(in crate::analyzer) fn rust_item_source_cost(
+#[doc(hidden)]
+pub fn rust_item_source_cost(
     items: &RustItemSourceFacts,
     types: &[RustTypeSourceFact],
 ) -> (usize, usize) {
@@ -238,7 +243,8 @@ pub(in crate::analyzer) fn rust_item_source_cost(
 /// source-facts manifest before this function. Every row below uses the exact
 /// producer-assigned identity and is written with a prepared statement so the
 /// cancellation boundary remains per physical row.
-pub(in crate::analyzer) fn insert_rust_item_source_facts_tx(
+#[doc(hidden)]
+pub fn insert_rust_item_source_facts_tx(
     tx: &Transaction<'_>,
     blob_id: i64,
     facts: &ParsedSourceFacts,
@@ -578,13 +584,14 @@ pub(in crate::analyzer) fn insert_rust_item_source_facts_tx(
         ])?;
     }
     drop(macros);
-    let mut inputs = tx.prepare_cached("INSERT INTO source_rust_macro_inputs(blob_id, invocation_occurrence_id, start_byte, source, native_gap_site, native_scope, invocation_start_byte, cfg_condition) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
+    let mut inputs = tx.prepare_cached("INSERT INTO source_rust_macro_inputs(blob_id, invocation_occurrence_id, macro_name, start_byte, source, native_gap_site, native_scope, invocation_start_byte, cfg_condition) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?;
     let mut tokens = tx.prepare_cached("INSERT INTO source_rust_macro_input_tokens(blob_id, invocation_occurrence_id, ordinal, parent_ordinal, syntax_kind, start_byte, end_byte, source_occurrence_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
     for input in &item_facts.macro_inputs {
         check_cancelled(cancellation)?;
         inputs.execute(params![
             blob_id,
             i64::from(input.invocation.get()),
+            input.macro_name.as_deref(),
             usize_to_i64(input.tree.start_byte)?,
             &input.tree.source,
             input.native_frontier.map(|(site, _)| i64::from(site.get())),

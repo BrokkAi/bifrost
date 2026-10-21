@@ -789,7 +789,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             let op = QueryStepOp::AbsentMember;
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.label().to_string()));
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(
                         &pair[0],
@@ -830,7 +830,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             }
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String("witness".to_string()));
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(&pair[0], "(witness ...) option names must be symbols")
                 })?;
@@ -880,7 +880,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             };
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.to_string()));
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(
                         &pair[0],
@@ -954,7 +954,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             };
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.to_string()));
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(
                         &pair[0],
@@ -1068,7 +1068,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 "op".to_string(),
                 Value::String(QueryStepOp::ResolvedCall.label().to_string()),
             );
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(
                         &pair[0],
@@ -1110,7 +1110,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 "op".to_string(),
                 Value::String(QueryStepOp::ResolvedValue.label().to_string()),
             );
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(&pair[0], "resolved-value option names must be symbols")
                 })?;
@@ -1178,7 +1178,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 "op".to_string(),
                 Value::String(QueryStepOp::JsxAttributeValue.label().to_string()),
             );
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(
                         &pair[0],
@@ -1426,7 +1426,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 "op".to_string(),
                 Value::String(QueryStepOp::FieldWriteValue.label().to_string()),
             );
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0]
                     .as_symbol()
                     .ok_or_else(|| lower_error(&pair[0], "expected an option name"))?;
@@ -1463,7 +1463,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 "op".to_string(),
                 Value::String(QueryStepOp::KeyedReadValue.label().to_string()),
             );
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0]
                     .as_symbol()
                     .ok_or_else(|| lower_error(&pair[0], "expected an option name"))?;
@@ -1660,7 +1660,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                     "dependency-evidence options must be pairs",
                 ));
             }
-            for pair in items[1..].chunks_exact(2) {
+            for pair in items[1..].as_chunks::<2>().0 {
                 let key = pair[0]
                     .as_symbol()
                     .ok_or_else(|| lower_error(&pair[0], "expected option name"))?;
@@ -1739,7 +1739,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 ));
             }
             let mut filter = Map::new();
-            for pair in options.chunks_exact(2) {
+            for pair in options.as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(&pair[0], "(paths ...) option names must be symbols")
                 })?;
@@ -1774,7 +1774,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 ));
             }
             let mut step = Map::new();
-            for pair in options.chunks_exact(2) {
+            for pair in options.as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(&pair[0], "(segments-of ...) option names must be symbols")
                 })?;
@@ -1834,7 +1834,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .expect("edge wrappers declare a query step");
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.label().to_string()));
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(
                         &pair[0],
@@ -1930,7 +1930,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .expect("constrained-option wrappers declare a query step");
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.label().to_string()));
-            for pair in items[1..items.len() - 1].chunks_exact(2) {
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
                 let key = pair[0].as_symbol().ok_or_else(|| {
                     lower_error(
                         &pair[0],
@@ -2105,7 +2105,7 @@ fn materialization_filter_to_json(
 ) -> LowerResult<Map<String, Value>> {
     validate_filter_option_pairs(expr, head, options)?;
     let mut object = Map::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let (key_expr, key, value) = filter_option_pair(pair, head)?;
         let unknown = || {
             lower_error(
@@ -2175,7 +2175,7 @@ fn cross_domain_inputs_to_json(
         ));
     }
     let mut object = Map::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let key = pair[0].as_symbol().ok_or_else(|| {
             lower_error(
                 &pair[0],
@@ -2227,7 +2227,7 @@ fn cross_domain_relation_to_json(expr: &Expr) -> LowerResult<Value> {
         ));
     }
     let mut body = Map::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let key = pair[0].as_symbol().ok_or_else(|| {
             lower_error(
                 &pair[0],
@@ -2335,7 +2335,7 @@ fn configuration_facts_filter_to_json(
         ));
     }
     let mut object = Map::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let key = pair[0].as_symbol().ok_or_else(|| {
             lower_error(
                 &pair[0],
@@ -2505,7 +2505,7 @@ fn decorator_binding_filter_to_json(
     options: &[Expr],
 ) -> LowerResult<Map<String, Value>> {
     let mut object = Map::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let key = pair[0].as_symbol().ok_or_else(|| {
             lower_error(
                 &pair[0],
@@ -2547,7 +2547,7 @@ fn environment_filter_to_json(
 ) -> LowerResult<Map<String, Value>> {
     validate_filter_option_pairs(expr, head, options)?;
     let mut object = Map::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let (key_expr, key, value) = filter_option_pair(pair, head)?;
         let unknown = || {
             lower_error(
@@ -2607,7 +2607,7 @@ fn occurrence_filter_to_json(
 ) -> LowerResult<Map<String, Value>> {
     validate_filter_option_pairs(expr, head, options)?;
     let mut object = Map::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let (key_expr, key, value) = filter_option_pair(pair, head)?;
         let option = occurrence_option_for_rql_label(key).ok_or_else(|| {
             lower_error(
@@ -3675,7 +3675,7 @@ fn arity_value(expr: &Expr, tail: &[Expr]) -> LowerResult<Value> {
         ));
     }
     let mut object = Map::new();
-    for pair in tail.chunks_exact(2) {
+    for pair in tail.as_chunks::<2>().0 {
         let key = pair[0]
             .as_symbol()
             .ok_or_else(|| lower_error(&pair[0], "(arity ...) bound names must be :min or :max"))?;

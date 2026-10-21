@@ -2059,9 +2059,12 @@ fn java_native_type_prefix_obscures_package_only_after_complete_lookup() {
         .iter()
         .find(|diagnostic| diagnostic.kind == "incomplete_binding")
         .expect("unproved prefix retains its incompleteness reasons");
+    // MissingTypes prefix ambiguity, the unresolved on-demand import that
+    // may supply MissingTypes, Nested constructor applicability, and Nested
+    // type ambiguity all remain open without a binding for MissingTypes.
     assert_eq!(
         binding.message.matches("UnsupportedSemantic(").count(),
-        3,
+        4,
         "{missing:?}"
     );
 }

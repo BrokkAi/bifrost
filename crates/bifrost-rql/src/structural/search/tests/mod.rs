@@ -1,12 +1,23 @@
 use super::results::CodeQueryRowScalarRef;
 use super::*;
+use crate::analyzer::AnalyzerConfig;
+use crate::analyzer::AnalyzerDelegate;
+use crate::analyzer::CodeUnitType;
+use crate::analyzer::JavaAnalyzer;
+use crate::analyzer::JavascriptAnalyzer;
+use crate::analyzer::MultiAnalyzer;
+use crate::analyzer::OverlayProject;
+use crate::analyzer::RustAnalyzer;
+use crate::analyzer::ScalaAnalyzer;
+use crate::analyzer::TestProject;
+use crate::analyzer::TypescriptAnalyzer;
+use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{
-    AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CodeUnitType, CppAnalyzer, GoAnalyzer,
-    JavaAnalyzer, JavascriptAnalyzer, MultiAnalyzer, OverlayProject, PhpAnalyzer, PythonAnalyzer,
-    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TestProject, TypescriptAnalyzer, WorkspaceAnalyzer,
-};
+use brokk_bifrost_go_analysis::analyzer::GoAnalyzer;
+
 use crate::structural::CodeQuery;
+use brokk_bifrost_csharp_analysis::CSharpAnalyzer;
+use brokk_bifrost_php_analysis::PhpAnalyzer;
 use serde_json::json;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -50,3 +61,9 @@ mod rust_task_and_callback;
 mod selected_edges;
 mod unit_partition_properties;
 mod units;
+
+use brokk_bifrost_ruby_analysis::RubyAnalyzer;
+
+use brokk_bifrost_cpp_analysis::analyzer::CppAnalyzer;
+
+use brokk_bifrost_python_analysis::PythonAnalyzer;

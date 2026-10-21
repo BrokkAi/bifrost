@@ -19,6 +19,7 @@ const CRATE_PACKAGES = [
   "brokk-bifrost-ruby",
   "brokk-bifrost-rust",
   "brokk-bifrost-analysis",
+  "brokk-bifrost-tools",
   "brokk-bifrost-flow",
   "brokk-bifrost-rql",
   "brokk-bifrost-policy",

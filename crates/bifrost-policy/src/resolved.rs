@@ -72,6 +72,12 @@ pub enum SelectorOrigin {
     Catalog {
         catalog: ResolvedCatalogIdentity,
     },
+    /// The union of one reviewed declaration-selection document's selectors
+    /// (#5931). The path is provenance; the query is the selection's meaning.
+    DeclarationSelection {
+        reference: WorkspaceRelativePath,
+        source: PolicySourceIdentity,
+    },
 }
 
 /// The fully loaded selector body.
@@ -3000,9 +3006,15 @@ fn validate_authored_selector_at(
 ) -> Result<(), LoadedModelError> {
     let path = PolicySelectorPath::new(path)
         .map_err(|error| LoadedModelError::CanonicalProjection(error.to_string()))?;
-    let resolved = selectors
-        .get(&path)
-        .ok_or_else(|| LoadedModelError::MissingSelectorPath { path: path.clone() })?;
+    let Some(resolved) = selectors.get(&path) else {
+        // A registry without a workspace defers a declaration-selection
+        // import: the authored reference stays the binding's identity and
+        // the plan cannot execute until a workspace activation resolves it.
+        if matches!(authored, PolicySelector::DeclarationSelection(_)) {
+            return Ok(());
+        }
+        return Err(LoadedModelError::MissingSelectorPath { path });
+    };
     validate_authored_selector_resolution(authored, resolved)
 }
 
@@ -3074,6 +3086,21 @@ fn validate_authored_selector_resolution(
                 || expected_version.is_some_and(|version| version != resolved_schema.version)
             {
                 return invalid("resolved file selector version precedence is inconsistent");
+            }
+        }
+        PolicySelector::DeclarationSelection(authored) => {
+            let SelectorOrigin::DeclarationSelection { reference, .. } = &resolved.origin else {
+                return invalid("resolved declaration selection lacks its document provenance");
+            };
+            let Some((_, query)) = resolved.as_query() else {
+                return invalid("resolved declaration selection is not a query");
+            };
+            if reference != &authored.path
+                || query.validate_row_fields().ok() != authored.shape.validate_row_fields().ok()
+            {
+                return invalid(
+                    "resolved declaration selection differs from its authored reference",
+                );
             }
         }
     }
@@ -3353,13 +3380,40 @@ fn validate_selector_closure(
         .iter()
         .map(|selector| selector.path.clone())
         .collect();
-    if let Some(path) = expected.difference(&actual).min().cloned() {
+    let deferred = deferrable_selector_paths(definition)?;
+    if let Some(path) = expected
+        .difference(&actual)
+        .filter(|path| !deferred.contains(*path))
+        .min()
+        .cloned()
+    {
         return Err(LoadedModelError::MissingSelectorPath { path });
     }
     if let Some(path) = actual.difference(&expected).min().cloned() {
         return Err(LoadedModelError::UnexpectedSelectorPath { path });
     }
     Ok(())
+}
+
+/// Bindings over a declaration-selection import, whose selector a registry
+/// without a workspace leaves unresolved (#5931).
+fn deferrable_selector_paths(
+    definition: &PolicyDefinition,
+) -> Result<HashSet<PolicySelectorPath>, LoadedModelError> {
+    let PolicyAnalysis::Assertion { spec } = &definition.analysis else {
+        return Ok(HashSet::new());
+    };
+    spec.relational
+        .iter()
+        .flat_map(|plan| &plan.bindings)
+        .filter(|binding| {
+            matches!(
+                binding.source,
+                RowBindingSource::Query(PolicySelector::DeclarationSelection(_))
+            )
+        })
+        .map(|binding| selector_path(&relational_binding_selector_path(&binding.name)))
+        .collect()
 }
 
 fn expected_selector_paths(

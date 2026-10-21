@@ -197,7 +197,7 @@ fn validate_wrapper(
     }
     if form == RqlForm::DependencyEvidence {
         analysis.path(child_path(path, "dependency_evidence"), head_range.clone());
-        for pair in args.chunks_exact(2) {
+        for pair in args.as_chunks::<2>().0 {
             let Some(label) = pair[0].as_symbol() else {
                 analysis.error(
                     pair[0].range.clone(),
@@ -766,7 +766,7 @@ fn validate_wrapper(
                 .unwrap_or(0);
             let step_path = format!("{}[{steps}]", child_path(path, "steps"));
             let mut seen = std::collections::HashSet::new();
-            for pair in options.chunks_exact(2) {
+            for pair in options.as_chunks::<2>().0 {
                 let Some(option) = pair[0]
                     .as_symbol()
                     .and_then(|label| QueryStepOp::AbsentMember.option_for_rql_label(label))
@@ -829,7 +829,7 @@ fn validate_wrapper(
                 .unwrap_or(0);
             let step_path = format!("{}[{steps}]", child_path(path, "steps"));
             let mut seen = std::collections::HashSet::new();
-            for pair in options.chunks_exact(2) {
+            for pair in options.as_chunks::<2>().0 {
                 let Some(option) = pair[0]
                     .as_symbol()
                     .and_then(|label| QueryStepOp::Witness.option_for_rql_label(label))
@@ -1231,7 +1231,7 @@ fn validate_path_source_options(args: &[Expr], analysis: &mut Analysis) {
         }
         return;
     }
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         let Some(key) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -1276,7 +1276,7 @@ fn validate_segments_of_options(args: &[Expr], analysis: &mut Analysis) {
         }
         return;
     }
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         let Some(key) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -1327,7 +1327,7 @@ fn validate_jsx_attribute_value_wrapper(args: &[Expr], query: &Expr, analysis: &
         .collect::<Vec<_>>()
         .join(", ");
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -1470,7 +1470,7 @@ fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut
     let mut container = None;
     let mut runtime_label = None;
     let mut global_label = None;
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -1794,7 +1794,7 @@ fn validate_call_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
     };
     let permits_depth = matches!(form, RqlForm::Callers | RqlForm::Callees);
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(key) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -1869,7 +1869,7 @@ fn validate_environment_options(
         return;
     }
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -1958,7 +1958,7 @@ fn validate_decorator_binding_options(options: &[Expr], analysis: &mut Analysis)
         return;
     }
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -2030,7 +2030,7 @@ fn validate_occurrence_options(form: RqlForm, options: &[Expr], analysis: &mut A
         return;
     }
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -2173,7 +2173,7 @@ fn validate_resolved_call_wrapper(
         .unwrap_or(0);
     let step_path = format!("{}[{steps}]", child_path(path, "steps"));
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -2309,7 +2309,7 @@ fn validate_resolved_value_wrapper(
         .unwrap_or(0);
     let step_path = format!("{}[{steps}]", child_path(path, "steps"));
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -2461,7 +2461,7 @@ fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analys
     };
 
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let key = &pair[0];
         let value = &pair[1];
         let Some((canonical, _)) =
@@ -2509,7 +2509,7 @@ fn validate_edge_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
     };
 
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let key = &pair[0];
         let value = &pair[1];
         let Some((canonical, _)) =
@@ -2634,7 +2634,7 @@ fn validate_constrained_option_wrapper(
         .collect::<Vec<_>>()
         .join(", ");
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let key = &pair[0];
         let value = &pair[1];
         let Some(label) = key.as_symbol() else {
@@ -2981,7 +2981,7 @@ fn validate_arity_predicate_args(
     let mut seen_bounds = HashSet::new();
     let mut min = None;
     let mut max = None;
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         let Some(key) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -3897,7 +3897,7 @@ fn validate_cross_domain_options(
         return;
     }
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),
@@ -3982,7 +3982,7 @@ fn validate_cross_domain_relation(expr: &Expr, relation_path: &str, analysis: &m
         );
         return;
     }
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let field = pair[0].as_symbol().and_then(|label| match form {
             RqlForm::ConfigurationKey => {
                 schema::configuration_key_relation_field_for_rql_label(label).map(|field| {
@@ -4135,7 +4135,7 @@ fn validate_configuration_facts_options(form: RqlForm, options: &[Expr], analysi
         return;
     }
     let mut seen = HashSet::new();
-    for pair in options.chunks_exact(2) {
+    for pair in options.as_chunks::<2>().0 {
         let Some(label) = pair[0].as_symbol() else {
             analysis.error(
                 pair[0].range.clone(),

@@ -1,12 +1,24 @@
 use super::ScalaAdapter;
+use super::source_storage::ScalaSourceStorage;
 use crate::analyzer::store::GenerationId;
 use crate::analyzer::{ProjectFile, TreeSitterAnalyzer};
 use crate::hash::HashMap;
 use git2::Oid;
 use std::sync::Arc;
 
-impl TreeSitterAnalyzer<ScalaAdapter> {
-    pub(crate) fn canonical_scala_source_facts(
+pub(crate) trait ScalaSourceFacts {
+    fn canonical_scala_source_facts(
+        &self,
+        file: &ProjectFile,
+        cache: &moka::sync::Cache<
+            (GenerationId, Oid, ProjectFile),
+            Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>,
+        >,
+    ) -> Option<Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>>;
+}
+
+impl ScalaSourceFacts for TreeSitterAnalyzer<ScalaAdapter> {
+    fn canonical_scala_source_facts(
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<

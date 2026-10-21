@@ -688,9 +688,20 @@ struct ProgressReporter {
     request_id: Value,
     workspace_generation: u64,
     last_build_revision: Mutex<Option<(u64, u64)>>,
+    /// When the last build-counter notification went out. The build revision
+    /// moves on every persisted batch, and the 100 ms poll would otherwise
+    /// forward each move: a cold build of a large repository sent ~10
+    /// notifications a second, each carrying up to 8 KB of counters, for the
+    /// whole build (#5990). A client only needs a recent snapshot, so plain
+    /// counter updates are spaced out; a status change still sends at once.
+    last_build_sent: Mutex<Option<Instant>>,
     minimum_build_generation: u64,
     task_id: Option<String>,
 }
+
+/// Minimum spacing between two build-counter progress notifications of one
+/// request. Phase and status notifications are not spaced.
+const BUILD_PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 impl ProgressReporter {
     /// A reporter for this request, or `None` when the caller did not opt in.
@@ -722,6 +733,7 @@ impl ProgressReporter {
                 0
             },
             last_build_revision: Mutex::new(None),
+            last_build_sent: Mutex::new(None),
             task_id: None,
         })
     }
@@ -749,6 +761,23 @@ impl ProgressReporter {
         }
     }
 
+    /// A poll-driven counter update: forwarded only when the previous
+    /// build-counter notification is at least `BUILD_PROGRESS_MIN_INTERVAL`
+    /// old. A skipped poll records nothing, so the first poll after the
+    /// interval forwards the newest revision. Completion and cancellation go
+    /// through [`Self::workspace`] directly and are never spaced.
+    async fn workspace_tick(&self, service: &SearchToolsService) {
+        let recently_sent = self
+            .last_build_sent
+            .lock()
+            .expect("progress send-time lock poisoned")
+            .is_some_and(|sent| sent.elapsed() < BUILD_PROGRESS_MIN_INTERVAL);
+        if recently_sent {
+            return;
+        }
+        self.workspace(service, None).await;
+    }
+
     async fn workspace(&self, service: &SearchToolsService, request_status: Option<&str>) {
         if service.workspace_generation() != self.workspace_generation {
             return;
@@ -769,6 +798,10 @@ impl ProgressReporter {
                 return;
             }
             *last = Some(revision);
+            *self
+                .last_build_sent
+                .lock()
+                .expect("progress send-time lock poisoned") = Some(Instant::now());
         }
         let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
         let mut params =
@@ -1567,7 +1600,7 @@ impl BifrostMcpHandler {
                         .await;
                 }
                 _ = build_ticks.tick(), if progress.is_some() => {
-                    progress.unwrap().workspace(&service, None).await;
+                    progress.unwrap().workspace_tick(&service).await;
                 }
                 output = &mut output => {
                     if let Some(progress) = progress { progress.workspace(&service, if bifrost_cancellation.is_cancelled() { Some("cancelled") }
@@ -1890,7 +1923,7 @@ async fn run_tool_as_task(
                 TaskExit::Error(ErrorData::internal_error(format!("task readiness wait panicked: {error}"), None))
             })?,
             _ = build_ticks.tick(), if progress.is_some() => {
-                progress.as_ref().unwrap().workspace(&service, None).await;
+                progress.as_ref().unwrap().workspace_tick(&service).await;
             }
         }
     };
@@ -2559,7 +2592,7 @@ impl ServerHandler for BifrostMcpHandler {
                         ErrorData::internal_error(format!("workspace readiness wait panicked: {error}"), None)
                     })?,
                     _ = ticks.tick(), if progress.is_some() => {
-                        progress.as_ref().unwrap().workspace(&service, None).await;
+                        progress.as_ref().unwrap().workspace_tick(&service).await;
                     }
                 }
             };

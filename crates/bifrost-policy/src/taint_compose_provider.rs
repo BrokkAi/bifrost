@@ -21,6 +21,7 @@
 //! except the frontier's endpoint matches and the call dispatches, which live
 //! in a [`CompositionMemo`] the policy run holds across its composed batches.
 
+use brokk_bifrost_rust_analysis::{RustStdBuiltinCall, rust_std_builtin_call};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -36,8 +37,7 @@ use brokk_bifrost_analysis::analyzer::semantic::partial_flow::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    GapOpenness, ProcedureOpenness, RustStdBuiltinCall, abort_paths_run_user_code,
-    classify_gap_openness, rust_std_builtin_call,
+    GapOpenness, ProcedureOpenness, abort_paths_run_user_code, classify_gap_openness,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     AccessPathRoot, BarrierObservation, CallArgumentEndpoint, CallBinding, CallBindings,

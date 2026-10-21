@@ -17,7 +17,18 @@ const PHP = "brokk-bifrost-php";
 const PYTHON = "brokk-bifrost-python";
 const RUBY = "brokk-bifrost-ruby";
 const RUST = "brokk-bifrost-rust";
+const SEMANTIC = "brokk-bifrost-semantic";
+const STORE = "brokk-bifrost-store";
 const ANALYSIS = "brokk-bifrost-analysis";
+const RUST_ANALYSIS = "brokk-bifrost-rust-analysis";
+const GO_ANALYSIS = "brokk-bifrost-go-analysis";
+const PYTHON_ANALYSIS = "brokk-bifrost-python-analysis";
+const CSHARP_ANALYSIS = "brokk-bifrost-csharp-analysis";
+const PHP_ANALYSIS = "brokk-bifrost-php-analysis";
+const CPP_ANALYSIS = "brokk-bifrost-cpp-analysis";
+const JS_TS_ANALYSIS = "brokk-bifrost-js-ts-analysis";
+const RUBY_ANALYSIS = "brokk-bifrost-ruby-analysis";
+const TOOLS = "brokk-bifrost-tools";
 const FLOW = "brokk-bifrost-flow";
 const RQL = "brokk-bifrost-rql";
 const POLICY = "brokk-bifrost-policy";
@@ -38,7 +49,18 @@ const EXPECTED_MEMBERS = new Set([
   PYTHON,
   RUBY,
   RUST,
+  SEMANTIC,
+  STORE,
   ANALYSIS,
+  GO_ANALYSIS,
+  RUST_ANALYSIS,
+  PYTHON_ANALYSIS,
+  CSHARP_ANALYSIS,
+  PHP_ANALYSIS,
+  CPP_ANALYSIS,
+  RUBY_ANALYSIS,
+  JS_TS_ANALYSIS,
+  TOOLS,
   FLOW,
   RQL,
   POLICY,
@@ -47,18 +69,27 @@ const EXPECTED_MEMBERS = new Set([
   SEMANTIC_PACKS,
   TEST_MACROS,
 ]);
-// Core is the bottom of the graph and depends on no workspace package; the
-// analysis crate sits above core and the language crates. Flow owns solver
-// engines above analysis, and RQL owns query execution above flow.
-// The per-language crates (cpp, csharp, go,
-// jvm, php, python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
-// language's knowledge out of the analysis compilation unit. `jvm` is one crate
-// for Java, Scala and Kotlin because the JVM source realm makes their routes
-// mutually dependent and all three share one `JvmAnalyzerConfig`; `js-ts` is one
-// crate for JavaScript and TypeScript for the same reason -- one module, one
-// `EdgePassId`, one usage strategy and one `JsTsAnalyzerConfig`. Policy
-// composes analysis, flow, and RQL.
+// Core is the bottom of the graph. Language knowledge crates depend on core
+// alone; the shared analysis engine sits above those crates. Extracted language
+// implementation crates (such as ruby-analysis) sit ABOVE the engine and depend
+// on it plus their own knowledge crate. Tools assembles the implementations.
+// Flow owns solvers above analysis; RQL owns query execution above flow; policy
+// composes analysis, flow and RQL. JVM and JS/TS each share a knowledge crate
+// because their languages share a source realm and analyzer configuration.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
+  [STORE, new Set([
+    CORE,
+    SEMANTIC,
+    "brokk-bifrost-cpp",
+    "brokk-bifrost-csharp",
+    "brokk-bifrost-go",
+    "brokk-bifrost-js-ts",
+    "brokk-bifrost-jvm",
+    "brokk-bifrost-php",
+    "brokk-bifrost-python",
+    "brokk-bifrost-ruby",
+    "brokk-bifrost-rust",
+  ])],
   [CORE, new Set()],
   [CPP, new Set([CORE])],
   [CSHARP, new Set([CORE])],
@@ -69,24 +100,48 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [SEMANTIC, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [ANALYSIS, new Set([CORE, SEMANTIC, STORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [GO_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, GO])],
+  [CPP_ANALYSIS, new Set([CORE, ANALYSIS, CPP])],
+  [CSHARP_ANALYSIS, new Set([CORE, ANALYSIS, CSHARP, SEMANTIC])],
+  [PYTHON_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, PYTHON])],
+  [PHP_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, PHP])],
+  [RUBY_ANALYSIS, new Set([CORE, ANALYSIS, RUBY])],
+  [JS_TS_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, JS_TS])],
+  [TOOLS, new Set([RUST_ANALYSIS, GO_ANALYSIS, CORE, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, CPP, GO, PHP, PYTHON, RUST])],
   [FLOW, new Set([CORE, ANALYSIS])],
   // Query execution uses the C++, Python, JVM and JS/TS crates' structured
   // grammar hooks. JS/TS property rules reuse the syntax and TypeScript object
   // helpers; these language crates remain below analysis and depend on core.
-  [RQL, new Set([CORE, ANALYSIS, FLOW, CPP, PYTHON, JVM, JS_TS])],
-  [POLICY, new Set([ANALYSIS, FLOW, RQL])],
-  [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
+  [RQL, new Set([RUST_ANALYSIS, GO_ANALYSIS, TOOLS, CORE, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW, CPP, PYTHON, JVM, JS_TS])],
+  [POLICY, new Set([RUST_ANALYSIS, TOOLS, ANALYSIS, FLOW, RQL])],
+  [SEMANTIC_PACKS, new Set([RUST_ANALYSIS, GO_ANALYSIS, ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
-  [MCP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
-  [FACADE, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, MCP, SEMANTIC_PACKS, RQL])],
+  [MCP, new Set([TOOLS, ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
+  [FACADE, new Set([RUST_ANALYSIS, GO_ANALYSIS, TOOLS, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW, POLICY, RUNTIME, MCP, SEMANTIC_PACKS, RQL])],
+  [RUST_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, RUST])],
 ]);
 // The private facade integration suites exercise parser and identity contracts
 // directly. These edges are permitted only for tests, never production or builds.
 const ALLOWED_DEVELOPMENT_DEPENDENCIES = new Map([
-  [FACADE, new Set([CORE, JS_TS, JVM])],
+  [MCP, new Set([GO_ANALYSIS])],
+  [TOOLS, new Set([JS_TS, SEMANTIC, RUBY])],
+  [FLOW, new Set([TOOLS])],
+  [RUNTIME, new Set([TOOLS])],
+  [SEMANTIC_PACKS, new Set([GO_ANALYSIS, TOOLS, JS_TS_ANALYSIS])],
+  [RQL, new Set([GO_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS])],
+  [POLICY, new Set([CPP_ANALYSIS, PYTHON_ANALYSIS, JS_TS_ANALYSIS])],
+  [FACADE, new Set([CORE, JS_TS, JVM, JS_TS_ANALYSIS])],
+]);
+// Optional production edges for feature-gated binaries. Only tools defines the
+// complete language table the engine links by symbol, so the release-tooling
+// `bifrost-semantic-pack` binary needs it; the library itself must not.
+const ALLOWED_OPTIONAL_DEPENDENCIES = new Map([
+  [SEMANTIC_PACKS, new Set([TOOLS])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
+  [STORE, new Set()],
   [CORE, new Set()],
   [CPP, new Set([CORE])],
   [CSHARP, new Set([CORE])],
@@ -97,14 +152,24 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [SEMANTIC, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [ANALYSIS, new Set([CORE, SEMANTIC, STORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [GO_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, GO])],
+  [CPP_ANALYSIS, new Set([CORE, ANALYSIS, CPP])],
+  [CSHARP_ANALYSIS, new Set([CORE, ANALYSIS, CSHARP])],
+  [PHP_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, PHP])],
+  [PYTHON_ANALYSIS, new Set([CORE, ANALYSIS, PYTHON])],
+  [RUBY_ANALYSIS, new Set([CORE, ANALYSIS, RUBY])],
+  [JS_TS_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, JS_TS])],
+  [TOOLS, new Set([RUST_ANALYSIS, GO_ANALYSIS, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS])],
   [FLOW, new Set([CORE, ANALYSIS])],
-  [RQL, new Set([CORE, ANALYSIS, FLOW])],
-  [POLICY, new Set([ANALYSIS, FLOW, RQL])],
-  [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
+  [RQL, new Set([RUST_ANALYSIS, GO_ANALYSIS, CORE, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW])],
+  [POLICY, new Set([RUST_ANALYSIS, ANALYSIS, FLOW, RQL])],
+  [SEMANTIC_PACKS, new Set([RUST_ANALYSIS, GO_ANALYSIS, ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
   [MCP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
   [FACADE, new Set()],
+  [RUST_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, RUST])],
 ]);
 const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   // Model and tokenizer dependencies remain prohibited in low-level crates.
@@ -148,6 +213,10 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   ],
   [
     RUST,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    SEMANTIC,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [
@@ -231,7 +300,9 @@ export function validateWorkspaceGraph(metadata) {
         // The shared test marker is available everywhere, but never at runtime.
         (dependency.name === TEST_MACROS && dependency.kind === "dev") ||
         (dependency.kind === "dev" &&
-          ALLOWED_DEVELOPMENT_DEPENDENCIES.get(pkg.name)?.has(dependency.name));
+          ALLOWED_DEVELOPMENT_DEPENDENCIES.get(pkg.name)?.has(dependency.name)) ||
+        (dependency.kind == null && dependency.optional === true &&
+          ALLOWED_OPTIONAL_DEPENDENCIES.get(pkg.name)?.has(dependency.name));
       if (EXPECTED_MEMBERS.has(dependency.name) && !isAllowed) {
         errors.push(`${pkg.name} must not depend on workspace package ${dependency.name}`);
       }

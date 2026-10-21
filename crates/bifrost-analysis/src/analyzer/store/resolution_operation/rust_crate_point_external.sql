@@ -13,7 +13,7 @@ SELECT DISTINCT mount.mount_ordinal, json_extract(binding.end_fixed_key,'$[#-2][
   ON gap.summary_id=unit.summary_id AND gap.gap_kind='external_dependency'
   AND gap.subject=targets.module_path || '::' || targets.name
  CROSS JOIN json_each(gap.detail, '$.evidence') AS evidence
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=unit.summary_id AND source.module_path=targets.module_path
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal

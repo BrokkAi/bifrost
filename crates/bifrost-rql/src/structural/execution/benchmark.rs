@@ -817,7 +817,9 @@ fn timing_summary(samples: &[ExecutionSample], mode: ExecutionMode) -> TimingSum
 
 fn paired_profiling_overhead_median_pct(samples: &[ExecutionSample]) -> f64 {
     let mut pairs = samples
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let profiled = pair
                 .iter()

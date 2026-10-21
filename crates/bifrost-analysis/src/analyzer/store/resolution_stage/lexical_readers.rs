@@ -401,7 +401,7 @@ CROSS JOIN temp.selected_resolution_scope_mounts AS scope ON scope.mount_ordinal
 WHERE (?1 IS NULL OR scope.mount_ordinal IN (SELECT value FROM json_each(?1)))
  AND (r.value ->> 2 = 0 OR (json_extract(p.body, '$[8][0][0]') = 0
   AND json_extract(p.body, '$[8][0][1]') = 0))"#, root=codec::encode_node(BindingNodeId::universal_root()));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(10, sql.capacity());
         sql
     })
@@ -1197,11 +1197,11 @@ pub(in crate::analyzer::store) fn lexical_definitions(
     Option<
         Vec<(
             SemanticId,
-            crate::analyzer::lexical_definitions::LexicalDefinition,
+            crate::analyzer::resolution::lexical_definition::LexicalDefinition,
         )>,
     >,
 > {
-    use crate::analyzer::lexical_definitions::LexicalDefinition;
+    use crate::analyzer::resolution::lexical_definition::LexicalDefinition;
     use crate::analyzer::{DeclarationKind, Range};
     let parameters = serde_json::to_string(
         &requests
@@ -1270,7 +1270,7 @@ pub(in crate::analyzer::store) fn candidate_unconditional_sql() -> &'static str 
         "WITH raw_gaps(host,reason_key,origin,covers,gap_key) AS (SELECT fact.host_ordinal,fact.reason_key,fact.origin,fact.covers,fact.gap_key FROM temp.selected_resolution_stage_gaps fact JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal WHERE fact.covers IN(0,:inventory_cover) AND (:scope IS NULL OR fact.host_ordinal IN(SELECT value FROM json_each(:scope)))) SELECT g.reason_key FROM raw_gaps g WHERE {} AND (g.covers=0 OR (g.host,g.gap_key) NOT IN(SELECT input.value->>0,input.value->>1 FROM json_each(:excluded) input))",
         super::frontier_completion::effective_gap_remains_sql(),
     );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(11, sql.capacity());
         sql
     })
@@ -1284,7 +1284,7 @@ pub(in crate::analyzer::store) fn candidate_branches_sql() -> &'static str {
         let suffix = " CROSS JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal WHERE (:scope IS NULL OR fact.host_ordinal IN(SELECT value FROM json_each(:scope)))";
         format!("WITH raw_gaps(request_ordinal,host,reason_key,origin,gap_key) AS ({base} AND fact.lookup_key IS NULL AND fact.lookup_shared IS NULL{suffix} UNION ALL {base} AND fact.lookup_key IS input.value->>1 AND fact.lookup_shared IS input.value->>2{suffix} AND input.value->>3=1 UNION ALL {base}{suffix} AND input.value->>3=2 AND (fact.lookup_key IS NOT NULL OR fact.lookup_shared IS NOT NULL)) SELECT g.request_ordinal,g.reason_key FROM raw_gaps g WHERE {} AND (g.host,g.gap_key) NOT IN(SELECT input.value->>0,input.value->>1 FROM json_each(:excluded) input)",super::frontier_completion::effective_gap_remains_sql())
     };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(12, sql.capacity());
         sql
     })
@@ -1920,7 +1920,7 @@ CROSS JOIN temp.selected_resolution_scope_mounts scope
                 root = codec::encode_node(BindingNodeId::universal_root())
             )
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(
             13,
             sql.capacity(),

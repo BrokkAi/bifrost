@@ -1,12 +1,14 @@
 use crate::analyzer::resolution::{
     AnswerMap, CallApplicabilityAdapter, CallTypeSubstitution, CandidateAssessment,
-    ConversionEvidence, FactEvaluation, InternedFactRow, IntrinsicCallType,
-    LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty, MappingAssessment,
-    PartialOrder, ResolutionAnswer, ResolutionCompletion, SelectedTypedRow, SemanticId, StateMap,
+    ConversionEvidence, FactEvaluation, ImplicitReceiverLookup, ImplicitReceiverScopeKind,
+    InternedFactRow, IntrinsicCallType, LoweredCallApplicabilityObligation,
+    LoweredCallableSignatureProperty, MappingAssessment, PartialOrder, ResolutionAnswer,
+    ResolutionCompletion, SelectedTypedRow, SemanticId, StateMap,
 };
 use crate::analyzer::store::Result;
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 
 pub(super) static JAVA_CALL_APPLICABILITY_ADAPTER: JavaCallApplicabilityAdapter =
@@ -15,6 +17,20 @@ pub(super) static JAVA_CALL_APPLICABILITY_ADAPTER: JavaCallApplicabilityAdapter 
 pub(crate) struct JavaCallApplicabilityAdapter;
 
 impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
+    fn implicit_receiver_lookup(&self) -> Option<ImplicitReceiverLookup> {
+        Some(ImplicitReceiverLookup::FirstMemberName)
+    }
+
+    fn implicit_receiver_scope_kind(
+        &self,
+        kind: ResolutionScopeKind,
+    ) -> Option<ImplicitReceiverScopeKind> {
+        match kind {
+            ResolutionScopeKind::TypeBody => Some(ImplicitReceiverScopeKind::Dispatch),
+            _ => None,
+        }
+    }
+
     fn has_intrinsic_call_type_table(&self) -> bool {
         true
     }

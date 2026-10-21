@@ -14,4 +14,6 @@ pub use brokk_bifrost_analysis::{CancellationToken, analyzer};
 pub use brokk_bifrost_flow as flow;
 pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_rql as rql;
+#[cfg(test)]
+use brokk_bifrost_tools as _;
 pub use code_intelligence::CodeIntelligenceRuntime;

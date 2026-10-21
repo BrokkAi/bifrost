@@ -3,6 +3,8 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { CHECKSUM_CORRECTION_PATHS } from "./sync-release-checksums.mjs";
+
 export const SCHEMA_VERSION = "4";
 
 export const COMPONENTS = Object.freeze([
@@ -135,7 +137,10 @@ const EXTRACTED_LANGUAGE_PATHS = [
     reason: "extracted language crate source or resources",
   },
   {
-    prefixes: ["crates/bifrost-analysis/src/analyzer/semantic_model/"],
+    prefixes: [
+      "crates/bifrost-analysis/src/analyzer/semantic_model/",
+      "crates/bifrost-semantic/src/analyzer/semantic_model/",
+    ],
     components: SEMANTIC_PACK_SOURCE_COMPONENTS,
     reason: "shared semantic-pack producer source",
   },
@@ -185,7 +190,7 @@ function isRqlTestPath(path) {
 
 function isMcpPath(path) {
   return (
-    startsWithAny(path, ["crates/bifrost-mcp/", "crates/bifrost-analysis/src/searchtools/"])
+    startsWithAny(path, ["crates/bifrost-mcp/", "crates/bifrost-tools/src/searchtools/"])
   );
 }
 
@@ -232,6 +237,7 @@ function isRustPath(path) {
   return startsWithAny(path, [
     "src/",
     "crates/bifrost-analysis/src/",
+    "crates/bifrost-tools/src/",
     "crates/bifrost-core/src/",
     "crates/bifrost-flow/src/",
     "crates/bifrost-policy/src/",
@@ -279,6 +285,7 @@ function classifyPath(path) {
   }
   if (
     path.startsWith("crates/bifrost-analysis/src/analyzer/semantic_model/csmi/") ||
+    path.startsWith("crates/bifrost-semantic/src/analyzer/semantic_model/csmi/") ||
     path === "crates/bifrost-semantic-packs/src/bin/bifrost-semantic-pack.rs"
   ) {
     return {
@@ -384,7 +391,7 @@ export function classifyChangeSet(input) {
   return classifyComponents(input);
 }
 
-function classifyComponents({ eventName, ref = "", changedPaths = [], diffFailed = false }) {
+function classifyComponents({ eventName, ref = "", changedPaths = [], diffFailed = false, singleCommit = false }) {
   if (eventName === "merge_group") {
     return fullDecision("merge queue requires the full matrix", changedPaths);
   }
@@ -392,6 +399,20 @@ function classifyComponents({ eventName, ref = "", changedPaths = [], diffFailed
     return fullDecision("release-candidate manual dispatch requires the full matrix", changedPaths);
   }
   if (eventName === "push" && isVersionRcRef(ref)) {
+    // The launcher checksum correction (sync-release-metadata.yml) is one commit
+    // that rewrites only the checksum projections. No Rust, Python or lint leg
+    // reads them, and the verifier takes those legs' evidence from the parent,
+    // so the push runs quick policy and the plugin legs that do read them.
+    if (!diffFailed && singleCommit && changedPaths.length > 0
+      && changedPaths.every((path) => CHECKSUM_CORRECTION_PATHS.includes(path))) {
+      return {
+        schemaVersion: SCHEMA_VERSION,
+        mode: "checksum",
+        changedPaths,
+        reasons: changedPaths.map((path) => `${path}: launcher checksum correction`),
+        selected: new Set(PLUGIN_COMPONENTS),
+      };
+    }
     return fullDecision("release-candidate push requires the full matrix", changedPaths);
   }
   if (eventName === "push" && ref === "refs/heads/master") {
@@ -467,6 +488,11 @@ function changedPathsFromPushGit(base, head) {
   return changedPathsFromGit([base, head]);
 }
 
+function isParentOf(base, head) {
+  const result = spawnSync("git", ["rev-parse", "--verify", `${head}^`], { encoding: "utf8" });
+  return result.status === 0 && result.stdout.trim() === base;
+}
+
 function writeOutputs(outputPath, decision) {
   const lines = [
     `schema_version=${decision.schemaVersion}`,
@@ -505,6 +531,7 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   let changedPaths = [];
   let diffFailed = false;
+  let singleCommit = false;
   // Pull requests diff from the merge base so changes added only to the base
   // branch do not select validation for a stale PR branch. Pushes compare the
   // prior and current commits directly.
@@ -512,12 +539,14 @@ function main() {
     ({ changedPaths, diffFailed } = changedPathsFromPullRequestGit(options.base, options.head));
   } else if (options.event === "push") {
     ({ changedPaths, diffFailed } = changedPathsFromPushGit(options.base, options.head));
+    singleCommit = isParentOf(options.base, options.head);
   }
   const decision = classifyChangeSet({
     eventName: options.event,
     ref: options.ref,
     changedPaths,
     diffFailed,
+    singleCommit,
   });
   writeOutputs(options.output, decision);
   writeSummary(options.summary, decision);

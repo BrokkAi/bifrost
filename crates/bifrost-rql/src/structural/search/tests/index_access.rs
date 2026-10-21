@@ -84,6 +84,7 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
     let composed_row = PipelineRow {
         value: PipelineValue::Declaration(declaration),
         traces: vec![PipelineTrace {
+            window_order: None,
             branch: Vec::new(),
             seed: Arc::clone(&seed),
             steps: vec![],
@@ -1158,11 +1159,8 @@ fn multi_analyzer_tracks_every_delegate_overlay_generation() {
     let typescript =
         TypescriptAnalyzer::new(Arc::clone(&ts_project) as Arc<dyn crate::analyzer::Project>);
     let analyzer = MultiAnalyzer::new(BTreeMap::from([
-        (Language::Java, AnalyzerDelegate::Java(java)),
-        (
-            Language::TypeScript,
-            AnalyzerDelegate::TypeScript(typescript),
-        ),
+        (Language::Java, AnalyzerDelegate::new(java)),
+        (Language::TypeScript, AnalyzerDelegate::new(typescript)),
     ]));
     let limits = CodeQueryExecutionLimits::default();
 
@@ -1864,4 +1862,64 @@ fn auto_defers_its_snapshot_build_to_the_background_warm_and_scans_until_it_land
     );
     assert_eq!(after_warm.index_hits, 1, "{after_warm:?}");
     assert_eq!(after_warm.index_builds, 0, "{after_warm:?}");
+}
+
+#[hardwon("#5113: procedure rows pinned artifacts until the workspace-wide stage completed")]
+#[test]
+fn semantic_procedure_references_release_windows_and_reject_changed_revisions() {
+    let original = "def target():\n    return 1\n";
+    let changed = "def target():\n    return 2\n";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), "app.py");
+    file.write(original).expect("write source");
+    let overlay = Arc::new(OverlayProject::new(Arc::new(TestProject::new(
+        root,
+        Language::Python,
+    ))));
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+        Arc::clone(&overlay) as Arc<dyn crate::analyzer::Project>,
+        AnalyzerConfig::default(),
+    )
+    .expect("workspace");
+    let mut semantic = SemanticQueryContext::new(
+        &workspace,
+        None,
+        CodeQueryExecutionLimits::default().semantic,
+    );
+    let references = semantic.procedure_references(&file);
+    let reference = references
+        .iter()
+        .find(|reference| reference.public.procedure_kind == "function")
+        .expect("target reference");
+    assert!(
+        semantic.can_start_artifact_windows(),
+        "identity inventory does not lower or retain artifacts"
+    );
+    semantic.start_artifact_window(file.clone());
+    let procedure = semantic
+        .resolve_procedure_reference(reference)
+        .expect("exact reference resolves");
+    let allocation = Arc::downgrade(procedure.handle.artifact());
+    let snapshot = SemanticTraceSnapshot::of(&SemanticPipelineValue::Procedure(procedure.clone()));
+    assert_eq!(
+        serde_json::to_value(snapshot.public_ref()).unwrap(),
+        serde_json::to_value(reference.public_ref()).unwrap()
+    );
+    drop(procedure);
+    semantic.release_artifact_window();
+    assert!(semantic.can_start_artifact_windows());
+    // The analyzer's byte-capped shared cache may retain the allocation, but
+    // a pipeline reference or provenance snapshot never owns that allocation.
+    let before = allocation.strong_count();
+    drop(snapshot);
+    assert_eq!(allocation.strong_count(), before);
+    assert!(overlay.set(file.abs_path(), changed.to_owned()));
+    semantic.start_artifact_window(file.clone());
+    assert!(semantic.resolve_procedure_reference(reference).is_none());
+    semantic.release_artifact_window();
+    assert!(semantic.take_diagnostics().iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+            && diagnostic.message.contains("source generation changed")
+    }));
 }

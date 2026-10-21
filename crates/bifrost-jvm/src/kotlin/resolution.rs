@@ -39,6 +39,24 @@ struct WalkContext {
     callable: Option<ResolutionSiteId>,
     declaration: Option<ResolutionSiteId>,
     singleton_owner: bool,
+    receiver_frame: Option<usize>,
+}
+
+/// A receiver introduced by this file's structured declaration walk. The frame
+/// is extraction-local; its owner/type already use the existing fact families.
+#[derive(Clone, Copy)]
+struct KotlinReceiverFrame<'source> {
+    parent: Option<usize>,
+    label: Option<&'source str>,
+    receiver: KotlinReceiver,
+}
+
+#[derive(Clone, Copy)]
+enum KotlinReceiver {
+    // Only source-named classes/objects have a nominal owner type slot.
+    Dispatch(ResolutionSiteId),
+    AnonymousDispatch(ResolutionSiteId),
+    Extension(ResolutionTypeSlotId),
 }
 
 struct SyntheticParameter<'source> {
@@ -130,7 +148,9 @@ impl KotlinJvmAnnotationProofs {
             if self.has_other_star_import {
                 continue;
             }
-            if self.has_kotlin_jvm_star_import || expected.first() == Some(&"kotlin") {
+            if expected.last() == Some(&local)
+                && (self.has_kotlin_jvm_star_import || expected.first() == Some(&"kotlin"))
+            {
                 return true;
             }
         }
@@ -149,6 +169,8 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     declaration_sources: Vec<(ResolutionSiteId, SourceDeclarationId)>,
     names: HashMap<String, ResolutionNameId>,
     sites_by_node: HashMap<usize, ResolutionSiteId>,
+    initialization_scopes: HashMap<ResolutionSiteId, ResolutionScopeId>,
+    constructor_headers: HashMap<ResolutionSiteId, WalkContext>,
     pending_function_types: Vec<(
         ResolutionTypeSlotId,
         Node<'source>,
@@ -158,6 +180,8 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     type_slots_by_node: HashMap<usize, ResolutionTypeSlotId>,
     expression_slots_by_node: HashMap<(usize, ResolutionTypeSlotRole), ResolutionTypeSlotId>,
     type_identity_slots: HashMap<ResolutionSiteId, ResolutionTypeSlotId>,
+    receiver_frames: Vec<KotlinReceiverFrame<'source>>,
+    anonymous_type_owners: HashSet<ResolutionSiteId>,
     type_sites: HashMap<usize, ResolutionSiteId>,
     type_names: HashMap<ResolutionSiteId, ResolutionNameId>,
     type_simple_names: HashMap<ResolutionSiteId, &'source str>,
@@ -168,6 +192,7 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     handled_identifiers: HashSet<usize>,
     next_parameters: HashMap<ResolutionSiteId, u32>,
     scalar_types_by_declaration: HashMap<ResolutionSiteId, KotlinScalarType>,
+    unstable_smart_cast_bindings: HashSet<ResolutionSiteId>,
     pending_calls: Vec<(
         Node<'source>,
         ResolutionSiteId,
@@ -175,6 +200,7 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
         WalkContext,
     )>,
     pending_constructor_properties: Vec<(ResolutionSiteId, ResolutionSiteId, bool)>,
+    pending_constructor_aliases: Vec<(Node<'source>, ResolutionSiteId, ResolutionScopeId)>,
     pending_constructors: Vec<(ResolutionSiteId, ResolutionSiteId)>,
     /// Declared value slots whose type comes from an initializer or an
     /// expression body, with the expression and its context.
@@ -213,10 +239,14 @@ pub(super) fn extract_kotlin_resolution<'source>(
         declaration_sources: Vec::new(),
         names: HashMap::default(),
         sites_by_node: HashMap::default(),
+        initialization_scopes: HashMap::default(),
+        constructor_headers: HashMap::default(),
         pending_function_types: Vec::new(),
         type_slots_by_node: HashMap::default(),
         expression_slots_by_node: HashMap::default(),
         type_identity_slots: HashMap::default(),
+        receiver_frames: Vec::new(),
+        anonymous_type_owners: HashSet::default(),
         type_sites: HashMap::default(),
         type_names: HashMap::default(),
         type_simple_names: HashMap::default(),
@@ -227,8 +257,10 @@ pub(super) fn extract_kotlin_resolution<'source>(
         handled_identifiers: HashSet::default(),
         next_parameters: HashMap::default(),
         scalar_types_by_declaration: HashMap::default(),
+        unstable_smart_cast_bindings: HashSet::default(),
         pending_calls: Vec::new(),
         pending_constructor_properties: Vec::new(),
+        pending_constructor_aliases: Vec::new(),
         pending_constructors: Vec::new(),
         pending_initializers: Vec::new(),
         pending_initializer_values: Vec::new(),
@@ -261,10 +293,10 @@ impl<'source, 'collector, 'declarations>
             end_byte: self.source.len(),
         });
         let placement = self.add_site(root, ResolutionSiteKind::UnsupportedRoute, root_scope);
-        self.facts.gaps.push(ResolutionGapFact {
-            site: placement,
-            kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-        });
+        self.facts.gaps.push(ResolutionGapFact::new(
+            placement,
+            ResolutionGapKind::UnsupportedPlacementBoundary,
+        ));
         self.record_package(root, placement);
 
         let mut stack = vec![(
@@ -275,21 +307,43 @@ impl<'source, 'collector, 'declarations>
                 callable: None,
                 declaration: None,
                 singleton_owner: false,
+                receiver_frame: None,
             },
         )];
         while let Some((node, mut context)) = stack.pop() {
+            if node.kind() == "delegation_specifier"
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "class_declaration")
+                && let Some(header) = context
+                    .owner_type
+                    .and_then(|owner| self.constructor_headers.get(&owner))
+                    .copied()
+            {
+                context = header;
+                // Delegation arguments share the parameter-default environment,
+                // which never inherits the class's instance-member scope.
+                let scope = &mut self.facts.scopes[context.scope.index()];
+                scope.end_byte = scope.end_byte.max(node.end_byte());
+            }
             if matches!(node.kind(), "class_body" | "enum_class_body") {
                 if node
                     .parent()
                     .is_some_and(|parent| parent.kind() == "object_literal")
                 {
-                    // An object literal is an anonymous type, not another
-                    // body of its enclosing named type. Keep lexical access
-                    // to the parent scope without reusing its type owner.
-                    context.scope =
-                        self.add_scope(node, context.scope, None, ResolutionScopeKind::Block);
-                    context.owner_type = None;
-                    context.declaration = None;
+                    let owner =
+                        self.type_sites[&node.parent().expect("object body has a parent").id()];
+                    let frame = self.receiver_frames.len();
+                    self.receiver_frames.push(KotlinReceiverFrame {
+                        parent: context.receiver_frame,
+                        label: None,
+                        receiver: KotlinReceiver::AnonymousDispatch(owner),
+                    });
+                    context.receiver_frame = Some(frame);
+                    context.owner_type = Some(owner);
+                    context.scope = self.ensure_type_body_scope(owner);
+                    context.callable = None;
+                    context.declaration = Some(owner);
                     context.singleton_owner = false;
                 } else if node
                     .parent()
@@ -298,14 +352,36 @@ impl<'source, 'collector, 'declarations>
                     // Enum-entry overrides are members of the enum class, so
                     // keep them in its canonical type-body scope.
                 } else {
-                    context.scope = self.add_scope(
-                        node,
-                        context.scope,
-                        context.owner_type,
-                        ResolutionScopeKind::TypeBody,
-                    );
+                    let body_scope = context.owner_type.and_then(|owner| {
+                        self.initialization_scopes.get(&owner).map(|scope| {
+                            self.facts.scopes[scope.index()]
+                                .parent
+                                .expect("a class initialization scope has a type-body parent")
+                        })
+                    });
+                    context.scope = body_scope.unwrap_or_else(|| {
+                        self.add_scope(
+                            node,
+                            context.scope,
+                            context.owner_type,
+                            ResolutionScopeKind::TypeBody,
+                        )
+                    });
                 }
-            } else if node.kind() == "block" {
+            } else if node.kind() == "when_expression" {
+                context.scope = self.add_scope(
+                    node,
+                    context.scope,
+                    context.callable,
+                    ResolutionScopeKind::Block,
+                );
+            } else if node.kind() == "anonymous_initializer"
+                && let Some(scope) = context
+                    .owner_type
+                    .and_then(|owner| self.initialization_scopes.get(&owner))
+            {
+                context.scope = *scope;
+            } else if matches!(node.kind(), "block" | "statements") {
                 context.scope = self.add_scope(
                     node,
                     context.scope,
@@ -325,8 +401,31 @@ impl<'source, 'collector, 'declarations>
 
             match node.kind() {
                 "import_header" => self.record_import(node, context.scope),
+                "object_literal" => {
+                    if let Some(body) = first_named_child_of_kind(node, "class_body") {
+                        let site =
+                            self.add_site(body, ResolutionSiteKind::TypeDeclaration, context.scope);
+                        let name =
+                            self.intern_name(&crate::anonymous_type::AnonymousTypeBody::name(body));
+                        let anonymous = crate::anonymous_type::AnonymousTypeBody { site, name };
+                        anonymous.declare(&mut self.facts);
+                        assert!(self.anonymous_type_owners.insert(site));
+                        anonymous.open_scope(&mut self.facts);
+                        self.type_sites.insert(node.id(), site);
+                        self.type_scope_ranges
+                            .insert(site, (body.start_byte(), body.end_byte()));
+                        self.type_scope_parents.insert(site, context.scope);
+                    }
+                }
                 "class_declaration" | "object_declaration" | "companion_object" => {
                     if let Some(site) = self.record_type_declaration(node, context) {
+                        let frame = self.receiver_frames.len();
+                        self.receiver_frames.push(KotlinReceiverFrame {
+                            parent: context.receiver_frame,
+                            label: Some(self.type_simple_names[&site]),
+                            receiver: KotlinReceiver::Dispatch(site),
+                        });
+                        context.receiver_frame = Some(frame);
                         context.owner_type = Some(site);
                         context.declaration = Some(site);
                         context.singleton_owner =
@@ -346,6 +445,21 @@ impl<'source, 'collector, 'declarations>
                 }
                 "function_declaration" => {
                     if let Some(site) = self.record_function(node, context) {
+                        if let Some(receiver) = self.facts.extension_receivers.last()
+                            && receiver.callable == site
+                        {
+                            let frame = self.receiver_frames.len();
+                            self.receiver_frames.push(KotlinReceiverFrame {
+                                parent: context.receiver_frame,
+                                label: Some(kotlin_identifier_text(
+                                    first_named_child_of_kind(node, "simple_identifier")
+                                        .expect("a recorded function has a declaration name"),
+                                    self.source,
+                                )),
+                                receiver: KotlinReceiver::Extension(receiver.receiver_type),
+                            });
+                            context.receiver_frame = Some(frame);
+                        }
                         context.callable = Some(site);
                         context.declaration = Some(site);
                         context.scope = self.add_scope(
@@ -358,6 +472,16 @@ impl<'source, 'collector, 'declarations>
                 }
                 "primary_constructor" | "secondary_constructor" => {
                     if let Some(site) = self.record_constructor(node, context) {
+                        if node.kind() == "primary_constructor"
+                            && named_children(node).into_iter().any(|parameter| {
+                                parameter.kind() == "class_parameter"
+                                    && first_named_child_of_kind(parameter, "binding_pattern_kind")
+                                        .is_none()
+                            })
+                            && let Some(owner) = context.owner_type
+                        {
+                            self.initialization_scope(owner);
+                        }
                         context.callable = Some(site);
                         context.declaration = Some(site);
                         context.scope = self.add_scope(
@@ -366,9 +490,14 @@ impl<'source, 'collector, 'declarations>
                             Some(site),
                             ResolutionScopeKind::Executable,
                         );
+                        if node.kind() == "primary_constructor"
+                            && let Some(owner) = context.owner_type
+                        {
+                            self.constructor_headers.insert(owner, context);
+                        }
                     }
                 }
-                "property_declaration" => self.record_property(node, context),
+                "property_declaration" | "when_subject" => self.record_property(node, context),
                 "assignment" => self.pending_writes.push((node, context)),
                 "prefix_expression" | "postfix_expression"
                     if matches!(kotlin_first_token(node), Some("++" | "--")) =>
@@ -387,16 +516,20 @@ impl<'source, 'collector, 'declarations>
                     self.call_result_slots.insert(node.id(), result);
                     self.pending_calls.push((node, site, result, context));
                 }
+                "check_expression"
+                    if node
+                        .child(1)
+                        .is_some_and(|operator| operator.kind() == "is") => {}
                 "check_expression" => {
                     let site = self.add_site(
                         node,
                         ResolutionSiteKind::UnsupportedExpression,
                         context.scope,
                     );
-                    self.facts.gaps.push(ResolutionGapFact {
+                    self.facts.gaps.push(ResolutionGapFact::new(
                         site,
-                        kind: ResolutionGapKind::UnsupportedExpression,
-                    });
+                        ResolutionGapKind::UnsupportedExpression,
+                    ));
                 }
                 "function_type" => {
                     self.ensure_type_slot(node, context.scope, context.declaration);
@@ -417,16 +550,35 @@ impl<'source, 'collector, 'declarations>
 
             let mut children = named_children(node);
             children.reverse();
-            stack.extend(children.into_iter().map(|child| (child, context)));
+            let initializer = (node.kind() == "property_declaration"
+                && self.type_body_owner(context).is_some())
+            .then(|| {
+                kotlin_expression_after_equals(node)
+                    .or_else(|| first_named_child_of_kind(node, "property_delegate"))
+            })
+            .flatten();
+            for child in children {
+                let mut child_context = context;
+                if initializer == Some(child)
+                    && let Some(scope) = context
+                        .owner_type
+                        .and_then(|owner| self.initialization_scopes.get(&owner))
+                {
+                    child_context.scope = *scope;
+                }
+                stack.push((child, child_context));
+            }
         }
 
         self.finish_synthetic_members(root);
         self.finish_type_body_scopes();
         self.finish_constructor_properties();
         self.finish_constructors();
+        self.finish_constructor_aliases();
         self.finish_initializers();
         self.finish_calls();
         self.finish_writes();
+        self.finish_smart_casts(root);
         self.finish_import_demands();
         self.finish_supertypes(root);
         self.finish_package_references();
@@ -614,12 +766,6 @@ impl<'source, 'collector, 'declarations>
                 .map(|stem| format!("{}Kt", uppercase_first(stem)))
         });
         self.facade_name = facade.map(|name| self.intern_name(&name));
-        if file_annotation.is_some() && self.facade_name.is_none() {
-            self.facts.gaps.push(ResolutionGapFact {
-                site: placement,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            });
-        }
         let declaration = first_named_child_of_kind(root, "package_header").map(|header| {
             self.add_site(
                 header,
@@ -632,27 +778,40 @@ impl<'source, 'collector, 'declarations>
             declaration,
             placement_gap_site: placement,
         });
-        let Some(header) = first_named_child_of_kind(root, "package_header") else {
-            return;
-        };
-        let Some(path) = first_named_child_of_kind(header, "identifier") else {
-            return;
-        };
-        for (ordinal, segment) in named_children(path)
-            .into_iter()
-            .filter(|child| child.kind() == "simple_identifier")
-            .enumerate()
+        if let Some(header) = first_named_child_of_kind(root, "package_header")
+            && let Some(path) = first_named_child_of_kind(header, "identifier")
         {
-            self.handled_identifiers.insert(segment.id());
-            let name = self.intern_name(kotlin_identifier_text(segment, self.source));
-            self.facts
-                .package_segments
-                .push(ResolutionPackageSegmentFact {
-                    root_scope: self.package_scope,
-                    ordinal: u32::try_from(ordinal).expect("Kotlin package path fits u32"),
-                    name,
-                });
-            self.package_names.push(name);
+            for (ordinal, segment) in named_children(path)
+                .into_iter()
+                .filter(|child| child.kind() == "simple_identifier")
+                .enumerate()
+            {
+                self.handled_identifiers.insert(segment.id());
+                let name = self.intern_name(kotlin_identifier_text(segment, self.source));
+                self.facts
+                    .package_segments
+                    .push(ResolutionPackageSegmentFact {
+                        root_scope: self.package_scope,
+                        ordinal: u32::try_from(ordinal).expect("Kotlin package path fits u32"),
+                        name,
+                    });
+                self.package_names.push(name);
+            }
+        }
+        if file_annotation.is_some() && self.facade_name.is_none() {
+            let binary_owner = self.binary_owner_route(None);
+            self.facts.gaps.push(ResolutionGapFact::unsupported_route(
+                placement,
+                ResolutionRouteGap::UnknownAlias {
+                    owner: ResolutionRouteOwner::JvmFacade {
+                        scope: self.package_scope,
+                        name: self.facade_name,
+                    },
+                    binary_owner,
+                    name: None,
+                    kind: None,
+                },
+            ));
         }
     }
 
@@ -731,6 +890,16 @@ impl<'source, 'collector, 'declarations>
                 anchor: ResolutionRootImportAnchor::Lexical,
                 position: None,
             });
+            self.facts
+                .root_import_kinds
+                .push(ResolutionRootImportKindFact {
+                    import_site: site,
+                    kind: if import.is_wildcard {
+                        ResolutionRootImportKind::Glob
+                    } else {
+                        ResolutionRootImportKind::Named
+                    },
+                });
             self.facts
                 .root_import_segments
                 .extend(
@@ -1160,7 +1329,11 @@ impl<'source, 'collector, 'declarations>
             );
         }
         if name == "copy" || name == "valueOf" {
-            let input = self.synthetic_class_type_slot(class, owner, site);
+            let input = self.owner_type_slot(
+                first_named_child_of_kind(class, "type_identifier").expect("a class has a name"),
+                owner,
+                site,
+            );
             let value_type = self.add_slot(site, ResolutionTypeSlotRole::DeclaredValue);
             self.facts
                 .declaration_type_slots
@@ -1189,14 +1362,12 @@ impl<'source, 'collector, 'declarations>
         Some(site)
     }
 
-    fn synthetic_class_type_slot(
+    fn owner_type_slot(
         &mut self,
-        class: Node<'source>,
+        anchor: Node<'source>,
         class_site: ResolutionSiteId,
         callable: ResolutionSiteId,
     ) -> ResolutionTypeSlotId {
-        let anchor = first_named_child_of_kind(class, "type_identifier")
-            .expect("a synthetic member owner has a name");
         let scope = *self
             .type_scope_parents
             .get(&class_site)
@@ -1302,10 +1473,10 @@ impl<'source, 'collector, 'declarations>
                 value_transform: ResolutionTypeTransferValueTransform::Preserve,
             });
         } else {
-            self.facts.gaps.push(ResolutionGapFact {
+            self.facts.gaps.push(ResolutionGapFact::new(
                 site,
-                kind: ResolutionGapKind::UnsupportedTypeSyntax,
-            });
+                ResolutionGapKind::UnsupportedTypeSyntax,
+            ));
         }
         Some(site)
     }
@@ -1324,7 +1495,13 @@ impl<'source, 'collector, 'declarations>
             context.scope,
             None,
         );
-        self.add_declaration_source(node, Some(name_node), site);
+        let declaration = self.add_declaration_source(node, Some(name_node), site);
+        if !self.units.contains_key(&declaration) {
+            // Scala uses this shared collector for every unitless callable,
+            // including a method owned by an anonymous expression body.
+            self.collector
+                .mark_lexical(declaration, DeclarationKind::BlockLocalItem);
+        }
         self.add_binder(site, context.scope, ResolutionBinderKind::Callable, true);
         self.add_visibility(site, node);
         self.add_package_membership(site, ResolutionNamespace::Callable, context.scope, node);
@@ -1402,10 +1579,10 @@ impl<'source, 'collector, 'declarations>
                         .push((value_type, expression, context));
                 }
                 (Some(body), None) if body.child(0).is_none_or(|first| first.kind() != "{") => {
-                    self.facts.gaps.push(ResolutionGapFact {
+                    self.facts.gaps.push(ResolutionGapFact::new(
                         site,
-                        kind: ResolutionGapKind::InferredType,
-                    });
+                        ResolutionGapKind::InferredType,
+                    ));
                 }
                 _ => {
                     let name = self.intern_name("kotlin.Unit");
@@ -1438,10 +1615,15 @@ impl<'source, 'collector, 'declarations>
         node: Node<'source>,
         context: WalkContext,
     ) -> Option<ResolutionSiteId> {
-        if !self.source_declarations.contains_key(&(node.id(), None)) {
-            // A primary constructor without written parameters declares no
-            // constructor unit of its own. The class declaration owns it and
-            // `record_default_constructor` models it.
+        if node.kind() == "primary_constructor"
+            && !named_children(node)
+                .into_iter()
+                .any(|child| child.kind() == "class_parameter")
+        {
+            // A primary constructor without written parameters belongs to the
+            // class declaration and `record_default_constructor` models it.
+            // Local constructors have no indexed CodeUnit either, but their
+            // written parameters still need a callable and initialization scope.
             return None;
         }
         Some(self.add_constructor_site(node, node, None, context))
@@ -1489,6 +1671,9 @@ impl<'source, 'collector, 'declarations>
 
     fn record_property(&mut self, node: Node<'source>, context: WalkContext) {
         let member_owner = self.type_body_owner(context);
+        let indirect_read = named_children(node)
+            .iter()
+            .any(|child| matches!(child.kind(), "property_delegate" | "getter" | "setter"));
         let variables = named_children(node)
             .into_iter()
             .flat_map(|child| match child.kind() {
@@ -1512,8 +1697,17 @@ impl<'source, 'collector, 'declarations>
                 context.scope,
                 None,
             );
-            self.add_declaration_source(node, Some(name_node), site);
+            let source_declaration = self.add_declaration_source(node, Some(name_node), site);
+            if node.kind() == "when_subject" {
+                // A when subject has no parser CodeUnit. Its selected binding
+                // still needs the same located lexical presentation as a local.
+                self.collector
+                    .mark_lexical(source_declaration, DeclarationKind::LocalVariable);
+            }
             let local = member_owner.is_none() && context.scope != self.package_scope;
+            if !local || indirect_read {
+                self.unstable_smart_cast_bindings.insert(site);
+            }
             self.add_binder(
                 site,
                 context.scope,
@@ -1570,14 +1764,23 @@ impl<'source, 'collector, 'declarations>
                     .filter(|_| variable.parent() == Some(node))
                 {
                     Some(expression) => {
-                        self.pending_initializers
-                            .push((value_type, expression, context));
+                        let mut initializer_context = context;
+                        if let Some(scope) =
+                            member_owner.and_then(|owner| self.initialization_scopes.get(&owner))
+                        {
+                            initializer_context.scope = *scope;
+                        }
+                        self.pending_initializers.push((
+                            value_type,
+                            expression,
+                            initializer_context,
+                        ));
                     }
                     None => {
-                        self.facts.gaps.push(ResolutionGapFact {
+                        self.facts.gaps.push(ResolutionGapFact::new(
                             site,
-                            kind: ResolutionGapKind::InferredType,
-                        });
+                            ResolutionGapKind::InferredType,
+                        ));
                     }
                 }
             }
@@ -1636,32 +1839,49 @@ impl<'source, 'collector, 'declarations>
         let Some(callable) = context.callable else {
             return;
         };
+        let constructor_property = node.kind() == "class_parameter"
+            && first_named_child_of_kind(node, "binding_pattern_kind").is_some()
+            && context.owner_type.is_some();
+        let binding_scope = if node.kind() == "class_parameter"
+            && !constructor_property
+            && let Some(owner) = context.owner_type
+        {
+            *self
+                .initialization_scopes
+                .get(&owner)
+                .expect("plain primary-constructor parameters have an initialization scope")
+        } else {
+            context.scope
+        };
         let site = self.add_identifier(
             name_node,
             ResolutionSiteKind::ValueDeclaration,
             ResolutionNamespace::Value,
             ResolutionIdentifierRole::Declaration,
-            context.scope,
+            binding_scope,
             None,
         );
-        let constructor_property = node.kind() == "class_parameter"
-            && first_named_child_of_kind(node, "binding_pattern_kind").is_some()
-            && context.owner_type.is_some();
         let source_declaration = self.add_declaration_source(node, Some(name_node), site);
         self.collector
             .mark_lexical(source_declaration, DeclarationKind::Parameter);
         if !constructor_property {
-            self.add_binder(site, context.scope, ResolutionBinderKind::Parameter, true);
+            self.add_binder(site, binding_scope, ResolutionBinderKind::Parameter, true);
+        }
+        if node.kind() == "class_parameter" {
+            self.pending_constructor_aliases
+                .push((name_node, site, context.scope));
         }
         let type_node = super::syntax::kotlin_binding_type_node(node);
         let value_type = if let Some(type_node) = type_node {
             if let Some(scalar) = kotlin_declared_scalar_type(type_node, self.source) {
                 self.scalar_types_by_declaration.insert(site, scalar);
             }
+            // Parameter types use the canonical declaration's classifier scope.
+            // Defaults and delegation arguments keep the header context.
             self.add_declared_type(
                 site,
                 type_node,
-                context.scope,
+                binding_scope,
                 ResolutionTypeSlotRole::DeclaredValue,
                 DeclarationTypeRole::Parameter,
                 Some(callable),
@@ -1675,10 +1895,10 @@ impl<'source, 'collector, 'declarations>
                     slot: value_type,
                     role: DeclarationTypeRole::Parameter,
                 });
-            self.facts.gaps.push(ResolutionGapFact {
+            self.facts.gaps.push(ResolutionGapFact::new(
                 site,
-                kind: ResolutionGapKind::UnsupportedTypeSyntax,
-            });
+                ResolutionGapKind::UnsupportedTypeSyntax,
+            ));
             value_type
         };
         if constructor_property {
@@ -1755,18 +1975,38 @@ impl<'source, 'collector, 'declarations>
         if segments.is_empty() {
             return None;
         }
+        let path = segments
+            .iter()
+            .map(|&segment| (segment, kotlin_identifier_text(segment, self.source)))
+            .collect::<Vec<_>>();
+        let slot = self.record_qualified_type_path(&path, context);
+        for segment in segments {
+            self.handled_identifiers.insert(segment.id());
+        }
+        self.type_slots_by_node.insert(node.id(), slot);
+        Some(slot)
+    }
+
+    // Explicit and synthetic nominal types must use the same positioned path,
+    // projection and root-import machinery, including unindexed boundaries.
+    fn record_qualified_type_path(
+        &mut self,
+        segments: &[(Node<'source>, &str)],
+        context: WalkContext,
+    ) -> ResolutionTypeSlotId {
+        assert!(!segments.is_empty());
         let mut previous = None;
         let mut reference_sites = Vec::with_capacity(segments.len());
-        let mut final_slot = None;
-        for segment in segments {
-            let site = self.add_identifier(
-                segment,
-                ResolutionSiteKind::TypeReference,
-                ResolutionNamespace::Type,
-                ResolutionIdentifierRole::Reference,
-                context.scope,
-                previous,
-            );
+        for &(segment, spelling) in segments {
+            let site = self.add_site(segment, ResolutionSiteKind::TypeReference, context.scope);
+            let name = self.intern_name(spelling);
+            self.facts.identifiers.push(PositionedIdentifierFact {
+                site,
+                name,
+                role: ResolutionIdentifierRole::Reference,
+                namespace: ResolutionNamespace::Type,
+                qualifier: previous,
+            });
             let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
             self.facts.binding_projections.push(BindingProjectionFact {
                 reference: site,
@@ -1783,12 +2023,11 @@ impl<'source, 'collector, 'declarations>
             }
             self.type_slots_by_node.insert(segment.id(), slot);
             self.type_sites.insert(segment.id(), site);
+            self.sites_by_node.insert(segment.id(), site);
             reference_sites.push(site);
             previous = Some(slot);
-            final_slot = Some(slot);
         }
-        let final_slot = final_slot.expect("a user type has at least one segment");
-        self.type_slots_by_node.insert(node.id(), final_slot);
+        let final_slot = previous.expect("a qualified type has a segment");
         if reference_sites.len() > 1 {
             let reference = *reference_sites.last().unwrap();
             self.facts
@@ -1819,7 +2058,7 @@ impl<'source, 'collector, 'declarations>
                     }),
             );
         }
-        Some(final_slot)
+        final_slot
     }
 
     fn ensure_type_slot(
@@ -1841,6 +2080,7 @@ impl<'source, 'collector, 'declarations>
                         callable: None,
                         declaration: owner,
                         singleton_owner: false,
+                        receiver_frame: None,
                     },
                 )
                 .expect("Kotlin user type has a positioned type segment");
@@ -1874,10 +2114,10 @@ impl<'source, 'collector, 'declarations>
         }
         let site = self.add_site(node, ResolutionSiteKind::TypeReference, scope);
         let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
-        self.facts.gaps.push(ResolutionGapFact {
+        self.facts.gaps.push(ResolutionGapFact::new(
             site,
-            kind: ResolutionGapKind::UnsupportedTypeSyntax,
-        });
+            ResolutionGapKind::UnsupportedTypeSyntax,
+        ));
         self.type_slots_by_node.insert(node.id(), slot);
         slot
     }
@@ -1994,10 +2234,10 @@ impl<'source, 'collector, 'declarations>
         let file_private = visibility == DeclaredVisibility::Private
             && self.facts.sites[declaration.index()].scope == self.package_scope;
         if visibility != DeclaredVisibility::Public && !file_private {
-            self.facts.gaps.push(ResolutionGapFact {
-                site: declaration,
-                kind: ResolutionGapKind::UnsupportedVisibility,
-            });
+            self.facts.gaps.push(ResolutionGapFact::new(
+                declaration,
+                ResolutionGapKind::UnsupportedVisibility,
+            ));
         }
     }
 
@@ -2051,7 +2291,10 @@ impl<'source, 'collector, 'declarations>
             });
     }
 
-    fn jvm_owner_segments(&self, owner: Option<ResolutionSiteId>) -> Option<Vec<ResolutionNameId>> {
+    fn jvm_owner_segments(
+        &mut self,
+        owner: Option<ResolutionSiteId>,
+    ) -> Option<Vec<ResolutionNameId>> {
         let mut segments = self.package_names.clone();
         let Some(mut current) = owner else {
             segments.push(self.facade_name?);
@@ -2066,8 +2309,51 @@ impl<'source, 'collector, 'declarations>
             };
         }
         nesting.reverse();
-        segments.extend(nesting);
+        let binary_name = nesting
+            .iter()
+            .map(|name| self.facts.names[name.index()].spelling.as_str())
+            .collect::<Vec<_>>()
+            .join("$");
+        segments.push(self.intern_name(&binary_name));
         Some(segments)
+    }
+
+    fn jvm_static_bridge_owner(&self, owner: Option<ResolutionSiteId>) -> Option<ResolutionSiteId> {
+        owner.and_then(|owner| {
+            if self.companion_types.contains(&owner) {
+                self.type_parents.get(&owner).copied().flatten()
+            } else {
+                Some(owner)
+            }
+        })
+    }
+
+    fn binary_owner_route(
+        &mut self,
+        owner: Option<ResolutionSiteId>,
+    ) -> ResolutionBinaryOwnerRoute {
+        match self.jvm_owner_segments(owner) {
+            Some(segments) => ResolutionBinaryOwnerRoute::Exact(segments),
+            None => ResolutionBinaryOwnerRoute::UnknownWithin {
+                scope: self.package_scope,
+                prefix: self.package_names.clone(),
+            },
+        }
+    }
+
+    fn default_impls_binary_owner_route(
+        &mut self,
+        owner: Option<ResolutionSiteId>,
+    ) -> ResolutionBinaryOwnerRoute {
+        match self.binary_owner_route(owner) {
+            ResolutionBinaryOwnerRoute::Exact(mut segments) => {
+                let owner = segments.pop().expect("interface binary owner");
+                let owner = format!("{}$DefaultImpls", self.facts.names[owner.index()].spelling);
+                segments.push(self.intern_name(&owner));
+                ResolutionBinaryOwnerRoute::Exact(segments)
+            }
+            unknown => unknown,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2117,6 +2403,16 @@ impl<'source, 'collector, 'declarations>
         status: ResolutionJvmAliasStatus,
         owner: Option<ResolutionSiteId>,
     ) {
+        // An anonymous type and its nested declarations have no source-named
+        // JVM export route. Their members remain ordinary receiver members;
+        // absence of an export alias is not an unsupported source route.
+        let mut enclosing = owner;
+        while let Some(current) = enclosing {
+            if self.anonymous_type_owners.contains(&current) {
+                return;
+            }
+            enclosing = self.type_parents.get(&current).copied().flatten();
+        }
         if let Some(owner_segments) = self.jvm_owner_segments(owner) {
             self.add_jvm_alias(
                 declaration,
@@ -2127,16 +2423,25 @@ impl<'source, 'collector, 'declarations>
                 status,
                 owner_segments,
             );
-        } else if !self
-            .facts
-            .gaps
-            .iter()
-            .any(|gap| gap.site == declaration && gap.kind == ResolutionGapKind::UnsupportedRoute)
-        {
-            self.facts.gaps.push(ResolutionGapFact {
-                site: declaration,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            });
+        } else {
+            let binary_owner = self.binary_owner_route(owner);
+            self.facts.add_route_gap(
+                declaration,
+                ResolutionRouteGap::UnknownAlias {
+                    binary_owner,
+                    owner: owner.map(ResolutionRouteOwner::Declaration).unwrap_or(
+                        ResolutionRouteOwner::JvmFacade {
+                            scope: self.package_scope,
+                            name: self.facade_name,
+                        },
+                    ),
+                    name: Some(member_name),
+                    kind: Some(kind),
+                },
+            );
+        }
+        if owner.is_none() {
+            self.add_multifile_part_gap(declaration, Some(member_name), Some(kind));
         }
     }
 
@@ -2212,7 +2517,47 @@ impl<'source, 'collector, 'declarations>
         let member_name = match jvm_name {
             Some(Some(name)) => name,
             Some(None) => {
-                self.add_unsupported_route_gap(declaration);
+                self.add_unsupported_route_gap(
+                    declaration,
+                    context.owner_type,
+                    None,
+                    Some(ResolutionJvmAliasKind::Method),
+                );
+                if context.singleton_owner
+                    && self.has_jvm_annotation(node, None, &["kotlin", "jvm", "JvmStatic"])
+                {
+                    let bridge_owner = context.owner_type.and_then(|owner| {
+                        if self.companion_types.contains(&owner) {
+                            self.type_parents.get(&owner).copied().flatten()
+                        } else {
+                            Some(owner)
+                        }
+                    });
+                    self.add_unsupported_route_gap(
+                        declaration,
+                        bridge_owner,
+                        None,
+                        Some(ResolutionJvmAliasKind::Method),
+                    );
+                }
+                if context
+                    .owner_type
+                    .is_some_and(|owner| self.interface_types.contains(&owner))
+                    && first_named_child_of_kind(node, "function_body").is_some()
+                {
+                    let binary_owner = self.default_impls_binary_owner_route(context.owner_type);
+                    self.facts.add_route_gap(
+                        declaration,
+                        ResolutionRouteGap::UnknownAlias {
+                            owner: ResolutionRouteOwner::Declaration(
+                                context.owner_type.expect("interface owner"),
+                            ),
+                            binary_owner,
+                            name: None,
+                            kind: Some(ResolutionJvmAliasKind::Method),
+                        },
+                    );
+                }
                 return;
             }
             None => source_name,
@@ -2289,7 +2634,10 @@ impl<'source, 'collector, 'declarations>
                 && first_named_child_of_kind(node, "function_body").is_some()
             {
                 if let Some(mut owner_segments) = self.jvm_owner_segments(context.owner_type) {
-                    owner_segments.push(self.intern_name("DefaultImpls"));
+                    let owner = owner_segments.pop().expect("interface binary owner");
+                    let owner =
+                        format!("{}$DefaultImpls", self.facts.names[owner.index()].spelling);
+                    owner_segments.push(self.intern_name(&owner));
                     self.add_jvm_alias(
                         declaration,
                         name,
@@ -2302,7 +2650,19 @@ impl<'source, 'collector, 'declarations>
                         owner_segments,
                     );
                 } else {
-                    self.add_unsupported_route_gap(declaration);
+                    let binary_owner = self.default_impls_binary_owner_route(context.owner_type);
+                    self.facts.add_route_gap(
+                        declaration,
+                        ResolutionRouteGap::UnknownAlias {
+                            owner: context
+                                .owner_type
+                                .map(ResolutionRouteOwner::Declaration)
+                                .expect("interface owner"),
+                            binary_owner,
+                            name: Some(name),
+                            kind: Some(ResolutionJvmAliasKind::Method),
+                        },
+                    );
                 }
             }
         }
@@ -2325,23 +2685,97 @@ impl<'source, 'collector, 'declarations>
         let has_jvm_field = self.has_jvm_annotation(node, None, &["kotlin", "jvm", "JvmField"])
             || self.has_jvm_annotation(node, Some("field"), &["kotlin", "jvm", "JvmField"]);
         let const_property = kotlin_has_modifier(node, "const");
-        if self.has_unresolved_jvm_annotation(node, None, &["kotlin", "jvm", "JvmField"])
-            && !has_jvm_field
-        {
-            self.add_unsupported_route_gap(declaration);
-            return;
-        }
         let companion_owner = context
             .owner_type
             .is_some_and(|owner| self.companion_types.contains(&owner));
+        let field_owner = if companion_owner {
+            context
+                .owner_type
+                .and_then(|owner| self.type_parents.get(&owner).copied().flatten())
+        } else {
+            context.owner_type
+        };
+        let getter_annotation = first_named_child_of_kind(node, "getter");
+        let setter_annotation = first_named_child_of_kind(node, "setter");
+        let getter_static =
+            self.has_jvm_annotation(node, Some("get"), &["kotlin", "jvm", "JvmStatic"])
+                || getter_annotation.is_some_and(|getter| {
+                    self.has_jvm_annotation(getter, None, &["kotlin", "jvm", "JvmStatic"])
+                });
+        let setter_static =
+            self.has_jvm_annotation(node, Some("set"), &["kotlin", "jvm", "JvmStatic"])
+                || setter_annotation.is_some_and(|setter| {
+                    self.has_jvm_annotation(setter, None, &["kotlin", "jvm", "JvmStatic"])
+                });
+        let is_var = first_named_child_of_kind(node, "binding_pattern_kind")
+            .is_some_and(|binding| binding.utf8_text(self.source.as_bytes()).ok() == Some("var"));
+        let setter_visible = is_var
+            && !setter_annotation.is_some_and(|setter| {
+                super::declarations::kotlin_declared_visibility(setter, self.source)
+                    == super::declarations::KotlinDeclaredVisibility::Private
+            });
+        if self.has_unresolved_jvm_annotation(node, None, &["kotlin", "jvm", "JvmField"])
+            && !has_jvm_field
+        {
+            let name = self.intern_name(source_name);
+            self.add_unsupported_route_gap(
+                declaration,
+                field_owner,
+                Some(name),
+                Some(ResolutionJvmAliasKind::Field),
+            );
+            // An unresolved JvmField may leave ordinary accessor projections,
+            // on the property's source owner, instead of the enclosing field.
+            let getter = self
+                .jvm_name_override(node, Some("get"))
+                .or_else(|| {
+                    getter_annotation.and_then(|getter| self.jvm_name_override(getter, None))
+                })
+                .unwrap_or_else(|| Some(kotlin_getter_name(source_name)));
+            let getter = getter.map(|name| self.intern_name(&name));
+            self.add_unsupported_route_gap(
+                declaration,
+                context.owner_type,
+                getter,
+                Some(ResolutionJvmAliasKind::Getter),
+            );
+            if getter_static && !top_level && context.singleton_owner {
+                let bridge_owner = self.jvm_static_bridge_owner(context.owner_type);
+                self.add_unsupported_route_gap(
+                    declaration,
+                    bridge_owner,
+                    getter,
+                    Some(ResolutionJvmAliasKind::Getter),
+                );
+            }
+            if setter_visible {
+                let setter = self
+                    .jvm_name_override(node, Some("set"))
+                    .or_else(|| {
+                        setter_annotation.and_then(|setter| self.jvm_name_override(setter, None))
+                    })
+                    .unwrap_or_else(|| Some(kotlin_setter_name(source_name)));
+                let setter = setter.map(|name| self.intern_name(&name));
+                self.add_unsupported_route_gap(
+                    declaration,
+                    context.owner_type,
+                    setter,
+                    Some(ResolutionJvmAliasKind::Setter),
+                );
+                if setter_static && !top_level && context.singleton_owner {
+                    let bridge_owner = self.jvm_static_bridge_owner(context.owner_type);
+                    self.add_unsupported_route_gap(
+                        declaration,
+                        bridge_owner,
+                        setter,
+                        Some(ResolutionJvmAliasKind::Setter),
+                    );
+                }
+            }
+            return;
+        }
         if has_jvm_field || const_property {
-            let owner = if companion_owner {
-                context
-                    .owner_type
-                    .and_then(|owner| self.type_parents.get(&owner).copied().flatten())
-            } else {
-                context.owner_type
-            };
+            let owner = field_owner;
             let name = self.intern_name(source_name);
             self.add_jvm_alias_for_owner(
                 declaration,
@@ -2356,63 +2790,63 @@ impl<'source, 'collector, 'declarations>
         }
 
         let receiver_parameters = u32::from(node.child_by_field_name("receiver").is_some());
-        let getter_annotation = first_named_child_of_kind(node, "getter");
-        let setter_annotation = first_named_child_of_kind(node, "setter");
         let getter_name = self
             .jvm_name_override(node, Some("get"))
             .or_else(|| getter_annotation.and_then(|getter| self.jvm_name_override(getter, None)));
         let getter_name = match getter_name {
-            Some(Some(name)) => name,
+            Some(Some(name)) => Some(name),
             Some(None) => {
-                self.add_unsupported_route_gap(declaration);
-                return;
-            }
-            None => kotlin_getter_name(source_name),
-        };
-        let getter_static =
-            self.has_jvm_annotation(node, Some("get"), &["kotlin", "jvm", "JvmStatic"])
-                || getter_annotation.is_some_and(|getter| {
-                    self.has_jvm_annotation(getter, None, &["kotlin", "jvm", "JvmStatic"])
-                });
-        let status = self.jvm_alias_status(node, context, top_level);
-        let getter_id = self.intern_name(&getter_name);
-        self.add_jvm_alias_for_owner(
-            declaration,
-            getter_id,
-            ResolutionJvmAliasKind::Getter,
-            top_level,
-            receiver_parameters,
-            status,
-            context.owner_type,
-        );
-        if getter_static && !top_level && context.singleton_owner {
-            let bridge_owner = context.owner_type.and_then(|owner| {
-                if self.companion_types.contains(&owner) {
-                    self.type_parents.get(&owner).copied().flatten()
-                } else {
-                    Some(owner)
+                self.add_unsupported_route_gap(
+                    declaration,
+                    context.owner_type,
+                    None,
+                    Some(ResolutionJvmAliasKind::Getter),
+                );
+                if getter_static && !top_level && context.singleton_owner {
+                    let bridge_owner = self.jvm_static_bridge_owner(context.owner_type);
+                    self.add_unsupported_route_gap(
+                        declaration,
+                        bridge_owner,
+                        None,
+                        Some(ResolutionJvmAliasKind::Getter),
+                    );
                 }
-            });
+                None
+            }
+            None => Some(kotlin_getter_name(source_name)),
+        };
+        let status = self.jvm_alias_status(node, context, top_level);
+        if let Some(getter_name) = getter_name {
+            let getter_id = self.intern_name(&getter_name);
             self.add_jvm_alias_for_owner(
                 declaration,
                 getter_id,
                 ResolutionJvmAliasKind::Getter,
-                true,
+                top_level,
                 receiver_parameters,
                 status,
-                bridge_owner,
+                context.owner_type,
             );
+            if getter_static && !top_level && context.singleton_owner {
+                let bridge_owner = context.owner_type.and_then(|owner| {
+                    if self.companion_types.contains(&owner) {
+                        self.type_parents.get(&owner).copied().flatten()
+                    } else {
+                        Some(owner)
+                    }
+                });
+                self.add_jvm_alias_for_owner(
+                    declaration,
+                    getter_id,
+                    ResolutionJvmAliasKind::Getter,
+                    true,
+                    receiver_parameters,
+                    status,
+                    bridge_owner,
+                );
+            }
         }
-
-        let is_var = first_named_child_of_kind(node, "binding_pattern_kind")
-            .is_some_and(|binding| binding.utf8_text(self.source.as_bytes()).ok() == Some("var"));
-        if !is_var {
-            return;
-        }
-        if setter_annotation.is_some_and(|setter| {
-            super::declarations::kotlin_declared_visibility(setter, self.source)
-                == super::declarations::KotlinDeclaredVisibility::Private
-        }) {
+        if !setter_visible {
             return;
         }
         let setter_name = self
@@ -2421,7 +2855,21 @@ impl<'source, 'collector, 'declarations>
         let setter_name = match setter_name {
             Some(Some(name)) => name,
             Some(None) => {
-                self.add_unsupported_route_gap(declaration);
+                self.add_unsupported_route_gap(
+                    declaration,
+                    context.owner_type,
+                    None,
+                    Some(ResolutionJvmAliasKind::Setter),
+                );
+                if setter_static && !top_level && context.singleton_owner {
+                    let bridge_owner = self.jvm_static_bridge_owner(context.owner_type);
+                    self.add_unsupported_route_gap(
+                        declaration,
+                        bridge_owner,
+                        None,
+                        Some(ResolutionJvmAliasKind::Setter),
+                    );
+                }
                 return;
             }
             None => kotlin_setter_name(source_name),
@@ -2439,11 +2887,6 @@ impl<'source, 'collector, 'declarations>
             status,
             context.owner_type,
         );
-        let setter_static =
-            self.has_jvm_annotation(node, Some("set"), &["kotlin", "jvm", "JvmStatic"])
-                || setter_annotation.is_some_and(|setter| {
-                    self.has_jvm_annotation(setter, None, &["kotlin", "jvm", "JvmStatic"])
-                });
         if setter_static && !top_level && context.singleton_owner {
             let bridge_owner = context.owner_type.and_then(|owner| {
                 if self.companion_types.contains(&owner) {
@@ -2502,32 +2945,67 @@ impl<'source, 'collector, 'declarations>
             .into_iter()
             .find_map(|annotation| {
                 if annotation_use_site(annotation, self.source).as_deref() != use_site
-                    || !annotation_has_simple_name(annotation, "JvmName", self.source)
+                    || !self.annotation_proofs.annotation_denotes(
+                        annotation,
+                        &["kotlin", "jvm", "JvmName"],
+                        self.source,
+                    )
                 {
                     return None;
-                }
-                if !self.annotation_proofs.annotation_denotes(
-                    annotation,
-                    &["kotlin", "jvm", "JvmName"],
-                    self.source,
-                ) {
-                    return Some(None);
                 }
                 Some(annotation_string_argument(annotation, self.source))
             })
     }
 
-    fn add_unsupported_route_gap(&mut self, site: ResolutionSiteId) {
-        if !self
-            .facts
-            .gaps
-            .iter()
-            .any(|gap| gap.site == site && gap.kind == ResolutionGapKind::UnsupportedRoute)
-        {
-            self.facts.gaps.push(ResolutionGapFact {
+    fn add_unsupported_route_gap(
+        &mut self,
+        site: ResolutionSiteId,
+        owner: Option<ResolutionSiteId>,
+        name: Option<ResolutionNameId>,
+        kind: Option<ResolutionJvmAliasKind>,
+    ) {
+        let binary_owner = self.binary_owner_route(owner);
+        self.facts.add_route_gap(
+            site,
+            ResolutionRouteGap::UnknownAlias {
+                binary_owner,
+                owner: owner.map(ResolutionRouteOwner::Declaration).unwrap_or(
+                    ResolutionRouteOwner::JvmFacade {
+                        scope: self.package_scope,
+                        name: self.facade_name,
+                    },
+                ),
+                name,
+                kind,
+            },
+        );
+        if owner.is_none() {
+            self.add_multifile_part_gap(site, name, kind);
+        }
+    }
+
+    fn add_multifile_part_gap(
+        &mut self,
+        site: ResolutionSiteId,
+        name: Option<ResolutionNameId>,
+        kind: Option<ResolutionJvmAliasKind>,
+    ) {
+        if self.multifile_file {
+            self.facts.add_route_gap(
                 site,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            });
+                ResolutionRouteGap::UnknownAlias {
+                    owner: ResolutionRouteOwner::JvmFacade {
+                        scope: self.package_scope,
+                        name: self.facade_name,
+                    },
+                    binary_owner: ResolutionBinaryOwnerRoute::UnknownWithin {
+                        scope: self.package_scope,
+                        prefix: self.package_names.clone(),
+                    },
+                    name,
+                    kind,
+                },
+            );
         }
     }
 
@@ -2562,10 +3040,10 @@ impl<'source, 'collector, 'declarations>
         }
         if kotlin_identifier_text(node, self.source).is_empty() {
             let site = self.add_site(node, ResolutionSiteKind::UnsupportedRoute, context.scope);
-            self.facts.gaps.push(ResolutionGapFact {
+            self.facts.gaps.push(ResolutionGapFact::new(
                 site,
-                kind: ResolutionGapKind::MalformedSyntax,
-            });
+                ResolutionGapKind::MalformedSyntax,
+            ));
             return;
         }
 
@@ -2593,7 +3071,14 @@ impl<'source, 'collector, 'declarations>
         let explicit_this_owner = if is_navigation_member {
             navigation
                 .and_then(kotlin_navigation_receiver)
-                .and_then(|receiver| self.this_expression_owner(receiver, context.owner_type))
+                .and_then(|receiver| {
+                    self.this_expression_receiver(receiver, context.receiver_frame)
+                        .and_then(|receiver| match receiver {
+                            KotlinReceiver::Dispatch(owner)
+                            | KotlinReceiver::AnonymousDispatch(owner) => Some(owner),
+                            KotlinReceiver::Extension(_) => None,
+                        })
+                })
         } else {
             None
         };
@@ -2782,16 +3267,101 @@ impl<'source, 'collector, 'declarations>
                 Some(slot) if role == ResolutionTypeSlotRole::ExpressionValue => slot,
                 _ => self.add_slot(site, role),
             }
+        } else if expression.kind() == "callable_reference"
+            && expression
+                .child(expression.child_count() - 1)
+                .is_some_and(|token| token.kind() == "class")
+            && let Some(operand) = first_named_child_of_kind(expression, "type_identifier")
+        {
+            let operand_name = kotlin_identifier_text(operand, self.source);
+            let argument = self.record_qualified_type_path(&[(operand, operand_name)], context);
+            self.handled_identifiers.insert(operand.id());
+            let identity = self.record_qualified_type_path(
+                &[
+                    (expression, "kotlin"),
+                    (expression, "reflect"),
+                    (expression, "KClass"),
+                ],
+                context,
+            );
+            // KClass is the compiler-defined reflection type, not a source
+            // spelling whose `kotlin` prefix can be obscured by imports. Bind
+            // its absolute package route to the selected declaration (including
+            // a workspace stdlib stand-in) without a lexical prefix obligation.
+            let root = self
+                .facts
+                .root_references
+                .last_mut()
+                .expect("qualified KClass root");
+            assert_eq!(root.reference, self.facts.type_slots[identity.index()].site);
+            root.anchor = ResolutionRootImportAnchor::Absolute;
+            root.prefix_reference = None;
+            self.facts
+                .declared_type_arguments
+                .push(ResolutionDeclaredTypeArgumentFact {
+                    owner: identity,
+                    ordinal: 0,
+                    argument,
+                });
+            self.facts.type_arguments.push(ResolutionTypeArgumentFact {
+                application: identity,
+                ordinal: 0,
+                argument,
+                indirection_delta: 0,
+                reference_indirection_delta: 0,
+            });
+            let site = self.add_site(expression, ResolutionSiteKind::Literal, scope);
+            let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            crate::call_arguments::publish_jvm_expression_type(&mut self.facts, identity, output);
+            output
+        } else if expression.kind() == "as_expression"
+            && expression
+                .child(1)
+                .is_some_and(|operator| operator.kind() == "as")
+            && let Some(ty) = named_children(expression)
+                .into_iter()
+                .rev()
+                .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
+        {
+            let identity = self.ensure_type_slot(ty, scope, context.declaration);
+            let site = self.add_site(expression, ResolutionSiteKind::UnaryExpression, scope);
+            let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            crate::call_arguments::publish_jvm_expression_type(&mut self.facts, identity, output);
+            output
         } else if expression.kind() == "this_expression"
-            && let Some(owner) = context.owner_type
-            && let Some(input) = self.type_identity_slots.get(&owner).copied()
+            && let Some(KotlinReceiver::Dispatch(owner)) =
+                self.this_expression_receiver(expression, context.receiver_frame)
+        {
+            // Only nominal dispatch receivers can be looked up through a type
+            // name. Anonymous dispatch frames still support `this.member`, but
+            // their whole-value `this` retains the unsupported-expression gap.
+            // A labeled outer receiver uses the selected nominal frame.
+            let site = self.add_site(expression, ResolutionSiteKind::ValueReference, scope);
+            let input =
+                self.owner_type_slot(expression, owner, context.declaration.unwrap_or(owner));
+            let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            crate::call_arguments::publish_jvm_expression_type(&mut self.facts, input, output);
+            output
+        } else if expression.kind() == "this_expression"
+            && let Some(KotlinReceiver::Extension(input)) =
+                self.this_expression_receiver(expression, context.receiver_frame)
         {
             let site = self.add_site(expression, ResolutionSiteKind::ValueReference, scope);
-            let output = self.add_slot(site, ResolutionTypeSlotRole::Receiver);
-            self.facts.type_transfers.push(ResolutionTypeTransferFact {
+            // The extension fact describes a type identity. Materialize its
+            // runtime value before using `this` as an initializer or argument.
+            // Receiver slots belong to calls, not to their input expressions.
+            let value = self.add_slot(site, ResolutionTypeSlotRole::DeclaredValue);
+            crate::call_arguments::publish_jvm_declared_type_transfer(
+                &mut self.facts,
                 input,
+                value,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+            );
+            let output = self.add_slot(site, role);
+            self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                input: value,
                 output,
-                kind: ResolutionTypeTransferKind::Receiver,
+                kind: ResolutionTypeTransferKind::Contextual,
                 indirection_delta: 0,
                 reference_indirection_delta: 0,
                 value_transform: ResolutionTypeTransferValueTransform::Preserve,
@@ -2849,9 +3419,9 @@ impl<'source, 'collector, 'declarations>
                     indirection: 0,
                 });
             } else {
-                self.facts.gaps.push(ResolutionGapFact {
+                self.facts.gaps.push(ResolutionGapFact::new(
                     site,
-                    kind: if matches!(
+                    if matches!(
                         expression.kind(),
                         "integer_literal"
                             | "long_literal"
@@ -2864,7 +3434,7 @@ impl<'source, 'collector, 'declarations>
                     } else {
                         ResolutionGapKind::UnsupportedExpressionType
                     },
-                });
+                ));
             }
             output
         } else if expression.kind() == "lambda_literal" {
@@ -2881,10 +3451,10 @@ impl<'source, 'collector, 'declarations>
                     indirection: 0,
                 });
             } else {
-                self.facts.gaps.push(ResolutionGapFact {
+                self.facts.gaps.push(ResolutionGapFact::new(
                     site,
-                    kind: ResolutionGapKind::UnsupportedExpressionType,
-                });
+                    ResolutionGapKind::UnsupportedExpressionType,
+                ));
             }
             output
         } else if let Some((left, right)) = self.additive_scalar_operands(expression) {
@@ -2907,10 +3477,10 @@ impl<'source, 'collector, 'declarations>
             output
         } else {
             let site = self.add_site(expression, ResolutionSiteKind::UnsupportedExpression, scope);
-            self.facts.gaps.push(ResolutionGapFact {
+            self.facts.gaps.push(ResolutionGapFact::new(
                 site,
-                kind: ResolutionGapKind::UnsupportedExpression,
-            });
+                ResolutionGapKind::UnsupportedExpression,
+            ));
             self.sites_by_node.insert(expression.id(), site);
             self.add_slot(site, role)
         };
@@ -2942,29 +3512,27 @@ impl<'source, 'collector, 'declarations>
         .then_some((left, right))
     }
 
-    fn this_expression_owner(
+    fn this_expression_receiver(
         &self,
         expression: Node<'source>,
-        current_owner: Option<ResolutionSiteId>,
-    ) -> Option<ResolutionSiteId> {
+        current_frame: Option<usize>,
+    ) -> Option<KotlinReceiver> {
         if expression.kind() != "this_expression" {
             return None;
         }
-        let label_node = first_named_child_of_kind(expression, "type_identifier");
-        let Some(label_node) = label_node else {
-            return current_owner;
-        };
-        let label = kotlin_identifier_text(label_node, self.source);
-        let mut owner = current_owner?;
+        let label = first_named_child_of_kind(expression, "type_identifier")
+            .map(|node| kotlin_identifier_text(node, self.source));
+        let mut frame = current_frame?;
         loop {
-            if self
-                .type_simple_names
-                .get(&owner)
-                .is_some_and(|owner_name| kotlin_owner_label_matches(owner_name, label))
-            {
-                return Some(owner);
+            let receiver = self.receiver_frames[frame];
+            if label.is_none_or(|label| {
+                receiver
+                    .label
+                    .is_some_and(|owner| kotlin_owner_label_matches(owner, label))
+            }) {
+                return Some(receiver.receiver);
             }
-            owner = self.type_parents.get(&owner).copied().flatten()?;
+            frame = receiver.parent?;
         }
     }
 
@@ -2987,13 +3555,23 @@ impl<'source, 'collector, 'declarations>
 
     fn scalar_type_of_identifier(&self, identifier: Node<'source>) -> Option<KotlinScalarType> {
         let reference_site = *self.sites_by_node.get(&identifier.id())?;
+        self.scalar_types_by_declaration
+            .get(&self.local_value_binding(reference_site)?)
+            .copied()
+    }
+
+    fn local_value_binding(&self, reference_site: ResolutionSiteId) -> Option<ResolutionSiteId> {
+        if !matches!(
+            self.facts.sites[reference_site.index()].kind,
+            ResolutionSiteKind::ValueReference | ResolutionSiteKind::ValueDeclaration
+        ) {
+            return None;
+        }
         let reference_name = self
             .facts
             .identifiers
             .iter()
-            .find(|fact| {
-                fact.site == reference_site && fact.role == ResolutionIdentifierRole::Reference
-            })?
+            .find(|fact| fact.site == reference_site && fact.qualifier.is_none())?
             .name;
         let mut current_scope = self.facts.sites[reference_site.index()].scope;
         loop {
@@ -3004,29 +3582,45 @@ impl<'source, 'collector, 'declarations>
                 .filter(|binder| {
                     matches!(
                         binder.kind,
-                        ResolutionBinderKind::Field
+                        ResolutionBinderKind::Alias { .. }
+                            | ResolutionBinderKind::Field
                             | ResolutionBinderKind::Local
                             | ResolutionBinderKind::Parameter
                             | ResolutionBinderKind::Pattern
                     ) && binder.scope == current_scope
-                        && binder.activation_start <= identifier.start_byte()
-                        && identifier.start_byte() < binder.activation_end
+                        && binder.activation_start
+                            <= self.facts.sites[reference_site.index()].start_byte
+                        && self.facts.sites[reference_site.index()].start_byte
+                            < binder.activation_end
                 })
-                .filter(|binder| {
-                    self.facts.identifiers.iter().any(|fact| {
-                        fact.site == binder.declaration
-                            && fact.role == ResolutionIdentifierRole::Declaration
-                            && fact.namespace == ResolutionNamespace::Value
-                            && fact.name == reference_name
-                    })
+                .filter_map(|binder| {
+                    let (role, target) = match binder.kind {
+                        ResolutionBinderKind::Alias { target } => {
+                            (ResolutionIdentifierRole::Alias, target)
+                        }
+                        ResolutionBinderKind::Field
+                        | ResolutionBinderKind::Local
+                        | ResolutionBinderKind::Parameter
+                        | ResolutionBinderKind::Pattern => {
+                            (ResolutionIdentifierRole::Declaration, binder.declaration)
+                        }
+                        _ => return None,
+                    };
+                    self.facts
+                        .identifiers
+                        .iter()
+                        .any(|fact| {
+                            fact.site == binder.declaration
+                                && fact.role == role
+                                && fact.namespace == ResolutionNamespace::Value
+                                && fact.name == reference_name
+                        })
+                        .then_some(target)
                 })
                 .collect::<Vec<_>>();
             match matching_binders.as_slice() {
-                [binder] => {
-                    return self
-                        .scalar_types_by_declaration
-                        .get(&binder.declaration)
-                        .copied();
+                [declaration] => {
+                    return Some(*declaration);
                 }
                 [] => {}
                 _ => return None,
@@ -3035,13 +3629,290 @@ impl<'source, 'collector, 'declarations>
         }
     }
 
+    /// Kotlin's dominated regions supply existing per-read declared-type
+    /// transfers. Bindings, rather than names, govern shadowing and writes.
+    fn finish_smart_casts(&mut self, root: Node<'source>) {
+        let mut refinements = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let children = named_children(node);
+            if node.kind() == "check_expression"
+                && node
+                    .child(1)
+                    .is_some_and(|operator| operator.kind() == "is")
+                && let [subject, ty] = children.as_slice()
+                && subject.kind() == "simple_identifier"
+            {
+                let mut condition = node;
+                let mut parent = condition.parent();
+                while let Some(outer) = parent {
+                    if outer.kind() == "parenthesized_expression" {
+                        condition = outer;
+                        parent = outer.parent();
+                        continue;
+                    }
+                    if outer.kind() == "conjunction_expression" {
+                        if outer
+                            .named_child(0)
+                            .is_some_and(|left| left.id() == condition.id())
+                            && let Some(right) = outer.named_child(1)
+                        {
+                            refinements.push((*subject, *ty, right.start_byte(), right.end_byte()));
+                        }
+                        condition = outer;
+                        parent = outer.parent();
+                        continue;
+                    }
+                    if outer.kind() == "if_expression"
+                        && outer
+                            .child_by_field_name("condition")
+                            .is_some_and(|child| child.id() == condition.id())
+                        && let Some(body) = outer.child_by_field_name("consequence")
+                    {
+                        refinements.push((*subject, *ty, body.start_byte(), body.end_byte()));
+                    }
+                    break;
+                }
+            } else if node.kind() == "as_expression"
+                && node
+                    .child(1)
+                    .is_some_and(|operator| operator.kind() == "as")
+                && let [subject, ty] = children.as_slice()
+                && subject.kind() == "simple_identifier"
+            {
+                let mut statement = node;
+                while let Some(parent) = statement.parent()
+                    && parent.kind() == "parenthesized_expression"
+                {
+                    statement = parent;
+                }
+                if let Some(block) = statement
+                    .parent()
+                    .filter(|parent| matches!(parent.kind(), "block" | "statements"))
+                {
+                    refinements.push((*subject, *ty, statement.end_byte(), block.end_byte()));
+                }
+            } else if node.kind() == "when_expression"
+                && let Some(subject) = first_named_child_of_kind(node, "when_subject")
+                && let Some(value) = first_named_child_of_kind(subject, "variable_declaration")
+                    .and_then(|variable| first_named_child_of_kind(variable, "simple_identifier"))
+                    .or_else(|| {
+                        named_children(subject)
+                            .into_iter()
+                            .find(|child| child.kind() == "simple_identifier")
+                    })
+            {
+                for entry in children.iter().filter(|child| child.kind() == "when_entry") {
+                    let conditions = named_children(*entry)
+                        .into_iter()
+                        .filter(|child| child.kind() == "when_condition")
+                        .collect::<Vec<_>>();
+                    if let [condition] = conditions.as_slice()
+                        && let Some(test) = first_named_child_of_kind(*condition, "type_test")
+                        && test
+                            .child(0)
+                            .is_some_and(|operator| operator.kind() == "is")
+                        && let Some(ty) = named_children(test)
+                            .into_iter()
+                            .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
+                        && let Some(body) =
+                            first_named_child_of_kind(*entry, "control_structure_body")
+                    {
+                        refinements.push((value, ty, body.start_byte(), body.end_byte()));
+                    }
+                }
+            }
+            stack.extend(children);
+        }
+        struct Region {
+            declaration: ResolutionSiteId,
+            execution_scope: ResolutionScopeId,
+            start: usize,
+            end: usize,
+            input: ResolutionTypeSlotId,
+        }
+        let write_targets = self
+            .facts
+            .local_writes
+            .iter()
+            .map(|write| write.target)
+            .collect::<HashSet<_>>();
+        let mut regions = Vec::new();
+        for (subject, ty, start, end) in refinements {
+            let Some(&subject_site) = self.sites_by_node.get(&subject.id()) else {
+                continue;
+            };
+            let declaration = if self.facts.identifiers.iter().any(|identifier| {
+                identifier.site == subject_site
+                    && identifier.role == ResolutionIdentifierRole::Declaration
+            }) {
+                Some(subject_site)
+            } else {
+                self.local_value_binding(subject_site)
+            };
+            let Some(declaration) = declaration.filter(|declaration| {
+                !self.unstable_smart_cast_bindings.contains(declaration)
+                    && !self
+                        .facts
+                        .member_owners
+                        .iter()
+                        .any(|owner| owner.member == *declaration)
+                    && self.facts.binders.iter().any(|binder| {
+                        binder.declaration == *declaration
+                            && matches!(
+                                binder.kind,
+                                ResolutionBinderKind::Local
+                                    | ResolutionBinderKind::Parameter
+                                    | ResolutionBinderKind::Pattern
+                            )
+                    })
+            }) else {
+                continue;
+            };
+            let Some(execution_scope) =
+                self.enclosing_execution_region(self.facts.sites[subject_site.index()].scope)
+            else {
+                continue;
+            };
+            // A captured mutable binding can change through an invocation
+            // whose source position is outside this dominated region.
+            if self.facts.local_writes.iter().any(|write| {
+                self.local_value_binding(write.target) == Some(declaration)
+                    && self.enclosing_execution_region(self.facts.sites[write.target.index()].scope)
+                        != Some(execution_scope)
+            }) {
+                continue;
+            }
+            let invalidation = self
+                .facts
+                .local_writes
+                .iter()
+                .filter(|write| {
+                    let site = self.facts.sites[write.target.index()];
+                    start <= site.start_byte
+                        && site.start_byte < end
+                        && self.local_value_binding(write.target) == Some(declaration)
+                })
+                .map(|write| {
+                    let target = self.facts.sites[write.target.index()];
+                    let value =
+                        self.facts.sites[self.facts.type_slots[write.value.index()].site.index()];
+                    // Kotlin evaluates the RHS before the local write takes effect.
+                    target.end_byte.max(value.end_byte)
+                })
+                .min()
+                .unwrap_or(end)
+                .min(end);
+            let input =
+                self.ensure_type_slot(ty, self.facts.sites[subject_site.index()].scope, None);
+            regions.push(Region {
+                declaration,
+                // A nested executable may introduce an implicit binder (for
+                // example lambda `it`) that this producer cannot identify.
+                execution_scope,
+                start,
+                end: invalidation,
+                input,
+            });
+        }
+        regions.sort_by_key(|region| {
+            (
+                region.declaration.index(),
+                region.execution_scope.index(),
+                region.start,
+                std::cmp::Reverse(region.end),
+            )
+        });
+        let mut active_key = None;
+        let mut active: Vec<(usize, usize, ResolutionTypeSlotId)> = Vec::new();
+        let mut read_inputs = HashMap::default();
+        for region in regions {
+            let key = (region.declaration, region.execution_scope);
+            if active_key != Some(key) {
+                active.clear();
+                active_key = Some(key);
+            }
+            while active
+                .last()
+                .is_some_and(|(start, end, _)| *start > region.start || *end < region.end)
+            {
+                active.pop();
+            }
+            let input = match active.last() {
+                Some((_, _, parent)) if *parent != region.input => {
+                    let site = self.facts.type_slots[region.input.index()].site;
+                    let union = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+                    for input in [*parent, region.input] {
+                        crate::call_arguments::publish_jvm_type_union_transfer(
+                            &mut self.facts,
+                            input,
+                            union,
+                        );
+                    }
+                    union
+                }
+                _ => region.input,
+            };
+            active.push((region.start, region.end, input));
+            for projection in &self.facts.binding_projections {
+                let site = self.facts.sites[projection.reference.index()];
+                if region.start <= site.start_byte
+                    && site.end_byte <= region.end
+                    && !write_targets.contains(&projection.reference)
+                    && matches!(
+                        projection.kind,
+                        BindingProjectionKind::TargetDeclaredValueType
+                            | BindingProjectionKind::TargetTypeOrDeclaredValueType
+                    )
+                    && self.local_value_binding(projection.reference) == Some(region.declaration)
+                    && self.enclosing_execution_region(site.scope) == Some(region.execution_scope)
+                {
+                    read_inputs.insert(projection.output, input);
+                }
+            }
+        }
+        // Share the region's bound identity instead of copying every ancestor
+        // bound onto every read. Allocation remains linear in the source blob.
+        let mut reads = read_inputs.into_iter().collect::<Vec<_>>();
+        reads.sort_unstable_by_key(|(output, _)| output.index());
+        for (output, input) in reads {
+            crate::call_arguments::publish_jvm_expression_refinement(
+                &mut self.facts,
+                input,
+                output,
+            );
+        }
+    }
+
+    fn enclosing_execution_region(
+        &self,
+        mut scope: ResolutionScopeId,
+    ) -> Option<ResolutionScopeId> {
+        let mut initializer = None;
+        loop {
+            let fact = self.facts.scopes[scope.index()];
+            match fact.kind {
+                ResolutionScopeKind::Executable => return Some(scope),
+                ResolutionScopeKind::Initializer => initializer = Some(scope),
+                // A nested class is a capture boundary even inside a function.
+                // Its initializer blocks have separate execution identities.
+                ResolutionScopeKind::TypeBody => return Some(initializer.unwrap_or(scope)),
+                _ => {}
+            }
+            let Some(parent) = fact.parent else {
+                return initializer;
+            };
+            scope = parent;
+        }
+    }
+
     fn finish_calls(&mut self) {
         for (call_node, call_site, result, context) in std::mem::take(&mut self.pending_calls) {
             let Some(callee) = kotlin_callee(call_node) else {
-                self.facts.gaps.push(ResolutionGapFact {
-                    site: call_site,
-                    kind: ResolutionGapKind::UnsupportedExpression,
-                });
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    call_site,
+                    ResolutionGapKind::UnsupportedExpression,
+                ));
                 continue;
             };
             let callee_name = if callee.kind() == "navigation_expression" {
@@ -3059,10 +3930,20 @@ impl<'source, 'collector, 'declarations>
                         ResolutionSiteKind::UnsupportedRoute,
                         context.scope,
                     );
-                    self.facts.gaps.push(ResolutionGapFact {
-                        site,
-                        kind: ResolutionGapKind::UnsupportedRoute,
-                    });
+                    let route = ResolutionRouteGap::OmittedReference {
+                        scope: context.scope,
+                        terminal: matches!(
+                            callee_name.kind(),
+                            "simple_identifier" | "type_identifier"
+                        )
+                        .then(|| {
+                            self.intern_name(kotlin_identifier_text(callee_name, self.source))
+                        }),
+                        namespace: Some(ResolutionNamespace::Callable),
+                    };
+                    self.facts.add_route_gap(site, route);
+                    self.facts
+                        .add_reference_enumeration_gap(site, ResolutionGapKind::UnsupportedRoute);
                     site
                 });
             let callee_kind = self.facts.sites[callee_site.index()].kind;
@@ -3091,21 +3972,24 @@ impl<'source, 'collector, 'declarations>
                         | ResolutionSiteKind::MemberReference
                 )
             {
-                self.facts.gaps.push(ResolutionGapFact {
-                    site: call_site,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                });
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    call_site,
+                    ResolutionGapKind::UnsupportedCallApplicability,
+                ));
                 continue;
             }
-            self.facts.gaps.push(ResolutionGapFact {
-                site: callee_site,
-                kind: ResolutionGapKind::UnsupportedCallApplicability,
-            });
-            let explicit_this = callee.kind() == "navigation_expression"
-                && kotlin_navigation_receiver(callee)
-                    .and_then(|receiver| self.this_expression_owner(receiver, context.owner_type))
-                    .is_some();
-            let receiver = (callee.kind() == "navigation_expression" && !explicit_this)
+            self.facts.gaps.push(ResolutionGapFact::new(
+                callee_site,
+                ResolutionGapKind::UnsupportedCallApplicability,
+            ));
+            let explicit_this_dispatch =
+                kotlin_navigation_receiver(callee).is_some_and(|receiver| {
+                    matches!(
+                        self.this_expression_receiver(receiver, context.receiver_frame),
+                        Some(KotlinReceiver::Dispatch(_) | KotlinReceiver::AnonymousDispatch(_))
+                    )
+                });
+            let receiver = (callee.kind() == "navigation_expression" && !explicit_this_dispatch)
                 .then(|| kotlin_navigation_receiver(callee))
                 .flatten()
                 .map(|receiver| {
@@ -3150,7 +4034,7 @@ impl<'source, 'collector, 'declarations>
                 .callable_receiver_origins
                 .push(ResolutionCallableReceiverOriginFact {
                     reference: callee_site,
-                    origin: if explicit_this {
+                    origin: if explicit_this_dispatch {
                         ResolutionCallableReceiverOrigin::CurrentInstance
                     } else if receiver.is_some() {
                         ResolutionCallableReceiverOrigin::ExplicitExpression
@@ -3236,6 +4120,24 @@ impl<'source, 'collector, 'declarations>
                     None,
                 );
             }
+        }
+    }
+
+    fn finish_constructor_aliases(&mut self) {
+        // Delegation specifiers finish widening the header during the walk.
+        // Publish aliases before scalar inference, with their final activation
+        // bounds, without changing the canonical AST node-to-site mapping.
+        for (name_node, target, scope) in std::mem::take(&mut self.pending_constructor_aliases) {
+            let alias = self.add_site(name_node, ResolutionSiteKind::AliasBinding, scope);
+            let name = self.intern_name(kotlin_identifier_text(name_node, self.source));
+            self.facts.identifiers.push(PositionedIdentifierFact {
+                site: alias,
+                name,
+                role: ResolutionIdentifierRole::Alias,
+                namespace: ResolutionNamespace::Value,
+                qualifier: None,
+            });
+            self.add_binder(alias, scope, ResolutionBinderKind::Alias { target }, true);
         }
     }
 
@@ -3395,10 +4297,10 @@ impl<'source, 'collector, 'declarations>
                     ResolutionSiteKind::UnsupportedExpression,
                     context.scope,
                 );
-                self.facts.gaps.push(ResolutionGapFact {
+                self.facts.gaps.push(ResolutionGapFact::new(
                     site,
-                    kind: ResolutionGapKind::UnsupportedExpression,
-                });
+                    ResolutionGapKind::UnsupportedExpression,
+                ));
                 self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue)
             };
             if let Some(target) = target {
@@ -3408,13 +4310,36 @@ impl<'source, 'collector, 'declarations>
                         .push(ResolutionLocalWriteFact { target, value });
                 } else {
                     let site = self.facts.type_slots[value.index()].site;
-                    self.facts.gaps.push(ResolutionGapFact {
+                    self.facts.gaps.push(ResolutionGapFact::new(
                         site,
-                        kind: ResolutionGapKind::UnsupportedScopeOrBinder,
-                    });
+                        ResolutionGapKind::UnsupportedScopeOrBinder,
+                    ));
                 }
             }
         }
+    }
+
+    fn initialization_scope(&mut self, owner: ResolutionSiteId) -> ResolutionScopeId {
+        if let Some(scope) = self.initialization_scopes.get(&owner) {
+            return *scope;
+        }
+        let parent = self.ensure_type_body_scope(owner);
+        let id = ResolutionScopeId::try_from_index(self.facts.scopes.len())
+            .expect("Kotlin resolution scope count fits u32");
+        let body = self.facts.scopes[parent.index()];
+        // Plain primary-constructor parameters are visible in property
+        // initializers and init blocks, but are not instance members.
+        self.facts.scopes.push(ResolutionScopeFact {
+            id,
+            parent: Some(parent),
+            owner: Some(owner),
+            kind: ResolutionScopeKind::Initializer,
+            inheritance: ResolutionScopeInheritance::Lexical,
+            start_byte: body.start_byte,
+            end_byte: body.end_byte,
+        });
+        self.initialization_scopes.insert(owner, id);
+        id
     }
 
     /// Every class, object and interface owns a member scope, even one that
@@ -3490,6 +4415,7 @@ impl<'source, 'collector, 'declarations>
         while let Some(node) = stack.pop() {
             if let Some(subtype) = self.type_sites.get(&node.id()).copied() {
                 let mut parent_ordinal = 0u32;
+                let mut has_superclass = false;
                 for specifier in named_children(node)
                     .into_iter()
                     .filter(|child| child.kind() == "delegation_specifier")
@@ -3523,6 +4449,7 @@ impl<'source, 'collector, 'declarations>
                         } else {
                             ResolutionSupertypeKind::Interface
                         };
+                        has_superclass |= kind == ResolutionSupertypeKind::Superclass;
                         self.facts.supertypes.push(ResolutionSupertypeFact {
                             subtype,
                             parent_ordinal,
@@ -3530,14 +4457,51 @@ impl<'source, 'collector, 'declarations>
                             supertype_slot: slot,
                             kind,
                         });
-                        self.facts.gaps.push(ResolutionGapFact {
-                            site: reference,
-                            kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                        });
+                        self.facts.gaps.push(ResolutionGapFact::new(
+                            reference,
+                            ResolutionGapKind::UnsupportedHierarchyTraversal,
+                        ));
                     }
                     parent_ordinal = parent_ordinal
                         .checked_add(1)
                         .expect("Kotlin supertype count fits u32");
+                }
+                let is_declared_any = self.type_parents.get(&subtype) == Some(&None)
+                    && self.package_names.len() == 1
+                    && self.facts.names[self.package_names[0].index()].spelling == "kotlin"
+                    && self.type_simple_names.get(&subtype) == Some(&"Any");
+                let implicit = if has_superclass || is_declared_any {
+                    None
+                } else if node.kind() == "object_literal" {
+                    Some(("Any", ResolutionSupertypeKind::ImplicitSuperclass))
+                } else {
+                    match kotlin_class_like_kind(node) {
+                        Some(super::declarations::KotlinClassLikeKind::Enum) => {
+                            // Enum has additional members beyond Any. An unindexed
+                            // Enum inventory stays open for every requested name.
+                            Some(("Enum", ResolutionSupertypeKind::Superclass))
+                        }
+                        Some(super::declarations::KotlinClassLikeKind::Annotation) => {
+                            Some(("Annotation", ResolutionSupertypeKind::Interface))
+                        }
+                        Some(_) => Some(("Any", ResolutionSupertypeKind::ImplicitSuperclass)),
+                        None => None,
+                    }
+                };
+                if let Some((name, kind)) = implicit {
+                    let scope = self.facts.sites[subtype.index()].scope;
+                    let reference =
+                        self.add_site(node, ResolutionSiteKind::SyntheticReference, scope);
+                    let name = self.intern_name(name);
+                    let prefix = [self.intern_name("kotlin")];
+                    crate::implicit_supertype::publish_implicit_supertype(
+                        &mut self.facts,
+                        subtype,
+                        reference,
+                        name,
+                        &prefix,
+                        kind,
+                    );
                 }
             }
             stack.extend(named_children(node));
@@ -3833,6 +4797,37 @@ mod tests {
         parse_kotlin_file(&file, source, &tree)
     }
 
+    #[test]
+    #[hardwon(
+        "#6084: a primary-constructor parameter on a local class had no initialization scope"
+    )]
+    fn local_class_primary_constructor_initialization_scope() {
+        let parsed = parse(
+            "fun outer() { class Local(input: String) { val stored = input } }",
+            "Local.kt",
+        );
+        let facts = &parsed.resolution_facts;
+        let parameter = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && spelling(facts, identifier.name) == "input"
+            })
+            .expect("local constructor parameter");
+        let scope = facts.scopes[facts.sites[parameter.site.index()].scope.index()];
+        assert_eq!(scope.kind, ResolutionScopeKind::Initializer);
+        let owner = scope.owner.expect("initialization scope has a class owner");
+        assert!(
+            facts
+                .member_owners
+                .iter()
+                .any(|member| member.owner == owner
+                    && facts.sites[member.member.index()].kind
+                        == ResolutionSiteKind::ConstructorDeclaration)
+        );
+    }
+
     fn spelling(facts: &FileResolutionFacts, name: ResolutionNameId) -> &str {
         &facts.names[name.index()].spelling
     }
@@ -3957,7 +4952,7 @@ mod tests {
     #[test]
     fn anonymous_object_body_does_not_reuse_its_named_enclosing_type_owner() {
         let parsed = parse(
-            "class Task { fun make(): Runnable = object : Runnable { override fun run() {} } }",
+            "class Task { fun make(): Runnable = object : Handler(this.toString()) { override fun run() { this.hashCode() } } }",
             "Task.kt",
         );
         let facts = &parsed.resolution_facts;
@@ -3995,7 +4990,61 @@ mod tests {
             .find(|scope| Some(scope.id) == run_scope.parent)
             .expect("enclosing function scope");
 
-        assert_eq!(run_scope.kind, ResolutionScopeKind::Block);
+        let header_receiver = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && spelling(facts, identifier.name) == "toString"
+            })
+            .expect("anonymous header receiver call");
+        let body_receiver = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && spelling(facts, identifier.name) == "hashCode"
+            })
+            .expect("anonymous body receiver call");
+        assert_eq!(
+            facts.sites[header_receiver.site.index()].scope,
+            task_body.id
+        );
+        assert_eq!(facts.sites[body_receiver.site.index()].scope, run_scope.id);
+        assert_eq!(run_scope.kind, ResolutionScopeKind::TypeBody);
+        let anonymous = run_scope
+            .owner
+            .expect("anonymous body owns its receiver level");
+        assert_ne!(anonymous, task.site);
+        assert_eq!(
+            facts.sites[anonymous.index()].kind,
+            ResolutionSiteKind::TypeDeclaration
+        );
+        assert!(
+            facts
+                .member_owners
+                .iter()
+                .any(|member| member.member == run.site && member.owner == anonymous)
+        );
+        assert!(
+            facts
+                .supertypes
+                .iter()
+                .any(|supertype| supertype.subtype == anonymous)
+        );
+        assert!(
+            !facts
+                .binders
+                .iter()
+                .any(|binder| binder.declaration == anonymous)
+        );
+        assert!(
+            !facts
+                .gaps
+                .iter()
+                .any(|gap| gap.site == run.site && gap.kind == ResolutionGapKind::UnsupportedRoute),
+            "an anonymous member needs no source-named JVM export route"
+        );
         assert_eq!(
             enclosing_function_scope.kind,
             ResolutionScopeKind::Executable
@@ -4148,7 +5197,7 @@ fun use(bytes: ByteArray, owner: Holder?) {
             .iter()
             .find(|alias| {
                 alias.kind == ResolutionJvmAliasKind::SingletonInstance
-                    && alias_owner(facts, alias.id) == ["sample", "Holder", "Companion"]
+                    && alias_owner(facts, alias.id) == ["sample", "Holder$Companion"]
             })
             .expect("companion INSTANCE field alias");
         assert!(companion_instance.is_static);
@@ -4188,7 +5237,7 @@ fun use(bytes: ByteArray, owner: Holder?) {
         assert!(of_aliases.iter().any(|alias| {
             !alias.is_static
                 && alias.parameter_count == 1
-                && alias_owner(facts, alias.id) == ["sample", "Holder", "Companion"]
+                && alias_owner(facts, alias.id) == ["sample", "Holder$Companion"]
         }));
         assert!(of_aliases.iter().any(|alias| {
             alias.is_static
@@ -4493,9 +5542,12 @@ fun use(box: Box, items: Array<String>) {
     }
 
     #[test]
+    #[hardwon(
+        "b455165d7fdd: extension this initializers published a receiver slot and panicked during lowering"
+    )]
     fn inferred_kotlin_declarations_take_their_type_from_the_initializer() {
         let parsed = parse(
-            "fun infer(value: String) = value\nval inferred = infer(\"x\")\nval delegated by lazy { 1 }\n",
+            "fun infer(value: String) = value\nval inferred = infer(\"x\")\nval delegated by lazy { 1 }\nfun String.retain() { val str = this }\n",
             "InferredTypes.kt",
         );
         let facts = &parsed.resolution_facts;
@@ -4559,6 +5611,16 @@ fun use(box: Box, items: Array<String>) {
         assert!(!facts.gaps.iter().any(|gap| {
             gap.site == property.site && gap.kind == ResolutionGapKind::InferredType
         }));
+        // Every initializer must preserve an expression value, including an
+        // extension receiver used as `val str = this` (as in KotlinPoet).
+        for transfer in &facts.type_transfers {
+            if transfer.kind == ResolutionTypeTransferKind::Initialization {
+                assert!(matches!(
+                    facts.type_slots[transfer.input.index()].role,
+                    ResolutionTypeSlotRole::CallResult | ResolutionTypeSlotRole::ExpressionValue
+                ));
+            }
+        }
         // A delegate has no initializer expression to take a type from.
         let delegated = facts
             .identifiers
@@ -4623,10 +5685,10 @@ fun use(box: Box, items: Array<String>) {
                     facts.type_slots[observation.output.index()].role,
                     ResolutionTypeSlotRole::AssignmentValue
                 );
-                assert!(facts.gaps.contains(&ResolutionGapFact {
-                    site: incoming,
-                    kind: ResolutionGapKind::InferredType,
-                }));
+                assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                    incoming,
+                    ResolutionGapKind::InferredType
+                )));
                 assert!(
                     !facts
                         .type_transfers
@@ -4646,10 +5708,10 @@ fun use(box: Box, items: Array<String>) {
                 .expect("binding declaration")
                 .site;
             if name == "n" {
-                assert!(facts.gaps.contains(&ResolutionGapFact {
-                    site: declaration,
-                    kind: ResolutionGapKind::InferredType,
-                }));
+                assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                    declaration,
+                    ResolutionGapKind::InferredType
+                )));
             } else {
                 assert!(!facts.type_slots.iter().any(|slot| {
                     slot.site == declaration && slot.role == ResolutionTypeSlotRole::AssignmentValue
@@ -5005,7 +6067,7 @@ fun exported(): Int = 1
             .find(|alias| {
                 alias_name(facts, alias) == "run"
                     && alias.status == ResolutionJvmAliasStatus::CompilerModeDependent
-                    && alias_owner(facts, alias.id) == ["sample", "Contract", "DefaultImpls"]
+                    && alias_owner(facts, alias.id) == ["sample", "Contract$DefaultImpls"]
             })
             .expect("DefaultImpls stays incomplete without compiler-mode selection");
         assert!(default_impl.is_static);
@@ -5031,10 +6093,10 @@ fun original() {}
                     && spelling(shadowed_facts, identifier.name) == "original"
             })
             .expect("source function declaration");
-        assert!(!shadowed_facts.jvm_aliases.iter().any(|alias| {
+        assert!(shadowed_facts.jvm_aliases.iter().any(|alias| {
             alias.declaration == declaration.site && alias.kind == ResolutionJvmAliasKind::Method
         }));
-        assert!(shadowed_facts.gaps.iter().any(|gap| {
+        assert!(!shadowed_facts.gaps.iter().any(|gap| {
             gap.site == declaration.site && gap.kind == ResolutionGapKind::UnsupportedRoute
         }));
     }

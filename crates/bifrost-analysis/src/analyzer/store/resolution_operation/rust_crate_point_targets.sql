@@ -2,10 +2,9 @@
 -- topology ?1 reaches, as seen from module ?6 of topology ?5: re-export
 -- routes, glob re-exports, the named imports and glob imports that bind in
 -- the requesting module and its ancestors, and the crate-wide macro scope.
--- The export lookup (`rust_crate_point_export.sql`) and the external binding
--- lookup (`rust_crate_point_external.sql`) and inventory completeness lookup
--- (`rust_crate_point_inventory.sql`) continue from this walk; ?3 is
--- the namespace.
+-- Only external-binding and unindexed-scope queries continue from this walk.
+-- Export, completion and module-start readers use published own bindings.
+-- ?3 is the namespace.
 -- Retain only whether a route has been followed: private named imports and
 -- macro-root lookup distinguish the seed from subsequent targets. Including
 -- path depth in UNION identity revisits cycles at every depth and duplicates
@@ -43,7 +42,7 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
                    AND declared.namespace=?3 AND declared.name=targets.name
                    AND declared.origin IN ('declaration','reexport'))
   AND NOT EXISTS(
-       SELECT 1 FROM main.rust_resolution_unit_summary_placements AS source
+       SELECT 1 FROM main.rust_unit_summary_placements AS source
        CROSS JOIN main.resolution_unit_summary_members AS member
          ON member.summary_id=source.summary_id
         AND member.member_ordinal=source.member_ordinal
@@ -63,7 +62,7 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  SELECT dependency.topology_id, route.target_module_path, route.target_name, 1
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
  AND source.scope_ordinal IS NOT NULL
  CROSS JOIN main.resolution_unit_summary_members AS member
@@ -94,7 +93,7 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
  CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=owner.summary_id
   AND gap.gap_kind='unresolved_import' AND gap.subject=targets.module_path || '::' || targets.name
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
  AND source.scope_ordinal IS NOT NULL
  CROSS JOIN main.resolution_unit_summary_members AS member
@@ -127,7 +126,7 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  SELECT dependency.topology_id, glob.target_module_path, targets.name, 1
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
  AND source.scope_ordinal IS NOT NULL
  CROSS JOIN main.resolution_unit_summary_members AS member

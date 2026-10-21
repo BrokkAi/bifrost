@@ -102,6 +102,81 @@ pub struct ResolutionScopeFact {
     pub end_byte: usize,
 }
 
+/// A semantic lookup continuation overriding syntax containment.
+/// Missing rows retain the containment parent; an explicit None stops lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionScopeContinuationFact {
+    pub scope: ResolutionScopeId,
+    pub parent: Option<ResolutionScopeId>,
+}
+
+/// Walk a validated, file-local scope chain without recursive stack growth.
+pub fn find_scope_in_chain(
+    start: Option<ResolutionScopeId>,
+    mut parent: impl FnMut(ResolutionScopeId) -> Option<ResolutionScopeId>,
+    mut eligible: impl FnMut(ResolutionScopeId) -> bool,
+) -> Option<ResolutionScopeId> {
+    let mut cursor = start;
+    while let Some(scope) = cursor {
+        if eligible(scope) {
+            return Some(scope);
+        }
+        cursor = parent(scope);
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionBindingLookup {
+    WholeScope,
+    Ordered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionBindingSlotFact {
+    pub declaration: ResolutionSiteId,
+    pub lookup: ResolutionBindingLookup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionBindingEventKind {
+    Parameter,
+    Assign,
+    Augment,
+    Delete,
+    Annotation,
+    Import,
+    Function,
+    Class,
+    Iteration,
+    With,
+    Exception,
+    Pattern,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionBindingEventFact {
+    pub ordinal: u32,
+    pub slot: ResolutionSiteId,
+    pub target: ResolutionSiteId,
+    pub kind: ResolutionBindingEventKind,
+    pub value: Option<ResolutionTypeSlotId>,
+    pub authored_declaration: Option<ResolutionSiteId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionBindingDirectiveKind {
+    Global,
+    Nonlocal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionBindingDirectiveFact {
+    pub reference: ResolutionSiteId,
+    pub kind: ResolutionBindingDirectiveKind,
+    pub target: Option<ResolutionSiteId>,
+}
+
 labelled_enum! {
     ResolutionSiteKind, ALL_RESOLUTION_SITE_KINDS {
         PackageDeclaration => "package_declaration",
@@ -143,6 +218,17 @@ labelled_enum! {
         /// A stable import qualifier whose head is looked up lexically before
         /// the import continues through a package or a projected value type.
         ImportQualifierReference => "import_qualifier_reference",
+        /// A lexical binding site with no declaration or reference occurrence.
+        AliasBinding => "alias_binding",
+        // Append-only: persisted site-kind codes are positions in this list.
+        BindingSlotDeclaration => "binding_slot_declaration",
+    }
+}
+
+impl ResolutionSiteKind {
+    /// Both authored variables and canonical name slots carry value properties.
+    pub const fn is_value_declaration(self) -> bool {
+        matches!(self, Self::ValueDeclaration | Self::BindingSlotDeclaration)
     }
 }
 
@@ -161,6 +247,8 @@ pub struct ResolutionSiteFact {
 pub enum ResolutionIdentifierRole {
     Declaration,
     Reference,
+    /// A binding route only; never a declaration or reference occurrence.
+    Alias,
 }
 
 labelled_enum! {
@@ -217,10 +305,16 @@ pub enum ResolutionBinderKind {
     Parameter,
     Pattern,
     Import,
+    /// Bind the same name to a canonical declaration in this fragment.
+    Alias {
+        target: ResolutionSiteId,
+    },
     Macro,
 }
 
 /// The lexical interval in which one declaration participates in lookup.
+/// For Alias, `declaration` identifies the alias site and its Alias identifier;
+/// the target remains the only declaration and keeps its original scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionBinderFact {
     pub declaration: ResolutionSiteId,
@@ -447,6 +541,17 @@ labelled_enum! {
         /// local writes. All inputs contribute values and completion; this is
         /// one producer and does not apply type-union trait-bound semantics.
         ValueJoin => "value_join",
+        // Append kinds: declaration ordinals are persisted vocabulary codes.
+        /// Select the value of an indexing expression, with language-owned
+        /// component selection and result addressability.
+        ComponentIndex => "component_index",
+        /// Select the second result of a comma-ok indexing expression.
+        ComponentIndexOk => "component_index_ok",
+        /// Select a sliced operand type or its constructed slice shape.
+        ComponentSlice => "component_slice",
+        /// Select the first result of comma-ok indexing, whose operand must
+        /// support that two-result operation.
+        ComponentCommaOkValue => "component_comma_ok_value",
     }
 }
 
@@ -459,7 +564,11 @@ impl ResolutionTypeTransferKind {
         match self {
             Self::ComponentElement => Some(ResolutionTypeComponentKind::Element),
             Self::ComponentKey => Some(ResolutionTypeComponentKind::Key),
-            Self::ComponentValue => Some(ResolutionTypeComponentKind::Value),
+            Self::ComponentValue
+            | Self::ComponentIndex
+            | Self::ComponentIndexOk
+            | Self::ComponentCommaOkValue => Some(ResolutionTypeComponentKind::Value),
+            Self::ComponentSlice => Some(ResolutionTypeComponentKind::Element),
             _ => None,
         }
     }
@@ -1527,10 +1636,86 @@ labelled_enum! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolutionGapFact {
     pub site: ResolutionSiteId,
     pub kind: ResolutionGapKind,
+    route: Option<ResolutionRouteGap>,
+}
+
+/// The source-owned boundary an unsupported route leaves unknown. A route
+/// must choose its obligation before shared lowering chooses its consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ResolutionRouteGap {
+    OmittedReference {
+        scope: ResolutionScopeId,
+        terminal: Option<ResolutionNameId>,
+        namespace: Option<ResolutionNamespace>,
+    },
+    UnknownBinder {
+        scope: ResolutionScopeId,
+        name: Option<ResolutionNameId>,
+        namespace: Option<ResolutionNamespace>,
+        may_publish: bool,
+    },
+    UnknownPlacement,
+    UnknownAlias {
+        owner: ResolutionRouteOwner,
+        binary_owner: ResolutionBinaryOwnerRoute,
+        name: Option<ResolutionNameId>,
+        kind: Option<ResolutionJvmAliasKind>,
+    },
+}
+
+/// Binary ownership is supplied by the language producer, never inferred by
+/// shared lowering from a source declaration's spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ResolutionBinaryOwnerRoute {
+    Exact(Vec<ResolutionNameId>),
+    UnknownWithin {
+        scope: ResolutionScopeId,
+        prefix: Vec<ResolutionNameId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionRouteOwner {
+    Declaration(ResolutionSiteId),
+    /// Access applicability is unknown at this exact source declaration,
+    /// independently of the identity of its source binder or JVM aliases.
+    DeclarationAccess(ResolutionSiteId),
+    /// The binary facade is an owner even when its JVM name is unknown.
+    JvmFacade {
+        scope: ResolutionScopeId,
+        name: Option<ResolutionNameId>,
+    },
+}
+
+impl ResolutionGapFact {
+    pub fn new(site: ResolutionSiteId, kind: ResolutionGapKind) -> Self {
+        assert_ne!(
+            kind,
+            ResolutionGapKind::UnsupportedRoute,
+            "route gaps require classified coordinates"
+        );
+        Self {
+            site,
+            kind,
+            route: None,
+        }
+    }
+
+    pub fn unsupported_route(site: ResolutionSiteId, route: ResolutionRouteGap) -> Self {
+        Self {
+            site,
+            kind: ResolutionGapKind::UnsupportedRoute,
+            route: Some(route),
+        }
+    }
+
+    pub fn route(&self) -> Option<ResolutionRouteGap> {
+        self.route.clone()
+    }
 }
 
 /// Producer-owned evidence that positioned reference enumeration is not
@@ -1594,11 +1779,121 @@ pub struct ResolutionLocalWriteFact {
     pub value: ResolutionTypeSlotId,
 }
 
+/// Source-owned Python import form. Absolute placement is selected-context authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonNativeImportForm {
+    Module,
+    From,
+    Star,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonNativeImportFact {
+    pub import_site: ResolutionSiteId,
+    pub form: PythonNativeImportForm,
+    pub relative_level: u32,
+    pub module_segment_count: u32,
+    pub binding_event: Option<u32>,
+}
+
+/// Python syntax only. Shared temporal selection must read guards through a
+/// language hook, never match these kinds in shared algorithms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonNativeGuardKind {
+    IfTrue,
+    IfFalse,
+    TryBody,
+    ExceptArm,
+    TryElse,
+    Finally,
+    LoopBody,
+    LoopElse,
+    MatchArm,
+    UnknownControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonNativeGuardFact {
+    pub id: u32,
+    pub parent: Option<u32>,
+    pub site: ResolutionSiteId,
+    pub execution_scope: ResolutionScopeId,
+    pub kind: PythonNativeGuardKind,
+    pub arm_ordinal: u32,
+    pub predicate: Option<ResolutionSiteId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonNativeSiteGuardFact {
+    pub site: ResolutionSiteId,
+    pub guard: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonNativeExportOperationKind {
+    ReplaceList,
+    ReplaceTuple,
+    AugmentList,
+    AugmentTuple,
+    Extend,
+    Append,
+    Delete,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonNativeExportOperationFact {
+    pub ordinal: u32,
+    pub site: ResolutionSiteId,
+    pub module_scope: ResolutionScopeId,
+    pub kind: PythonNativeExportOperationKind,
+    pub readable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonNativeExportMemberFact {
+    pub operation_ordinal: u32,
+    pub ordinal: u32,
+    pub name: ResolutionNameId,
+    pub literal_site: ResolutionSiteId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonNativeCuratedSurface {
+    Absent,
+    Listed,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonNativeWildcardPolicy {
+    PublicNames,
+    Curated,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonNativeExportSurfaceFact {
+    pub module_scope: ResolutionScopeId,
+    pub curated: PythonNativeCuratedSurface,
+    pub wildcard_policy: PythonNativeWildcardPolicy,
+}
+
 /// One source file's normalized, target-independent resolution rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileResolutionFacts {
     pub names: Vec<ResolutionNameFact>,
     pub scopes: Vec<ResolutionScopeFact>,
+    pub scope_continuations: Vec<ResolutionScopeContinuationFact>,
+    pub binding_slots: Vec<ResolutionBindingSlotFact>,
+    pub binding_events: Vec<ResolutionBindingEventFact>,
+    pub binding_directives: Vec<ResolutionBindingDirectiveFact>,
+    pub python_imports: Vec<PythonNativeImportFact>,
+    pub python_guards: Vec<PythonNativeGuardFact>,
+    pub python_site_guards: Vec<PythonNativeSiteGuardFact>,
+    pub python_export_operations: Vec<PythonNativeExportOperationFact>,
+    pub python_export_members: Vec<PythonNativeExportMemberFact>,
+    pub python_export_surfaces: Vec<PythonNativeExportSurfaceFact>,
     pub sites: Vec<ResolutionSiteFact>,
     pub packages: Vec<ResolutionPackageFact>,
     pub package_segments: Vec<ResolutionPackageSegmentFact>,
@@ -1772,7 +2067,14 @@ impl FileResolutionFacts {
 
     /// Append a gap unless this file already contains the same fact.
     pub fn add_gap(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
-        let gap = ResolutionGapFact { site, kind };
+        let gap = ResolutionGapFact::new(site, kind);
+        if !self.gaps.contains(&gap) {
+            self.gaps.push(gap);
+        }
+    }
+
+    pub fn add_route_gap(&mut self, site: ResolutionSiteId, route: ResolutionRouteGap) {
+        let gap = ResolutionGapFact::unsupported_route(site, route);
         if !self.gaps.contains(&gap) {
             self.gaps.push(gap);
         }
@@ -1866,6 +2168,26 @@ impl FileResolutionFacts {
         }
     }
 
+    /// Publish wildcard demands and their exact same-name provenance together.
+    pub fn extend_same_name_glob_demands(
+        &mut self,
+        import_sites: &[ResolutionSiteId],
+        demands: &[(ResolutionNamespace, ResolutionNameId)],
+    ) {
+        self.extend_root_import_demands(import_sites, demands);
+        for &import_site in import_sites {
+            for &(namespace, name) in demands {
+                self.root_import_demand_targets
+                    .push(ResolutionRootImportDemandTargetFact {
+                        import_site,
+                        namespace,
+                        name,
+                        target: ResolutionRootImportDemandTarget::SameNameGlob,
+                    });
+            }
+        }
+    }
+
     /// Append a call with one result slot and no additional result slots.
     pub fn add_single_result_call(
         &mut self,
@@ -1925,6 +2247,16 @@ impl FileResolutionFacts {
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
             && self.scopes.is_empty()
+            && self.scope_continuations.is_empty()
+            && self.binding_slots.is_empty()
+            && self.binding_events.is_empty()
+            && self.binding_directives.is_empty()
+            && self.python_imports.is_empty()
+            && self.python_guards.is_empty()
+            && self.python_site_guards.is_empty()
+            && self.python_export_operations.is_empty()
+            && self.python_export_members.is_empty()
+            && self.python_export_surfaces.is_empty()
             && self.sites.is_empty()
             && self.packages.is_empty()
             && self.package_segments.is_empty()
@@ -2151,6 +2483,16 @@ impl FileResolutionFacts {
                     .fold(0usize, usize::saturating_add),
             )
             .saturating_add(rows(&self.scopes))
+            .saturating_add(rows(&self.scope_continuations))
+            .saturating_add(rows(&self.binding_slots))
+            .saturating_add(rows(&self.binding_events))
+            .saturating_add(rows(&self.binding_directives))
+            .saturating_add(rows(&self.python_imports))
+            .saturating_add(rows(&self.python_guards))
+            .saturating_add(rows(&self.python_site_guards))
+            .saturating_add(rows(&self.python_export_operations))
+            .saturating_add(rows(&self.python_export_members))
+            .saturating_add(rows(&self.python_export_surfaces))
             .saturating_add(rows(&self.sites))
             .saturating_add(rows(&self.packages))
             .saturating_add(rows(&self.package_segments))

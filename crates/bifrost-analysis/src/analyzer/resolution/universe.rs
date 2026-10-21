@@ -8,37 +8,48 @@
 //! value types, under the names their literals' intrinsic seeds use.
 
 use brokk_bifrost_core::analyzer::Language;
+
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionNamespace};
+
+use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 
 use super::fact_source::language_identity_domain;
+
 use crate::analyzer::structural::PrecedenceTier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UniverseIdentityKind {
+#[doc(hidden)]
+pub enum UniverseIdentityKind {
     Type(IntrinsicTypeKind),
     Callable,
     Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GoRangeType {
+#[doc(hidden)]
+pub enum GoRangeType {
     String,
     Integer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UniverseEntry {
-    pub(crate) language: Language,
+    #[doc(hidden)]
+    pub language: Language,
     /// The name as it is written in source.
-    pub(crate) spelling: &'static str,
+    #[doc(hidden)]
+    pub spelling: &'static str,
     /// The name that the identity digest and the intrinsic seeds use. It is
     /// `spelling` unless the written name is a shorthand for a qualified one
     /// (`Int` names `kotlin.Int`, the identity a literal of that type seeds).
-    pub(crate) identity_spelling: &'static str,
+    #[doc(hidden)]
+    pub identity_spelling: &'static str,
     pub(crate) namespace: ResolutionNamespace,
-    pub(crate) identity_kind: UniverseIdentityKind,
-    pub(crate) range_type: Option<GoRangeType>,
+    #[doc(hidden)]
+    pub identity_kind: UniverseIdentityKind,
+    #[doc(hidden)]
+    pub range_type: Option<GoRangeType>,
     /// Source-free definition projection for this language's universe rule.
     /// None retains the existing predeclared or external-boundary surface.
     pub(crate) definition_tier: Option<PrecedenceTier>,
@@ -120,7 +131,84 @@ const fn java_builtin_type(
     entry
 }
 
-const JAVA_UNIVERSE: &[UniverseEntry] = &[java_builtin_type("String", "java.lang.String")];
+#[doc = " Closed JLS bootstrap member inventory. The stable table ordinal distinguishes"]
+#[doc = " overloads; the callable projection retains the source-level member name."]
+pub(crate) use brokk_bifrost_jvm::intrinsics::IntrinsicMember;
+
+pub(crate) fn intrinsic_member_inventory(owner: &str) -> Option<&'static [IntrinsicMember]> {
+    // Keep the existing Java Object ordinals stable. Newly admitted roots use
+    // the generated source-name inventory, including inherited members.
+    if owner == "java.lang.Object" {
+        Some(JAVA_OBJECT_MEMBERS)
+    } else {
+        brokk_bifrost_jvm::intrinsics::root_member_inventory(owner)
+    }
+}
+
+const JAVA_OBJECT_MEMBERS: &[IntrinsicMember] = &[
+    IntrinsicMember {
+        name: "getClass",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "hashCode",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "equals",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "clone",
+        visibility: "protected",
+    },
+    IntrinsicMember {
+        name: "toString",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "notify",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "notifyAll",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "wait",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "wait",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "wait",
+        visibility: "public",
+    },
+    IntrinsicMember {
+        name: "finalize",
+        visibility: "protected",
+    },
+];
+
+const JAVA_UNIVERSE: &[UniverseEntry] = &[
+    java_builtin_type("String", "java.lang.String"),
+    java_builtin_type("Object", "java.lang.Object"),
+    java_builtin_type("Throwable", "java.lang.Throwable"),
+    java_builtin_type("Exception", "java.lang.Exception"),
+    java_builtin_type("RuntimeException", "java.lang.RuntimeException"),
+    java_builtin_type("Error", "java.lang.Error"),
+    java_builtin_type("Boolean", "java.lang.Boolean"),
+    java_builtin_type("Byte", "java.lang.Byte"),
+    java_builtin_type("Character", "java.lang.Character"),
+    java_builtin_type("Double", "java.lang.Double"),
+    java_builtin_type("Float", "java.lang.Float"),
+    java_builtin_type("Integer", "java.lang.Integer"),
+    java_builtin_type("Long", "java.lang.Long"),
+    java_builtin_type("Short", "java.lang.Short"),
+    java_builtin_type("Void", "java.lang.Void"),
+];
 
 const fn kotlin_builtin_type(
     spelling: &'static str,
@@ -319,6 +407,15 @@ pub(crate) fn fixed_type_entries() -> impl Iterator<Item = UniverseEntry> {
     .into_iter()
     .flat_map(table)
     .copied()
+}
+
+/// Intrinsic operand types recognized by Go component selection. Untyped
+/// strings are expression types, not predeclared source names.
+pub(crate) fn go_component_types() -> impl Iterator<Item = UniverseEntry> {
+    go_types().chain([UniverseEntry {
+        range_type: Some(GoRangeType::String),
+        ..go_builtin_type("untyped string")
+    }])
 }
 
 pub(crate) fn go_types() -> impl Iterator<Item = UniverseEntry> {

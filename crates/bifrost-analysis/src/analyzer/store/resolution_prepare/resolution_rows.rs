@@ -292,11 +292,13 @@ fn identity_domain_from_code(value: i64) -> ResolutionIdentityDomain {
     ResolutionIdentityDomain::Language(language)
 }
 
-pub(crate) fn namespace_code(namespace: ResolutionNamespace) -> i64 {
+#[doc(hidden)]
+pub fn namespace_code(namespace: ResolutionNamespace) -> i64 {
     code(ALL_RESOLUTION_NAMESPACES, namespace)
 }
 
-pub(crate) fn namespace_from_code(value: i64) -> ResolutionNamespace {
+#[doc(hidden)]
+pub fn namespace_from_code(value: i64) -> ResolutionNamespace {
     from_code(ALL_RESOLUTION_NAMESPACES, value, "resolution namespace")
 }
 
@@ -309,7 +311,8 @@ pub(crate) fn receiver_origin_code(origin: ResolutionCallableReceiverOrigin) -> 
 }
 
 /// `0` a reference, `1` a definition.
-pub(crate) const fn semantic_role_code(role: LoweredSemanticRole) -> i64 {
+#[doc(hidden)]
+pub const fn semantic_role_code(role: LoweredSemanticRole) -> i64 {
     match role {
         LoweredSemanticRole::Reference => 0,
         LoweredSemanticRole::Definition => 1,
@@ -635,7 +638,8 @@ pub(crate) const fn covers_candidate_inventory(direction: LoweredCandidateDirect
 /// `LoweringGapOrigin` (`kind` and `from_kind` are total and mutually
 /// inverse), so the stored code is a position in an existing vocabulary and
 /// this invents no numbering of its own.
-pub(crate) fn gap_origin_code(origin: LoweringGapOrigin) -> i64 {
+#[doc(hidden)]
+pub fn gap_origin_code(origin: LoweringGapOrigin) -> i64 {
     code(ALL_RESOLUTION_GAP_ORIGIN_KINDS, origin.kind())
 }
 

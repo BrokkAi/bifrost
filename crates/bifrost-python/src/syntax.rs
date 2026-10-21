@@ -10,41 +10,57 @@ pub(crate) fn python_parameter_name(node: Node<'_>, source: &str) -> Option<Stri
 }
 
 pub(crate) fn python_parameter_name_bounded(
-    mut node: Node<'_>,
+    node: Node<'_>,
     source: &str,
-    mut scope_step: impl FnMut() -> bool,
+    scope_step: impl FnMut() -> bool,
 ) -> Option<Option<String>> {
+    python_parameter_node_bounded(node, scope_step).map(|node| {
+        node.and_then(|node| {
+            let name = node_text(node, source).trim();
+            (!name.is_empty()).then(|| name.to_owned())
+        })
+    })
+}
+
+/// The exact binder token, shared by signature and native lexical production.
+pub(crate) fn python_parameter_node(node: Node<'_>) -> Option<Node<'_>> {
+    python_parameter_node_bounded(node, || true).expect("unbounded parameter token lookup")
+}
+
+fn python_parameter_node_bounded(
+    mut node: Node<'_>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Option<Node<'_>>> {
     loop {
         if !scope_step() {
             return None;
         }
         match node.kind() {
-            "identifier" => {
-                let name = node_text(node, source).trim();
-                return Some((!name.is_empty()).then(|| name.to_string()));
-            }
+            "identifier" => return Some((!node.is_missing()).then_some(node)),
             "typed_parameter"
             | "typed_default_parameter"
             | "default_parameter"
             | "list_splat_pattern"
             | "dictionary_splat_pattern" => {
-                let name = if let Some(name) = node.child_by_field_name("name") {
-                    Some(name)
-                } else {
-                    let mut selected = None;
-                    let mut cursor = node.walk();
-                    for child in node.named_children(&mut cursor) {
-                        if !scope_step() {
-                            return None;
-                        }
-                        if child.kind() == "identifier" {
-                            selected = Some(child);
-                            break;
-                        }
+                if let Some(name) = node.child_by_field_name("name") {
+                    node = name;
+                    continue;
+                }
+                let mut selected = None;
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if !scope_step() {
+                        return None;
                     }
-                    selected
-                };
-                let Some(name) = name else {
+                    if matches!(
+                        child.kind(),
+                        "identifier" | "list_splat_pattern" | "dictionary_splat_pattern"
+                    ) {
+                        selected = Some(child);
+                        break;
+                    }
+                }
+                let Some(name) = selected else {
                     return Some(None);
                 };
                 node = name;
@@ -81,20 +97,32 @@ pub(crate) fn attribute_chain<'tree>(node: Node<'tree>) -> Option<(Node<'tree>, 
 }
 
 pub fn python_reference_is_deferred_function_body(node: Node<'_>) -> bool {
+    python_reference_is_deferred_function_body_bounded(node, || true)
+        .expect("unbounded deferred-context lookup completes")
+}
+
+/// Body containment under the caller's sticky traversal budget.
+pub fn python_reference_is_deferred_function_body_bounded(
+    node: Node<'_>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
     let site_start = node.start_byte();
     let site_end = node.end_byte();
     let mut current = node;
     while let Some(parent) = current.parent() {
+        if !scope_step() {
+            return None;
+        }
         if matches!(parent.kind(), "function_definition" | "lambda")
             && parent
                 .child_by_field_name("body")
                 .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
         {
-            return true;
+            return Some(true);
         }
         current = parent;
     }
-    false
+    Some(false)
 }
 
 /// The identifier nodes in one static Python value path, from root to leaf.
@@ -557,6 +585,22 @@ fn python_literal_annotation_base(value: Node<'_>, source: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// A structurally selected subtree mentioning the module export identifier.
+/// Used by both legacy recovery and native export-operation classification.
+pub(crate) fn python_contains_all_identifier(node: Node<'_>, source: &str) -> bool {
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+    let mut found = false;
+    walk_named_tree_preorder(node, true, |node| {
+        if node.kind() == "identifier" && &source[node.byte_range()] == "__all__" {
+            found = true;
+            WalkControl::Break
+        } else {
+            WalkControl::Continue
+        }
+    });
+    found
 }
 
 #[cfg(test)]

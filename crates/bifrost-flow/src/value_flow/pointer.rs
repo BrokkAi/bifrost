@@ -19,7 +19,8 @@ use super::{
     ValueFlowCarrier, ValueFlowEdgeKillSpec, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
     ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPlanError, ValueFlowSinkId,
     ValueFlowSinkSpec, ValueFlowSolveError, ValueFlowSourceId, ValueFlowSourceSpec,
-    ValueFlowSummaryResult, identity_alias_closure, solve_value_flow_summaries_on_snapshot,
+    ValueFlowSources, ValueFlowSummaryResult, identity_alias_closure,
+    solve_value_flow_summaries_on_snapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,7 +127,7 @@ struct AliasSeed {
     alias: PointerAlias,
     origin: PointerOrigin,
     identity: OriginIdentity,
-    trigger_key: ValueFlowEventKey,
+    trigger_id: ValueFlowSourceId,
 }
 
 #[derive(Debug, Clone)]
@@ -244,10 +245,10 @@ impl PointerProvenancePlan {
 
         let mut aliases = Vec::<AliasSeed>::new();
         let mut lifecycle = Vec::<LifecycleFact>::new();
-        let mut source_specs = Vec::<ValueFlowSourceSpec>::new();
+        let mut source_specs = ValueFlowSources::default();
         let mut source_metadata = HashMap::<ValueFlowEventKey, SourceMetadata>::default();
-        let mut alias_keys_by_origin =
-            HashMap::<OriginIdentity, Vec<(usize, ValueFlowEventKey)>>::default();
+        let mut aliases_by_origin =
+            HashMap::<OriginIdentity, Vec<(usize, ValueFlowSourceId)>>::default();
 
         for procedure in &procedures {
             let semantics = procedure.semantics();
@@ -262,15 +263,7 @@ impl PointerProvenancePlan {
                     return Err(ValueFlowPlanError::LimitExceeded);
                 }
                 let key = source_event_key(&point, source_specs.len())?;
-                aliases.push(AliasSeed {
-                    procedure: procedure.clone(),
-                    origin_procedure: procedure.clone(),
-                    alias: alias.clone(),
-                    origin,
-                    identity: identity.clone(),
-                    trigger_key: key.clone(),
-                });
-                source_specs.push(ValueFlowSourceSpec::new(
+                let trigger_id = source_specs.push(ValueFlowSourceSpec::new(
                     key.clone(),
                     point,
                     ValueFlowObservationPhase::AfterEffects,
@@ -278,11 +271,19 @@ impl PointerProvenancePlan {
                     ProofStatus::Proven,
                     EvidenceCompleteness::Complete,
                 ));
-                source_metadata.insert(key.clone(), SourceMetadata::Alias(alias_index));
-                alias_keys_by_origin
+                aliases.push(AliasSeed {
+                    procedure: procedure.clone(),
+                    origin_procedure: procedure.clone(),
+                    alias: alias.clone(),
+                    origin,
+                    identity: identity.clone(),
+                    trigger_id,
+                });
+                source_metadata.insert(key, SourceMetadata::Alias(alias_index));
+                aliases_by_origin
                     .entry(identity)
                     .or_default()
-                    .push((alias_index, key));
+                    .push((alias_index, trigger_id));
             }
 
             for (owner, alias) in additional_facts
@@ -313,15 +314,7 @@ impl PointerProvenancePlan {
                     return Err(ValueFlowPlanError::LimitExceeded);
                 }
                 let key = source_event_key(&point, source_specs.len())?;
-                aliases.push(AliasSeed {
-                    procedure: procedure.clone(),
-                    origin_procedure: procedure.clone(),
-                    alias: alias.clone(),
-                    origin,
-                    identity: identity.clone(),
-                    trigger_key: key.clone(),
-                });
-                source_specs.push(ValueFlowSourceSpec::new(
+                let trigger_id = source_specs.push(ValueFlowSourceSpec::new(
                     key.clone(),
                     point,
                     ValueFlowObservationPhase::AfterEffects,
@@ -329,11 +322,19 @@ impl PointerProvenancePlan {
                     ProofStatus::Proven,
                     EvidenceCompleteness::Complete,
                 ));
-                source_metadata.insert(key.clone(), SourceMetadata::Alias(alias_index));
-                alias_keys_by_origin
+                aliases.push(AliasSeed {
+                    procedure: procedure.clone(),
+                    origin_procedure: procedure.clone(),
+                    alias: alias.clone(),
+                    origin,
+                    identity: identity.clone(),
+                    trigger_id,
+                });
+                source_metadata.insert(key, SourceMetadata::Alias(alias_index));
+                aliases_by_origin
                     .entry(identity)
                     .or_default()
-                    .push((alias_index, key));
+                    .push((alias_index, trigger_id));
             }
 
             for invalidation in semantics.pointer_invalidations() {
@@ -419,6 +420,14 @@ impl PointerProvenancePlan {
                     }
                     let key = source_event_key(&point, source_specs.len())?;
                     let alias_index = aliases.len();
+                    let trigger_id = source_specs.push(ValueFlowSourceSpec::new(
+                        key.clone(),
+                        point.clone(),
+                        ValueFlowObservationPhase::AfterEffects,
+                        value_carrier(caller, result.id()),
+                        ProofStatus::Proven,
+                        EvidenceCompleteness::Complete,
+                    ));
                     aliases.push(AliasSeed {
                         procedure: caller.clone(),
                         origin_procedure: callee.clone(),
@@ -433,21 +442,13 @@ impl PointerProvenancePlan {
                         },
                         origin,
                         identity: identity.clone(),
-                        trigger_key: key.clone(),
+                        trigger_id,
                     });
-                    source_specs.push(ValueFlowSourceSpec::new(
-                        key.clone(),
-                        point.clone(),
-                        ValueFlowObservationPhase::AfterEffects,
-                        value_carrier(caller, result.id()),
-                        ProofStatus::Proven,
-                        EvidenceCompleteness::Complete,
-                    ));
-                    source_metadata.insert(key.clone(), SourceMetadata::Alias(alias_index));
-                    alias_keys_by_origin
+                    source_metadata.insert(key, SourceMetadata::Alias(alias_index));
+                    aliases_by_origin
                         .entry(identity)
                         .or_default()
-                        .push((alias_index, key));
+                        .push((alias_index, trigger_id));
                 }
             }
         }
@@ -632,15 +633,15 @@ impl PointerProvenancePlan {
                     LifecycleFact::Invalidation { placement, .. } => placement.as_ref(),
                     LifecycleFact::ScopeEnd { .. } => None,
                 };
-                let alias_sources: Vec<(usize, &ValueFlowEventKey)> =
+                let alias_sources: Vec<(usize, ValueFlowSourceId)> =
                     if let Some(placement) = placement {
                         let alias = &aliases[placement.trigger_alias];
-                        vec![(placement.trigger_alias, &alias.trigger_key)]
+                        vec![(placement.trigger_alias, alias.trigger_id)]
                     } else {
                         aliases
                             .iter()
                             .enumerate()
-                            .map(|(alias_index, alias)| (alias_index, &alias.trigger_key))
+                            .map(|(alias_index, alias)| (alias_index, alias.trigger_id))
                             .collect()
                     };
                 for (alias_index, trigger) in alias_sources {
@@ -668,7 +669,7 @@ impl PointerProvenancePlan {
                     ..
                 } => unreachable!("pointer invalidations were handled above"),
             };
-            let Some(origin_aliases) = alias_keys_by_origin.get(&origin) else {
+            let Some(origin_aliases) = aliases_by_origin.get(&origin) else {
                 continue;
             };
             for (alias_index, trigger) in origin_aliases {
@@ -692,7 +693,7 @@ impl PointerProvenancePlan {
                         fact,
                         fact_index,
                         *alias_index,
-                        trigger,
+                        *trigger,
                         candidate,
                         &mut source_specs,
                         &mut source_metadata,
@@ -1249,9 +1250,9 @@ fn append_lifecycle_source(
     fact: &LifecycleFact,
     fact_index: usize,
     alias_index: usize,
-    trigger: &ValueFlowEventKey,
+    trigger: ValueFlowSourceId,
     pointer: ValueId,
-    source_specs: &mut Vec<ValueFlowSourceSpec>,
+    source_specs: &mut ValueFlowSources,
     source_metadata: &mut HashMap<ValueFlowEventKey, SourceMetadata>,
     edge_kills: &mut Vec<ValueFlowEdgeKillSpec>,
 ) -> Result<(), ValueFlowPlanError> {
@@ -1280,7 +1281,8 @@ fn append_lifecycle_source(
             ValueFlowObservationPhase::AfterEffects
         }
     };
-    source_specs.push(
+    let trigger = source_specs.intern_list(vec![trigger]);
+    let id = source_specs.push(
         ValueFlowSourceSpec::new(
             key.clone(),
             point.clone(),
@@ -1289,10 +1291,10 @@ fn append_lifecycle_source(
             ProofStatus::Proven,
             EvidenceCompleteness::Complete,
         )
-        .when_sources_reach(vec![trigger.clone()]),
+        .when_sources_reach(trigger),
     );
     source_metadata.insert(
-        key.clone(),
+        key,
         SourceMetadata::Lifecycle {
             alias: alias_index,
             fact: fact_index,
@@ -1311,7 +1313,7 @@ fn append_lifecycle_source(
                 target: edge.target_point,
                 kind: edge.kind,
                 carrier: carrier.clone(),
-                sources: vec![key.clone()],
+                sources: source_specs.intern_list(vec![id]),
             });
         }
     }

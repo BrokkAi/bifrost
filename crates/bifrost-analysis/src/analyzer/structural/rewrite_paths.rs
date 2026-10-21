@@ -26,15 +26,10 @@
 
 use crate::analyzer::AnalyzerQueryScope;
 use crate::analyzer::QueryScope;
-use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
-use crate::hash::HashSet;
 use crate::text_utils::find_line_index_for_offset;
-use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::structural::rewrite_path::{
-    RewriteDomainKind, RewriteOrigin, RewriteOutcome, RewritePath, RewriteTrace,
-};
-use brokk_bifrost_rust::graph_support::resolve_module_package_traced_while;
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{RewriteDomainKind, RewritePath};
 
 /// Why a file's rewrite-path derivation is not the complete answer.
 ///
@@ -84,7 +79,8 @@ impl RewritePathCompleteness {
         })
     }
 
-    fn from_reasons(reasons: Vec<RewritePathIncompleteReason>) -> Self {
+    #[doc(hidden)]
+    pub fn from_reasons(reasons: Vec<RewritePathIncompleteReason>) -> Self {
         if reasons.is_empty() {
             Self::Complete
         } else {
@@ -102,7 +98,7 @@ pub struct FileRewritePaths {
 }
 
 impl FileRewritePaths {
-    fn complete(paths: Vec<RewritePath>, generation: u64) -> Self {
+    pub(crate) fn complete(paths: Vec<RewritePath>, generation: u64) -> Self {
         Self {
             paths,
             completeness: RewritePathCompleteness::Complete,
@@ -110,7 +106,8 @@ impl FileRewritePaths {
         }
     }
 
-    fn incomplete(reasons: Vec<RewritePathIncompleteReason>, generation: u64) -> Self {
+    #[doc(hidden)]
+    pub fn incomplete(reasons: Vec<RewritePathIncompleteReason>, generation: u64) -> Self {
         Self {
             paths: Vec::new(),
             completeness: RewritePathCompleteness::Incomplete { reasons },
@@ -133,10 +130,8 @@ impl<'request> RewritePathRequest<'request> {
 
 /// Derive every bounded rewrite path one file engages.
 ///
-/// Today exactly one domain is declared, so this runs the Rust import-alias
-/// chase over the file's own import binders. A second domain becomes a second
-/// branch here plus its own production chase; nothing in the row shape or the
-/// query surface changes for it.
+/// The language support derives its declared domains using their production
+/// chases. Languages with no declared domain return an empty complete result.
 pub fn rewrite_paths_for_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -145,12 +140,11 @@ pub fn rewrite_paths_for_file(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let generation = analyzer.project().analysis_generation();
-    if crate::analyzer::common::language_for_file(file) != Language::Rust {
-        // The only declared domain does not apply here. That is an answer, not
-        // a gap: there is nothing this derivation failed to compute.
-        return FileRewritePaths::complete(Vec::new(), generation);
+    let language = crate::analyzer::common::language_for_file(file);
+    match crate::analyzer::languages::language_support(language) {
+        Some(support) => support.rewrite_paths(analyzer, token, file, generation, request),
+        None => FileRewritePaths::complete(Vec::new(), generation),
     }
-    rust_import_alias_paths(analyzer, token, file, generation, request)
 }
 
 /// Derive one file's rewrite paths with the default request controls.
@@ -163,122 +157,19 @@ pub fn rewrite_paths_for_file_with_cancellation(
     rewrite_paths_for_file(analyzer, file, &mut RewritePathRequest::new(&token))
 }
 
-/// The `rust_import_alias` domain over one Rust file.
-fn rust_import_alias_paths(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    generation: u64,
-    request: &mut RewritePathRequest<'_>,
-) -> FileRewritePaths {
-    let domain = RewriteDomainKind::RustImportAlias;
-    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
-    let Some(rust) = crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(analyzer)
-    else {
-        return FileRewritePaths::incomplete(
-            vec![RewritePathIncompleteReason::NoDomainAnalyzer(domain)],
-            generation,
-        );
-    };
-    let Some(source) = analyzer.indexed_source(file) else {
-        return FileRewritePaths::incomplete(
-            vec![RewritePathIncompleteReason::NoIndexedSource],
-            generation,
-        );
-    };
-    let lines = LineIndex::build(&source);
-
-    let mut reasons = Vec::new();
-    let mut paths = Vec::new();
-    let mut seen_origins: HashSet<String> = HashSet::default();
-    for import in brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider::import_info_of(
-        rust, token, file,
-    ) {
-        if request.cancellation.is_cancelled() {
-            reasons.push(RewritePathIncompleteReason::Cancelled);
-            break;
-        }
-        // A wildcard binds no single name, so it has no root the alias rule
-        // can rewrite, and the binder records no rewritable root for it.
-        if import.is_wildcard {
-            continue;
-        }
-        let (Some(local_name), Some(span)) = (import.local_name(), import.binder_span) else {
-            continue;
-        };
-        if !seen_origins.insert(local_name.to_string()) {
-            continue;
-        }
-        let mut trace = RewriteTrace::default();
-        // The resolved name is not this consumer's output, but failure still
-        // prevents a complete account of how the instrumented chase terminated.
-        if let Err(error) = resolve_module_package_traced_while(
-            rust,
-            scope.token(),
-            file,
-            local_name,
-            Some(&mut trace),
-            &|| !request.cancellation.is_cancelled(),
-        ) {
-            use brokk_bifrost_rust::graph_support::{ReferenceContextError, RustCargoRouteError};
-            reasons.push(match error {
-                ReferenceContextError::CargoRoutes(RustCargoRouteError::Unavailable) => {
-                    RewritePathIncompleteReason::CanonicalFactsUnavailable
-                }
-                ReferenceContextError::Interrupted
-                | ReferenceContextError::CargoRoutes(RustCargoRouteError::Cancelled) => {
-                    RewritePathIncompleteReason::Cancelled
-                }
-            });
-            break;
-        }
-        let (declared_bound, steps, outcome) = trace.into_parts();
-        // A specifier whose root no alias rewrites never engaged the domain,
-        // so it is not a path through it.
-        if steps.is_empty() {
-            continue;
-        }
-        let outcome = outcome.unwrap_or(RewriteOutcome::ExceededBudget {
-            explored: steps.len(),
-        });
-        paths.push(RewritePath {
-            domain,
-            origin: RewriteOrigin {
-                file: file.clone(),
-                specifier: local_name.to_string(),
-                range: lines.range(span.start_byte, span.end_byte),
-            },
-            declared_bound,
-            steps,
-            outcome,
-            generation,
-        });
-    }
-    paths.sort_by_key(|path| {
-        (
-            path.origin.range.start_byte,
-            path.origin.range.end_byte,
-            path.origin.specifier.clone(),
-        )
-    });
-    FileRewritePaths {
-        paths,
-        completeness: RewritePathCompleteness::from_reasons(reasons),
-        generation,
-    }
-}
-
 /// Byte offset to line number over one analyzed source.
 ///
 /// Coordinate arithmetic over the exact bytes the analyzer indexed, not a
 /// parse: the origin span comes from the adapter's own binder token, and this
 /// only turns it into the line pair every row shape carries.
-struct LineIndex {
+#[doc(hidden)]
+pub struct LineIndex {
     starts: Vec<usize>,
 }
 
 impl LineIndex {
-    fn build(source: &str) -> Self {
+    #[doc(hidden)]
+    pub fn build(source: &str) -> Self {
         let mut starts = vec![0usize];
         starts.extend(
             source
@@ -294,7 +185,8 @@ impl LineIndex {
         find_line_index_for_offset(&self.starts, offset) + 1
     }
 
-    fn range(&self, start_byte: usize, end_byte: usize) -> Range {
+    #[doc(hidden)]
+    pub fn range(&self, start_byte: usize, end_byte: usize) -> Range {
         Range {
             start_byte,
             end_byte,

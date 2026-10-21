@@ -32,7 +32,7 @@ pub(crate) fn procedure_budget_error(limit: usize, attempted: usize) -> Semantic
     limits.procedures = limit;
     SemanticBudget::new(limits)
         .expect("positive procedure budget")
-        .check(SemanticWork {
+        .check_admission(SemanticWork {
             procedures: attempted,
             ..SemanticWork::default()
         })

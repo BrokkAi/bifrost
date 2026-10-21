@@ -22,7 +22,8 @@ use super::{AnalyzerStore, Result, StoreError};
 impl AnalyzerStore {
     /// Collection refreshes statistics through its own connection. Reload
     /// that result without sampling the same database a second time.
-    pub(crate) fn reload_planner_statistics(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn reload_planner_statistics(&self) -> Result<()> {
         self.conn.execute(|conn| -> Result<()> {
             conn.execute_batch("ANALYZE sqlite_schema;")?;
             conn.flush_prepared_statement_cache();
@@ -224,6 +225,21 @@ pub mod pinned_plans {
     pub(crate) const OID: &str = "0123456789012345678901234567890123456789";
     pub(crate) const MEMBERSHIP: &str = "units.in_declarations = 1";
 
+    /// The textual Rust macro-walk pins. These read the selected source path
+    /// and summary membership, so
+    /// `every_pinned_query_plans_in_both_statistics_states` asserts those
+    /// seeks on exactly these names. The blob-keyed `rust_macro_*` source-row
+    /// pins read only their source rows and are covered by
+    /// `selected_macro_input_reads_seek_blob_and_invocation_in_both_statistics_states`.
+    #[cfg(test)]
+    pub(crate) const RUST_MACRO_WALK_QUERIES: [&str; 5] = [
+        "rust_macro_walk_ancestry",
+        "rust_macro_walk_child_module_files",
+        "rust_macro_included_file",
+        "rust_macro_include_starts",
+        "rust_macro_host_files",
+    ];
+
     /// Request counts the batch definition-candidate statements are pinned at
     /// (issue #3030).
     ///
@@ -397,6 +413,10 @@ pub mod pinned_plans {
     /// does not even prepare, so the dump would report a preparation error
     /// instead of a plan.
     pub fn prepare_pin_context(conn: &Connection) {
+        super::super::ensure_revisioned_workspace_views(conn)
+            .expect("revisioned workspace query views");
+        conn.execute_batch(super::super::resolution_operation::REVERSE_CANDIDATE_KEYS_DDL)
+            .expect("reverse candidate request keys");
         super::super::ensure_declaration_candidate_requests_table(conn)
             .expect("identifier candidate request table");
         crate::analyzer::store::resolution_lexical::register_resolution_identity_functions(conn)
@@ -634,6 +654,31 @@ pub mod pinned_plans {
         ),
     ];
 
+    #[cfg(test)]
+    fn rust_macro_source_row_pins() -> [PinnedQuery; 3] {
+        use crate::analyzer::store::rust_macro_source_sql::{
+            RUST_MACRO_INPUT_EXISTS_SQL, RUST_MACRO_INVOCATION_INPUT_SQL,
+            RUST_MACRO_INVOCATION_TOKENS_SQL,
+        };
+        [
+            pin(
+                "rust_macro_input_exists",
+                RUST_MACRO_INPUT_EXISTS_SQL,
+                vec![integer(1)],
+            ),
+            pin(
+                "rust_macro_invocation_input",
+                RUST_MACRO_INVOCATION_INPUT_SQL,
+                vec![integer(1), integer(16)],
+            ),
+            pin(
+                "rust_macro_invocation_tokens",
+                RUST_MACRO_INVOCATION_TOKENS_SQL,
+                vec![integer(1), integer(2)],
+            ),
+        ]
+    }
+
     /// Every EXPLAIN QUERY PLAN pin this crate's store module owns, as data.
     ///
     /// This is where each of those statements is written, once. The pin tests
@@ -653,6 +698,40 @@ pub mod pinned_plans {
                 text("module3/src/main0"),
             ],
         )];
+        for (name, sql, params) in [
+            (
+                "reverse_candidate_keys_ddl",
+                super::super::resolution_operation::REVERSE_CANDIDATE_KEYS_DDL,
+                vec![],
+            ),
+            (
+                "reverse_candidates",
+                super::super::resolution_operation::REVERSE_CANDIDATES_SQL,
+                vec![],
+            ),
+            (
+                "reverse_candidate_keys_clear",
+                super::super::resolution_operation::REVERSE_CANDIDATE_KEYS_CLEAR_SQL,
+                vec![],
+            ),
+            (
+                "reverse_candidate_keys_insert",
+                super::super::resolution_operation::REVERSE_CANDIDATE_KEYS_INSERT_SQL,
+                vec![text("[[0,0,1,1,1,1,1]]")],
+            ),
+        ] {
+            queries.push(pin(name, sql, params));
+        }
+        queries.push(pin(
+            "intrinsic_member_owner_indexed",
+            super::super::resolution_typed::external_owners::INTRINSIC_MEMBER_OWNER_INDEXED_SQL,
+            vec![text("provider"), text("java.lang.Object")],
+        ));
+        queries.push(pin(
+            "external_member_owner_by_definition",
+            super::super::resolution_typed::external_owners::EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL,
+            vec![text("provider"), text("owner.Type"), integer(0), text("[\"provider\"]")],
+        ));
         queries.push(pin(
             "type_productions_by_output",
             super::super::resolution_prepare::typed_rows::TYPE_PRODUCTIONS_BY_OUTPUT_SQL,
@@ -671,10 +750,24 @@ pub mod pinned_plans {
                 text("rust"),
             ],
         ));
+        #[cfg(test)]
+        queries.extend(rust_macro_source_row_pins());
         queries.push(pin(
             "selected_macro_occurrence_lines",
             super::super::resolution_operation::SELECTED_MACRO_OCCURRENCE_LINES_SQL,
             vec![integer(1)],
+        ));
+        queries.push(pin(
+            "generic_parameter_declarations",
+            super::super::resolution_typed::GENERIC_PARAMETER_DECLARATIONS_SQL,
+            vec![],
+        ));
+        queries.push(pin(
+            "qualified_route_mounts",
+            super::super::resolution_typed::QUALIFIED_ROUTE_MOUNTS_SQL,
+            vec![integer(
+                super::super::resolution::TypedFactRelation::QualifiedRouteLookup.code(),
+            )],
         ));
         queries.push(pin(
             "invocation_roles_for_references",
@@ -939,6 +1032,16 @@ pub mod pinned_plans {
                 crate::analyzer::store::resolution::TypedFactRelation::DeferredMemberOwnerLookup,
             ),
             vec![integer(0), integer(1)],
+        ));
+        queries.push(pin(
+            "selected_typed_shared_membership_64",
+            crate::analyzer::store::resolution_typed::shared_membership_sql(
+                64,
+                crate::analyzer::store::resolution::TypedFactRelation::DeferredMemberOwnerLookup,
+            ),
+            (0..64)
+                .flat_map(|ordinal| [integer(ordinal), integer(1)])
+                .collect(),
         ));
         queries.extend([
             pin(
@@ -1228,6 +1331,11 @@ pub mod pinned_plans {
                 ],
             ),
             pin(
+                "rust_reverse_site_cfg",
+                reverse::SITE_CFG_SQL,
+                vec![text("src/lib.rs"), integer(7)],
+            ),
+            pin(
                 "rust_reverse_call_arity",
                 reverse::CALL_ARITY_SQL,
                 vec![integer(1), integer(7)],
@@ -1364,11 +1472,47 @@ pub mod pinned_plans {
                         ),
                     )),
                     integer(1),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::MalformedSyntax,
+                        ),
+                    )),
                 ],
             ),
             pin(
                 "rust_reverse_target_scoped_inventory_gaps",
                 reverse::target_scoped_reference_inventory_gaps_sql(),
+                vec![
+                    integer(1),
+                    text("[[\"target\",\"callable\"]]"),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference,
+                    )),
+                    integer(1 << 31),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::MemberReference,
+                    )),
+                    text("[]"),
+                    integer(1),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CallableReference,
+                    )),
+                    text("[]"),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface,
+                        ),
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedCallApplicability,
+                        ),
+                    )),
+                ],
+            ),
+            pin(
+                "rust_reverse_initial_gap_locators",
+                reverse::initial_reference_inventory_gap_locators_sql(),
                 vec![
                     integer(1),
                     text("[[\"target\",\"callable\"]]"),
@@ -1418,6 +1562,18 @@ pub mod pinned_plans {
         // seek instead of being joined against a scan of the table.
         use crate::analyzer::store::resolution_prepare::resolution_rows as rows;
         queries.extend([
+            pin(
+                "jvm_alias_owner_surface_by_identity",
+                crate::analyzer::store::resolution_prepare::authority_rows::NODE_FOR_IDENTITY_SQL,
+                vec![integer(1), digest(0)],
+            ),
+            pin(
+                "jvm_alias_stage_owner_surface_by_identity",
+                crate::analyzer::store::resolution_stage::lexical_readers::NODE_IDENTITIES_SQL,
+                vec![text(
+                    r#"[[0,"0000000000000000000000000000000000000000000000000000000000000000"]]"#,
+                )],
+            ),
             pin(
                 "resolution_paths_by_key",
                 rows::RESOLUTION_PATHS_BY_KEY_SQL,
@@ -1857,6 +2013,7 @@ pub mod pinned_plans {
                     digest(5),
                     integer(1),
                     digest(6),
+                    text("python"),
                 ],
             ),
             (
@@ -1881,6 +2038,7 @@ pub mod pinned_plans {
                     digest(1),
                     text("src/app.py"),
                     text("python"),
+                    text("python"),
                     integer(1),
                     digest(2),
                     digest(3),
@@ -1897,6 +2055,7 @@ pub mod pinned_plans {
                 vec![
                     digest(1),
                     text("src/app.py"),
+                    text("python"),
                     text("python"),
                     integer(1),
                     digest(2),
@@ -1937,7 +2096,7 @@ pub mod pinned_plans {
             (
                 "class_set_summary_procedure",
                 CLASS_SET_SUMMARY_PROCEDURE_SQL.as_str(),
-                vec![digest(2)],
+                vec![digest(2), text("python")],
             ),
             (
                 "class_set_summary_dependents_by_lookup",
@@ -2567,14 +2726,16 @@ pub mod pinned_plans {
         queries
     }
 
-    pub(crate) fn plan_rows(
+    #[doc(hidden)]
+    pub fn plan_rows(
         conn: &Connection,
         query: &PinnedQuery,
     ) -> std::result::Result<Vec<String>, String> {
         plan_rows_for_sql(conn, &query.sql, &query.params)
     }
 
-    pub(crate) fn plan_rows_for_sql(
+    #[doc(hidden)]
+    pub fn plan_rows_for_sql(
         conn: &Connection,
         sql: &str,
         params: &[Value],
@@ -2634,6 +2795,7 @@ pub mod pinned_plans {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::rust_tests_test_support::*;
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
@@ -2645,14 +2807,16 @@ pub(crate) mod tests {
     // `pinned_plans` so the benchmark can call them too; the pin tests in
     // `store/mod.rs` still reach them through this module's path, which is why
     // the three they use are re-exported rather than merely imported.
-    use super::pinned_plans::{OID, pinned_queries, plan_rows};
+    use super::pinned_plans::{OID, RUST_MACRO_WALK_QUERIES, pinned_queries, plan_rows};
     pub(crate) use super::pinned_plans::{explain_pin, pinned, prepare_pin_context};
-    use std::sync::Arc;
 
-    use brokk_bifrost_core::cache_gc::{
-        PlannerStatisticsState, STORE_STATISTICS_ENV, planner_statistics_repairs,
-        planner_statistics_row_count, with_representative_statistics,
-    };
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
+    use brokk_bifrost_core::cache_gc::planner_statistics_repairs;
+
+    use brokk_bifrost_core::cache_gc::planner_statistics_row_count;
+
+    use brokk_bifrost_core::cache_gc::with_representative_statistics;
 
     pub(crate) fn assert_pinned_query_uses_index(
         conn: &Connection,
@@ -2676,10 +2840,117 @@ pub(crate) mod tests {
         );
     }
 
-    use crate::analyzer::store::test_adapters::two_revision_collection_fixture;
-    use crate::analyzer::workspace::WorkspaceAnalyzer;
-    use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject};
-    use crate::gitblob::test_repo::{commit_all, init_repo};
+    fn fill_reverse_candidate_fixture(conn: &Connection) {
+        // Like the neighboring access-plan fixtures, populate source rows
+        // without publishing fragments: this pin tests indexed reads.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        for blob in 1..=16 {
+            for key in 1..=256_i64 {
+                conn.execute(
+                    "INSERT INTO resolution_sites(blob_id,site,role,namespace) VALUES(?1,?2,0,0)",
+                    rusqlite::params![blob, key],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_scoped,end_node,end_lead_identity,end_lead_scoped,body)
+                     VALUES(?1,?2,?3,0,12,?3,0,jsonb('[[],null,[],null,[],null,[],null,[],[],[]]'))",
+                    rusqlite::params![blob, key * 2, key],
+                ).unwrap();
+                let fixed = format!("[0,0,0,-{key}]");
+                let body = format!("[[],null,[],null,{fixed},null,[],null,[],[],[]]");
+                conn.execute(
+                    "INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_scoped,end_node,end_lead_scoped,root_terminal,body,end_fixed_key,end_open_tail)
+                     VALUES(?1,?2,?3,0,-1,0,?3,jsonb(?4),?5,0)",
+                    rusqlite::params![blob, key * 2 + 1, key, body, fixed],
+                ).unwrap();
+                conn.execute(
+                    "INSERT INTO resolution_qualified_routes(blob_id,reference,precedence_ordinal,qualifier_slot,lookup,source_lookup,namespace,projection_output_slot,projection_kind,coarse_gap_reason)
+                     VALUES(?1,?2,0,?2,?2,?2,0,?2,0,0)",
+                    rusqlite::params![blob, key],
+                ).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_candidate_union_seeks_all_arms_in_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            prepare_pin_context(&conn);
+            fill_reverse_candidate_fixture(&conn);
+            state.install(&conn);
+            for (width, lexical) in [1, 64, 256, 4096]
+                .into_iter()
+                .flat_map(|width| [(width, true), (width, false)])
+            {
+                conn.execute(
+                    super::super::resolution_operation::REVERSE_CANDIDATE_KEYS_CLEAR_SQL,
+                    [],
+                )
+                .unwrap();
+                let requested = (0..width)
+                    .map(|ordinal| {
+                        (
+                            ordinal,
+                            ordinal,
+                            ordinal % 16 + 1,
+                            ordinal / 16 + 1,
+                            1,
+                            1,
+                            lexical,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                conn.execute(
+                    super::super::resolution_operation::REVERSE_CANDIDATE_KEYS_INSERT_SQL,
+                    [serde_json::to_string(&requested).unwrap()],
+                )
+                .unwrap();
+                let plan = explain_pin(&conn, &pinned("reverse_candidates"));
+                // The three UNION arms may scan their driving TEMP key table,
+                // but every base-table read must be a constrained indexed SEARCH.
+                for (arm, index, constraints) in [
+                    (
+                        "lookup",
+                        "resolution_paths_end_lookup_identity",
+                        "blob_id=? AND end_lead_identity=?",
+                    ),
+                    (
+                        "prefixed root",
+                        "resolution_paths_root_terminal",
+                        "blob_id=? AND root_terminal=?",
+                    ),
+                    (
+                        "qualified route",
+                        "resolution_qualified_routes_source_lookup",
+                        "blob_id=? AND source_lookup=?",
+                    ),
+                ] {
+                    assert!(
+                        plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                            && detail.contains(index)
+                            && detail.contains(constraints)),
+                        "{state}, {width} keys, {arm} must seek its indexed base-table key: {plan:#?}"
+                    );
+                }
+                assert_eq!(
+                    plan.iter()
+                        .filter(|detail| detail.starts_with("SEARCH s USING PRIMARY KEY")
+                            && detail.contains("blob_id=? AND site=?"))
+                        .count(),
+                    3,
+                    "{state}, {width} keys: each arm must seek its site: {plan:#?}"
+                );
+                assert!(
+                    plan.iter()
+                        .all(|detail| !detail.starts_with("SCAN ") || detail == "SCAN k")
+                        && plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
+                    "{state}, {width} keys: only the driving TEMP request keys may be scanned; no base table may be scanned: {plan:#?}"
+                );
+            }
+        }
+    }
 
     #[test]
     #[hardwon("#3769: Rust field-only usage scans evaluated unrelated full resolution facts")]
@@ -2868,6 +3139,41 @@ pub(crate) mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn external_member_owner_inverse_seeks_the_member_primary_key() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            state.install(&conn);
+            let owner_plan = explain_pin(&conn, &pinned("intrinsic_member_owner_indexed"));
+            assert!(
+                owner_plan.iter().any(|detail| detail.contains(
+                    "SEARCH jvm_external_owners USING PRIMARY KEY (provider_id=? AND owner_fqn=?)"
+                )),
+                "{state}: {owner_plan:?}"
+            );
+            assert!(
+                owner_plan
+                    .iter()
+                    .all(|detail| !detail.contains("SCAN jvm_external_owners")),
+                "{state}: {owner_plan:?}"
+            );
+            let plan = explain_pin(&conn, &pinned("external_member_owner_by_definition"));
+            assert!(
+                plan.iter().any(|detail| detail.contains(
+                    "SEARCH member USING PRIMARY KEY (provider_id=? AND owner_fqn=? AND ordinal=?)"
+                )),
+                "{state}: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .all(|detail| !detail.contains("SCAN member")
+                        && !detail.contains("SCAN inventory")),
+                "{state}: {plan:?}"
+            );
         }
     }
 
@@ -3339,389 +3645,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    #[hardwon(
-        "#4990+#4995: Rust point readers repeated live alignment and dependency closure per lookup"
-    )]
-    fn rust_module_placement_readers_seek_materialized_selection_rows() {
-        use crate::CancellationToken;
-        use crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL;
-        use crate::analyzer::store::resolution_selection::{
-            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
-            SelectedResolutionOverlayMask,
-        };
-        use crate::inline_project::InlineTestProject;
-        use rusqlite::types::Value;
-
-        let project = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[package]\nname='placements'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprovider={path='provider'}\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub mod child; pub mod inline { pub fn target() {} }",
-            )
-            .file(
-                "src/child.rs",
-                "pub fn caller() { crate::inline::target(); }",
-            )
-            .file("provider/Cargo.toml", "[package]\nname='provider'\nversion='0.1.0'\nedition='2021'\n")
-            .file("provider/src/lib.rs", "pub struct Item; #[macro_export] macro_rules! chosen { () => {} }")
-            .build();
-        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-        let store = analyzer.store().unwrap();
-        let workspace = {
-            let conn = store.conn.lock().unwrap();
-            super::super::WorkspaceId(
-                conn.query_row(
-                    "SELECT workspace_id FROM workspace_heads WHERE lang='rust'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap(),
-            )
-        };
-        let snapshots = store
-            .workspace_snapshots_for_current_languages(&workspace, &["rust".into()])
-            .unwrap();
-        // Publication can replace summary rows without moving the workspace
-        // revision. Both reader pools must invalidate that identical selection.
-        store
-            .execute_selection_publication(|conn| -> super::super::Result<()> {
-                let tx = conn.transaction()?;
-                tx.execute(
-                    super::super::unit_summaries::DELETE_LANGUAGE_VERSIONS_SQL,
-                    ["rust"],
-                )?;
-                tx.execute(
-                    super::super::unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL,
-                    [],
-                )?;
-                tx.commit()?;
-                Ok(())
-            })
-            .unwrap();
-        let mut ordinary = store.read_conn_for_workspace(&snapshots).unwrap();
-        assert_eq!(
-            ordinary
-                .query_row(
-                    "SELECT count(*) FROM selected_rust_unit_summaries",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        {
-            let conn = store.conn.lock().unwrap();
-            store
-                .select_writer_workspace_snapshots(&conn, &snapshots)
-                .unwrap();
-            assert_eq!(
-                conn.query_row(
-                    "SELECT count(*) FROM selected_rust_unit_summaries",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-                0
-            );
-        }
-        store.reconcile_rust_crates(&snapshots["rust"]).unwrap();
-        assert_eq!(
-            store
-                .workspace_snapshots_for_current_languages(&workspace, &["rust".into()])
-                .unwrap(),
-            snapshots
-        );
-        assert!(
-            store.writer_selection.lock().unwrap().is_none(),
-            "same-connection publication invalidates the writer fallback"
-        );
-        store
-            .select_workspace_snapshots(&mut ordinary, &snapshots)
-            .unwrap();
-        let published: i64 = ordinary
-            .query_row(
-                "SELECT count(*) FROM selected_rust_unit_summaries",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            published > 0,
-            "unchanged revision sees newly published units"
-        );
-        let counts = store.workspace_selection_counts_for_test();
-        store
-            .select_workspace_snapshots(&mut ordinary, &snapshots)
-            .unwrap();
-        assert_eq!(
-            store.workspace_selection_counts_for_test(),
-            counts,
-            "unchanged publication reuses materialized units"
-        );
-        drop(ordinary);
-        {
-            let conn = store.conn.lock().unwrap();
-            store
-                .select_writer_workspace_snapshots(&conn, &snapshots)
-                .unwrap();
-            assert_eq!(
-                conn.query_row(
-                    "SELECT count(*) FROM selected_rust_unit_summaries",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-                published
-            );
-        }
-        // Reuse, then acquire a different masked selection, then restore it.
-        // The fill runs only after the final input write in each acquisition.
-        for masks in [
-            vec![],
-            vec![],
-            vec![SelectedResolutionOverlayMask::removal(
-                "rust",
-                "src/child.rs",
-            )],
-            vec![],
-        ] {
-            let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
-                .open_selected_resolution_mount_inventory(
-                    &workspace,
-                    &snapshots,
-                    &[SelectedResolutionLanguage::new("rust", Language::Rust)],
-                    &masks,
-                    &CancellationToken::default(),
-                )
-                .unwrap()
-            else {
-                panic!("complete selection");
-            };
-            let conn = selection.connection();
-            let count: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM selected_rust_module_placements",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(count > 0, "selection must publish module placements");
-            // Compare the completed table to the original live SELECT, including
-            // aligned inline scopes. SQL text is a value, not source syntax.
-            let select = SELECTED_MODULE_PLACEMENTS_FILL_SQL
-                .split_once("INSERT INTO temp.selected_rust_module_placements\n")
-                .unwrap()
-                .1
-                .trim_end_matches([';', '\n']);
-            let equal: bool = conn.query_row(&format!(
-                "WITH expected AS ({select}) SELECT NOT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM selected_rust_module_placements) AND NOT EXISTS(SELECT * FROM selected_rust_module_placements EXCEPT SELECT * FROM expected)"), [], |row| row.get(0)).unwrap();
-            assert!(
-                equal,
-                "materialized placements match completed selection inputs"
-            );
-            let fill = super::super::rust_selected_units_fill_sql();
-            let units_select = fill
-                .split_once("INSERT INTO temp.selected_rust_unit_summaries\n")
-                .unwrap()
-                .1
-                .split_once(';')
-                .unwrap()
-                .0;
-            let equal: bool = conn.query_row(&format!(
-                "WITH expected AS ({units_select}) SELECT NOT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM selected_rust_unit_summaries) AND NOT EXISTS(SELECT * FROM selected_rust_unit_summaries EXCEPT SELECT * FROM expected)"), [], |row| row.get(0)).unwrap();
-            assert!(equal, "selected units match the original live predicate");
-            let complete_contexts: bool = conn.query_row(
-                "SELECT NOT EXISTS(SELECT 1 FROM main.resolution_unit_summary_versions AS v JOIN main.rust_resolution_unit_summary_versions AS r USING(workspace_id,lang,generation,unit_key,valid_from,summary_id) LEFT JOIN main.rust_resolution_unit_summary_contexts AS c USING(summary_id) WHERE c.summary_id IS NULL)", [], |row| row.get(0)).unwrap();
-            assert!(
-                complete_contexts,
-                "published route owners have their context rows"
-            );
-            let (roots, pairs): (i64, i64) = conn.query_row(
-                "SELECT (SELECT count(*) FROM selected_rust_unit_summaries), count(*) FROM selected_rust_unit_closure", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
-            assert!(
-                pairs > roots,
-                "fixture must exercise workspace dependency reachability"
-            );
-        }
-        // Statistics installation writes main, so plan against the fixture's
-        // writer after exercising the real read-only selection lifecycle.
-        let conn = store.conn.lock().unwrap();
-        prepare_pin_context(&conn);
-        conn.execute_batch(
-            "DELETE FROM temp.selected_resolution_mounts;
-                            DELETE FROM temp.selected_rust_module_placements;
-                            DELETE FROM temp.selected_rust_unit_closure;
-                            DELETE FROM temp.selected_rust_unit_summaries;
-                            DELETE FROM temp.selected_workspace_revisions;",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO temp.selected_workspace_revisions
-                      SELECT workspace_id,lang,generation,revision FROM workspace_heads
-                      WHERE workspace_id=?1 AND lang='rust'",
-            [workspace.as_str()],
-        )
-        .unwrap();
-        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
-        conn.execute_batch("INSERT INTO temp.selected_resolution_mounts(
-                             mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path)
-                           SELECT row_number() OVER (ORDER BY rel_path),blob_id,'rust','rust',rel_path
-                           FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_unit_members);").unwrap();
-        conn.execute_batch(SELECTED_MODULE_PLACEMENTS_FILL_SQL)
-            .unwrap();
-        let (blob, key): (i64, Vec<u8>) = conn.query_row(
-            "SELECT placement_blob,unit_key FROM selected_rust_module_placements WHERE container_path='crate'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
-        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_reverse_rows::GAP_CANDIDATE_SITES_SCHEMA_SQL).unwrap();
-        let (topology, summary): (i64, i64) = conn
-            .query_row(
-                "SELECT topology_id,summary_id FROM selected_rust_unit_summaries WHERE unit_key=?1",
-                [&key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        for state in PlannerStatisticsState::BOTH {
-            state.install(&conn);
-            for shape in ["type", "value", "macro", "root"] {
-                let mut pin = pinned(&format!("rust_point_targets_{shape}"));
-                pin.params[0] = Value::Integer(topology);
-                pin.params[4] = Value::Integer(topology);
-                let plan = explain_pin(&conn, &pin);
-                for (alias, index) in [
-                    ("owner", "selected_rust_unit_summaries_topology"),
-                    ("dependency", "selected_rust_unit_summaries_key"),
-                ] {
-                    assert!(
-                        plan.iter()
-                            .filter(
-                                |row| row.contains(&format!("SEARCH {alias} USING INDEX {index}"))
-                            )
-                            .count()
-                            >= 5,
-                        "{state} {shape}: every recursive arm seeks {alias}: {plan:?}"
-                    );
-                }
-                assert!(
-                    plan.iter().all(|row| !row.contains("AUTOMATIC")),
-                    "{state} {shape}: {plan:?}"
-                );
-            }
-            for (name, params, index) in [
-                (
-                    "rust_point_access_memberships",
-                    vec![Value::Blob(key.clone()), Value::Integer(blob)],
-                    "selected_rust_unit_closure_summary",
-                ),
-                (
-                    "rust_point_modules",
-                    vec![Value::Integer(summary)],
-                    "selected_rust_unit_closure_summary",
-                ),
-                (
-                    "rust_scope_closure_mounts",
-                    vec![Value::Blob(key.clone())],
-                    "selected_rust_unit_closure_summary",
-                ),
-                (
-                    "rust_point_crate",
-                    vec![Value::Blob(key.clone())],
-                    "selected_rust_unit_summaries_key",
-                ),
-                (
-                    "rust_point_file_crates",
-                    vec![Value::Integer(blob), Value::Text("src/lib.rs".into())],
-                    "selected_rust_unit_summaries_summary",
-                ),
-            ] {
-                let mut pin = pinned(name);
-                pin.params = params;
-                let plan = explain_pin(&conn, &pin);
-                if name == "rust_point_modules" {
-                    assert!(
-                        plan.iter().any(|row| row.contains(
-                            "SEARCH cargo USING INDEX selected_rust_unit_summaries_workspace"
-                        )),
-                        "{state} {name}: {plan:?}"
-                    );
-                    assert!(
-                        plan.iter().any(|row| row.contains("SEARCH cargo_context")
-                            && (row.contains("summary_id=?")
-                                || row.contains("INTEGER PRIMARY KEY (rowid=?)"))),
-                        "{state} {name}: {plan:?}"
-                    );
-                    assert!(
-                        plan.iter().all(|row| !row.contains("SCAN cargo_context")),
-                        "{state} {name}: {plan:?}"
-                    );
-                }
-                assert!(
-                    plan.iter()
-                        .any(|row| row.contains("SEARCH") && row.contains(index)),
-                    "{state} {name}: {plan:?}"
-                );
-                assert!(
-                    plan.iter()
-                        .all(|row| !row.contains("AUTOMATIC") && !row.contains("RECURSIVE STEP")),
-                    "{state} {name}: {plan:?}"
-                );
-            }
-            for name in [
-                "rust_point_access_placements",
-                "rust_point_access_reference_placements",
-                "rust_point_module_placements",
-            ] {
-                let mut pin = pinned(name);
-                pin.params = if name == "rust_point_module_placements" {
-                    vec![Value::Integer(blob), Value::Text("crate".into())]
-                } else {
-                    vec![Value::Blob(key.clone()), Value::Integer(blob), Value::Null]
-                };
-                let plan = explain_pin(&conn, &pin);
-                assert!(
-                    plan.iter().any(|row| row.contains("SEARCH")
-                        && row.contains("selected_rust_module_placements_blob (placement_blob=?")),
-                    "{state} {name} must seek the blob: {plan:?}"
-                );
-                assert!(
-                    plan.iter().all(|row| !row.contains("AUTOMATIC")
-                        && !row.starts_with("SCAN placement")
-                        && !row.contains("SCAN mount")),
-                    "{state} {name}: {plan:?}"
-                );
-                if name == "rust_point_access_placements" {
-                    let seek = plan
-                        .iter()
-                        .position(|row| {
-                            row.contains("selected_rust_module_placements_blob (placement_blob=?")
-                        })
-                        .unwrap();
-                    let graph = plan
-                        .iter()
-                        .position(|row| {
-                            row.contains(
-                                "SEARCH graph USING INDEX selected_rust_unit_closure_topology",
-                            )
-                        })
-                        .unwrap();
-                    assert!(
-                        seek < graph,
-                        "{state} seek placements before the dependency join: {plan:?}"
-                    );
-                }
-            }
-            let plan = explain_pin(&conn, &pinned("rust_reverse_gap_candidate_sites"));
-            assert!(
-                plan.iter()
-                    .any(|row| row
-                        .contains("selected_rust_module_placements_topology (topology_id=?")),
-                "{state} reverse target hosts must seek their topology: {plan:?}"
-            );
-        }
-    }
-
     /// Milestone 6's checkpoint reads rows by key, in both statistics states.
     ///
     /// The three statements the checkpoint adds each pass the keys the caller
@@ -3741,6 +3664,16 @@ pub(crate) mod tests {
             prepare_pin_context(&conn);
             state.install(&conn);
             for (name, required, forbidden) in [
+                (
+                    "jvm_alias_owner_surface_by_identity",
+                    "(blob_id=? AND identity_digest=?)",
+                    "SCAN resolution_node_catalog",
+                ),
+                (
+                    "jvm_alias_stage_owner_surface_by_identity",
+                    "selected_resolution_stage_node_identity (host_ordinal=? AND identity_digest=?)",
+                    "SCAN coordinate",
+                ),
                 (
                     "resolution_paths_by_key",
                     "SEARCH resolution_paths USING PRIMARY KEY (blob_id=? AND path=?)",
@@ -4150,6 +4083,51 @@ pub(crate) mod tests {
                 plan.first().is_some_and(|row| row.contains("SCAN request")),
                 "{state}: requested coordinates drive hydration: {plan:?}"
             );
+        }
+    }
+
+    #[test]
+    #[hardwon("#5658: macro admission and matching decoded every invocation's tokens")]
+    fn selected_macro_input_reads_seek_blob_and_invocation_in_both_statistics_states() {
+        let store = AnalyzerStore::open_ephemeral().expect("open store");
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute_batch("PRAGMA foreign_keys=OFF;
+            WITH RECURSIVE blobs(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM blobs WHERE n<64),
+            invocations(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM invocations WHERE n<8)
+            INSERT INTO source_rust_macro_inputs(blob_id,invocation_occurrence_id,start_byte,source,invocation_start_byte)
+            SELECT blobs.n,invocations.n,invocations.n*8,'(x)',invocations.n*8-1 FROM blobs CROSS JOIN invocations;
+            WITH ordinals(n) AS (VALUES(0),(1))
+            INSERT INTO source_rust_macro_input_tokens(blob_id,invocation_occurrence_id,ordinal,source_occurrence_id,parent_ordinal,syntax_kind,start_byte,end_byte)
+            SELECT blob_id,invocation_occurrence_id,n,n,CASE n WHEN 0 THEN NULL ELSE 0 END,'token_tree',start_byte,start_byte+3
+            FROM source_rust_macro_inputs CROSS JOIN ordinals;").unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for name in [
+                "rust_macro_input_exists",
+                "rust_macro_invocation_input",
+                "rust_macro_invocation_tokens",
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                assert!(
+                    plan.iter()
+                        .any(|row| row.contains("SEARCH source_rust_macro_")),
+                    "{state} {name}: {plan:?}"
+                );
+                for forbidden in ["SCAN source_rust_macro_", "TEMP B-TREE", "AUTOMATIC"] {
+                    assert!(
+                        plan.iter().all(|row| !row.contains(forbidden)),
+                        "{state} {name}: {plan:?}"
+                    );
+                }
+                if name == "rust_macro_invocation_tokens" {
+                    assert!(
+                        plan.iter().any(|row| row.contains(
+                            "USING PRIMARY KEY (blob_id=? AND invocation_occurrence_id=?)"
+                        )),
+                        "{state} {name}: {plan:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -4736,7 +4714,7 @@ pub(crate) mod tests {
                     );
                     assert!(
                         plan.iter().any(|detail| {
-                            detail.contains("rust_resolution_unit_summary_dependency_names_ordinal")
+                            detail.contains("resolution_unit_summary_dependency_names_ordinal")
                         }),
                         "{state} Cargo-route lookup must seek dependency names by ordinal: {plan:?}"
                     );
@@ -4779,7 +4757,7 @@ pub(crate) mod tests {
                         "{state} Rust target capability lookup must stay indexed: {plan:?}"
                     );
                 }
-                if query.name.starts_with("rust_macro_") {
+                if RUST_MACRO_WALK_QUERIES.contains(&query.name.as_str()) {
                     // A query reads its source path through the selected mount, or
                     // through the selected file version of the persisted path when
                     // it never reads a mount (the child-module walk).
@@ -4817,6 +4795,32 @@ pub(crate) mod tests {
                                 && !detail.starts_with("SCAN included_member ")
                         }),
                         "{state} {} must not scan Rust summary rows: {plan:?}",
+                        query.name
+                    );
+                }
+                if matches!(
+                    query.name.as_str(),
+                    "rust_macro_input_exists"
+                        | "rust_macro_invocation_input"
+                        | "rust_macro_invocation_tokens"
+                ) {
+                    let seek = if query.name == "rust_macro_invocation_tokens" {
+                        "SEARCH source_rust_macro_input_tokens USING PRIMARY KEY (blob_id=? AND invocation_occurrence_id=?)"
+                    } else {
+                        "SEARCH source_rust_macro_inputs USING PRIMARY KEY (blob_id=?)"
+                    };
+                    assert!(
+                        plan.iter().any(|detail| detail.contains(seek)),
+                        "{state} {} must seek its source rows by their key: {plan:?}",
+                        query.name
+                    );
+                    assert!(
+                        plan.iter().all(|detail| {
+                            (!detail.starts_with("SCAN ") || detail == "SCAN CONSTANT ROW")
+                                && !detail.contains("AUTOMATIC")
+                                && !detail.contains("TEMP B-TREE")
+                        }),
+                        "{state} {} must not scan macro source rows or create indexes: {plan:?}",
                         query.name
                     );
                 }
@@ -5197,120 +5201,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A first persisted build leaves the store with planner statistics, and a
-    /// second build of the same unchanged workspace does not recompute them.
-    ///
-    /// The sentinel is how "did not recompute" is observed: `ANALYZE` rewrites
-    /// `sqlite_stat1` wholesale, so a row naming no real table survives exactly
-    /// when the second build skipped the refresh.
-    #[test]
-    fn a_persisted_build_analyzes_once_and_a_no_op_build_does_not_repeat_it() {
-        let _guard = statistics_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.rs"), "pub fn widget() -> u32 { 1 }\n").unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "one file");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-
-        let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("persisted analyzer should build");
-        let db_path = workspace
-            .persisted_store_path()
-            .expect("a persisted build reports its store path");
-        drop(workspace);
-
-        let statistics = Connection::open(&db_path).unwrap();
-        assert!(
-            planner_statistics_row_count(&statistics).unwrap() > 0,
-            "the first persisted build must leave planner statistics behind"
-        );
-        statistics
-            .execute(
-                "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES('zzz_3016_sentinel', NULL, '1')",
-                [],
-            )
-            .unwrap();
-        drop(statistics);
-
-        let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("persisted analyzer should rebuild");
-        drop(workspace);
-
-        let statistics = Connection::open(&db_path).unwrap();
-        let sentinel: i64 = statistics
-            .query_row(
-                "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'zzz_3016_sentinel'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            sentinel, 1,
-            "a build that persisted nothing new must not re-run ANALYZE"
-        );
-    }
-
-    /// `BIFROST_STORE_STATISTICS=off` leaves the store with no statistics at
-    /// all, which is how a statistics-free plan is reproduced.
-    ///
-    /// The environment variable is process-wide, so this test sets it around
-    /// one build and restores it; it does not run beside the test above.
-    /// A collection that dropped rows refreshes the statistics it invalidated.
-    ///
-    /// The setup makes one persisted blob genuinely unreachable: two commits,
-    /// each built, then the branch is moved back to the first and the working
-    /// tree is restored to the first content and the retained workspace
-    /// projection is released, so nothing owns the second blob any more.
-    #[test]
-    fn a_collection_that_drops_rows_refreshes_the_statistics() {
-        let _guard = statistics_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let fixture = two_revision_collection_fixture();
-        let db_path = &fixture.db_path;
-        drop(fixture.store);
-
-        let statistics = Connection::open(db_path).unwrap();
-        statistics
-            .execute(
-                "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES('zzz_3016_sentinel', NULL, '1')",
-                [],
-            )
-            .unwrap();
-        drop(statistics);
-
-        let outcome =
-            brokk_bifrost_core::cache_gc::force_gc(db_path, &fixture.repository, &fixture.root)
-                .expect("forced collection");
-        assert!(
-            outcome.analyzer_dropped > 0,
-            "the setup must leave the second content collectable: {outcome:?}"
-        );
-        let statistics = Connection::open(db_path).unwrap();
-        let sentinel: i64 = statistics
-            .query_row(
-                "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'zzz_3016_sentinel'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            sentinel, 0,
-            "a collection that dropped {} rows must re-run ANALYZE",
-            outcome.analyzer_dropped
-        );
-        assert!(
-            planner_statistics_row_count(&statistics).unwrap() > 0,
-            "and must leave real statistics behind"
-        );
-    }
-
     /// A pinned query whose plan the captured corpus statistics change, so a
     /// test can see which statistics a connection is planning with.
     ///
@@ -5487,65 +5377,6 @@ pub(crate) mod tests {
         assert_eq!(store.planner_statistics_rows().unwrap(), 0);
     }
 
-    /// The end-to-end shape of the repair: a workspace built with the switch
-    /// off carries no statistics, and the next open of that store -- with the
-    /// switch cleared -- gives it some.
-    #[test]
-    #[hardwon(
-        "d78f9a16030c: disabled build-time analysis left later opens without planner statistics"
-    )]
-    fn a_build_with_the_switch_off_is_repaired_at_the_next_open() {
-        let _guard = statistics_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.rs"), "pub fn widget() -> u32 { 1 }\n").unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "one file");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-
-        // SAFETY: the lock above serializes every test that reads or writes
-        // this variable, and no other thread in this binary reads it.
-        unsafe { std::env::set_var(STORE_STATISTICS_ENV, "off") };
-        let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("persisted analyzer should build");
-        let db_path = workspace
-            .persisted_store_path()
-            .expect("a persisted build reports its store path");
-        drop(workspace);
-        unsafe { std::env::remove_var(STORE_STATISTICS_ENV) };
-
-        let statistics = Connection::open(&db_path).unwrap();
-        assert_eq!(
-            planner_statistics_row_count(&statistics).unwrap(),
-            0,
-            "the build must have left this store without statistics"
-        );
-        drop(statistics);
-
-        let repairs = planner_statistics_repairs();
-        let store = AnalyzerStore::open_persistent(&db_path).unwrap();
-        assert_eq!(
-            planner_statistics_repairs(),
-            repairs + 1,
-            "reopening the store must repair what the switch suppressed"
-        );
-        assert!(
-            store.planner_statistics_rows().unwrap() > 0,
-            "and must leave real statistics behind"
-        );
-    }
-
-    /// Serializes the tests that set `BIFROST_STORE_STATISTICS`, which is
-    /// process-wide state, with any other test that observes the switch while
-    /// exercising a planner-statistics hook.
-    fn statistics_env_lock() -> &'static std::sync::Mutex<()> {
-        brokk_bifrost_core::cache_gc::planner_statistics_test_lock()
-    }
-
     /// One blob with one declaration, so `ANALYZE` has rows to describe.
     fn insert_one_declaration(conn: &Connection) {
         conn.execute(
@@ -5698,8 +5529,11 @@ mod rust_crate_row_plans {
              INSERT INTO rust_crate_containers VALUES(1, 'crate', 'module', 'root');
              INSERT INTO rust_crate_container_members SELECT 1, 'crate', id FROM blobs;
              INSERT INTO rust_crate_container_sources SELECT 1, 'crate', id, 0, 'src/lib.rs', 'declared', NULL, NULL FROM blobs;
-             INSERT INTO rust_crate_exports SELECT 1, 'crate', 'type', 'X', 'declaration',
-                 'public', NULL, id, 0 FROM blobs;
+             INSERT INTO rust_crate_exports(topology_id, module_path, namespace, name,
+                 origin, visibility, restricted_module_path, declaration_blob_id,
+                 declaration_site, target_crate_key, target_module_path, target_name)
+             SELECT 1, 'crate', 'type', 'X', 'declaration',
+                 'public', NULL, id, 0, zeroblob(32), 'crate', 'X' FROM blobs;
              INSERT INTO rust_crate_imports VALUES(1, 'crate', 'type', 'X', 1, 0, 0,
                  zeroblob(32), 'crate', 'X');
              INSERT INTO rust_crate_reexport_routes VALUES(1, 'crate', 'X', zeroblob(32),
@@ -5755,5 +5589,18 @@ mod rust_crate_row_plans {
                 );
             }
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod rust_tests_test_support {
+
+    /// Serializes the tests that set `BIFROST_STORE_STATISTICS`, which is
+    /// process-wide state, with any other test that observes the switch while
+    /// exercising a planner-statistics hook.
+    #[doc(hidden)]
+    pub fn statistics_env_lock() -> &'static std::sync::Mutex<()> {
+        brokk_bifrost_core::cache_gc::planner_statistics_test_lock()
     }
 }

@@ -18,28 +18,53 @@
 //! decision log); the facts snapshot underneath them is the cached part.
 
 use super::facts::FileFacts;
+
 use super::kinds::NormalizedKind;
-use super::lexical_environment::{
-    BindingOfOutcome, EnvironmentFileResult, binding_of, environment_for_file,
-};
-use super::occurrences::{
-    ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole, OccurrenceRoleSupport,
-};
-use super::resolution::{PrecedenceTier, RejectionReason};
+
+use super::lexical_environment::BindingOfOutcome;
+use super::lexical_environment::EnvironmentFileResult;
+use super::lexical_environment::binding_of;
+use super::lexical_environment::environment_for_file;
+
+use super::occurrences::ALL_OCCURRENCE_ROLES;
+use super::occurrences::Namespace;
+use super::occurrences::OccurrenceClass;
+use super::occurrences::OccurrenceRole;
+use super::occurrences::OccurrenceRoleSupport;
+
+use super::resolution::PrecedenceTier;
+use super::resolution::RejectionReason;
+
 use super::spec::StructuralSpec;
+
 use crate::analyzer::common::language_for_file;
+
 use crate::analyzer::lexical_definitions::LexicalDefinition;
-use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
+
+use crate::analyzer::semantic::ContentIdentity;
+use crate::analyzer::semantic::LengthDelimitedDigest;
+
 use crate::analyzer::structural::StructuralFactProvider;
+
 use crate::analyzer::structural_spec_for;
-use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, ResolutionTraceResult, TraceCandidate,
-    TraceCandidateRef, resolve_definition_batch_with_source_and_cancellation,
-    resolve_definition_batch_with_trace,
-};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+
+use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
+use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
+use crate::analyzer::usages::get_definition::ResolutionTraceResult;
+use crate::analyzer::usages::get_definition::TraceCandidate;
+use crate::analyzer::usages::get_definition::TraceCandidateRef;
+use crate::analyzer::usages::get_definition::resolve_definition_batch_with_source_and_cancellation;
+use crate::analyzer::usages::get_definition::resolve_definition_batch_with_trace;
+
+use crate::analyzer::CodeUnit;
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::ProjectFile;
+use crate::analyzer::Range;
+
 use crate::cancellation::CancellationToken;
+
 use std::collections::HashSet;
+
 use std::sync::Arc;
 
 /// Domain separator for a single occurrence's stable id.
@@ -757,134 +782,23 @@ fn append_shadowed_bindings(
     }));
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "occurrence_rows/js_ts_tests_support.rs"]
+pub mod js_ts_tests_support;
+
 #[cfg(test)]
 mod tests {
-    use super::super::resolution::{BoundaryStatus, EnvironmentAxis};
+    use super::js_ts_tests_support::*;
+
+    use super::super::resolution::BoundaryStatus;
+    use super::super::resolution::EnvironmentAxis;
+
     use super::*;
-    use crate::analyzer::usages::get_definition::TraceCompleteness;
-    use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
+
+    use crate::analyzer::Language;
+
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
-    use tempfile::TempDir;
-
-    struct Fixture {
-        _temp: TempDir,
-        workspace: WorkspaceAnalyzer,
-        file: ProjectFile,
-        source: String,
-    }
-
-    impl Fixture {
-        fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            Self::with_supporting_files(language, relative_path, source, &[])
-        }
-
-        /// A fixture whose occurrences are read from `relative_path` while the
-        /// analyzer also indexes `supporting`, so cross-file resolution has
-        /// something to resolve to.
-        fn with_supporting_files(
-            language: Language,
-            relative_path: &str,
-            source: &str,
-            supporting: &[(&str, &str)],
-        ) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let file = ProjectFile::new(root.clone(), relative_path);
-            file.write(source).expect("write fixture source");
-            for (path, contents) in supporting {
-                ProjectFile::new(root.clone(), *path)
-                    .write(contents)
-                    .expect("write supporting source");
-            }
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                AnalyzerConfig::default(),
-            )
-            .expect("ephemeral workspace should build");
-            Self {
-                _temp: temp,
-                workspace,
-                file,
-                source: source.to_owned(),
-            }
-        }
-
-        fn result(&self) -> OccurrenceFileResult {
-            occurrences_for_file(
-                self.workspace.analyzer(),
-                &self.file,
-                &CancellationToken::new(),
-            )
-            .expect("uncancelled occurrence derivation")
-        }
-
-        fn identity_only_result(&self) -> OccurrenceFileResult {
-            occurrences_for_file_with_options(
-                self.workspace.analyzer(),
-                &self.file,
-                OccurrenceDerivationOptions::IDENTITY_ONLY,
-                &CancellationToken::new(),
-            )
-            .expect("uncancelled occurrence derivation")
-        }
-
-        fn identity_only_roles(&self, roles: &[OccurrenceRole]) -> OccurrenceFileResult {
-            occurrences_for_file_with_options_and_roles(
-                self.workspace.analyzer(),
-                &self.file,
-                OccurrenceDerivationOptions::IDENTITY_ONLY,
-                Some(roles),
-                &CancellationToken::new(),
-            )
-            .expect("uncancelled role-scoped occurrence derivation")
-        }
-
-        fn traced_result(&self) -> OccurrenceFileResult {
-            occurrences_for_file_with_options(
-                self.workspace.analyzer(),
-                &self.file,
-                OccurrenceDerivationOptions::WITH_CANDIDATES,
-                &CancellationToken::new(),
-            )
-            .expect("uncancelled occurrence derivation")
-        }
-
-        /// Byte offset of `needle`, whose first token is the occurrence under
-        /// test; the marker keeps the assertion readable without re-scanning.
-        fn at(&self, needle: &str) -> usize {
-            crate::test_support::fixture_marker(&self.source, needle)
-        }
-    }
-
-    fn row_at(rows: &[OccurrenceRow], start_byte: usize) -> Option<&OccurrenceRow> {
-        rows.iter().find(|row| row.range.start_byte == start_byte)
-    }
-
-    #[test]
-    fn role_scoped_derivation_retains_only_observable_rows_and_full_completeness() {
-        let source = concat!(
-            "function render(value: string) {\n",
-            "    return value.trim().length;\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
-        let exhaustive = fixture.identity_only_result();
-        let scoped = fixture.identity_only_roles(&[OccurrenceRole::ReceiverPosition]);
-
-        assert!(!scoped.rows.is_empty());
-        assert!(
-            scoped
-                .rows
-                .iter()
-                .all(|row| row.role == OccurrenceRole::ReceiverPosition),
-            "a role-scoped producer must not materialize unobservable rows: {:?}",
-            scoped.rows.iter().map(|row| row.role).collect::<Vec<_>>()
-        );
-        assert!(exhaustive.rows.len() > scoped.rows.len());
-        assert_eq!(scoped.completeness, exhaustive.completeness);
-    }
 
     #[test]
     fn selected_reference_rows_keep_status_separate_from_undemanded_rows() {
@@ -947,21 +861,6 @@ mod tests {
         assert!(undemanded_references.iter().all(|row| {
             row.resolution_status.is_none() && matches!(&row.target, OccurrenceTarget::NotDerived)
         }));
-    }
-
-    fn expect_row<'rows>(
-        rows: &'rows [OccurrenceRow],
-        start_byte: usize,
-        label: &str,
-    ) -> &'rows OccurrenceRow {
-        row_at(rows, start_byte).unwrap_or_else(|| {
-            panic!(
-                "no occurrence row for {label} at byte {start_byte}; rows: {:?}",
-                rows.iter()
-                    .map(|row| (row.range.start_byte, row.raw_spelling.as_str(), row.role))
-                    .collect::<Vec<_>>()
-            )
-        })
     }
 
     #[test]
@@ -1154,354 +1053,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn js_shorthand_is_a_binder_in_a_pattern_and_a_reference_in_an_expression() {
-        let source = concat!(
-            "const source = { alpha: 1, beta: 2 };\n",
-            "const { alpha, beta: renamed } = source;\n",
-            "const payload = { alpha };\n",
-        );
-        let fixture = Fixture::new(Language::JavaScript, "src/app.js", source);
-        let result = fixture.result();
-
-        let pattern_binder = expect_row(&result.rows, fixture.at("alpha, beta"), "pattern binder");
-        assert_eq!(pattern_binder.role, OccurrenceRole::Binder);
-        assert_eq!(pattern_binder.class, OccurrenceClass::Binding);
-        assert_eq!(pattern_binder.namespace, Namespace::Value);
-        assert!(matches!(pattern_binder.target, OccurrenceTarget::None));
-
-        let renamed_key = expect_row(&result.rows, fixture.at("beta: renamed"), "renamed key");
-        assert_eq!(renamed_key.role, OccurrenceRole::LabelOrKey);
-        assert_eq!(renamed_key.namespace, Namespace::Label);
-        let renamed_binder = expect_row(&result.rows, fixture.at("renamed }"), "renamed binder");
-        assert_eq!(renamed_binder.role, OccurrenceRole::Binder);
-
-        let shorthand_read = expect_row(&result.rows, fixture.at("alpha };"), "shorthand read");
-        assert_eq!(shorthand_read.role, OccurrenceRole::ValueReference);
-        assert_eq!(shorthand_read.class, OccurrenceClass::Reference);
-        assert!(
-            !matches!(shorthand_read.target, OccurrenceTarget::None),
-            "reference-class rows always carry a resolution outcome"
-        );
-    }
-
-    #[test]
-    fn python_annotations_are_type_operands_and_parameters_are_binders() {
-        let source = concat!(
-            "import os.path\n",
-            "\n",
-            "class Widget:\n",
-            "    def render(self, label: str) -> str:\n",
-            "        return os.path.join(label, key=label)\n",
-        );
-        let fixture = Fixture::new(Language::Python, "src/app.py", source);
-        let result = fixture.result();
-
-        let class_name = expect_row(&result.rows, fixture.at("Widget:"), "class name");
-        assert_eq!(class_name.namespace, Namespace::Type);
-
-        let binder = expect_row(&result.rows, fixture.at("label: str"), "parameter binder");
-        assert_eq!(binder.role, OccurrenceRole::Binder);
-        assert_eq!(binder.namespace, Namespace::Value);
-
-        let annotation = expect_row(&result.rows, fixture.at("str)"), "annotation operand");
-        assert_eq!(annotation.role, OccurrenceRole::TypeOperand);
-        assert_eq!(annotation.namespace, Namespace::Type);
-
-        let segment = expect_row(&result.rows, fixture.at("os.path\n"), "import path segment");
-        assert_eq!(segment.role, OccurrenceRole::PathSegment);
-        assert_eq!(
-            segment.namespace,
-            Namespace::Module,
-            "Python dotted-name segments are modules"
-        );
-
-        let keyword = expect_row(&result.rows, fixture.at("key="), "keyword argument name");
-        assert_eq!(keyword.role, OccurrenceRole::LabelOrKey);
-        assert_eq!(keyword.namespace, Namespace::Label);
-    }
-
-    #[test]
-    fn python_formal_parameters_and_scope_directives_have_distinct_structural_roles() {
-        let source = concat!(
-            "def outer(enclosing):\n",
-            "    shared = 0\n",
-            "    def inner(\n",
-            "        bare,\n",
-            "        typed: int,\n",
-            "        default=1,\n",
-            "        typed_default: int = 2,\n",
-            "        *args,\n",
-            "        **kwargs,\n",
-            "    ):\n",
-            "        global shared\n",
-            "        nonlocal enclosing\n",
-            "        return bare\n",
-        );
-        let fixture = Fixture::new(Language::Python, "src/app.py", source);
-        let rows = fixture.result().rows;
-        for needle in [
-            "bare,",
-            "typed: int",
-            "default=1",
-            "typed_default: int",
-            "args,",
-            "kwargs,",
-        ] {
-            let row = expect_row(&rows, fixture.at(needle), "formal parameter");
-            assert_eq!(row.role, OccurrenceRole::Binder, "{needle}");
-            assert_eq!(row.class, OccurrenceClass::Binding, "{needle}");
-        }
-
-        let global_name = fixture.at("global shared") + "global ".len();
-        let global = expect_row(&rows, global_name, "global directive name");
-        assert_eq!(global.role, OccurrenceRole::GlobalDirective);
-        assert_eq!(global.class, OccurrenceClass::NonReference);
-
-        let nonlocal_name = fixture.at("nonlocal enclosing") + "nonlocal ".len();
-        let nonlocal = expect_row(&rows, nonlocal_name, "nonlocal directive name");
-        assert_eq!(nonlocal.role, OccurrenceRole::NonlocalDirective);
-        assert_eq!(nonlocal.class, OccurrenceClass::NonReference);
-    }
-
-    #[test]
-    fn rust_raw_identifiers_decode_and_declaration_heads_keep_their_namespace() {
-        let source = concat!(
-            "struct Widget {\n",
-            "    label: String,\n",
-            "}\n",
-            "\n",
-            "fn render(r#type: &str) -> String {\n",
-            "    r#type.to_owned()\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
-        let result = fixture.result();
-
-        let struct_name = expect_row(&result.rows, fixture.at("Widget {"), "struct name");
-        assert_eq!(struct_name.role, OccurrenceRole::DeclarationName);
-        assert_eq!(struct_name.namespace, Namespace::Type);
-
-        let function_name = expect_row(&result.rows, fixture.at("render("), "function name");
-        assert_eq!(function_name.namespace, Namespace::Value);
-
-        let raw_binder = expect_row(&result.rows, fixture.at("r#type:"), "raw-identifier binder");
-        assert_eq!(raw_binder.role, OccurrenceRole::Binder);
-        assert_eq!(raw_binder.raw_spelling, "r#type");
-        assert_eq!(raw_binder.decoded_spelling.as_deref(), Some("type"));
-        assert_eq!(raw_binder.effective_spelling(), "type");
-
-        let plain = expect_row(&result.rows, fixture.at("label: String"), "field name");
-        assert_eq!(
-            plain.decoded_spelling, None,
-            "unescaped spellings decode to nothing"
-        );
-    }
-
-    /// A declaration name inherits the namespace of the fact it *names*, not of
-    /// the fact it sits inside. `field_declaration` is not itself a fact, so a
-    /// Rust struct field's name has a `Class` fact for its arena parent while
-    /// naming a value; inheriting the parent's kind would report a field in the
-    /// type namespace. The same shape occurs for a TypeScript interface member.
-    #[test]
-    fn a_member_name_under_a_type_declaration_stays_in_the_value_namespace() {
-        let rust = Fixture::new(
-            Language::Rust,
-            "src/app.rs",
-            "struct Widget {\n    label: String,\n}\n",
-        );
-        let rust_result = rust.result();
-        assert_eq!(
-            expect_row(&rust_result.rows, rust.at("Widget {"), "struct name").namespace,
-            Namespace::Type,
-            "the struct's own name is the one token that names the type"
-        );
-        assert_eq!(
-            expect_row(&rust_result.rows, rust.at("label: String"), "field name").namespace,
-            Namespace::Value
-        );
-
-        let typescript = Fixture::new(
-            Language::TypeScript,
-            "src/app.ts",
-            "interface Widget {\n    label: string;\n}\n",
-        );
-        let typescript_result = typescript.result();
-        assert_eq!(
-            expect_row(
-                &typescript_result.rows,
-                typescript.at("Widget {"),
-                "interface name"
-            )
-            .namespace,
-            Namespace::Type
-        );
-        assert_eq!(
-            expect_row(
-                &typescript_result.rows,
-                typescript.at("label: string"),
-                "property name"
-            )
-            .namespace,
-            Namespace::Value
-        );
-    }
-
-    /// A Rust path scope segment can be a module or a type, and the syntax
-    /// does not decide which; it resolves in the qualifier namespace, which is
-    /// [`Namespace::PathPrefix`]. The row is kept and the role is covered:
-    /// dropping it lost the only evidence that `std` and `HashMap` are
-    /// mentioned at all (#3064).
-    #[brokk_bifrost_test_macros::hardwon(
-        "#3064: Rust path qualifier occurrences were dropped instead of using the path-prefix namespace"
-    )]
-    #[test]
-    fn rust_path_segments_are_kept_in_the_path_prefix_namespace() {
-        let source = "use std::collections::HashMap;\nfn take(map: HashMap<u32, u32>) -> usize { map.len() }\n";
-        let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
-        let result = fixture.result();
-
-        let segments: Vec<(&str, Namespace)> = result
-            .rows
-            .iter()
-            .filter(|row| row.role == OccurrenceRole::PathSegment)
-            .map(|row| (row.effective_spelling(), row.namespace))
-            .collect();
-        assert_eq!(
-            segments,
-            [
-                ("std", Namespace::PathPrefix),
-                ("collections", Namespace::PathPrefix),
-            ],
-        );
-        assert!(result.completeness.covers(OccurrenceRole::PathSegment));
-        assert!(result.completeness.covers(OccurrenceRole::Binder));
-        if let OccurrenceCompleteness::Incomplete { reasons, .. } = &result.completeness {
-            assert!(
-                !reasons.iter().any(|reason| matches!(
-                    reason,
-                    OccurrenceIncompleteReason::NamespaceUnknown(_)
-                )),
-                "no row is dropped for want of a namespace: {reasons:?}"
-            );
-        }
-    }
-
-    /// An adapter that classifies some roles and not others reports incomplete
-    /// for the roles it cannot name, and covers exactly the ones it can.
-    ///
-    /// Go declares `member_position` and `binder` (as of #3547) and nothing
-    /// else, so the roles it stays silent about must never come back as a
-    /// clean empty answer. This guard used to point at Scala, which declared no
-    /// roles at all until #1597 graduated it, and then at PHP, which classifies
-    /// every role its grammar establishes as of #2962.
-    #[test]
-    fn an_adapter_with_a_partial_role_table_reports_incomplete_not_empty_complete() {
-        let source = concat!(
-            "package widget\n",
-            "\n",
-            "type Helper struct{}\n",
-            "\n",
-            "func (h Helper) Build() int { return 1 }\n",
-            "\n",
-            "func Render(h Helper) int {\n",
-            "\treturn h.Build()\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Go, "widget/widget.go", source);
-        let result = fixture.result();
-
-        let declared = [OccurrenceRole::MemberPosition, OccurrenceRole::Binder];
-        assert!(
-            result.rows.iter().all(|row| declared.contains(&row.role)),
-            "go must publish only the roles it declares: {:?}",
-            result.rows
-        );
-        match &result.completeness {
-            OccurrenceCompleteness::Incomplete {
-                unsupported_roles, ..
-            } => {
-                assert_eq!(
-                    unsupported_roles.len(),
-                    ALL_OCCURRENCE_ROLES.len() - declared.len()
-                );
-                for role in declared {
-                    assert!(result.completeness.covers(role), "{role} is declared");
-                }
-                for role in ALL_OCCURRENCE_ROLES
-                    .iter()
-                    .filter(|role| !declared.contains(role))
-                {
-                    assert!(!result.completeness.covers(*role), "{role} claimed covered");
-                }
-            }
-            OccurrenceCompleteness::Complete => {
-                panic!("an adapter with unsupported roles must never report Complete")
-            }
-        }
-    }
-
-    fn trace_of<'rows>(
-        rows: &'rows [OccurrenceRow],
-        start_byte: usize,
-        label: &str,
-    ) -> &'rows ResolutionTraceResult {
-        expect_row(rows, start_byte, label)
-            .candidates
-            .as_ref()
-            .unwrap_or_else(|| panic!("no trace attached to {label}"))
-    }
-
-    fn rejections(trace: &ResolutionTraceResult, reason: RejectionReason) -> Vec<&TraceCandidate> {
-        trace
-            .rejected()
-            .filter(|row| row.outcome.rejection() == Some(reason))
-            .collect()
-    }
-
-    /// The mined `61c223586` shape: an inner binding shadows an outer one of
-    /// the same name. The read between them selects the inner binder at the
-    /// lexical tier, and the outer binder is reported as a rejected candidate
-    /// with the reason that discarded it.
-    #[test]
-    fn a_shadowed_rust_binding_is_reported_as_rejected_beside_the_selected_local() {
-        let source = concat!(
-            "fn render() -> usize {\n",
-            "    let label = 1;\n",
-            "    {\n",
-            "        let label = 2;\n",
-            "        return label;\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
-        let result = fixture.traced_result();
-        let trace = trace_of(&result.rows, fixture.at("label;"), "shadowed read");
-
-        assert_eq!(
-            trace.completeness,
-            TraceCompleteness::SelectionOnly,
-            "native Rust retains these lexical rejections but does not instrument every rejected path"
-        );
-        assert!(
-            trace.selects_at(PrecedenceTier::LexicalBinding),
-            "the inner binder is the selection: {:?}",
-            trace.candidates
-        );
-        let shadowed = rejections(trace, RejectionReason::ShadowedByNearer);
-        assert_eq!(
-            shadowed.len(),
-            1,
-            "exactly the outer binder loses: {:?}",
-            trace.candidates
-        );
-        assert_eq!(shadowed[0].tier, Some(PrecedenceTier::LexicalBinding));
-        match &shadowed[0].candidate {
-            TraceCandidateRef::Binding { name, .. } => assert_eq!(name, "label"),
-            other => panic!("a shadowed binder is an environment binding row, got {other:?}"),
-        }
-    }
-
     /// Java resolves a simple type name against single-type imports before
     /// on-demand ones, so an explicit import selects at its tier and the
     /// wildcard routes it beat are recorded as rejected peers.
@@ -1617,170 +1168,6 @@ mod tests {
         );
     }
 
-    fn discovery_declaring_with_stub_artifacts(
-        language: &str,
-        modules: &[&str],
-    ) -> crate::analyzer::semantic_model::DependencyDiscoveryOutcome {
-        use crate::analyzer::semantic_model::{
-            DependencyArtifactRole, ExternalArtifactKind, ResolvedDependencyArtifact,
-        };
-
-        crate::test_support::discovery_declaring(language, modules, |module| {
-            vec![ResolvedDependencyArtifact::module_file(
-                DependencyArtifactRole::Declarations,
-                ExternalArtifactKind::PythonStub,
-                module.to_owned(),
-                PathBuf::from("unused-in-this-test.pyi"),
-            )]
-        })
-    }
-
-    fn external_boundaries(trace: &ResolutionTraceResult) -> Vec<BoundaryStatus> {
-        let external: Vec<BoundaryStatus> = crate::test_support::external_route_candidates(trace)
-            .into_iter()
-            .map(|row| row.boundary)
-            .collect();
-        assert!(
-            !external.is_empty(),
-            "a boundary outcome always reports the route it took: {:?}",
-            trace.candidates
-        );
-        external
-    }
-
-    /// #1601 acceptance: a Python file importing a distribution the workspace
-    /// declares but does not contain reports `external_declared_unindexed`,
-    /// and the dotted attribute read routes through the same declared module.
-    #[test]
-    fn a_python_import_of_a_declared_unindexed_distribution_reports_declared_unindexed() {
-        let source = concat!(
-            "import requests\n",
-            "\n",
-            "def fetch():\n",
-            "    return requests.get\n",
-        );
-        let fixture = Fixture::new(Language::Python, "app/client.py", source);
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::Python],
-            &discovery_declaring_with_stub_artifacts("python", &["requests"]),
-        );
-        let result = fixture.traced_result();
-        let trace = trace_of(&result.rows, fixture.at("requests.get"), "declared read");
-        assert!(
-            external_boundaries(trace)
-                .iter()
-                .all(|boundary| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "the build declares `requests`, so the miss is declared-unindexed: {:?}",
-            trace.candidates
-        );
-    }
-
-    /// #1601 acceptance: a name nothing declares stays `external_unknown`
-    /// even when discovery ran to completion, and a workspace where discovery
-    /// never ran reports `external_unknown` for everything.
-    #[test]
-    fn an_undeclared_python_import_stays_external_unknown() {
-        let source = concat!(
-            "import nonsuch\n",
-            "\n",
-            "def fetch():\n",
-            "    return nonsuch.get\n",
-        );
-        let undiscovered = Fixture::new(Language::Python, "app/client.py", source);
-        let trace_rows = undiscovered.traced_result();
-        let trace = trace_of(
-            &trace_rows.rows,
-            undiscovered.at("nonsuch.get"),
-            "no discovery",
-        );
-        assert!(
-            external_boundaries(trace)
-                .iter()
-                .all(|boundary| *boundary == BoundaryStatus::ExternalUnknown),
-            "no discovery has run, so nothing is known: {:?}",
-            trace.candidates
-        );
-
-        let declared_elsewhere = Fixture::new(Language::Python, "app/client.py", source);
-        declared_elsewhere
-            .workspace
-            .retain_dependency_discovery_evidence(
-                &[Language::Python],
-                &discovery_declaring_with_stub_artifacts("python", &["requests"]),
-            );
-        let result = declared_elsewhere.traced_result();
-        let trace = trace_of(
-            &result.rows,
-            declared_elsewhere.at("nonsuch.get"),
-            "undeclared read",
-        );
-        assert!(
-            external_boundaries(trace)
-                .iter()
-                .all(|boundary| *boundary == BoundaryStatus::ExternalUnknown),
-            "a complete discovery declares nothing named `nonsuch`: {:?}",
-            trace.candidates
-        );
-    }
-
-    /// #1601 acceptance for JS/TS: the imported binding's boundary routes
-    /// through the npm module the build declares, read from the usage index's
-    /// import binders rather than from the binding's own spelling.
-    #[test]
-    fn a_typescript_import_of_a_declared_unindexed_package_reports_declared_unindexed() {
-        let source = concat!(
-            "import { debounce } from \"lodash\";\n",
-            "export const wrapped = debounce;\n",
-        );
-        let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::JavaScript, Language::TypeScript],
-            &discovery_declaring_with_stub_artifacts("typescript", &["lodash"]),
-        );
-        let result = fixture.traced_result();
-        let trace = trace_of(
-            &result.rows,
-            fixture.at("debounce;"),
-            "declared binding use",
-        );
-        assert!(
-            external_boundaries(trace)
-                .iter()
-                .all(|boundary| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "`debounce` is imported from declared `lodash`: {:?}",
-            trace.candidates
-        );
-    }
-
-    /// Python and JS/TS reach the shared outcome constructors but no tier of
-    /// their resolvers reports what it discarded, so their traces say so
-    /// instead of letting an absent rejection row read as "nothing lost".
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn a_language_without_tier_tracing_reports_selection_only() {
-        let python = Fixture::new(
-            Language::Python,
-            "src/app.py",
-            "def render(label):\n    return label\n",
-        );
-        let python_result = python.traced_result();
-        assert_eq!(
-            trace_of(&python_result.rows, python.at("label\n"), "python read").completeness,
-            TraceCompleteness::SelectionOnly
-        );
-
-        let js = Fixture::new(
-            Language::JavaScript,
-            "src/app.js",
-            "function render(label) {\n    return label;\n}\n",
-        );
-        let js_result = js.traced_result();
-        assert_eq!(
-            trace_of(&js_result.rows, js.at("label;"), "javascript read").completeness,
-            TraceCompleteness::SelectionOnly
-        );
-    }
-
     /// An adapter that has not learned the candidate axes must surface that
     /// through the capability spine. An empty trace from an uninstrumented
     /// language would read exactly like "the resolver considered nothing".
@@ -1848,87 +1235,6 @@ mod tests {
             ast_id(content, 3),
             occurrence_id(content, 3, OccurrenceRole::Binder),
             "the two domains must not collide"
-        );
-    }
-    /// Identity-only derivation is the same rows, minus the definition batch.
-    ///
-    /// This is the #1452 lever: resolving every reference is the dominant cost
-    /// of deriving a large file's occurrences, and a consumer that joins rows
-    /// by AST identity never reads the result. The contract that makes
-    /// skipping it safe is that nothing else about the rows changes and the
-    /// omission is stated in the row rather than looking like a failed
-    /// resolution.
-    #[test]
-    fn identity_only_rows_match_resolved_rows_and_state_that_targets_were_not_derived() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            "src/lib.rs",
-            "pub fn order(mut values: Vec<usize>) -> usize {\n    values.sort();\n    values.len()\n}\n",
-        );
-        let resolved = fixture.result();
-        let identity_only = fixture.identity_only_result();
-
-        let key = |rows: &OccurrenceFileResult| {
-            rows.rows
-                .iter()
-                .map(|row| {
-                    (
-                        row.ast_id(),
-                        row.id(),
-                        row.role,
-                        row.class,
-                        row.namespace,
-                        row.range.start_byte,
-                        row.range.end_byte,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            key(&identity_only),
-            key(&resolved),
-            "identity, role, class, namespace and position must not depend on target derivation"
-        );
-        assert_eq!(
-            identity_only.completeness, resolved.completeness,
-            "skipping the definition batch says nothing about the file's completeness"
-        );
-
-        let reference_rows: Vec<&OccurrenceRow> = identity_only
-            .rows
-            .iter()
-            .filter(|row| row.class == OccurrenceClass::Reference)
-            .collect();
-        assert!(
-            !reference_rows.is_empty(),
-            "the fixture must contain reference-class rows for this to prove anything"
-        );
-        for row in reference_rows {
-            assert!(
-                matches!(row.target, OccurrenceTarget::NotDerived),
-                "a reference row derived without targets must say so rather than look unresolved; got {:?}",
-                row.target
-            );
-            assert!(row.resolution_status.is_none());
-        }
-        for row in identity_only
-            .rows
-            .iter()
-            .filter(|row| row.class != OccurrenceClass::Reference)
-        {
-            assert!(
-                matches!(row.target, OccurrenceTarget::None),
-                "a non-reference row has nothing to resolve either way; got {:?}",
-                row.target
-            );
-            assert!(row.resolution_status.is_none());
-        }
-        assert!(
-            resolved.rows.iter().any(|row| !matches!(
-                row.target,
-                OccurrenceTarget::None | OccurrenceTarget::NotDerived
-            )),
-            "the resolved derivation must actually resolve something, or the comparison is vacuous"
         );
     }
 }

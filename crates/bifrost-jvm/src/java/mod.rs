@@ -11,6 +11,7 @@ pub mod hierarchy;
 pub mod import_split;
 pub mod imports;
 pub mod javadoc;
+pub mod primitives;
 mod resolution;
 pub mod source_facts;
 pub(crate) mod source_types;

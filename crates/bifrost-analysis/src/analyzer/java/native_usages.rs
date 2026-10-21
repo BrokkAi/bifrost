@@ -2,7 +2,10 @@
 
 use super::JavaAnalyzer;
 use super::selected_reverse::{JavaSelectedReverseOutcome, java_selected_inverse_detailed_for};
-use crate::analyzer::structural::reference_edges::{EdgeCompleteness, ReferenceSiteClassifier};
+use crate::analyzer::store::resolution_operation::selected_reverse_reference_file;
+use crate::analyzer::structural::reference_edges::{
+    EdgeCompleteness, SelectedReferenceFileProjection,
+};
 use crate::analyzer::usages::UsageProof;
 use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::usages::{
@@ -10,7 +13,6 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, CodeUnitIndex, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use std::collections::BTreeSet;
 
@@ -62,10 +64,7 @@ impl GraphUsageAnalyzer for JavaNativeUsageStrategy {
             })
             .cloned()
             .collect::<HashSet<_>>();
-        let mut sources = HashMap::<
-            ProjectFile,
-            (String, Box<[usize]>, Option<ReferenceSiteClassifier<'_>>),
-        >::default();
+        let mut sources = HashMap::<ProjectFile, SelectedReferenceFileProjection<'_>>::default();
         let mut seen_targets = HashSet::default();
         for target in overloads {
             if !seen_targets.insert(target) {
@@ -78,37 +77,38 @@ impl GraphUsageAnalyzer for JavaNativeUsageStrategy {
                     "native Java usage query was cancelled".into(),
                 ));
             }
-            let answer = match java_selected_inverse_detailed_for(java, target, &cancellation) {
-                JavaSelectedReverseOutcome::Ready(answer) => answer,
-                JavaSelectedReverseOutcome::Unavailable(reason) => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "native_resolution_unavailable",
-                        reason,
-                    ));
-                }
-                JavaSelectedReverseOutcome::Stale(reason) => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "stale_selected_source",
-                        reason,
-                    ));
-                }
-                JavaSelectedReverseOutcome::Cancelled => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "cancelled",
-                        "native Java usage query was cancelled".into(),
-                    ));
-                }
-                JavaSelectedReverseOutcome::StoreError(reason) => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "native_store_error",
-                        reason,
-                    ));
-                }
-            };
+            let answer =
+                match java_selected_inverse_detailed_for(analyzer, java, target, &cancellation) {
+                    JavaSelectedReverseOutcome::Ready(answer) => answer,
+                    JavaSelectedReverseOutcome::Unavailable(reason) => {
+                        return GraphUsageOutcome::TerminalFailure(diagnostic(
+                            primary,
+                            "native_resolution_unavailable",
+                            reason,
+                        ));
+                    }
+                    JavaSelectedReverseOutcome::Stale(reason) => {
+                        return GraphUsageOutcome::TerminalFailure(diagnostic(
+                            primary,
+                            "stale_selected_source",
+                            reason,
+                        ));
+                    }
+                    JavaSelectedReverseOutcome::Cancelled => {
+                        return GraphUsageOutcome::TerminalFailure(diagnostic(
+                            primary,
+                            "cancelled",
+                            "native Java usage query was cancelled".into(),
+                        ));
+                    }
+                    JavaSelectedReverseOutcome::StoreError(reason) => {
+                        return GraphUsageOutcome::TerminalFailure(diagnostic(
+                            primary,
+                            "native_store_error",
+                            reason,
+                        ));
+                    }
+                };
             if let EdgeCompleteness::Incomplete { reasons } = &answer.edges.completeness {
                 diagnostics.push(diagnostic(
                     target,
@@ -137,33 +137,25 @@ impl GraphUsageAnalyzer for JavaNativeUsageStrategy {
                     continue;
                 }
                 if !sources.contains_key(&edge.site.file) {
-                    let Some(source) = java.indexed_source(&edge.site.file) else {
-                        return GraphUsageOutcome::TerminalFailure(diagnostic(
-                            primary,
-                            "native_source_unavailable",
-                            format!(
-                                "selected Java usage source is unavailable: {}",
-                                edge.site.file
-                            ),
-                        ));
-                    };
-                    if !java
-                        .inner
-                        .source_matches_selected_native_content(&edge.site.file, &source)
-                    {
-                        return GraphUsageOutcome::TerminalFailure(diagnostic(
-                            primary,
-                            "stale_selected_source",
-                            format!("selected Java usage source changed: {}", edge.site.file),
-                        ));
-                    }
-                    let line_starts = compute_line_starts(&source).into_boxed_slice();
-                    let classifier = ReferenceSiteClassifier::new(java, &edge.site.file);
-                    sources.insert(edge.site.file.clone(), (source, line_starts, classifier));
+                    let projection =
+                        match selected_reverse_reference_file(analyzer, java, &edge.site.file) {
+                            Ok(projection) => projection,
+                            Err(error) => {
+                                return GraphUsageOutcome::TerminalFailure(diagnostic(
+                                    primary,
+                                    "stale_selected_source",
+                                    error.to_string(),
+                                ));
+                            }
+                        };
+                    sources.insert(edge.site.file.clone(), projection);
                 }
-                let (source, line_starts, classifier) = sources
+                let projection = sources
                     .get(&edge.site.file)
-                    .expect("selected Java usage source was admitted");
+                    .expect("selected usage source was admitted");
+                let source = &projection.source;
+                let line_starts = &projection.state.line_starts;
+                let classifier = &projection.state.classifier;
                 let usage_range = if constructor_targets.contains(target) {
                     classifier
                         .as_ref()
@@ -217,7 +209,12 @@ impl GraphUsageAnalyzer for JavaNativeUsageStrategy {
                 hits_by_overload: proven,
                 unproven_by_overload: uncertain,
                 unproven_total_by_overload: totals,
-            } = FuzzyResult::success_with_unproven(target.clone(), hits, unproven)
+            } = FuzzyResult::success_with_unproven_limit(
+                target.clone(),
+                hits,
+                unproven,
+                scan_scope.max_unproven(),
+            )
             else {
                 unreachable!("success constructor produces Success");
             };

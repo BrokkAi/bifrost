@@ -140,10 +140,11 @@ mod tests {
     use std::sync::Arc;
 
     use brokk_bifrost_analysis::CancellationToken;
-    use brokk_bifrost_analysis::analyzer::{
-        IAnalyzer, JavaAnalyzer, Language, PythonAnalyzer, RustAnalyzer, TypescriptAnalyzer,
-    };
+    use brokk_bifrost_analysis::analyzer::{IAnalyzer, JavaAnalyzer, Language};
+    use brokk_bifrost_js_ts_analysis::TypescriptAnalyzer;
+    use brokk_bifrost_python_analysis::PythonAnalyzer;
     use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
+    use brokk_bifrost_rust_analysis::RustAnalyzer;
 
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use crate::{

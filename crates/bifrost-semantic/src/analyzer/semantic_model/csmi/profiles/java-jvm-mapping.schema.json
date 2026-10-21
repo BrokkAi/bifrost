@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/java-jvm-mapping.schema.json",
+  "title": "CSMI csmi.java-jvm-mapping 0.1 relation payload",
+  "description": "Evidence-bearing relation from one source identity to zero or more exact JVM binary identities. Encoded resemblance is never mapping evidence.",
+  "oneOf": [
+    { "$ref": "#/$defs/established" },
+    { "$ref": "#/$defs/indeterminate" },
+    { "$ref": "#/$defs/unsupported" }
+  ],
+  "$defs": {
+    "localId": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "producer", "digest"],
+      "properties": {
+        "kind": { "enum": ["compiler-symbol-table", "classfile-metadata", "language-metadata", "verified-build-output"] },
+        "producer": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "established": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profileVersion", "resolution", "sourceSymbol", "binarySymbols", "mappingKind", "evidence"],
+      "properties": {
+        "profileVersion": { "const": "0.1" },
+        "resolution": { "const": "established" },
+        "sourceSymbol": { "$ref": "#/$defs/localId" },
+        "binarySymbols": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/localId" }
+        },
+        "mappingKind": { "enum": ["direct", "erased", "bridge", "lowered", "generated", "relocated"] },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      }
+    },
+    "indeterminate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profileVersion", "resolution", "sourceSymbol", "reason"],
+      "properties": {
+        "profileVersion": { "const": "0.1" },
+        "resolution": { "const": "indeterminate" },
+        "sourceSymbol": { "$ref": "#/$defs/localId" },
+        "reason": { "enum": ["missing-classfile", "missing-compiler-metadata", "ambiguous-lowering", "unselected-artifact-variant", "unverified-relocation"] },
+        "diagnostic": { "type": "string", "minLength": 1 }
+      }
+    },
+    "unsupported": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profileVersion", "resolution", "sourceSymbol", "unsupportedVocabulary", "unsupportedVersion"],
+      "properties": {
+        "profileVersion": { "const": "0.1" },
+        "resolution": { "const": "unsupported" },
+        "sourceSymbol": { "$ref": "#/$defs/localId" },
+        "unsupportedVocabulary": { "type": "string", "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$" },
+        "unsupportedVersion": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

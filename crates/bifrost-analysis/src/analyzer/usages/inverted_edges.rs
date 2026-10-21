@@ -28,9 +28,8 @@
 //! every accounting rule — only the key type differs.
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, JsTsScopedNodeStatus,
-    JsTsScopedUsageEdges, NodeKey, PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey,
-    UsageReferenceCounts, first_precise,
+    CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, JsTsScopedUsageEdges, NodeKey,
+    PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts, first_precise,
 };
 
 use crate::analyzer::common::declaration_language_for_file;
@@ -73,7 +72,8 @@ pub(crate) fn class_range_index_from_declaration_ranges(
 /// A callee with more distinct call sites than this is reported as truncated and
 /// contributes no edges. Tied to the per-symbol scan's guardrail
 /// (`DEFAULT_MAX_USAGES`) so `usage_graph`'s truncation matches `scan_usages`.
-pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
+#[doc(hidden)]
+pub const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
 
 /// The endpoint-admission contract for one inverted edge build.
 ///
@@ -82,7 +82,8 @@ pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USA
 /// validate exact resolved targets after the scan. Inbound consumers invert
 /// that shape: every indexed enclosing declaration may be a caller, while the
 /// requested callee catalog remains closed.
-pub(crate) enum EdgeNodeDomain<'a, K = String> {
+#[doc(hidden)]
+pub enum EdgeNodeDomain<'a, K = String> {
     Closed(&'a HashSet<K>),
     Rooted(&'a HashSet<K>),
     Inbound(&'a HashSet<K>),
@@ -97,7 +98,8 @@ impl<K> Clone for EdgeNodeDomain<'_, K> {
 }
 
 impl<'a, K> EdgeNodeDomain<'a, K> {
-    pub(crate) fn callers(self) -> &'a HashSet<K> {
+    #[doc(hidden)]
+    pub fn callers(self) -> &'a HashSet<K> {
         match self {
             Self::Closed(nodes) | Self::Rooted(nodes) => nodes,
             Self::Inbound(_) => unreachable!("inbound domains do not enumerate callers"),
@@ -122,7 +124,8 @@ impl<'a, K> EdgeNodeDomain<'a, K> {
 /// Both merges are order-insensitive -- `UsageEdges` sorts each edge's sites in
 /// [`finish`](Self::finish) and `UsageEdgeWeights` accumulates counts -- so
 /// absorbing in parallel and combining partials cannot change the output.
-pub(crate) trait UsageEdgeBuildOutput<K: NodeKey>: Sized {
+#[doc(hidden)]
+pub trait UsageEdgeBuildOutput<K: NodeKey>: Sized {
     /// Partial state for a subset of the workspace's files.
     type Partial: Default + Send;
 
@@ -143,7 +146,8 @@ pub(crate) trait UsageEdgeBuildOutput<K: NodeKey>: Sized {
 /// behaviour and may consume the output from an omitted file. Dead-code bulk
 /// proofs use this status to avoid retaining such a graph: a missing parse,
 /// file state, or provider result is evidence that the graph is incomplete.
-pub(crate) enum UsageEdgeBuildResult<Output> {
+#[doc(hidden)]
+pub enum UsageEdgeBuildResult<Output> {
     Complete(Output),
     Uncacheable {
         output: Output,
@@ -166,7 +170,8 @@ impl<Output> UsageEdgeBuildResult<Output> {
 /// Cache shape used by dead-code bulk proofs. The owner is one language
 /// analyzer instance, so the key only needs the canonical target FQNs; the
 /// analyzer instance supplies the generation and language domain.
-pub(crate) type UsageEdgesCache = Cache<Arc<[String]>, Arc<UsageEdges>>;
+#[doc(hidden)]
+pub type UsageEdgesCache = Cache<Arc<[String]>, Arc<UsageEdges>>;
 
 pub(crate) fn sorted_usage_edge_targets(targets: &HashSet<String>) -> Arc<[String]> {
     let mut targets = targets.iter().cloned().collect::<Vec<_>>();
@@ -174,7 +179,8 @@ pub(crate) fn sorted_usage_edge_targets(targets: &HashSet<String>) -> Arc<[Strin
     targets.into()
 }
 
-pub(crate) fn weight_usage_edges(key: &Arc<[String]>, edges: &Arc<UsageEdges>) -> u32 {
+#[doc(hidden)]
+pub fn weight_usage_edges(key: &Arc<[String]>, edges: &Arc<UsageEdges>) -> u32 {
     let key_bytes = size_of::<Arc<[String]>>()
         + key
             .iter()
@@ -183,7 +189,8 @@ pub(crate) fn weight_usage_edges(key: &Arc<[String]>, edges: &Arc<UsageEdges>) -
     weight_usage_edge_contents(key_bytes, edges)
 }
 
-pub(crate) fn weight_usage_edge_contents(key_bytes: usize, edges: &UsageEdges) -> u32 {
+#[doc(hidden)]
+pub fn weight_usage_edge_contents(key_bytes: usize, edges: &UsageEdges) -> u32 {
     let edge_bytes = edges
         .edges
         .iter()
@@ -309,7 +316,8 @@ impl<K: NodeKey + Send> UsageEdgeBuildOutput<K> for UsageEdgeWeights<K> {
     }
 }
 
-pub(crate) fn build_file_declarations<K: NodeKey>(
+#[doc(hidden)]
+pub fn build_file_declarations<K: NodeKey>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
 ) -> FileDeclarations<K> {
@@ -448,7 +456,8 @@ fn build_file_declarations_from_declaration_ranges_with_filter<K: NodeKey>(
 /// closure runs. See the Go implementation in [`super::go_graph`] for the canonical
 /// `scan` shape.
 #[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note above
-pub(crate) fn build_edge_weights<K, KeepFn, ScanFn>(
+#[doc(hidden)]
+pub fn build_edge_weights<K, KeepFn, ScanFn>(
     files: &[ProjectFile],
     keep_file: KeepFn,
     scan: ScanFn,
@@ -462,7 +471,8 @@ where
 }
 
 #[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note above
-pub(crate) fn build_edge_output<K, Output, KeepFn, ScanFn>(
+#[doc(hidden)]
+pub fn build_edge_output<K, Output, KeepFn, ScanFn>(
     files: &[ProjectFile],
     keep_file: KeepFn,
     scan: ScanFn,
@@ -497,7 +507,8 @@ where
 /// This is deliberately an opt-in sibling of [`build_edge_output`]. Existing
 /// usage paths continue to receive their best-effort graph, while callers that
 /// publish a graph beyond the current request can fail closed on omitted input.
-pub(crate) fn build_edge_output_with_completeness<K, Output, KeepFn, ScanFn>(
+#[doc(hidden)]
+pub fn build_edge_output_with_completeness<K, Output, KeepFn, ScanFn>(
     files: &[ProjectFile],
     keep_file: KeepFn,
     scan: ScanFn,
@@ -551,7 +562,8 @@ where
 /// file path onto the result. Every borrow the input hands out is scoped to this
 /// call, so the caller is free to drop the parsed tree / source / line starts as
 /// soon as this returns.
-pub(crate) fn collect_file_edges<K, S>(
+#[doc(hidden)]
+pub fn collect_file_edges<K, S>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     nodes: &HashSet<K>,
@@ -586,7 +598,8 @@ where
     )
 }
 
-pub(crate) fn collect_file_edges_with_domain<K, S>(
+#[doc(hidden)]
+pub fn collect_file_edges_with_domain<K, S>(
     file: &ProjectFile,
     domain: EdgeNodeDomain<'_, K>,
     parsed: &ParsedTreeFile,
@@ -646,7 +659,8 @@ where
 /// generalizing this over [`NodeKey`] would push file-scoping bounds onto code that
 /// has no business knowing about it. Module-scoped languages route through their own
 /// cross-file index instead of this on-demand parse.
-pub(crate) fn parse_and_collect_with_domain<S>(
+#[doc(hidden)]
+pub fn parse_and_collect_with_domain<S>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     domain: EdgeNodeDomain<'_>,
@@ -687,7 +701,8 @@ where
     ))
 }
 
-pub(crate) fn parse_source_and_collect_with_declarations_and_domain<S>(
+#[doc(hidden)]
+pub fn parse_source_and_collect_with_declarations_and_domain<S>(
     source: String,
     file: &ProjectFile,
     domain: EdgeNodeDomain<'_>,
@@ -716,7 +731,8 @@ where
 /// sites per edge. Unioning line numbers across files would instead collapse
 /// the same line number appearing in two files (e.g. a partial class) and
 /// undercount.
-pub(crate) struct EdgeSitesPartial<K: NodeKey> {
+#[doc(hidden)]
+pub struct EdgeSitesPartial<K: NodeKey> {
     edge_sites: BTreeMap<(K, K), Vec<CallSite>>,
     callsites: BTreeMap<K, usize>,
     unproven_inbound: BTreeMap<K, usize>,
@@ -801,7 +817,8 @@ fn cap_edge_sites<K: NodeKey>(
 }
 
 /// Reference-kind counts accumulated so far, before the call-site cap.
-pub(crate) struct EdgeWeightsPartial<K: NodeKey> {
+#[doc(hidden)]
+pub struct EdgeWeightsPartial<K: NodeKey> {
     edge_weights: BTreeMap<(K, K), UsageReferenceCounts>,
     callsites: BTreeMap<K, usize>,
     unproven_inbound: BTreeMap<K, usize>,

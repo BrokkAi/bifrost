@@ -12,13 +12,16 @@
 
 use std::collections::VecDeque;
 
-use super::correlations::{CorrelationError, charge_edges, charge_entries, check_cancelled};
+use super::correlations::{
+    CorrelationError, admit_set_entry, charge_edges, charge_entries, check_cancelled,
+    record_entry_work,
+};
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     CancellationToken, ClassAtom, ClassIdentity, GuardFact, GuardPredicate, MemberAccessQuery,
     MemoryLocationId, MemoryLocationKind, ProcedureHandle, ProcedureSemantics, ProgramPointId,
-    SemanticBudget, SemanticEffect, SemanticGapImpact, SemanticValueKind, TypeFlowAdapter,
-    ValueFlowSnapshot, ValueId,
+    SemanticBudget, SemanticEffect, SemanticGapImpact, SemanticValueKind, SemanticWork,
+    TypeFlowAdapter, ValueFlowSnapshot, ValueId,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -131,7 +134,12 @@ impl State {
         // The join keeps this state, so it is charged for what it now holds
         // beyond what it held before.  A join that only removes entries
         // retains nothing new.
-        charge_entries(budget, self.size().saturating_sub(before_size))?;
+        let after_size = self.size();
+        charge_entries(budget, after_size.saturating_sub(before_size))?;
+        budget.release_admission(SemanticWork {
+            nested_entries: before_size.saturating_sub(after_size),
+            ..SemanticWork::default()
+        });
         Ok(*self != before)
     }
 
@@ -183,19 +191,23 @@ impl FieldAccesses {
         let mut queried = HashSet::default();
         for location in procedure.semantics().memory_locations() {
             check_cancelled(Some(cancellation))?;
-            charge_entries(budget, 1)?;
+            record_entry_work(budget, 1);
             if let MemoryLocationKind::Field { base, .. } = location.kind {
-                queried.insert(base);
+                admit_set_entry(budget, &mut queried, base)?;
             }
             let Some(member) =
                 adapter.accessed_member(workspace, procedure, MemberAccessQuery::Load(location))
             else {
                 continue;
             };
+            charge_entries(budget, 1)?;
             location_members.push((location.id, member.clone()));
             let MemoryLocationKind::Field { base, .. } = location.kind else {
                 continue;
             };
+            if !known.contains_key(&member) {
+                charge_entries(budget, 1)?;
+            }
             let index = *known.entry(member.clone()).or_insert_with(|| {
                 adapter
                     .field_access_is_plain(workspace, class, &member)
@@ -206,6 +218,7 @@ impl FieldAccesses {
                     })
             });
             if let Some(index) = index {
+                charge_entries(budget, 1)?;
                 locations.insert(location.id, (index, base));
             }
         }
@@ -224,7 +237,7 @@ impl FieldAccesses {
             let mut pure = true;
             for (atom, _) in &slot.atoms {
                 check_cancelled(Some(cancellation))?;
-                charge_entries(budget, 1)?;
+                record_entry_work(budget, 1);
                 if !matches!(atom, ClassAtom::Class(class) if adapter.truthiness_is_pure(workspace, class))
                 {
                     pure = false;
@@ -236,7 +249,7 @@ impl FieldAccesses {
         let mut pure_reads = HashSet::default();
         for (field, member) in members.iter().enumerate() {
             check_cancelled(Some(cancellation))?;
-            charge_entries(budget, 1)?;
+            record_entry_work(budget, 1);
             let Some(slot) = field_slots.slot(class, member) else {
                 continue;
             };
@@ -245,20 +258,21 @@ impl FieldAccesses {
             }
             for (location, accessed_member) in &location_members {
                 check_cancelled(Some(cancellation))?;
-                charge_entries(budget, 1)?;
+                record_entry_work(budget, 1);
                 if slot.atoms.iter().all(|(atom, _)| {
                     matches!(atom, ClassAtom::Class(class) if adapter.member_access_is_pure(workspace, class, accessed_member))
                 }) {
-                    pure_reads.insert((field, *location));
+                    admit_set_entry(budget, &mut pure_reads, (field, *location))?;
                 }
             }
         }
         let tracked = tracked_values(procedure.semantics(), queried, budget, cancellation)?;
+        charge_entries(budget, members.len())?;
         let mut version_slots = vec![None; members.len()];
         let mut version_slot_count = 0;
         for point in procedure.semantics().points() {
             check_cancelled(Some(cancellation))?;
-            charge_entries(budget, point.events.len().saturating_add(1))?;
+            record_entry_work(budget, point.events.len().saturating_add(1));
             for event in &point.events {
                 let SemanticEffect::MemoryLoad { location, .. } = event.effect else {
                     continue;
@@ -324,15 +338,15 @@ fn tracked_values(
 ) -> Result<HashSet<ValueId>, CorrelationError> {
     for guard in semantics.guard_facts() {
         check_cancelled(Some(cancellation))?;
-        charge_entries(budget, 1)?;
+        record_entry_work(budget, 1);
         if let Some(subject) = guard_origin_subject(guard) {
-            queried.insert(subject);
+            admit_set_entry(budget, &mut queried, subject)?;
         }
     }
     let mut sources_of = HashMap::<ValueId, Vec<ValueId>>::default();
     for point in semantics.points() {
         check_cancelled(Some(cancellation))?;
-        charge_entries(budget, point.events.len().saturating_add(1))?;
+        record_entry_work(budget, point.events.len().saturating_add(1));
         for event in &point.events {
             let (source, target) = match event.effect {
                 SemanticEffect::Assignment { target, value } => (value, target),
@@ -346,6 +360,7 @@ fn tracked_values(
             if source == target {
                 continue;
             }
+            charge_entries(budget, 1)?;
             sources_of.entry(target).or_default().push(source);
         }
     }
@@ -571,7 +586,8 @@ fn refine_edge(
 /// per point for the fixpoint, whatever a join adds to a stored state, the
 /// per-procedure indexes, and the alternatives the returned refinements
 /// carry. The copy a visit and an edge work on is transient and is not
-/// charged; the propagation that makes those visits is charged one
+/// charged. The cache derivation scope refunds these scratch admissions on
+/// every returned outcome and admits only the returned census. Propagation is charged one
 /// `control_edges` unit per edge traversal.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn derive(
@@ -676,6 +692,7 @@ pub(super) fn derive(
     for point in semantics.points() {
         check_cancelled(Some(cancellation))?;
         if let Some(mut state) = incoming[point.id.index()].take() {
+            let held_entries = state.size();
             let refined = transfer(
                 procedure,
                 snapshot,
@@ -690,6 +707,11 @@ pub(super) fn derive(
                 charge_entries(budget, refinement.alternatives.len().saturating_add(1))?;
             }
             loads.extend(refined);
+            drop(state);
+            budget.release_admission(SemanticWork {
+                nested_entries: held_entries,
+                ..SemanticWork::default()
+            });
         }
     }
     Ok(loads)

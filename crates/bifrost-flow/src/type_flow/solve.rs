@@ -366,7 +366,7 @@ pub struct TypeFlowSolveAttempt {
 /// Everything one root's solve concluded.
 #[derive(Debug)]
 pub struct TypeFlowRootResult {
-    pub root: ProcedureHandle,
+    pub root: crate::analyzer::semantic::SemanticProcedureReference,
     pub class_sets: Vec<ReceiverClassSet>,
     pub findings: Vec<AbsentMemberFinding>,
     /// The completeness contract later consumers (#2943, #2945, #2949) build
@@ -1018,6 +1018,8 @@ pub fn solve_type_flow_for_root_with_refinements(
                     // ICFG cache when no cut retry is needed. The witness solve
                     // observes those zero-work replays, so retain the semantic
                     // charge that originally produced them.
+                    drop(trial_interpreted);
+                    drop(trial_result);
                     iteration_budget = trial_semantic_budget;
                     let mut witness_solver_budget = SolverBudget::new(root_solver_limits);
                     let mut witness_request =
@@ -1341,7 +1343,7 @@ fn interpret(
     }
     collapse_absent_member_findings(&mut distinct_findings);
     TypeFlowRootResult {
-        root: root.clone(),
+        root: crate::analyzer::semantic::SemanticProcedureReference::of(root),
         class_sets,
         findings: distinct_findings,
         complete,

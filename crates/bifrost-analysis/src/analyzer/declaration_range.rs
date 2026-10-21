@@ -7,11 +7,11 @@ use brokk_bifrost_core::analyzer::usages::reference_site::node_range as node_byt
 use crate::analyzer::common::{
     language_for_file, language_for_target, source_identifier_for_target,
 };
-use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::tree_walk::{node_for_exact_range, push_named_children_reversed};
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
 
 pub struct DeclarationNameRangeContext {
     content: Arc<str>,
@@ -243,7 +243,7 @@ fn code_unit_declaration_name_range_scoped<'tree>(
     declaration_range: Range,
 ) -> Option<Range> {
     let identifier = declaration_source_identifier(code_unit);
-    let support = crate::analyzer::languages::language_support(language_for_target(code_unit));
+    let support = crate::analyzer::languages::language_knowledge(language_for_target(code_unit));
     let name_node = node_for_exact_range(scope, &declaration_range)
         .or_else(|| node_for_smallest_containing_range(scope, &declaration_range))
         .and_then(|declaration_node| {
@@ -319,7 +319,7 @@ fn declaration_name_node_for_line_range<'tree>(
     range: &Range,
     identifier: &str,
     content: &str,
-    support: Option<&'static dyn crate::analyzer::languages::LanguageSupport>,
+    support: Option<&'static dyn LanguageKnowledge>,
 ) -> Option<Node<'tree>> {
     if !node_lines_meet_range(root, range) {
         return None;
@@ -397,7 +397,7 @@ fn declaration_name_node_from_fields<'tree>(
     declaration_node: Node<'tree>,
     identifier: &str,
     content: &str,
-    support: Option<&'static dyn LanguageSupport>,
+    support: Option<&'static dyn LanguageKnowledge>,
 ) -> Option<(Node<'tree>, bool)> {
     // `child_by_field_name` resolves the field id by comparing the name against
     // the grammar's field table on every call, and this walk asks six of them
@@ -461,7 +461,7 @@ fn declaration_name_node<'tree>(
     declaration_node: Node<'tree>,
     identifier: &str,
     content: &str,
-    support: Option<&'static dyn LanguageSupport>,
+    support: Option<&'static dyn LanguageKnowledge>,
 ) -> Option<Node<'tree>> {
     declaration_name_node_from_fields(declaration_node, identifier, content, support)
         .map(|(name_node, _)| name_node)
@@ -473,7 +473,7 @@ fn node_names_identifier(
     node: Node<'_>,
     identifier: &str,
     content: &str,
-    support: Option<&'static dyn LanguageSupport>,
+    support: Option<&'static dyn LanguageKnowledge>,
 ) -> bool {
     if support
         .and_then(|support| support.symbol_literal_name(node, content))
@@ -496,7 +496,7 @@ fn matching_identifier_node<'tree>(
     root: Node<'tree>,
     identifier: &str,
     content: &str,
-    support: Option<&'static dyn LanguageSupport>,
+    support: Option<&'static dyn LanguageKnowledge>,
 ) -> Option<Node<'tree>> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -557,7 +557,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("failed to parse {language:?}"));
             let declaration = first_node_of_kind(tree.root_node(), declaration_kind);
             let identifier = if language == Language::Ruby { "X" } else { "x" };
-            let support = crate::analyzer::languages::language_support(language);
+            let support = crate::analyzer::languages::language_knowledge(language);
             let name = declaration_name_node(declaration, identifier, source, support)
                 .unwrap_or_else(|| panic!("missing declaration name for {language:?}"));
 

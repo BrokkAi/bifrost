@@ -12,7 +12,7 @@
         import.cfg_condition, context.cfg_atoms
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=unit.summary_id AND source.module_path=targets.module_path
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
@@ -47,7 +47,7 @@ UNION
 SELECT 1
 FROM targets
 CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
-CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+CROSS JOIN main.rust_unit_summary_placements AS source
  ON source.summary_id=unit.summary_id AND source.module_path='crate'
 CROSS JOIN main.resolution_unit_summary_members AS member
  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal

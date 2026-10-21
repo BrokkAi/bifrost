@@ -3,31 +3,58 @@
 //! The topology tables remain Rust-owned. Their crate key is also the shared
 //! summary unit key, which makes rust_crate_versions the crosswalk from a
 //! summary version to its topology row.
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
+
 #[cfg(any(test, feature = "test-support"))]
 use std::fmt::Debug;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use rusqlite::params;
 
-use super::unit_summaries::{
-    ConsumedDependency, UnitDependency, UnitExport, UnitGap, UnitImport, UnitInputs, UnitMember,
-    UnitOutputs, UnitRead, UnitSummaryLanguage,
-};
-use super::{AnalyzerStore, Result, StoreError, WorkspaceSnapshotId, WorkspaceSnapshots};
+use super::unit_summaries::ConsumedDependency;
+use super::unit_summaries::UnitDependency;
+use super::unit_summaries::UnitExport;
+use super::unit_summaries::UnitGap;
+use super::unit_summaries::UnitImport;
+use super::unit_summaries::UnitInputs;
+use super::unit_summaries::UnitMember;
+use super::unit_summaries::UnitOutputs;
+use super::unit_summaries::UnitRead;
+use super::unit_summaries::UnitSummaryLanguage;
+
+use super::AnalyzerStore;
+use super::Result;
+use super::StoreError;
+use super::WorkspaceSnapshotId;
+use super::WorkspaceSnapshots;
+
 use crate::analyzer::canonical_hash::CanonicalHasher;
-use crate::analyzer::store::resolution_prepare::resolution_rows::{language_code, namespace_code};
+
+use crate::analyzer::store::resolution_prepare::resolution_rows::language_code;
+use crate::analyzer::store::resolution_prepare::resolution_rows::namespace_code;
+
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+
 use brokk_bifrost_core::analyzer::rust_facts::decode_rust_visibility;
-use brokk_bifrost_rust::imports::{
-    resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
-};
-use brokk_bifrost_rust::usage::{
-    Domain as RustBindingDomain, ModuleKey as RustModuleKey, RustPathIdentity,
-    direct_import_scope_for_module_with_identity,
-};
+
+use brokk_bifrost_rust::imports::resolve_rust_module_path_with_crate;
+use brokk_bifrost_rust::imports::resolve_rust_module_segments_with_crate;
+
+use brokk_bifrost_rust::usage::Domain as RustBindingDomain;
+use brokk_bifrost_rust::usage::ModuleKey as RustModuleKey;
+use brokk_bifrost_rust::usage::RustPathIdentity;
+use brokk_bifrost_rust::usage::direct_import_scope_for_module_with_identity;
 
 /// Bump when the Rust summary's normalized rows or read set changes.
-pub(crate) const RUST_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 13;
+// Version 18 keeps scoped ambiguity out of member name-inventory obligations.
+// Version 19 adds the published binding-authority rows to the surface digest.
+// Version 20 separates module inventories from binding gaps at colliding paths.
+#[doc(hidden)]
+pub const RUST_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 21;
 
 pub(crate) const IMPORTING_FILES_FOR_MEMBER_SQL: &str = r#"
 WITH target_declarations AS (
@@ -143,7 +170,7 @@ WITH selected_units AS (
 SELECT members.rel_path, json(naming.package_components), contexts.crate_name,
        contexts.target_kind, blobs.blob_oid,
        EXISTS (
-         SELECT 1 FROM main.rust_resolution_unit_summary_placements AS root
+         SELECT 1 FROM main.rust_unit_summary_placements AS root
          WHERE root.summary_id = members.summary_id
            AND root.member_ordinal = members.member_ordinal
            AND root.module_path = 'crate'
@@ -214,9 +241,9 @@ JOIN main.rust_resolution_unit_summary_contexts AS parent_context
   ON parent_context.summary_id = parent.summary_id
 LEFT JOIN main.workspace_file_versions AS parent_manifest
   ON parent_manifest.file_version_id = parent.manifest_file_version_id
-LEFT JOIN main.rust_resolution_unit_summary_placements AS parent_placement
+LEFT JOIN main.resolution_unit_summary_placements AS parent_placement
   ON parent_placement.summary_id = parent.summary_id
- AND parent_placement.module_path = 'crate'
+ AND parent_placement.container_path = ''
 LEFT JOIN main.resolution_unit_summary_members AS parent_member
   ON parent_member.summary_id = parent_placement.summary_id
  AND parent_member.member_ordinal = parent_placement.member_ordinal
@@ -238,8 +265,7 @@ LEFT JOIN main.rust_resolution_unit_summary_file_naming AS parent_naming
  AND parent_naming.member_ordinal = parent_member.member_ordinal
 LEFT JOIN main.resolution_unit_summary_dependencies AS dependencies
   ON dependencies.summary_id = parent.summary_id
-LEFT JOIN main.rust_resolution_unit_summary_dependency_names AS dependency_names
-  INDEXED BY rust_resolution_unit_summary_dependency_names_ordinal
+LEFT JOIN main.rust_unit_summary_dependency_names AS dependency_names
   ON dependency_names.summary_id = dependencies.summary_id
  AND dependency_names.dependency_ordinal = dependencies.dependency_ordinal
 LEFT JOIN main.resolution_unit_summary_versions AS child_versions
@@ -271,9 +297,9 @@ LEFT JOIN main.rust_resolution_unit_summary_contexts AS child_context
   ON child_context.summary_id = child_rust_versions.summary_id
 LEFT JOIN main.workspace_file_versions AS child_manifest
   ON child_manifest.file_version_id = child_rust_versions.manifest_file_version_id
-LEFT JOIN main.rust_resolution_unit_summary_placements AS child_placement
+LEFT JOIN main.resolution_unit_summary_placements AS child_placement
   ON child_placement.summary_id = child_rust_versions.summary_id
- AND child_placement.module_path = 'crate'
+ AND child_placement.container_path = ''
 LEFT JOIN main.resolution_unit_summary_members AS child_member
   ON child_member.summary_id = child_placement.summary_id
  AND child_member.member_ordinal = child_placement.member_ordinal
@@ -313,6 +339,27 @@ WHERE context.target_kind <> 'detached' OR NOT EXISTS (
     AND attached_context.target_kind <> 'detached'
 );
 "#;
+
+pub(super) const BINDING_PROVENANCE_READ_SQL: &str =
+    "SELECT members.member_ordinal, targets.source_import_id, routes.import_ordinal,
+                    routes.binder_scope, routes.module_path, routes.namespace,
+                    routes.bound_name, routes.provider_crate_key,
+                    routes.provider_module_path, routes.provider_name,
+                    targets.visibility, targets.local_start, targets.is_extern_crate,
+                    routes.target_crate_key,routes.target_module_path,routes.target_name
+             FROM resolution_unit_summary_members AS members
+             CROSS JOIN rust_crate_binding_provenance AS routes
+               INDEXED BY rust_crate_binding_provenance_source
+               ON routes.topology_id=?2 AND routes.blob_id=members.blob_id
+             CROSS JOIN rust_unit_summary_placements AS placement
+               ON placement.summary_id=members.summary_id
+              AND placement.member_ordinal=members.member_ordinal AND placement.module_path=routes.module_path
+             CROSS JOIN source_rust_import_targets AS targets
+               ON targets.blob_id=routes.blob_id AND targets.ordinal=routes.import_ordinal
+             WHERE members.summary_id=?1
+             ORDER BY members.member_ordinal, routes.import_ordinal,
+                      routes.namespace, routes.bound_name, routes.provider_crate_key,
+                      routes.provider_module_path, routes.provider_name";
 
 pub(crate) const RUST_SUMMARY_BINDING_SURFACES_SQL: &str = r#"WITH RECURSIVE
 requested_members AS (
@@ -469,7 +516,7 @@ route_graph(root_summary_id, root_member_ordinal, root_route_ordinal,
   FROM roots
   CROSS JOIN selected_rust_unit_summary_route_owners AS origin_owner
     ON origin_owner.unit_key = roots.target_unit_key
-  CROSS JOIN main.rust_resolution_unit_summary_placements AS origin_placement
+  CROSS JOIN main.rust_unit_summary_placements AS origin_placement
     ON origin_placement.summary_id = origin_owner.summary_id
    AND origin_placement.module_path = roots.target_module_path
   CROSS JOIN main.resolution_unit_summary_members AS origin_member
@@ -553,94 +600,155 @@ WITH candidates AS (
   FROM json_each(?1)
 )
 SELECT candidates.candidate_ordinal,
-       containers.module_path IS NOT NULL,
+       containers.container_path IS NOT NULL,
        members.rel_path
 FROM candidates
-LEFT JOIN main.rust_resolution_unit_summary_containers AS containers
+LEFT JOIN main.resolution_unit_summary_containers AS containers
   ON containers.summary_id = candidates.summary_id
- AND containers.module_path = candidates.module_path
-LEFT JOIN main.rust_resolution_unit_summary_placements AS placements
+ AND containers.container_path = CASE candidates.module_path WHEN 'crate' THEN '' ELSE candidates.module_path END
+LEFT JOIN main.resolution_unit_summary_placements AS placements
   ON placements.summary_id = containers.summary_id
- AND placements.module_path = containers.module_path
+ AND placements.container_path = containers.container_path
 LEFT JOIN main.resolution_unit_summary_members AS members
   ON members.summary_id = placements.summary_id
  AND members.member_ordinal = placements.member_ordinal
 "#;
 
 #[derive(Debug)]
-pub(crate) struct RustSummaryPackageRow {
-    pub(crate) rel_path: String,
-    pub(crate) package_components: Vec<String>,
-    pub(crate) crate_name: String,
-    pub(crate) target_kind: String,
-    pub(crate) blob_oid: String,
-    pub(crate) is_root_member: bool,
+#[doc(hidden)]
+pub struct RustSummaryPackageRow {
+    #[doc(hidden)]
+    pub rel_path: String,
+    #[doc(hidden)]
+    pub package_components: Vec<String>,
+    #[doc(hidden)]
+    pub crate_name: String,
+    #[doc(hidden)]
+    pub target_kind: String,
+    #[doc(hidden)]
+    pub blob_oid: String,
+    #[doc(hidden)]
+    pub is_root_member: bool,
 }
 
 #[derive(Debug)]
-pub(crate) struct RustSummaryBindingSurfaceRow {
-    pub(crate) member_ordinal: i64,
-    pub(crate) route_ordinal: i64,
-    pub(crate) rel_path: String,
-    pub(crate) module_path: String,
-    pub(crate) name: String,
-    pub(crate) namespace: String,
-    pub(crate) visibility_kind: String,
-    pub(crate) visibility_crate_root: Option<String>,
-    pub(crate) visibility_module_path: Option<String>,
-    pub(crate) origin_file: String,
-    pub(crate) origin_root_components: String,
-    pub(crate) origin_module_path: String,
-    pub(crate) origin_name: String,
-    pub(crate) root_components: String,
-    pub(crate) route_name: String,
-    pub(crate) route_file: String,
-    pub(crate) source_import_id: Option<i64>,
-    pub(crate) source_import_ordinal: Option<i64>,
-    pub(crate) route_source_import_id: Option<i64>,
-    pub(crate) route_source_import_ordinal: Option<i64>,
-    pub(crate) root_crate_name: Option<String>,
-    pub(crate) root_target_kind: Option<String>,
-    pub(crate) edge_crate_name: Option<String>,
-    pub(crate) edge_target_kind: Option<String>,
+#[doc(hidden)]
+pub struct RustSummaryBindingSurfaceRow {
+    #[doc(hidden)]
+    pub member_ordinal: i64,
+    #[doc(hidden)]
+    pub route_ordinal: i64,
+    #[doc(hidden)]
+    pub rel_path: String,
+    #[doc(hidden)]
+    pub module_path: String,
+    #[doc(hidden)]
+    pub name: String,
+    #[doc(hidden)]
+    pub namespace: String,
+    #[doc(hidden)]
+    pub visibility_kind: String,
+    #[doc(hidden)]
+    pub visibility_crate_root: Option<String>,
+    #[doc(hidden)]
+    pub visibility_module_path: Option<String>,
+    #[doc(hidden)]
+    pub origin_file: String,
+    #[doc(hidden)]
+    pub origin_root_components: String,
+    #[doc(hidden)]
+    pub origin_module_path: String,
+    #[doc(hidden)]
+    pub origin_name: String,
+    #[doc(hidden)]
+    pub root_components: String,
+    #[doc(hidden)]
+    pub route_name: String,
+    #[doc(hidden)]
+    pub route_file: String,
+    #[doc(hidden)]
+    pub source_import_id: Option<i64>,
+    #[doc(hidden)]
+    pub source_import_ordinal: Option<i64>,
+    #[doc(hidden)]
+    pub route_source_import_id: Option<i64>,
+    #[doc(hidden)]
+    pub route_source_import_ordinal: Option<i64>,
+    #[doc(hidden)]
+    pub root_crate_name: Option<String>,
+    #[doc(hidden)]
+    pub root_target_kind: Option<String>,
+    #[doc(hidden)]
+    pub edge_crate_name: Option<String>,
+    #[doc(hidden)]
+    pub edge_target_kind: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RustSummaryBindingCompletenessRow {
-    pub(crate) summary_id: i64,
-    pub(crate) rel_path: String,
-    pub(crate) package_components: String,
-    pub(crate) root_components: String,
-    pub(crate) complete: bool,
-    pub(crate) gap_kind: String,
-    pub(crate) gap_subject: String,
+#[doc(hidden)]
+pub struct RustSummaryBindingCompletenessRow {
+    #[doc(hidden)]
+    pub summary_id: i64,
+    #[doc(hidden)]
+    pub rel_path: String,
+    #[doc(hidden)]
+    pub package_components: String,
+    #[doc(hidden)]
+    pub root_components: String,
+    #[doc(hidden)]
+    pub complete: bool,
+    #[doc(hidden)]
+    pub gap_kind: String,
+    #[doc(hidden)]
+    pub gap_subject: String,
 }
 
 #[derive(Debug)]
-pub(crate) struct RustSummaryModuleCandidateRow {
-    pub(crate) candidate_ordinal: usize,
-    pub(crate) present: bool,
-    pub(crate) rel_path: Option<String>,
+#[doc(hidden)]
+pub struct RustSummaryModuleCandidateRow {
+    #[doc(hidden)]
+    pub candidate_ordinal: usize,
+    #[doc(hidden)]
+    pub present: bool,
+    #[doc(hidden)]
+    pub rel_path: Option<String>,
 }
 
 #[derive(Debug)]
-pub(crate) struct RustSummaryCargoRouteRow {
-    pub(crate) unit_key: [u8; 32],
-    pub(crate) manifest_rel_path: Option<String>,
-    pub(crate) target_kind: String,
-    pub(crate) crate_name: String,
-    pub(crate) edition: String,
-    pub(crate) development_capable: bool,
-    pub(crate) root_rel_path: Option<String>,
-    pub(crate) root_package_components: Option<Vec<String>>,
-    pub(crate) dependency_extern_name: Option<String>,
-    pub(crate) dependency_kind: Option<String>,
-    pub(crate) dependency_boundary: Option<String>,
-    pub(crate) dependency_unit_key: Option<[u8; 32]>,
-    pub(crate) dependency_target_kind: Option<String>,
-    pub(crate) dependency_root_rel_path: Option<String>,
-    pub(crate) dependency_root_package_components: Option<Vec<String>>,
-    pub(crate) dependency_manifest_rel_path: Option<String>,
+#[doc(hidden)]
+pub struct RustSummaryCargoRouteRow {
+    #[doc(hidden)]
+    pub unit_key: [u8; 32],
+    #[doc(hidden)]
+    pub manifest_rel_path: Option<String>,
+    #[doc(hidden)]
+    pub target_kind: String,
+    #[doc(hidden)]
+    pub crate_name: String,
+    #[doc(hidden)]
+    pub edition: String,
+    #[doc(hidden)]
+    pub development_capable: bool,
+    #[doc(hidden)]
+    pub root_rel_path: Option<String>,
+    #[doc(hidden)]
+    pub root_package_components: Option<Vec<String>>,
+    #[doc(hidden)]
+    pub dependency_extern_name: Option<String>,
+    #[doc(hidden)]
+    pub dependency_kind: Option<String>,
+    #[doc(hidden)]
+    pub dependency_boundary: Option<String>,
+    #[doc(hidden)]
+    pub dependency_unit_key: Option<[u8; 32]>,
+    #[doc(hidden)]
+    pub dependency_target_kind: Option<String>,
+    #[doc(hidden)]
+    pub dependency_root_rel_path: Option<String>,
+    #[doc(hidden)]
+    pub dependency_root_package_components: Option<Vec<String>>,
+    #[doc(hidden)]
+    pub dependency_manifest_rel_path: Option<String>,
 }
 
 const STAGE_SCHEMA_SQL: &str = "CREATE TEMP TABLE IF NOT EXISTS rust_unit_summary_units(
@@ -727,7 +835,7 @@ const IMPORT_TARGET_KEYS_SQL: &str = "SELECT DISTINCT imports.target_crate_key
 
 const EXPORTS_SQL: &str = "SELECT exports.module_path, exports.namespace, exports.name,
        exports.origin, exports.declaration_blob_id, exports.declaration_site,
-       semantic.semantic_key
+       semantic.semantic_key,exports.target_crate_key,exports.target_module_path,exports.target_name
     FROM main.rust_crate_exports AS exports
     LEFT JOIN main.resolution_semantic_sites AS semantic
       ON semantic.blob_id = exports.declaration_blob_id
@@ -738,7 +846,9 @@ const EXPORTS_SQL: &str = "SELECT exports.module_path, exports.namespace, export
 
 // Resolve the source binder inside the retained topology/blob frame. Only
 // target identity lookup below selects the current destination publication.
-pub(super) const NAMED_REEXPORT_TARGETS_SQL: &str =
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const NAMED_REEXPORT_TARGETS_SQL: &str =
     "SELECT DISTINCT imports.target_crate_key, imports.target_module_path, imports.target_name
     FROM main.rust_crate_imports AS imports
     JOIN main.source_rust_import_targets AS source
@@ -756,33 +866,6 @@ pub(super) const NAMED_REEXPORT_TARGETS_SQL: &str =
             AND member.container_path = imports.module_path AND member.blob_id = imports.blob_id
             AND scope.resolution_scope = imports.binder_scope
       )";
-
-// Match the fixpoint's normalized target domains before ambiguity assembly.
-// Constructor values carry their effective visibility in the same export rows.
-const GLOB_REEXPORT_TARGETS_SQL: &str = "WITH candidates AS (
-    SELECT routes.target_crate_key, routes.target_module_path, routes.module_path,
-           target.visibility,
-           CASE target.visibility
-             WHEN 'public' THEN NULL
-             WHEN 'private' THEN target.module_path
-             WHEN 'crate' THEN 'crate'
-             WHEN 'restricted' THEN target.restricted_module_path END AS target_domain
-    FROM main.rust_crate_glob_reexport_routes AS routes
-    JOIN main.rust_crate_versions AS versions
-      ON versions.workspace_id = ?5 AND versions.lang = 'rust' AND versions.generation = ?6
-     AND versions.crate_key = routes.target_crate_key
-     AND versions.valid_from <= ?7 AND (versions.valid_until IS NULL OR ?7 < versions.valid_until)
-    JOIN main.rust_crate_exports AS target
-      ON target.topology_id = versions.topology_id
-     AND target.module_path = routes.target_module_path
-     AND target.namespace = ?3 AND target.name = ?4
-    WHERE routes.topology_id = ?1 AND routes.module_path = ?2
-    )
-    SELECT DISTINCT target_crate_key, target_module_path FROM candidates
-    WHERE visibility = 'public'
-       OR (target_crate_key = ?8 AND target_domain IS NOT NULL
-           AND (module_path = target_domain
-                OR substr(module_path, 1, length(target_domain) + 2) = target_domain || '::'))";
 
 const TARGET_IDENTITY_SQL: &str = "SELECT identities.id, identities.identity_digest,
        exports.declaration_blob_id, exports.declaration_site
@@ -803,6 +886,8 @@ const TARGET_IDENTITY_SQL: &str = "SELECT identities.id, identities.identity_dig
 pub(crate) const DEPENDENCY_REEXPORT_WITNESS_SQL: &str = concat!(
     "WITH live AS (",
     super::unit_summaries::live_summary_select!("zeroblob(32)"),
+    "), target_live AS (",
+    super::unit_summaries::live_summary_select!("zeroblob(32)", "?8"),
     ")
      SELECT EXISTS(
        SELECT 1 FROM live
@@ -826,6 +911,27 @@ pub(crate) const DEPENDENCY_REEXPORT_WITNESS_SQL: &str = concat!(
          ON reachability.topology_id = topology.topology_id
         AND reachability.target_crate_key = ?8
         AND reachability.target_module_path = ?9
+       UNION ALL
+       SELECT 1 FROM target_live
+       CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
+         INDEXED BY rust_resolution_unit_summary_exports_alias_target
+         ON exports.summary_id = target_live.summary_id
+       CROSS JOIN live
+       CROSS JOIN main.rust_crate_versions AS versions
+         ON versions.workspace_id = ?1 AND versions.lang = ?2 AND versions.generation = ?3
+        AND versions.crate_key = ?4 AND versions.valid_from <= ?5
+        AND (versions.valid_until IS NULL OR ?5 < versions.valid_until)
+       CROSS JOIN main.rust_crate_topologies AS topology
+         ON topology.topology_id = versions.topology_id
+        AND topology.publication_state = 'complete'
+       CROSS JOIN main.rust_crate_public_module_reachability AS reachability
+         ON reachability.topology_id = topology.topology_id
+        AND reachability.target_crate_key = ?8
+        AND reachability.target_module_path = exports.module_path
+       WHERE exports.origin <> 'declaration'
+         AND exports.visibility = 'public' AND exports.namespace = ?10
+         AND exports.target_unit_key = ?8 AND exports.target_module_path = ?9
+         AND exports.target_name = ?11 AND exports.alias_identity_id = ?12
      )"
 );
 
@@ -856,11 +962,10 @@ const GAPS_SQL: &str = "SELECT gap_kind, subject, json(detail)
     WHERE topology_id = ?1 AND subject NOT LIKE 'public-module-surface:%'
     ORDER BY gap_kind, subject";
 
-pub(crate) struct RustUnitSummaries;
+#[doc(hidden)]
+pub struct RustUnitSummaries;
 
-/// The dependency ordinal, identity id and identity digest of a re-export target.
-type ReexportTarget = (Option<usize>, i64, [u8; 32]);
-
+/// Compare Rust-specific publication with the generic summary producer.
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapshotId) {
     let topology_count: usize = conn
@@ -1218,7 +1323,7 @@ impl UnitSummaryLanguage for RustUnitSummaries {
         let reads = read_rows(conn, snapshot, &producer_epoch)?;
 
         let mut dependencies = Vec::new();
-        let mut dependency_keys = HashSet::new();
+        let mut dependency_names = Vec::new();
         {
             let mut statement = conn.prepare_cached(DEPENDENCIES_SQL)?;
             let mut rows = statement.query([topology_id])?;
@@ -1263,17 +1368,42 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                         )));
                     }
                 };
-                if dependency_keys.insert(key) {
-                    dependencies.push(UnitDependency {
-                        unit_key: key,
-                        unit_id,
-                        label: format!("Rust dependency {dependency_label}"),
-                        boundary,
-                        provenance,
-                        external_digest,
-                    });
-                }
+                dependency_names.push(super::unit_summaries::UnitDependencyName {
+                    role: dependency_kind,
+                    name: extern_name,
+                    unit_key: Some(key),
+                });
+                dependencies.push(UnitDependency {
+                    unit_key: key,
+                    unit_id,
+                    label: format!("Rust dependency {dependency_label}"),
+                    boundary,
+                    provenance,
+                    external_digest,
+                });
             }
+        }
+        let member_ordinals = super::unit_summaries::member_ordinals(&members);
+        let mut placements = Vec::new();
+        let mut containers = Vec::new();
+        let mut statement = conn.prepare_cached("SELECT container_path, parent_container_path, rel_path, source_kind, scope_ordinal, blob_id FROM rust_crate_container_sources WHERE topology_id=?1 ORDER BY container_path, rel_path, source_kind")?;
+        let mut rows = statement.query([topology_id])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let parent: Option<String> = row.get(1)?;
+            let rel_path: String = row.get(2)?;
+            let role: String = row.get(3)?;
+            let path = if path == "crate" { String::new() } else { path };
+            containers.push(super::unit_summaries::UnitContainer {
+                path: path.clone(),
+                parent_path: parent.map(|path| if path == "crate" { String::new() } else { path }),
+            });
+            placements.push(super::unit_summaries::UnitPlacement {
+                container_path: path,
+                member_ordinal: member_ordinals
+                    [&(row.get::<_, i64>(5)?, rel_path.as_str(), role.as_str())],
+                scope_ordinal: row.get(4)?,
+            });
         }
         Ok(UnitInputs {
             unit_id,
@@ -1282,6 +1412,9 @@ impl UnitSummaryLanguage for RustUnitSummaries {
             members,
             reads,
             dependencies,
+            dependency_names,
+            containers,
+            placements,
         })
     }
 
@@ -1327,36 +1460,8 @@ impl UnitSummaryLanguage for RustUnitSummaries {
             );
         }
 
-        let dependency_ordinals: HashMap<[u8; 32], usize> = dependencies
-            .iter()
-            .map(|dependency| (dependency.unit_key, dependency.ordinal))
-            .collect();
-        let dependency_keys_by_extern = {
-            let mut statement = conn.prepare_cached(
-                "SELECT extern_name, boundary, dependency_crate_key
-                 FROM main.rust_crate_dependencies WHERE topology_id = ?1 ORDER BY extern_name",
-            )?;
-            let mut rows = statement.query([topology_id])?;
-            let mut mapping = HashMap::new();
-            while let Some(row) = rows.next()? {
-                let extern_name: String = row.get(0)?;
-                let boundary: String = row.get(1)?;
-                let dependency_key: Option<Vec<u8>> = row.get(2)?;
-                let key = match (boundary.as_str(), dependency_key) {
-                    ("workspace", Some(key)) => digest_from_row(key)?,
-                    ("external", None) => external_unit_key(&extern_name),
-                    ("std", None) => standard_unit_key(&extern_name),
-                    other => {
-                        return Err(StoreError::corrupt(format!(
-                            "{}: invalid dependency binding for {extern_name:?}: {other:?}",
-                            unit.label
-                        )));
-                    }
-                };
-                mapping.insert(extern_name, key);
-            }
-            mapping
-        };
+        let dependency_ordinals = super::unit_summaries::dependency_ordinals(dependencies);
+        let dependency_keys_by_extern = super::unit_summaries::dependency_keys_by_name(unit);
 
         let mut exports = Vec::new();
         // Identity, namespace, declaration blob and declaration site.
@@ -1393,19 +1498,15 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                     if rust_origin == "declaration" {
                         ("declaration", None, None, None)
                     } else {
-                        let target = self.reexport_target(
+                        let target = canonical_export_target(
                             conn,
                             snapshot,
                             unit,
-                            topology_id,
-                            &module_path,
                             &namespace,
-                            &name,
-                            &rust_origin,
+                            (digest_from_row(row.get(7)?)?, row.get(8)?, row.get(9)?),
                             &dependency_ordinals,
                         )?;
-                        let Some((dependency_ordinal, identity_id, identity_digest)) = target
-                        else {
+                        let Some(target) = target else {
                             gaps.insert(
                                 (
                                     "unresolved_reexport",
@@ -1417,9 +1518,9 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                         };
                         (
                             "reexport",
-                            dependency_ordinal,
-                            Some(identity_id),
-                            Some(identity_digest),
+                            target.dependency_ordinal,
+                            Some(target.identity.identity_id),
+                            Some(target.identity.identity_digest),
                         )
                     };
                 let (origin, alias_dependency_ordinal, alias_identity_id, alias_identity_digest) =
@@ -1630,6 +1731,18 @@ fn write_rust_summary_rows(
     dependencies: &[ConsumedDependency],
     summary_id: i64,
 ) -> Result<usize> {
+    const RUST_SUMMARY_CONTAINER_ATTRIBUTES_SQL: &str = "INSERT INTO rust_resolution_unit_summary_container_attributes(summary_id, container_path, kind)
+         SELECT ?1, CASE container_path WHEN 'crate' THEN '' ELSE container_path END, kind
+         FROM rust_crate_containers WHERE topology_id=?2";
+    const RUST_SUMMARY_PLACEMENT_ATTRIBUTES_SQL: &str = "INSERT INTO rust_resolution_unit_summary_placement_attributes(summary_id, container_path, member_ordinal, placement, source_kind, enum_scope_node_key)
+         SELECT ?1, CASE sources.container_path WHEN 'crate' THEN '' ELSE sources.container_path END,
+                members.member_ordinal, containers.placement, sources.source_kind, sources.enum_scope_node_key
+         FROM rust_crate_container_sources AS sources
+         JOIN rust_crate_containers AS containers USING(topology_id, container_path)
+         JOIN resolution_unit_summary_members AS members
+           ON members.summary_id=?1 AND members.rel_path=sources.rel_path
+          AND members.source_role=sources.source_kind
+         WHERE sources.topology_id=?2";
     let topology_id: i64 = conn.query_row(
         "SELECT topology_id FROM temp.rust_unit_summary_units WHERE unit_id = ?1",
         [unit.unit_id],
@@ -1638,7 +1751,7 @@ fn write_rust_summary_rows(
     for table in [
         "rust_resolution_unit_summary_gaps",
         "rust_resolution_unit_summary_contexts",
-        "rust_resolution_unit_summary_containers",
+        "rust_resolution_unit_summary_container_attributes",
         "rust_resolution_unit_summary_root_routes",
         "rust_resolution_unit_summary_trait_endpoints",
     ] {
@@ -1652,22 +1765,8 @@ fn write_rust_summary_rows(
     // are replaced by write_summary.
     let mut rows_written = 0;
     for sql in [
-        "INSERT INTO rust_resolution_unit_summary_containers(
-             summary_id, module_path, kind, placement)
-             SELECT ?1, container_path, kind, placement FROM rust_crate_containers
-             WHERE topology_id = ?2",
-        "INSERT INTO rust_resolution_unit_summary_placements(
-                 summary_id, module_path, member_ordinal, source_kind, scope_ordinal,
-                 enum_scope_node_key, parent_module_path)
-             SELECT ?1, sources.container_path, members.member_ordinal,
-                    sources.source_kind, sources.scope_ordinal,
-                    sources.enum_scope_node_key, sources.parent_container_path
-             FROM rust_crate_container_sources AS sources
-             JOIN resolution_unit_summary_members AS members
-               ON members.summary_id = ?1
-              AND members.rel_path = sources.rel_path
-              AND members.source_role = sources.source_kind
-             WHERE sources.topology_id = ?2",
+        RUST_SUMMARY_CONTAINER_ATTRIBUTES_SQL,
+        RUST_SUMMARY_PLACEMENT_ATTRIBUTES_SQL,
         "INSERT INTO rust_resolution_unit_summary_file_naming(
                  summary_id, member_ordinal, package_components, root_components)
              SELECT ?1, members.member_ordinal, naming.package_components,
@@ -1715,29 +1814,9 @@ fn write_rust_summary_rows(
     );
     rows_written += context_written;
 
-    let member_ordinals = {
-        let mut statement = conn.prepare_cached(
-            "SELECT blob_id, rel_path, source_role, member_ordinal
-             FROM resolution_unit_summary_members WHERE summary_id = ?1",
-        )?;
-        statement
-            .query_map([summary_id], |row| {
-                Ok((
-                    (
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ),
-                    row.get::<_, usize>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<HashMap<_, _>>>()?
-    };
+    let member_ordinals = super::unit_summaries::member_ordinals(&unit.members);
 
-    let dependency_ordinals = dependencies
-        .iter()
-        .map(|dependency| (dependency.unit_key, dependency.ordinal))
-        .collect::<HashMap<_, _>>();
+    let dependency_ordinals = super::unit_summaries::dependency_ordinals(dependencies);
     // The shared dependency rows list the unit's direct consumed dependencies.
     // A route can reach a unit they do not list: a unit reached through a
     // facade's re-export, or a sibling detached root. The route keeps the
@@ -1750,47 +1829,6 @@ fn write_rust_summary_rows(
             dependency_ordinals.get(&target_unit_key).copied()
         }
     };
-    let mut dependency_statement = conn.prepare_cached(
-        "SELECT extern_name, boundary, dependency_crate_key, dependency_kind
-         FROM rust_crate_dependencies WHERE topology_id = ?1 ORDER BY extern_name",
-    )?;
-    let mut dependency_rows = dependency_statement.query([topology_id])?;
-    let mut insert_dependency_name = conn.prepare_cached(
-        "INSERT INTO rust_resolution_unit_summary_dependency_names(
-             summary_id, dependency_ordinal, extern_name, dependency_kind)
-         VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    while let Some(row) = dependency_rows.next()? {
-        let extern_name: String = row.get(0)?;
-        let boundary: String = row.get(1)?;
-        let crate_key: Option<Vec<u8>> = row.get(2)?;
-        let dependency_kind: String = row.get(3)?;
-        let unit_key = match (boundary.as_str(), crate_key) {
-            ("workspace", Some(key)) => digest_from_row(key)?,
-            ("external", None) => external_unit_key(&extern_name),
-            ("std", None) => standard_unit_key(&extern_name),
-            other => {
-                return Err(StoreError::corrupt(format!(
-                    "{}: invalid Rust dependency row for {extern_name:?}: {other:?}",
-                    unit.label
-                )));
-            }
-        };
-        let ordinal = dependency_ordinals.get(&unit_key).ok_or_else(|| {
-            StoreError::corrupt(format!(
-                "{}: Rust dependency {extern_name:?} has no shared summary dependency row; dependencies={dependencies:?}",
-                unit.label
-            ))
-        })?;
-        insert_dependency_name.execute(params![
-            summary_id,
-            ordinal,
-            extern_name,
-            dependency_kind
-        ])?;
-        rows_written += 1;
-    }
-
     // Both import readers below need only the canonical source import id.
     // Joining the base targets avoids materializing the full source view.
     let mut import_statement = conn.prepare_cached(
@@ -1837,7 +1875,7 @@ fn write_rust_summary_rows(
             ))
         })?;
         let member_ordinal = member_ordinals
-            .get(&(blob_id, rel_path.clone(), source_kind.clone()))
+            .get(&(blob_id, rel_path.as_str(), source_kind.as_str()))
             .copied()
             .ok_or_else(|| {
                 StoreError::corrupt(format!(
@@ -1900,7 +1938,7 @@ fn write_rust_summary_rows(
             ))
         })?;
         let member_ordinal = member_ordinals
-            .get(&(blob_id, rel_path.clone(), source_kind.clone()))
+            .get(&(blob_id, rel_path.as_str(), source_kind.as_str()))
             .copied()
             .ok_or_else(|| {
                 StoreError::corrupt(format!(
@@ -1992,7 +2030,8 @@ fn write_rust_summary_rows(
 
     let mut export_statement = conn.prepare_cached(
         "SELECT module_path, namespace, name, origin, visibility,
-                restricted_module_path, declaration_blob_id
+                restricted_module_path, declaration_blob_id,declaration_site,
+                target_crate_key,target_module_path,target_name
          FROM rust_crate_exports WHERE topology_id = ?1
          ORDER BY module_path, namespace, name",
     )?;
@@ -2041,14 +2080,25 @@ fn write_rust_summary_rows(
                           AND catalog.local_key = site.semantic_key
                          WHERE exports.topology_id = ?1 AND exports.module_path = ?2
                            AND exports.namespace = ?3 AND exports.name = ?4
-                           AND exports.origin = 'declaration'",
+                           AND exports.origin = 'declaration'
+                           AND exports.declaration_blob_id=?5 AND exports.declaration_site=?6",
                 )?
-                .query_map(params![topology_id, module_path, namespace, name], |row| {
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?,
-                        row.get::<_, Option<Vec<u8>>>(1)?,
-                    ))
-                })?
+                .query_map(
+                    params![
+                        topology_id,
+                        module_path,
+                        namespace,
+                        name,
+                        declaration_blob_id,
+                        row.get::<_, i64>(7)?
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                        ))
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             assert_eq!(
                 identities.len(),
@@ -2066,7 +2116,7 @@ fn write_rust_summary_rows(
             );
             let mut statement = conn.prepare_cached(
                 "SELECT placement.member_ordinal, site.source_site
-                     FROM rust_resolution_unit_summary_placements AS placement
+                     FROM rust_unit_summary_placements AS placement
                      JOIN resolution_unit_summary_members AS members
                        ON members.summary_id = placement.summary_id
                       AND members.member_ordinal = placement.member_ordinal
@@ -2142,7 +2192,7 @@ fn write_rust_summary_rows(
                     .prepare_cached(
                         "SELECT placement.member_ordinal, site.source_site,
                                     catalog.shared_identity, hex(catalog.identity_digest)
-                             FROM rust_resolution_unit_summary_placements AS placement
+                             FROM rust_unit_summary_placements AS placement
                              JOIN resolution_unit_summary_members AS members
                                ON members.summary_id = placement.summary_id
                               AND members.member_ordinal = placement.member_ordinal
@@ -2185,42 +2235,16 @@ fn write_rust_summary_rows(
                 None,
             )
         } else {
-            let candidates = export_target_candidates(
-                conn,
-                snapshot,
-                unit,
-                topology_id,
-                &module_path,
-                &namespace,
-                &name,
-                &origin,
-                &dependency_ordinals,
-            )?;
-            if candidates.len() > 1 && origin == "glob_reexport" {
-                // Two glob imports bind this name to different declarations. Rust
-                // binds neither, and a use of the name is ambiguous. The glob
-                // routes keep both candidates; an export row names one target,
-                // so it cannot describe this name.
-                continue;
-            }
-            if candidates.is_empty() {
-                // No live target: the name has no export row. It is the same gap
-                // an unresolved re-export gets at derivation, so readers answer it
-                // as incomplete rather than as a proved absence.
-                conn.prepare_cached(
-                    "INSERT OR IGNORE INTO rust_resolution_unit_summary_gaps(summary_id, gap_kind, subject, detail)
-                     VALUES(?1, 'unresolved_reexport', ?2, jsonb('{\"reason\":\"reexport_target_unavailable\"}'))",
-                )?
-                .execute(params![summary_id, format!("{module_path}::{namespace}:{name}")])?;
-                continue;
-            }
-            if candidates.len() > 1 {
-                return Err(StoreError::corrupt(format!(
-                    "{}: Rust re-export {module_path}::{namespace}:{name} has non-unique live targets: {candidates:?}",
-                    unit.label
-                )));
-            }
-            let target = candidates.into_iter().next().expect("one target checked");
+            let target_unit_key = digest_from_row(row.get::<_, Vec<u8>>(8)?)?;
+            let target_module_path: String = row.get(9)?;
+            let target_name: String = row.get(10)?;
+            let target = canonical_export_target(
+                conn, snapshot, unit, &namespace,
+                (target_unit_key, target_module_path, target_name), &dependency_ordinals,
+            )?.ok_or_else(|| StoreError::corrupt(format!(
+                "{}: admitted canonical export {module_path}::{namespace}:{name} lacks a published dependency witness",
+                unit.label
+            )))?;
             (
                 None,
                 None,
@@ -2294,7 +2318,7 @@ fn write_rust_summary_rows(
         summary_id,
         &dependency_ordinal_for,
     )?;
-    rows_written += write_rust_effective_bindings(conn, snapshot, unit, summary_id)?;
+    rows_written += write_rust_effective_bindings(conn, snapshot, unit, topology_id, summary_id)?;
 
     Ok(rows_written)
 }
@@ -2354,6 +2378,8 @@ struct RustClosureProvenance {
 
 #[derive(Debug, Clone)]
 struct RustClosureImport {
+    canonical_target: ([u8; 32], String, String),
+    provider: ([u8; 32], String, String),
     member_ordinal: i64,
     import_id: i64,
     import_ordinal: i64,
@@ -2453,15 +2479,45 @@ fn rust_closure_intersection(
     target.intersect(edge)
 }
 
+/// The closure's bindings in key order, with the same keys grouped by module
+/// path. An import route asks for the bindings of one target module, and the
+/// fixpoint asks once per import per round, so that question reads the
+/// module's group instead of scanning every binding of the unit: the scan made
+/// the Rust unit-summary reconcile of this repository's own crates quadratic in
+/// the writer thread (#5990). Each group keeps key order, so iterating a group
+/// visits the same bindings in the same order as filtering `by_key` would.
+#[derive(Default)]
+struct RustClosureBindings {
+    by_key: BTreeMap<RustClosureBindingKey, RustClosureBinding>,
+    by_module: HashMap<String, BTreeSet<RustClosureBindingKey>>,
+}
+
+impl RustClosureBindings {
+    fn in_module<'a>(
+        &'a self,
+        module_path: &str,
+    ) -> impl Iterator<Item = &'a RustClosureBinding> + 'a {
+        self.by_module
+            .get(module_path)
+            .into_iter()
+            .flatten()
+            .map(|key| &self.by_key[key])
+    }
+
+    fn values(&self) -> impl Iterator<Item = &RustClosureBinding> {
+        self.by_key.values()
+    }
+}
+
 fn rust_closure_insert_binding(
-    bindings: &mut BTreeMap<RustClosureBindingKey, RustClosureBinding>,
+    bindings: &mut RustClosureBindings,
     next_route_ordinal: &mut i64,
     key: RustClosureBindingKey,
     binder_scope: i64,
     owner_unit_key: [u8; 32],
     first_import: Option<(i64, i64)>,
 ) -> (i64, bool) {
-    if let Some(binding) = bindings.get(&key) {
+    if let Some(binding) = bindings.by_key.get(&key) {
         return (binding.route_ordinal, false);
     }
     let route_ordinal = *next_route_ordinal;
@@ -2473,7 +2529,14 @@ fn rust_closure_insert_binding(
         route_ordinal,
         first_import,
     };
-    assert!(bindings.insert(key, binding).is_none());
+    assert!(
+        bindings
+            .by_module
+            .entry(key.module_path.clone())
+            .or_default()
+            .insert(key.clone())
+    );
+    assert!(bindings.by_key.insert(key, binding).is_none());
     (route_ordinal, true)
 }
 
@@ -2605,6 +2668,7 @@ fn write_rust_effective_bindings(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
     unit: &UnitInputs,
+    topology_id: i64,
     summary_id: i64,
 ) -> Result<usize> {
     let mut rows_written = 0;
@@ -2663,7 +2727,7 @@ fn write_rust_effective_bindings(
     }
     let root_member: Option<i64> = conn
         .query_row(
-            "SELECT member_ordinal FROM rust_resolution_unit_summary_placements
+            "SELECT member_ordinal FROM rust_unit_summary_placements
              WHERE summary_id = ?1 AND module_path = 'crate'
              ORDER BY member_ordinal LIMIT 1",
             [summary_id],
@@ -2671,7 +2735,7 @@ fn write_rust_effective_bindings(
         )
         .optional()?;
 
-    let mut bindings = BTreeMap::new();
+    let mut bindings = RustClosureBindings::default();
     let mut next_route_ordinal = 0_i64;
     let mut provenance = BTreeSet::new();
     {
@@ -2689,7 +2753,7 @@ fn write_rust_effective_bindings(
                  JOIN source_rust_module_declarations AS modules
                    ON modules.blob_id = bridges.blob_id
                   AND modules.declaration_id = bridges.declaration_id
-                 JOIN rust_resolution_unit_summary_placements AS placements
+                 JOIN rust_unit_summary_placements AS placements
                    ON placements.summary_id = members.summary_id
                   AND placements.member_ordinal = members.member_ordinal
                   AND placements.module_path = exports.module_path
@@ -2772,11 +2836,11 @@ fn write_rust_effective_bindings(
             "SELECT child.module_path, placement.parent_module_path,
                     parent.member_ordinal, declaration.declaration_id,
                     declaration.module_name, property.visibility
-             FROM rust_resolution_unit_summary_containers AS child
-             JOIN rust_resolution_unit_summary_placements AS placement
+             FROM rust_unit_summary_containers AS child
+             JOIN rust_unit_summary_placements AS placement
                ON placement.summary_id = child.summary_id
               AND placement.module_path = child.module_path
-             JOIN rust_resolution_unit_summary_placements AS parent_placement
+             JOIN rust_unit_summary_placements AS parent_placement
                ON parent_placement.summary_id = child.summary_id
               AND parent_placement.module_path = placement.parent_module_path
              JOIN resolution_unit_summary_members AS parent
@@ -2874,24 +2938,8 @@ fn write_rust_effective_bindings(
 
     let mut imports = Vec::new();
     {
-        let mut statement = conn.prepare_cached(
-            "SELECT routes.member_ordinal, routes.import_id, routes.route_ordinal,
-                    routes.binder_scope, routes.module_path, routes.namespace,
-                    routes.bound_name, routes.target_unit_key,
-                    routes.target_module_path, routes.target_name,
-                    targets.visibility, targets.local_start, targets.is_extern_crate
-             FROM rust_resolution_unit_summary_import_routes AS routes
-             JOIN resolution_unit_summary_members AS members
-               ON members.summary_id = routes.summary_id
-              AND members.member_ordinal = routes.member_ordinal
-             JOIN source_rust_import_targets AS targets
-               ON targets.blob_id = members.blob_id
-              AND targets.source_import_id = routes.import_id
-             WHERE routes.summary_id = ?1
-             ORDER BY routes.member_ordinal, routes.import_id,
-                      routes.route_ordinal, routes.namespace, routes.bound_name",
-        )?;
-        let mut rows = statement.query([summary_id])?;
+        let mut statement = conn.prepare_cached(BINDING_PROVENANCE_READ_SQL)?;
+        let mut rows = statement.query(params![summary_id, topology_id])?;
         while let Some(row) = rows.next()? {
             let member_ordinal: i64 = row.get(0)?;
             let import_id: i64 = row.get(1)?;
@@ -2900,12 +2948,25 @@ fn write_rust_effective_bindings(
             let module_path: String = row.get(4)?;
             let namespace: String = row.get(5)?;
             let bound_name: String = row.get(6)?;
-            let target_unit_key = digest_from_row(row.get(7)?)?;
-            let target_module_path: String = row.get(8)?;
-            let target_name: String = row.get(9)?;
+            let provider = (
+                digest_from_row(row.get(7)?)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            );
             let visibility: String = row.get(10)?;
             let local_start: Option<i64> = row.get(11)?;
             let is_extern_crate: bool = row.get(12)?;
+            let canonical_target = (
+                digest_from_row(row.get(13)?)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, String>(15)?,
+            );
+            // Bindings consume admitted canonical endpoints directly. Provider
+            // edges are attached only after this set is complete, so positive
+            // provenance cycles cannot prevent publication of an exact binding.
+            let target_unit_key = canonical_target.0;
+            let target_module_path = canonical_target.1.clone();
+            let target_name = canonical_target.2.clone();
             if local_start.is_some() || is_extern_crate || target_name == "self" {
                 continue;
             }
@@ -2957,6 +3018,8 @@ fn write_rust_effective_bindings(
                 module_path,
                 bound_name: Some(bound_name),
                 namespace: Some(namespace),
+                canonical_target,
+                provider,
                 target_unit_key,
                 target_module_path,
                 target_name: Some(target_name),
@@ -2984,129 +3047,18 @@ fn write_rust_effective_bindings(
             imports.push(route);
         }
     }
-    {
-        let mut statement = conn.prepare_cached(
-            "SELECT globs.member_ordinal, globs.source_import_id, globs.route_ordinal,
-                    globs.binder_scope, globs.module_path, globs.target_unit_key,
-                    globs.target_module_path, targets.visibility, targets.local_start
-             FROM rust_resolution_unit_summary_glob_imports AS globs
-             JOIN resolution_unit_summary_members AS members
-               ON members.summary_id = globs.summary_id
-              AND members.member_ordinal = globs.member_ordinal
-             JOIN source_rust_import_targets AS targets
-               ON targets.blob_id = members.blob_id
-              AND targets.source_import_id = globs.source_import_id
-             WHERE globs.summary_id = ?1
-             ORDER BY globs.member_ordinal, globs.source_import_id,
-                      globs.route_ordinal, globs.module_path",
-        )?;
-        let mut rows = statement.query([summary_id])?;
-        while let Some(row) = rows.next()? {
-            let member_ordinal: i64 = row.get(0)?;
-            let import_id: i64 = row.get(1)?;
-            let import_ordinal: i64 = row.get(2)?;
-            let binder_scope: i64 = row.get(3)?;
-            let module_path: String = row.get(4)?;
-            let target_unit_key = digest_from_row(row.get(5)?)?;
-            let target_module_path: String = row.get(6)?;
-            let visibility: String = row.get(7)?;
-            let local_start: Option<i64> = row.get(8)?;
-            if local_start.is_some() {
-                continue;
-            }
-            let identity = member_identity.get(&member_ordinal).ok_or_else(|| {
-                StoreError::corrupt(format!(
-                    "Rust glob route has no member path identity: member={member_ordinal}, import_id={import_id}"
-                ))
-            })?;
-            let owner_package = resolve_rust_module_path_with_crate(
-                &identity.crate_root_package,
-                &identity.crate_root_package,
-                &module_path,
-            )
-            .ok_or_else(|| {
-                StoreError::corrupt(format!(
-                    "invalid Rust glob owner module path {module_path:?}"
-                ))
-            })?;
-            let Some(domain) = direct_import_scope_for_module_with_identity(
-                &owner_package,
-                decode_rust_visibility(&visibility).ok_or_else(|| {
-                    StoreError::corrupt(format!(
-                        "invalid Rust glob visibility {visibility:?} for import {import_id}"
-                    ))
-                })?,
-                root_member == Some(member_ordinal),
-                identity,
-            ) else {
-                continue;
-            };
-            let target_domain = match domain {
-                RustBindingDomain::Public => RustClosureDomain::Public,
-                RustBindingDomain::Crate(crate_root) => RustClosureDomain::Crate(crate_root),
-                RustBindingDomain::Module(module) => RustClosureDomain::Module {
-                    crate_root: module.crate_root,
-                    module_path: std::iter::once("crate")
-                        .chain(module.components.iter().map(String::as_str))
-                        .collect::<Vec<_>>()
-                        .join("::"),
-                },
-            };
-            let mut route = RustClosureImport {
-                member_ordinal,
-                import_id,
-                import_ordinal,
-                binder_scope,
-                module_path: module_path.clone(),
-                bound_name: None,
-                namespace: None,
-                target_unit_key,
-                target_module_path,
-                target_name: None,
-                domain: target_domain,
-                importer_module: rust_closure_module_key(
-                    &module_path,
-                    &identity.crate_root_package,
-                )?,
-                external_targets: Vec::new(),
-            };
-            if route.target_unit_key != unit.unit_key
-                && let Some(child_summary_id) = summary_for_target(route.target_unit_key)?
-            {
-                route.external_targets = read_live_rust_closure_bindings(
-                    conn,
-                    child_summary_id,
-                    route.target_unit_key,
-                    &route.target_module_path,
-                    None,
-                )?;
-            }
-            imports.push(route);
-        }
-    }
-    imports.sort_by(|left, right| {
-        left.member_ordinal
-            .cmp(&right.member_ordinal)
-            .then_with(|| left.import_id.cmp(&right.import_id))
-            .then_with(|| left.import_ordinal.cmp(&right.import_ordinal))
-            .then_with(|| left.target_unit_key.cmp(&right.target_unit_key))
-            .then_with(|| left.target_module_path.cmp(&right.target_module_path))
-    });
-
     let mut unresolved_complete = BTreeSet::new();
     loop {
         let mut inserted_any = false;
-        let mut pending_provenance = BTreeSet::new();
         for import in &imports {
             let candidates = if import.target_unit_key == unit.unit_key {
                 bindings
-                    .values()
+                    .in_module(&import.target_module_path)
                     .filter(|binding| {
-                        binding.key.module_path == import.target_module_path
-                            && import
-                                .target_name
-                                .as_deref()
-                                .is_none_or(|name| binding.key.name == name)
+                        import
+                            .target_name
+                            .as_deref()
+                            .is_none_or(|name| binding.key.name == name)
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -3114,6 +3066,12 @@ fn write_rust_effective_bindings(
                 import.external_targets.clone()
             };
             for candidate in candidates {
+                if candidate.key.origin_unit_key != import.canonical_target.0
+                    || candidate.key.origin_module_path != import.canonical_target.1
+                    || candidate.key.origin_name != import.canonical_target.2
+                {
+                    continue;
+                }
                 if import.namespace.as_deref().is_some_and(|namespace| {
                     !rust_closure_namespace_matches(Some(namespace), &candidate.key.namespace)
                 }) {
@@ -3190,7 +3148,7 @@ fn write_rust_effective_bindings(
                     origin_name: candidate.key.origin_name.clone(),
                     domain,
                 };
-                let (route_ordinal, inserted) = rust_closure_insert_binding(
+                let (_, inserted) = rust_closure_insert_binding(
                     &mut bindings,
                     &mut next_route_ordinal,
                     key,
@@ -3199,18 +3157,62 @@ fn write_rust_effective_bindings(
                     Some((import.import_id, import.import_ordinal)),
                 );
                 inserted_any |= inserted;
-                pending_provenance.insert(RustClosureProvenance {
+            }
+        }
+        if !inserted_any {
+            break;
+        }
+    }
+
+    // Provider edges cannot gate publication of already admitted canonical
+    // bindings. Attach them after the direct binding set has been materialized.
+    for import in &imports {
+        let candidates = if import.provider.0 == unit.unit_key {
+            bindings
+                .values()
+                .filter(|binding| {
+                    binding.key.module_path == import.provider.1
+                        && binding.key.name == import.provider.2
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else if let Some(provider_summary) = summary_for_target(import.provider.0)? {
+            read_live_rust_closure_bindings(
+                conn,
+                provider_summary,
+                import.provider.0,
+                &import.provider.1,
+                Some(&import.provider.2),
+            )?
+        } else {
+            Vec::new()
+        };
+        for candidate in candidates.iter().filter(|candidate| {
+            candidate.key.origin_unit_key == import.canonical_target.0
+                && candidate.key.origin_module_path == import.canonical_target.1
+                && candidate.key.origin_name == import.canonical_target.2
+                && rust_closure_namespace_matches(
+                    import.namespace.as_deref(),
+                    &candidate.key.namespace,
+                )
+        }) {
+            for binding in bindings.values().filter(|binding| {
+                binding.key.member_ordinal == import.member_ordinal
+                    && binding.key.module_path == import.module_path
+                    && import.bound_name.as_deref() == Some(binding.key.name.as_str())
+                    && binding.key.namespace == candidate.key.namespace
+                    && binding.key.origin_unit_key == import.canonical_target.0
+                    && binding.key.origin_module_path == import.canonical_target.1
+                    && binding.key.origin_name == import.canonical_target.2
+            }) {
+                provenance.insert(RustClosureProvenance {
                     member_ordinal: import.member_ordinal,
                     import_id: import.import_id,
                     import_ordinal: import.import_ordinal,
-                    route_ordinal,
-                    target: rust_closure_binding_reference(&candidate),
+                    route_ordinal: binding.route_ordinal,
+                    target: rust_closure_binding_reference(candidate),
                 });
             }
-        }
-        provenance.extend(pending_provenance);
-        if !inserted_any {
-            break;
         }
     }
 
@@ -3237,17 +3239,18 @@ fn write_rust_effective_bindings(
 
     for import in &imports {
         let found = if import.target_unit_key == unit.unit_key {
-            bindings.values().any(|binding| {
-                binding.key.module_path == import.target_module_path
-                    && import
+            bindings
+                .in_module(&import.target_module_path)
+                .any(|binding| {
+                    import
                         .target_name
                         .as_deref()
                         .is_none_or(|name| binding.key.name == name)
-                    && import
-                        .namespace
-                        .as_deref()
-                        .is_none_or(|namespace| binding.key.namespace == namespace)
-            })
+                        && import
+                            .namespace
+                            .as_deref()
+                            .is_none_or(|namespace| binding.key.namespace == namespace)
+                })
         } else {
             !import.external_targets.is_empty()
         };
@@ -3339,8 +3342,28 @@ fn write_rust_effective_bindings(
 
     let gaps = {
         let mut statement = conn.prepare_cached(
+            // A known name can have ambiguous targets without opening the member's
+            // name inventory. Keep the gap itself for exact binding readers. Every
+            // entry must carry scoped ambiguity evidence; mixed or malformed
+            // inventories still prevent import-graph publication.
             "SELECT gap_kind, subject FROM rust_resolution_unit_summary_gaps
-             WHERE summary_id = ?1 ORDER BY gap_kind, subject",
+             WHERE summary_id = ?1
+               AND NOT (gap_kind = 'open_export_inventory'
+                 AND json_type(detail, '$.evidence') IS 'array'
+                 AND json_array_length(detail, '$.evidence') > 0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM json_each(detail, '$.evidence') AS evidence
+                   WHERE CASE WHEN evidence.type = 'object' THEN
+                     json_extract(evidence.value, '$.reason') IS 'InconsistentPrecedence'
+                     AND json_type(evidence.value, '$.namespace') IS 'text'
+                     AND json_extract(evidence.value, '$.namespace') IN ('type', 'value', 'macro')
+                     AND json_type(evidence.value, '$.member_blob') IS 'integer'
+                     AND json_extract(evidence.value, '$.member_blob') >= 0
+                     AND json_type(evidence.value, '$.binder_scope') IS 'integer'
+                     AND json_extract(evidence.value, '$.binder_scope') >= 0
+                   ELSE 0 END IS NOT 1
+                 ))
+             ORDER BY gap_kind, subject",
         )?;
         statement
             .query_map([summary_id], |row| {
@@ -3725,8 +3748,6 @@ fn write_rust_trait_endpoints(
 struct ExportTargetIdentity {
     identity_id: i64,
     identity_digest: [u8; 32],
-    declaration_blob_id: i64,
-    declaration_site: i64,
 }
 
 #[derive(Debug)]
@@ -3739,164 +3760,78 @@ struct ExportTargetCandidate {
     dependency_ordinal: Option<usize>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn export_target_candidates(
+fn canonical_export_target(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
     unit: &UnitInputs,
-    topology_id: i64,
-    module_path: &str,
     namespace: &str,
-    name: &str,
-    origin: &str,
+    target: ([u8; 32], String, String),
     dependency_ordinals: &HashMap<[u8; 32], usize>,
-) -> Result<Vec<ExportTargetCandidate>> {
-    let candidates = if origin == "glob_reexport" {
-        let mut statement = conn.prepare_cached(GLOB_REEXPORT_TARGETS_SQL)?;
-        statement
-            .query_map(
-                params![
-                    topology_id,
-                    module_path,
-                    namespace,
-                    name,
-                    snapshot.workspace_id.as_str(),
-                    snapshot.generation.get(),
-                    snapshot.revision,
-                    unit.unit_key.as_slice()
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        name.to_owned(),
-                    ))
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        let mut statement = conn.prepare_cached(NAMED_REEXPORT_TARGETS_SQL)?;
-        statement
-            .query_map(params![topology_id, module_path, namespace, name], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+) -> Result<Option<ExportTargetCandidate>> {
+    let (target_unit_key, target_module_path, target_name) = target;
+    let same_unit = target_unit_key == unit.unit_key;
+    let Some(identity) = target_identity(
+        conn,
+        snapshot,
+        &target_unit_key,
+        &target_module_path,
+        namespace,
+        &target_name,
+        same_unit,
+    )?
+    else {
+        return Ok(None);
     };
-    // A spelling identity alone does not identify a declaration. Keep the
-    // canonical unit and the declaration's source coordinates in this key.
-    let mut resolved = HashMap::new();
-    for (key, target_module_path, target_name) in candidates {
-        let target_unit_key = digest_from_row(key)?;
-        let same_unit = target_unit_key == unit.unit_key;
-        let Some(identity) = target_identity(
-            conn,
-            snapshot,
-            &target_unit_key,
-            &target_module_path,
-            namespace,
-            &target_name,
-            same_unit,
-        )?
-        else {
-            return Ok(Vec::new());
-        };
-        let dependency_ordinal = if same_unit {
-            None
-        } else if let Some(ordinal) = dependency_ordinals.get(&target_unit_key) {
-            Some(*ordinal)
-        } else {
-            let producer_epoch: String = conn.query_row(
-                "SELECT producer_epoch FROM main.resolution_producer_epochs WHERE lang = 'rust'",
-                [],
+    let dependency_ordinal = if same_unit {
+        None
+    } else {
+        let producer_epoch: String = conn.query_row(
+            "SELECT producer_epoch FROM main.resolution_producer_epochs WHERE lang = 'rust'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut statement = conn.prepare_cached(DEPENDENCY_REEXPORT_WITNESS_SQL)?;
+        let mut first_hop = dependency_ordinals.get(&target_unit_key).copied();
+        for (dependency_key, ordinal) in dependency_ordinals {
+            if first_hop.is_some_and(|previous| previous <= *ordinal) {
+                continue;
+            }
+            let witnesses_target: bool = statement.query_row(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    "rust",
+                    snapshot.generation.get(),
+                    dependency_key.as_slice(),
+                    snapshot.revision,
+                    producer_epoch,
+                    RUST_UNIT_SUMMARY_DERIVATION_VERSION,
+                    target_unit_key.as_slice(),
+                    target_module_path,
+                    namespace,
+                    target_name,
+                    identity.identity_id
+                ],
                 |row| row.get(0),
             )?;
-            let mut statement = conn.prepare_cached(DEPENDENCY_REEXPORT_WITNESS_SQL)?;
-            let mut first_hop = None;
-            for (dependency_key, ordinal) in dependency_ordinals {
-                if first_hop.is_some_and(|previous| previous <= *ordinal) {
-                    continue;
-                }
-                let witnesses_target: bool = statement.query_row(
-                    params![
-                        snapshot.workspace_id.as_str(),
-                        "rust",
-                        snapshot.generation.get(),
-                        dependency_key.as_slice(),
-                        snapshot.revision,
-                        producer_epoch,
-                        RUST_UNIT_SUMMARY_DERIVATION_VERSION,
-                        target_unit_key.as_slice(),
-                        target_module_path,
-                        namespace,
-                        target_name,
-                        identity.identity_id
-                    ],
-                    |row| row.get(0),
-                )?;
-                if witnesses_target {
-                    first_hop = Some(*ordinal);
-                }
-            }
-            let Some(first_hop) = first_hop else {
-                // Do not let an unproven candidate disappear behind another
-                // candidate and turn an incomplete export into a unique one.
-                return Ok(Vec::new());
-            };
-            Some(first_hop)
-        };
-        let declaration = (
-            target_unit_key,
-            identity.identity_id,
-            identity.declaration_blob_id,
-            identity.declaration_site,
-        );
-        let candidate = ExportTargetCandidate {
-            target_unit_key,
-            target_module_path,
-            target_name,
-            identity,
-            dependency_ordinal,
-        };
-        // Other routes to the same declaration can have different first hops
-        // or aliases. Select the smallest ordinal, then stable coordinates.
-        match resolved.entry(declaration) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(candidate);
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let previous = entry.get();
-                if (
-                    candidate.dependency_ordinal,
-                    &candidate.target_module_path,
-                    &candidate.target_name,
-                ) < (
-                    previous.dependency_ordinal,
-                    &previous.target_module_path,
-                    &previous.target_name,
-                ) {
-                    entry.insert(candidate);
-                }
+            if witnesses_target {
+                first_hop = Some(*ordinal);
             }
         }
-    }
-    let mut resolved = resolved.into_values().collect::<Vec<_>>();
-    resolved.sort_by(|left, right| {
-        (
-            left.target_unit_key,
-            &left.target_module_path,
-            &left.target_name,
-        )
-            .cmp(&(
-                right.target_unit_key,
-                &right.target_module_path,
-                &right.target_name,
-            ))
-    });
-    Ok(resolved)
+        let Some(first_hop) = first_hop else {
+            // Do not let an unproven candidate disappear behind another
+            // candidate and turn an incomplete export into a unique one.
+            return Ok(None);
+        };
+        Some(first_hop)
+    };
+
+    Ok(Some(ExportTargetCandidate {
+        target_unit_key,
+        target_module_path,
+        target_name,
+        identity,
+        dependency_ordinal,
+    }))
 }
 
 impl RustUnitSummaries {
@@ -4006,41 +3941,6 @@ impl RustUnitSummaries {
         finish(current.take())?;
         Ok(imports)
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn reexport_target(
-        &self,
-        conn: &Connection,
-        snapshot: &WorkspaceSnapshotId,
-        unit: &UnitInputs,
-        topology_id: i64,
-        module_path: &str,
-        namespace: &str,
-        name: &str,
-        rust_origin: &str,
-        dependency_ordinals: &HashMap<[u8; 32], usize>,
-    ) -> Result<Option<ReexportTarget>> {
-        let mut candidates = export_target_candidates(
-            conn,
-            snapshot,
-            unit,
-            topology_id,
-            module_path,
-            namespace,
-            name,
-            rust_origin,
-            dependency_ordinals,
-        )?;
-        if candidates.len() != 1 {
-            return Ok(None);
-        }
-        let target = candidates.pop().expect("one target checked");
-        Ok(Some((
-            target.dependency_ordinal,
-            target.identity.identity_id,
-            target.identity.identity_digest,
-        )))
-    }
 }
 
 fn read_rows(
@@ -4129,26 +4029,15 @@ fn target_identity(
                 namespace_code,
                 same_unit
             ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(
-        |(identity_id, digest, declaration_blob_id, declaration_site)| {
-            Ok(ExportTargetIdentity {
-                identity_id,
-                identity_digest: digest_from_row(digest)?,
-                declaration_blob_id,
-                declaration_site,
-            })
-        },
-    )
+    row.map(|(identity_id, digest)| {
+        Ok(ExportTargetIdentity {
+            identity_id,
+            identity_digest: digest_from_row(digest)?,
+        })
+    })
     .transpose()
 }
 
@@ -4267,7 +4156,8 @@ fn digest_from_row(bytes: Vec<u8>) -> Result<[u8; 32]> {
 }
 
 impl AnalyzerStore {
-    pub(crate) fn rust_summary_binding_completeness_rows(
+    #[doc(hidden)]
+    pub fn rust_summary_binding_completeness_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
         rel_paths: &[String],
@@ -4305,7 +4195,8 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
-    pub(crate) fn rust_summary_module_candidate_rows(
+    #[doc(hidden)]
+    pub fn rust_summary_module_candidate_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
         candidates: &[(i64, String)],
@@ -4339,7 +4230,8 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
-    pub(crate) fn rust_summary_binding_surface_rows(
+    #[doc(hidden)]
+    pub fn rust_summary_binding_surface_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
         rel_paths: &[String],
@@ -4451,7 +4343,8 @@ impl AnalyzerStore {
     /// a declaration in `rel_path`. This is the reverse-importer query used by
     /// Rust relevance and usage candidate selection; it stays demand-shaped
     /// and does not build a workspace-wide reverse index in the analyzer.
-    pub(crate) fn rust_summary_importing_file_paths(
+    #[doc(hidden)]
+    pub fn rust_summary_importing_file_paths(
         &self,
         snapshots: &WorkspaceSnapshots,
         blob_oid: &str,
@@ -4506,7 +4399,8 @@ impl AnalyzerStore {
         Ok(paths)
     }
 
-    pub(crate) fn rust_summary_package_rows(
+    #[doc(hidden)]
+    pub fn rust_summary_package_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
     ) -> Result<Vec<RustSummaryPackageRow>> {
@@ -4566,7 +4460,8 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
-    pub(crate) fn rust_summary_cargo_route_rows(
+    #[doc(hidden)]
+    pub fn rust_summary_cargo_route_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
     ) -> Result<Vec<RustSummaryCargoRouteRow>> {
@@ -4672,2136 +4567,5 @@ impl AnalyzerStore {
         drop(statement);
         tx.commit()?;
         Ok(rows)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use brokk_bifrost_test_macros::hardwon;
-
-    use crate::AnalyzerConfig;
-    use crate::analyzer::WorkspaceAnalyzer;
-    use crate::analyzer::store::AnalyzerStore;
-    use crate::inline_project::InlineTestProject;
-
-    include!("rust_forwarded_surface_tests.rs");
-
-    fn live_summaries(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, (i64, Vec<u8>)> {
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let mut statement = conn
-            .prepare(
-                "SELECT topology.crate_name, summaries.summary_id, summaries.output_digest
-                 FROM rust_crate_versions AS topology_versions
-                 JOIN rust_crate_topologies AS topology USING(topology_id)
-                 JOIN resolution_unit_summary_versions AS summary_versions
-                   ON summary_versions.workspace_id = topology_versions.workspace_id
-                  AND summary_versions.lang = topology_versions.lang
-                  AND summary_versions.generation = topology_versions.generation
-                  AND summary_versions.unit_key = topology_versions.crate_key
-                  AND summary_versions.valid_until IS NULL
-                 JOIN resolution_unit_summaries AS summaries
-                   ON summaries.summary_id = summary_versions.summary_id
-                 WHERE topology_versions.lang = 'rust'
-                   AND topology_versions.valid_until IS NULL
-                   AND topology.target_kind = 'lib'
-                   AND summaries.publication_state = 'complete'
-                 ORDER BY topology.crate_name",
-            )
-            .unwrap();
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(|row| {
-                let (name, summary_id, output_digest) = row.unwrap();
-                (name, (summary_id, output_digest))
-            })
-            .collect()
-    }
-
-    fn changed_summaries(
-        before: &BTreeMap<String, (i64, Vec<u8>)>,
-        after: &BTreeMap<String, (i64, Vec<u8>)>,
-    ) -> BTreeSet<String> {
-        assert_eq!(
-            before.keys().collect::<Vec<_>>(),
-            after.keys().collect::<Vec<_>>()
-        );
-        before
-            .iter()
-            .filter(|(name, (summary_id, _))| after[*name].0 != *summary_id)
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-
-    type SummaryRootRoute = (i64, String, i64, i64, Vec<u8>, String, String);
-
-    fn summary_root_routes(
-        workspace: &WorkspaceAnalyzer,
-        summary_id: i64,
-    ) -> Vec<SummaryRootRoute> {
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        conn.prepare(
-            "SELECT member_ordinal, module_path, route_key, reference_source_site,
-                    target_unit_key, target_module_path, target_name
-             FROM rust_resolution_unit_summary_root_routes
-             WHERE summary_id = ?1
-             ORDER BY member_ordinal, module_path, route_key",
-        )
-        .unwrap()
-        .query_map([summary_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-    }
-
-    #[test]
-    #[hardwon("ae10707fd23b: Rust topology ids and multi-namespace declarations were misread")]
-    fn summary_detail_rows_crosswalk_the_selected_topology() {
-        let names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
-        let members = names
-            .iter()
-            .map(|name| format!("\"pkg_{name}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut fixture = InlineTestProject::new().file(
-            "Cargo.toml",
-            format!("[workspace]\nmembers = [{members}]\nresolver = \"2\"\n"),
-        );
-        for name in names {
-            fixture = fixture
-                .file(
-                    format!("pkg_{name}/Cargo.toml"),
-                    format!(
-                        "[package]\nname = \"unit_{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-                    ),
-                )
-                .file(
-                    format!("pkg_{name}/src/lib.rs"),
-                    format!("pub struct {name}Item;\npub fn {name}() {{}}\n"),
-                );
-        }
-        let fixture = fixture.build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let rows = conn
-            .prepare(
-                "SELECT topology.crate_name, contexts.crate_name
-                 FROM rust_crate_versions AS topology_versions
-                 JOIN rust_crate_topologies AS topology USING(topology_id)
-                 JOIN resolution_unit_summary_versions AS summary_versions
-                   ON summary_versions.workspace_id = topology_versions.workspace_id
-                  AND summary_versions.lang = topology_versions.lang
-                  AND summary_versions.generation = topology_versions.generation
-                  AND summary_versions.unit_key = topology_versions.crate_key
-                  AND summary_versions.valid_until IS NULL
-                 JOIN rust_resolution_unit_summary_versions AS rust_versions
-                   ON rust_versions.summary_id = summary_versions.summary_id
-                 JOIN rust_resolution_unit_summary_contexts AS contexts
-                   ON contexts.summary_id = rust_versions.summary_id
-                 WHERE topology_versions.lang = 'rust'
-                   AND topology_versions.valid_until IS NULL
-                   AND topology.target_kind = 'lib'
-                 ORDER BY topology.crate_name",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(rows.len(), names.len(), "published Rust contexts: {rows:?}");
-        assert!(
-            rows.iter()
-                .all(|(topology_name, summary_name)| topology_name == summary_name),
-            "summary detail rows must join their selected topology: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn rust_summary_binding_surface_reader_seeks_in_both_statistics_states() {
-        use crate::analyzer::store::planner_statistics::pinned_plans::{
-            explain_pin, pinned, prepare_pin_context,
-        };
-        use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
-        use rusqlite::types::Value;
-
-        let fixture = InlineTestProject::with_language(crate::analyzer::Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"binding_surface_plan\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/lib.rs", "pub struct Item; pub fn run() {}\n")
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let store = workspace.store().expect("fixture store");
-        let conn = store.conn.lock().expect("fixture store connection");
-        crate::analyzer::store::ensure_revisioned_workspace_views(&conn)
-            .expect("revisioned workspace views");
-        conn.execute("DELETE FROM selected_workspace_revisions", [])
-            .expect("clear workspace selections");
-        conn.execute(
-            "INSERT INTO selected_workspace_revisions
-             SELECT workspace_id, lang, generation, revision FROM workspace_heads
-             WHERE lang = 'rust'",
-            [],
-        )
-        .expect("select fixture Rust workspace");
-        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
-        prepare_pin_context(&conn);
-        let mut pin = pinned("rust_unit_summary_import_graph_binding_surfaces");
-        pin.params = vec![Value::Text(serde_json::json!(["src/lib.rs"]).to_string())];
-
-        for state in PlannerStatisticsState::BOTH {
-            state.install(&conn);
-            let plan = explain_pin(&conn, &pin);
-            for index in [
-                "rust_resolution_unit_summary_effective_bindings_member_name",
-                "rust_resolution_unit_summary_import_route_provenance_binding",
-                "rust_resolution_unit_summary_effective_bindings_module_name",
-            ] {
-                assert!(
-                    plan.iter().any(|row| row.contains(index)),
-                    "{state:?}: binding surface reader must seek {index}: {plan:?}"
-                );
-            }
-            assert!(
-                plan.iter()
-                    .all(|row| !row.contains("AUTOMATIC") && !row.contains("TEMP B-TREE")),
-                "{state:?}: binding surface reader builds no transient index or sort: {plan:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rust_summary_binding_completeness_reader_seeks_in_both_statistics_states() {
-        use crate::analyzer::store::planner_statistics::pinned_plans::{
-            explain_pin, pinned, prepare_pin_context,
-        };
-        use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
-        use rusqlite::types::Value;
-
-        let fixture = InlineTestProject::with_language(crate::analyzer::Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"binding_completeness_plan\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/lib.rs", "pub struct Item; pub fn run() {}\n")
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let store = workspace.store().expect("fixture store");
-        let conn = store.conn.lock().expect("fixture store connection");
-        crate::analyzer::store::ensure_revisioned_workspace_views(&conn)
-            .expect("revisioned workspace views");
-        conn.execute("DELETE FROM selected_workspace_revisions", [])
-            .expect("clear workspace selections");
-        conn.execute(
-            "INSERT INTO selected_workspace_revisions
-             SELECT workspace_id, lang, generation, revision FROM workspace_heads
-             WHERE lang = 'rust'",
-            [],
-        )
-        .expect("select fixture Rust workspace");
-        crate::analyzer::store::fill_selected_rust_units(&conn).unwrap();
-        prepare_pin_context(&conn);
-        let mut pin = pinned("rust_unit_summary_import_graph_binding_completeness");
-        pin.params = vec![Value::Text(serde_json::json!(["src/lib.rs"]).to_string())];
-
-        for state in PlannerStatisticsState::BOTH {
-            state.install(&conn);
-            let plan = explain_pin(&conn, &pin);
-            assert!(
-                plan.iter()
-                    .any(|row| row
-                        .contains("rust_resolution_unit_summary_binding_completeness_member")),
-                "{state:?}: binding completeness reader must seek its member index: {plan:?}"
-            );
-            assert!(
-                plan.iter()
-                    .all(|row| !row.contains("AUTOMATIC") && !row.contains("TEMP B-TREE")),
-                "{state:?}: binding completeness reader builds no transient index or sort: {plan:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rust_summary_module_candidate_reader_seeks_in_both_statistics_states() {
-        use crate::analyzer::store::planner_statistics::pinned_plans::{
-            explain_pin, pinned, prepare_pin_context,
-        };
-        use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
-        use rusqlite::types::Value;
-
-        let store = AnalyzerStore::open_ephemeral().expect("ephemeral planner store");
-        let conn = store.conn.lock().expect("planner store connection");
-        prepare_pin_context(&conn);
-        let mut pin = pinned("rust_unit_summary_import_graph_module_candidates");
-        pin.params = vec![Value::Text(
-            serde_json::json!([[0, 1, "crate"]]).to_string(),
-        )];
-
-        for state in PlannerStatisticsState::BOTH {
-            state.install(&conn);
-            let plan = explain_pin(&conn, &pin);
-            for access in [
-                "SEARCH containers USING PRIMARY KEY",
-                "SEARCH placements USING PRIMARY KEY",
-                "SEARCH members USING PRIMARY KEY",
-            ] {
-                assert!(
-                    plan.iter().any(|row| row.contains(access)),
-                    "{state:?}: module candidate reader must seek by primary key at {access}: {plan:?}"
-                );
-            }
-            assert!(
-                plan.iter()
-                    .all(|row| !row.contains("AUTOMATIC") && !row.contains("TEMP B-TREE")),
-                "{state:?}: module candidate reader builds no transient index or sort: {plan:?}"
-            );
-        }
-    }
-
-    #[test]
-    #[hardwon(
-        "#4920: one enum reexported through two dependencies failed Rust summary reconciliation"
-    )]
-    fn reexport_routes_to_one_declaration_keep_the_smallest_dependency_ordinal() {
-        // Swap the module paths as well as source order so EXPORTS_SQL visits
-        // the direct and indirect dependency routes in both orders.
-        for selection_source in [
-            "pub mod traits { pub use infer::traits::*; pub mod project { pub use middle::traits::Reveal; } }\n",
-            "pub mod traits { pub use middle::traits::Reveal; pub mod project { pub use infer::traits::*; } }\n",
-        ] {
-            let fixture = InlineTestProject::new()
-                .file("Cargo.toml", "[workspace]\nmembers = [\"middle\", \"infer\", \"selection\"]\nresolver = \"2\"\n")
-                .file("middle/Cargo.toml", "[package]\nname = \"middle\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
-                .file("middle/src/lib.rs", "pub mod traits { pub enum Reveal { UserFacing, All } }\n")
-                .file("infer/Cargo.toml", "[package]\nname = \"infer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nmiddle = { path = \"../middle\" }\n")
-                .file("infer/src/lib.rs", "pub mod traits { pub mod project { pub use middle::traits::Reveal; } pub use self::project::Reveal; pub use middle::traits::*; }\n")
-                .file("selection/Cargo.toml", "[package]\nname = \"selection\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nmiddle = { path = \"../middle\" }\ninfer = { path = \"../infer\" }\n")
-                .file("selection/src/lib.rs", selection_source)
-                .build();
-            let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-            // A failed unit publishes nothing; every library must have a live
-            // summary after fresh reconciliation (also checked by differential).
-            let summaries = live_summaries(&workspace);
-            assert_eq!(summaries.len(), 3, "live Rust summaries: {summaries:?}");
-            let conn = workspace.store().unwrap().read_conn().unwrap();
-            let (count, ordinal, minimum): (i64, i64, i64) = conn
-                .query_row(
-                    "SELECT count(*), MIN(exports.alias_dependency_ordinal),
-                       (SELECT MIN(dependency_ordinal)
-                        FROM resolution_unit_summary_dependencies WHERE summary_id = ?1)
-                     FROM resolution_unit_summary_exports AS exports
-                     JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                     JOIN resolution_unit_summary_exports AS declaration
-                       ON declaration.summary_id = ?2
-                      AND declaration.identity_id = exports.identity_id
-                      AND declaration.namespace = exports.namespace
-                      AND declaration.declaration_blob_id = exports.declaration_blob_id
-                      AND declaration.declaration_site = exports.declaration_site
-                     WHERE exports.summary_id = ?1 AND identities.spelling = 'Reveal'
-                       AND exports.namespace = 'type' AND exports.origin = 'reexport'",
-                    rusqlite::params![summaries["selection"].0, summaries["middle"].0],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "one shared export for the enum declaration");
-            assert_eq!(ordinal, minimum, "smallest dependency ordinal wins");
-        }
-    }
-
-    fn vector_reexport_fixture() -> crate::inline_project::BuiltInlineTestProject {
-        // Vector's root package depends only on vector-lib. The declaration
-        // lives in vector-core, which is deliberately not a direct dependency
-        // of vector. Keep this fixture free of external packs and dependencies.
-        InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"vector\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                 [workspace]\nmembers = [\"lib/vector-lib\", \"lib/vector-core\"]\nresolver = \"2\"\n\
-                 [dependencies]\nvector-lib = { path = \"lib/vector-lib\" }\n",
-            )
-            .file("src/lib.rs", "pub use vector_lib::event::Event;\n")
-            .file(
-                "lib/vector-lib/Cargo.toml",
-                "[package]\nname = \"vector-lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                 [dependencies]\nvector-core = { path = \"../vector-core\" }\n",
-            )
-            .file("lib/vector-lib/src/lib.rs", "pub use vector_core::event;\n")
-            .file(
-                "lib/vector-core/Cargo.toml",
-                "[package]\nname = \"vector-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file("lib/vector-core/src/lib.rs", "pub mod event;\n")
-            .file("lib/vector-core/src/event.rs", "pub enum Event { Log, Metric }\n")
-            .build()
-    }
-
-    #[test]
-    #[hardwon("#5133: a public module alias can leave a forwarded module's physical subtree")]
-    fn vector_forwarded_module_alias_outside_subtree_publishes_first_hop() {
-        let fixture = vector_reexport_fixture();
-        fixture
-            .file("lib/vector-core/src/lib.rs")
-            .write("pub mod event;\npub mod outside;\n")
-            .unwrap();
-        fixture
-            .file("lib/vector-core/src/event.rs")
-            .write("pub use crate::outside as alias;\n")
-            .unwrap();
-        std::fs::write(
-            fixture.root().join("lib/vector-core/src/outside.rs"),
-            "pub enum Event { Log, Metric }\n",
-        )
-        .unwrap();
-        fixture
-            .file("src/lib.rs")
-            .write("pub use vector_lib::event::alias::Event;\n")
-            .unwrap();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let topologies = vector_topologies(&workspace);
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let targets = conn
-            .prepare(super::NAMED_REEXPORT_TARGETS_SQL)
-            .unwrap()
-            .query_map(
-                rusqlite::params![topologies["vector"], "crate", "type", "Event"],
-                |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-            )
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            targets,
-            vec![("crate::outside".to_owned(), "Event".to_owned())],
-            "the shared route algorithm must retain the canonical module alias target"
-        );
-        let topology_has_event: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM rust_crate_exports
-                 WHERE topology_id = ?1 AND module_path = 'crate'
-                   AND namespace = 'type' AND name = 'Event' AND visibility = 'public')",
-                [topologies["vector"]],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            topology_has_event,
-            "the legal alias must exist in the topology oracle"
-        );
-        drop(conn);
-        assert_vector_event_export(
-            &workspace,
-            "vector",
-            "lib/vector-core/src/outside.rs",
-            "vector_lib",
-        );
-    }
-
-    #[test]
-    #[hardwon("#5133: a transitive reexport disappeared from the shared Rust summary")]
-    fn vector_transitive_reexport_publishes_the_direct_dependency_and_complete_header() {
-        let fixture = vector_reexport_fixture();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        assert_eq!(summaries.len(), 3, "live Rust summaries: {summaries:?}");
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let rows = conn
-            .prepare(
-                "SELECT identities.spelling, exports.namespace, exports.origin,
-                        dependency_names.extern_name, declaration_members.rel_path,
-                        summaries.complete, summaries.publication_state,
-                        rust_exports.target_unit_key = leaf.unit_key,
-                        rust_exports.target_module_path, rust_exports.target_name,
-                        rust_exports.alias_identity_id = declaration.identity_id
-                 FROM resolution_unit_summary_exports AS exports
-                 JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                 JOIN resolution_unit_summaries AS summaries USING(summary_id)
-                 JOIN rust_resolution_unit_summary_dependency_names AS dependency_names
-                   ON dependency_names.summary_id = exports.summary_id
-                  AND dependency_names.dependency_ordinal = exports.alias_dependency_ordinal
-                 JOIN resolution_unit_summary_exports AS declaration
-                   ON declaration.summary_id = ?2
-                  AND declaration.declaration_blob_id = exports.declaration_blob_id
-                  AND declaration.declaration_site = exports.declaration_site
-                  AND declaration.namespace = exports.namespace
-                 JOIN resolution_unit_summary_members AS declaration_members
-                   ON declaration_members.summary_id = declaration.summary_id
-                  AND declaration_members.blob_id = declaration.declaration_blob_id
-                 JOIN resolution_unit_summaries AS leaf ON leaf.summary_id = declaration.summary_id
-                 JOIN rust_resolution_unit_summary_exports AS rust_exports
-                   ON rust_exports.summary_id = exports.summary_id
-                  AND rust_exports.module_path = 'crate'
-                  AND rust_exports.name = identities.spelling
-                  AND rust_exports.namespace = exports.namespace
-                 WHERE exports.summary_id = ?1 AND identities.spelling = 'Event'
-                 ORDER BY exports.namespace",
-            )
-            .unwrap()
-            .query_map(
-                rusqlite::params![summaries["vector"].0, summaries["vector_core"].0],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, bool>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, bool>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, bool>(10)?,
-                    ))
-                },
-            )
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            rows,
-            vec![(
-                "Event".to_owned(),
-                "type".to_owned(),
-                "reexport".to_owned(),
-                "vector_lib".to_owned(),
-                "lib/vector-core/src/event.rs".to_owned(),
-                true,
-                "complete".to_owned(),
-                true,
-                "crate::event".to_owned(),
-                "Event".to_owned(),
-                true,
-            )],
-            "the shared first hop is vector_lib and the Rust target is the canonical vector_core leaf"
-        );
-    }
-
-    #[test]
-    #[hardwon("#5133: local imports polluted module aliases and suppressed module glob exports")]
-    fn module_native_reexport_selector_5133_keeps_local_bindings_and_restricted_exports() {
-        let fixture = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"module_scope\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                r#"pub mod chosen {
-    pub enum Item { First }
-    pub enum ModuleHidden { First }
-}
-pub mod other {
-    pub enum Item { Second }
-    pub enum ModuleHidden { Second }
-    pub enum LocalOnly { Second }
-}
-pub use crate::chosen as Alias;
-pub use crate::chosen::*;
-use crate::other::ModuleHidden;
-pub(crate) use crate::chosen::Item as RestrictedNamed;
-pub mod restricted {
-    pub(crate) use crate::chosen::*;
-}
-pub fn public_local() {
-    pub use crate::other as Alias;
-    pub use crate::other::Item;
-    pub use crate::other::*;
-    pub(crate) use crate::other::LocalOnly as LocalRestricted;
-}
-pub fn private_local() {
-    use crate::other as Alias;
-    use crate::other::Item;
-}
-pub fn enclosing() {
-    pub mod nested {
-        pub use crate::chosen::Item as NestedItem;
-    }
-}
-"#,
-            )
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        assert_eq!(summaries.len(), 1, "complete module summary: {summaries:?}");
-        let conn = workspace.store().unwrap().read_conn().unwrap();
-        let summary_id = summaries["module_scope"].0;
-        let rows = conn
-            .prepare(
-                "SELECT module_path, name, visibility, target_module_path, target_name
-                 FROM rust_resolution_unit_summary_exports
-                 WHERE summary_id = ?1 AND namespace = 'type'
-                   AND origin IN ('reexport', 'glob_reexport')
-                 ORDER BY module_path, name",
-            )
-            .unwrap()
-            .query_map([summary_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        let expected = [
-            ("crate", "Alias", "public", "crate", "chosen"),
-            ("crate", "Item", "public", "crate::chosen", "Item"),
-            ("crate", "RestrictedNamed", "crate", "crate::chosen", "Item"),
-            (
-                "crate::nested",
-                "NestedItem",
-                "public",
-                "crate::chosen",
-                "Item",
-            ),
-            (
-                "crate::restricted",
-                "Item",
-                "crate",
-                "crate::chosen",
-                "Item",
-            ),
-            (
-                "crate::restricted",
-                "ModuleHidden",
-                "crate",
-                "crate::chosen",
-                "ModuleHidden",
-            ),
-        ]
-        .map(|(module, name, visibility, target_module, target)| {
-            (
-                module.to_owned(),
-                name.to_owned(),
-                visibility.to_owned(),
-                target_module.to_owned(),
-                target.to_owned(),
-            )
-        });
-        assert_eq!(rows, expected, "only module-native imports produce exports");
-        let retained: (i64, i64) = conn
-            .query_row(
-                "SELECT count(*), count(DISTINCT imports.binder_scope)
-                 FROM rust_resolution_unit_summary_import_routes AS imports
-                 WHERE imports.summary_id = ?1 AND imports.module_path = 'crate'
-                   AND imports.bound_name = 'Alias' AND imports.namespace = 'type'",
-                [summary_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            retained,
-            (3, 3),
-            "module, public local, and private local aliases remain usable"
-        );
-        let gaps: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT gap_kind, subject FROM resolution_unit_summary_gaps
-                 WHERE summary_id = ?1 ORDER BY gap_kind, subject",
-            )
-            .unwrap()
-            .query_map([summary_id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            gaps.is_empty(),
-            "valid local public imports are not reexport gaps: {gaps:?}"
-        );
-    }
-
-    // Keep cross-store comparisons independent of database-local ids. The
-    // declaration path and source site identify the same source in either store.
-    fn vector_surface(workspace: &WorkspaceAnalyzer) -> Vec<(String, String, String, i64)> {
-        let summary_id = live_summaries(workspace)["vector"].0;
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        conn.prepare(
-            "SELECT identities.spelling, exports.namespace, members.rel_path, exports.declaration_site
-             FROM resolution_unit_summary_exports AS exports
-             JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-             JOIN resolution_unit_summary_members AS members
-               ON members.blob_id = exports.declaration_blob_id
-             WHERE exports.summary_id = ?1
-             GROUP BY identities.spelling, exports.namespace, members.rel_path, exports.declaration_site
-             ORDER BY identities.spelling, exports.namespace, members.rel_path, exports.declaration_site",
-        )
-        .unwrap()
-        .query_map([summary_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-    }
-
-    fn vector_topologies(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, i64> {
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        conn.prepare(
-            "SELECT topology.crate_name, versions.topology_id
-             FROM rust_crate_versions AS versions
-             JOIN rust_crate_topologies AS topology USING(topology_id)
-             WHERE versions.lang = 'rust' AND versions.valid_until IS NULL
-               AND topology.target_kind = 'lib'
-             ORDER BY topology.crate_name",
-        )
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .map(|row| row.unwrap())
-        .collect()
-    }
-
-    fn vector_lib_surface_digest(workspace: &WorkspaceAnalyzer) -> Vec<u8> {
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        conn.query_row(
-            "SELECT topologies.export_surface_digest
-             FROM rust_crate_versions AS versions
-             JOIN rust_crate_topologies AS topologies USING(topology_id)
-             WHERE versions.lang = 'rust' AND versions.valid_until IS NULL
-               AND topologies.crate_name = 'vector_lib' AND topologies.target_kind = 'lib'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    fn assert_vector_event_export(
-        workspace: &WorkspaceAnalyzer,
-        unit: &str,
-        expected_path: &str,
-        expected_first_hop: &str,
-    ) {
-        let summary_id = live_summaries(workspace)[unit].0;
-        let conn = workspace.store().unwrap().read_conn().unwrap();
-        let rows = conn
-            .prepare(
-                "SELECT DISTINCT identities.spelling, exports.namespace, exports.origin,
-                        exports.visibility, members.rel_path,
-                        exports.alias_dependency_ordinal, names.extern_name,
-                        summaries.complete, summaries.publication_state
-                 FROM resolution_unit_summary_exports AS exports
-                 JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                 JOIN resolution_unit_summaries AS summaries USING(summary_id)
-                 JOIN resolution_unit_summary_members AS members
-                   ON members.blob_id = exports.declaration_blob_id
-                 LEFT JOIN rust_resolution_unit_summary_dependency_names AS names
-                   ON names.summary_id = exports.summary_id
-                  AND names.dependency_ordinal = exports.alias_dependency_ordinal
-                 WHERE exports.summary_id = ?1 AND identities.spelling = 'Event'
-                 ORDER BY exports.namespace",
-            )
-            .unwrap()
-            .query_map([summary_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, bool>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            rows,
-            vec![(
-                "Event".to_owned(),
-                "type".to_owned(),
-                "reexport".to_owned(),
-                "exported".to_owned(),
-                expected_path.to_owned(),
-                Some(0),
-                Some(expected_first_hop.to_owned()),
-                true,
-                "complete".to_owned(),
-            )],
-            "{unit} retains its actual Event export with a complete header"
-        );
-        let gaps: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT gap_kind, subject FROM resolution_unit_summary_gaps
-                 WHERE summary_id = ?1 ORDER BY gap_kind, subject",
-            )
-            .unwrap()
-            .query_map([summary_id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect();
-        assert!(
-            gaps.iter().all(|(kind, _)| kind != "unresolved_reexport"),
-            "{unit} has no unresolved reexport gap: {gaps:?}"
-        );
-    }
-
-    fn vector_terminal_alias_fixture() -> crate::inline_project::BuiltInlineTestProject {
-        InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"vector\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                 [workspace]\nmembers = [\"lib/vector-lib\", \"lib/vector-core\"]\nresolver = \"2\"\n\
-                 [dependencies]\nvector-lib = { path = \"lib/vector-lib\" }\n",
-            )
-            .file("src/lib.rs", "pub use vector_lib::Event;\n")
-            .file(
-                "lib/vector-lib/Cargo.toml",
-                "[package]\nname = \"vector-lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                 [dependencies]\nvector-core = { path = \"../vector-core\" }\n",
-            )
-            .file("lib/vector-lib/src/lib.rs", "pub use vector_core::Event;\n")
-            .file(
-                "lib/vector-core/Cargo.toml",
-                "[package]\nname = \"vector-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file(
-                "lib/vector-core/src/lib.rs",
-                "pub enum Event { Log, Metric }\nfn private_body() -> u8 { 1 }\n",
-            )
-            .build()
-    }
-
-    fn assert_vector_body_then_manifest_churn(
-        fixture: &crate::inline_project::BuiltInlineTestProject,
-        declaration_path: &str,
-        body_changed_source: &str,
-        manifest_path: &str,
-        facade_event_path: &str,
-    ) {
-        let mut workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let initial = live_summaries(&workspace);
-        let initial_topologies = vector_topologies(&workspace);
-        assert_eq!(initial.len(), 3, "initial vector summaries: {initial:?}");
-        assert_eq!(initial_topologies.len(), 3, "initial vector topologies");
-        assert_vector_event_export(&workspace, "vector", facade_event_path, "vector_lib");
-        assert_vector_matches_fresh_store(fixture, &workspace);
-
-        let initial_blob: i64 = workspace
-            .store()
-            .unwrap()
-            .read_conn()
-            .unwrap()
-            .query_row(
-                "SELECT declaration_blob_id FROM resolution_unit_summary_exports AS exports
-                 JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                 WHERE exports.summary_id = ?1 AND identities.spelling = 'Event'
-                   AND exports.origin = 'declaration'",
-                [initial["vector_core"].0],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        let declaration = fixture.file(declaration_path);
-        declaration.write(body_changed_source).unwrap();
-        workspace = workspace.update(&BTreeSet::from([declaration]));
-        let after_body = live_summaries(&workspace);
-        assert_eq!(
-            changed_summaries(&initial, &after_body),
-            BTreeSet::from(["vector_core".to_owned()]),
-            "changing only the private body rederives the declaring crate"
-        );
-        let after_body_topologies = vector_topologies(&workspace);
-        assert_eq!(
-            initial_topologies["vector_lib"], after_body_topologies["vector_lib"],
-            "equal published output retains the dependent facade topology"
-        );
-        assert_eq!(
-            initial_topologies["vector"], after_body_topologies["vector"],
-            "equal published output retains the consumer topology"
-        );
-        assert_ne!(
-            initial["vector_core"].0, after_body["vector_core"].0,
-            "core summary is rederived for the new declaration blob"
-        );
-        let after_body_blob: i64 = workspace
-            .store()
-            .unwrap()
-            .read_conn()
-            .unwrap()
-            .query_row(
-                "SELECT declaration_blob_id FROM resolution_unit_summary_exports AS exports
-                 JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                 WHERE exports.summary_id = ?1 AND identities.spelling = 'Event'
-                   AND exports.origin = 'declaration'",
-                [after_body["vector_core"].0],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_ne!(
-            initial_blob, after_body_blob,
-            "core Event declaration blob changes"
-        );
-        assert_eq!(
-            initial["vector_core"].1, after_body["vector_core"].1,
-            "private body does not change core's published output"
-        );
-        assert_eq!(
-            initial["vector_lib"], after_body["vector_lib"],
-            "facade summary is retained across equal core output"
-        );
-        assert_eq!(
-            initial["vector"], after_body["vector"],
-            "consumer summary is retained across equal facade output"
-        );
-        assert_vector_event_export(&workspace, "vector", facade_event_path, "vector_lib");
-        assert_vector_matches_fresh_store(fixture, &workspace);
-
-        let manifest = fixture.file(manifest_path);
-        let manifest_path = fixture.root().join(manifest_path);
-        let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
-        std::fs::write(&manifest_path, format!("{manifest_text}# refresh\n")).unwrap();
-        workspace = workspace.update(&BTreeSet::from([manifest]));
-        let after_manifest = live_summaries(&workspace);
-        assert_ne!(
-            after_body["vector"].0, after_manifest["vector"].0,
-            "manifest raw-read refresh rederives the consumer summary"
-        );
-        assert_eq!(
-            after_body_topologies["vector"],
-            vector_topologies(&workspace)["vector"],
-            "manifest refresh retains the consumer topology frame"
-        );
-        assert_eq!(
-            after_body_blob,
-            workspace
-                .store()
-                .unwrap()
-                .read_conn()
-                .unwrap()
-                .query_row(
-                    "SELECT declaration_blob_id FROM resolution_unit_summary_exports AS exports
-                     JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                     WHERE exports.summary_id = ?1 AND identities.spelling = 'Event'
-                       AND exports.origin = 'declaration'",
-                    [after_manifest["vector_core"].0],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            "manifest refresh leaves the current core declaration blob intact"
-        );
-        assert_vector_event_export(&workspace, "vector", facade_event_path, "vector_lib");
-        assert_vector_matches_fresh_store(fixture, &workspace);
-    }
-
-    #[test]
-    #[hardwon("#5133: retained module exports hid declaration blob churn on manifest refresh")]
-    fn vector_module_reexport_body_churn_then_manifest_refresh_matches_fresh_store() {
-        let fixture = vector_reexport_fixture();
-        fixture
-            .file("lib/vector-core/src/event.rs")
-            .write("pub enum Event { Log, Metric }\nfn private_body() -> u8 { 1 }\n")
-            .unwrap();
-        assert_vector_body_then_manifest_churn(
-            &fixture,
-            "lib/vector-core/src/event.rs",
-            "pub enum Event { Log, Metric }\nfn private_body() -> u8 { 2 }\n",
-            "Cargo.toml",
-            "lib/vector-core/src/event.rs",
-        );
-    }
-
-    #[test]
-    #[hardwon("#5133: retained terminal aliases hid declaration blob churn on manifest refresh")]
-    fn vector_terminal_alias_body_churn_then_manifest_refresh_matches_fresh_store() {
-        let fixture = vector_terminal_alias_fixture();
-        assert_vector_body_then_manifest_churn(
-            &fixture,
-            "lib/vector-core/src/lib.rs",
-            "pub enum Event { Log, Metric }\nfn private_body() -> u8 { 2 }\n",
-            "Cargo.toml",
-            "lib/vector-core/src/lib.rs",
-        );
-    }
-
-    fn assert_vector_consumed_live_facade(workspace: &WorkspaceAnalyzer) {
-        let summaries = live_summaries(workspace);
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let consumed: Vec<u8> = conn
-            .query_row(
-                "SELECT dependencies.consumed_output_digest
-             FROM resolution_unit_summary_dependencies AS dependencies
-             JOIN resolution_unit_summaries AS facade
-               ON facade.unit_key = dependencies.dependency_unit_key AND facade.summary_id = ?2
-             WHERE dependencies.summary_id = ?1",
-                rusqlite::params![summaries["vector"].0, summaries["vector_lib"].0],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            consumed, summaries["vector_lib"].1,
-            "consumer recorded the live facade output"
-        );
-    }
-
-    fn assert_vector_matches_fresh_store(
-        fixture: &crate::inline_project::BuiltInlineTestProject,
-        workspace: &WorkspaceAnalyzer,
-    ) {
-        // This constructor opens a new ephemeral store. Reconciliation against
-        // the incremental store would reuse the very summary keys under test.
-        let fresh = fixture.workspace_analyzer(AnalyzerConfig::default());
-        assert!(!std::ptr::eq(
-            workspace.store().unwrap().as_ref(),
-            fresh.store().unwrap().as_ref(),
-        ));
-        let digests = |analyzer: &WorkspaceAnalyzer| {
-            live_summaries(analyzer)
-                .into_iter()
-                .map(|(name, (_, digest))| (name, digest))
-                .collect::<BTreeMap<_, _>>()
-        };
-        assert_eq!(
-            digests(workspace),
-            digests(&fresh),
-            "fresh-store published outputs"
-        );
-        assert_eq!(
-            vector_surface(workspace),
-            vector_surface(&fresh),
-            "fresh-store consumer exports"
-        );
-    }
-
-    #[test]
-    #[hardwon("#5133: withdrawing a forwarded module must republish its named downstream alias")]
-    fn vector_transitive_reexport_edits_match_fresh_store_and_cut_off_equal_output() {
-        let fixture = vector_reexport_fixture();
-        let mut workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let mut previous = live_summaries(&workspace);
-        assert_eq!(vector_surface(&workspace).len(), 1, "initial Event export");
-        assert_vector_consumed_live_facade(&workspace);
-        for (path, source, expected_changed) in [
-            (
-                "lib/vector-core/src/lib.rs",
-                "pub mod event;\nfn private_body() -> u8 { 2 }\n",
-                BTreeSet::from(["vector_core".to_owned()]),
-            ),
-            // An unrelated child export is outside the module the facade forwards.
-            (
-                "lib/vector-core/src/lib.rs",
-                "pub mod event;\npub fn unrelated() {}\n",
-                BTreeSet::from(["vector_core".to_owned(), "vector_lib".to_owned()]),
-            ),
-        ] {
-            let file = fixture.file(path);
-            file.write(source).unwrap();
-            workspace = workspace.update(&BTreeSet::from([file]));
-            let incremental = live_summaries(&workspace);
-            assert_eq!(
-                changed_summaries(&previous, &incremental),
-                expected_changed,
-                "{path}"
-            );
-            assert_eq!(
-                previous["vector_lib"].1, incremental["vector_lib"].1,
-                "equal facade output: {path}"
-            );
-            assert_eq!(
-                previous["vector"], incremental["vector"],
-                "consumer is reused: {path}"
-            );
-            assert_vector_consumed_live_facade(&workspace);
-            assert_vector_matches_fresh_store(&fixture, &workspace);
-            previous = incremental;
-        }
-
-        // Withdraw the module that actually supplies vector::Event, rather than
-        // adding an unrelated facade name that leaves that route intact.
-        let facade = fixture.file("lib/vector-lib/src/lib.rs");
-        facade.write("// event is no longer forwarded\n").unwrap();
-        workspace = workspace.update(&BTreeSet::from([facade.clone()]));
-        let withdrawn = live_summaries(&workspace);
-        assert_eq!(
-            changed_summaries(&previous, &withdrawn),
-            BTreeSet::from(["vector_lib".to_owned(), "vector".to_owned(),])
-        );
-        assert_ne!(previous["vector_lib"].1, withdrawn["vector_lib"].1);
-        assert_ne!(previous["vector"].1, withdrawn["vector"].1);
-        assert!(
-            vector_surface(&workspace).is_empty(),
-            "withdrawn Event must not survive in shared rows"
-        );
-        let header: (bool, String) = workspace.store().unwrap().read_conn().unwrap().query_row(
-            "SELECT complete, publication_state FROM resolution_unit_summaries WHERE summary_id = ?1",
-            [withdrawn["vector"].0], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
-        assert_eq!(
-            header,
-            (false, "complete".to_owned()),
-            "unresolved reexport seals an incomplete header"
-        );
-        assert_vector_consumed_live_facade(&workspace);
-        assert_vector_matches_fresh_store(&fixture, &workspace);
-
-        facade.write("pub use vector_core::event;\n").unwrap();
-        workspace = workspace.update(&BTreeSet::from([facade]));
-        let restored = live_summaries(&workspace);
-        assert_eq!(
-            changed_summaries(&withdrawn, &restored),
-            BTreeSet::from(["vector_lib".to_owned(), "vector".to_owned(),])
-        );
-        assert_eq!(previous["vector_lib"].1, restored["vector_lib"].1);
-        assert_eq!(previous["vector"].1, restored["vector"].1);
-        assert_eq!(vector_surface(&workspace).len(), 1, "restored Event export");
-        assert_vector_consumed_live_facade(&workspace);
-        assert_vector_matches_fresh_store(&fixture, &workspace);
-    }
-
-    #[test]
-    #[hardwon(
-        "#5133: a removed descendant of a forwarded module must not leave a stale consumer export"
-    )]
-    fn vector_transitive_reexport_descendant_removal_withdraws_consumer() {
-        let fixture = vector_reexport_fixture();
-        let mut workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let before = live_summaries(&workspace);
-        let original_facade_surface_digest = vector_lib_surface_digest(&workspace);
-        assert_eq!(vector_surface(&workspace).len(), 1);
-        let leaf = fixture.file("lib/vector-core/src/event.rs");
-        leaf.write("// Event was removed; the forwarded event module still exists\n")
-            .unwrap();
-        workspace = workspace.update(&BTreeSet::from([leaf]));
-        let after = live_summaries(&workspace);
-        // Print before assertions so a contract gap identifies the precise
-        // cutoff and digests even when the stale consumer fails the test.
-        eprintln!(
-            "descendant removal before={before:?}, after={after:?}, consumer={:?}",
-            vector_surface(&workspace)
-        );
-        assert_ne!(before["vector_core"].1, after["vector_core"].1);
-        assert_ne!(
-            before["vector_lib"].1, after["vector_lib"].1,
-            "the facade publishes the forwarded module's descendant surface"
-        );
-        assert_ne!(
-            original_facade_surface_digest,
-            vector_lib_surface_digest(&workspace),
-            "the facade topology digest includes the forwarded descendant surface"
-        );
-        assert_ne!(
-            before["vector"].0, after["vector"].0,
-            "consumer must republish"
-        );
-        assert!(
-            vector_surface(&workspace).is_empty(),
-            "removed Event must not survive in shared rows"
-        );
-        assert_vector_consumed_live_facade(&workspace);
-        assert_vector_matches_fresh_store(&fixture, &workspace);
-
-        let leaf = fixture.file("lib/vector-core/src/event.rs");
-        leaf.write("pub enum Event { Log, Metric }\n").unwrap();
-        workspace = workspace.update(&BTreeSet::from([leaf]));
-        let restored = live_summaries(&workspace);
-        assert_eq!(
-            changed_summaries(&after, &restored),
-            BTreeSet::from([
-                "vector_core".to_owned(),
-                "vector_lib".to_owned(),
-                "vector".to_owned()
-            ])
-        );
-        assert_eq!(
-            original_facade_surface_digest,
-            vector_lib_surface_digest(&workspace),
-            "restoring the original descendant restores the facade surface digest"
-        );
-        assert_eq!(vector_surface(&workspace).len(), 1, "restored Event export");
-        assert_vector_consumed_live_facade(&workspace);
-        assert_vector_matches_fresh_store(&fixture, &workspace);
-    }
-
-    #[test]
-    #[hardwon(
-        "#5133: restricted tuple constructors escaped through enclosing and cross-crate reexports"
-    )]
-    fn restricted_tuple_constructor_is_not_exported_but_public_constructor_is() {
-        let fixture = InlineTestProject::new()
-            .file("Cargo.toml", "[workspace]\nmembers = [\"core\", \"facade\", \"consumer\"]\nresolver = \"2\"\n")
-            .file("core/Cargo.toml", "[package]\nname = \"constructor_core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
-            .file("core/src/lib.rs", "pub mod transform;\n")
-            .file("core/src/transform/mod.rs", "mod outputs;\npub use outputs::{OutputBuffer, Mixed, Public, Unit, Empty, NonExhaustive};\n")
-            .file("core/src/transform/outputs.rs", "pub struct OutputBuffer(pub(super) Vec<u8>);\n\
-                pub struct Mixed(pub u8, pub(crate) u8, u8);\n\
-                pub struct Public(pub u8);\n\
-                pub struct Unit;\n\
-                pub struct Empty();\n\
-                #[non_exhaustive]\npub struct NonExhaustive(pub u8);\n")
-            .file("facade/Cargo.toml", "[package]\nname = \"constructor_facade\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nconstructor_core = { path = \"../core\" }\n")
-            .file("facade/src/lib.rs", "pub use constructor_core::transform;\n")
-            .file("consumer/Cargo.toml", "[package]\nname = \"constructor_consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nconstructor_facade = { path = \"../facade\" }\n")
-            .file("consumer/src/lib.rs", "pub use constructor_facade::transform::{OutputBuffer, Mixed, Public, Unit, Empty, NonExhaustive};\n")
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        assert_eq!(summaries.len(), 3, "constructor summaries: {summaries:?}");
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let expected = vec![
-            ("Empty".to_owned(), "type".to_owned()),
-            ("Empty".to_owned(), "value".to_owned()),
-            ("Mixed".to_owned(), "type".to_owned()),
-            ("NonExhaustive".to_owned(), "type".to_owned()),
-            ("OutputBuffer".to_owned(), "type".to_owned()),
-            ("Public".to_owned(), "type".to_owned()),
-            ("Public".to_owned(), "value".to_owned()),
-            ("Unit".to_owned(), "type".to_owned()),
-            ("Unit".to_owned(), "value".to_owned()),
-        ];
-        for (name, module) in [
-            ("constructor_core", "crate::transform::outputs"),
-            ("constructor_core", "crate::transform"),
-            ("constructor_consumer", "crate"),
-        ] {
-            let summary_id = summaries[name].0;
-            // The topology is the differential oracle: assert the corrected
-            // visibility there independently instead of accepting oracle agreement.
-            for sql in [
-                "SELECT name, namespace FROM rust_crate_exports AS exports
-                 JOIN rust_crate_versions AS versions USING(topology_id)
-                 JOIN resolution_unit_summary_versions AS summaries
-                   ON summaries.workspace_id = versions.workspace_id
-                  AND summaries.lang = versions.lang AND summaries.generation = versions.generation
-                  AND summaries.unit_key = versions.crate_key AND summaries.valid_until IS NULL
-                 WHERE summaries.summary_id = ?1 AND versions.valid_until IS NULL
-                   AND exports.module_path = ?2 AND exports.visibility = 'public'
-                 ORDER BY name, namespace",
-                "SELECT name, namespace FROM rust_resolution_unit_summary_exports
-                 WHERE summary_id = ?1 AND module_path = ?2 AND visibility = 'public'
-                 ORDER BY name, namespace",
-            ] {
-                let rows = conn
-                    .prepare(sql)
-                    .unwrap()
-                    .query_map(rusqlite::params![summary_id, module], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap();
-                assert_eq!(
-                    rows, expected,
-                    "{name} {module}: type survives; only legal constructors are public; query={sql}"
-                );
-            }
-        }
-        // A module facade has no copied descendant export rows. Its published
-        // module must keep the core target, not flatten OutputBuffer into a value.
-        let facade_route: (bool, String, String) = conn.query_row(
-            "SELECT exports.target_unit_key = core.unit_key, exports.target_module_path, exports.target_name
-             FROM rust_resolution_unit_summary_exports AS exports
-             JOIN resolution_unit_summaries AS core ON core.summary_id = ?2
-             WHERE exports.summary_id = ?1 AND exports.module_path = 'crate'
-               AND exports.name = 'transform' AND exports.namespace = 'type'",
-            rusqlite::params![summaries["constructor_facade"].0, summaries["constructor_core"].0],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
-        assert_eq!(
-            facade_route,
-            (true, "crate".to_owned(), "transform".to_owned())
-        );
-        for name in [
-            "constructor_core",
-            "constructor_facade",
-            "constructor_consumer",
-        ] {
-            let rows = conn
-                .prepare(
-                    "SELECT identities.spelling, exports.namespace
-                 FROM resolution_unit_summary_exports AS exports
-                 JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                 WHERE exports.summary_id = ?1 AND identities.spelling IN
-                   ('OutputBuffer', 'Mixed', 'Public', 'Unit', 'Empty', 'NonExhaustive')
-                 ORDER BY identities.spelling, exports.namespace",
-                )
-                .unwrap()
-                .query_map([summaries[name].0], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            let expected_rows = if name == "constructor_facade" {
-                Vec::new()
-            } else {
-                expected.clone()
-            };
-            assert_eq!(
-                rows, expected_rows,
-                "{name}: shared public constructor projection"
-            );
-        }
-    }
-
-    #[test]
-    #[hardwon("#5133: a tuple field attribute before pub hid a legal public constructor")]
-    fn attributed_public_tuple_fields_keep_the_constructor_public() {
-        let fixture = InlineTestProject::with_language(crate::analyzer::Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"attributed_constructor\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "#![allow(dead_code)]\n\
-                 pub struct Attributed(#[allow(dead_code)] pub u8, #[allow(dead_code)] pub String);\n\
-                 pub struct Mixed(#[allow(dead_code)] pub u8, #[allow(dead_code)] u8);\n",
-            )
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        assert_eq!(summaries.len(), 1, "fixture summaries: {summaries:?}");
-
-        // Rust permits construction of Attributed because every tuple field is
-        // public, even though each field has an attribute before its modifier.
-        // Mixed remains non-constructible outside the crate because one field
-        // is private.
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        for sql in [
-            "SELECT name, namespace FROM rust_crate_exports
-             JOIN rust_crate_versions USING(topology_id)
-             JOIN resolution_unit_summary_versions
-               ON resolution_unit_summary_versions.workspace_id = rust_crate_versions.workspace_id
-              AND resolution_unit_summary_versions.lang = rust_crate_versions.lang
-              AND resolution_unit_summary_versions.generation = rust_crate_versions.generation
-              AND resolution_unit_summary_versions.unit_key = rust_crate_versions.crate_key
-              AND resolution_unit_summary_versions.valid_until IS NULL
-             WHERE resolution_unit_summary_versions.summary_id = ?1
-               AND rust_crate_versions.valid_until IS NULL
-               AND rust_crate_exports.module_path = 'crate'
-               AND rust_crate_exports.visibility = 'public'
-               AND rust_crate_exports.name IN ('Attributed', 'Mixed')
-             ORDER BY name, namespace",
-            "SELECT identities.spelling, exports.namespace
-             FROM rust_resolution_unit_summary_exports AS exports
-             JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-             WHERE exports.summary_id = ?1 AND exports.module_path = 'crate'
-               AND exports.visibility = 'public'
-               AND identities.spelling IN ('Attributed', 'Mixed')
-             ORDER BY identities.spelling, exports.namespace",
-            "SELECT identities.spelling, exports.namespace
-             FROM resolution_unit_summary_exports AS exports
-             JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-             WHERE exports.summary_id = ?1 AND exports.visibility = 'exported'
-               AND identities.spelling IN ('Attributed', 'Mixed')
-             ORDER BY identities.spelling, exports.namespace",
-        ] {
-            let rows = conn
-                .prepare(sql)
-                .unwrap()
-                .query_map([summaries["attributed_constructor"].0], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert_eq!(
-                rows,
-                vec![
-                    ("Attributed".to_owned(), "type".to_owned()),
-                    ("Attributed".to_owned(), "value".to_owned()),
-                    ("Mixed".to_owned(), "type".to_owned()),
-                ],
-                "public Rust tuple constructor rows from analyzer store; query={sql}"
-            );
-        }
-        let complete: bool = conn
-            .query_row(
-                "SELECT complete = 1 FROM resolution_unit_summaries WHERE summary_id = ?1",
-                [summaries["attributed_constructor"].0],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(complete, "shared summary header must be complete");
-    }
-
-    #[test]
-    #[hardwon("#5133: an earlier narrow glob route hid the same declaration's later public route")]
-    fn restricted_tuple_constructor_wider_glob_route_reaches_named_downstream_alias() {
-        let fixture = InlineTestProject::new()
-            .file("Cargo.toml", "[workspace]\nmembers = [\"core\", \"facade\", \"consumer\"]\nresolver = \"2\"\n")
-            .file("core/Cargo.toml", "[package]\nname = \"glob_core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
-            .file("core/src/lib.rs", "pub enum Item { First, Second }\n")
-            .file("facade/Cargo.toml", "[package]\nname = \"glob_facade\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nglob_core = { path = \"../core\" }\n")
-            .file("facade/src/lib.rs", "mod narrow { pub(crate) use glob_core::*; }\n\
-                mod wide { pub use glob_core::*; }\n\
-                pub mod api {\n\
-                    pub(crate) use crate::narrow::*;\n\
-                    pub use crate::wide::*;\n\
-                }\n\
-                pub use api::Item as Exported;\n")
-            .file("consumer/Cargo.toml", "[package]\nname = \"glob_consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nglob_facade = { path = \"../facade\" }\n")
-            .file("consumer/src/lib.rs", "pub use glob_facade::Exported as Visible;\n")
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let rows = conn.prepare(
-            "SELECT contexts.crate_name, exports.module_path, exports.name, exports.visibility
-             FROM rust_resolution_unit_summary_exports AS exports
-             JOIN rust_resolution_unit_summary_contexts AS contexts USING(summary_id)
-             JOIN resolution_unit_summary_versions AS versions
-               ON versions.summary_id = exports.summary_id AND versions.valid_until IS NULL
-             WHERE (contexts.crate_name = 'glob_facade' AND
-                      ((exports.module_path = 'crate::api' AND exports.name = 'Item') OR
-                       (exports.module_path = 'crate' AND exports.name = 'Exported')))
-                OR (contexts.crate_name = 'glob_consumer' AND exports.module_path = 'crate' AND exports.name = 'Visible')
-             ORDER BY contexts.crate_name, exports.module_path, exports.name",
-        ).unwrap().query_map([], |row| Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                (
-                    "glob_consumer".to_owned(),
-                    "crate".to_owned(),
-                    "Visible".to_owned(),
-                    "public".to_owned(),
-                ),
-                (
-                    "glob_facade".to_owned(),
-                    "crate".to_owned(),
-                    "Exported".to_owned(),
-                    "public".to_owned(),
-                ),
-                (
-                    "glob_facade".to_owned(),
-                    "crate::api".to_owned(),
-                    "Item".to_owned(),
-                    "public".to_owned(),
-                ),
-            ],
-            "the later wider route must widen and reschedule the same declaration"
-        );
-        let shared: Vec<(String, String)> = conn.prepare(
-            "SELECT contexts.crate_name, identities.spelling
-             FROM resolution_unit_summary_exports AS exports
-             JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-             JOIN rust_resolution_unit_summary_contexts AS contexts USING(summary_id)
-             JOIN resolution_unit_summary_versions AS versions
-               ON versions.summary_id = exports.summary_id AND versions.valid_until IS NULL
-             WHERE identities.spelling IN ('Exported', 'Visible') ORDER BY contexts.crate_name, identities.spelling",
-        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        assert_eq!(
-            shared,
-            vec![
-                ("glob_consumer".to_owned(), "Visible".to_owned()),
-                ("glob_facade".to_owned(), "Exported".to_owned())
-            ]
-        );
-        let core_sources: Vec<String> = conn
-            .prepare(
-                "SELECT DISTINCT members.rel_path
-             FROM resolution_unit_summary_exports AS exports
-             JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-             JOIN resolution_unit_summary_members AS members
-               ON members.summary_id = ?2
-              AND members.blob_id = exports.declaration_blob_id
-             WHERE exports.summary_id = ?1 AND identities.spelling = 'Visible'
-             ORDER BY members.rel_path",
-            )
-            .unwrap()
-            .query_map(
-                rusqlite::params![summaries["glob_consumer"].0, summaries["glob_core"].0],
-                |row| row.get(0),
-            )
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap();
-        assert_eq!(core_sources, vec!["core/src/lib.rs"]);
-    }
-
-    #[test]
-    #[hardwon("#5133: a private glob candidate caused a false ambiguity with a public item")]
-    fn rust_glob_export_ignores_inaccessible_private_candidate() {
-        let fixture = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"glob_visibility\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "mod a { pub fn item() {} }\nmod b { fn item() {} }\npub use a::*;\npub use b::*;\n",
-            )
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        let summary_id = summaries["glob_visibility"].0;
-        let conn = workspace.store().unwrap().read_conn().unwrap();
-
-        let shared: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT identities.spelling, exports.namespace
-                 FROM resolution_unit_summary_exports AS exports
-                 JOIN resolution_identities AS identities ON identities.id = exports.identity_id
-                 WHERE exports.summary_id = ?1
-                   AND identities.spelling = 'item' AND exports.visibility = 'exported'
-                 ORDER BY identities.spelling, exports.namespace",
-            )
-            .unwrap()
-            .query_map([summary_id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(shared, vec![("item".to_owned(), "value".to_owned())]);
-
-        let rust_root: Vec<(String, String, String)> = conn
-            .prepare(
-                "SELECT name, namespace, visibility
-                 FROM rust_resolution_unit_summary_exports
-                 WHERE summary_id = ?1 AND module_path = 'crate' AND name = 'item'
-                 ORDER BY name, namespace",
-            )
-            .unwrap()
-            .query_map([summary_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            rust_root,
-            vec![("item".to_owned(), "value".to_owned(), "public".to_owned())]
-        );
-    }
-
-    #[test]
-    fn body_edit_stops_at_rust_output_digest_and_public_item_reaches_direct_dependents() {
-        let fixture = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"base\", \"alpha\", \"beta\", \"leaf\"]\nresolver = \"2\"\n",
-            )
-            .file(
-                "base/Cargo.toml",
-                "[package]\nname = \"base_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file("base/src/lib.rs", "pub fn first() -> u32 { 1 }\n")
-            .file(
-                "alpha/Cargo.toml",
-                "[package]\nname = \"alpha_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nbase_unit = { path = \"../base\" }\n",
-            )
-            .file(
-                "alpha/src/lib.rs",
-                "pub use base_unit::first; pub fn alpha() -> u32 { crate::first() }\n",
-            )
-            .file(
-                "beta/Cargo.toml",
-                "[package]\nname = \"beta_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nbase_unit = { path = \"../base\" }\n",
-            )
-            .file(
-                "beta/src/lib.rs",
-                "pub use base_unit::first; pub fn beta() -> u32 { crate::first() }\n",
-            )
-            .file(
-                "leaf/Cargo.toml",
-                "[package]\nname = \"leaf_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nalpha_unit = { path = \"../alpha\" }\n",
-            )
-            .file(
-                "leaf/src/lib.rs",
-                "pub fn leaf() -> u32 { alpha_unit::alpha() }\n",
-            )
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let initial = live_summaries(&workspace);
-        assert_eq!(initial.len(), 4, "live Rust summaries: {initial:?}");
-        let initial_alpha_routes = summary_root_routes(&workspace, initial["alpha_unit"].0);
-        let initial_beta_routes = summary_root_routes(&workspace, initial["beta_unit"].0);
-        assert!(
-            !initial_alpha_routes.is_empty(),
-            "alpha root routes: {initial_alpha_routes:?}"
-        );
-        assert!(
-            !initial_beta_routes.is_empty(),
-            "beta root routes: {initial_beta_routes:?}"
-        );
-
-        let base_path = fixture.root().join("base/src/lib.rs");
-        let body_edit = "pub fn first() -> u32 { 2 }\n";
-        std::fs::write(&base_path, body_edit).unwrap();
-        let body_update = workspace.update(&BTreeSet::from([fixture.file("base/src/lib.rs")]));
-        let after_body = live_summaries(&body_update);
-        assert_eq!(
-            changed_summaries(&initial, &after_body),
-            BTreeSet::from(["base_unit".to_owned()]),
-            "body-only edit should derive just its Rust crate"
-        );
-        assert_eq!(
-            initial["base_unit"].1, after_body["base_unit"].1,
-            "body-only edit must preserve the crate output digest"
-        );
-        assert_eq!(
-            summary_root_routes(&body_update, after_body["alpha_unit"].0),
-            initial_alpha_routes,
-            "body-only target edits leave alpha's live root-route rows untouched"
-        );
-        assert_eq!(
-            summary_root_routes(&body_update, after_body["beta_unit"].0),
-            initial_beta_routes,
-            "body-only target edits leave beta's live root-route rows untouched"
-        );
-
-        let public_item_edit = format!("{body_edit}pub fn second() -> u32 {{ 2 }}\n");
-        std::fs::write(&base_path, public_item_edit).unwrap();
-        let public_update = body_update.update(&BTreeSet::from([fixture.file("base/src/lib.rs")]));
-        let after_public_item = live_summaries(&public_update);
-        assert_eq!(
-            changed_summaries(&after_body, &after_public_item),
-            BTreeSet::from([
-                "alpha_unit".to_owned(),
-                "base_unit".to_owned(),
-                "beta_unit".to_owned(),
-            ]),
-            "an exported item should derive its crate and direct dependents only"
-        );
-        assert_eq!(
-            summary_root_routes(&public_update, after_public_item["alpha_unit"].0),
-            initial_alpha_routes,
-            "an exported target change republishes alpha's root routes with its new summary"
-        );
-        assert_eq!(
-            summary_root_routes(&public_update, after_public_item["beta_unit"].0),
-            initial_beta_routes,
-            "an exported target change republishes beta's root routes with its new summary"
-        );
-        assert_eq!(
-            after_body["alpha_unit"].1, after_public_item["alpha_unit"].1,
-            "an importing crate keeps its output digest"
-        );
-        assert_eq!(
-            after_body["beta_unit"].1, after_public_item["beta_unit"].1,
-            "an importing crate keeps its output digest"
-        );
-    }
-
-    #[test]
-    #[ignore = "finds real bug: the legacy topology reconcile keeps a glob-chain export after its target unit drops the name; the test-only differential reports it"]
-    fn a_name_reached_through_a_glob_chain_follows_its_target_on_edit() {
-        // leaf names `first` through its own glob re-export of alpha, and alpha
-        // glob-re-exports base_unit. leaf's stored route is a pointer to its own
-        // crate root, so the answer depends on alpha's live glob rows and on
-        // base_unit's live exports. Removing `first` from base_unit must make the
-        // answer unresolved, whichever summary rows are stale.
-        let fixture = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"base\", \"alpha\", \"leaf\"]\nresolver = \"2\"\n",
-            )
-            .file(
-                "base/Cargo.toml",
-                "[package]\nname = \"base_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file("base/src/lib.rs", "pub fn first() -> u32 { 1 }\n")
-            .file(
-                "alpha/Cargo.toml",
-                "[package]\nname = \"alpha_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nbase_unit = { path = \"../base\" }\n",
-            )
-            .file("alpha/src/lib.rs", "pub use base_unit::*;\n")
-            .file(
-                "leaf/Cargo.toml",
-                "[package]\nname = \"leaf_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nalpha_unit = { path = \"../alpha\" }\n",
-            )
-            .file(
-                "leaf/src/lib.rs",
-                "pub use alpha_unit::*;\npub fn leaf() -> u32 { crate::first() }\n",
-            )
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let status_of = |analyzer: &WorkspaceAnalyzer| {
-            let result = crate::searchtools::get_definitions_by_location_with_cancellation(
-                analyzer.analyzer(),
-                crate::searchtools::GetDefinitionParams {
-                    references: vec![crate::searchtools::DefinitionReferenceQuery {
-                        path: "leaf/src/lib.rs".to_owned(),
-                        line: Some(2),
-                        column: Some(31),
-                    }],
-                },
-                None,
-            );
-            result.results[0].status.clone()
-        };
-        assert_eq!(
-            status_of(&workspace),
-            "resolved",
-            "crate::first resolves before the edit"
-        );
-
-        std::fs::write(
-            fixture.root().join("base/src/lib.rs"),
-            "pub fn second() -> u32 { 2 }\n",
-        )
-        .unwrap();
-        let update = workspace.update(&BTreeSet::from([fixture.file("base/src/lib.rs")]));
-        assert_ne!(
-            status_of(&update),
-            "resolved",
-            "crate::first must not resolve once base_unit no longer exports first"
-        );
-    }
-
-    type BindingProjection = Vec<(String, String, String, Vec<u8>, String)>;
-    type ProvenanceProjection = Vec<(i64, i64, String, Vec<u8>, String)>;
-
-    fn summary_binding_projection(
-        workspace: &WorkspaceAnalyzer,
-        summary_id: i64,
-    ) -> BindingProjection {
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        conn.prepare(
-            "SELECT module_path, name, namespace, target_unit_key, target_name
-             FROM rust_resolution_unit_summary_effective_bindings
-             WHERE summary_id = ?1
-             ORDER BY module_path, name, namespace, target_unit_key",
-        )
-        .unwrap()
-        .query_map([summary_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-    }
-
-    fn summary_provenance_projection(
-        workspace: &WorkspaceAnalyzer,
-        summary_id: i64,
-    ) -> ProvenanceProjection {
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        conn.prepare(
-            "SELECT import_ordinal, hop_ordinal, target_binding_name, target_unit_key, namespace
-             FROM rust_resolution_unit_summary_import_route_provenance
-             WHERE summary_id = ?1
-             ORDER BY import_ordinal, hop_ordinal, target_unit_key",
-        )
-        .unwrap()
-        .query_map([summary_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-    }
-
-    #[test]
-    fn target_export_republishes_importer_binding_rows_and_body_edit_does_not() {
-        // `alpha` re-exports `base_unit::first`, so its effective bindings and
-        // import-route provenance depend on base's binding closure. A body-only
-        // edit in base leaves that closure unchanged; a new public item changes
-        // base's summary, so alpha must republish under its new summary id with
-        // the same binding rows.
-        let fixture = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"base\", \"alpha\"]\nresolver = \"2\"\n",
-            )
-            .file(
-                "base/Cargo.toml",
-                "[package]\nname = \"base_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file("base/src/lib.rs", "pub fn first() -> u32 { 1 }\n")
-            .file(
-                "alpha/Cargo.toml",
-                "[package]\nname = \"alpha_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nbase_unit = { path = \"../base\" }\n",
-            )
-            .file(
-                "alpha/src/lib.rs",
-                "pub use base_unit::first; pub fn alpha() -> u32 { crate::first() }\n",
-            )
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let initial = live_summaries(&workspace);
-        let alpha_id = initial["alpha_unit"].0;
-        let initial_bindings = summary_binding_projection(&workspace, alpha_id);
-        let initial_provenance = summary_provenance_projection(&workspace, alpha_id);
-        assert!(
-            initial_bindings.iter().any(|row| row.1 == "first"),
-            "alpha effective bindings must carry the re-exported target: {initial_bindings:?}"
-        );
-        assert!(
-            !initial_provenance.is_empty(),
-            "alpha import-route provenance must cite the re-exported import"
-        );
-
-        let base_path = fixture.root().join("base/src/lib.rs");
-        std::fs::write(&base_path, "pub fn first() -> u32 { 2 }\n").unwrap();
-        let body_update = workspace.update(&BTreeSet::from([fixture.file("base/src/lib.rs")]));
-        let after_body = live_summaries(&body_update);
-        assert_eq!(
-            after_body["alpha_unit"].0, alpha_id,
-            "a body-only target edit must not republish alpha"
-        );
-        assert_eq!(
-            summary_binding_projection(&body_update, alpha_id),
-            initial_bindings,
-            "a body-only target edit must leave alpha's effective bindings unchanged"
-        );
-        assert_eq!(
-            summary_provenance_projection(&body_update, alpha_id),
-            initial_provenance,
-            "a body-only target edit must leave alpha's import-route provenance unchanged"
-        );
-
-        std::fs::write(
-            &base_path,
-            "pub fn first() -> u32 { 2 }\npub fn second() -> u32 { 2 }\n",
-        )
-        .unwrap();
-        let export_update = body_update.update(&BTreeSet::from([fixture.file("base/src/lib.rs")]));
-        let after_export = live_summaries(&export_update);
-        let republished_id = after_export["alpha_unit"].0;
-        assert_ne!(
-            republished_id, alpha_id,
-            "an exported target change must republish alpha under a new summary"
-        );
-        assert_eq!(
-            summary_binding_projection(&export_update, republished_id),
-            initial_bindings,
-            "an exported target change must republish alpha's effective bindings with the same rows"
-        );
-        assert_eq!(
-            summary_provenance_projection(&export_update, republished_id),
-            initial_provenance,
-            "an exported target change must republish alpha's import-route provenance with the same rows"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "73413900c759: a private import of a name its target binds twice failed the provenance insert and aborted the crate's summary pass"
-    )]
-    fn private_import_of_a_twice_bound_name_publishes_both_traversed_bindings() {
-        // `mod agent` reaches `select` through an explicit public re-export
-        // and through a crate-visible glob that the explicit one shadows. Both
-        // traversed bindings reach one declaration and one alias in `user`,
-        // so the import route has two provenance rows.
-        let fixture = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"shadow\"]\nresolver = \"2\"\n",
-            )
-            .file(
-                "shadow/Cargo.toml",
-                "[package]\nname = \"shadow_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file(
-                "shadow/src/lib.rs",
-                "mod inner { pub fn select() -> u32 { 1 } }\n\
-                 mod agent {\n\
-                     pub(crate) use crate::inner::*;\n\
-                     pub use crate::inner::select;\n\
-                 }\n\
-                 mod user {\n\
-                     use crate::agent::select;\n\
-                     pub fn run() -> u32 { select() }\n\
-                 }\n",
-            )
-            .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        let summary_id = summaries
-            .get("shadow_unit")
-            .expect("a double-bound private import must not abort the crate's summary pass")
-            .0;
-        let provenance = summary_provenance_projection(&workspace, summary_id);
-        let mut rows_per_import = std::collections::BTreeMap::<i64, usize>::new();
-        for row in &provenance {
-            *rows_per_import.entry(row.0).or_default() += 1;
-        }
-        assert!(
-            rows_per_import.values().any(|count| *count == 2),
-            "the double-bound import keeps one provenance row per traversed binding: {provenance:?}"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "d04c9b381fde: a dev-dependency cycle ordered a consumer before its provider and left its trait endpoint unnamed"
-    )]
-    fn dev_dependency_cycle_does_not_leave_a_consumers_trait_endpoint_open() {
-        // `cycle_a` depends on `cycle_b` and `cycle_b` dev-depends on `cycle_a`,
-        // as Vector's vector-config and vector-config-macros do. Every chain
-        // crate depends on the next one and the last on `cycle_a`, so the chain
-        // consumes the cycle. A dev-dependency is an input of the test targets,
-        // not of the library, so it must not order the library units; otherwise
-        // the whole chain lands in the unordered remainder, and a crate can be
-        // derived before the crate whose trait it implements.
-        const CHAIN: usize = 8;
-        let mut members = vec!["\"cycle_a\"".to_owned(), "\"cycle_b\"".to_owned()];
-        members.extend((0..CHAIN).map(|index| format!("\"chain_{index}\"")));
-        let mut fixture = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                format!(
-                    "[workspace]\nmembers = [{}]\nresolver = \"2\"\n",
-                    members.join(", ")
-                ),
-            )
-            .file(
-                "cycle_a/Cargo.toml",
-                "[package]\nname = \"cycle_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                 [dependencies]\ncycle_b = { path = \"../cycle_b\" }\n",
-            )
-            .file("cycle_a/src/lib.rs", "pub fn a() {}\n")
-            .file(
-                "cycle_b/Cargo.toml",
-                "[package]\nname = \"cycle_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                 [dev-dependencies]\ncycle_a = { path = \"../cycle_a\" }\n",
-            )
-            .file("cycle_b/src/lib.rs", "pub fn b() {}\n");
-        for index in 0..CHAIN {
-            let next = if index + 1 < CHAIN {
-                format!("chain_{}", index + 1)
-            } else {
-                "cycle_a".to_owned()
-            };
-            let source = if index + 1 < CHAIN {
-                format!(
-                    "pub trait Tr{index} {{}}\npub struct S{index};\nimpl {next}::Tr{next_index} for S{index} {{}}\n",
-                    next_index = index + 1
-                )
-            } else {
-                format!("pub trait Tr{index} {{}}\n")
-            };
-            fixture = fixture
-                .file(
-                    format!("chain_{index}/Cargo.toml"),
-                    format!(
-                        "[package]\nname = \"chain_{index}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                         [dependencies]\n{next} = {{ path = \"../{next}\" }}\n"
-                    ),
-                )
-                .file(format!("chain_{index}/src/lib.rs"), source);
-        }
-        let fixture = fixture.build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
-        let summaries = live_summaries(&workspace);
-        assert_eq!(
-            summaries.len(),
-            CHAIN + 2,
-            "every unit publishes a summary: {:?}",
-            summaries.keys().collect::<Vec<_>>()
-        );
-        let store = workspace.store().unwrap();
-        let conn = store.read_conn().unwrap();
-        let live_endpoints = |state: &str| -> Vec<(String, String)> {
-            conn.prepare(
-                "SELECT summaries.summary_id, endpoints.endpoint_role
-                 FROM rust_resolution_unit_summary_trait_endpoints AS endpoints
-                 JOIN resolution_unit_summary_versions AS versions
-                   ON versions.summary_id = endpoints.summary_id AND versions.valid_until IS NULL
-                 JOIN resolution_unit_summaries AS summaries
-                   ON summaries.summary_id = versions.summary_id
-                 WHERE endpoints.endpoint_state = ?1
-                 ORDER BY summaries.summary_id, endpoints.endpoint_role",
-            )
-            .unwrap()
-            .query_map([state], |row| {
-                Ok((row.get::<_, i64>(0)?.to_string(), row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-        };
-        let resolved = live_endpoints("resolved");
-        let unresolved = live_endpoints("unresolved");
-        assert_eq!(
-            resolved.len(),
-            2 * (CHAIN - 1),
-            "every chain impl names its subject and its trait: {resolved:?}"
-        );
-        assert!(
-            unresolved.is_empty(),
-            "no consumer was derived before its provider: {unresolved:?}"
-        );
-        let unavailable: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT gaps.gap_kind, gaps.subject
-                 FROM resolution_unit_summary_gaps AS gaps
-                 JOIN resolution_unit_summary_versions AS versions
-                   ON versions.summary_id = gaps.summary_id AND versions.valid_until IS NULL
-                 WHERE gaps.gap_kind = 'unit_summary_unavailable'",
-            )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            unavailable.is_empty(),
-            "a dev-dependency derived later is consumed once it exists: {unavailable:?}"
-        );
-    }
-
-    #[test]
-    #[ignore = "operator measurement: needs BIFROST_RUST_UNIT_SUMMARY_CORPUS, a writable Rust repository copy"]
-    fn measure_rust_unit_summary_reconcile_on_a_corpus() {
-        use std::sync::Arc;
-        use std::time::Instant;
-
-        use crate::analyzer::{Language, ProjectFile, TestProject};
-
-        let root = std::path::PathBuf::from(
-            std::env::var("BIFROST_RUST_UNIT_SUMMARY_CORPUS")
-                .expect("BIFROST_RUST_UNIT_SUMMARY_CORPUS names a writable Rust repository copy"),
-        )
-        .canonicalize()
-        .unwrap();
-        let project: Arc<dyn crate::analyzer::Project> =
-            Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let started = Instant::now();
-        let workspace =
-            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-                .expect("build the real Rust workspace");
-        eprintln!("MEASURE Rust fresh build {:?}", started.elapsed());
-
-        let report_rows = |label: &str, workspace: &WorkspaceAnalyzer| {
-            let store = workspace.store().unwrap();
-            let conn = store.read_conn().unwrap();
-            let mut statement = conn
-                .prepare(
-                    "SELECT topology.crate_name, summaries.summary_id,
-                       2
-                       + (SELECT count(*) FROM resolution_unit_summary_members AS members
-                          WHERE members.summary_id = summaries.summary_id)
-                       + (SELECT count(*) FROM resolution_unit_summary_dependencies AS dependencies
-                          WHERE dependencies.summary_id = summaries.summary_id)
-                       + (SELECT count(*) FROM resolution_unit_summary_reads AS reads
-                          WHERE reads.summary_id = summaries.summary_id)
-                       + (SELECT count(*) FROM resolution_unit_summary_exports AS exports
-                          WHERE exports.summary_id = summaries.summary_id)
-                       + (SELECT count(*) FROM resolution_unit_summary_imports AS imports
-                          WHERE imports.summary_id = summaries.summary_id)
-                       + (SELECT count(*) FROM resolution_unit_summary_gaps AS gaps
-                          WHERE gaps.summary_id = summaries.summary_id)
-                     FROM rust_crate_versions AS topology_versions
-                     JOIN rust_crate_topologies AS topology USING(topology_id)
-                     JOIN resolution_unit_summary_versions AS summary_versions
-                       ON summary_versions.workspace_id = topology_versions.workspace_id
-                      AND summary_versions.lang = topology_versions.lang
-                      AND summary_versions.generation = topology_versions.generation
-                      AND summary_versions.unit_key = topology_versions.crate_key
-                      AND summary_versions.valid_until IS NULL
-                     JOIN resolution_unit_summaries AS summaries
-                       ON summaries.summary_id = summary_versions.summary_id
-                     WHERE topology_versions.lang = 'rust'
-                       AND topology_versions.valid_until IS NULL
-                       AND topology.publication_state = 'complete'
-                     ORDER BY topology.crate_name, topology.target_kind",
-                )
-                .unwrap();
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            eprintln!("MEASURE {label} summary rows per crate: {rows:?}");
-            rows
-        };
-
-        let fresh = report_rows("fresh", &workspace);
-        assert!(
-            !fresh.is_empty(),
-            "the Rust workspace published no summaries"
-        );
-        let store = workspace.store().unwrap();
-        let member = store
-            .read_conn()
-            .unwrap()
-            .query_row(
-                "SELECT rel_path FROM resolution_unit_summary_members
-                 ORDER BY rel_path LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap();
-        let path = root.join(&member);
-        let mut source = std::fs::read_to_string(&path).unwrap();
-        source.push_str("\n// Rust unit summary measurement edit\n");
-        std::fs::write(&path, source).unwrap();
-        let started = Instant::now();
-        let updated = workspace.update(&BTreeSet::from([ProjectFile::new(
-            root.clone(),
-            std::path::PathBuf::from(&member),
-        )]));
-        eprintln!(
-            "MEASURE Rust one-file edit/update {:?} ({member})",
-            started.elapsed()
-        );
-        let after = report_rows("one-file-edit", &updated);
-        let fresh_summary_ids = fresh
-            .iter()
-            .map(|(_, summary_id, _)| *summary_id)
-            .collect::<BTreeSet<_>>();
-        let derived = after
-            .iter()
-            .filter(|(_, summary_id, _)| !fresh_summary_ids.contains(summary_id))
-            .map(|(crate_name, summary_id, rows)| (crate_name.clone(), *summary_id, *rows))
-            .collect::<Vec<_>>();
-        eprintln!("MEASURE Rust one-file edit derived crate summaries: {derived:?}");
-        assert_eq!(
-            derived.len(),
-            1,
-            "a body-only edit should derive its crate summary and no dependents"
-        );
     }
 }

@@ -69,7 +69,7 @@ workspace. It only reads them; it never writes to them.
 | `$NUGET_PACKAGES` and `~/.nuget/packages` | C# workspaces whose restore output names packages there |
 | Python standard library and site-packages directories | Only when `.bifrost/packs.json` configures a Python runtime environment |
 | Go module metadata through `go list` | A CLI policy run in a Go workspace; see [Subprocesses](#subprocesses) |
-| Semantic-pack bundles and policy roots named by `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` and `BIFROST_OPEN_POLICY_PACK_ROOT` | When those variables are set |
+| Semantic-pack bundles and policy roots named by `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` and `BIFROST_POLICY_PACK_ROOT` | When those variables are set |
 
 ## Subprocesses
 

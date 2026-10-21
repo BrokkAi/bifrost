@@ -6,12 +6,10 @@ use crate::analyzer::semantic::{LengthDelimitedDigest, SemanticValueKind};
 use crate::analyzer::usages::effects::EffectCoverage;
 use crate::query::{AssignmentRelationFilter, AssignmentRelationKind};
 use brokk_bifrost_analysis::analyzer::{
-    CAssignmentCandidate, CAssignmentSyntaxVerdict, OverwrittenLocalCandidate,
-    OverwrittenLocalSourceKind, PlainAssignmentCandidate, PlainAssignmentVerdict,
-    c_assignment_candidates, cpp_overwritten_local_candidates, go_overwritten_local_candidates,
-    java_overwritten_local_candidates, js_ts_overwritten_local_candidates,
-    plain_assignment_candidates, python_overwritten_local_candidates,
-    single_target_overwritten_local_candidates,
+    OverwrittenLocalCandidate, OverwrittenLocalSourceKind, PlainAssignmentCandidate,
+    PlainAssignmentVerdict, go_overwritten_local_candidates, java_overwritten_local_candidates,
+    js_ts_overwritten_local_candidates, plain_assignment_candidates,
+    python_overwritten_local_candidates, single_target_overwritten_local_candidates,
 };
 use brokk_bifrost_flow::flow_state::{
     BindingInitializationAnswer, FlowCertainty, FlowRelation, FlowStateAxis, FlowStateCompleteness,
@@ -1468,3 +1466,8 @@ fn row(
         },
     )))
 }
+
+use brokk_bifrost_cpp_analysis::analyzer::CAssignmentCandidate;
+use brokk_bifrost_cpp_analysis::analyzer::CAssignmentSyntaxVerdict;
+use brokk_bifrost_cpp_analysis::analyzer::c_assignment_candidates;
+use brokk_bifrost_cpp_analysis::analyzer::cpp_overwritten_local_candidates;

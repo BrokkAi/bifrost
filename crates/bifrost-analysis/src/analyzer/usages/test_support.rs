@@ -7,7 +7,8 @@ use crate::path_utils::rel_path_string;
 use crate::test_support::AnalyzerFixture;
 use tree_sitter::Tree;
 
-pub(crate) fn byte_range(source: &str, needle: &str) -> Range {
+#[doc(hidden)]
+pub fn byte_range(source: &str, needle: &str) -> Range {
     let start_byte = source.rfind(needle).expect("call expression exists");
     Range {
         start_byte,
@@ -17,7 +18,8 @@ pub(crate) fn byte_range(source: &str, needle: &str) -> Range {
     }
 }
 
-pub(crate) fn call_node_id(source: &str, facts: &FileFacts, call_text: &str) -> u32 {
+#[doc(hidden)]
+pub fn call_node_id(source: &str, facts: &FileFacts, call_text: &str) -> u32 {
     let start = source.rfind(call_text).expect("call text exists");
     let end = start + call_text.len();
     facts
@@ -33,7 +35,8 @@ pub(crate) fn call_node_id(source: &str, facts: &FileFacts, call_text: &str) -> 
         .expect("call node exists at the text span")
 }
 
-pub(crate) fn wide_deep_member_fixture(
+#[doc(hidden)]
+pub fn wide_deep_member_fixture(
     language: Language,
     file_name: &str,
     source: String,
@@ -78,7 +81,8 @@ pub(crate) fn wide_deep_member_fixture(
     (fixture, file, source, tree, site)
 }
 
-pub(crate) fn assert_scope_budget_exceeded<T: std::fmt::Debug>(
+#[doc(hidden)]
+pub fn assert_scope_budget_exceeded<T: std::fmt::Debug>(
     outcome: &BoundedResolution<T>,
     budget: ReceiverAnalysisBudget,
 ) {
@@ -94,7 +98,8 @@ pub(crate) fn assert_scope_budget_exceeded<T: std::fmt::Debug>(
     );
 }
 
-pub(crate) fn activate_semantic_pack(
+#[doc(hidden)]
+pub fn activate_semantic_pack(
     analyzer: &dyn IAnalyzer,
     source_id: &str,
     source: &[u8],

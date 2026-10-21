@@ -24,6 +24,10 @@ impl<K: Eq + Hash, V> ExactReadMemo<K, V> {
         self.entries.get(key)
     }
 
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
+
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.entries.insert(key, value)
     }

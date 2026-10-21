@@ -840,8 +840,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         for flow in active {
             let mut killed = self.plan.universe().empty_set();
             for kill in kills.iter().filter(|kill| kill.carrier == flow.carrier) {
-                for key in &kill.sources {
-                    let Some(source) = self.plan.source(*key) else {
+                for source_id in self.plan.value_flow().source_list(kill.sources) {
+                    let Some(source) = self.plan.source(*source_id) else {
                         continue;
                     };
                     killed.union_with(source.classes());
@@ -1219,7 +1219,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                     for flow in &mut active {
                         let mut killed = self.plan.universe().empty_set();
                         for kill in kills.iter().filter(|kill| kill.carrier == flow.carrier) {
-                            for source in &kill.sources {
+                            for source in self.plan.value_flow().source_list(kill.sources) {
                                 if let Some(source) = self.plan.source(*source) {
                                     killed.union_with(source.classes());
                                 }

@@ -390,6 +390,21 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
+    /// Complete comparison operator spans from this grammar node. Unknown by
+    /// default. This transient shape is only a negative candidate proof: it
+    /// does not publish singular roles or correlated operand pairs.
+    /// Each span must be both the exact name and text spelling used by an
+    /// un-normalized Operator role; otherwise the adapter must return None.
+    /// Call `step` before inspecting each child or growing the result and once
+    /// before returning a complete answer; a stopped callback must return None.
+    fn comparison_operator_spans(
+        &self,
+        _node: Node<'_>,
+        _step: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<Span>> {
+        None
+    }
+
     /// Whether this adapter records directly paired tuple/list assignment
     /// shapes for the supported syntax it recognizes.
     fn supports_assignment_shape(&self) -> bool {

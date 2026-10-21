@@ -51,8 +51,8 @@ run_semantic_pack_tool verify "${output_dir}"
 
 if [[ -n "${cache_root}" ]]; then
   catalog_version=$(sed -nE \
-    's/^pub\(super\) const CURRENT_CATALOG_VERSION: i64 = ([0-9]+);$/\1/p' \
-    crates/bifrost-analysis/src/analyzer/semantic_model/catalog/db.rs)
+    's/^pub\(in crate::analyzer::semantic_model::catalog\) const CURRENT_CATALOG_VERSION: i64 = ([0-9]+);$/\1/p' \
+    crates/bifrost-semantic/src/analyzer/semantic_model/catalog/db.rs)
   if [[ ! "${catalog_version}" =~ ^[0-9]+$ ]]; then
     echo "could not derive exactly one numeric semantic-pack catalog version" >&2
     exit 2

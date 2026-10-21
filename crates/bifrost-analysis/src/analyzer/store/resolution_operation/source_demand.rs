@@ -1,4 +1,5 @@
 //! Source ownership for selected root demands, independent of language policy.
+use super::demand_closure::Read;
 use super::*;
 use crate::analyzer::resolution::{BatchCandidateRequest, EndpointSignature};
 
@@ -6,12 +7,14 @@ const MAX_REVERSE_ROOT_CANDIDATE_KEYS_PER_BATCH: usize = 64;
 
 /// Source halves live where a demand originated, independently of the units
 /// that can export its answer. The vector dies with this discovery batch.
-pub(crate) enum RootSourceHorizon {
+#[doc(hidden)]
+pub enum RootSourceHorizon {
     Bounded(Vec<SelectedResolutionMountOrdinal>),
     Universal,
 }
 
-pub(super) fn root_source_horizon(
+#[doc(hidden)]
+pub fn root_source_horizon(
     ready: &ReadySelectedResolution<'_, '_>,
     endpoint: &EndpointSignature,
     cancellation: &CancellationToken,
@@ -80,10 +83,23 @@ pub(super) fn root_source_horizon(
 
 /// Proven by an admitted source half, never inferred from a spelling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct SourceDemandKey {
+#[doc(hidden)]
+pub struct SourceDemandKey {
     pub(crate) fragment: BindingFragmentId,
     pub(crate) token: SemanticId,
     pub(crate) demand: SemanticId,
+}
+
+impl SourceDemandKey {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(fragment: BindingFragmentId, demand: SemanticId, token: SemanticId) -> Self {
+        Self {
+            fragment,
+            demand,
+            token,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -91,6 +107,35 @@ pub(super) struct SelectedRootSource {
     pub(super) key: SourceDemandKey,
     pub(super) half: SelectedRootPathHalf,
     pub(super) completion: ResolutionCompletion,
+}
+
+/// Every compatible half for one proved source key, in candidate read order.
+/// Completion on each half stays with its source path's evaluator.
+#[doc(hidden)]
+pub struct SelectedRootSources {
+    pub(super) key: SourceDemandKey,
+    pub(super) halves: Vec<SelectedRootSource>,
+}
+
+#[doc(hidden)]
+pub fn root_source_set(
+    ready: &ReadySelectedResolution<'_, '_>,
+    base: &dyn BatchResolutionFragmentSource,
+    endpoint: &EndpointSignature,
+    mounts: Option<&[SelectedResolutionMountOrdinal]>,
+    session: &ResolutionSession,
+    cancellation: &CancellationToken,
+) -> Result<Read<Option<SelectedRootSources>>> {
+    Ok(root_source_sets_in_mounts(
+        ready,
+        base,
+        std::slice::from_ref(endpoint),
+        mounts,
+        session,
+        cancellation,
+    )?
+    .pop()
+    .expect("one endpoint produces one source-set result"))
 }
 
 pub(super) fn root_source_key(
@@ -154,7 +199,26 @@ pub(super) fn root_source_halves_in_mounts(
     session: &ResolutionSession,
     cancellation: &CancellationToken,
 ) -> Result<Vec<Option<SelectedRootSource>>> {
-    let mut results = std::iter::repeat_with(|| None)
+    Ok(
+        root_source_sets_in_mounts(ready, base, endpoints, mounts, session, cancellation)?
+            .into_iter()
+            .map(|result| match result {
+                Read::Ready { value, .. } => value.and_then(|mut source| source.halves.pop()),
+                Read::Unavailable { .. } | Read::Cancelled(_) => None,
+            })
+            .collect(),
+    )
+}
+
+fn root_source_sets_in_mounts(
+    ready: &ReadySelectedResolution<'_, '_>,
+    base: &dyn BatchResolutionFragmentSource,
+    endpoints: &[EndpointSignature],
+    mounts: Option<&[SelectedResolutionMountOrdinal]>,
+    session: &ResolutionSession,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Read<Option<SelectedRootSources>>>> {
+    let mut results = std::iter::repeat_with(|| Read::ready(None))
         .take(endpoints.len())
         .collect::<Vec<_>>();
     let mut eligible = Vec::new();
@@ -231,8 +295,7 @@ pub(super) fn root_source_halves_in_mounts(
             .map(|_| {
                 (
                     None::<SourceDemandKey>,
-                    None::<SelectedRootPathHalf>,
-                    None::<ResolutionCompletion>,
+                    Vec::<SelectedRootSource>::new(),
                     false,
                 )
             })
@@ -291,12 +354,14 @@ pub(super) fn root_source_halves_in_mounts(
                             return Ok(false);
                         };
                         if compatible.is_ok() {
-                            let (key, selected_half, completion, ambiguous) =
-                                &mut candidates[request];
+                            let (key, selected_halves, ambiguous) = &mut candidates[request];
                             *ambiguous |= key.is_some_and(|previous| previous != candidate);
                             *key = Some(candidate);
-                            *selected_half = Some(half);
-                            *completion = Some(path.completion().clone());
+                            selected_halves.push(SelectedRootSource {
+                                key: candidate,
+                                half,
+                                completion: path.completion().clone(),
+                            });
                         }
                     }
                 }
@@ -309,20 +374,24 @@ pub(super) fn root_source_halves_in_mounts(
             || cancellation.is_cancelled()
             || !session.observe_cancellation()
         {
+            let completion = outcome
+                .unconditional_completion()
+                .combine(&crate::analyzer::resolution::cancelled_completion());
+            for &(position, _) in eligible_batch {
+                results[position] = Read::Cancelled(completion.clone());
+            }
             return Ok(results);
         }
         for (local, &(position, _)) in eligible_batch.iter().enumerate() {
-            let (key, half, completion, ambiguous) = std::mem::take(&mut candidates[local]);
-            if !ambiguous {
-                results[position] =
-                    key.zip(half)
-                        .zip(completion)
-                        .map(|((key, half), completion)| SelectedRootSource {
-                            key,
-                            half,
-                            completion,
-                        });
-            }
+            let (key, halves, ambiguous) = std::mem::take(&mut candidates[local]);
+            results[position] = if ambiguous {
+                Read::Unavailable {
+                    reason: crate::analyzer::resolution::DemandRootUnavailableReason::MissingSourceProvenance,
+                    completion: ResolutionCompletion::Complete,
+                }
+            } else {
+                Read::ready(key.map(|key| SelectedRootSources { key, halves }))
+            };
         }
     }
     Ok(results)

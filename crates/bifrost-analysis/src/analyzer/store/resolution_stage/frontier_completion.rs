@@ -44,7 +44,7 @@ pub(in crate::analyzer::store) fn effective_gap_remains_sql() -> &'static str {
                 QUALIFIED_GAP_REMAINS_SQL
             )
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(
             14,
             sql.capacity(),
@@ -105,7 +105,7 @@ ORDER BY d.host,d.subject_key,d.subject_shared
                 effective_gap_remains = effective_gap_remains_sql()
             )
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(
             15,
             sql.capacity(),
@@ -206,7 +206,7 @@ fn decode_pair(key: Option<i64>, shared: Option<i64>) -> SemanticId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::store::resolution_selection::tests::SelectionFixture;
+    use crate::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
 
     #[test]
     fn raw_exclusion_keeps_closed_identity_while_effective_gaps_remove_it() {

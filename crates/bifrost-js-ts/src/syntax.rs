@@ -6689,3 +6689,39 @@ function read() {
         assert!(!bindings.is_bound_at("task", use_byte));
     }
 }
+
+#[derive(Default)]
+#[doc(hidden)]
+pub struct JsTsModuleMemberWriteMemo {
+    by_module: std::sync::Mutex<HashMap<String, std::sync::Arc<JsTsModuleMemberWrites>>>,
+}
+
+impl JsTsModuleMemberWriteMemo {
+    /// This file's writes to `module`'s members, collected on first use.
+    ///
+    /// One memo belongs to one file, so `root`, `source`, `lexical` and
+    /// `imports` must describe that file at every call; the module specifier is
+    /// the only thing that varies.
+    #[doc(hidden)]
+    pub fn writes(
+        &self,
+        root: tree_sitter::Node<'_>,
+        source: &str,
+        module: &str,
+        lexical: &JsTsLexicalBindingIndex,
+        imports: &JsTsImportBinder,
+    ) -> std::sync::Arc<JsTsModuleMemberWrites> {
+        let mut by_module = self
+            .by_module
+            .lock()
+            .expect("module member write memo mutex poisoned");
+        if let Some(writes) = by_module.get(module) {
+            return std::sync::Arc::clone(writes);
+        }
+        let writes = std::sync::Arc::new(JsTsModuleMemberWrites::collect_with(
+            root, source, module, lexical, imports,
+        ));
+        by_module.insert(module.to_owned(), std::sync::Arc::clone(&writes));
+        writes
+    }
+}

@@ -71,7 +71,7 @@ impl CallRelationProvider for JavaNativeCallRelations {
         let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
             return unavailable("native Java analyzer is unavailable", target);
         };
-        let selected = match java_selected_inverse_detailed_for(java, target, &cancellation) {
+        let selected = match java_selected_inverse_detailed_for(java, java, target, &cancellation) {
             JavaSelectedReverseOutcome::Ready(answer) => answer,
             JavaSelectedReverseOutcome::Unavailable(reason) => {
                 return unavailable(

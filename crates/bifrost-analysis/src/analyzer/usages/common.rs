@@ -2,19 +2,34 @@
 // reclassification need nothing but a node, a string, or the hit set, so they
 // moved to `brokk-bifrost-core` and are re-exported here at the paths their
 // callers already use. What stays needs an `IAnalyzer` or a `Language`.
-pub(super) use brokk_bifrost_core::analyzer::usages::common::same_node;
-pub(crate) use brokk_bifrost_core::analyzer::usages::common::{
-    classify_recursive_hit, external_usage_hit_count, namespace_prefixes,
-};
+pub(crate) use brokk_bifrost_core::analyzer::usages::common::classify_recursive_hit;
+
+pub(crate) use brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count;
+
+pub(crate) use brokk_bifrost_core::analyzer::usages::common::namespace_prefixes;
 
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
+
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{
-    CodeUnit, CodeUnitIndex, IAnalyzer, Language, ProjectFile, Range, SignatureMetadata,
-};
+
+use crate::analyzer::CodeUnit;
+
+use crate::analyzer::CodeUnitIndex;
+
+use crate::analyzer::IAnalyzer;
+
+use crate::analyzer::Language;
+
+use crate::analyzer::ProjectFile;
+
+use crate::analyzer::Range;
+
+use crate::analyzer::SignatureMetadata;
+
 use std::collections::BTreeSet;
 
-pub(crate) fn build_reference_site(
+#[doc(hidden)]
+pub fn build_reference_site(
     path: String,
     text: String,
     range: Range,
@@ -33,7 +48,8 @@ pub(crate) fn build_reference_site(
 // Graph strategy selection uses source language, not declaration naming.
 // An unclaimed extension may be eligible for C++ include inference without
 // supplying a C++ graph surface.
-pub(crate) fn language_for_target(target: &CodeUnit) -> Language {
+#[doc(hidden)]
+pub fn language_for_target(target: &CodeUnit) -> Language {
     language_for_file(target.source())
 }
 
@@ -57,7 +73,8 @@ pub(crate) fn is_constructor_metadata(metadata: &[SignatureMetadata]) -> bool {
 ///
 /// Both the declaration name ranges and the file read behind them are computed
 /// only when some hit is a candidate, so the ordinary query pays nothing.
-pub(crate) fn classify_recursive_hits(
+#[doc(hidden)]
+pub fn classify_recursive_hits(
     analyzer: &dyn IAnalyzer,
     hits: BTreeSet<UsageHit>,
     target: &CodeUnit,
@@ -94,7 +111,8 @@ fn target_declaration_name_ranges(
 
 pub(super) use crate::analyzer::common::language_for_file;
 
-pub(crate) fn analyzed_files_for_language(
+#[doc(hidden)]
+pub fn analyzed_files_for_language(
     analyzer: &dyn CodeUnitIndex,
     language: Language,
 ) -> Vec<ProjectFile> {
@@ -126,7 +144,8 @@ pub(crate) fn select_usage_graph_files(
         .collect()
 }
 
-pub(crate) fn with_relational_frontier<R>(
+#[doc(hidden)]
+pub fn with_relational_frontier<R>(
     analyzer: &dyn IAnalyzer,
     language: &str,
     mut visit: impl FnMut(&dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier) -> R,
@@ -147,6 +166,4 @@ pub(crate) fn with_relational_frontier<R>(
     }
 }
 
-pub(crate) use brokk_bifrost_core::analyzer::usages::common::{
-    enclosing_class_chain, enclosing_owner_chain,
-};
+pub(crate) use brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain;

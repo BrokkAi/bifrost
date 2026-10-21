@@ -330,6 +330,27 @@ impl From<Vec<ResolutionIncompleteReason>> for CompletionReasons {
 }
 
 impl CompletionReasons {
+    /// Canonicalize an entire reason bucket once, preserving the union order.
+    pub(crate) fn from_reasons(reasons: impl IntoIterator<Item = Reason>) -> Self {
+        Self::from_iter_with_poll(reasons, &mut || false)
+            .expect("the non-cancellable completion union cannot be cancelled")
+    }
+
+    fn from_iter_with_poll<P>(
+        reasons: impl IntoIterator<Item = Reason>,
+        cancelled: &mut P,
+    ) -> Option<Self>
+    where
+        P: FnMut() -> bool + ?Sized,
+    {
+        let reasons = canonical_reasons_with_seed_and_poll(BTreeSet::new(), reasons, cancelled)?;
+        assert!(
+            !reasons.is_empty(),
+            "incomplete resolution requires a reason"
+        );
+        Some(Self::from_validated_canonical_box(reasons))
+    }
+
     pub(crate) fn canonical(reasons: Vec<Reason>) -> Self {
         assert!(
             !reasons.is_empty(),
@@ -983,12 +1004,7 @@ where
     J: IntoIterator<Item = Reason>,
     P: FnMut() -> bool + ?Sized,
 {
-    let reasons = canonical_additions_union_with_poll(left, right, cancelled)?;
-    assert!(
-        !reasons.is_empty(),
-        "incomplete resolution requires a reason"
-    );
-    Some(CompletionReasons::canonical(reasons.into_vec()))
+    CompletionReasons::from_iter_with_poll(left.into_iter().chain(right), cancelled)
 }
 
 fn factored_union_raw_with_poll<P>(

@@ -13,9 +13,9 @@
 use std::collections::HashSet;
 
 use crate::definition::{
-    PolicySelector, RelationalAssertionPlan, RowAggregate, RowAggregateOp, RowBinding,
-    RowBindingSource, RowFieldRef, RowJoin, RowJoinKind, RowPredicate, RowPredicateOp,
-    RowPredicateOperand,
+    DeclarationSelectionReference, PolicySelector, RelationalAssertionPlan, RowAggregate,
+    RowAggregateOp, RowBinding, RowBindingSource, RowFieldRef, RowJoin, RowJoinKind, RowPredicate,
+    RowPredicateOp, RowPredicateOperand,
 };
 
 use super::ir::{
@@ -51,7 +51,13 @@ fn lower_bindings(
         }
         let id = IrRelationId(relations.len());
         let (op, schema, domain) = match &binding.source {
-            RowBindingSource::Query(PolicySelector::Inline { query, .. }) => {
+            RowBindingSource::Query(
+                PolicySelector::Inline { query, .. }
+                | PolicySelector::DeclarationSelection(DeclarationSelectionReference {
+                    shape: query,
+                    ..
+                }),
+            ) => {
                 let (kind, fields) = query.validate_row_fields().map_err(|error| {
                     RelationalAssertionPlanError::InvalidQuery {
                         binding: name.clone(),

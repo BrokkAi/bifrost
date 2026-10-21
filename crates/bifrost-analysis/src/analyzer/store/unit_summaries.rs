@@ -26,7 +26,8 @@ use crate::CancellationToken;
 use brokk_bifrost_core::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 
 /// One file of a unit: the unit's own input.
-pub(crate) struct UnitMember {
+#[doc(hidden)]
+pub struct UnitMember {
     pub blob_id: i64,
     pub blob_oid: String,
     pub rel_path: String,
@@ -34,7 +35,8 @@ pub(crate) struct UnitMember {
 }
 
 /// A recorded input that is neither a member nor a child summary.
-pub(crate) struct UnitRead {
+#[doc(hidden)]
+pub struct UnitRead {
     pub kind: &'static str,
     pub key_digest: [u8; 32],
     pub digest: [u8; 32],
@@ -43,7 +45,8 @@ pub(crate) struct UnitRead {
 /// A unit this one consumes. A workspace dependency that is itself a unit names
 /// its `unit_id` so the driver can look up the child's live summary; an external
 /// or standard-library dependency names the digest of the provenance it saw.
-pub(crate) struct UnitDependency {
+#[doc(hidden)]
+pub struct UnitDependency {
     pub unit_key: [u8; 32],
     pub unit_id: Option<i64>,
     pub label: String,
@@ -52,13 +55,87 @@ pub(crate) struct UnitDependency {
     pub external_digest: Option<[u8; 32]>,
 }
 
-pub(crate) struct UnitInputs {
+#[doc(hidden)]
+pub struct UnitInputs {
     pub unit_id: i64,
     pub unit_key: [u8; 32],
     pub label: String,
     pub members: Vec<UnitMember>,
     pub reads: Vec<UnitRead>,
     pub dependencies: Vec<UnitDependency>,
+    pub dependency_names: Vec<UnitDependencyName>,
+    pub containers: Vec<UnitContainer>,
+    pub placements: Vec<UnitPlacement>,
+}
+
+/// Language spelling is independent of consumption: several names can bind one unit.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct UnitDependencyName {
+    pub role: String,
+    pub name: String,
+    pub unit_key: Option<[u8; 32]>,
+}
+
+#[doc(hidden)]
+pub struct UnitContainer {
+    pub path: String,
+    pub parent_path: Option<String>,
+}
+
+#[doc(hidden)]
+pub struct UnitPlacement {
+    pub container_path: String,
+    pub member_ordinal: usize,
+    pub scope_ordinal: Option<i64>,
+}
+
+pub(crate) fn member_ordinals(
+    members: &[UnitMember],
+) -> std::collections::HashMap<(i64, &str, &str), usize> {
+    members
+        .iter()
+        .enumerate()
+        .map(|(ordinal, member)| {
+            (
+                (
+                    member.blob_id,
+                    member.rel_path.as_str(),
+                    member.source_role.as_str(),
+                ),
+                ordinal,
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn dependency_ordinals(
+    dependencies: &[ConsumedDependency],
+) -> std::collections::HashMap<[u8; 32], usize> {
+    dependencies
+        .iter()
+        .map(|dependency| (dependency.unit_key, dependency.ordinal))
+        .collect()
+}
+
+/// A name-only consumer requires its selected dependency roles to agree on
+/// the target of each name. The complete role/name rows remain independent.
+pub(crate) fn dependency_keys_by_name(
+    unit: &UnitInputs,
+) -> std::collections::HashMap<String, [u8; 32]> {
+    let mut keys = std::collections::HashMap::new();
+    for binding in &unit.dependency_names {
+        if let Some(key) = binding.unit_key
+            && let Some(previous) = keys.insert(binding.name.clone(), key)
+        {
+            assert_eq!(
+                previous, key,
+                "{}: conflicting role/name bindings: {:?}",
+                unit.label, unit.dependency_names
+            );
+        }
+    }
+    keys
 }
 
 /// One dependency as the derivation consumed it. `available` is false for a
@@ -66,7 +143,8 @@ pub(crate) struct UnitInputs {
 /// a marker that differs from every real output digest, so a dependent derived
 /// without it is derived again when the dependency appears.
 #[derive(Debug)]
-pub(crate) struct ConsumedDependency {
+#[doc(hidden)]
+pub struct ConsumedDependency {
     pub ordinal: usize,
     pub unit_key: [u8; 32],
     pub label: String,
@@ -75,7 +153,8 @@ pub(crate) struct ConsumedDependency {
     pub available: bool,
 }
 
-pub(crate) struct UnitExport {
+#[doc(hidden)]
+pub struct UnitExport {
     pub identity_id: i64,
     pub identity_digest: [u8; 32],
     pub namespace: String,
@@ -90,7 +169,8 @@ pub(crate) struct UnitExport {
     pub declaration_key: i64,
 }
 
-pub(crate) struct UnitImport {
+#[doc(hidden)]
+pub struct UnitImport {
     pub blob_id: i64,
     /// The blob's `source_imports.import_id`.
     pub import_id: i64,
@@ -103,25 +183,29 @@ pub(crate) struct UnitImport {
     pub state: &'static str,
 }
 
-pub(crate) struct UnitGap {
+#[doc(hidden)]
+pub struct UnitGap {
     pub kind: &'static str,
     pub subject: String,
     /// A JSON document, stored as JSONB.
     pub detail: String,
 }
 
-pub(crate) struct UnitOutputs {
+#[doc(hidden)]
+pub struct UnitOutputs {
     pub exports: Vec<UnitExport>,
     pub imports: Vec<UnitImport>,
     pub gaps: Vec<UnitGap>,
     pub complete: bool,
-    /// Published semantic output supplement, not input or provenance; `None` keeps the encoding.
+    /// Language output read by dependents, including any dependency-visible
+    /// provenance relations; `None` keeps the encoding.
     pub public_surface_digest: Option<[u8; 32]>,
 }
 
 /// What a language supplies. Every method runs on the store's writer
 /// connection, inside one reconcile.
-pub(crate) trait UnitSummaryLanguage {
+#[doc(hidden)]
+pub trait UnitSummaryLanguage {
     fn lang(&self) -> &'static str;
     fn unit_kind(&self) -> &'static str;
     fn derivation_version(&self) -> i64;
@@ -217,7 +301,8 @@ pub(crate) trait UnitSummaryLanguage {
 
 /// What one reconcile pass did, for profiling and for the caller to report.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct UnitSummaryReconciliation {
+#[doc(hidden)]
+pub struct UnitSummaryReconciliation {
     pub units: usize,
     /// Units whose live version row already pointed at the digest's summary.
     pub unchanged: usize,
@@ -260,11 +345,14 @@ pub(crate) struct UnitSummaryReconciliation {
 /// the writer and every reader use that one statement.
 macro_rules! live_summary_select {
     ($profile:literal) => {
+        $crate::analyzer::store::unit_summaries::live_summary_select!($profile, "?4")
+    };
+    ($profile:literal, $unit:literal) => {
         concat!("SELECT versions.summary_id, summaries.output_digest
      FROM resolution_unit_summary_versions AS versions
      JOIN resolution_unit_summaries AS summaries ON summaries.summary_id = versions.summary_id
      WHERE versions.workspace_id = ?1 AND versions.lang = ?2 AND versions.generation = ?3
-       AND versions.unit_key = ?4 AND versions.profile_digest = ", $profile, "
+       AND versions.unit_key = ", $unit, " AND versions.profile_digest = ", $profile, "
        AND versions.valid_from <= ?5 AND (versions.valid_until IS NULL OR ?5 < versions.valid_until)
        AND summaries.publication_state = 'complete'
        AND summaries.producer_epoch = ?6 AND summaries.derivation_version = ?7")
@@ -336,7 +424,8 @@ pub(super) const DELETE_WORKSPACE_VERSIONS_SQL: &str =
     "DELETE FROM resolution_unit_summary_versions WHERE workspace_id = ?1";
 
 /// Withdraw every version row of one language (analysis epoch rotation).
-pub(super) const DELETE_LANGUAGE_VERSIONS_SQL: &str =
+#[doc(hidden)]
+pub const DELETE_LANGUAGE_VERSIONS_SQL: &str =
     "DELETE FROM resolution_unit_summary_versions WHERE lang = ?1";
 
 /// Withdraw the version rows of generations the language epoch has left behind
@@ -496,7 +585,8 @@ impl AnalyzerStore {
     /// read on the writer connection, so a child published a moment ago is
     /// visible to its dependents. Each unit is its own transaction, so another
     /// process's writer is never held off for more than one unit.
-    pub(crate) fn reconcile_unit_summaries(
+    #[doc(hidden)]
+    pub fn reconcile_unit_summaries(
         &self,
         snapshot: &WorkspaceSnapshotId,
         language: impl UnitSummaryLanguage + Send + 'static,
@@ -785,7 +875,7 @@ fn publish_unit(
         republished: false,
         output_moved: false,
     };
-    let unit = match language.inputs(conn, snapshot, unit_id) {
+    let mut unit = match language.inputs(conn, snapshot, unit_id) {
         Ok(unit) => unit,
         Err(error) => {
             report.failed.push((
@@ -795,6 +885,29 @@ fn publish_unit(
             return Ok(nothing);
         }
     };
+    unit.containers
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    unit.containers.dedup_by(|right, left| {
+        if left.path != right.path {
+            return false;
+        }
+        assert_eq!(
+            left.parent_path, right.parent_path,
+            "a container has one parent"
+        );
+        true
+    });
+    unit.placements.sort_by(|left, right| {
+        (&left.container_path, left.member_ordinal)
+            .cmp(&(&right.container_path, right.member_ordinal))
+    });
+    unit.dependency_names
+        .sort_by(|left, right| (&left.role, &left.name).cmp(&(&right.role, &right.name)));
+    // Keep the first language-supplied provenance for a consumed unit. Names
+    // remain separate rows even when their consumed unit is the same.
+    let mut dependency_keys = std::collections::HashSet::new();
+    unit.dependencies
+        .retain(|dependency| dependency_keys.insert(dependency.unit_key));
     let dependencies = consume_dependencies(conn, snapshot, language, producer_epoch, &unit)?;
     conn.prepare_cached(FORGET_UNAVAILABLE_SQL)?
         .execute([unit_id])?;
@@ -840,7 +953,7 @@ fn publish_unit(
                     report.cancelled = true;
                     return Ok(nothing);
                 }
-                let output_digest = output_digest(&dependencies, &outputs);
+                let output_digest = output_digest(&unit, &dependencies, &outputs);
                 let summary_id = write_summary(
                     &tx,
                     language,
@@ -1196,6 +1309,7 @@ fn summary_digest(
         hash.field("dependency-digest", &dependency.consumed_output_digest);
         hash.field("dependency-boundary", dependency.boundary.as_bytes());
     }
+    hash_summary_relations(unit, &mut hash);
     hash.finish()
 }
 
@@ -1204,11 +1318,17 @@ fn summary_digest(
 /// `conflicting_names` gaps (two declarations of one name). It leaves out
 /// declaration blob ids, sites and keys, and dependency ordinals, which name
 /// where a declaration lives or a dependency sits rather than what the unit exports.
-/// It leaves out imports, which are not visible to dependents. So an edit that
+/// It leaves out authored imports unless a language publishes their edges to
+/// dependent readers through its output supplement (Rust route provenance).
+/// Every relation a dependent reads belongs in that language output. An edit that
 /// keeps the surface keeps this digest and stops at the unit's dependents.
 /// Readers never copy coordinates out of a summary, so an equal digest cannot
 /// leave a stale coordinate behind.
-fn output_digest(dependencies: &[ConsumedDependency], outputs: &UnitOutputs) -> [u8; 32] {
+fn output_digest(
+    unit: &UnitInputs,
+    dependencies: &[ConsumedDependency],
+    outputs: &UnitOutputs,
+) -> [u8; 32] {
     let mut hash = CanonicalHasher::new(b"bifrost-unit-summary-output:v4");
     hash.field("complete", &[u8::from(outputs.complete)]);
     let mut exports: Vec<_> = outputs
@@ -1277,7 +1397,37 @@ fn output_digest(dependencies: &[ConsumedDependency], outputs: &UnitOutputs) -> 
     if let Some(digest) = outputs.public_surface_digest {
         hash.field("language-public-surface:v1", &digest);
     }
+    hash_summary_relations(unit, &mut hash);
     hash.finish()
+}
+
+fn hash_summary_relations(unit: &UnitInputs, hash: &mut CanonicalHasher) {
+    // These are semantic outputs consumed by placement and dependency-name
+    // readers. Hash keys and scopes, never store-local summary or blob ids.
+    for container in &unit.containers {
+        hash.field("container", container.path.as_bytes());
+        hash.field(
+            "parent-container",
+            container.parent_path.as_deref().unwrap_or("").as_bytes(),
+        );
+    }
+    for placement in &unit.placements {
+        hash.field("placement-container", placement.container_path.as_bytes());
+        hash.field(
+            "placement-member",
+            &(placement.member_ordinal as u64).to_be_bytes(),
+        );
+        if let Some(scope) = placement.scope_ordinal {
+            hash.field("placement-scope", &scope.to_be_bytes());
+        }
+    }
+    for binding in &unit.dependency_names {
+        hash.field("dependency-role", binding.role.as_bytes());
+        hash.field("dependency-name", binding.name.as_bytes());
+        if let Some(key) = binding.unit_key {
+            hash.field("named-dependency", &key);
+        }
+    }
 }
 
 /// Write one summary's header and children and seal it. `replace` is the header
@@ -1303,6 +1453,14 @@ fn write_summary(
                 "UPDATE resolution_unit_summaries SET publication_state = 'building',
                         output_digest = NULL, member_count = 0, export_count = 0, import_count = 0
                  WHERE summary_id = ?1",
+                [summary_id],
+            )?;
+            tx.execute(
+                "DELETE FROM resolution_unit_summary_dependency_names WHERE summary_id=?1",
+                [summary_id],
+            )?;
+            tx.execute(
+                "DELETE FROM resolution_unit_summary_containers WHERE summary_id=?1",
                 [summary_id],
             )?;
             for table in [
@@ -1440,6 +1598,17 @@ fn write_summary(
         for gap in &outputs.gaps {
             insert.execute(params![summary_id, gap.kind, gap.subject, gap.detail])?;
         }
+    }
+    for container in &unit.containers {
+        *rows_written += tx.execute("INSERT INTO resolution_unit_summary_containers(summary_id, container_path, parent_container_path) VALUES(?1, ?2, ?3)", params![summary_id, container.path, container.parent_path])?;
+    }
+    for placement in &unit.placements {
+        *rows_written += tx.execute("INSERT INTO resolution_unit_summary_placements(summary_id, container_path, member_ordinal, scope_ordinal) VALUES(?1, ?2, ?3, ?4)", params![summary_id, placement.container_path, placement.member_ordinal, placement.scope_ordinal])?;
+    }
+    let ordinals = dependency_ordinals(dependencies);
+    for binding in &unit.dependency_names {
+        let ordinal = binding.unit_key.map(|key| ordinals[&key]);
+        *rows_written += tx.execute("INSERT INTO resolution_unit_summary_dependency_names(summary_id, role, name, dependency_ordinal) VALUES(?1, ?2, ?3, ?4)", params![summary_id, binding.role, binding.name, ordinal])?;
     }
     *rows_written += language.write_language_rows(tx, snapshot, unit, dependencies, summary_id)?;
     let counts = |table: &str| -> Result<usize> {

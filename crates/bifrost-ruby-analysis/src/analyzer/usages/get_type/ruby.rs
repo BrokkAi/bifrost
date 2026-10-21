@@ -1,0 +1,88 @@
+use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::candidates_outcome_with_target_kind;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::no_type;
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+use crate::analyzer::usages::get_definition::ruby::RubyBoundedPreflight;
+
+use crate::analyzer::usages::get_definition::ruby::RubyDefinitionProvider;
+
+use crate::analyzer::usages::get_definition::ruby::ruby_bounded_preflight;
+
+use crate::analyzer::usages::get_definition::ruby::ruby_type_lookup_resolution_bounded;
+
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+
+use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+
+use brokk_bifrost_core::analyzer::definition_lookup::BoundedDefinitionLookup;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::cancellation::CancellationToken;
+use tree_sitter::Tree;
+
+pub(crate) fn resolve_ruby_type_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let (ruby, tree) = match ruby_bounded_preflight(analyzer, tree, &session) {
+        RubyBoundedPreflight::Ready { ruby, tree } => (ruby, tree),
+        RubyBoundedPreflight::AnalyzerUnavailable => {
+            return session.finish(no_type(
+                "ruby_analyzer_unavailable",
+                "Ruby analyzer is unavailable",
+            ));
+        }
+        RubyBoundedPreflight::ParseFailed => {
+            return session.finish(no_type(
+                "ruby_parse_failed",
+                "Ruby source could not be parsed",
+            ));
+        }
+        RubyBoundedPreflight::SourceFactsUnavailable => {
+            return session.finish(no_type(
+                "ruby_source_facts_unavailable",
+                "Canonical Ruby source facts are unavailable",
+            ));
+        }
+    };
+    let support = RubyDefinitionProvider::new(ruby, &session);
+    let Some(resolution) =
+        ruby_type_lookup_resolution_bounded(&support, file, source, tree.root_node(), site)
+    else {
+        return session.finish(no_type(
+            "ruby_dynamic_receiver_unsupported",
+            format!(
+                "`{}` has no structurally proven Ruby type; dynamic dispatch, metaprogramming, inheritance, mixins, refinements, and method_missing remain open",
+                site.text
+            ),
+        ));
+    };
+    let candidates = support.fqn(&resolution.fqn);
+    if candidates.is_empty() {
+        return session.finish(no_type(
+            "ruby_no_indexed_type_definition",
+            format!(
+                "`{}` resolved as a Ruby type but has no exact indexed definition",
+                resolution.fqn
+            ),
+        ));
+    }
+    let outcome =
+        candidates_outcome_with_target_kind(resolution.fqn, candidates, resolution.target_kind);
+    session.finish(outcome)
+}

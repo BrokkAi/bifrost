@@ -483,31 +483,54 @@ pub fn annotation_class_qualifier_site<'tree>(
     node: Node<'tree>,
     target: &CodeUnit,
 ) -> Option<Node<'tree>> {
-    if node.kind() != "attribute"
-        || !target.is_class()
-        || !is_annotation_reference_node(node, source)
-    {
+    if !target.is_class() {
         return None;
     }
+    annotation_class_qualifier_sites(graph, python, file, source, node)
+        .find_map(|(site, owner)| (&owner == target).then_some(site))
+}
 
-    let (root, attributes) = attribute_chain(node)?;
-    let mut owner =
-        unique_bare_annotation_class(graph, python, file, source, root, node_text(root, source))?;
-    if &owner == target {
-        return Some(root);
-    }
-
-    // The final attribute is the annotation declaration itself. Only the
-    // preceding segments are class qualifiers.
-    let qualifier_count = attributes.len().saturating_sub(1);
-    for attribute in attributes.into_iter().take(qualifier_count) {
-        owner = unique_nested_annotation_class(graph, &owner, node_text(attribute, source))?;
-        if &owner == target {
-            return Some(attribute);
+/// Class qualifiers in lexical order. The lazy walk preserves the singleton
+/// lookup's early stop, while a batched scan resolves the shared path once.
+pub fn annotation_class_qualifier_sites<'a, 'tree: 'a>(
+    graph: &'a PythonGraphSource<'_>,
+    python: &'a dyn PythonUsageSource,
+    file: &'a ProjectFile,
+    source: &'a str,
+    node: Node<'tree>,
+) -> impl Iterator<Item = (Node<'tree>, CodeUnit)> + 'a {
+    let resolved = (|| {
+        if node.kind() != "attribute" || !is_annotation_reference_node(node, source) {
+            return None;
         }
-    }
-
-    None
+        let (root, attributes) = attribute_chain(node)?;
+        let owner = unique_bare_annotation_class(
+            graph,
+            python,
+            file,
+            source,
+            root,
+            node_text(root, source),
+        )?;
+        Some((root, owner, attributes))
+    })();
+    let (mut first, mut owner, attributes) = match resolved {
+        Some((root, owner, attributes)) => (Some((root, owner.clone())), Some(owner), attributes),
+        None => (None, None, Vec::new()),
+    };
+    // The terminal attribute is the annotated declaration, not a qualifier.
+    let count = attributes.len().saturating_sub(1);
+    let mut attributes = attributes.into_iter().take(count);
+    std::iter::from_fn(move || {
+        if let Some(first) = first.take() {
+            return Some(first);
+        }
+        let previous = owner.take()?;
+        let attribute = attributes.next()?;
+        let next = unique_nested_annotation_class(graph, &previous, node_text(attribute, source))?;
+        owner = Some(next.clone());
+        Some((attribute, next))
+    })
 }
 
 fn resolve_annotation_attribute_types(

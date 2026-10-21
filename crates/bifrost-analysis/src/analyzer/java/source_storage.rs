@@ -32,8 +32,19 @@ fn required<T>(value: Option<T>, label: &str) -> Result<T> {
     crate::analyzer::store::required_source_value(value, "Java source syntax", label)
 }
 
-impl AnalyzerStore {
-    pub(crate) fn java_source_facts<A: LanguageAdapter>(
+pub(crate) trait JavaSourceStorage {
+    fn java_source_facts<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        generation: GenerationId,
+        adapter: &A,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Option<JavaFileSourceFacts>>;
+}
+
+impl JavaSourceStorage for AnalyzerStore {
+    fn java_source_facts<A: LanguageAdapter>(
         &self,
         oid: Oid,
         generation: GenerationId,

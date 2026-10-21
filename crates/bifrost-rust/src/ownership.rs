@@ -11,8 +11,13 @@
 //! fixed-point pass goes through the caller's charge callback.
 
 use crate::declarations::rust_node_text;
-use crate::graph_support::{rust_path_is_leading_absolute, rust_path_segments};
-use crate::imports::{RustImportBindingName, rust_imports_with_visibility_from_use_declaration};
+use crate::graph_support::{
+    rust_path_is_leading_absolute, rust_path_is_leading_absolute_bounded, rust_path_segments,
+    rust_path_segments_bounded,
+};
+use crate::imports::RustImportBindingName;
+use crate::lexical_scope::{RustTypeHead, rust_type_head_at_bounded};
+use crate::prelude::rust_std_type_fact;
 use crate::syntax::unwrap_attributes;
 use brokk_bifrost_core::analyzer::tree_walk::{
     has_child_of_kind as has_anonymous_child, named_children_vec as named_children,
@@ -160,6 +165,13 @@ enum EvalState {
     Incomplete(RustOwnershipIncomplete),
 }
 
+enum TypeEvaluation<'tree> {
+    Leaf(EvalState),
+    Alias(Node<'tree>),
+    Option(Node<'tree>),
+    Aggregate(Vec<Node<'tree>>),
+}
+
 #[derive(Clone, Debug)]
 struct PendingImpl<'tree> {
     module_path: Vec<String>,
@@ -174,6 +186,7 @@ struct PendingImpl<'tree> {
 #[derive(Debug)]
 pub struct RustOwnershipIndex<'tree, 'source> {
     source: &'source str,
+    root: Node<'tree>,
     declarations: Vec<NominalDeclaration<'tree>>,
     by_path: HashMap<Vec<String>, Vec<usize>>,
     imports: Vec<ImportBinding>,
@@ -220,7 +233,8 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                     &frame.module_path,
                     &mut imports,
                     &mut shadowed_names,
-                );
+                    &mut charge,
+                )?;
             }
 
             if !macro_context {
@@ -290,6 +304,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
 
         let mut index = Self {
             source,
+            root,
             declarations,
             by_path,
             imports,
@@ -369,16 +384,10 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType);
         }
         if type_node.kind() == "reference_type" {
-            if reference_referent(type_node)
-                .is_some_and(|referent| referent.kind() == "pointer_type")
-            {
-                return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::RawPointer);
-            }
-            return if reference_is_mutable(type_node) {
-                RustOwnershipClass::MutableReference
-            } else {
-                RustOwnershipClass::SharedReference
-            };
+            return classify_reference_type_bounded(type_node, &mut |_| {
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .expect("infallible legacy reference classification");
         }
         let state = self.classify_type_state(type_node);
         if type_node.kind() == "primitive_type" {
@@ -392,6 +401,323 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             };
         }
         state.into_public()
+    }
+
+    /// Prove the ordered, owned tuple layout of this exact source type.
+    /// #5911: aliases are evaluated in their declaration's scope, never in
+    /// the destructuring caller's scope. Callback failure publishes no layout.
+    pub fn tuple_component_types_bounded<F, E>(
+        &self,
+        type_node: Node<'tree>,
+        mut charge: F,
+    ) -> Result<Result<Vec<Node<'tree>>, RustOwnershipIncomplete>, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        let node = match self.normalized_type_bounded(type_node, &mut charge)? {
+            Ok(node) => node,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if node.kind() != "tuple_type" {
+            return Ok(Err(RustOwnershipIncomplete::UnsupportedType));
+        }
+        let mut components = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            charge(1)?;
+            if matches!(child.kind(), "line_comment" | "block_comment") {
+                continue;
+            }
+            if !is_type_node(child) {
+                return Ok(Err(RustOwnershipIncomplete::UnsupportedType));
+            }
+            components.push(child);
+        }
+        charge(0)?;
+        Ok(Ok(components))
+    }
+
+    fn normalized_type_bounded<F, E>(
+        &self,
+        mut node: Node<'tree>,
+        charge: &mut F,
+    ) -> Result<Result<Node<'tree>, RustOwnershipIncomplete>, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        charge(0)?;
+        let mut ancestor = Some(node);
+        loop {
+            charge(1)?;
+            let Some(current) = ancestor else {
+                return Ok(Err(RustOwnershipIncomplete::UnresolvedPath));
+            };
+            if current.id() == self.root.id() {
+                break;
+            }
+            ancestor = current.parent();
+        }
+        let mut visited = HashSet::new();
+        loop {
+            charge(1)?;
+            if !visited.insert(node.id()) {
+                return Ok(Err(RustOwnershipIncomplete::CyclicNominal));
+            }
+            if node.has_error()
+                || has_macro_ancestor_bounded(node, charge)?
+                || has_unsafe_ancestor_bounded(node, charge)?
+            {
+                return Ok(Err(RustOwnershipIncomplete::UnsupportedType));
+            }
+            if let Some(inner) = crate::type_syntax::rust_parenthesized_type_inner(node) {
+                node = inner;
+                continue;
+            }
+            if matches!(
+                node.kind(),
+                "primitive_type" | "type_identifier" | "scoped_type_identifier" | "generic_type"
+            ) {
+                match self.type_expansion_bounded(node, charge)? {
+                    Some(TypeEvaluation::Alias(target)) => {
+                        node = target;
+                        continue;
+                    }
+                    Some(TypeEvaluation::Leaf(EvalState::Incomplete(reason))) => {
+                        return Ok(Err(reason));
+                    }
+                    _ => {}
+                }
+            }
+            charge(0)?;
+            return Ok(Ok(node));
+        }
+    }
+
+    /// Ownership for tuple components, including transparent nongeneric
+    /// aliases and the independently proven conditional Copy of std Option.
+    /// New proof work uses the caller's existing work/cancellation callback.
+    pub fn classify_type_bounded<F, E>(
+        &self,
+        type_node: Node<'tree>,
+        mut charge: F,
+    ) -> Result<RustOwnershipClass, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        let type_node = match self.normalized_type_bounded(type_node, &mut charge)? {
+            Ok(node) => node,
+            Err(reason) => return Ok(RustOwnershipClass::Incomplete(reason)),
+        };
+        // References retain their alias/reborrow class; a tuple referent is
+        // not permission to copy or move the owned tuple behind the borrow.
+        if type_node.kind() == "reference_type" {
+            // Normalization already checked the alias RHS ancestry with this
+            // callback. Classify the reference without re-entering legacy walks.
+            return classify_reference_type_bounded(type_node, &mut charge);
+        }
+        let state =
+            self.evaluate_type_state_bounded(type_node, &mut charge, &mut |node, charge| {
+                self.type_expansion_bounded(node, charge)
+            })?;
+        charge(0)?;
+        Ok(
+            if type_node.kind() == "primitive_type" && state == EvalState::Copy {
+                RustOwnershipClass::ScalarCopy
+            } else {
+                state.into_public()
+            },
+        )
+    }
+
+    fn type_expansion_bounded<F, E>(
+        &self,
+        node: Node<'tree>,
+        charge: &mut F,
+    ) -> Result<Option<TypeEvaluation<'tree>>, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        if node.kind() == "tuple_type" {
+            let mut children = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                charge(1)?;
+                if matches!(child.kind(), "line_comment" | "block_comment") {
+                    continue;
+                }
+                if !is_type_node(child) {
+                    return Ok(Some(TypeEvaluation::Leaf(EvalState::Incomplete(
+                        RustOwnershipIncomplete::UnsupportedType,
+                    ))));
+                }
+                children.push(child);
+            }
+            return Ok(Some(TypeEvaluation::Aggregate(children)));
+        }
+        let name = if node.kind() == "generic_type" {
+            let Some(name) = node.child_by_field_name("type") else {
+                return Ok(Some(TypeEvaluation::Leaf(EvalState::Incomplete(
+                    RustOwnershipIncomplete::MissingType,
+                ))));
+            };
+            name
+        } else {
+            node
+        };
+        let path = if name.kind() == "primitive_type" {
+            charge(1)?;
+            vec![name]
+        } else {
+            let Some(path) = rust_path_segments_bounded(name, &mut *charge)? else {
+                return Ok(None);
+            };
+            path
+        };
+        charge(path.len())?;
+        let names = path
+            .iter()
+            .map(|node| rust_node_text(*node, self.source))
+            .collect::<Vec<_>>();
+        let Some(first) = names.first() else {
+            return Ok(None);
+        };
+        let absolute = rust_path_is_leading_absolute_bounded(name, &mut *charge)?;
+        let actual_head = rust_type_head_at_bounded(self.root, self.source, name, first, charge)?;
+        let head = if absolute {
+            // Keep activation/opaque-scope refusal at the actual site even
+            // though an absolute name selects its head at the crate root.
+            if matches!(actual_head, RustTypeHead::Unknown) {
+                return Ok(Some(TypeEvaluation::Leaf(EvalState::Incomplete(
+                    RustOwnershipIncomplete::UnresolvedPath,
+                ))));
+            }
+            rust_type_head_at_bounded(self.root, self.source, self.root, first, charge)?
+        } else {
+            actual_head
+        };
+        if node.kind() != "generic_type"
+            && names.len() == 1
+            && !absolute
+            && let RustTypeHead::Item(item) = &head
+        {
+            if item.kind() == "type_item" {
+                let target = item.child_by_field_name("type");
+                let valid = item.child_by_field_name("type_parameters").is_none()
+                    && !has_where_clause_bounded(*item, charge)?;
+                return Ok(Some(if valid {
+                    target
+                        .map(TypeEvaluation::Alias)
+                        .unwrap_or(TypeEvaluation::Leaf(EvalState::Incomplete(
+                            RustOwnershipIncomplete::MissingType,
+                        )))
+                } else {
+                    TypeEvaluation::Leaf(EvalState::Incomplete(
+                        RustOwnershipIncomplete::GenericObligation,
+                    ))
+                }));
+            }
+            // Preserve the exact selected local nominal, not a pooled
+            // same-spelled declaration from another lexical block.
+            let mut state = None;
+            for (index, declaration) in self.declarations.iter().enumerate() {
+                charge(1)?;
+                if declaration.identity.source_start == item.start_byte() {
+                    state = self.states.get(&index).copied();
+                    break;
+                }
+            }
+            return Ok(Some(TypeEvaluation::Leaf(match state {
+                Some(NominalState::Copy) => EvalState::Copy,
+                Some(NominalState::Move) => EvalState::Move,
+                Some(NominalState::Pending) => EvalState::Pending,
+                Some(NominalState::Incomplete(reason)) => EvalState::Incomplete(reason),
+                None => EvalState::Incomplete(RustOwnershipIncomplete::UnresolvedPath),
+            })));
+        }
+        if node.kind() == "primitive_type" {
+            return Ok(Some(TypeEvaluation::Leaf(
+                if matches!(head, RustTypeHead::Unbound) && is_copy_primitive(node, self.source) {
+                    EvalState::Copy
+                } else {
+                    EvalState::Incomplete(RustOwnershipIncomplete::UnresolvedPath)
+                },
+            )));
+        }
+        if node.kind() == "generic_type" {
+            // This is the specific language/library rule Option<T>: Copy
+            // when T: Copy. The table supplies identity/arity, not Copy:
+            // its inert-drop facts also include non-Copy String/Vec/Box.
+            let option = rust_std_type_fact("Option").expect("reviewed Option identity and arity");
+            assert_eq!(
+                option.type_arguments, 1,
+                "conditional Option Copy has one payload"
+            );
+            let canonical = match head {
+                RustTypeHead::Unbound if names == ["Option"] && !absolute => true,
+                RustTypeHead::Unbound => {
+                    names.len() == option.path.len()
+                        && matches!(names[0], "core" | "std")
+                        && names[1..] == option.path[1..]
+                }
+                RustTypeHead::Import { path, declaration } => {
+                    let mut target = path;
+                    for name in names.iter().skip(1) {
+                        charge(1)?;
+                        charge(name.len())?;
+                        target.push((*name).to_string());
+                    }
+                    // An import's own root is resolved at the import site by
+                    // the shared selector, before it can supply std identity.
+                    let root_unbound = if let Some(first) = target.first() {
+                        matches!(
+                            rust_type_head_at_bounded(
+                                self.root,
+                                self.source,
+                                declaration,
+                                first,
+                                charge
+                            )?,
+                            RustTypeHead::Unbound
+                        )
+                    } else {
+                        false
+                    };
+                    root_unbound
+                        && target.len() == option.path.len()
+                        && matches!(target[0].as_str(), "core" | "std")
+                        && target.iter().skip(1).map(String::as_str).eq(option
+                            .path
+                            .iter()
+                            .skip(1)
+                            .copied())
+                }
+                _ => false,
+            };
+            if canonical {
+                let arguments = node.child_by_field_name("type_arguments");
+                let mut actual = Vec::new();
+                if let Some(arguments) = arguments {
+                    let mut cursor = arguments.walk();
+                    for argument in arguments.named_children(&mut cursor) {
+                        charge(1)?;
+                        if !matches!(argument.kind(), "line_comment" | "block_comment") {
+                            actual.push(argument);
+                        }
+                    }
+                }
+                if actual.len() == option.type_arguments
+                    && actual.iter().all(|argument| is_type_node(*argument))
+                {
+                    return Ok(Some(TypeEvaluation::Option(actual[0])));
+                }
+            }
+            return Ok(Some(TypeEvaluation::Leaf(EvalState::Incomplete(
+                RustOwnershipIncomplete::GenericObligation,
+            ))));
+        }
+        Ok(Some(TypeEvaluation::Leaf(EvalState::Incomplete(
+            RustOwnershipIncomplete::UnresolvedPath,
+        ))))
     }
 
     /// Classify a local nominal declaration for destructor queries.
@@ -735,130 +1061,152 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
     }
 
     fn classify_type_state(&self, type_node: Node<'tree>) -> EvalState {
+        // Existing unbounded callers keep their original syntax-only envelope.
+        // Alias/Option traversal is admitted only through the charged API.
+        self.evaluate_type_state_bounded(
+            type_node,
+            &mut |_| Ok::<_, std::convert::Infallible>(()),
+            &mut |_, _| Ok(None),
+        )
+        .expect("infallible legacy ownership evaluation")
+    }
+
+    fn evaluate_type_state_bounded<F, E, P>(
+        &self,
+        type_node: Node<'tree>,
+        charge: &mut F,
+        expand: &mut P,
+    ) -> Result<EvalState, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+        P: FnMut(Node<'tree>, &mut F) -> Result<Option<TypeEvaluation<'tree>>, E>,
+    {
         let mut values = HashMap::new();
+        let mut plans = HashMap::new();
+        let mut active = HashSet::new();
         let mut stack = vec![(type_node, false)];
         while let Some((node, finish)) = stack.pop() {
+            charge(1)?;
             let key = node.id();
             if values.contains_key(&key) {
                 continue;
             }
             if finish {
-                let result = if node.kind() == "array_type" {
-                    let Some(element) = sequence_element(node) else {
-                        values.insert(
-                            key,
-                            EvalState::Incomplete(RustOwnershipIncomplete::MissingType),
-                        );
-                        continue;
-                    };
-                    values
-                        .get(&element.id())
-                        .copied()
-                        .expect("array element was visited before its parent")
-                } else {
-                    aggregate_result(
-                        named_children(node)
-                            .into_iter()
-                            .filter(|child| is_type_node(*child))
-                            .map(|child| {
-                                values
-                                    .get(&child.id())
-                                    .copied()
-                                    .expect("tuple child was visited before its parent")
-                            }),
-                    )
+                let plan = plans.remove(&key).expect("scheduled ownership plan");
+                let result = match plan {
+                    TypeEvaluation::Alias(child) => values[&child.id()],
+                    TypeEvaluation::Option(child) => match values[&child.id()] {
+                        EvalState::Copy => EvalState::Copy,
+                        EvalState::Pending => EvalState::Pending,
+                        EvalState::Incomplete(reason) => EvalState::Incomplete(reason),
+                        EvalState::Move => {
+                            EvalState::Incomplete(RustOwnershipIncomplete::GenericObligation)
+                        }
+                    },
+                    TypeEvaluation::Aggregate(children) => {
+                        aggregate_result(children.iter().map(|child| values[&child.id()]))
+                    }
+                    TypeEvaluation::Leaf(_) => unreachable!("leaves finish immediately"),
                 };
+                active.remove(&key);
                 values.insert(key, result);
                 continue;
             }
-            if has_macro_ancestor(node) {
+            if !active.insert(key) {
                 values.insert(
                     key,
-                    EvalState::Incomplete(RustOwnershipIncomplete::MacroExpansion),
+                    EvalState::Incomplete(RustOwnershipIncomplete::CyclicNominal),
                 );
                 continue;
             }
-            if has_unsafe_ancestor(node) {
-                values.insert(
-                    key,
-                    EvalState::Incomplete(RustOwnershipIncomplete::UnsupportedType),
-                );
-                continue;
-            }
-            match node.kind() {
-                "array_type" => {
-                    stack.push((node, true));
-                    if let Some(element) = sequence_element(node) {
-                        stack.push((element, false));
-                    }
-                }
-                "tuple_type" => {
-                    stack.push((node, true));
-                    let children = named_children(node);
-                    for child in children.into_iter().rev() {
-                        if is_type_node(child) {
-                            stack.push((child, false));
-                        }
-                    }
-                }
-                "primitive_type" => {
-                    let state = if is_copy_primitive(node, self.source) {
-                        EvalState::Copy
-                    } else {
-                        EvalState::Incomplete(RustOwnershipIncomplete::UnsupportedType)
-                    };
-                    values.insert(key, state);
-                }
-                "unit_type" => {
-                    values.insert(key, EvalState::Copy);
-                }
-                "never_type" => {
-                    values.insert(
-                        key,
-                        EvalState::Incomplete(RustOwnershipIncomplete::UnsupportedType),
-                    );
-                }
-                "reference_type" => {
-                    let state = match reference_referent(node) {
+            let plan = if has_macro_ancestor_bounded(node, charge)? {
+                TypeEvaluation::Leaf(EvalState::Incomplete(
+                    RustOwnershipIncomplete::MacroExpansion,
+                ))
+            } else if has_unsafe_ancestor_bounded(node, charge)? {
+                TypeEvaluation::Leaf(EvalState::Incomplete(
+                    RustOwnershipIncomplete::UnsupportedType,
+                ))
+            } else {
+                match node.kind() {
+                    "array_type" => match sequence_element(node) {
+                        Some(element) => TypeEvaluation::Aggregate(vec![element]),
+                        None => TypeEvaluation::Leaf(EvalState::Incomplete(
+                            RustOwnershipIncomplete::MissingType,
+                        )),
+                    },
+                    "tuple_type" => expand(node, charge)?.unwrap_or_else(|| {
+                        TypeEvaluation::Aggregate(
+                            named_children(node)
+                                .into_iter()
+                                .filter(|child| is_type_node(*child))
+                                .collect(),
+                        )
+                    }),
+                    "primitive_type" => expand(node, charge)?.unwrap_or_else(|| {
+                        TypeEvaluation::Leaf(if is_copy_primitive(node, self.source) {
+                            EvalState::Copy
+                        } else {
+                            EvalState::Incomplete(RustOwnershipIncomplete::UnsupportedType)
+                        })
+                    }),
+                    "unit_type" => TypeEvaluation::Leaf(EvalState::Copy),
+                    "reference_type" => TypeEvaluation::Leaf(match reference_referent(node) {
                         None => EvalState::Incomplete(RustOwnershipIncomplete::MissingType),
                         Some(referent) if referent.kind() == "pointer_type" => {
                             EvalState::Incomplete(RustOwnershipIncomplete::RawPointer)
                         }
-                        Some(_) if reference_is_mutable(node) => EvalState::Move,
+                        Some(_) if reference_is_mutable_bounded(node, charge)? => EvalState::Move,
                         Some(_) => EvalState::Copy,
-                    };
+                    }),
+                    "pointer_type" => TypeEvaluation::Leaf(EvalState::Incomplete(
+                        RustOwnershipIncomplete::RawPointer,
+                    )),
+                    "type_identifier"
+                    | "identifier"
+                    | "scoped_type_identifier"
+                    | "scoped_identifier" => expand(node, charge)?.unwrap_or_else(|| {
+                        TypeEvaluation::Leaf(self.classify_nominal_reference(node))
+                    }),
+                    "generic_type" => expand(node, charge)?.unwrap_or(TypeEvaluation::Leaf(
+                        EvalState::Incomplete(RustOwnershipIncomplete::GenericObligation),
+                    )),
+                    _ => TypeEvaluation::Leaf(EvalState::Incomplete(
+                        RustOwnershipIncomplete::UnsupportedType,
+                    )),
+                }
+            };
+            match plan {
+                TypeEvaluation::Leaf(state) => {
+                    active.remove(&key);
                     values.insert(key, state);
                 }
-                "pointer_type" => {
-                    values.insert(
-                        key,
-                        EvalState::Incomplete(RustOwnershipIncomplete::RawPointer),
-                    );
-                }
-                "type_identifier"
-                | "identifier"
-                | "scoped_type_identifier"
-                | "scoped_identifier" => {
-                    values.insert(key, self.classify_nominal_reference(node));
-                }
-                "generic_type" => {
-                    values.insert(
-                        key,
-                        EvalState::Incomplete(RustOwnershipIncomplete::GenericObligation),
-                    );
-                }
-                _ => {
-                    values.insert(
-                        key,
-                        EvalState::Incomplete(RustOwnershipIncomplete::UnsupportedType),
-                    );
+                plan => {
+                    let child_count = match &plan {
+                        TypeEvaluation::Alias(_) | TypeEvaluation::Option(_) => 1,
+                        TypeEvaluation::Aggregate(children) => children.len(),
+                        TypeEvaluation::Leaf(_) => unreachable!(),
+                    };
+                    charge(child_count)?;
+                    let children = match &plan {
+                        TypeEvaluation::Alias(child) | TypeEvaluation::Option(child) => {
+                            vec![*child]
+                        }
+                        TypeEvaluation::Aggregate(children) => children.clone(),
+                        TypeEvaluation::Leaf(_) => unreachable!(),
+                    };
+                    plans.insert(key, plan);
+                    charge(1)?;
+                    stack.push((node, true));
+                    for child in children.into_iter().rev() {
+                        charge(1)?;
+                        stack.push((child, false));
+                    }
                 }
             }
         }
-        values
-            .get(&type_node.id())
-            .copied()
-            .expect("root type node was visited")
+        charge(0)?;
+        Ok(values[&type_node.id()])
     }
 
     fn classify_nominal_reference(&self, type_node: Node<'tree>) -> EvalState {
@@ -1362,17 +1710,33 @@ fn derive_builtin_traits(
     Ok(traits)
 }
 
-fn collect_imports(
+fn collect_imports<F, E>(
     node: Node<'_>,
     source: &str,
     module_path: &[String],
     imports: &mut Vec<ImportBinding>,
     shadowed: &mut HashSet<ShadowedBinding>,
-) {
-    for import in rust_imports_with_visibility_from_use_declaration(node, source) {
+    charge: &mut F,
+) -> Result<(), E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    for leaf in crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+        node,
+        source,
+        &mut *charge,
+    )? {
+        charge(1)?;
+        let import = leaf.import;
+        charge(module_path.len())?;
+        for segment in import.path() {
+            charge(1)?;
+            charge(segment.len())?;
+        }
         match import.binding_name() {
             RustImportBindingName::Glob => {
                 for name in ["Copy", "Clone", "Drop"] {
+                    charge(1)?;
                     shadowed.insert(ShadowedBinding {
                         module_path: module_path.to_vec(),
                         name: name.to_string(),
@@ -1389,6 +1753,7 @@ fn collect_imports(
                 if name == "_" {
                     continue;
                 }
+                charge(name.len())?;
                 shadowed.insert(ShadowedBinding {
                     module_path: module_path.to_vec(),
                     name: name.to_string(),
@@ -1403,6 +1768,8 @@ fn collect_imports(
             RustImportBindingName::Unnamed => {}
         }
     }
+    charge(0)?;
+    Ok(())
 }
 
 fn builtin_trait_kind(
@@ -1558,40 +1925,99 @@ fn declaration_path<'tree>(declaration: &NominalDeclaration<'tree>) -> Vec<Strin
 }
 
 fn has_where_clause(node: Node<'_>) -> bool {
-    named_children(node)
-        .into_iter()
-        .any(|child| child.kind() == "where_clause")
+    has_where_clause_bounded(node, &mut |_| Ok::<_, std::convert::Infallible>(()))
+        .expect("infallible legacy where-clause inspection")
 }
 
-pub(crate) fn has_macro_ancestor(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
+fn has_named_child_bounded<F, E>(node: Node<'_>, kind: &str, charge: &mut F) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        charge(1)?;
+        if child.kind() == kind {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_where_clause_bounded<F, E>(node: Node<'_>, charge: &mut F) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    has_named_child_bounded(node, "where_clause", charge)
+}
+
+pub(crate) fn has_macro_ancestor(node: Node<'_>) -> bool {
+    has_macro_ancestor_bounded(node, &mut |_| Ok::<_, std::convert::Infallible>(()))
+        .expect("infallible legacy macro ancestry")
+}
+
+fn has_macro_ancestor_bounded<F, E>(mut node: Node<'_>, charge: &mut F) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    loop {
+        charge(1)?;
+        let Some(parent) = node.parent() else {
+            return Ok(false);
+        };
         if matches!(parent.kind(), "macro_invocation" | "macro_definition") {
-            return true;
+            return Ok(true);
         }
         node = parent;
     }
-    false
 }
 
-fn has_unsafe_ancestor(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if matches!(parent.kind(), "unsafe_block" | "unsafe_item") {
-            return true;
+fn has_unsafe_ancestor(node: Node<'_>) -> bool {
+    has_unsafe_ancestor_bounded(node, &mut |_| Ok::<_, std::convert::Infallible>(()))
+        .expect("infallible legacy unsafe ancestry")
+}
+
+fn has_unsafe_modifier_bounded<F, E>(node: Node<'_>, charge: &mut F) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        charge(1)?;
+        if child.kind() == "unsafe" {
+            return Ok(true);
         }
-        if parent.kind() == "function_modifiers" && has_anonymous_child(parent, "unsafe") {
-            return true;
+    }
+    Ok(false)
+}
+
+fn has_unsafe_ancestor_bounded<F, E>(mut node: Node<'_>, charge: &mut F) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    loop {
+        charge(1)?;
+        let Some(parent) = node.parent() else {
+            return Ok(false);
+        };
+        if matches!(parent.kind(), "unsafe_block" | "unsafe_item") {
+            return Ok(true);
+        }
+        if parent.kind() == "function_modifiers" && has_unsafe_modifier_bounded(parent, charge)? {
+            return Ok(true);
         }
         if matches!(parent.kind(), "function_item" | "function_signature_item") {
-            let unsafe_modifier = named_children(parent).into_iter().any(|child| {
-                child.kind() == "function_modifiers" && has_anonymous_child(child, "unsafe")
-            });
-            if unsafe_modifier {
-                return true;
+            let mut cursor = parent.walk();
+            for child in parent.named_children(&mut cursor) {
+                charge(1)?;
+                if child.kind() == "function_modifiers"
+                    && has_unsafe_modifier_bounded(child, charge)?
+                {
+                    return Ok(true);
+                }
             }
         }
         node = parent;
     }
-    false
 }
 
 fn contains_generic(node: Node<'_>) -> bool {
@@ -1632,13 +2058,44 @@ fn reference_referent(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn reference_is_mutable(node: Node<'_>) -> bool {
-    node.kind() == "reference_type" && has_mutable_reference_specifier(node)
+    reference_is_mutable_bounded(node, &mut |_| Ok::<_, std::convert::Infallible>(()))
+        .expect("infallible legacy reference mutability")
+}
+
+fn reference_is_mutable_bounded<F, E>(node: Node<'_>, charge: &mut F) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    Ok(node.kind() == "reference_type"
+        && has_named_child_bounded(node, "mutable_specifier", charge)?)
 }
 
 fn has_mutable_reference_specifier(node: Node<'_>) -> bool {
-    named_children(node)
-        .into_iter()
-        .any(|child| child.kind() == "mutable_specifier")
+    has_named_child_bounded(node, "mutable_specifier", &mut |_| {
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .expect("infallible legacy mutable specifier")
+}
+
+fn classify_reference_type_bounded<F, E>(
+    node: Node<'_>,
+    charge: &mut F,
+) -> Result<RustOwnershipClass, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    assert_eq!(node.kind(), "reference_type");
+    charge(1)?;
+    let class =
+        if reference_referent(node).is_some_and(|referent| referent.kind() == "pointer_type") {
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::RawPointer)
+        } else if reference_is_mutable_bounded(node, charge)? {
+            RustOwnershipClass::MutableReference
+        } else {
+            RustOwnershipClass::SharedReference
+        };
+    charge(0)?;
+    Ok(class)
 }
 
 fn sequence_element(node: Node<'_>) -> Option<Node<'_>> {
@@ -2177,6 +2634,568 @@ mod tests {
             index.classify_type(type_named(tree.root_node(), source, "Inner")),
             RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5911: tuple-let component initialization lacked alias-rebased type and Option Copy proof"
+    )]
+    fn tuple_components_keep_alias_scope_option_identity_and_stops() {
+        // Invalid/cfg-ambiguous type declarations below are intentional
+        // refusal controls. Parsing them is not evidence of Rust validity.
+        let source = r#"
+use core::option::Option as Maybe;
+struct NotCopy<T>(T);
+type SizeHint = (usize, Option<usize>);
+type Pair = (usize, usize);
+type Borrow = &'static usize;
+type CycleA = CycleB;
+type CycleB = CycleA;
+fn ordinary() {
+    let direct: (usize, usize);
+    let pair: Pair;
+    let size: SizeHint;
+    let optional: Maybe<usize>;
+    let nested: Option<Option<usize>>;
+    let alias_reference: Borrow;
+    let borrowed: &Pair;
+    let mutable_payload: Option<&'static mut usize>;
+    let unknown_payload: Option<Missing>;
+    let inert_is_not_copy: Option<String>;
+    let other_generic: Vec<usize>;
+    let too_many_arguments: Option<usize, usize>;
+    let non_type_argument: Option<3>;
+    let cycle: CycleA;
+}
+fn local_shadow() {
+    let forward: Pair;
+    type Pair = (usize, bool);
+    type Option<T> = NotCopy<T>;
+    let rebased: SizeHint;
+    let local_option: Option<usize>;
+}
+fn import_shadow() {
+    use core::option::Option as Choice;
+    use crate::NotCopy as Choice;
+    let ambiguous: Choice<usize>;
+}
+fn conditional_import() {
+    #[cfg(feature = "maybe")]
+    use core::option::Option as Conditional;
+    let conditional: Conditional<usize>;
+}
+fn opaque_scope() {
+    opaque!();
+    let macro_scope: Option<usize>;
+}
+fn wildcard_scope() {
+    use crate::unknown::*;
+    let wildcard: Option<usize>;
+}
+fn generic<Option>(generic_parameter: Option) {}
+fn primitive_generic<usize>() {
+    let generic_primitive: usize;
+    let generic_payload: Option<usize>;
+}
+fn primitive_shadow() {
+    type usize = NotCopy<u8>;
+    let shadowed_primitive: usize;
+    let shadowed_payload: Option<usize>;
+    let rhs_rebased: SizeHint;
+}
+fn shadow_root() {
+    mod core { pub mod option { pub struct Option<T>(T); } }
+    use core::option::Option as Wrong;
+    let wrong_root: Wrong<usize>;
+    let absolute: ::core::option::Option<usize>;
+    let absolute_option: ::Option<usize>;
+}
+mod disabled_owner {
+    #![no_implicit_prelude]
+    type Pair = (usize, Option<usize>);
+    fn probe() { let nested_disabled: Pair; }
+}
+mod conditional_owner {
+    #![cfg(feature = "maybe")]
+    fn probe() { let inner_activation: Option<usize>; }
+}
+fn grouped_imports() {
+    use core::option::{Option as FirstChoice, Option as SecondChoice, Option as ThirdChoice};
+    let grouped: ThirdChoice<usize>;
+}
+"#;
+        let tree = parse(source);
+        let root = tree.root_node();
+        let index = RustOwnershipIndex::build(root, source, |_| Ok::<_, ()>(())).unwrap();
+        let declared_type = |name: &str| {
+            let mut stack = vec![root];
+            while let Some(node) = stack.pop() {
+                if matches!(node.kind(), "let_declaration" | "parameter")
+                    && node
+                        .child_by_field_name("pattern")
+                        .is_some_and(|pattern| rust_node_text(pattern, source) == name)
+                {
+                    return node.child_by_field_name("type").expect("annotated binding");
+                }
+                stack.extend(named_children(node));
+            }
+            panic!("missing test binding {name}");
+        };
+        for name in ["direct", "pair", "size", "rebased", "rhs_rebased"] {
+            let ty = declared_type(name);
+            let components = index
+                .tuple_component_types_bounded(ty, |_| Ok::<_, ()>(()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(components.len(), 2, "{name}");
+            assert_eq!(rust_node_text(components[0], source), "usize", "{name}");
+            assert_eq!(
+                index
+                    .classify_type_bounded(ty, |_| Ok::<_, ()>(()))
+                    .unwrap(),
+                RustOwnershipClass::AggregateCopy,
+                "{name}"
+            );
+            for component in components {
+                assert!(
+                    matches!(
+                        index
+                            .classify_type_bounded(component, |_| Ok::<_, ()>(()))
+                            .unwrap(),
+                        RustOwnershipClass::ScalarCopy | RustOwnershipClass::AggregateCopy
+                    ),
+                    "{name}"
+                );
+            }
+        }
+        let forward = index
+            .tuple_component_types_bounded(declared_type("forward"), |_| Ok::<_, ()>(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rust_node_text(forward[1], source),
+            "bool",
+            "local item shadows before its declaration"
+        );
+        for name in ["optional", "nested", "absolute", "grouped"] {
+            assert_eq!(
+                index
+                    .classify_type_bounded(declared_type(name), |_| Ok::<_, ()>(()))
+                    .unwrap(),
+                RustOwnershipClass::AggregateCopy,
+                "{name}"
+            );
+        }
+        for name in ["alias_reference", "borrowed"] {
+            assert_eq!(
+                index
+                    .classify_type_bounded(declared_type(name), |_| Ok::<_, ()>(()))
+                    .unwrap(),
+                RustOwnershipClass::SharedReference,
+                "{name}"
+            );
+            assert!(
+                index
+                    .tuple_component_types_bounded(declared_type(name), |_| Ok::<_, ()>(()))
+                    .unwrap()
+                    .is_err(),
+                "{name}"
+            );
+        }
+        for name in [
+            "local_option",
+            "ambiguous",
+            "conditional",
+            "generic_parameter",
+            "wrong_root",
+            "mutable_payload",
+            "unknown_payload",
+            "inert_is_not_copy",
+            "other_generic",
+            "absolute_option",
+            "nested_disabled",
+            "inner_activation",
+            "macro_scope",
+            "wildcard",
+            "too_many_arguments",
+            "non_type_argument",
+            "generic_primitive",
+            "generic_payload",
+            "shadowed_primitive",
+            "shadowed_payload",
+        ] {
+            assert!(
+                matches!(
+                    index
+                        .classify_type_bounded(declared_type(name), |_| Ok::<_, ()>(()))
+                        .unwrap(),
+                    RustOwnershipClass::Incomplete(_)
+                ),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            index
+                .tuple_component_types_bounded(declared_type("cycle"), |_| Ok::<_, ()>(()))
+                .unwrap(),
+            Err(RustOwnershipIncomplete::CyclicNominal)
+        );
+        let mut charged = 0;
+        assert!(
+            index
+                .tuple_component_types_bounded(declared_type("size"), |work| {
+                    charged += work;
+                    if charged > 4 { Err(()) } else { Ok(()) }
+                })
+                .is_err()
+        );
+        let mut worked = false;
+        assert!(
+            index
+                .classify_type_bounded(declared_type("size"), |work| {
+                    if work == 0 && worked {
+                        return Err(());
+                    }
+                    worked |= work != 0;
+                    Ok(())
+                })
+                .is_err(),
+            "a terminal stop cannot publish Copy"
+        );
+        // Nested ownership evaluation revisits ancestry for each component.
+        // Interrupt those actual parent walks, rather than only the initial
+        // root admission or a later type-head lookup.
+        let nested_source = "unsafe fn probe(value: ((((u8,),),),)) {}";
+        let nested_tree = parse(nested_source);
+        let nested_type = type_named(nested_tree.root_node(), nested_source, "u8");
+        let mut macro_work = 0;
+        assert_eq!(
+            has_macro_ancestor_bounded(nested_type, &mut |work| {
+                macro_work += work;
+                if macro_work == 3 { Err(()) } else { Ok(()) }
+            }),
+            Err(())
+        );
+        assert_eq!(macro_work, 3);
+        let mut unsafe_work = 0;
+        assert_eq!(
+            has_unsafe_ancestor_bounded(nested_type, &mut |work| {
+                unsafe_work += work;
+                if unsafe_work == 3 { Err(()) } else { Ok(()) }
+            }),
+            Err(())
+        );
+        assert_eq!(unsafe_work, 3);
+        assert!(has_unsafe_ancestor(nested_type));
+        assert!(!has_macro_ancestor(nested_type));
+
+        // Child scans must stop inside the helper, including alias admission
+        // and reference payload evaluation after normalized ancestry succeeds.
+        let inspection_source = "type Alias = u8; fn refs(value: & /* one */ /* two */ mut u8) {}";
+        let inspection_tree = parse(inspection_source);
+        let alias = inspection_tree.root_node().named_child(0).expect("alias");
+        assert_eq!(alias.kind(), "type_item");
+        assert_eq!(
+            has_where_clause_bounded(alias, &mut |_| Err::<(), _>(())),
+            Err(())
+        );
+        let reference = type_named(
+            inspection_tree.root_node(),
+            inspection_source,
+            "& /* one */ /* two */ mut u8",
+        );
+        assert_eq!(
+            reference_is_mutable_bounded(reference, &mut |_| Err::<(), _>(())),
+            Err(())
+        );
+        assert_eq!(
+            classify_reference_type_bounded(reference, &mut |_| Ok::<_, ()>(())),
+            Ok(RustOwnershipClass::MutableReference)
+        );
+        let mut reference_work = 0;
+        assert_eq!(
+            classify_reference_type_bounded(reference, &mut |work| {
+                reference_work += work;
+                if reference_work == 2 { Err(()) } else { Ok(()) }
+            }),
+            Err(())
+        );
+        assert_eq!(reference_work, 2);
+
+        // Stop inside the exact path walker, not in ownership ancestry.
+        let absolute_type = declared_type("absolute");
+        let head = absolute_type
+            .child_by_field_name("type")
+            .expect("Option constructor");
+        let complete_path = rust_path_segments(head).expect("structured core Option path");
+        assert_eq!(complete_path.len(), 3);
+        let mut path_work = 0;
+        assert!(
+            rust_path_segments_bounded(head, |work| {
+                path_work += work;
+                if path_work >= 2 { Err(()) } else { Ok(()) }
+            })
+            .is_err(),
+            "no partially retained path can escape a stop"
+        );
+        assert_eq!(path_work, 2);
+
+        // The collector's post-owner check precedes its pending use-tree
+        // stack. Permit several steps past that check, then interrupt the
+        // real prefix/group traversal before it can finish collecting leaves.
+        let mut pending = vec![root];
+        let grouped_use = loop {
+            let node = pending.pop().expect("grouped import fixture");
+            if node.kind() == "use_declaration"
+                && node
+                    .child_by_field_name("argument")
+                    .is_some_and(|argument| argument.kind() == "scoped_use_list")
+            {
+                break node;
+            }
+            pending.extend(named_children(node));
+        };
+        let leaves = crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+            grouped_use,
+            source,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap();
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(
+            leaves
+                .iter()
+                .map(|leaf| leaf.import.info.alias.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("FirstChoice"),
+                Some("SecondChoice"),
+                Some("ThirdChoice")
+            ]
+        );
+        let mut after_owner_setup = false;
+        let mut tree_steps = 0;
+        let stopped = crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+            grouped_use,
+            source,
+            |work| {
+                if work == 0 {
+                    after_owner_setup = true;
+                }
+                if after_owner_setup && work != 0 {
+                    tree_steps += 1;
+                    if tree_steps == 6 {
+                        return Err(());
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert!(after_owner_setup);
+        assert_eq!(tree_steps, 6);
+        assert!(
+            stopped.is_err(),
+            "no partial leaf list is a complete import answer"
+        );
+
+        let disabled_source = "#![no_implicit_prelude]\nfn f(value: Option<usize>) {}";
+        let disabled_tree = parse(disabled_source);
+        let disabled_index =
+            RustOwnershipIndex::build(disabled_tree.root_node(), disabled_source, |_| {
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        let ty = named_children(disabled_tree.root_node())
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap()
+            .child_by_field_name("parameters")
+            .unwrap()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("type")
+            .unwrap();
+        assert!(matches!(
+            disabled_index
+                .classify_type_bounded(ty, |_| Ok::<_, ()>(()))
+                .unwrap(),
+            RustOwnershipClass::Incomplete(_)
+        ));
+
+        // #5911: Copy component types and a tentative local ID do not prove
+        // a bare pattern name binds. In particular, a unit constant can be an
+        // irrefutable pattern. These controls exercise the independent scope
+        // proof without consulting either ownership or the local inventory.
+        let binding_source = r#"
+const UNIT: () = ();
+static STATIC_UNIT: () = ();
+struct Empty;
+enum Choice { Zero }
+fn unit_control(sh: ((), usize)) { let (UNIT, low) = sh; }
+fn variable_control(sh: ((), usize)) { let (unit, mut low) = sh; }
+fn rebound(a: usize, b: usize) { let (a, b) = (b, a); }
+fn prior_local(sh: ((), usize)) { let unit = (); let (unit, low) = sh; }
+fn raw_constant(sh: ((), usize)) { let (r#UNIT, low) = sh; }
+fn raw_binding(sh: ((), usize)) { let (r#plain, low) = sh; }
+fn forward_const(sh: ((), usize)) {
+    let (FORWARD, low) = sh;
+    const FORWARD: () = ();
+}
+fn static_control(sh: ((), usize)) { let (STATIC_UNIT, low) = sh; }
+fn constructor_control(sh: (Empty, usize)) { let (Empty, low) = sh; }
+fn imported(sh: ((), usize)) {
+    use crate::UNIT as Imported;
+    let (Imported, low) = sh;
+}
+fn imported_variant(sh: (Choice, usize)) {
+    use crate::Choice::Zero;
+    let (Zero, low) = sh;
+}
+fn wildcard(sh: (Choice, usize)) {
+    use crate::Choice::*;
+    let (Zero, low) = sh;
+}
+fn late_wildcard(sh: ((), usize)) {
+    let (fresh, low) = sh;
+    use crate::unknown::*;
+}
+fn prelude(sh: (Option<usize>, usize)) { let (None, low) = sh; }
+fn generic<const N: usize>(sh: (usize, usize)) { let (N, low) = sh; }
+fn conditional(sh: ((), usize)) {
+    #[cfg(feature = "maybe")]
+    const CONDITIONAL: () = ();
+    let (CONDITIONAL, low) = sh;
+}
+fn macro_scope(sh: ((), usize)) { opaque!(); let (fresh, low) = sh; }
+fn late_macro(sh: ((), usize)) { let (fresh, low) = sh; opaque!(); }
+mod container {
+    const NESTED: () = ();
+    fn nested(sh: ((), usize)) { let (NESTED, low) = sh; }
+}
+struct Owner;
+impl Owner {
+    fn associated(sh: ((), usize)) { let (fresh, low) = sh; }
+}
+"#;
+        let binding_tree = parse(binding_source);
+        let binding_root = binding_tree.root_node();
+        let pattern_in = |function: &str, name: &str| {
+            let mut pending = vec![binding_root];
+            while let Some(node) = pending.pop() {
+                if node.kind() == "function_item"
+                    && node
+                        .child_by_field_name("name")
+                        .is_some_and(|node| rust_node_text(node, binding_source) == function)
+                {
+                    let body = node.child_by_field_name("body").expect("fixture body");
+                    for declaration in named_children(body) {
+                        if declaration.kind() != "let_declaration" {
+                            continue;
+                        }
+                        let pattern = declaration.child_by_field_name("pattern").unwrap();
+                        if pattern.kind() != "tuple_pattern" {
+                            continue;
+                        }
+                        for leaf in named_children(pattern) {
+                            if rust_node_text(leaf, binding_source) == name {
+                                return leaf;
+                            }
+                        }
+                    }
+                    panic!("missing tuple leaf {function}::{name}");
+                }
+                pending.extend(named_children(node));
+            }
+            panic!("missing function {function}");
+        };
+        for (function, name, expected) in [
+            ("unit_control", "UNIT", false),
+            ("unit_control", "low", true),
+            ("variable_control", "unit", true),
+            ("variable_control", "mut low", true),
+            ("rebound", "a", true),
+            ("rebound", "b", true),
+            ("prior_local", "unit", true),
+            ("raw_constant", "UNIT", false),
+            ("raw_binding", "plain", true),
+            ("forward_const", "FORWARD", false),
+            ("static_control", "STATIC_UNIT", false),
+            ("constructor_control", "Empty", false),
+            ("imported", "Imported", false),
+            ("imported", "low", true),
+            ("imported_variant", "Zero", false),
+            ("wildcard", "Zero", false),
+            ("late_wildcard", "fresh", false),
+            ("prelude", "None", false),
+            ("generic", "N", false),
+            ("conditional", "CONDITIONAL", false),
+            ("macro_scope", "fresh", false),
+            ("late_macro", "fresh", false),
+            ("nested", "NESTED", false),
+            ("associated", "fresh", false),
+        ] {
+            let leaf = pattern_in(function, name);
+            assert_eq!(
+                crate::lexical_scope::rust_pattern_identifier_binding_bounded(
+                    binding_root,
+                    binding_source,
+                    leaf,
+                    &mut |_| Ok::<_, ()>(()),
+                ),
+                Ok(expected),
+                "{function}::{name}",
+            );
+        }
+        let mut_leaf = pattern_in("variable_control", "mut low");
+        let mut_name = named_children(mut_leaf)
+            .into_iter()
+            .find(|node| node.kind() == "identifier")
+            .unwrap();
+        assert_eq!(
+            crate::lexical_scope::rust_pattern_identifier_binding_bounded(
+                binding_root,
+                binding_source,
+                mut_name,
+                &mut |_| Ok::<_, ()>(()),
+            ),
+            Ok(true),
+        );
+
+        // Stop at the final observation of an otherwise successful proof, so
+        // neither completed scope traversal nor a tentative ID can hide a late
+        // cancellation. This necessarily reaches beyond ancestor enumeration.
+        let leaf = pattern_in("imported", "low");
+        let mut complete_calls = 0;
+        assert_eq!(
+            crate::lexical_scope::rust_pattern_identifier_binding_bounded(
+                binding_root,
+                binding_source,
+                leaf,
+                &mut |_| {
+                    complete_calls += 1;
+                    Ok::<_, ()>(())
+                },
+            ),
+            Ok(true),
+        );
+        let mut stopped_calls = 0;
+        assert_eq!(
+            crate::lexical_scope::rust_pattern_identifier_binding_bounded(
+                binding_root,
+                binding_source,
+                leaf,
+                &mut |_| {
+                    stopped_calls += 1;
+                    if stopped_calls == complete_calls {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+            ),
+            Err(()),
+        );
+        assert_eq!(stopped_calls, complete_calls);
     }
 
     #[test]

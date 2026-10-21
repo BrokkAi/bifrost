@@ -34,11 +34,13 @@ pub fn is_go_module_field(unit: &CodeUnit) -> bool {
 
 pub struct GoModuleRoot {
     pub import_path: String,
+    /// Workspace-relative directory; empty for the module at the project root.
     pub workspace_dir: PathBuf,
 }
 
 pub struct GoWorkspacePathIndex {
     module_roots: Vec<GoModuleRoot>,
+    unnamed_module_roots: Vec<PathBuf>,
     representative_by_directory: HashMap<PathBuf, ProjectFile>,
     exact_import_paths: HashSet<String>,
     complete: bool,
@@ -53,7 +55,8 @@ impl GoWorkspacePathIndex {
             Ok(files) => (files, true),
             Err(_) => (Default::default(), false),
         };
-        let (module_roots, module_roots_complete) = go_module_roots_from_files(project, &files);
+        let (module_roots, unnamed_module_roots, module_roots_complete) =
+            go_module_roots_from_files(project, &files);
         let go_files = files
             .into_iter()
             .filter(|file| {
@@ -61,6 +64,7 @@ impl GoWorkspacePathIndex {
                     .extension()
                     .is_some_and(|extension| extension == "go")
             })
+            .filter(|file| !is_under_unnamed_module(file, &unnamed_module_roots, &module_roots))
             .collect::<Vec<_>>();
         let mut representative_by_directory: HashMap<PathBuf, ProjectFile> = HashMap::default();
         for file in &go_files {
@@ -75,6 +79,7 @@ impl GoWorkspacePathIndex {
         }
         let mut index = Self {
             module_roots,
+            unnamed_module_roots,
             representative_by_directory,
             exact_import_paths: HashSet::default(),
             complete: complete && module_roots_complete,
@@ -100,17 +105,22 @@ impl GoWorkspacePathIndex {
 
     /// Whether every input needed to enumerate exact workspace import paths
     /// was available: the whole-workspace file listing succeeded, every listed
-    /// `go.mod` was readable and its lexical scan produced exactly one
-    /// top-level module directive whose decoded path satisfies Go's module-path
-    /// element restrictions, and every listed Go file supplied a nonempty
-    /// parsed `package` clause. Other go.mod directives are not semantically
-    /// validated. When this is false, positive lookup evidence remains usable,
-    /// but a missing package is not proof that the package is absent.
+    /// `go.mod` was readable and lexically valid, each named module's decoded
+    /// path satisfies Go's module-path element restrictions, and every Go file
+    /// inside a named module supplied a nonempty parsed `package` clause.
+    /// A valid manifest without a module directive is an unnamed module
+    /// boundary, so its files are excluded from the package inventory. Other
+    /// go.mod directives are not semantically validated. When this is false,
+    /// positive lookup evidence remains usable, but a missing package is not
+    /// proof that the package is absent.
     pub const fn is_complete(&self) -> bool {
         self.complete
     }
 
     pub fn import_files(&self, source_file: &ProjectFile, import_path: &str) -> Vec<ProjectFile> {
+        if self.is_outside_selected_modules(source_file) {
+            return Vec::new();
+        }
         let import_path = import_path.trim().trim_matches('/');
         if import_path.is_empty() {
             return Vec::new();
@@ -172,6 +182,9 @@ impl GoWorkspacePathIndex {
     /// this workspace. Unlike [`canonical_go_package_name`], this performs no
     /// ancestor filesystem walk and no repeated `go.mod` reads.
     pub fn canonical_package_name(&self, file: &ProjectFile, declared_package: &str) -> String {
+        if self.is_outside_selected_modules(file) {
+            return no_module_base(file, declared_package);
+        }
         let (declared_base, is_external_test) = declared_package_parts(file, declared_package);
         let file_dir = file.parent();
         let base = self
@@ -195,17 +208,75 @@ impl GoWorkspacePathIndex {
     /// module-local boundary; a file inside a module never joins that fallback.
     pub fn same_module(&self, left: &ProjectFile, right: &ProjectFile) -> bool {
         let nearest_module = |file: &ProjectFile| {
-            self.module_roots
+            let named = self
+                .module_roots
                 .iter()
                 .filter(|module| file.parent().starts_with(&module.workspace_dir))
-                .max_by_key(|module| module.workspace_dir.components().count())
+                .max_by_key(|module| module.workspace_dir.components().count());
+            let unnamed = self
+                .unnamed_module_roots
+                .iter()
+                .filter(|directory| file.parent().starts_with(directory.as_path()))
+                .max_by_key(|directory| directory.components().count());
+            match (named, unnamed) {
+                (Some(named), Some(unnamed))
+                    if unnamed.components().count() >= named.workspace_dir.components().count() =>
+                {
+                    Some((false, unnamed.as_path()))
+                }
+                (Some(named), _) => Some((true, named.workspace_dir.as_path())),
+                (None, Some(unnamed)) => Some((false, unnamed.as_path())),
+                (None, None) => None,
+            }
         };
         match (nearest_module(left), nearest_module(right)) {
-            (Some(left), Some(right)) => left.workspace_dir == right.workspace_dir,
+            (Some(left), Some(right)) => left == right,
             (None, None) => left.root() == right.root(),
             _ => false,
         }
     }
+
+    /// Whether a Go file falls under a nearer unnamed module boundary and is
+    /// therefore outside every import-path-bearing module in this workspace.
+    pub fn is_outside_selected_modules(&self, file: &ProjectFile) -> bool {
+        self.unnamed_module_root(file).is_some()
+    }
+
+    /// The nearest unnamed module boundary containing this file, if any.
+    pub fn unnamed_module_root(&self, file: &ProjectFile) -> Option<&Path> {
+        nearest_unnamed_module_root(file, &self.unnamed_module_roots, &self.module_roots)
+    }
+}
+
+fn is_under_unnamed_module(
+    file: &ProjectFile,
+    unnamed_roots: &[PathBuf],
+    named_roots: &[GoModuleRoot],
+) -> bool {
+    nearest_unnamed_module_root(file, unnamed_roots, named_roots).is_some()
+}
+
+fn nearest_unnamed_module_root<'a>(
+    file: &ProjectFile,
+    unnamed_roots: &'a [PathBuf],
+    named_roots: &[GoModuleRoot],
+) -> Option<&'a Path> {
+    let file_dir = file.parent();
+    let nearest_unnamed = unnamed_roots
+        .iter()
+        .filter(|directory| file_dir.starts_with(directory.as_path()))
+        .max_by_key(|directory| directory.components().count());
+    let nearest_named = named_roots
+        .iter()
+        .filter(|module| file_dir.starts_with(&module.workspace_dir))
+        .max_by_key(|module| module.workspace_dir.components().count());
+    nearest_unnamed
+        .filter(|unnamed| {
+            nearest_named.is_none_or(|named| {
+                unnamed.components().count() >= named.workspace_dir.components().count()
+            })
+        })
+        .map(PathBuf::as_path)
 }
 
 /// Source-inventory role from the selected path and declared package clause.
@@ -223,11 +294,25 @@ pub fn source_inventory_role(file: &ProjectFile, declared_package: &str) -> &'st
 /// Whether a source filename or parsed leading comment excludes package
 /// inventory from Go-tool-independent completion.
 pub fn source_file_has_build_constraints(file: &ProjectFile, has_build_directive: bool) -> bool {
-    if has_build_directive {
-        return true;
-    }
+    let (goos, goarch) = source_filename_target(file);
+    has_build_directive || goos.is_some() || goarch.is_some()
+}
+
+/// Filename-only build selection. Directive evaluation requires Go-tool evidence.
+pub fn source_filename_matches_target(file: &ProjectFile, goos: &str, goarch: &str) -> bool {
+    let (file_os, file_arch) = source_filename_target(file);
+    file_os.is_none_or(|os| {
+        os == goos
+            || matches!(
+                (goos, os),
+                ("android", "linux") | ("illumos", "solaris") | ("ios", "darwin")
+            )
+    }) && file_arch.is_none_or(|arch| arch == goarch)
+}
+
+fn source_filename_target(file: &ProjectFile) -> (Option<&str>, Option<&str>) {
     let Some(stem) = file.rel_path().file_stem().and_then(|stem| stem.to_str()) else {
-        return false;
+        return (None, None);
     };
     let stem = stem.strip_suffix("_test").unwrap_or(stem);
     const GOOS: &[&str] = &[
@@ -274,14 +359,18 @@ pub fn source_file_has_build_constraints(file: &ProjectFile, has_build_directive
         "sparc64",
         "wasm",
     ];
-    GOOS.iter()
-        .chain(GOARCH)
-        .any(|suffix| stem.ends_with(&format!("_{suffix}")))
-        || GOOS.iter().any(|os| {
-            GOARCH
-                .iter()
-                .any(|arch| stem.ends_with(&format!("_{os}_{arch}")))
-        })
+    let Some((prefix, suffix)) = stem.rsplit_once('_') else {
+        return (None, None);
+    };
+    if GOARCH.contains(&suffix) {
+        let os = prefix
+            .rsplit_once('_')
+            .map(|(_, os)| os)
+            .filter(|os| GOOS.contains(os));
+        (os, Some(suffix))
+    } else {
+        (GOOS.contains(&suffix).then_some(suffix), None)
+    }
 }
 
 fn is_go_test_file(file: &ProjectFile) -> bool {
@@ -308,9 +397,10 @@ pub fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
 fn go_module_roots_from_files<'a>(
     project: &dyn Project,
     files: impl IntoIterator<Item = &'a ProjectFile>,
-) -> (Vec<GoModuleRoot>, bool) {
+) -> (Vec<GoModuleRoot>, Vec<PathBuf>, bool) {
     let mut complete = true;
     let mut module_roots = Vec::new();
+    let mut unnamed_module_roots = Vec::new();
     for manifest in files.into_iter().filter(|file| {
         file.rel_path()
             .file_name()
@@ -320,14 +410,14 @@ fn go_module_roots_from_files<'a>(
             complete = false;
             continue;
         };
-        let Some(import_path) = go_module_path_from_source(&contents) else {
-            complete = false;
-            continue;
-        };
-        module_roots.push(GoModuleRoot {
-            import_path,
-            workspace_dir: manifest.parent(),
-        });
+        match parse_go_module_manifest(&contents) {
+            Some(Some(import_path)) => module_roots.push(GoModuleRoot {
+                import_path,
+                workspace_dir: manifest.parent(),
+            }),
+            Some(None) => unnamed_module_roots.push(manifest.parent()),
+            None => complete = false,
+        }
     }
     module_roots.sort_by(|left, right| {
         right
@@ -336,7 +426,8 @@ fn go_module_roots_from_files<'a>(
             .cmp(&left.import_path.len())
             .then_with(|| left.workspace_dir.cmp(&right.workspace_dir))
     });
-    (module_roots, complete)
+    unnamed_module_roots.sort();
+    (module_roots, unnamed_module_roots, complete)
 }
 
 /// Canonical Go package identity (import path) for `file`, given the
@@ -610,6 +701,12 @@ pub fn read_go_module_path(dir: &Path) -> Option<String> {
 /// return `None`, making workspace authority incomplete rather than publishing
 /// a guessed identity.
 pub fn go_module_path_from_source(contents: &str) -> Option<String> {
+    parse_go_module_manifest(contents).flatten()
+}
+
+/// `Some(None)` is a lexically valid go.mod with no module directive. Go
+/// still treats that file as a module boundary, but it has no import path.
+fn parse_go_module_manifest(contents: &str) -> Option<Option<String>> {
     let tokens = go_mod_tokens(contents)?;
     let mut module_path = None;
     let mut cursor = 0;
@@ -641,7 +738,11 @@ pub fn go_module_path_from_source(contents: &str) -> Option<String> {
             module_path = Some(go_module_path_token(&line[1])?.to_owned());
         }
     }
-    module_path.filter(|path| valid_go_module_path(path))
+    match module_path {
+        Some(path) if valid_go_module_path(&path) => Some(Some(path)),
+        Some(_) => None,
+        None => Some(None),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -38,3 +38,6 @@ pub mod source_facts;
 mod source_properties;
 pub mod structural;
 pub mod test_detection;
+
+mod knowledge;
+pub use knowledge::PhpKnowledge;

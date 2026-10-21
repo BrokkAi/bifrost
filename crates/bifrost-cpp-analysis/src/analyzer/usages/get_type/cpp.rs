@@ -1,0 +1,99 @@
+use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupDiagnostic;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupType;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::no_type;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::sort_units;
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+use crate::analyzer::usages::get_definition::cpp::cpp_type_lookup_resolution_in_session;
+
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+
+use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+
+use brokk_bifrost_analysis::analyzer::usages::target_kind::TypeLookupTargetKind;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::cancellation::CancellationToken;
+use tree_sitter::Tree;
+
+pub(crate) fn resolve_cpp_type_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    if !brokk_bifrost_cpp::imports::receiver_query_supported(file) {
+        return session.finish(TypeLookupOutcome {
+            status: TypeLookupStatus::UnsupportedLanguage,
+            reference: None,
+            types: Vec::new(),
+            diagnostics: vec![TypeLookupDiagnostic {
+                kind: "cpp_c_receiver_unsupported".to_string(),
+                message: "bounded receiver traversal is intentionally unsupported for plain C"
+                    .to_string(),
+            }],
+            target_kind: TypeLookupTargetKind::ValueExpression,
+        });
+    }
+    let Some(tree) = tree else {
+        return session.finish(no_type(
+            "cpp_parse_failed",
+            "C++ source could not be parsed",
+        ));
+    };
+    let Some(mut resolution) =
+        cpp_type_lookup_resolution_in_session(analyzer, file, source, tree, site, &session)
+    else {
+        return session.finish(no_type(
+            "no_explicit_type",
+            format!(
+                "`{}` does not have a supported structured C++ type",
+                site.text
+            ),
+        ));
+    };
+    sort_units(&mut resolution.candidates);
+    resolution.candidates.dedup();
+    let status = if resolution.ambiguous {
+        TypeLookupStatus::Ambiguous
+    } else {
+        TypeLookupStatus::Resolved
+    };
+    session.finish(TypeLookupOutcome {
+        status,
+        reference: None,
+        types: vec![TypeLookupType {
+            fqn: resolution.fqn,
+            definitions: resolution.candidates,
+            semantic_model_id: None,
+        }],
+        diagnostics: if status == TypeLookupStatus::Ambiguous {
+            vec![TypeLookupDiagnostic {
+                kind: "cpp_open_or_ambiguous_type".to_string(),
+                message:
+                    "C++ receiver type has multiple identities or crosses an open template boundary"
+                        .to_string(),
+            }]
+        } else {
+            Vec::new()
+        },
+        target_kind: resolution.target_kind,
+    })
+}

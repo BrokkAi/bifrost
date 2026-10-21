@@ -74,7 +74,14 @@ pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
     let mut has_inactive_regions = false;
     // Byte spans that stay in the parse, accumulated as [start, end) pairs.
     let mut kept: Vec<(usize, usize)> = Vec::new();
-    let mut line_start = 0usize;
+    // A byte-order mark is not source text: the compiler reads past it before
+    // it recognizes a directive, so `\u{feff}#if` opens a conditional. The
+    // grammar skips the mark too, so leaving it out of the ranges loses nothing.
+    let mut line_start = if source.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
 
     while line_start <= source.len() {
         let line_end = match bytes[line_start..].iter().position(|&b| b == b'\n') {
@@ -664,6 +671,20 @@ mod tests {
     fn directive_on_the_last_line_without_a_newline() {
         let source = "int a;\n#endif";
         assert_eq!(kept_text(source), "int a;\n");
+    }
+
+    #[test]
+    #[hardwon(
+        "#6139: a byte-order mark hid the opening #if, so Dapper's SnowflakeTests.cs parsed with a MISSING #endif"
+    )]
+    fn a_directive_after_a_byte_order_mark_is_recognized() {
+        let source =
+            "\u{feff}#if !NETFRAMEWORK\r\nnamespace A\r\n{\r\n    class B { }\r\n}\r\n#endif";
+        assert_eq!(
+            kept_text(source),
+            "namespace A\r\n{\r\n    class B { }\r\n}\r\n"
+        );
+        assert_eq!(error_count(&parse_csharp(source).unwrap()), 0);
     }
 
     #[test]

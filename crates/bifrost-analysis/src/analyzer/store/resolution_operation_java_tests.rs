@@ -4,6 +4,7 @@ use crate::analyzer::store::WorkspacePackageFileRow;
 use crate::analyzer::store::resolution_operation::java_reverse_rows::{
     JvmReverseCandidateOutcome, JvmReverseConfirmed,
 };
+use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 
 const JAVA_ROOT_CONSUMER_PATH: &str = "src/use/Use.java";
 const JAVA_ROOT_PROVIDER_PATH: &str = "src/dep/Target.java";
@@ -735,6 +736,75 @@ fn selected_jvm_file_context_reuses_derivation_only_within_one_operation() {
         derivations(&operation, "derive_file_context"),
         1,
         "the same selected file is derived once"
+    );
+
+    // #5600: another name must not replay invariant import/provider work or
+    // recompile already published provider cells inside this one request.
+    let import_derivations = derivations(&operation, "derive_import");
+    let java_import_derivations = derivations(&operation, "derive_java_import");
+    let implicit_derivations = derivations(&operation, "derive_implicit_context");
+    let compile_context = |context: super::super::jvm_context::JvmImportContext| {
+        let super::super::jvm_context::JvmImportContext::Ready { context, .. } = context else {
+            panic!("fixture context is ready");
+        };
+        let SelectedResolutionContextValidationOutcome::Ready(context) = (*context)
+            .validate_exact_mounts(
+                operation.mount_table().mount_count(),
+                &selected_mount_lookup(operation.mount_table()),
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("fixture context validates");
+        };
+        assert!(matches!(
+            operation
+                .collect_jvm_blueprint_in_session(
+                    context,
+                    &cancellation,
+                    &ResolutionSession::unbounded()
+                )
+                .unwrap(),
+            SelectedFactOperationBlueprintConstruction::Ready(_)
+        ));
+    };
+    compile_context(
+        operation
+            .jvm_import_context(Language::Java, JAVA_ROOT_CONSUMER_PATH, &cancellation)
+            .unwrap(),
+    );
+    let root_compilations = derivations(&operation, "compile_root_context_cell");
+    let package_compilations = derivations(&operation, "compile_package_context_cell");
+    assert!(root_compilations > 0, "the fixture has a source import");
+    for name in ["Target", "Unrelated", "Target"] {
+        compile_context(
+            operation
+                .jvm_import_context_for_name(
+                    Language::Java,
+                    JAVA_ROOT_CONSUMER_PATH,
+                    name,
+                    &cancellation,
+                )
+                .unwrap(),
+        );
+    }
+    assert_eq!(derivations(&operation, "derive_file_context"), 1);
+    assert_eq!(derivations(&operation, "derive_import"), import_derivations);
+    assert_eq!(
+        derivations(&operation, "derive_java_import"),
+        java_import_derivations
+    );
+    assert_eq!(
+        derivations(&operation, "derive_implicit_context"),
+        implicit_derivations
+    );
+    assert_eq!(
+        derivations(&operation, "compile_root_context_cell"),
+        root_compilations
+    );
+    assert_eq!(
+        derivations(&operation, "compile_package_context_cell"),
+        package_compilations
     );
 
     let cancelled = CancellationToken::new();
@@ -2097,9 +2167,15 @@ fn selected_java_reverse_confirms_an_imported_scala_reference() {
         .max_by_key(|identifier| scala_facts.sites[identifier.site.index()].start_byte)
         .expect("Scala usage reference")
         .site;
+    let before_nomination = operation.ready.inventory.read_change_stamp().unwrap();
     let candidates = operation
         .jvm_reverse_candidate_sites(&target, &cancellation)
         .unwrap();
+    assert_eq!(
+        operation.ready.inventory.read_change_stamp().unwrap(),
+        before_nomination,
+        "private reverse request keys must not invalidate selected authority",
+    );
     let JvmReverseCandidateOutcome::Ready(candidates) = candidates else {
         panic!("selected JVM candidate inventory must be ready");
     };
@@ -2152,6 +2228,8 @@ fn selected_java_reverse_for_qualified_peer_reference<A: LanguageAdapter>(
     peer_path: &str,
     peer_source: &str,
     adapter: &A,
+    prepare_peer: impl FnOnce(&mut FileState),
+    before_confirm: impl FnOnce(&AnalyzerStore, &str),
 ) -> (JvmReverseConfirmed, ResolutionSiteId) {
     let project_root = tempfile::tempdir().unwrap();
     let store = AnalyzerStore::open_persistent(&project_root.path().join("store.db")).unwrap();
@@ -2162,7 +2240,7 @@ fn selected_java_reverse_for_qualified_peer_reference<A: LanguageAdapter>(
     let java_source = "package model; public class Visible {}\n";
     let (java_state, _) =
         super::parsed_operation_state(project_root.path(), java_path, java_source, &JavaAdapter);
-    let (peer_state, peer_facts) =
+    let (mut peer_state, peer_facts) =
         super::parsed_operation_state(project_root.path(), peer_path, peer_source, adapter);
     let reference_site = site_for_identifier(
         &peer_facts,
@@ -2170,6 +2248,13 @@ fn selected_java_reverse_for_qualified_peer_reference<A: LanguageAdapter>(
         ResolutionIdentifierRole::Reference,
         ResolutionNamespace::Type,
     );
+    // Keep a caller-owned inventory gap distinct from the Java target. The
+    // legacy target-level reduction must also retain its Inventory attribution.
+    Arc::get_mut(&mut peer_state)
+        .expect("the fixture still owns its peer state exclusively")
+        .resolution_facts
+        .add_reference_enumeration_gap(reference_site, ResolutionGapKind::UnsupportedRoute);
+    prepare_peer(Arc::get_mut(&mut peer_state).expect("the fixture owns its peer state"));
     let java_generation = store
         .ensure_language_epoch_value("java", "selected-jvm-reverse-context-v1")
         .unwrap();
@@ -2291,6 +2376,53 @@ fn selected_java_reverse_for_qualified_peer_reference<A: LanguageAdapter>(
     let JvmReverseCandidateOutcome::Ready(candidates) = candidates else {
         panic!("selected JVM candidate inventory must be ready");
     };
+    use super::super::reverse::{ReverseEvidenceOrigin, ReverseSubject};
+    let target_inventory =
+        ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+            candidates.target.semantic,
+        )]);
+    let obligations = candidates
+        .evidence
+        .enumeration
+        .obligations
+        .iter()
+        .filter(|obligation| {
+            *obligation.subject() == ReverseSubject::Target(candidates.target.semantic)
+                && matches!(obligation.origin, ReverseEvidenceOrigin::Inventory)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        obligations.len(),
+        1,
+        "the synthesized inventory obligation must remain distinct from the peer boundary"
+    );
+    for obligation in obligations {
+        assert_eq!(obligation.completion, target_inventory);
+    }
+    assert_eq!(
+        candidates
+            .evidence
+            .enumeration
+            .obligations
+            .iter()
+            .filter(|obligation| {
+                matches!(obligation.origin, ReverseEvidenceOrigin::InventoryBoundary)
+            })
+            .count(),
+        usize::from(candidates.peer_language_inventory_open),
+    );
+    let ledger_completion = candidates
+        .evidence
+        .enumeration
+        .completion_for(|obligation| {
+            !matches!(obligation.origin, ReverseEvidenceOrigin::InventoryBoundary)
+        })
+        .combine(&candidates.evidence.binding.completion())
+        .combine(&candidates.evidence.metadata.completion());
+    assert_eq!(
+        ledger_completion, candidates.completion,
+        "the candidate ledger must retain every legacy inventory reason"
+    );
     assert!(
         candidates.candidates.iter().any(|candidate| {
             candidate.locator.storage_language() == peer_storage_language
@@ -2299,6 +2431,7 @@ fn selected_java_reverse_for_qualified_peer_reference<A: LanguageAdapter>(
         }),
         "the qualified peer reference must enter the shared JVM candidate set: {candidates:#?}"
     );
+    before_confirm(&store, &peer_oid.to_string());
     let confirmed = operation
         .confirm_jvm_reverse_candidates(
             candidates,
@@ -2322,6 +2455,8 @@ fn selected_java_reverse_confirms_a_qualified_scala_reference() {
         "src/main/scala/client/Use.scala",
         "package client\nclass Use { val value: model.Visible = new model.Visible() }\n",
         &ScalaAdapter,
+        |_| {},
+        |_, _| {},
     );
     assert!(
         confirmed.peer_language_inventory_open,
@@ -2356,6 +2491,8 @@ fn selected_java_reverse_confirms_a_qualified_kotlin_reference() {
         "src/main/kotlin/client/Use.kt",
         "package client\nclass Use { val value: model.Visible = model.Visible() }\n",
         &KotlinAdapter,
+        |_| {},
+        |_, _| {},
     );
     let binding = confirmed
         .references
@@ -2377,6 +2514,7 @@ fn selected_java_reverse_confirms_a_qualified_kotlin_reference() {
 }
 
 #[test]
+#[hardwon("#5796: incomplete caller inventory lost its target-level evidence obligation")]
 fn selected_java_reverse_keeps_an_omitted_qualified_scala_site_incomplete() {
     use crate::analyzer::scala::ScalaAdapter;
 
@@ -2386,6 +2524,8 @@ fn selected_java_reverse_keeps_an_omitted_qualified_scala_site_incomplete() {
         "src/main/scala/client/Use.scala",
         "package client\nclass Use { val missing: absent.Visible = null }\n",
         &ScalaAdapter,
+        |_| {},
+        |_, _| {},
     );
     assert!(
         confirmed.peer_language_inventory_open,
@@ -2701,3 +2841,472 @@ fn selected_java_same_package_parity_reopens_and_keeps_lexical_shadowing() {
     );
     assert_java_provider_visibility(&default, true);
 }
+
+#[allow(clippy::too_many_arguments)]
+fn publish_shared_jvm_consumer<A: LanguageAdapter>(
+    store: &AnalyzerStore,
+    root: &std::path::Path,
+    workspace: &WorkspaceId,
+    path: &str,
+    source: &str,
+    storage: &str,
+    language: Language,
+    adapter: &A,
+    configuration: &[WorkspaceConfigurationInput],
+) -> (
+    crate::analyzer::store::WorkspaceSnapshotId,
+    FileResolutionFacts,
+) {
+    let generation = store
+        .ensure_language_epoch_value(storage, "j0-private-member-consumer-v1")
+        .unwrap();
+    store
+        .ensure_resolution_producer_epoch(storage, language)
+        .unwrap();
+    let (state, facts) = parsed_operation_state(root, path, source, adapter);
+    let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+    let package = state.package_name.clone();
+    let prepared =
+        AnalyzerStore::prepare_parsed_blob(oid, storage, generation, adapter, state).unwrap();
+    let (outcomes, _) =
+        store.persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
+    assert!(
+        outcomes.iter().all(|outcome| outcome.error.is_none()),
+        "{outcomes:?}"
+    );
+    let snapshot = store
+        .sync_workspace_inputs_for_workspace(
+            workspace,
+            storage,
+            generation,
+            &[WorkspaceFileRow {
+                rel_path: path.to_owned(),
+                blob_oid: oid,
+            }],
+            &[],
+            &[],
+            &[WorkspacePackageFileRow {
+                package_name: package,
+                rel_path: path.to_owned(),
+            }],
+            &[],
+            &[],
+            configuration,
+            &[],
+        )
+        .unwrap();
+    (snapshot, facts)
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#5658: owner review found shared member proofs erased target kind and terminal evidence"
+)]
+fn shared_closer_private_jvm_member_consumer() {
+    use super::super::jvm_demand::shared_contract;
+    use crate::analyzer::scala::ScalaAdapter;
+    let consumer_path = "src/main/scala/use/Use.scala";
+
+    let provider_path = "src/main/java/dep/Base.java";
+    let cases = [
+        "class Base { val selected = 1 }",
+        "class Base extends Missing { val other = 1 }",
+    ];
+    let mut publications = Vec::new();
+    for ancestor_source in cases {
+        let consumer_source = format!(
+            "package use\n{ancestor_source}\nobject Child extends Base\nimport Child.selected\nobject Use {{ val answer = selected }}\n"
+        );
+        let provider_source = "package dep; public class Base { public int decoy; }\n";
+        let root = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&root.path().join("store.db")).unwrap();
+        let project = MutableGenerationProject::new(root.path(), Language::Scala);
+        let workspace = WorkspaceId(
+            "1919191919191919191919191919191919191919191919191919191919191919".to_owned(),
+        );
+        let configuration = [WorkspaceConfigurationInput::new("pom.xml".to_owned(), b"<project><groupId>test</groupId><artifactId>j0</artifactId><version>1</version></project>".to_vec().into_boxed_slice())];
+        let (scala, consumer_facts) = publish_shared_jvm_consumer(
+            &store,
+            root.path(),
+            &workspace,
+            consumer_path,
+            &consumer_source,
+            "scala",
+            Language::Scala,
+            &ScalaAdapter,
+            &configuration,
+        );
+        let (java, _) = publish_shared_jvm_consumer(
+            &store,
+            root.path(),
+            &workspace,
+            provider_path,
+            provider_source,
+            "java",
+            Language::Java,
+            &JavaAdapter,
+            &configuration,
+        );
+        let mut snapshots = WorkspaceSnapshots::default();
+        snapshots.insert("scala".to_owned(), scala);
+        snapshots.insert("java".to_owned(), java);
+        store.reconcile_jvm_package_contexts(&snapshots).unwrap();
+        let languages = [
+            SelectedResolutionLanguage::new("java", Language::Java),
+            SelectedResolutionLanguage::new("scala", Language::Scala),
+        ];
+        let cancellation = CancellationToken::new();
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+            .open_selected_resolution_operation(
+                SelectedResolutionOperationInput::new(
+                    &project,
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                ),
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("selected JVM fixture opens")
+        };
+        let mount = operation
+            .mounts()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.persisted_relative_path() == consumer_path)
+            .unwrap();
+        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+            mount.fragment(),
+            &operation.ready.shared_names(),
+            Language::Scala,
+            &consumer_facts,
+        );
+        crate::analyzer::resolution::record_fixture_selected_identity_catalog(
+            lowered.identities(),
+            operation
+                .ready
+                .inventory
+                .mount_record_by_ordinal(mount.ordinal())
+                .unwrap()
+                .fragment_digest()
+                .as_bytes(),
+        );
+        let report = shared_contract::run(&operation, consumer_path, &lowered, &cancellation);
+        assert!(
+            report.dependencies > 0,
+            "the real member phase must request hierarchy dependencies"
+        );
+        let complete = report.observation.completion == ResolutionCompletion::Complete;
+        if complete {
+            assert!(
+                !report.observation.owners.is_empty(),
+                "complete inherited member has a declaring owner"
+            );
+            assert!(
+                report.published,
+                "complete member publishes through shared tail"
+            );
+        } else {
+            assert!(
+                !report.published,
+                "an incomplete ancestor cannot publish a closed shared endpoint"
+            );
+        }
+        eprintln!(
+            "J0_CONSUMER published={} dependencies={} observation={:?}",
+            report.published, report.dependencies, report.observation
+        );
+        publications.push(report.published);
+    }
+    assert_eq!(
+        publications,
+        [true, false],
+        "closed and incomplete ancestor fixtures stay distinct"
+    );
+}
+
+#[test]
+fn shared_closer_discovered_jvm_provider_witness() {
+    use super::super::jvm_demand::shared_contract;
+    use crate::analyzer::{kotlin::KotlinAdapter, scala::ScalaAdapter};
+    for (language, storage, path, source) in [
+        (
+            Language::Kotlin,
+            "kotlin",
+            "src/main/kotlin/use/Use.kt",
+            "package use\nimport absent.*\nclass List\nfun echo(value: List): List = value\n",
+        ),
+        (
+            Language::Scala,
+            "scala",
+            "src/main/scala/use/Use.scala",
+            "package use\nimport absent._\nclass List\nobject Use { def echo(value: List): List = value }\n",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&root.path().join("store.db")).unwrap();
+        let project = MutableGenerationProject::new(root.path(), language);
+        let workspace = WorkspaceId(
+            "2121212121212121212121212121212121212121212121212121212121212121".to_owned(),
+        );
+        let configuration = [WorkspaceConfigurationInput::new("pom.xml".to_owned(),
+            b"<project><groupId>test</groupId><artifactId>j1</artifactId><version>1</version></project>".to_vec().into_boxed_slice())];
+        let (snapshot, facts) = match language {
+            Language::Kotlin => publish_shared_jvm_consumer(
+                &store,
+                root.path(),
+                &workspace,
+                path,
+                source,
+                storage,
+                language,
+                &KotlinAdapter,
+                &configuration,
+            ),
+            Language::Scala => publish_shared_jvm_consumer(
+                &store,
+                root.path(),
+                &workspace,
+                path,
+                source,
+                storage,
+                language,
+                &ScalaAdapter,
+                &configuration,
+            ),
+            _ => unreachable!(),
+        };
+        let mut snapshots = WorkspaceSnapshots::default();
+        snapshots.insert(storage.to_owned(), snapshot);
+        store.reconcile_jvm_package_contexts(&snapshots).unwrap();
+        let languages = [SelectedResolutionLanguage::new(storage, language)];
+        let cancellation = CancellationToken::new();
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+            .open_selected_resolution_operation(
+                SelectedResolutionOperationInput::new(
+                    &project,
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                ),
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("consumer opens")
+        };
+        let mount = operation
+            .mounts()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.persisted_relative_path() == path)
+            .unwrap();
+        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+            mount.fragment(),
+            &operation.ready.shared_names(),
+            language,
+            &facts,
+        );
+        crate::analyzer::resolution::record_fixture_selected_identity_catalog(
+            lowered.identities(),
+            operation
+                .ready
+                .inventory
+                .mount_record_by_ordinal(mount.ordinal())
+                .unwrap()
+                .fragment_digest()
+                .as_bytes(),
+        );
+        shared_contract::run_discovered(
+            &operation,
+            language,
+            storage,
+            path,
+            &lowered,
+            &cancellation,
+        );
+    }
+}
+
+// Omit the owner projection before publication. The package-object case
+// exercises the shared missing-source branch while retaining semantic binding.
+#[test]
+fn selected_java_reverse_missing_scala_package_object_is_an_error() {
+    let (confirmed, site) = selected_java_reverse_for_qualified_peer_reference(
+        Language::Scala,
+        "scala",
+        "src/main/scala/client/package.scala",
+        "package object client { val value: model.Visible = new model.Visible() }\n",
+        &crate::analyzer::scala::ScalaAdapter,
+        |state| {
+            assert!(!state.source_declaration_units.is_empty());
+            state.source_declaration_metadata.clear();
+            state.source_declaration_units.clear();
+        },
+        |_, _| {},
+    );
+    let reference = confirmed
+        .references
+        .into_iter()
+        .find(|reference| {
+            reference.locator.storage_language() == "scala"
+                && reference.locator.source_site() == Some(site)
+        })
+        .expect("the semantic reference survives missing native owner rows");
+    assert!(
+        reference
+            .answer
+            .binding()
+            .targets()
+            .contains(&confirmed.target)
+    );
+    assert!(matches!(
+        reference.owner,
+        super::super::reverse::ReverseEnclosingUnit::MissingSource
+    ));
+    assert!(reference.owner.into_unit().is_err());
+}
+
+#[test]
+fn selected_java_reverse_keeps_a_known_absent_owner() {
+    let (confirmed, site) = selected_java_reverse_for_qualified_peer_reference(
+        Language::Scala,
+        "scala",
+        "src/main/scala/client/Use.scala",
+        "package client\nclass Use { val value: model.Visible = new model.Visible() }\n",
+        &crate::analyzer::scala::ScalaAdapter,
+        |_| {},
+        |store, oid| {
+            let oid = oid.to_owned();
+            store.conn.execute(move |connection| {
+                connection.execute(
+                    "UPDATE resolution_sites SET owner=-1 WHERE role=0 AND blob_id IN (SELECT id FROM blobs WHERE blob_oid=?1)",
+                    [oid],
+                )
+            }).unwrap();
+        },
+    );
+    let reference = confirmed
+        .references
+        .into_iter()
+        .find(|reference| {
+            reference.locator.storage_language() == "scala"
+                && reference.locator.source_site() == Some(site)
+        })
+        .expect("the known-no-owner reference survives confirmation");
+    assert!(
+        reference
+            .answer
+            .binding()
+            .targets()
+            .contains(&confirmed.target)
+    );
+    assert!(matches!(
+        reference.owner,
+        super::super::reverse::ReverseEnclosingUnit::NoEnclosingUnit
+    ));
+    assert!(reference.owner.into_unit().unwrap().is_none());
+}
+
+#[test]
+fn selected_jvm_reverse_cancellation_wrappers_leave_retry_answers_unchanged() {
+    let fixture = JavaRootResolutionOperationFixture::new();
+    let (provider, _) = super::parsed_operation_state(
+        fixture.project_root.path(),
+        JAVA_ROOT_PROVIDER_PATH,
+        JAVA_ROOT_SOURCES[1].1,
+        &JavaAdapter,
+    );
+    let target = provider
+        .declarations
+        .iter()
+        .find(|unit| unit.short_name() == "Target" && unit.is_class())
+        .expect("the public reverse target");
+    let query = |cancellation: &CancellationToken| {
+        let admission = CancellationToken::new();
+        let operation = fixture.open_ready(&admission);
+        let JvmReverseCandidateOutcome::Ready(candidates) = operation
+            .jvm_reverse_candidate_sites(target, &admission)
+            .unwrap()
+        else {
+            panic!("the candidate inventory is available before cancellation")
+        };
+        operation
+            .confirm_jvm_reverse_candidates(
+                candidates,
+                cancellation,
+                &mut SelectedResolutionContextMetrics,
+            )
+            .unwrap()
+    };
+    let render = |confirmed: &JvmReverseConfirmed| {
+        let mut rows = confirmed
+            .references
+            .iter()
+            .map(|reference| {
+                let owner = match &reference.owner {
+                    super::super::reverse::ReverseEnclosingUnit::Unit(unit) => unit.fq_name(),
+                    super::super::reverse::ReverseEnclosingUnit::NoEnclosingUnit => {
+                        "<no enclosing unit>".into()
+                    }
+                    super::super::reverse::ReverseEnclosingUnit::MissingSource => {
+                        "<missing source>".into()
+                    }
+                };
+                format!(
+                    "{:?} target={} alternatives={} binding={:?} full={:?} owner={owner}",
+                    reference.locator,
+                    reference
+                        .answer
+                        .binding()
+                        .targets()
+                        .contains(&confirmed.target),
+                    reference.answer.binding().targets().len(),
+                    reference.answer.binding().completion(),
+                    reference.answer.completion(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        (confirmed.completion.clone(), rows)
+    };
+    let SelectedResolutionOperationOutcome::Native(baseline) = query(&CancellationToken::new())
+    else {
+        panic!("the unbounded reverse request completes")
+    };
+    let baseline = render(&baseline);
+    let mut cancelled = 0;
+    // Deterministic token wrappers exercise early and late lifecycle checks,
+    // including the forward callback, without depending on wall-clock timing.
+    for checks in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096] {
+        let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+        match query(&cancellation) {
+            SelectedResolutionOperationOutcome::Cancelled(completion) => {
+                cancelled += 1;
+                assert_eq!(completion.combine(&cancelled_completion()), completion);
+            }
+            SelectedResolutionOperationOutcome::Native(answer) => {
+                assert_eq!(render(&answer), baseline)
+            }
+            _ => panic!("a cancellation wrapper changed the reverse outcome"),
+        }
+        let SelectedResolutionOperationOutcome::Native(retry) = query(&CancellationToken::new())
+        else {
+            panic!("cancellation must not leak staged state into the retry")
+        };
+        assert_eq!(
+            render(&retry),
+            baseline,
+            "retry after cancellation limit {checks}"
+        );
+    }
+    assert!(
+        cancelled > 0,
+        "the wrappers must actually observe cancellation"
+    );
+}
+
+use crate::analyzer::store::resolution_operation::resolution_operation_tests_go_support::go_extraction_support_11::{mount_lookup, assert_empty_context_metrics};

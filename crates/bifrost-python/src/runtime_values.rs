@@ -490,7 +490,11 @@ fn execution_context_accessor_coverage(
             }));
             continue;
         }
-        if node.kind() == "call" && can_precede(node_source_range(node), read_range, node) {
+        if node.kind() == "call"
+            && python_hazard_can_precede_bounded(node_source_range(node), read_range, node, || {
+                budget.visit()
+            }) != Some(false)
+        {
             return PythonRuntimeAccessorCoverage::UnknownAccessorEffects;
         }
         let mut cursor = node.walk();
@@ -508,21 +512,32 @@ fn execution_context_accessor_coverage(
 /// A hazard inside a loop that also contains the read can run before it on a
 /// later iteration, so the loop is checked structurally rather than by
 /// position alone.
-fn can_precede(hazard: Range, read_range: Range, hazard_node: Node<'_>) -> bool {
+pub(crate) fn python_hazard_can_precede_bounded(
+    hazard: Range,
+    read_range: Range,
+    hazard_node: Node<'_>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
+    if !scope_step() {
+        return None;
+    }
     if hazard.end_byte <= read_range.start_byte {
-        return true;
+        return Some(true);
     }
     let mut current = hazard_node;
     while let Some(parent) = current.parent() {
+        if !scope_step() {
+            return None;
+        }
         if matches!(parent.kind(), "for_statement" | "while_statement")
             && parent.start_byte() <= read_range.start_byte
             && read_range.end_byte <= parent.end_byte()
         {
-            return true;
+            return Some(true);
         }
         current = parent;
     }
-    false
+    Some(false)
 }
 
 /// The module whose object escapes at this identifier, when one does.

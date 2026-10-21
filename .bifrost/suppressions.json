@@ -86,18 +86,6 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "0f24fa8b44b904743f3b8f483f8793a32726f6a1758b156b68b3bd6b825534e9",
-      "path": "crates/bifrost-analysis/src/analyzer/rust/dependency_discovery.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "4fb0f1316d0af15c4bb07c7ecd209fa9afcf0c5b95cdc2a975af896ccd50d3c7",
       "path": "plugins/bifrost-agent/test/sync-release-version.test.mjs",

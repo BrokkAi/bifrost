@@ -16,7 +16,8 @@ publish = true
 name = "brokk_bifrost_go"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.13.1" }
+serde = { version = "1.0.228", features = ["derive"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0" }
 rayon = "1.10.0"
 regex = "1.12.2"
 tree-sitter = "0.25.10"
@@ -24,7 +25,7 @@ tree-sitter-go = "0.25.0"
 
 [dev-dependencies]
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.13.1", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0", features = ["test-support"] }
 tempfile = "3.23.0"
 
 [features]

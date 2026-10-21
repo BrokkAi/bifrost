@@ -38,6 +38,8 @@ pub enum RqlpDocumentKind {
     Policy,
     Endpoint,
     EndpointSet,
+    /// A reviewed set of exact declarations that a policy imports (#5931).
+    DeclarationSelection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,10 +60,15 @@ pub struct DocumentOwners(u8);
 impl DocumentOwners {
     const POLICY_BIT: u8 = 1;
     const ENDPOINT_BIT: u8 = 2;
+    const DECLARATION_SELECTION_BIT: u8 = 4;
 
     pub const POLICY: Self = Self(Self::POLICY_BIT);
     pub const ENDPOINT: Self = Self(Self::ENDPOINT_BIT);
     pub const BOTH: Self = Self(Self::POLICY_BIT | Self::ENDPOINT_BIT);
+    pub const DECLARATION_SELECTION: Self = Self(Self::DECLARATION_SELECTION_BIT);
+    /// Inline RQL is the one selector form every document kind accepts.
+    pub const ANY: Self =
+        Self(Self::POLICY_BIT | Self::ENDPOINT_BIT | Self::DECLARATION_SELECTION_BIT);
 
     pub const fn contains(self, kind: RqlpDocumentKind) -> bool {
         let bit = match kind {
@@ -73,6 +80,7 @@ impl DocumentOwners {
             // existing taint entry descriptors apply without duplicating all
             // of their applicability metadata.
             RqlpDocumentKind::EndpointSet => Self::POLICY_BIT | Self::ENDPOINT_BIT,
+            RqlpDocumentKind::DeclarationSelection => Self::DECLARATION_SELECTION_BIT,
         };
         self.0 & bit != 0
     }
@@ -149,6 +157,9 @@ impl OwnerApplicability {
     );
     pub const ENDPOINT: Self = Self::new(DocumentOwners::ENDPOINT, AnalysisOwners::NONE);
     pub const BOTH: Self = Self::new(DocumentOwners::BOTH, AnalysisOwners::ALL);
+    pub const DECLARATION_SELECTION: Self =
+        Self::new(DocumentOwners::DECLARATION_SELECTION, AnalysisOwners::NONE);
+    pub const ANY_DOCUMENT: Self = Self::new(DocumentOwners::ANY, AnalysisOwners::ALL);
 
     pub const fn new(documents: DocumentOwners, analyses: AnalysisOwners) -> Self {
         Self {
@@ -171,7 +182,9 @@ impl OwnerApplicability {
             return false;
         }
         match document {
-            RqlpDocumentKind::Endpoint | RqlpDocumentKind::EndpointSet => true,
+            RqlpDocumentKind::Endpoint
+            | RqlpDocumentKind::EndpointSet
+            | RqlpDocumentKind::DeclarationSelection => true,
             RqlpDocumentKind::Policy => match analysis {
                 Some(kind) => self.analyses.contains(kind),
                 None => false,
@@ -251,6 +264,9 @@ policy_records! {
     Policy { labels: ["policy"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)", description: "Define one executable static-analysis policy." }
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
     EndpointSetDocument { labels: ["endpoint-set-document"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint-set-document [:schema-version N] :kind KIND [:language LANGUAGE] [:rql-schema-version N] :set (endpoint-set ...))", description: "Define one standalone typed endpoint-set document for nested policy imports." }
+    DeclarationSelectionDocument { labels: ["declaration-selection-document"], layout: KeywordPairs, owner: OwnerApplicability::DECLARATION_SELECTION, signature: "(declaration-selection-document [:schema-version N] :language LANGUAGE [:rql-schema-version N] :declarations [(rql ...)...])", description: "Define one standalone reviewed set of exact declarations for a policy to import." }
+    DeclarationSelectionFile { labels: ["declaration-selection-file"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(declaration-selection-file :path \"workspace-relative.rqlp\" :language LANGUAGE)", description: "Bind the declarations of one workspace-relative declaration-selection document; a missing or invalid document fails activation." }
+    ProcedureEffectsOf { labels: ["procedure-effects-of"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(procedure-effects-of :binding NAME)", description: "Bind the procedure effects of the declarations an earlier row binding selects, so both bindings read one selection." }
     EndpointSetFile { labels: ["endpoint-set-file"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])", description: "Reference one nested typed endpoint-set document by workspace-relative path." }
     Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion|flow ...)", description: "Select and configure exactly one policy analysis kind." }
     Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME :query SELECTOR)", description: "Bind one named typed row relation from a CodeQuery." }
@@ -277,7 +293,7 @@ policy_records! {
     CardinalityExactly { labels: ["exactly"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(exactly N)", description: "Require exactly N joined occurrence rows." }
     CardinalityAtLeast { labels: ["at-least"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-least N)", description: "Require at least N joined occurrence rows." }
     CardinalityAtMost { labels: ["at-most"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-most N)", description: "Require at most N joined occurrence rows." }
-    Rql { labels: ["rql"], layout: Mixed, owner: OwnerApplicability::BOTH, signature: "(rql [:schema-version N] QUERY)", description: "Embed one native RQL selector without rendering or reparsing it." }
+    Rql { labels: ["rql"], layout: Mixed, owner: OwnerApplicability::ANY_DOCUMENT, signature: "(rql [:schema-version N] QUERY)", description: "Embed one native RQL selector without rendering or reparsing it." }
     RqlFile { labels: ["rql-file"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(rql-file [:schema-version N] :path \"workspace/relative.rql\")", description: "Reference one workspace-relative RQL selector for deferred loading." }
     GeneratedMessage { labels: ["generated-message"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(generated-message :relation can-reach)", description: "Generate the fixed source-display can-reach sink-display message after proven flow." }
     CvssSeverity { labels: ["cvss-severity"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(cvss-severity :when-unscored unrated|note|warning|error)", description: "Derive severity from CVSS with an explicit unscored fallback." }
@@ -632,6 +648,8 @@ macro_rules! value_shapes {
                     | Self::ReportOptions
                     | Self::WitnessOptions
                     | Self::Selector
+                    | Self::RowBindingQuery
+                    | Self::DeclarationSelectors
                     | Self::RqlQuery
                     | Self::EndpointSemantics
                     | Self::TaintEndpointSet
@@ -719,6 +737,13 @@ macro_rules! value_shapes {
                     Self::Severity => &[PolicyRecord::CvssSeverity],
                     Self::FixedOrUnratedSeverity => &[],
                     Self::Selector => &[PolicyRecord::Rql, PolicyRecord::RqlFile],
+                    Self::RowBindingQuery => &[
+                        PolicyRecord::Rql,
+                        PolicyRecord::RqlFile,
+                        PolicyRecord::DeclarationSelectionFile,
+                        PolicyRecord::ProcedureEffectsOf,
+                    ],
+                    Self::DeclarationSelectors => &[PolicyRecord::Rql],
                     Self::EndpointBinding
                     | Self::PolicyPort
                     | Self::TypestateBinding
@@ -990,6 +1015,8 @@ value_shapes! {
     ReportOptions => "a report record",
     WitnessOptions => "a witness record",
     Selector => "an inline rql or deferred rql-file selector",
+    RowBindingQuery => "an inline rql, deferred rql-file, declaration-selection-file, or procedure-effects-of selector",
+    DeclarationSelectors => "one or more inline rql exact declaration selectors",
     RqlQuery => "one native RQL query expression",
     Severity => "note, warning, error, unrated, or a cvss-severity record",
     FixedOrUnratedSeverity => "note, warning, error, or unrated",
@@ -1238,6 +1265,13 @@ policy_fields! {
     EndpointSetDocumentLanguage { record: EndpointSetDocument, labels: ["language"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SelectorLanguages, owner: OwnerApplicability::ENDPOINT, signature: ":language LANGUAGE", description: "Provide one inherited analyzer language default for selectors in this document." }
     EndpointSetDocumentRqlSchemaVersion { record: EndpointSetDocument, labels: ["rql-schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::ENDPOINT, signature: ":rql-schema-version N", description: "Provide one inherited RQL schema version default for selectors in this document." }
     EndpointSetDocumentSet { record: EndpointSetDocument, labels: ["set"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::ENDPOINT, signature: ":set (endpoint-set ...)", description: "Provide the typed endpoint-set contents." }
+    DeclarationSelectionDocumentSchemaVersion { record: DeclarationSelectionDocument, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::DECLARATION_SELECTION, signature: ":schema-version N", description: "Pin the standalone declaration-selection document version exactly." }
+    DeclarationSelectionDocumentLanguage { record: DeclarationSelectionDocument, labels: ["language"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: SelectorLanguages, owner: OwnerApplicability::DECLARATION_SELECTION, signature: ":language LANGUAGE", description: "Declare the one analyzer language of every selected declaration; it must equal the importing reference's language." }
+    DeclarationSelectionDocumentRqlSchemaVersion { record: DeclarationSelectionDocument, labels: ["rql-schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::DECLARATION_SELECTION, signature: ":rql-schema-version N", description: "Provide one inherited RQL schema version default for selectors in this document." }
+    DeclarationSelectionDocumentDeclarations { record: DeclarationSelectionDocument, labels: ["declarations"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::set(1, brokk_bifrost_rql::query::MAX_QUERY_BRANCHES), shape: DeclarationSelectors, owner: OwnerApplicability::DECLARATION_SELECTION, signature: ":declarations [(rql (enclosing-decl ...))...]", description: "List the exact declarations: each an inline enclosing-decl selector of a function, method, or class with an exact name, optionally inside one exactly named owner." }
+    DeclarationSelectionFilePath { record: DeclarationSelectionFile, labels: ["path"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: WorkspacePath, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":path \"workspace-relative.rqlp\"", description: "Name one workspace-relative declaration-selection document." }
+    DeclarationSelectionFileLanguage { record: DeclarationSelectionFile, labels: ["language"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: SelectorLanguages, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":language LANGUAGE", description: "Require the imported document to select declarations of exactly this analyzer language." }
+    ProcedureEffectsOfBinding { record: ProcedureEffectsOf, labels: ["binding"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":binding NAME", description: "Name the earlier row binding whose selected declarations feed procedure-effects." }
     EndpointSetFilePath { record: EndpointSetFile, labels: ["path"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: WorkspacePath, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":path \"workspace-relative.rqlp\"", description: "Name one workspace-relative endpoint-set document." }
     EndpointSetFileSha256 { record: EndpointSetFile, labels: ["sha256"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Sha256, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":sha256 \"64-lower-hex\"", description: "Optionally pin the imported endpoint-set semantic content hash." }
 
@@ -1270,7 +1304,7 @@ policy_fields! {
     AnalysisAutomaton { record: Analysis, labels: ["automaton"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AutomatonSpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":automaton (automaton ...)", description: "Declare the author-facing typestate automaton and terminal obligations." }
 
     BindName { record: Bind, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":name NAME", description: "Set the unique row binding name." }
-    BindQuery { record: Bind, labels: ["query"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":query (rql ...)|(rql-file ...)", description: "Execute one typed CodeQuery as the binding source." }
+    BindQuery { record: Bind, labels: ["query"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowBindingQuery, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":query (rql ...)|(rql-file ...)|(declaration-selection-file ...)|(procedure-effects-of ...)", description: "Execute one typed CodeQuery as the binding source." }
     JoinLeft { record: Join, labels: ["left"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":left NAME", description: "Name the left row binding." }
     JoinRight { record: Join, labels: ["right"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":right NAME", description: "Name the right row binding." }
     JoinKind { record: Join, labels: ["kind"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowJoinKind, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":kind inner|semi|anti", description: "Choose an inner join, a semi join that keeps matching left rows without the right relation columns, or an anti-join that keeps left rows with no partner; omission means inner." }
@@ -1293,8 +1327,8 @@ policy_fields! {
     WinningTierCandidates { record: RowAssertSelectedInWinningTier, labels: ["candidates"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":candidates NAME", description: "Name the binding holding the callable-applicability rows of the same sites." }
     WinningTierCardinality { record: RowAssertSelectedInWinningTier, labels: ["cardinality"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: AssertCardinality, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":cardinality (exactly|at-least|at-most N)", description: "Bound the number of candidates that are both selected and applicable; omission means exactly 1. State (exactly 0) to assert an unresolved site and (at-least 2) to assert an ambiguous one." }
 
-    RqlSchemaVersion { record: Rql, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::BOTH, signature: ":schema-version N", description: "Pin the nested RQL version exactly; omission uses the RQL compatible head." }
-    RqlQuery { record: Rql, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: RqlQuery, owner: OwnerApplicability::BOTH, signature: "QUERY", description: "Embed exactly one spanned RQL query subtree." }
+    RqlSchemaVersion { record: Rql, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::ANY_DOCUMENT, signature: ":schema-version N", description: "Pin the nested RQL version exactly; omission uses the RQL compatible head." }
+    RqlQuery { record: Rql, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: RqlQuery, owner: OwnerApplicability::ANY_DOCUMENT, signature: "QUERY", description: "Embed exactly one spanned RQL query subtree." }
     RqlFileSchemaVersion { record: RqlFile, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::BOTH, signature: ":schema-version N", description: "Pin or constrain the referenced RQL document version." }
     RqlFilePath { record: RqlFile, labels: ["path"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: WorkspacePath, owner: OwnerApplicability::BOTH, signature: ":path \"queries/name.rql\"", description: "Name one workspace-root-relative RQL file for deferred loading." }
 

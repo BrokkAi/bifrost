@@ -189,7 +189,7 @@ jobs:
           set -euo pipefail
           endpoint="https://crates.io/api/v1/crates/${CRATE_PACKAGE}/${RELEASE_VERSION}"
           response="$RUNNER_TEMP/crates-io-visible.json"
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
               --output "$response" --write-out '%{http_code}' --user-agent 'bifrost-qualified-crate' "$endpoint")"
             if [[ "$status" == 200 ]]; then

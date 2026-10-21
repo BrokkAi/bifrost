@@ -27,7 +27,6 @@ use crate::analyzer::usages::call_shape::CallShapeReport;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
-use serde::{Deserialize, Serialize};
 
 /// Identity of an external declaration or a scope-proven static type.
 ///
@@ -194,7 +193,8 @@ impl ExternalConversionIdentity {
 }
 
 /// Complete conversion evidence, a proven rejection, or unresolved applicability.
-pub(crate) enum ModelArgumentApplicability {
+#[doc(hidden)]
+pub enum ModelArgumentApplicability {
     Applicable(Box<ArgumentTypeConversion>),
     Inapplicable,
     Unknown(ConversionUnknown),
@@ -204,7 +204,8 @@ pub(crate) enum ModelArgumentApplicability {
 ///
 /// The shared relation owns exact call/signature/actual/formal joins and delegates only
 /// owner applicability and one AST-backed actual/formal proof to the selected language.
-pub(crate) trait CallArgumentConversionProver: Send + Sync {
+#[doc(hidden)]
+pub trait CallArgumentConversionProver: Send + Sync {
     /// Validate applicability constraints owned by the formal language syntax.
     fn validate_owner(&self, _owner: tree_sitter::Node<'_>) -> Result<(), ConversionUnknown> {
         Ok(())
@@ -270,17 +271,7 @@ pub(crate) trait CallArgumentConversionProver: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JavaPrimitive {
-    Boolean,
-    Byte,
-    Short,
-    Char,
-    Int,
-    Long,
-    Float,
-    Double,
-}
+pub use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CSharpPrimitive {
@@ -486,57 +477,7 @@ impl ConversionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ConversionUnknown {
-    UnsupportedLanguage,
-    UnresolvedSignature,
-    UnresolvedSourceType,
-    UnresolvedTargetType,
-    AmbiguousBinding,
-    GenericSubstitution,
-    UnsupportedConversion,
-    UnsupportedExpression,
-    IncompleteHierarchy,
-    BudgetExhausted,
-    Cancelled,
-    /// Another actual prevents establishing applicability of this signature.
-    SignatureApplicability,
-}
-
-impl ConversionUnknown {
-    pub const LABELS: &'static [&'static str] = &[
-        "unsupported_language",
-        "unresolved_signature",
-        "unresolved_source_type",
-        "unresolved_target_type",
-        "ambiguous_binding",
-        "generic_substitution",
-        "unsupported_conversion",
-        "unsupported_expression",
-        "incomplete_hierarchy",
-        "budget_exhausted",
-        "cancelled",
-        "signature_applicability",
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::UnsupportedLanguage => "unsupported_language",
-            Self::UnresolvedSignature => "unresolved_signature",
-            Self::UnresolvedSourceType => "unresolved_source_type",
-            Self::UnresolvedTargetType => "unresolved_target_type",
-            Self::AmbiguousBinding => "ambiguous_binding",
-            Self::GenericSubstitution => "generic_substitution",
-            Self::UnsupportedConversion => "unsupported_conversion",
-            Self::UnsupportedExpression => "unsupported_expression",
-            Self::IncompleteHierarchy => "incomplete_hierarchy",
-            Self::BudgetExhausted => "budget_exhausted",
-            Self::Cancelled => "cancelled",
-            Self::SignatureApplicability => "signature_applicability",
-        }
-    }
-}
+pub use crate::analyzer::semantic::call_conversion::ConversionUnknown;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArgumentTypeConversion {

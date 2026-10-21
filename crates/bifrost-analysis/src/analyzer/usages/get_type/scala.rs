@@ -1,7 +1,9 @@
 use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, ResolutionSession, ScalaDefinitionProvider, ScalaTypeLookupResolution,
-    scala_type_lookup_resolution_in_session,
+    BoundedResolution, ResolutionSession,
+    scala::{
+        ScalaDefinitionProvider, ScalaTypeLookupResolution, scala_type_lookup_resolution_in_session,
+    },
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;

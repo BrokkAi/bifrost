@@ -3,9 +3,7 @@
 use super::call_binding::CallBindingValue;
 use super::results::{CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact};
 use super::*;
-use brokk_bifrost_analysis::analyzer::{
-    cpp_provenance_for_anchor, cpp_provenance_for_anchor_with_model_key,
-};
+
 use brokk_bifrost_core::analyzer::cpp_facts::{CppProvenanceFact, CppProvenanceRule};
 use brokk_bifrost_rql::CppProvenanceFilter;
 
@@ -174,3 +172,6 @@ fn report_incomplete(
         withheld_rows_path: None,
     });
 }
+
+use brokk_bifrost_cpp_analysis::analyzer::cpp_provenance_for_anchor;
+use brokk_bifrost_cpp_analysis::analyzer::cpp_provenance_for_anchor_with_model_key;

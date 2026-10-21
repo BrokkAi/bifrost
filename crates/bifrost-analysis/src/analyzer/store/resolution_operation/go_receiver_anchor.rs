@@ -4,7 +4,8 @@ use super::*;
 use crate::analyzer::resolution::{ResolutionSlotValue, ResolutionTypeRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum GoReceiverAnchorRole {
+#[doc(hidden)]
+pub enum GoReceiverAnchorRole {
     FieldType,
     BindingValue,
     BindingParameter,
@@ -27,15 +28,21 @@ impl GoReceiverAnchorRole {
 /// receiver. The declaration is already selected in its owning blob; callers
 /// can share the following keyed declared-type/member reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GoReceiverTypeAnchor {
-    pub(crate) mount: SelectedResolutionMountOrdinal,
-    pub(crate) definition: SemanticId,
-    pub(crate) role: GoReceiverAnchorRole,
-    pub(crate) member_name: String,
+#[doc(hidden)]
+pub struct GoReceiverTypeAnchor {
+    #[doc(hidden)]
+    pub mount: SelectedResolutionMountOrdinal,
+    #[doc(hidden)]
+    pub definition: SemanticId,
+    #[doc(hidden)]
+    pub role: GoReceiverAnchorRole,
+    #[doc(hidden)]
+    pub member_name: String,
 }
 
 impl GoReceiverTypeAnchor {
-    pub(crate) fn field_type(member: SemanticId, member_name: String) -> Self {
+    #[doc(hidden)]
+    pub fn field_type(member: SemanticId, member_name: String) -> Self {
         let mount = SelectedResolutionMountOrdinal::new(
             member
                 .ordinal()
@@ -51,16 +58,23 @@ impl GoReceiverTypeAnchor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct GoReceiverReferenceBinding {
-    pub(crate) reference: SemanticId,
-    pub(crate) definition: SemanticId,
+#[doc(hidden)]
+pub struct GoReceiverReferenceBinding {
+    #[doc(hidden)]
+    pub reference: SemanticId,
+    #[doc(hidden)]
+    pub definition: SemanticId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GoReceiverAnchorTypes {
-    pub(crate) receiver_type: ResolutionTypeRef,
-    pub(crate) reference_bindings: Box<[GoReceiverReferenceBinding]>,
-    pub(crate) typed_slots: Box<[(SemanticId, ResolutionSlotValue)]>,
+#[doc(hidden)]
+pub struct GoReceiverAnchorTypes {
+    #[doc(hidden)]
+    pub receiver_type: ResolutionTypeRef,
+    #[doc(hidden)]
+    pub reference_bindings: Box<[GoReceiverReferenceBinding]>,
+    #[doc(hidden)]
+    pub typed_slots: Box<[(SemanticId, ResolutionSlotValue)]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -81,7 +95,8 @@ pub(super) type GoReceiverAnchorTypesMemo = super::super::selected_read_memo::Ex
 >;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GoReceiverAnchorMember {
+#[doc(hidden)]
+pub enum GoReceiverAnchorMember {
     Known {
         receiver_type: ResolutionTypeRef,
         member: SemanticId,
@@ -627,7 +642,8 @@ ORDER BY package_file.mount_ordinal,semantic.semantic_key
 "#;
 
 impl SelectedResolutionOperation<'_, '_> {
-    pub(crate) fn go_point_reference_at(
+    #[doc(hidden)]
+    pub fn go_point_reference_at(
         &self,
         caller_path: &str,
         start_byte: usize,
@@ -665,7 +681,8 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Select the callable identity at a call site. Generic Go invocations
     /// can publish a type-name and callable reference at the same byte range.
-    pub(crate) fn go_point_call_reference_at(
+    #[doc(hidden)]
+    pub fn go_point_call_reference_at(
         &self,
         caller_path: &str,
         start_byte: usize,
@@ -701,7 +718,8 @@ impl SelectedResolutionOperation<'_, '_> {
         )))
     }
 
-    pub(crate) fn go_point_expression_value_slot_at(
+    #[doc(hidden)]
+    pub fn go_point_expression_value_slot_at(
         &self,
         caller_path: &str,
         start_byte: usize,
@@ -795,7 +813,8 @@ impl SelectedResolutionOperation<'_, '_> {
         )))
     }
 
-    pub(crate) fn go_point_callable_result_slot(
+    #[doc(hidden)]
+    pub fn go_point_callable_result_slot(
         &self,
         caller_path: &str,
         reference: SemanticId,
@@ -834,7 +853,8 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Select a package function's persisted callable-result anchor from one
     /// exact call reference in the caller blob.
-    pub(crate) fn go_point_callable_result_anchor(
+    #[doc(hidden)]
+    pub fn go_point_callable_result_anchor(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -907,7 +927,8 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     /// Read the declared Go type name belonging to one selected type identity.
-    pub(crate) fn go_point_type_name(
+    #[doc(hidden)]
+    pub fn go_point_type_name(
         &self,
         identity: SemanticId,
         cancellation: &CancellationToken,
@@ -934,7 +955,8 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(name))
     }
 
-    pub(crate) fn go_point_receiver_slot(
+    #[doc(hidden)]
+    pub fn go_point_receiver_slot(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -973,7 +995,8 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn go_point_receiver_type_anchor(
+    #[doc(hidden)]
+    pub fn go_point_receiver_type_anchor(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -1056,7 +1079,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Select the exact local or parameter binding whose declared type
     /// anchors a Go receiver. The AST supplies the selected declaration-name
     /// range; each join stays within that caller blob.
-    pub(crate) fn go_point_binding_type_anchor(
+    #[doc(hidden)]
+    pub fn go_point_binding_type_anchor(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -1136,7 +1160,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Resolve the type declared by one selected field/callable anchor and the
     /// declaration of `member_name` under that type. This is a fixed number of
     /// keyed reads, shared by Go point confirmation and reverse candidates.
-    pub(crate) fn resolve_go_receiver_anchor_member(
+    #[doc(hidden)]
+    pub fn resolve_go_receiver_anchor_member(
         &self,
         context_id: i64,
         package_id: i64,
@@ -1223,7 +1248,8 @@ impl SelectedResolutionOperation<'_, '_> {
         })
     }
 
-    pub(crate) fn go_receiver_anchor_types(
+    #[doc(hidden)]
+    pub fn go_receiver_anchor_types(
         &self,
         context_id: i64,
         package_id: i64,

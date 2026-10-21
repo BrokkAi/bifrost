@@ -14,10 +14,15 @@ jobs:
     # A cold runner needs compilation, all workspace libraries, and doctests.
     # Keep that coverage independent of whether a dependency cache is available.
     timeout-minutes: 90
-    # Exact public compilation passed on 16 GiB with two compiler jobs.
-    # Bound overlapping rustc/link processes; test scheduling stays unchanged.
+    # One compiler job. The brokk-bifrost-analysis lib and its lib-test
+    # harness each peak near 12 GB (max RSS 12.1-12.2 GB in public runs
+    # 39188363767 and 39216334491) on a 16 GiB runner. On a cold cache the
+    # harness waits for its dev-dependencies, so two jobs never overlapped
+    # them. A warm dependency cache starts both at once, and the runner was
+    # lost twice ("shutdown signal", exit 143) minutes after analysis began
+    # compiling. Test scheduling stays unchanged.
     env:
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 1
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -26,7 +31,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
           components: rustfmt
 
       - name: Cache public Rust dependencies
@@ -64,7 +69,7 @@ jobs:
           BIFROST_OPEN_PACKS_DISABLE: '1'
         # One outer scheduler covers every library; Cargo runs libraries serially.
         # Preserve the ordinary ignored-test selection and expose first failures.
-        run: /usr/bin/time -v cargo nextest run --workspace --lib --locked --max-fail 100 --retries 0
+        run: bash scripts/public/time-command.sh cargo nextest run --workspace --lib --locked --max-fail 100 --retries 0
 
       - name: Record runner storage after unit tests
         if: always()
@@ -73,7 +78,7 @@ jobs:
       - name: Run public doctests
         env:
           BIFROST_OPEN_PACKS_DISABLE: '1'
-        run: /usr/bin/time -v cargo test --workspace --doc --locked
+        run: bash scripts/public/time-command.sh cargo test --workspace --doc --locked
 
       - name: Record runner storage after doctests
         if: always()
@@ -94,7 +99,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
           components: rustfmt
 
       - name: Cache public Rust dependencies
@@ -132,7 +137,7 @@ jobs:
               'cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1',
           ]))
           mcp = next(p for p in metadata['packages'] if p['name'] == 'brokk-bifrost-mcp')
-          command = ['/usr/bin/time', '-v', 'cargo', 'test', '--workspace', '--locked']
+          command = ['bash', 'scripts/public/time-command.sh', 'cargo', 'test', '--workspace', '--locked']
           targets = []
           for target in mcp['targets']:
               kind = target['kind']

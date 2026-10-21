@@ -25,6 +25,7 @@ pub mod diagnostics;
 pub mod graph;
 pub mod hierarchy;
 pub mod imports;
+pub mod package_discovery;
 pub mod packages;
 pub mod parse;
 pub mod queries;
@@ -33,3 +34,6 @@ pub mod source_facts;
 pub(crate) mod source_properties;
 pub mod structural;
 pub mod test_detection;
+
+mod knowledge;
+pub use knowledge::GoKnowledge;

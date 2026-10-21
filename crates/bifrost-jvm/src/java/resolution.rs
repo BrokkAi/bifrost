@@ -26,10 +26,11 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionMemberQualifierCompatibility, ResolutionNameId, ResolutionNamespace,
     ResolutionPackageFact, ResolutionPackageMemberFact, ResolutionPackageSegmentFact,
     ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
-    ResolutionRootImportDemandFact, ResolutionRootImportFact, ResolutionRootImportSegmentFact,
-    ResolutionRootReferenceFact, ResolutionRootReferenceSegmentFact, ResolutionScopeFact,
-    ResolutionScopeId, ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact,
-    ResolutionSiteId, ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
+    ResolutionRootImportDemandFact, ResolutionRootImportFact, ResolutionRootImportKind,
+    ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
+    ResolutionRootReferenceSegmentFact, ResolutionRouteGap, ResolutionScopeFact, ResolutionScopeId,
+    ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
+    ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
     ResolutionTypeComponentFact, ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
     ResolutionTypeRelationId, ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
     ResolutionTypeTransferFact, ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
@@ -741,10 +742,10 @@ impl<'source> JavaResolutionBuilder<'source> {
                 "Java reference-enumeration gap names an unknown site: {gap:?}"
             );
             assert!(
-                self.facts.gaps.contains(&ResolutionGapFact {
-                    site: gap.site,
-                    kind: gap.kind,
-                }),
+                self.facts
+                    .gaps
+                    .iter()
+                    .any(|point| point.site == gap.site && point.kind == gap.kind),
                 "Java reference-enumeration gap must refine an extracted gap: {gap:?}"
             );
             assert!(
@@ -1409,7 +1410,15 @@ impl<'source> JavaResolutionBuilder<'source> {
         kind: ResolutionSiteKind,
     ) -> TreeWalkAction {
         let site = self.add_site(node, kind);
-        self.add_gap(site, ResolutionGapKind::UnsupportedRoute);
+        self.facts.add_route_gap(
+            site,
+            ResolutionRouteGap::UnknownBinder {
+                scope: self.facts.sites[site.index()].scope,
+                name: None,
+                namespace: None,
+                may_publish: false,
+            },
+        );
         self.add_reference_enumeration_gap_if_omitted(
             node,
             site,
@@ -1529,36 +1538,38 @@ impl<'source> JavaResolutionBuilder<'source> {
         self.suppress_semantics()
     }
 
-    fn lower_named_type_reference(&mut self, node: Node<'_>) {
+    // A dotted type name is a `scoped_identifier` in declarations and
+    // annotations, but a `field_access` where the grammar admits an
+    // expression, such as the receiver of an `Outer.Inner::new` reference.
+    fn lower_named_type_reference(&mut self, node: Node<'_>) -> ResolutionTypeSlotId {
+        if let Some(slot) = self.type_slots_by_node.get(&node.id()) {
+            return *slot;
+        }
         if node.has_error() || node.is_missing() {
-            self.lower_gap_type(node, ResolutionGapKind::MalformedSyntax);
-            return;
+            return self.lower_gap_type(node, ResolutionGapKind::MalformedSyntax);
         }
         if matches!(node.kind(), "identifier" | "type_identifier") {
-            self.lower_plain_type_reference(node);
-            return;
-        }
-        if node.kind() != "scoped_identifier" {
-            self.lower_unsupported_type(node);
-            return;
+            return self.lower_plain_type_reference(node);
         }
 
         let mut current = node;
         let mut members = Vec::new();
-        while current.kind() == "scoped_identifier" {
+        while let Some((scope_field, name_field)) = match current.kind() {
+            "scoped_identifier" => Some(("scope", "name")),
+            "field_access" => Some(("object", "field")),
+            _ => None,
+        } {
             let (Some(scope), Some(name)) = (
-                current.child_by_field_name("scope"),
-                current.child_by_field_name("name"),
+                current.child_by_field_name(scope_field),
+                current.child_by_field_name(name_field),
             ) else {
-                self.lower_unsupported_type(node);
-                return;
+                return self.lower_unsupported_type(node);
             };
             members.push((current, name));
             current = scope;
         }
-        if !matches!(current.kind(), "identifier" | "type_identifier") {
-            self.lower_unsupported_type(node);
-            return;
+        if members.is_empty() || !matches!(current.kind(), "identifier" | "type_identifier") {
+            return self.lower_unsupported_type(node);
         }
 
         let root_slot = self.lower_plain_type_reference(current);
@@ -1611,6 +1622,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         for site in qualified_sites {
             self.add_gap(site, ResolutionGapKind::AmbiguousQualifiedType);
         }
+        qualifier
     }
 
     fn lower_package_declaration<'tree>(
@@ -1653,7 +1665,8 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
 
         let Some(segments) = syntax.segments.as_ref() else {
-            self.add_gap(declaration, ResolutionGapKind::UnsupportedRoute);
+            self.facts
+                .add_route_gap(declaration, ResolutionRouteGap::UnknownPlacement);
             self.add_reference_enumeration_gap_if_omitted(
                 node,
                 declaration,
@@ -1708,7 +1721,15 @@ impl<'source> JavaResolutionBuilder<'source> {
             );
         }
         let Some(segments) = syntax.segments.as_ref() else {
-            self.add_gap(site, ResolutionGapKind::UnsupportedRoute);
+            self.facts.add_route_gap(
+                site,
+                ResolutionRouteGap::UnknownBinder {
+                    scope: root_scope,
+                    name: None,
+                    namespace: (!syntax.is_static).then_some(ResolutionNamespace::Type),
+                    may_publish: false,
+                },
+            );
             self.add_reference_enumeration_gap_if_omitted(
                 node,
                 site,
@@ -1775,6 +1796,16 @@ impl<'source> JavaResolutionBuilder<'source> {
                 position: None,
             });
             self.facts
+                .root_import_kinds
+                .push(ResolutionRootImportKindFact {
+                    import_site: site,
+                    kind: if bound_name.is_some() {
+                        ResolutionRootImportKind::Named
+                    } else {
+                        ResolutionRootImportKind::Glob
+                    },
+                });
+            self.facts
                 .root_import_segments
                 .extend(
                     segments
@@ -1830,7 +1861,19 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
         // The source route is exact, but selecting its destination package,
         // owner, and declaration inventory remains operation-local.
-        self.add_gap(site, ResolutionGapKind::UnsupportedRoute);
+        self.facts.add_route_gap(
+            site,
+            ResolutionRouteGap::UnknownBinder {
+                scope: root_scope,
+                name: bound_name,
+                namespace: matches!(
+                    kind,
+                    ResolutionImportRouteKind::SingleType | ResolutionImportRouteKind::TypeOnDemand
+                )
+                .then_some(ResolutionNamespace::Type),
+                may_publish: false,
+            },
+        );
         self.suppress_semantics()
     }
 
@@ -1915,10 +1958,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             assert_eq!(package.root_scope, root_scope);
             let placement = self.site(package.placement_gap_site);
             assert_eq!(placement.scope, root_scope);
-            assert!(self.facts.gaps.contains(&ResolutionGapFact {
-                site: package.placement_gap_site,
-                kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-            }));
+            assert!(self.facts.gaps.contains(&ResolutionGapFact::new(
+                package.placement_gap_site,
+                ResolutionGapKind::UnsupportedPlacementBoundary
+            )));
 
             match package.declaration {
                 Some(declaration) => {
@@ -1958,10 +2001,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             let site = self.site(route.site);
             assert_eq!(site.scope, root_scope);
             assert_eq!(site.kind, ResolutionSiteKind::ImportDeclaration);
-            assert!(self.facts.gaps.contains(&ResolutionGapFact {
-                site: route.site,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            }));
+            assert!(self.facts.gaps.iter().any(
+                |gap| gap.site == route.site && gap.kind == ResolutionGapKind::UnsupportedRoute
+            ));
 
             let segments = self
                 .facts
@@ -2327,7 +2369,11 @@ impl<'source> JavaResolutionBuilder<'source> {
             | ResolutionTypeTransferKind::Return
             | ResolutionTypeTransferKind::ComponentElement
             | ResolutionTypeTransferKind::ComponentKey
-            | ResolutionTypeTransferKind::ComponentValue => {
+            | ResolutionTypeTransferKind::ComponentValue
+            | ResolutionTypeTransferKind::ComponentIndex
+            | ResolutionTypeTransferKind::ComponentIndexOk
+            | ResolutionTypeTransferKind::ComponentCommaOkValue
+            | ResolutionTypeTransferKind::ComponentSlice => {
                 ResolutionTypeTransferValueTransform::Preserve
             }
             ResolutionTypeTransferKind::NumericPromotion
@@ -2668,16 +2714,15 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
         let enclosing = self.type_contexts.last().copied();
         let declaration = self.add_site(body, ResolutionSiteKind::TypeDeclaration);
-        let position = body.start_position();
-        let synthetic_name_text = format!("$anon${}:{}", position.row, position.column);
-        let synthetic_name = self.intern_name(&synthetic_name_text);
-        self.facts.identifiers.push(PositionedIdentifierFact {
+        let synthetic_name =
+            self.intern_name(&crate::anonymous_type::AnonymousTypeBody::name(body));
+        let anonymous = crate::anonymous_type::AnonymousTypeBody {
             site: declaration,
             name: synthetic_name,
-            role: ResolutionIdentifierRole::Declaration,
-            namespace: ResolutionNamespace::Type,
-            qualifier: None,
-        });
+        };
+        anonymous.declare(&mut self.facts);
+        // The semantic site owns members inside the anonymous body, but the
+        // synthetic type has no source declaration or source visibility.
         if parent.kind() == "object_creation_expression" {
             let scope = *self.scope(self.current_scope());
             self.facts.binders.push(ResolutionBinderFact {
@@ -2751,13 +2796,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             true
         };
 
-        let body_scope = self.allocate_scope(
-            self.current_scope(),
-            Some(declaration),
-            ResolutionScopeKind::TypeBody,
-            body.start_byte(),
-            body.end_byte(),
-        );
+        let body_scope = anonymous.open_scope(&mut self.facts);
         assert!(
             self.body_scopes.insert(body.id(), body_scope).is_none(),
             "one type-body scope per synthetic Java class body"
@@ -2835,7 +2874,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             return;
         };
         match type_node.kind() {
-            "identifier" => self.lower_named_type_reference(type_node),
+            "identifier" => {
+                self.lower_named_type_reference(type_node);
+            }
             "generic_type" => {
                 self.lower_type(type_node);
             }
@@ -3808,67 +3849,19 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.site(subtype).scope,
         );
         let name = self.intern_name("Object");
-        self.facts.identifiers.push(PositionedIdentifierFact {
-            site: reference,
-            name,
-            role: ResolutionIdentifierRole::Reference,
-            namespace: ResolutionNamespace::Type,
-            qualifier: None,
-        });
-        self.facts
-            .reference_owners
-            .push(ResolutionReferenceOwnerFact {
-                reference,
-                owner: Some(subtype),
-            });
-        let slot = self.add_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
-        self.facts.binding_projections.push(BindingProjectionFact {
+        let prefix = [self.intern_name("java"), self.intern_name("lang")];
+        crate::implicit_supertype::publish_implicit_supertype(
+            &mut self.facts,
+            subtype,
             reference,
-            output: slot,
-            kind: BindingProjectionKind::TargetTypeIdentity,
-        });
-        self.facts
-            .root_references
-            .push(ResolutionRootReferenceFact {
-                reference,
-                root_scope: self.facts.scopes[0].id,
-                anchor: ResolutionRootImportAnchor::Absolute,
-                prefix_reference: None,
-                owner_continued: false,
-            });
-        for (position, spelling) in ["java", "lang"].into_iter().enumerate() {
-            let name = self.intern_name(spelling);
-            self.facts
-                .root_reference_segments
-                .push(ResolutionRootReferenceSegmentFact {
-                    reference,
-                    position: dense_ordinal(position, "implicit superclass route"),
-                    name,
-                });
-        }
-        for parent in self
-            .facts
-            .supertypes
-            .iter_mut()
-            .filter(|parent| parent.subtype == subtype)
-        {
-            parent.parent_ordinal = parent
-                .parent_ordinal
-                .checked_add(1)
-                .expect("a declaration's parent count fits u32");
-        }
+            name,
+            &prefix,
+            ResolutionSupertypeKind::ImplicitSuperclass,
+        );
         let next = self.next_parent_ordinal.entry(subtype).or_default();
         *next = next
             .checked_add(1)
             .expect("a declaration's parent count fits u32");
-        self.facts.supertypes.push(ResolutionSupertypeFact {
-            subtype,
-            parent_ordinal: 0,
-            supertype_reference: reference,
-            supertype_slot: slot,
-            kind: ResolutionSupertypeKind::ImplicitSuperclass,
-        });
-        self.add_gap(reference, ResolutionGapKind::UnsupportedHierarchyTraversal);
     }
 
     fn add_supertype(
@@ -4508,10 +4501,12 @@ impl<'source> JavaResolutionBuilder<'source> {
                         continue;
                     };
                     stack.push((node, true));
-                    if self.is_type_syntax(receiver.kind())
-                        || (terminal.kind() == "new" && receiver.kind() == "identifier")
-                    {
+                    if self.is_type_syntax(receiver.kind()) {
                         self.lower_type(receiver);
+                    } else if terminal.kind() == "new" {
+                        // JLS 15.13: a constructor reference names a class or
+                        // array type, even where the grammar parsed an expression.
+                        self.lower_named_type_reference(receiver);
                     } else if receiver.kind() == "identifier" {
                         self.lower_value_reference_in_namespace(
                             receiver,
@@ -4847,10 +4842,10 @@ impl<'source> JavaResolutionBuilder<'source> {
         let constructor = terminal.kind() == "new";
         let qualifier = if receiver.kind() == "this" {
             None
-        } else if self.is_type_syntax(receiver.kind())
-            || (constructor && receiver.kind() == "identifier")
-        {
+        } else if self.is_type_syntax(receiver.kind()) {
             Some(self.lower_type(receiver))
+        } else if constructor {
+            Some(self.lower_named_type_reference(receiver))
         } else {
             Some(self.expression_slot(receiver))
         };
@@ -6065,8 +6060,8 @@ mod tests {
         facts
             .gaps
             .iter()
-            .copied()
             .filter(|gap| gap.kind != ResolutionGapKind::UnsupportedVisibility)
+            .cloned()
             .collect()
     }
 
@@ -6448,34 +6443,28 @@ mod tests {
         assert_eq!(
             non_visibility_gaps(&facts),
             vec![
-                ResolutionGapFact {
-                    site: qualifier_site,
-                    kind: ResolutionGapKind::AmbiguousQualifiedType,
-                },
-                ResolutionGapFact {
-                    site: foo_reference.site,
-                    kind: ResolutionGapKind::AmbiguousQualifiedType,
-                },
-                ResolutionGapFact {
-                    site: foo_reference.site,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: interface.supertype_reference,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: implicit_superclass_reference(&facts, foo),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: b,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: facts.gaps.last().expect("placement gap").site,
-                    kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-                },
+                ResolutionGapFact::new(qualifier_site, ResolutionGapKind::AmbiguousQualifiedType),
+                ResolutionGapFact::new(
+                    foo_reference.site,
+                    ResolutionGapKind::AmbiguousQualifiedType
+                ),
+                ResolutionGapFact::new(
+                    foo_reference.site,
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(
+                    interface.supertype_reference,
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(
+                    implicit_superclass_reference(&facts, foo),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(b, ResolutionGapKind::UnsupportedHierarchyTraversal),
+                ResolutionGapFact::new(
+                    facts.gaps.last().expect("placement gap").site,
+                    ResolutionGapKind::UnsupportedPlacementBoundary
+                ),
             ]
         );
         // `A` is package-private, and so is the default constructor it supplies.
@@ -6628,10 +6617,10 @@ mod tests {
             );
             let incoming = facts.type_slot(observations[0].input).site;
             assert_ne!(incoming, declaration);
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: incoming,
-                kind: ResolutionGapKind::InferredType,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                incoming,
+                ResolutionGapKind::InferredType
+            )));
             assert!(
                 !facts
                     .type_transfers
@@ -7518,10 +7507,10 @@ mod tests {
         .site;
         assert_eq!(facts.supertypes.len(), 2);
         for subtype in [implicit, explicit] {
-            assert!(!facts.gaps.contains(&ResolutionGapFact {
-                site: subtype,
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }));
+            assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+                subtype,
+                ResolutionGapKind::UnsupportedHierarchyTraversal
+            )));
             let edge = facts
                 .supertypes
                 .iter()
@@ -7539,10 +7528,10 @@ mod tests {
                 slot(&facts, edge.supertype_slot).site,
                 edge.supertype_reference
             );
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: edge.supertype_reference,
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                edge.supertype_reference,
+                ResolutionGapKind::UnsupportedHierarchyTraversal
+            )));
             let route = facts
                 .root_references
                 .iter()
@@ -7605,10 +7594,10 @@ mod tests {
         )
         .site;
         assert!(facts.supertypes.is_empty());
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: declaration,
-            kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-        }));
+        assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            declaration,
+            ResolutionGapKind::UnsupportedHierarchyTraversal
+        )));
     }
 
     #[test]
@@ -7663,10 +7652,10 @@ mod tests {
             ResolutionNamespace::Type,
         )
         .site;
-        assert!(!overloaded.gaps.contains(&ResolutionGapFact {
-            site: r,
-            kind: ResolutionGapKind::ImplicitConstructor,
-        }));
+        assert!(!overloaded.gaps.contains(&ResolutionGapFact::new(
+            r,
+            ResolutionGapKind::ImplicitConstructor
+        )));
 
         let compact = parse("record C(int x) { C { } }");
         let c = identifier(
@@ -7676,10 +7665,10 @@ mod tests {
             ResolutionNamespace::Type,
         )
         .site;
-        assert!(!compact.gaps.contains(&ResolutionGapFact {
-            site: c,
-            kind: ResolutionGapKind::ImplicitConstructor,
-        }));
+        assert!(!compact.gaps.contains(&ResolutionGapFact::new(
+            c,
+            ResolutionGapKind::ImplicitConstructor
+        )));
         let compact_constructor = identifier(
             &compact,
             "C",
@@ -7687,10 +7676,10 @@ mod tests {
             ResolutionNamespace::Constructor,
         )
         .site;
-        assert!(compact.gaps.contains(&ResolutionGapFact {
-            site: compact_constructor,
-            kind: ResolutionGapKind::UnsupportedCallApplicability,
-        }));
+        assert!(compact.gaps.contains(&ResolutionGapFact::new(
+            compact_constructor,
+            ResolutionGapKind::UnsupportedCallApplicability
+        )));
         assert!(
             compact
                 .callable_parameters
@@ -7840,10 +7829,10 @@ mod tests {
             ]
         );
         for row in &facts.supertypes {
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: row.supertype_reference,
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                row.supertype_reference,
+                ResolutionGapKind::UnsupportedHierarchyTraversal
+            )));
         }
         assert_eq!(
             facts
@@ -7854,15 +7843,15 @@ mod tests {
             7
         );
         for implicit_root in [base, other] {
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: implicit_root,
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                implicit_root,
+                ResolutionGapKind::UnsupportedHierarchyTraversal
+            )));
         }
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: child,
-            kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-        }));
+        assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+            child,
+            ResolutionGapKind::UnsupportedHierarchyTraversal
+        )));
     }
 
     #[test]
@@ -7984,10 +7973,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["p", "Owner"]
             );
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: import.site,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            }));
+            assert!(
+                facts.gaps.iter().any(|gap| gap.site == import.site
+                    && gap.kind == ResolutionGapKind::UnsupportedRoute)
+            );
         }
     }
 
@@ -8061,10 +8050,10 @@ mod tests {
         );
         assert_eq!(imports[0].id, route.site);
         assert!(imports[1..].iter().all(|site| {
-            facts.gaps.contains(&ResolutionGapFact {
-                site: site.id,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            })
+            facts
+                .gaps
+                .iter()
+                .any(|gap| gap.site == site.id && gap.kind == ResolutionGapKind::UnsupportedRoute)
         }));
 
         let packages = facts
@@ -8081,10 +8070,10 @@ mod tests {
             vec!["package nested;", "package late;"]
         );
         assert!(packages.iter().all(|site| {
-            facts.gaps.contains(&ResolutionGapFact {
-                site: site.id,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            })
+            facts
+                .gaps
+                .iter()
+                .any(|gap| gap.site == site.id && gap.kind == ResolutionGapKind::UnsupportedRoute)
         }));
     }
 
@@ -8104,10 +8093,10 @@ mod tests {
             &leading_source[late_package.start_byte..late_package.end_byte],
             "package p;"
         );
-        assert!(leading.gaps.contains(&ResolutionGapFact {
-            site: late_package.id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
+        assert!(
+            leading.gaps.iter().any(|gap| gap.site == late_package.id
+                && gap.kind == ResolutionGapKind::UnsupportedRoute)
+        );
 
         let between_source = "package p; ; import q.T; class A {}";
         let between = parse(between_source);
@@ -8132,10 +8121,9 @@ mod tests {
             &between_source[late_import.start_byte..late_import.end_byte],
             "import q.T;"
         );
-        assert!(between.gaps.contains(&ResolutionGapFact {
-            site: late_import.id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
+        assert!(between.gaps.iter().any(
+            |gap| gap.site == late_import.id && gap.kind == ResolutionGapKind::UnsupportedRoute
+        ));
     }
 
     #[test]
@@ -8172,10 +8160,9 @@ mod tests {
             "import com.acme.;"
         );
         assert_ne!(imports[0].id, route.site);
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: imports[0].id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
+        assert!(facts.gaps.iter().any(
+            |gap| gap.site == imports[0].id && gap.kind == ResolutionGapKind::UnsupportedRoute
+        ));
         assert_eq!(
             &source[imports[1].start_byte..imports[1].end_byte],
             "import Target;"
@@ -8209,10 +8196,9 @@ mod tests {
             .iter()
             .find(|site| site.kind == ResolutionSiteKind::ImportDeclaration)
             .expect("late malformed import remains a native site");
-        assert!(parsed.resolution_facts.gaps.contains(&ResolutionGapFact {
-            site: import_site.id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
+        assert!(parsed.resolution_facts.gaps.iter().any(
+            |gap| gap.site == import_site.id && gap.kind == ResolutionGapKind::UnsupportedRoute
+        ));
     }
 
     #[test]
@@ -8232,10 +8218,10 @@ mod tests {
             &source[declarations[0].start_byte..declarations[0].end_byte],
             "package broken.;"
         );
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: declarations[0].id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
+        assert!(
+            facts.gaps.iter().any(|gap| gap.site == declarations[0].id
+                && gap.kind == ResolutionGapKind::UnsupportedRoute)
+        );
         assert_eq!(
             facts
                 .gaps
@@ -8392,30 +8378,24 @@ mod tests {
         assert_eq!(
             non_visibility_gaps(&facts),
             vec![
-                ResolutionGapFact {
-                    site: interface,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: enumeration,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: record,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: annotation,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: implicit_superclass_reference(&facts, owner),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: facts.gaps.last().expect("placement gap").site,
-                    kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-                },
+                ResolutionGapFact::new(interface, ResolutionGapKind::UnsupportedHierarchyTraversal),
+                ResolutionGapFact::new(
+                    enumeration,
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(record, ResolutionGapKind::UnsupportedHierarchyTraversal),
+                ResolutionGapFact::new(
+                    annotation,
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(
+                    implicit_superclass_reference(&facts, owner),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(
+                    facts.gaps.last().expect("placement gap").site,
+                    ResolutionGapKind::UnsupportedPlacementBoundary
+                ),
             ]
         );
         assert_eq!(
@@ -8896,10 +8876,12 @@ mod tests {
                         facts.reference_enumeration_gaps
                     )
                 });
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: gap.site,
-                kind,
-            }));
+            assert!(
+                facts
+                    .gaps
+                    .iter()
+                    .any(|point| point.site == gap.site && point.kind == kind)
+            );
         }
         assert!(facts.identifiers.iter().any(|identifier| {
             identifier.role == ResolutionIdentifierRole::Reference

@@ -43,7 +43,8 @@ pub(super) const EDGES_SQL: &str = "SELECT units.unit_id, edges.dependency_id
 
 /// Stable unit order within dependency-first component waves. Keeping the
 /// unit-id tie break also preserves the previous acyclic Kahn order.
-pub(super) const ORDER_SQL: &str = "SELECT component.unit_id
+#[doc(hidden)]
+pub const ORDER_SQL: &str = "SELECT component.unit_id
  FROM temp.unit_schedule_waves AS waves INDEXED BY unit_schedule_waves_wave
  CROSS JOIN temp.unit_schedule_components AS component INDEXED BY unit_schedule_components_component
  WHERE component.component_id = waves.component_id
@@ -51,7 +52,8 @@ pub(super) const ORDER_SQL: &str = "SELECT component.unit_id
 
 /// Read the entire graph once, compute SCCs and dependency-first parallel waves,
 /// and release all graph allocations before any subsequent read of the store.
-pub(super) fn build(conn: &Connection) -> Result<()> {
+#[doc(hidden)]
+pub fn build(conn: &Connection) -> Result<()> {
     let rows = conn
         .prepare(EDGES_SQL)?
         .query_map([], |row| {

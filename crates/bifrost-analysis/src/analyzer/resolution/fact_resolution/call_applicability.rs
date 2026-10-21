@@ -5,7 +5,7 @@
 //! evidence. All values are query-local; no call assessment is persisted.
 
 use brokk_bifrost_core::analyzer::Language;
-use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionScopeKind};
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason,
 };
@@ -23,19 +23,21 @@ use super::super::typed_fact_lowering::{
 };
 use super::{
     AnswerMap, CallCandidateApplicability, FactEvaluation, InternedFactRow, ResolutionNamespace,
-    StateMap, StoreResult,
+    ResolutionTypeRef, StateMap, StoreResult, TypedFrontierState,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ArgumentFormalBinding {
+#[doc(hidden)]
+pub struct ArgumentFormalBinding {
     pub argument_index: usize,
     pub parameter_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MappingAssessment {
+#[doc(hidden)]
+pub enum MappingAssessment {
     Mapped {
         bindings: Vec<ArgumentFormalBinding>,
         used_defaults: u32,
@@ -47,7 +49,8 @@ pub(crate) enum MappingAssessment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PartialOrder {
+#[doc(hidden)]
+pub enum PartialOrder {
     Better,
     Equal,
     Worse,
@@ -56,14 +59,16 @@ pub(crate) enum PartialOrder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConversionKind {
+#[doc(hidden)]
+pub enum ConversionKind {
     Exact,
     Subtype,
     Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IntrinsicCallType {
+#[doc(hidden)]
+pub enum IntrinsicCallType {
     Boolean,
     String,
     Byte,
@@ -76,7 +81,8 @@ pub(crate) enum IntrinsicCallType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConversionEvidence {
+#[doc(hidden)]
+pub struct ConversionEvidence {
     pub argument_ordinal: u32,
     pub parameter_ordinal: u32,
     pub source_type: Option<SemanticId>,
@@ -85,7 +91,8 @@ pub(crate) struct ConversionEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CandidateAssessment {
+#[doc(hidden)]
+pub struct CandidateAssessment {
     pub candidate: SemanticId,
     pub verdict: ApplicabilityVerdict,
     pub reason: Option<CallableRejectionReason>,
@@ -162,7 +169,8 @@ impl CandidateAssessment {
 /// lets a callee lookup land on a type: the lookup also searches the Type
 /// namespace, and the answer's types are interpreted through this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TypeInCallPosition {
+#[doc(hidden)]
+pub enum TypeInCallPosition {
     /// A type is not callable (Java, Rust): the call names only callables.
     Nothing,
     /// The call is a conversion to the type (Go): the type itself is the
@@ -178,7 +186,60 @@ pub(crate) enum TypeInCallPosition {
     ApplyMembers,
 }
 
-pub(crate) trait CallApplicabilityAdapter: Sync {
+/// The language's stopping rule over the shared lexical receiver chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ImplicitReceiverLookup {
+    FirstMemberName,
+    FirstApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ImplicitReceiverScopeKind {
+    Dispatch,
+    Extension,
+}
+
+#[doc(hidden)]
+pub trait CallApplicabilityAdapter: Sync {
+    fn implicit_receiver_lookup(&self) -> Option<ImplicitReceiverLookup> {
+        None
+    }
+
+    fn implicit_receiver_scope_kind(
+        &self,
+        _kind: ResolutionScopeKind,
+    ) -> Option<ImplicitReceiverScopeKind> {
+        None
+    }
+
+    /// Independent declared bounds each supply a receiver surface. Languages
+    /// opt in when their refinement producer uses TypeUnion for intersections.
+    fn has_independent_receiver_bounds(&self) -> bool {
+        false
+    }
+
+    fn receiver_runtime_type(&self, state: &TypedFrontierState) -> Option<ResolutionTypeRef> {
+        super::exact_singleton_runtime_type(state)
+    }
+
+    fn receiver_formal_type(&self, state: &TypedFrontierState) -> Option<ResolutionTypeRef> {
+        (state.completion() == &ResolutionCompletion::Complete)
+            .then(|| super::singleton_type_object(state))
+            .flatten()
+    }
+
+    fn receiver_is_subtype(
+        &self,
+        evaluation: &mut FactEvaluation<'_, '_>,
+        subtype: SemanticId,
+        supertype: SemanticId,
+        states: &StateMap,
+    ) -> StoreResult<Option<bool>> {
+        evaluation.jvm_type_is_subtype(subtype, supertype, states)
+    }
+
     fn no_applicable_call_diagnostic(&self) -> Option<&'static str> {
         None
     }
@@ -207,6 +268,11 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
     /// Retain an unmodeled callable as a partial receiver candidate.
     fn retains_unmodeled_receiver_callables(&self) -> bool {
         true
+    }
+
+    /// Keep visible extension candidates when this receiver has no type evidence.
+    fn retains_extensions_without_receiver_evidence(&self, _state: &TypedFrontierState) -> bool {
+        false
     }
 
     /// A missing receiver member stays open when an extension search is not modeled.
@@ -238,6 +304,18 @@ pub(crate) trait CallApplicabilityAdapter: Sync {
         call: &LoweredCallApplicabilityObligation,
         signature: &LoweredCallableSignatureProperty,
     ) -> MappingAssessment;
+
+    /// A language may replace the call envelope with the exact frontiers
+    /// that explain every unresolved conversion after shape checking.
+    fn unresolved_conversion_completion(
+        &self,
+        _assessment: &CandidateAssessment,
+        _call: &LoweredCallApplicabilityObligation,
+        _signature: &LoweredCallableSignatureProperty,
+        _states: &StateMap,
+    ) -> Option<ResolutionCompletion> {
+        None
+    }
 
     fn result_application_member_names(&self) -> &'static [&'static str] {
         &[]
@@ -889,7 +967,8 @@ pub(crate) struct PositionalAdapter;
 
 static POSITIONAL_ADAPTER: PositionalAdapter = PositionalAdapter;
 
-pub(crate) fn adapter(language: Language) -> &'static dyn CallApplicabilityAdapter {
+#[doc(hidden)]
+pub fn adapter(language: Language) -> &'static dyn CallApplicabilityAdapter {
     crate::analyzer::languages::language_support(language)
         .and_then(|support| support.call_applicability_adapter())
         .unwrap_or(&POSITIONAL_ADAPTER)
@@ -911,7 +990,8 @@ impl CallApplicabilityAdapter for PositionalAdapter {
     }
 }
 
-pub(crate) fn map_call_shape(
+#[doc(hidden)]
+pub fn map_call_shape(
     call: &LoweredCallApplicabilityObligation,
     signature: &LoweredCallableSignatureProperty,
     allow_defaults: bool,
@@ -1631,6 +1711,45 @@ fn dominates<A: CallApplicabilityAdapter + ?Sized>(
     adapter.compare_specificity(left, right) == PartialOrder::Better
 }
 
+/// Keep conversion uncertainty on its operand rather than duplicating it on
+/// the whole call. Every unknown conversion must have an open typed frontier;
+/// a missing signature, mapping, receiver proof, or closed unknown relation
+/// cannot use this discharge.
+pub(crate) fn unresolved_argument_conversion_completion(
+    assessment: &CandidateAssessment,
+    call: &LoweredCallApplicabilityObligation,
+    signature: &LoweredCallableSignatureProperty,
+    states: &StateMap,
+) -> Option<ResolutionCompletion> {
+    if assessment.conversions.is_empty() {
+        return None;
+    }
+    let mut completion = ResolutionCompletion::Complete;
+    let mut unknown = false;
+    for conversion in &assessment.conversions {
+        if conversion.kind != ConversionKind::Unknown {
+            continue;
+        }
+        unknown = true;
+        let argument = call
+            .arguments()
+            .iter()
+            .find(|argument| argument.ordinal() == conversion.argument_ordinal)?;
+        let parameter = signature
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.ordinal() == conversion.parameter_ordinal)?;
+        let source = states.get(&argument.slot())?;
+        let target = states.get(&parameter.slot())?;
+        let frontier = source.completion().combine(target.completion());
+        if frontier == ResolutionCompletion::Complete {
+            return None;
+        }
+        completion = completion.combine(&frontier);
+    }
+    unknown.then_some(completion)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1940,73 +2059,6 @@ mod tests {
                 ],
                 used_defaults: 0,
                 used_vararg: false,
-                result_application_lists: vec![],
-            }
-        );
-    }
-
-    #[test]
-    fn go_maps_every_extra_argument_to_the_trailing_variadic_formal() {
-        use super::super::super::model::ResolutionCompletion;
-        use super::super::super::typed_fact_lowering::{
-            LoweredCallArgumentProperty, LoweredCallableParameterApplicability,
-            LoweredCallableParameterProperty,
-        };
-
-        let id = |label: &'static [u8]| SemanticId::for_test(label);
-        let call = LoweredCallApplicabilityObligation::new(
-            id(b"call"),
-            id(b"reference"),
-            None,
-            id(b"result"),
-            vec![id(b"first"), id(b"second")],
-            Vec::new(),
-            0,
-            id(b"reason"),
-            ResolutionCompletion::Complete,
-        )
-        .with_argument_shape(
-            Language::Go,
-            vec![
-                LoweredCallArgumentProperty::new(0, 0, id(b"first"), None),
-                LoweredCallArgumentProperty::new(0, 1, id(b"second"), None),
-            ],
-            vec![0],
-        );
-        let signature = LoweredCallableSignatureProperty::new(
-            id(b"callable"),
-            0,
-            vec![LoweredCallableParameterProperty::new(
-                0,
-                id(b"variadic"),
-                id(b"variadic-type"),
-                true,
-            )],
-            ResolutionCompletion::Complete,
-        )
-        .with_applicability_shape(
-            vec![0],
-            vec![LoweredCallableParameterApplicability::new(
-                0, 0, None, false, true,
-            )],
-            None,
-        );
-
-        assert_eq!(
-            adapter(Language::Go).map_arguments(&call, &signature),
-            MappingAssessment::Mapped {
-                bindings: vec![
-                    ArgumentFormalBinding {
-                        argument_index: 0,
-                        parameter_index: 0,
-                    },
-                    ArgumentFormalBinding {
-                        argument_index: 1,
-                        parameter_index: 0,
-                    },
-                ],
-                used_defaults: 0,
-                used_vararg: true,
                 result_application_lists: vec![],
             }
         );

@@ -13,16 +13,16 @@
 use std::collections::VecDeque;
 
 use super::correlations::{
-    CorrelationError, charge_edges, charge_entries, check_cancelled, correlation_event_candidate,
-    open_bindings_from_copy_graph, produced_value, tested_boolean_bindings_from_copy_graph,
-    unknown_write_bindings,
+    CorrelationError, admit_set_entry, charge_edges, charge_entries, check_cancelled,
+    correlation_event_candidate, open_bindings_from_copy_graph, produced_value, record_entry_work,
+    tested_boolean_bindings_from_copy_graph, unknown_write_bindings,
 };
 use super::is_assignment_transfer_marker;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CancellationToken, GuardFact, GuardPredicate, ProcedureHandle,
     ProcedureSemantics, ProgramPointId, SemanticBudget, SemanticEffect, SemanticValueKind,
-    TypeFlowAdapter, ValueFlowKind, ValueId,
+    SemanticWork, TypeFlowAdapter, ValueFlowKind, ValueId,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -52,6 +52,22 @@ pub(super) struct GuardBindings {
 }
 
 impl GuardBindings {
+    pub(super) fn census(&self) -> crate::analyzer::semantic::SemanticWork {
+        crate::analyzer::semantic::SemanticWork {
+            nested_entries: self.by_guard.len()
+                + self.exits.len()
+                + self.exits.values().map(State::size).sum::<usize>()
+                + self.queried.len()
+                + self.retained.len()
+                + self.correlation_bindings.len()
+                + self.open_bindings.len()
+                + self.data_bindings.len()
+                + self.correlation_events.len()
+                + self.correlation_events.iter().map(Vec::len).sum::<usize>(),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn binding_for_guard(&self, guard_index: usize) -> Option<ValueId> {
         self.by_guard.get(guard_index).copied().flatten()
     }
@@ -167,7 +183,8 @@ impl State {
 /// per point for the fixpoint, the entries kept in the exit map at a queried
 /// point, and the per-procedure indexes. The copy a visit works on is
 /// transient and is not charged; the propagation that makes those visits is
-/// charged one `control_edges` unit per edge traversal.
+/// charged one `control_edges` unit per edge traversal. The cache derivation
+/// scope refunds scratch on every returned outcome and admits only the result census.
 pub(super) fn derive(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
@@ -213,7 +230,9 @@ pub(super) fn derive(
     charge_entries(budget, point_count.saturating_mul(2).saturating_add(1))?;
     let mut incoming = vec![None::<State>; point_count];
     let mut exits = HashMap::<ProgramPointId, State>::default();
-    incoming[entry.index()] = Some(State::entry(&bindings, &tracked));
+    let entry_state = State::entry(&bindings, &tracked);
+    charge_entries(budget, entry_state.size())?;
+    incoming[entry.index()] = Some(entry_state);
     let mut queued = vec![false; point_count];
     queued[entry.index()] = true;
     check_cancelled(Some(cancellation))?;
@@ -241,6 +260,10 @@ pub(super) fn derive(
         if retained.contains(&point_id) {
             let previous = exits.get(&point_id).map_or(0, State::size);
             charge_entries(budget, state.size().saturating_sub(previous))?;
+            budget.release_admission(SemanticWork {
+                nested_entries: previous.saturating_sub(state.size()),
+                ..SemanticWork::default()
+            });
             exits.insert(point_id, state.clone());
         }
 
@@ -251,7 +274,13 @@ pub(super) fn derive(
             let changed = if let Some(existing) = &mut incoming[target] {
                 // Intersection only removes entries, so this join retains
                 // nothing new and charges nothing new.
-                existing.intersect(&state)
+                let previous = existing.size();
+                let changed = existing.intersect(&state);
+                budget.release_admission(SemanticWork {
+                    nested_entries: previous - existing.size(),
+                    ..SemanticWork::default()
+                });
+                changed
             } else {
                 charge_entries(budget, state.size())?;
                 incoming[target] = Some(state.clone());
@@ -270,7 +299,7 @@ pub(super) fn derive(
     let mut by_guard = Vec::with_capacity(guard_count);
     for guard in semantics.guard_facts() {
         check_cancelled(Some(cancellation))?;
-        charge_entries(budget, 1)?;
+        record_entry_work(budget, 1);
         let subject = guard_predicate_subject(guard);
         let binding = subject
             .and_then(|subject| exits.get(&guard.point)?.current.get(&subject))
@@ -442,19 +471,19 @@ fn queried_values(
     let mut queried = HashSet::default();
     for guard in semantics.guard_facts() {
         check_cancelled(Some(cancellation))?;
-        charge_entries(budget, 1)?;
+        record_entry_work(budget, 1);
         if let Some(subject) = guard.subject {
-            queried.insert(subject);
+            admit_set_entry(budget, &mut queried, subject)?;
         }
         if let Some(subject) = guard_predicate_subject(guard) {
-            queried.insert(subject);
+            admit_set_entry(budget, &mut queried, subject)?;
         }
     }
     let subjects = adapter.refinement_subjects(workspace, procedure);
     charge_entries(budget, subjects.len().saturating_add(1))?;
     for subject in subjects {
         check_cancelled(Some(cancellation))?;
-        queried.insert(subject);
+        admit_set_entry(budget, &mut queried, subject)?;
     }
     Ok(queried)
 }
@@ -469,14 +498,14 @@ fn queried_points(
     let mut points = HashSet::default();
     for guard in semantics.guard_facts() {
         check_cancelled(Some(cancellation))?;
-        charge_entries(budget, 1)?;
-        points.insert(guard.point);
+        record_entry_work(budget, 1);
+        admit_set_entry(budget, &mut points, guard.point)?;
     }
     for call in semantics.call_sites() {
         check_cancelled(Some(cancellation))?;
-        charge_entries(budget, 1)?;
+        record_entry_work(budget, 1);
         if let Some(normal) = call.normal_continuation.target() {
-            points.insert(normal);
+            admit_set_entry(budget, &mut points, normal)?;
         }
     }
     Ok(points)
@@ -508,12 +537,14 @@ fn tracked_values(
     let mut correlation_sources_of = HashMap::<ValueId, Vec<ValueId>>::default();
     let mut correlation_targets_of = HashMap::<ValueId, Vec<ValueId>>::default();
     let mut address_sources = HashSet::default();
+    charge_entries(budget, semantics.points().len())?;
     let mut correlation_events = vec![Vec::new(); semantics.points().len()];
     for point in semantics.points() {
         check_cancelled(Some(cancellation))?;
-        charge_entries(budget, point.events.len().saturating_add(1))?;
+        record_entry_work(budget, point.events.len().saturating_add(1));
         for (event_index, event) in point.events.iter().enumerate() {
             if correlation_event_candidate(&event.effect) {
+                charge_entries(budget, 1)?;
                 correlation_events[point.id.index()].push(event_index);
             }
             match &event.effect {
@@ -526,7 +557,7 @@ fn tracked_values(
                     .value(*target)
                     .is_some_and(|target| target.kind == SemanticValueKind::Address) =>
                 {
-                    address_sources.insert(*value);
+                    admit_set_entry(budget, &mut address_sources, *value)?;
                 }
                 _ => {}
             }
@@ -552,6 +583,7 @@ fn tracked_values(
             if source == target {
                 continue;
             }
+            charge_entries(budget, 2)?;
             correlation_sources_of
                 .entry(target)
                 .or_default()
@@ -563,6 +595,7 @@ fn tracked_values(
             if bindings.contains(&target) || !binding_copy {
                 continue;
             }
+            charge_entries(budget, 1)?;
             sources_of.entry(target).or_default().push(source);
         }
     }

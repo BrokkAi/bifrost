@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use brokk_bifrost_analysis::CancellationToken;
+// Links the complete language table (`__brokk_bifrost_language_supports_v1`).
 use brokk_bifrost_analysis::analyzer::semantic_model::csmi::{
     CsmiDiagnostic, CsmiDocument, CsmiProfileValidation, CsmiResourceError, CsmiResourceResolver,
     CsmiVocabularySupport, validate_csmi_document, validate_csmi_pack, validate_resource_size,
@@ -35,6 +36,7 @@ use brokk_bifrost_semantic_packs::summary_foundry::sanitizer_pack::{
 use brokk_bifrost_semantic_packs::summary_foundry::{
     FoundryPins, FoundryRunInputs, run_foundry_join,
 };
+use brokk_bifrost_tools as _;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde::Serialize;
@@ -493,7 +495,9 @@ fn generate_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8
         return Err(failure(2, usage(), format));
     }
     let inputs = remaining
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| BundleInput {
             spec_path: PathBuf::from(&pair[0]),
             artifact_path: PathBuf::from(&pair[1]),

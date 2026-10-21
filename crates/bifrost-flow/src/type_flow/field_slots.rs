@@ -10,9 +10,9 @@ use crate::analyzer::semantic::{
     ClassAtom, ClassBodyMemberBinding, ClassIdentity, ClassSeed, DynamicFieldNameSet,
     DynamicFieldWrite, IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemberAccessQuery,
     MemoryLocationKind, ProcedureHandle, SemanticBudget, SemanticBudgetExceeded, SemanticEffect,
-    SemanticIrVersion, SemanticRequest, SemanticValueKind, SourcePosition, SourceSpan,
-    StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowKind, WorkspaceMountId,
-    WorkspaceRelativePath,
+    SemanticIrVersion, SemanticProcedureReference, SemanticRequest, SemanticValueKind,
+    SourcePosition, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowKind,
+    WorkspaceMountId, WorkspaceRelativePath,
 };
 #[cfg(test)]
 use crate::analyzer::semantic::{MemberAccessKind, MemberReceiverQuery};
@@ -93,6 +93,7 @@ pub struct FieldSlotIndex {
     persistent_artifacts: Vec<ClassSetFieldSlotArtifactRow>,
     mounted_artifacts: Vec<MountedArtifactReplay>,
     persistable: bool,
+    source_refusals: Vec<crate::analyzer::semantic::SemanticProviderError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +149,7 @@ struct CollectedSlots {
     dynamic_writes: Vec<PendingDynamicWrite>,
     dynamic_effects: Vec<ScopedDynamicWrite>,
     globally_incomplete: bool,
+    source_refusals: Vec<crate::analyzer::semantic::SemanticProviderError>,
     transient_resolver_budget: bool,
     has_open_bound: bool,
     semantic_budget_exhaustion: Option<SemanticBudgetExceeded>,
@@ -301,7 +303,7 @@ impl FieldStoreSurvey {
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 29;
+    const ALGORITHM_VERSION: u32 = 30;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -611,18 +613,32 @@ impl FieldSlotIndex {
             .project()
             .analyzable_files(adapter.language())
             .map_err(TypeFlowPlanError::WorkspaceEnumeration)?;
+        let _timing = brokk_bifrost_core::profiling::scope("type_flow.field_slot_build");
         let mut collected = CollectedSlots::default();
+        // Cross-file dynamic effects need identities, not live artifacts. Both
+        // procedure references and pending receiver facts survive file release.
         let mut procedures = Vec::new();
         for file in files {
+            semantic_budget.release_transient_residency();
             if cancellation.is_cancelled() {
                 return Err(TypeFlowPlanError::Cancelled);
             }
-            let outcome = workspace
-                .materialize_program_semantics(
-                    &file,
-                    &mut SemanticRequest::new(semantic_budget, cancellation),
-                )
-                .map_err(TypeFlowPlanError::Discovery)?;
+            let _file_timing = brokk_bifrost_core::profiling::scope_with(|| {
+                format!("type_flow.field_slot_file[{}]", file.rel_path().display())
+            });
+            let outcome = match workspace.materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(semantic_budget, cancellation),
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) if error.is_intrinsic_source_rejection() => {
+                    // Follow publication: omit this file from the inventory,
+                    // rather than opening every admitted class's field slots.
+                    collected.source_refusals.push(error);
+                    continue;
+                }
+                Err(error) => return Err(TypeFlowPlanError::Discovery(error)),
+            };
             if cancellation.is_cancelled()
                 || matches!(
                     &outcome,
@@ -654,7 +670,7 @@ impl FieldSlotIndex {
                     .procedure_handle(procedure.id())
                     .expect("a retained artifact owns each procedure");
                 collect_procedure(workspace, adapter, &procedure, &mut collected, cancellation)?;
-                procedures.push(procedure);
+                procedures.push(SemanticProcedureReference::of(&procedure));
             }
         }
         if !collected.dynamic_writes.is_empty() {
@@ -677,7 +693,7 @@ impl FieldSlotIndex {
                         )
                     })
                     .collect();
-                let mut effects = super::dynamic_stores::survey(
+                let mut effects = super::dynamic_stores::survey_references(
                     workspace,
                     adapter,
                     &provisional,
@@ -777,7 +793,8 @@ impl FieldSlotIndex {
             collected.stores.remove(&key);
         }
         let store_survey = FieldStoreSurvey::from_collected(&collected);
-        let persistable = collected.dynamic_writes.is_empty()
+        let persistable = collected.source_refusals.is_empty()
+            && collected.dynamic_writes.is_empty()
             && !collected.globally_incomplete
             && !collected.transient_resolver_budget
             && !collected.has_open_bound
@@ -962,6 +979,7 @@ impl FieldSlotIndex {
             persistent_artifacts,
             mounted_artifacts,
             persistable,
+            source_refusals: collected.source_refusals,
         };
         index.persistable &= index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize;
         Ok(index)
@@ -1178,6 +1196,7 @@ impl FieldSlotIndex {
             persistent_artifacts,
             mounted_artifacts: replay.mounted,
             persistable: true,
+            source_refusals: Vec::new(),
         };
         (index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize)
             .then_some(index)
@@ -1321,6 +1340,11 @@ impl FieldSlotIndex {
         self.digest
     }
 
+    /// Intrinsically rejected files omitted from this request's inventory.
+    pub fn source_refusals(&self) -> &[crate::analyzer::semantic::SemanticProviderError] {
+        &self.source_refusals
+    }
+
     pub const fn semantic_budget_exhausted(&self) -> bool {
         self.semantic_budget_exhaustion.is_some() || self.transient_resolver_budget
     }
@@ -1342,7 +1366,7 @@ impl FieldSlotIndex {
         for artifact in &self.mounted_artifacts {
             if cancellation.is_cancelled()
                 || staged
-                    .charge_complete_artifact_hit(artifact.fingerprint, artifact.work)
+                    .replay_released_artifact_census(artifact.fingerprint, artifact.work)
                     .is_err()
             {
                 return false;
@@ -1528,7 +1552,7 @@ fn replay_artifact_charges(
     cancellation: &crate::analyzer::semantic::CancellationToken,
 ) -> Result<PersistedArtifactReplay, PersistedHydrationRejection> {
     let project = workspace.analyzer().project();
-    let mut remaining_source_bytes = semantic_budget.remaining().source_bytes;
+    let maximum_source_bytes = semantic_budget.limits().source_bytes;
     let mut mounted = Vec::with_capacity(artifacts.len());
     let mut source_lengths = HashMap::default();
     for artifact in artifacts {
@@ -1541,7 +1565,7 @@ fn replay_artifact_charges(
         let provider = workspace
             .program_semantics_provider_for_file(&file)
             .ok_or(PersistedHydrationRejection::Hydration)?;
-        let snapshot = match provider.current_artifact_source(&file, remaining_source_bytes) {
+        let snapshot = match provider.current_artifact_source(&file, maximum_source_bytes) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => return Err(PersistedHydrationRejection::ReplayBudget),
             Err(error) => {
@@ -1553,9 +1577,6 @@ fn replay_artifact_charges(
                 return Err(PersistedHydrationRejection::Hydration);
             }
         };
-        remaining_source_bytes = remaining_source_bytes
-            .checked_sub(snapshot.source().len())
-            .ok_or(PersistedHydrationRejection::ReplayBudget)?;
         let key = snapshot.key();
         if key.public_fingerprint().as_bytes() != &artifact.public_digest {
             return Err(PersistedHydrationRejection::Hydration);
@@ -1567,14 +1588,12 @@ fn replay_artifact_charges(
         {
             return Err(PersistedHydrationRejection::Hydration);
         }
+        semantic_budget.charge_work(crate::analyzer::semantic::SemanticWork {
+            source_bytes: snapshot.source().len(),
+            ..crate::analyzer::semantic::SemanticWork::default()
+        });
         semantic_budget
-            .charge(crate::analyzer::semantic::SemanticWork {
-                source_bytes: snapshot.source().len(),
-                ..crate::analyzer::semantic::SemanticWork::default()
-            })
-            .map_err(|_| PersistedHydrationRejection::ReplayBudget)?;
-        semantic_budget
-            .charge_complete_artifact_hit(fingerprint, artifact.work)
+            .replay_released_artifact_census(fingerprint, artifact.work)
             .map_err(|_| PersistedHydrationRejection::ReplayBudget)?;
         mounted.push(MountedArtifactReplay {
             fingerprint,
@@ -1739,16 +1758,18 @@ fn collect_procedure(
                 span,
             } => {
                 if let Some(file) = file_for_procedure(workspace, procedure) {
-                    collected.dynamic_writes.push(PendingDynamicWrite {
-                        procedure: procedure.clone(),
+                    collected.dynamic_writes.push(PendingDynamicWrite::new(
+                        workspace,
+                        adapter,
+                        procedure,
                         receiver,
                         names,
-                        site: SourceSite {
+                        SourceSite {
                             file,
                             span,
                             kind: SourceSiteKind::Unknown,
                         },
-                    });
+                    ));
                 } else if match &names {
                     DynamicFieldNameSet::Exact(names) => !names.is_empty(),
                     DynamicFieldNameSet::Prefix(_) | DynamicFieldNameSet::Any => true,
@@ -1790,16 +1811,18 @@ fn collect_procedure(
                         MemberAccessQuery::Load(location),
                     ) else {
                         if let Some(file) = file_for_procedure(workspace, procedure) {
-                            collected.dynamic_writes.push(PendingDynamicWrite {
-                                procedure: procedure.clone(),
-                                receiver: Some(base),
-                                names: DynamicFieldNameSet::Any,
-                                site: SourceSite {
+                            collected.dynamic_writes.push(PendingDynamicWrite::new(
+                                workspace,
+                                adapter,
+                                procedure,
+                                Some(base),
+                                DynamicFieldNameSet::Any,
+                                SourceSite {
                                     file,
                                     span: mapping_span(procedure, event.source),
                                     kind: SourceSiteKind::Unknown,
                                 },
-                            });
+                            ));
                         } else {
                             collected.globally_incomplete = true;
                         }
@@ -2797,6 +2820,65 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#5113: field-slot prepass retained every file artifact through dynamic-write handles"
+    )]
+    fn field_slot_collection_does_not_pin_artifacts() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "first.py",
+                "class First:\n    def write(self, name):\n        setattr(self, name, 1)\n",
+            )
+            .file(
+                "second.py",
+                "class Second:\n    def write(self, name):\n        setattr(self, name, 2)\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            memo_cache_budget_bytes: Some(0),
+            ..AnalyzerConfig::default()
+        });
+        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut collected = CollectedSlots::default();
+        let mut allocations = Vec::new();
+        for name in ["first.py", "second.py"] {
+            let outcome = workspace
+                .materialize_program_semantics(
+                    &project.file(name),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap();
+            let artifact = outcome.available_value().unwrap();
+            allocations.push(Arc::downgrade(artifact));
+            for procedure in artifact.procedures() {
+                collect_procedure(
+                    &workspace,
+                    &adapter,
+                    &artifact.procedure_handle(procedure.id()).unwrap(),
+                    &mut collected,
+                    &cancellation,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(collected.dynamic_writes.len(), 2);
+        // Drop the shared cache owner, leaving the prepass result alive. Neither
+        // its cross-file write identities nor its field facts may pin an artifact.
+        drop(workspace);
+        assert!(
+            allocations
+                .iter()
+                .all(|artifact| artifact.upgrade().is_none())
+        );
+        assert_ne!(
+            collected.dynamic_writes[0].procedure,
+            collected.dynamic_writes[1].procedure
+        );
+    }
+
+    #[test]
     fn dynamic_write_survey_keeps_truncated_callers_open_without_seeding_them() {
         let mut source = String::from(
             "class Value:\n    pass\ndef write(target, name):\n    setattr(target, name, 1)\ndef caller():\n    write(Value(), 'extra')\n",
@@ -2809,92 +2891,110 @@ mod tests {
         for index in 0..130 {
             source.push_str(&format!("def leaf{index}():\n    pass\n"));
         }
-        let project = InlineTestProject::with_language(Language::Python)
-            .file("app.py", &source)
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
-        let cancellation = crate::analyzer::semantic::CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let artifact = workspace
-            .materialize_program_semantics(
-                &project.file("app.py"),
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .unwrap()
-            .available_value()
-            .cloned()
-            .unwrap();
-        let procedures = artifact
-            .procedures()
-            .iter()
-            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
-            .collect::<Vec<_>>();
-        let mut collected = CollectedSlots::default();
-        for procedure in &procedures {
-            collect_procedure(
+        // A refused reverse depth opens only that write without surveying roots.
+        let mut chain = String::from(
+            "class Value:\n    pass\ndef write(target, name):\n    setattr(target, name, 1)\ndef caller():\n    link0(Value(), 'extra')\n",
+        );
+        for index in 0..130 {
+            chain.push_str(&format!(
+                "def link{index}(target, name):\n    link{}(target, name)\n",
+                index + 1,
+            ));
+        }
+        chain.push_str("def link130(target, name):\n    write(target, name)\n");
+        for (case, source) in [source, chain].into_iter().enumerate() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .file("app.py", &source)
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
+            let cancellation = crate::analyzer::semantic::CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("app.py"),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            let procedures = artifact
+                .procedures()
+                .iter()
+                .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+                .collect::<Vec<_>>();
+            let mut collected = CollectedSlots::default();
+            for procedure in &procedures {
+                collect_procedure(
+                    &workspace,
+                    &adapter,
+                    procedure,
+                    &mut collected,
+                    &cancellation,
+                )
+                .unwrap();
+            }
+            assert_eq!(collected.dynamic_writes.len(), 1);
+            let mut slots =
+                FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation)
+                    .unwrap();
+            slots.store_survey.dynamic_effects = collected
+                .dynamic_writes
+                .iter()
+                .map(|write| {
+                    ScopedDynamicWrite::open(
+                        write.site.clone(),
+                        write.names.clone(),
+                        UnknownReason::UnmodeledLoad,
+                    )
+                })
+                .collect();
+            let caller = procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .semantics()
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("caller")
+                })
+                .unwrap();
+            adapter.constructed_queries.store(0, Ordering::Relaxed);
+            let effects = super::super::dynamic_stores::survey(
                 &workspace,
                 &adapter,
-                procedure,
-                &mut collected,
+                &slots,
+                std::slice::from_ref(caller),
+                &collected.dynamic_writes,
+                ValueFlowCache::default(),
+                &mut budget,
+                &mut SolverBudget::default(),
                 &cancellation,
             )
             .unwrap();
+            assert_eq!(
+                effects[0].evidence.reason,
+                Some(if case == 0 {
+                    UnknownReason::Truncated
+                } else {
+                    UnknownReason::UnmodeledLoad
+                }),
+                "{effects:?}"
+            );
+            assert!(
+                effects[0].classes.is_empty(),
+                "a truncated caller cannot bound the write: {effects:?}"
+            );
+            assert_eq!(
+                adapter.constructed_queries.load(Ordering::Relaxed),
+                0,
+                "class seeding cannot repair a discovery the survey already rejects"
+            );
         }
-        assert_eq!(collected.dynamic_writes.len(), 1);
-        let mut slots =
-            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
-        slots.store_survey.dynamic_effects = collected
-            .dynamic_writes
-            .iter()
-            .map(|write| {
-                ScopedDynamicWrite::open(
-                    write.site.clone(),
-                    write.names.clone(),
-                    UnknownReason::UnmodeledLoad,
-                )
-            })
-            .collect();
-        let caller = procedures
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .semantics()
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("caller")
-            })
-            .unwrap();
-        adapter.constructed_queries.store(0, Ordering::Relaxed);
-        let effects = super::super::dynamic_stores::survey(
-            &workspace,
-            &adapter,
-            &slots,
-            std::slice::from_ref(caller),
-            &collected.dynamic_writes,
-            ValueFlowCache::default(),
-            &mut budget,
-            &mut SolverBudget::default(),
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(
-            effects[0].evidence.reason,
-            Some(UnknownReason::Truncated),
-            "{effects:?}"
-        );
-        assert!(
-            effects[0].classes.is_empty(),
-            "a truncated caller cannot bound the write: {effects:?}"
-        );
-        assert_eq!(
-            adapter.constructed_queries.load(Ordering::Relaxed),
-            0,
-            "class seeding cannot repair a discovery the survey already rejects"
-        );
     }
 
     #[test]
@@ -3102,7 +3202,14 @@ mod tests {
             assert!(Arc::ptr_eq(&leader.index, &follower.index));
             assert!(leader_budget.used().source_bytes > 0);
             assert_eq!(follower_budget.used().source_bytes, 0);
-            assert_eq!(follower_budget.used(), artifact_census(&follower.index));
+            let metadata_visits = follower.index.mounted_artifacts.len();
+            let mut replayed = artifact_census(&follower.index);
+            replayed.nested_entries += metadata_visits;
+            assert_eq!(follower_budget.used(), replayed);
+            assert_eq!(
+                follower_budget.root_work_peak().nested_entries,
+                metadata_visits
+            );
         });
     }
 
@@ -3428,13 +3535,14 @@ mod tests {
         assert!(!warm.published);
         assert_eq!(warm.index.slots(), cold.index.slots());
         assert_eq!(warm.index.digest(), cold.index.digest());
-        let artifact_census = artifact_census(&cold.index);
+        let mut replayed = artifact_census(&cold.index);
+        replayed.nested_entries += warm.index.mounted_artifacts.len();
         assert_eq!(
             crate::analyzer::semantic::SemanticWork {
                 source_bytes: 0,
                 ..warm_budget.used()
             },
-            artifact_census
+            replayed
         );
         assert_eq!(
             warm_budget.used().source_bytes,
@@ -3740,7 +3848,7 @@ mod tests {
     }
 
     #[hardwon(
-        "5b11f64c8ae7: dynamic-write survey seeded field-slot roots outside its reachable closure"
+        "5b11f64c8ae7+#5113: disjoint or unavailable roots must not prevent connected dynamic-write evidence"
     )]
     #[test]
     fn dynamic_write_survey_does_not_seed_disjoint_roots() {
@@ -3756,6 +3864,9 @@ mod tests {
                     "def caller():\n    write(Value(), 'extra')\n",
                 ),
             )
+            .file("other.py", "def other():
+    pass
+")
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
         let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
@@ -3832,18 +3943,15 @@ mod tests {
                 &cancellation,
             )
             .unwrap();
-            if name == "unrelated_opaque" {
-                assert!(
-                    adapter.constructed_queries.load(Ordering::Relaxed) > 0,
-                    "missing control topology must retain the original plan boundary path"
-                );
-            } else if name != "caller" {
+            if name != "caller" {
                 assert_eq!(
                     adapter.constructed_queries.load(Ordering::Relaxed),
                     0,
-                    "discovery proves this root cannot reach the surveyed write"
+                    "the reverse caller walk proves this root cannot reach the surveyed write"
                 );
                 assert!(effects[0].classes.is_empty());
+                assert!(!effects[0].global);
+                assert_eq!(effects[0].evidence.reason, None);
             } else {
                 assert!(
                     effects[0]
@@ -3853,6 +3961,35 @@ mod tests {
                     "the connected caller must contribute its actual receiver: {effects:?}"
                 );
                 assert!(adapter.constructed_queries.load(Ordering::Relaxed) > 0);
+                // A reference that cannot mount its recorded artifact must not
+                // prevent the next connected root from supplying its evidence.
+                let other = workspace
+                    .materialize_program_semantics(
+                        &project.file("other.py"),
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .unwrap();
+                let valid = crate::analyzer::semantic::SemanticProcedureReference::of(root);
+                let mut unavailable = valid.clone();
+                unavailable.key = other.available_value().unwrap().key().clone();
+                let recovered = super::super::dynamic_stores::survey_references(
+                    &workspace,
+                    &adapter,
+                    &slots,
+                    &[unavailable, valid],
+                    &collected.dynamic_writes,
+                    ValueFlowCache::default(),
+                    &mut budget,
+                    &mut SolverBudget::default(),
+                    &cancellation,
+                )
+                .expect("an unavailable root must not abort the dynamic survey");
+                assert!(
+                    recovered[0]
+                        .classes
+                        .iter()
+                        .any(|class| class.qualified_name() == "app.Value")
+                );
                 let provider = crate::value_flow::WorkspaceValueFlowProvider::new(
                     &workspace,
                     crate::value_flow::ValueFlowCache::default(),
@@ -4069,7 +4206,9 @@ mod tests {
         assert!(!warm.published);
         assert!(Arc::ptr_eq(&cold.index, &warm.index));
         assert_eq!(cold.index.digest(), warm.index.digest());
-        assert_eq!(warm_budget.used(), artifact_census(&warm.index));
+        let mut replayed = artifact_census(&warm.index);
+        replayed.nested_entries += warm.index.mounted_artifacts.len();
+        assert_eq!(warm_budget.used(), replayed);
     }
 
     #[test]

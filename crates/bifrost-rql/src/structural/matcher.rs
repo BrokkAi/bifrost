@@ -996,17 +996,10 @@ fn eval_span_only(
     {
         return false;
     }
-    if let Some(predicate) = &pattern.name {
-        let Some(name) = target.name else {
-            return false;
-        };
-        if !predicate.matches(name.text(facts.source())) {
-            return false;
-        }
-    }
-    if let Some(predicate) = &pattern.text
-        && !predicate.matches(target.span.text(facts.source()))
-    {
+    if !pattern.name_text_matches(
+        target.name.map(|name| name.text(facts.source())),
+        target.span.text(facts.source()),
+    ) {
         return false;
     }
     if let Some(label) = &pattern.capture

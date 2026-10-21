@@ -48,6 +48,67 @@ Binding requires:
 If the required identity is absent, ambiguous, conflicting, or only partially
 modeled, Bifrost preserves that boundary in the result.
 
+Python runtime class bases and exact imported calls share bounded, structured
+lexical import selection. A function-local import is eligible only when it is
+one unconditional binding event preceding the reference in the same executing
+function. Competing declarations, rebinding, parameters, class-namespace
+shadowing and captured-cell uncertainty withhold proof. Dotted namespace
+imports must match the consumed receiver segments exactly, including aliases.
+Exhaustion or cancellation cannot fall through to a weaker import proof or
+publish staged call evidence.
+
+Selection proves an import binding. Workspace class admission separately
+checks indexed source, facade bindings and declaration ownership; external
+admission requires the exact applicable class identity. External intermediate
+attribute owners require complete activated module evidence. A matching module
+filename alone does not prove that a from-imported value is that module, so
+unsupported value chains remain unknown. External ancestry additionally needs
+applicable runtime-base claims and retains their provenance and incomplete
+boundaries.
+
+Runtime class-object proof also checks recognized AST mutation hazards for
+module bindings. Immediate reads use structural execution order, including
+loop back-edges; deferred reads remain conservative across the file. A hazard
+in an earlier callable body can withhold proof without evidence that the
+callable ran. The current guard does not prove invocation or the target
+namespace of its exec call, even when an explicit namespace is supplied.
+Source imports check each module and facade as a completed export. Actual
+global binding events in a directive's own lexical scope remain file-wide
+barriers, including pending declarations, imports and deletes; a read-only
+global directive is not a mutation. Unknown or stopped admission cannot fall
+through to source, external or builtin proof of the same uncertain binding.
+These checks neither interpret arbitrary exec text nor infer replacement
+values, and do not establish universal absence of side effects. Ordinary
+declaration navigation retains its existing contract.
+
+Runtime ancestry can follow class-object assignment aliases within one module.
+An eligible alias has one unconditional binding: a plain, unannotated
+assignment to a single identifier directly in module scope. The assignment
+must finish before the alias read. Its right-hand side is resolved at the
+assignment, so each referenced binding must already be available there. Both
+reads independently retain the mutation and freshness checks above. Existing
+source, imported-class, builtin and model admission rules still govern the
+target.
+
+Alias chains are followed iteratively within the same operation's budget and
+cancellation state. Results retain the original base spelling, location and
+order while reporting the underlying class identity. Competing bindings,
+deletions, ambiguous wildcard imports, later target declarations, cycles and
+unsupported assignment or value shapes withhold proof. Local and exported
+assignment aliases remain unsupported. This runtime transport does not change
+ordinary declaration navigation or establish general value-flow analysis.
+
+Complete, pure-syntax inventories of binding-event names and dynamic-hazard
+ranges can be reused by exact prepared-source identity within one query or
+resolution operation. Syntax reuse does not replace the actual owner's source
+and dependency reads, freshness checks or current stopping checks, even when
+different owners have identical source bytes. The caller's budget and
+cancellation state cover collection, reuse and each read or export check,
+including operations without an outer query. Interrupted inventories are not
+shared, and a completed inventory cannot override a current reader's stop. The
+inventory retains no resolution or model answers and is discarded with its
+query or operation; it is not a persistent cache.
+
 ## Source and model precedence
 
 Workspace source bodies are analyzed directly. An external summary can stand

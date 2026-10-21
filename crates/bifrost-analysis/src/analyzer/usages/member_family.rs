@@ -233,7 +233,8 @@ impl MemberFamilyAnswer {
     }
 }
 
-pub(crate) fn proven_member_family_answer(
+#[doc(hidden)]
+pub fn proven_member_family_answer(
     capability: MemberFamilyCapability,
     member: &CodeUnit,
     implements: impl IntoIterator<Item = (CodeUnit, CodeUnit)>,

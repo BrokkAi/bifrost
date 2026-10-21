@@ -6,7 +6,8 @@ use crate::analyzer::resolution::{LoweredGoPackageImport, UnindexedExternalFront
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGoPackageImportKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedGoImportBindingDescriptor {
+#[doc(hidden)]
+pub struct SelectedGoImportBindingDescriptor {
     pub(super) source_fragment: BindingFragmentId,
     import: LoweredGoPackageImport,
     definition_node: BindingNodeId,
@@ -21,7 +22,8 @@ impl SelectedGoImportBindingDescriptor {
     /// The selected reader supplies the exact definition node and a Package
     /// lookup for the sealed explicit alias or canonical provider package name.
     /// Blank imports cannot create a lexical binding.
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         source_fragment: BindingFragmentId,
         import: &LoweredGoPackageImport,
         definition_node: BindingNodeId,
@@ -53,6 +55,16 @@ impl SelectedGoImportBindingDescriptor {
             member: None,
         });
         self
+    }
+
+    pub(crate) fn validate_content_authority(
+        &self,
+        identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<()> {
+        self.digest(identities, source, cancellation)?;
+        Ok(())
     }
 
     fn digest(
@@ -120,7 +132,8 @@ impl SelectedGoImportBindingDescriptor {
         )]
     }
 
-    pub(crate) fn compile(
+    #[doc(hidden)]
+    pub fn compile(
         &self,
         identities: &SelectedContextIdentities,
         source: &dyn BatchResolutionFragmentSource,
@@ -167,95 +180,4 @@ mod tests {
     use crate::analyzer::resolution::test_support::{fragment as fixture_fragment, node, semantic};
 
     use super::*;
-
-    #[test]
-    fn selected_import_authority_survives_context_extensions_and_cancels_atomically() {
-        let fragment = fixture_fragment("selected-go-import-source");
-        let ordinal = SelectedResolutionMountOrdinal::new(fragment.ordinal());
-        let lookup = |candidate| Ok((candidate == fragment).then_some((ordinal, Language::Go)));
-        let identities = SelectedContextIdentities::new();
-        let cancellation = CancellationToken::new();
-        let binding = SelectedGoImportBindingDescriptor::new(
-            fragment,
-            &LoweredGoPackageImport {
-                definition: semantic("selected-go-import-definition"),
-                source_site: ResolutionSiteId::new(7),
-                file_scope: node("selected-go-import-file-scope"),
-                spelling_choice: semantic("selected-go-import-choice"),
-                start_byte: 10,
-                end_byte: 20,
-                kind: ResolutionGoPackageImportKind::Named,
-            },
-            node("selected-go-import-definition-node"),
-            SemanticId::shared_name(
-                super::super::super::local_identity::test_shared_names().intern(
-                    brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
-                        b"bifrost-fixture-go-package-lookup:v1",
-                        b"Package",
-                    ),
-                ),
-            ),
-            ResolutionCompletion::Complete,
-        );
-        let expected = binding
-            .compile(
-                &identities,
-                &PreloadedFragmentSource::new([], []),
-                &cancellation,
-                &ResolutionSession::unbounded(),
-            )
-            .unwrap();
-        let context = SelectedResolutionContextSet::new(identities.clone(), Vec::new(), 1, &lookup)
-            .unwrap()
-            .extend_go_import_bindings(vec![binding.clone()], &cancellation, &lookup)
-            .unwrap()
-            .unwrap();
-        let root_bridge = SelectedRootBridgeDescriptor::for_test(
-            fragment,
-            Language::Go,
-            ResolutionSiteId::new(7),
-            ResolutionRootImportAnchor::Lexical,
-            fragment,
-            Language::Go,
-            ResolutionScopeId::new(0),
-            Vec::new(),
-            ResolutionLookupSemanticRecipe::new(Language::Go, ResolutionNamespace::Type, "Item"),
-            ResolutionLookupSemanticRecipe::new(Language::Go, ResolutionNamespace::Type, "Item"),
-            ResolutionCompletion::Complete,
-        );
-        let extended = context
-            .clone()
-            .extend_root_bridges(vec![root_bridge], &cancellation, None, &lookup)
-            .unwrap()
-            .unwrap()
-            .extend_package_bridges(Vec::new(), &cancellation, &lookup)
-            .unwrap()
-            .unwrap();
-        let SelectedResolutionContextValidationOutcome::Ready(input) = extended
-            .validate_exact_mounts(1, &lookup, &cancellation)
-            .unwrap()
-        else {
-            panic!("live selected import context must validate");
-        };
-        let (_, _, _, _, assigned, _, imports) = input.into_parts();
-        assert_eq!(imports.as_ref(), std::slice::from_ref(&binding));
-        assert_eq!(
-            imports[0]
-                .compile(
-                    &assigned,
-                    &PreloadedFragmentSource::new([], []),
-                    &cancellation,
-                    &ResolutionSession::unbounded()
-                )
-                .unwrap(),
-            expected
-        );
-        cancellation.cancel();
-        assert!(
-            context
-                .extend_go_import_bindings(vec![binding], &cancellation, &lookup)
-                .unwrap()
-                .is_none()
-        );
-    }
 }

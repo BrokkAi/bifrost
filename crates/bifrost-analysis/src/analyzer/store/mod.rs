@@ -1,188 +1,387 @@
+use self::resolution::PreparedResolutionBundle;
+#[cfg(test)]
+use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
+
+use self::resolution_prepare::ResolutionInteriorPreparation;
+
+use self::resolution_prepare::prepare_resolution_bundle_with_source_facts;
+
+use self::semantic_ir::PreparedSemanticIr;
+
+use self::semantic_ir::SemanticIrLoweringOutcome;
+
+use self::semantic_ir::insert_semantic_ir_tx;
+
+use self::semantic_ir::semantic_ir_producer_epoch;
+
+use crate::CancellationToken;
+
+use crate::analyzer::fq_name::FqName;
+
+use crate::analyzer::fq_name::SegmentKind;
+
+use crate::analyzer::fq_name::segment_interner;
+
+use crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES;
+
+use crate::analyzer::read_ledger::IndexFamily;
+
+use crate::analyzer::resolution::BindingFragmentId;
+
+use crate::analyzer::resolution::lower_resolution_facts_with_identity_catalog;
+
+use crate::analyzer::semantic::partial_flow::fixpoint::parse_time_partial_flows;
+
+use crate::analyzer::semantic::service::ProgramSemanticsLowerer;
+
+use crate::analyzer::semantic::service::semantic_artifact_key_from_content;
+
+use crate::analyzer::semantic::ContentIdentity;
+
+use crate::analyzer::semantic::SemanticArtifact;
+
+use crate::analyzer::semantic::SemanticArtifactBuildError;
+
+use crate::analyzer::semantic::SemanticBudget;
+
+use crate::analyzer::semantic::SemanticOutcome;
+
+use crate::analyzer::semantic::StableDigest;
+
+use crate::analyzer::structural::DeclaredVisibility;
+
+use crate::analyzer::structural::facts::AssignmentShape;
+
+use crate::analyzer::store::structural_vocabulary::PersistedCallSite;
+
+use crate::analyzer::store::structural_vocabulary::PersistedOccurrenceRole;
+
+use crate::analyzer::store::structural_vocabulary::PersistedRecoveredRegion;
+
+use crate::analyzer::store::structural_vocabulary::PersistedSpan;
+
+use crate::analyzer::store::structural_vocabulary::PersistedStructuralFacts;
+
+use crate::analyzer::store::structural_vocabulary::PersistedStructuralNode;
+
+use crate::analyzer::store::structural_vocabulary::PersistedStructuralRole;
+
+use crate::analyzer::structural::materialization::MaterializationRecord;
+
+use crate::analyzer::structural::materialization::MaterializationRecordPayload;
+
+use crate::analyzer::store::file_state::FileState;
+
+use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
+
+use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
+
+use crate::analyzer::CallableArity;
+
+use crate::analyzer::CallableLinkage;
+
+use crate::analyzer::CallableOverrideModifier;
+
+use crate::analyzer::CodeUnit;
+
+use crate::analyzer::CodeUnitType;
+
+use crate::analyzer::CppFieldLinkage;
+
+use crate::analyzer::DispatchExtensibility;
+
+use crate::analyzer::ImportInfo;
+
+use crate::analyzer::Language;
+
+use crate::analyzer::PackageAnchor;
+
+use crate::analyzer::ParameterMetadata;
+
+use crate::analyzer::ProjectFile;
+
+use crate::analyzer::Range;
+
+use crate::analyzer::RubyMethodDispatchMode;
+
+use crate::analyzer::SignatureMetadata;
+
+use crate::analyzer::StructuredImportPath;
+
+use crate::analyzer::StructuredImportPathKind;
+
+use crate::analyzer::StructuredImportScope;
+
+use crate::analyzer::StructuredTypeIdentity;
+
+use crate::analyzer::SummaryFileProjection;
+
+use crate::gitblob;
+
+use crate::hash::HashMap;
+
+use crate::hash::HashSet;
+
+use crate::hash::set_with_capacity;
+
+use crate::text_utils::compute_line_starts;
+
+use brokk_bifrost_core::analyzer::RelationalName;
+
+use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
+
+use brokk_bifrost_core::analyzer::canonical_hash::write_length_prefixed as hash_length_prefixed;
+
+use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
+
+use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
+
+pub(crate) use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
+
+use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
+
+use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_MACRO;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustExportFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustIdentifierOccurrence;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustImportTargetFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustIncludeEdgeFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustIncludeHostBindingFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustMacroGateFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustModuleFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustModuleRouteFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustModuleRouteFacts;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustModuleScopeFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustRulesItemMacroDefinition;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts;
+
+use brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition;
+
+use brokk_bifrost_core::analyzer::rust_facts::decode_rust_include_binding_kind;
+
+use brokk_bifrost_core::analyzer::rust_facts::decode_rust_visibility;
+
+use brokk_bifrost_core::analyzer::rust_facts::encode_rust_cfg_condition;
+
+use brokk_bifrost_core::analyzer::rust_facts::encode_rust_include_binding_kind;
+
+use brokk_bifrost_core::analyzer::rust_facts::encode_rust_visibility;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceImportId;
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+use brokk_bifrost_core::cache_db::OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE;
+
+use brokk_bifrost_core::cache_db::OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD;
+
+use brokk_bifrost_core::cache_db::OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE;
+
+use brokk_bifrost_core::cache_db::OPTIONAL_FACT_KIND_SCALA_EXPORT;
+
+use brokk_bifrost_core::cache_db::OPTIONAL_FACT_KIND_SCALA_TRAIT;
+
+use brokk_bifrost_core::cache_db::OPTIONAL_FACT_KIND_SIGNATURE_METADATA_SIGNATURE;
+
+use git2::Oid;
+
+pub(crate) use go_package_context::GoContextHeadStatus;
+
+pub(crate) use go_package_context::GoContextIdentity;
+
+use growable_bloom_filter::GrowableBloom;
+
+pub(crate) use import_graph::WorkspaceImportDirection;
+
+pub(crate) use import_graph::WorkspaceImportGraphBinding;
+
+pub(crate) use import_graph::WorkspaceImportGraphDependencies;
+
+pub(crate) use import_graph::WorkspaceImportGraphEdge;
+
+pub(crate) use import_graph::WorkspaceImportGraphRefreshPlan;
+
+pub(crate) use import_graph::WorkspaceImportGraphSource;
+
+pub(crate) use relational_query::RelationalStoreOutcome;
+
+use rusqlite::Connection;
+
+use rusqlite::OptionalExtension;
+
+use rusqlite::ToSql;
+
+use rusqlite::Transaction;
+
+use rusqlite::TransactionBehavior;
+
+use rusqlite::params;
+
+use rusqlite::params_from_iter;
+
+use sha2::Digest;
+
+use sha2::Sha256;
+
+pub use source_facts::SourceFactStorage;
+
+use std::borrow::Cow;
+
+use std::cell::RefCell;
+
+use std::fmt;
+
+use std::fmt::Write as _;
+
+use std::path::Path;
+
+use std::path::PathBuf;
+
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicBool;
+
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::Ordering;
+
+use std::sync::Arc;
+
+use std::sync::Condvar;
+
+use std::sync::LazyLock;
+
+use std::sync::Mutex;
+
+use std::sync::OnceLock;
+
+use std::time::Duration;
+
+pub(crate) use workspace_inputs::NativeConfigurationOverlayAuthority;
+
+pub(crate) use workspace_inputs::WorkspaceConfigurationInput;
+
+pub(crate) use workspace_inputs::configuration_digest;
+
+use writer::StoreWriter;
+
 pub mod class_set_field_slots;
 pub mod class_set_procedure_surfaces;
 pub mod class_set_root_results;
 pub mod class_set_summaries;
-pub(in crate::analyzer) mod cpp_template;
-#[cfg(test)]
-mod cpp_template_tests;
-pub(crate) mod dependency_file_evidence;
+#[doc(hidden)]
+pub mod cpp_template;
+#[doc(hidden)]
+pub mod dependency_file_evidence;
 pub mod epoch;
 pub mod gc;
 mod jvm_package_context;
 pub mod liveness;
 pub mod planner_statistics;
 pub mod policy_units;
-pub(crate) mod python_runtime;
+#[doc(hidden)]
+pub mod python_runtime;
 pub mod query;
 mod read_keys;
-mod relational_query;
-#[cfg(test)]
-mod rust_context_scope_tests;
-mod rust_crates;
-#[cfg(test)]
-mod rust_item_query_plan_tests;
-#[cfg(test)]
-mod rust_item_source_tests;
-#[cfg(test)]
-mod rust_macro_context_tests;
-#[cfg(test)]
-mod rust_manifest_update_tests;
-#[cfg(test)]
-mod rust_module_source_tests;
-#[cfg(test)]
-mod rust_type_form_tests;
-mod selected_definition;
+#[doc(hidden)]
+pub mod relational_query;
+
+#[doc(hidden)]
+pub mod rust_crates;
+
+#[doc(hidden)]
+pub mod selected_definition;
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn selected_macro_item_unit_sql_for_plan() -> &'static str {
     selected_definition::SELECTED_MACRO_ITEM_UNIT_SQL.as_str()
 }
 
-pub(in crate::analyzer) mod source_facts;
-pub use source_facts::SourceFactStorage;
+#[doc(hidden)]
+pub mod source_facts;
+
 // Milestone 5 publishes the normalized writer seam before the producer and
 // selected-hydration tranches wire it into analyzer construction.
-pub(crate) mod go_package_context;
-pub(crate) mod go_unit_summaries;
-pub(crate) mod import_graph;
+#[doc(hidden)]
+pub mod go_package_context;
+#[doc(hidden)]
+pub mod go_unit_summaries;
+#[doc(hidden)]
+pub mod import_graph;
 pub(crate) mod jvm_external_inventory;
-pub(crate) mod rust_unit_summaries;
-mod unit_schedule;
-pub(crate) mod unit_summaries;
-pub(crate) use go_package_context::{GoContextHeadStatus, GoContextIdentity};
-pub(crate) use import_graph::{
-    WorkspaceImportDirection, WorkspaceImportGraphBinding, WorkspaceImportGraphDependencies,
-    WorkspaceImportGraphEdge, WorkspaceImportGraphRefreshPlan, WorkspaceImportGraphSource,
-};
-#[allow(dead_code)]
-pub(crate) mod resolution;
-pub(crate) mod resolution_authority;
-#[allow(dead_code)]
-pub(crate) mod resolution_lexical;
-mod resolution_manifest;
-#[allow(dead_code)]
-pub(crate) mod resolution_operation;
-#[allow(dead_code)]
-pub(crate) mod resolution_prepare;
-pub(crate) mod resolution_publication;
-#[allow(dead_code)]
-pub(crate) mod resolution_selection;
-pub(crate) mod resolution_stage;
-pub(crate) mod resolution_typed;
-pub(crate) mod selected_read_memo;
-pub(crate) mod semantic_ir;
-#[cfg(test)]
-pub(crate) mod test_adapters;
-mod workspace_inputs;
-pub(crate) use workspace_inputs::{
-    NativeConfigurationOverlayAuthority, WorkspaceConfigurationInput, configuration_digest,
-};
-pub(crate) mod writer;
-pub(crate) use relational_query::RelationalStoreOutcome;
-
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::fmt;
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
-use std::time::Duration;
+#[doc(hidden)]
+pub mod python_unit_summaries;
+#[doc(hidden)]
+pub mod rust_unit_summaries;
+#[doc(hidden)]
+pub mod unit_schedule;
+#[doc(hidden)]
+pub mod unit_summaries;
 
-use git2::Oid;
-use growable_bloom_filter::GrowableBloom;
-use rusqlite::{
-    Connection, OptionalExtension, ToSql, Transaction, TransactionBehavior, params,
-    params_from_iter,
-};
-use sha2::{Digest, Sha256};
-use tree_sitter::Language as TsLanguage;
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod resolution;
+#[doc(hidden)]
+pub mod resolution_authority;
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod resolution_lexical;
+#[doc(hidden)]
+pub mod resolution_manifest;
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod resolution_operation;
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod resolution_prepare;
+#[doc(hidden)]
+pub mod resolution_publication;
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod resolution_selection;
+#[doc(hidden)]
+pub mod resolution_stage;
+#[doc(hidden)]
+pub mod resolution_typed;
+pub(crate) mod selected_read_memo;
+#[doc(hidden)]
+pub mod semantic_ir;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_adapters;
+#[doc(hidden)]
+pub mod workspace_inputs;
 
-#[cfg(test)]
-fn test_blob_oid(contents: impl AsRef<[u8]>) -> Oid {
+#[doc(hidden)]
+pub mod writer;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_blob_oid(contents: impl AsRef<[u8]>) -> Oid {
     Oid::hash_object(git2::ObjectType::Blob, contents.as_ref()).expect("test blob oid")
 }
 
-use brokk_bifrost_core::cache_db::{
-    OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE, OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
-    OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE, OPTIONAL_FACT_KIND_SCALA_EXPORT,
-    OPTIONAL_FACT_KIND_SCALA_TRAIT, OPTIONAL_FACT_KIND_SIGNATURE_METADATA_SIGNATURE,
-};
-
-use brokk_bifrost_core::analyzer::RelationalName;
-use brokk_bifrost_core::analyzer::canonical_hash::{
-    lower_hex_string, write_length_prefixed as hash_length_prefixed,
-};
-use brokk_bifrost_core::analyzer::parsed_file::{ParsedSourceFacts, SourceImportFact};
-use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
-#[cfg(test)]
-use brokk_bifrost_core::analyzer::rust_facts::RustVisibility;
-use brokk_bifrost_core::analyzer::rust_facts::{
-    RUST_OCCURRENCE_CODE, RUST_OCCURRENCE_MACRO, RustExportFact, RustIdentifierOccurrence,
-    RustImportTargetFact, RustIncludeEdgeFact, RustIncludeHostBindingFact, RustMacroGateFact,
-    RustModuleFact, RustModuleRouteFact, RustModuleRouteFacts, RustModuleScopeFact,
-    RustRulesItemMacroDefinition, RustUsageFacts, decode_rust_cfg_condition,
-    decode_rust_include_binding_kind, decode_rust_visibility, encode_rust_cfg_condition,
-    encode_rust_include_binding_kind, encode_rust_visibility,
-};
-#[cfg(test)]
-use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
-use brokk_bifrost_core::analyzer::source_facts::SourceImportId;
-use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
-
-use crate::CancellationToken;
-use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
-use crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES;
-use crate::analyzer::read_ledger::IndexFamily;
-use crate::analyzer::resolution::{
-    BindingFragmentId, lower_resolution_facts_with_identity_catalog,
-};
-use crate::analyzer::structural::DeclaredVisibility;
-use crate::analyzer::structural::facts::{
-    AssignmentShape, PersistedCallSite, PersistedOccurrenceRole, PersistedRecoveredRegion,
-    PersistedSpan, PersistedStructuralFacts, PersistedStructuralNode, PersistedStructuralRole,
-};
-use crate::analyzer::structural::materialization::{
-    MaterializationRecord, MaterializationRecordPayload,
-};
-use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
-use crate::analyzer::{
-    CallableArity, CallableLinkage, CallableOverrideModifier, CodeUnit, CodeUnitType,
-    CppFieldLinkage, DispatchExtensibility, ImportInfo, Language, PackageAnchor, ParameterMetadata,
-    ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata, StructuredImportPath,
-    StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity, SummaryFileProjection,
-};
-use crate::gitblob;
-use crate::hash::{HashMap, HashSet, set_with_capacity};
-use crate::text_utils::compute_line_starts;
-pub(crate) use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
-use writer::StoreWriter;
-
-use self::resolution::PreparedResolutionBundle;
-use self::resolution_prepare::{
-    ResolutionInteriorPreparation, prepare_resolution_bundle_with_source_facts,
-};
-use self::semantic_ir::{
-    PreparedSemanticIr, SemanticIrLoweringOutcome, insert_semantic_ir_tx,
-    semantic_ir_producer_epoch,
-};
-use crate::analyzer::semantic::partial_flow::fixpoint::parse_time_partial_flows;
-use crate::analyzer::semantic::service::{
-    ProgramSemanticsLowerer, semantic_artifact_key_from_content,
-};
-use crate::analyzer::semantic::{
-    ContentIdentity, SemanticArtifact, SemanticArtifactBuildError, SemanticBudget, SemanticOutcome,
-    StableDigest,
-};
-use crate::analyzer::tree_sitter_analyzer::{
-    PreparedSyntaxPreparation, PreparedSyntaxTree, reparse_retained_source,
-};
-
-#[cfg(test)]
-pub(crate) fn declaration_name<'a>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn declaration_name<'a>(
     facts: &ParsedSourceFacts,
     source: &'a str,
     declaration: SourceDeclarationId,
@@ -201,7 +400,8 @@ const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 /// this is a materialization budget for one read. The schema enforces the write
 /// gate now (see `0023-signature-metadata-columns.sql`), so the read budget
 /// stands on its own.
-const MAX_LIMITED_QUERY_ROW_BYTES: usize = 8 << 20;
+#[doc(hidden)]
+pub const MAX_LIMITED_QUERY_ROW_BYTES: usize = 8 << 20;
 const LIMITED_UNIT_IDENTITY_PREDICATE: &str =
     "units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
      AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
@@ -209,7 +409,8 @@ const LIMITED_UNIT_IDENTITY_PREDICATE: &str =
      AND units.short_name = ?5
      AND units.signature IS ?6
      AND units.synthetic = ?7";
-const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = 8 << 20;
+#[doc(hidden)]
+pub const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = 8 << 20;
 
 pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
@@ -236,8 +437,10 @@ pub enum StoreErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError {
     message: String,
-    kind: StoreErrorKind,
-    missing_required_source_facts: bool,
+    #[doc(hidden)]
+    pub kind: StoreErrorKind,
+    #[doc(hidden)]
+    pub missing_required_source_facts: bool,
 }
 
 impl StoreError {
@@ -249,7 +452,8 @@ impl StoreError {
         }
     }
 
-    pub(crate) fn missing_required_source_facts(message: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn missing_required_source_facts(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             kind: StoreErrorKind::Generic,
@@ -257,11 +461,13 @@ impl StoreError {
         }
     }
 
-    pub(crate) fn is_missing_required_source_facts(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_missing_required_source_facts(&self) -> bool {
         self.missing_required_source_facts
     }
 
-    pub(crate) fn stale_generation(message: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn stale_generation(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             kind: StoreErrorKind::StaleGeneration,
@@ -269,7 +475,8 @@ impl StoreError {
         }
     }
 
-    pub(crate) fn stale_resolution(message: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn stale_resolution(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             kind: StoreErrorKind::StaleResolution,
@@ -285,7 +492,8 @@ impl StoreError {
         }
     }
 
-    pub(crate) fn corrupt(message: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn corrupt(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             kind: StoreErrorKind::Corrupt,
@@ -317,7 +525,8 @@ impl StoreError {
         self.kind == StoreErrorKind::SqliteInterrupted
     }
 
-    pub(crate) fn context(self, context: impl fmt::Display) -> Self {
+    #[doc(hidden)]
+    pub fn context(self, context: impl fmt::Display) -> Self {
         Self {
             message: format!("{context}: {}", self.message),
             kind: self.kind,
@@ -372,21 +581,25 @@ impl From<git2::Error> for StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-pub(crate) fn required_source_value<T>(value: Option<T>, context: &str, label: &str) -> Result<T> {
+#[doc(hidden)]
+pub fn required_source_value<T>(value: Option<T>, context: &str, label: &str) -> Result<T> {
     value.ok_or_else(|| StoreError::new(format!("{context} is missing {label}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct WorkspaceId(String);
+#[doc(hidden)]
+pub struct WorkspaceId(#[doc(hidden)] pub String);
 
 impl WorkspaceId {
-    pub(crate) fn for_root(root: &Path) -> Self {
+    #[doc(hidden)]
+    pub fn for_root(root: &Path) -> Self {
         Self(brokk_bifrost_core::gitblob::workspace_cache_identity(root))
     }
 
     /// A partial listing must never reconcile under a live root's identity,
     /// or under another session's identity even when their roots coincide.
-    pub(crate) fn for_session() -> Self {
+    #[doc(hidden)]
+    pub fn for_session() -> Self {
         use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
 
         Self(lower_hex_string(&hash_domain_bytes(
@@ -395,20 +608,27 @@ impl WorkspaceId {
         )))
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    #[doc(hidden)]
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceSnapshotId {
-    pub(crate) workspace_id: WorkspaceId,
-    pub(crate) lang: String,
-    pub(crate) generation: GenerationId,
-    pub(crate) revision: i64,
+#[doc(hidden)]
+pub struct WorkspaceSnapshotId {
+    #[doc(hidden)]
+    pub workspace_id: WorkspaceId,
+    #[doc(hidden)]
+    pub lang: String,
+    #[doc(hidden)]
+    pub generation: GenerationId,
+    #[doc(hidden)]
+    pub revision: i64,
 }
 
-pub(crate) type WorkspaceSnapshots = HashMap<String, WorkspaceSnapshotId>;
+#[doc(hidden)]
+pub type WorkspaceSnapshots = HashMap<String, WorkspaceSnapshotId>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SemanticPackActivationSourceKind {
@@ -509,12 +729,14 @@ static RUST_SELECTED_UNITS_FILL_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// The rendered [`RUST_SELECTED_UNITS_FILL_SQL`], shared with the planner test
 /// that replays its selection statement.
-pub(crate) fn rust_selected_units_fill_sql() -> &'static str {
+#[doc(hidden)]
+pub fn rust_selected_units_fill_sql() -> &'static str {
     RUST_SELECTED_UNITS_FILL_SQL.as_str()
 }
 
 /// Rebuild selection-owned Rust rows for either reader pool after its input write.
-fn fill_selected_rust_units(conn: &Connection) -> Result<()> {
+#[doc(hidden)]
+pub fn fill_selected_rust_units(conn: &Connection) -> Result<()> {
     conn.execute_batch(rust_selected_units_fill_sql())?;
     Ok(())
 }
@@ -710,24 +932,30 @@ pub struct AnalyzerStore {
     // declaration order, so the writer `conn` and every pooled reader must be
     // closed before `_ephemeral` runs and deletes the backing temp file (open
     // handles block deletion on Windows).
-    conn: StoreWriter,
-    readers: ReaderPool,
-    active_readers: ReaderPool,
+    #[doc(hidden)]
+    pub conn: StoreWriter,
+    #[doc(hidden)]
+    pub readers: ReaderPool,
+    #[doc(hidden)]
+    pub active_readers: ReaderPool,
     streaming_readers: ReaderPool,
     /// The workspace selection held by the writer connection's temp schema, for
     /// the in-memory fallback that reads through it. Only the holder of the
     /// writer connection's guard ever reads or writes this, and it takes both
     /// guards together (see [`ReaderConn::Writer`]).
-    writer_selection: Arc<Mutex<Option<AppliedWorkspaceSelection>>>,
-    #[cfg(test)]
-    crate_statement_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
+    #[doc(hidden)]
+    pub writer_selection: Arc<Mutex<Option<AppliedWorkspaceSelection>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub crate_statement_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
     writer_resolution_selection: Mutex<Option<resolution_selection::RetainedResolutionSelection>>,
     /// The store's shared-name answers, shared by every request.
     ///
     /// An interned id is a fact of the store and is never reused, so this
     /// cache never goes stale and nothing invalidates it; it is bounded by an
     /// entry cap. See [`resolution::SharedNameCache`].
-    resolution_shared_name_cache: resolution::SharedNameCache,
+    #[doc(hidden)]
+    pub resolution_shared_name_cache: resolution::SharedNameCache,
     /// Complete selected Go contexts reused under their selected publication.
     /// Both file-local bindings and prepared import closures share this
     /// explicitly bounded cache and immutable value representation.
@@ -736,33 +964,36 @@ pub struct AnalyzerStore {
         Arc<resolution_operation::go_named::GoPreparedImportContextSnapshot>,
     >,
     /// Reusable selected Rust include-overlay plans, bounded to four entries.
-    rust_macro_include_overlay_cache: resolution_operation::SelectedRustMacroIncludeOverlayCache,
-    #[cfg(test)]
+    #[doc(hidden)]
+    pub rust_macro_include_overlay_cache:
+        resolution_operation::SelectedRustMacroIncludeOverlayCache,
+    #[cfg(any(test, feature = "test-support"))]
     workspace_selection_counters: WorkspaceSelectionCounters,
-    db_path: Option<PathBuf>,
+    #[doc(hidden)]
+    pub db_path: Option<PathBuf>,
     lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
     #[cfg(any(test, feature = "test-support"))]
     class_set_field_slot_operational_failure: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     class_set_root_result_operational_failure: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     parsed_blob_transaction_starts: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     parsed_blob_point_contains_queries: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     replacement_cost_lookup_queries: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     replacement_cost_fallback_queries: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     prepared_generation_lookup_queries: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relational_batch_reader_checkouts: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relational_batch_generation_validations: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relational_batch_distinct_requests: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relational_live_unit_count_queries: AtomicUsize,
 }
 
@@ -804,9 +1035,11 @@ pub struct AnalyzerStore {
 /// writer connection so correctness is preserved at the cost of read
 /// parallelism. That path takes no permit: it is already serialized by the
 /// writer mutex.
-struct ReaderPool {
+#[doc(hidden)]
+pub struct ReaderPool {
     source: Option<PathBuf>,
-    capacity: usize,
+    #[doc(hidden)]
+    pub capacity: usize,
     state: Mutex<ReaderPoolState>,
     /// Signalled by every checkin, so a checkout blocked at `capacity` wakes as
     /// soon as a reader is back in `idle`.
@@ -867,7 +1100,8 @@ fn workspace_selection_stamp(conn: &Connection) -> Result<WorkspaceSelectionStam
     })
 }
 
-struct AppliedWorkspaceSelection {
+#[doc(hidden)]
+pub struct AppliedWorkspaceSelection {
     snapshots: WorkspaceSnapshots,
     stamp: WorkspaceSelectionStamp,
 }
@@ -906,7 +1140,7 @@ const _: () = assert!(
 );
 
 /// What the workspace-selection path actually did, for the cost pins.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct WorkspaceSelectionCounters {
     /// Runs of `revisioned_workspace_views.sql`, one per reader connection.
@@ -1101,10 +1335,10 @@ impl ReaderPool {
         };
         // Closing the connection happens outside the pool lock; a waiter should
         // not queue behind another thread's `sqlite3_close`.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let before_eviction = resolution_operation::heap_pin_bytes();
         drop(discarded);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         READER_EVICTION_BYTES.with(|bytes| {
             bytes.set(bytes.get() + before_eviction - resolution_operation::heap_pin_bytes())
         });
@@ -1139,8 +1373,9 @@ impl ReaderPool {
         self.reader_returned.notify_one();
     }
 
-    #[cfg(test)]
-    fn idle_len(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn idle_len(&self) -> usize {
         self.state
             .lock()
             .expect("analyzer store reader pool poisoned")
@@ -1153,7 +1388,8 @@ impl ReaderPool {
 /// Derefs to `Connection` so existing read methods — `conn.transaction()`,
 /// helper calls taking `&Connection` — work unchanged. On drop, a pooled reader
 /// is returned to its pool.
-pub(crate) struct ReaderGuard<'a> {
+#[doc(hidden)]
+pub struct ReaderGuard<'a> {
     inner: ReaderConn<'a>,
     checkin_cleanup: Option<&'static str>,
     query_planner_stability_on_checkin: Option<bool>,
@@ -1179,11 +1415,12 @@ enum ReaderConn<'a> {
     },
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! { static READER_EVICTION_BYTES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
 
-#[cfg(test)]
-pub(crate) fn reader_eviction_bytes_for_test() -> i64 {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reader_eviction_bytes_for_test() -> i64 {
     READER_EVICTION_BYTES.with(std::cell::Cell::get)
 }
 
@@ -1590,7 +1827,7 @@ fn canonical_language_label(label: &str) -> Option<Language> {
 fn live_class_set_owner_blob_id(
     conn: &Connection,
     blob_oid: &str,
-    language: &str,
+    storage_language_key: &crate::analyzer::semantic::StorageLanguageKey,
 ) -> Result<Option<i64>> {
     conn.query_row(
         &format!(
@@ -1599,7 +1836,7 @@ fn live_class_set_owner_blob_id(
              WHERE blobs.blob_oid=?1 AND blobs.lang=?2
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
         ),
-        params![blob_oid, language],
+        params![blob_oid, storage_language_key.as_str()],
         |row| row.get(0),
     )
     .optional()
@@ -1627,31 +1864,36 @@ fn unique_temp_db_path() -> PathBuf {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GenerationId(i64);
+pub struct GenerationId(#[doc(hidden)] pub i64);
 
 impl GenerationId {
     /// Rehydrate an epoch identity from a schema-checked generation column.
-    pub(crate) fn from_persisted(value: i64) -> Self {
+    #[doc(hidden)]
+    pub fn from_persisted(value: i64) -> Self {
         assert!(value >= 0, "persisted generations are nonnegative");
         Self(value)
     }
 
-    pub(crate) const BOOTSTRAP: Self = Self(0);
+    #[doc(hidden)]
+    pub const BOOTSTRAP: Self = Self(0);
 
-    pub(crate) const fn get(self) -> i64 {
+    #[doc(hidden)]
+    pub const fn get(self) -> i64 {
         self.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompleteAnalysisBlobRequest {
+#[doc(hidden)]
+pub struct CompleteAnalysisBlobRequest {
     oid: Oid,
     storage_language: String,
     possible_additional_storage_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MissingCompleteAnalysisBlob {
+#[doc(hidden)]
+pub struct MissingCompleteAnalysisBlob {
     oid: Oid,
     storage_language: String,
     required_existing_additional_storage_languages: Vec<String>,
@@ -1680,7 +1922,8 @@ impl MissingCompleteAnalysisBlob {
 }
 
 impl CompleteAnalysisBlobRequest {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         oid: Oid,
         storage_language: impl Into<String>,
         possible_additional_storage_languages: impl IntoIterator<Item = String>,
@@ -1719,9 +1962,11 @@ impl CompleteAnalysisBlobRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImportFacts {
+#[doc(hidden)]
+pub struct ImportFacts {
     pub(crate) package_name: String,
-    pub(crate) imports: Vec<ImportInfo>,
+    #[doc(hidden)]
+    pub imports: Vec<ImportInfo>,
     pub(crate) contains_tests: bool,
 }
 
@@ -1864,63 +2109,87 @@ struct RenderedNameComponent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PathSymbolRow {
-    pub(crate) rel_path: String,
-    pub(crate) blob_oid: Oid,
-    pub(crate) kind: CodeUnitType,
-    pub(crate) package_name: String,
-    pub(crate) short_name: String,
-    pub(crate) exact_fqn: String,
-    pub(crate) normalized_fqn: String,
+#[doc(hidden)]
+pub struct PathSymbolRow {
+    #[doc(hidden)]
+    pub rel_path: String,
+    #[doc(hidden)]
+    pub blob_oid: Oid,
+    #[doc(hidden)]
+    pub kind: CodeUnitType,
+    #[doc(hidden)]
+    pub package_name: String,
+    #[doc(hidden)]
+    pub short_name: String,
+    #[doc(hidden)]
+    pub exact_fqn: String,
+    #[doc(hidden)]
+    pub normalized_fqn: String,
     /// Whether this row only counts when its file has an import statement.
     /// A static property of the language's adapter
     /// (`path_synthetic_module_requires_imports`), stored per row so
     /// `live_path_symbol_names` can gate on a column instead of naming
     /// languages in SQL.
-    pub(crate) requires_imports: bool,
+    #[doc(hidden)]
+    pub requires_imports: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceFileRow {
-    pub(crate) rel_path: String,
-    pub(crate) blob_oid: Oid,
+#[doc(hidden)]
+pub struct WorkspaceFileRow {
+    #[doc(hidden)]
+    pub rel_path: String,
+    #[doc(hidden)]
+    pub blob_oid: Oid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct WorkspacePackageFileRow {
+#[doc(hidden)]
+pub struct WorkspacePackageFileRow {
     pub(crate) package_name: String,
     pub(crate) rel_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct WorkspacePackageEdgeRow {
+#[doc(hidden)]
+pub struct WorkspacePackageEdgeRow {
     pub(crate) rel_path: String,
     pub(crate) parent_package_name: String,
     pub(crate) child_package_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct WorkspaceAnchorRow {
+#[doc(hidden)]
+pub struct WorkspaceAnchorRow {
     pub(crate) rel_path: String,
     pub(crate) anchor: PackageAnchor,
-    pub(crate) package_name: String,
+    #[doc(hidden)]
+    pub package_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct WorkspaceContentPackageFact {
-    pub(crate) blob_oid: Oid,
-    pub(crate) anchor: Option<PackageAnchor>,
-    pub(crate) content_qualifier: String,
-    pub(crate) package_tail: FqName,
+#[doc(hidden)]
+pub struct WorkspaceContentPackageFact {
+    #[doc(hidden)]
+    pub blob_oid: Oid,
+    #[doc(hidden)]
+    pub anchor: Option<PackageAnchor>,
+    #[doc(hidden)]
+    pub content_qualifier: String,
+    #[doc(hidden)]
+    pub package_tail: FqName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceContentPackageFacts {
-    pub(crate) facts: Vec<WorkspaceContentPackageFact>,
+#[doc(hidden)]
+pub struct WorkspaceContentPackageFacts {
+    #[doc(hidden)]
+    pub facts: Vec<WorkspaceContentPackageFact>,
     /// Whether every requested blob contributed an exact package identity.
     /// Missing facts make package absence non-authoritative, but must not keep
     /// the workspace file snapshot (and its valid declarations) unpublished.
-    pub(crate) complete: bool,
+    #[doc(hidden)]
+    pub complete: bool,
 }
 
 type PathSymbolRowsResult = Result<Vec<(String, PathSymbolRow)>>;
@@ -2200,7 +2469,8 @@ fn workspace_snapshots_conn(
     Ok(snapshots)
 }
 
-fn ensure_revisioned_workspace_views(conn: &Connection) -> Result<()> {
+#[doc(hidden)]
+pub fn ensure_revisioned_workspace_views(conn: &Connection) -> Result<()> {
     let configured = conn
         .query_row(
             "SELECT 1 FROM temp.sqlite_schema
@@ -2339,7 +2609,8 @@ pub type HydratedSearchCandidateRow = SearchCandidateRow<RelationalUnitFq>;
 /// package prefix hydrates from. `lang_index` indexes the caller's storage
 /// language-key slice so a row never allocates a language string.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SearchCandidateNameRow {
+#[doc(hidden)]
+pub struct SearchCandidateNameRow {
     pub lang_index: usize,
     pub blob_oid: Oid,
     pub unit_key: i64,
@@ -2358,7 +2629,8 @@ pub(crate) struct SearchCandidateNameRow {
 /// blob's prefixes cannot be enumerated at all, so its declarations must survive
 /// the prefilter unconditionally.
 #[derive(Debug, Clone)]
-pub(crate) struct ActiveSearchBlob {
+#[doc(hidden)]
+pub struct ActiveSearchBlob {
     pub(crate) oid: Oid,
     /// The required literals this blob's path-derived package prefixes contain,
     /// lowercased and joined with `\n`. A required literal is `[a-z0-9_]` only,
@@ -2370,7 +2642,8 @@ pub(crate) struct ActiveSearchBlob {
 impl ActiveSearchBlob {
     /// A blob no literal prefilter will be applied against, for callers that
     /// pass no required literals.
-    pub(crate) fn unfiltered(oid: Oid) -> Self {
+    #[doc(hidden)]
+    pub fn unfiltered(oid: Oid) -> Self {
         Self {
             oid,
             package_literals: String::new(),
@@ -2382,7 +2655,8 @@ impl ActiveSearchBlob {
 /// A declaration identity that survived pattern matching and therefore earns
 /// the full candidate projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SearchCandidateKey {
+#[doc(hidden)]
+pub struct SearchCandidateKey {
     pub lang_index: usize,
     pub blob_oid: Oid,
     pub unit_key: i64,
@@ -2466,7 +2740,8 @@ WHERE endpoints.endpoint_role = 'trait' AND endpoints.endpoint_state = 'unresolv
   AND summaries.derivation_version = ?2";
 
 impl AnalyzerStore {
-    pub(crate) fn resolution_shared_name_cache(&self) -> &resolution::SharedNameCache {
+    #[doc(hidden)]
+    pub fn resolution_shared_name_cache(&self) -> &resolution::SharedNameCache {
         &self.resolution_shared_name_cache
     }
 
@@ -2479,7 +2754,8 @@ impl AnalyzerStore {
         &self.go_prepared_context_cache
     }
 
-    pub(crate) fn workspace_content_package_facts(
+    #[doc(hidden)]
+    pub fn workspace_content_package_facts(
         &self,
         lang: &str,
         generation: GenerationId,
@@ -2657,7 +2933,8 @@ impl AnalyzerStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn sync_workspace_inputs_for_workspace(
+    #[doc(hidden)]
+    pub fn sync_workspace_inputs_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
         lang: &str,
@@ -2746,9 +3023,10 @@ impl AnalyzerStore {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn sync_workspace_snapshot_for_workspace(
+    #[doc(hidden)]
+    pub fn sync_workspace_snapshot_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
         lang: &str,
@@ -2775,9 +3053,10 @@ impl AnalyzerStore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
-    fn sync_workspace_snapshot(
+    #[doc(hidden)]
+    pub fn sync_workspace_snapshot(
         &self,
         lang: &str,
         generation: GenerationId,
@@ -2826,7 +3105,8 @@ impl AnalyzerStore {
     }
 
     /// Existing path-symbol lookup with a source-row cap before hydration.
-    pub(crate) fn path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
+    #[doc(hidden)]
+    pub fn path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
         &self,
         workspace_snapshots: &WorkspaceSnapshots,
         langs: &[String],
@@ -2878,8 +3158,9 @@ impl AnalyzerStore {
         })
     }
 
-    #[cfg(test)]
-    fn path_symbol_rows_by_fqn_for_langs(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn path_symbol_rows_by_fqn_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
@@ -2926,7 +3207,8 @@ impl AnalyzerStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn replace_path_symbol_unit(
+    #[doc(hidden)]
+    pub fn replace_path_symbol_unit(
         &self,
         workspace_id: &WorkspaceId,
         base_snapshots: &WorkspaceSnapshots,
@@ -3170,7 +3452,7 @@ impl AnalyzerStore {
             .expect("configure resolution identity SQL functions");
         rust_crates::register_point_export_functions(&conn)
             .expect("configure Rust export SQL functions");
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)
             .expect("configure test workspace views");
         Self {
@@ -3179,14 +3461,14 @@ impl AnalyzerStore {
             active_readers: ReaderPool::new(reader_source.clone()),
             streaming_readers: ReaderPool::new(reader_source),
             writer_selection: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
             resolution_shared_name_cache: resolution::SharedNameCache::new(),
             go_prepared_context_cache: resolution::BoundedResolutionCache::new(128),
             rust_macro_include_overlay_cache:
                 resolution_operation::SelectedRustMacroIncludeOverlayCache::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path,
             lifetime: Arc::new(()),
@@ -3195,23 +3477,23 @@ impl AnalyzerStore {
             class_set_field_slot_operational_failure: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             class_set_root_result_operational_failure: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             parsed_blob_point_contains_queries: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             replacement_cost_lookup_queries: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             replacement_cost_fallback_queries: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             prepared_generation_lookup_queries: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_batch_reader_checkouts: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_batch_generation_validations: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_batch_distinct_requests: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_live_unit_count_queries: AtomicUsize::new(0),
         }
     }
@@ -3224,14 +3506,14 @@ impl AnalyzerStore {
             active_readers: ReaderPool::new(Some(reader_source.clone())),
             streaming_readers: ReaderPool::new(Some(reader_source)),
             writer_selection: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
             resolution_shared_name_cache: resolution::SharedNameCache::new(),
             go_prepared_context_cache: resolution::BoundedResolutionCache::new(128),
             rust_macro_include_overlay_cache:
                 resolution_operation::SelectedRustMacroIncludeOverlayCache::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path: Some(db_path.to_path_buf()),
             lifetime: Arc::new(()),
@@ -3240,23 +3522,23 @@ impl AnalyzerStore {
             class_set_field_slot_operational_failure: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             class_set_root_result_operational_failure: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             parsed_blob_point_contains_queries: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             replacement_cost_lookup_queries: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             replacement_cost_fallback_queries: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             prepared_generation_lookup_queries: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_batch_reader_checkouts: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_batch_generation_validations: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_batch_distinct_requests: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relational_live_unit_count_queries: AtomicUsize::new(0),
         })
     }
@@ -3390,7 +3672,7 @@ impl AnalyzerStore {
         ))
     }
 
-    fn open_in_memory_single_connection() -> Result<Self> {
+    pub(in crate::analyzer) fn open_in_memory_single_connection() -> Result<Self> {
         let mut conn = crate::cache_db::open_in_memory_store_connection()?;
         crate::cache_db::configure_connection(&mut conn).map_err(StoreError::new)?;
         crate::cache_db::migrate(&mut conn).map_err(StoreError::new)?;
@@ -3400,7 +3682,8 @@ impl AnalyzerStore {
 
     /// Decode language-owned source rows in one generation-checked snapshot.
     /// Connection pooling and transaction lifetime stay in store infrastructure.
-    pub(in crate::analyzer) fn read_source_transaction<T>(
+    #[doc(hidden)]
+    pub fn read_source_transaction<T>(
         &self,
         lang: &str,
         generation: GenerationId,
@@ -3418,7 +3701,8 @@ impl AnalyzerStore {
     /// run concurrently against WAL snapshots; the writer connection is never
     /// taken by these paths (except in the in-memory single-connection
     /// fallback, where `source` is `None`).
-    pub(crate) fn read_conn(&self) -> Result<ReaderGuard<'_>> {
+    #[doc(hidden)]
+    pub fn read_conn(&self) -> Result<ReaderGuard<'_>> {
         let conn = self.checkout_read_conn()?;
         #[cfg(test)]
         let conn = {
@@ -3436,7 +3720,8 @@ impl AnalyzerStore {
         Ok(conn)
     }
 
-    pub(crate) fn uses_single_connection_reads(&self) -> bool {
+    #[doc(hidden)]
+    pub fn uses_single_connection_reads(&self) -> bool {
         self.readers.source.is_none()
     }
 
@@ -3446,7 +3731,11 @@ impl AnalyzerStore {
     /// workspace, and alternating two selections on one connection would
     /// rewrite the selection rows on every checkout, which is the cost this
     /// exists to remove.
-    fn read_conn_for_workspace(&self, snapshots: &WorkspaceSnapshots) -> Result<ReaderGuard<'_>> {
+    #[doc(hidden)]
+    pub fn read_conn_for_workspace(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+    ) -> Result<ReaderGuard<'_>> {
         let mut conn = self.checkout_read_conn()?;
         self.select_workspace_snapshots(&mut conn, snapshots)?;
         Ok(conn)
@@ -3470,7 +3759,8 @@ impl AnalyzerStore {
     /// A publication job may commit before returning an error. Invalidate the
     /// writer fallback while its connection is still held, even in that case:
     /// SQLite data_version excludes commits made by the connection itself.
-    fn execute_selection_publication<T, F>(&self, job: F) -> T
+    #[doc(hidden)]
+    pub fn execute_selection_publication<T, F>(&self, job: F) -> T
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> T + Send + 'static,
@@ -3492,7 +3782,8 @@ impl AnalyzerStore {
     /// rows are rewritten only when snapshots or publication freshness change, so a run of
     /// batches against one workspace generation costs one view script and one
     /// selection write however many batches it contains (#2883).
-    fn select_workspace_snapshots(
+    #[doc(hidden)]
+    pub fn select_workspace_snapshots(
         &self,
         guard: &mut ReaderGuard<'_>,
         snapshots: &WorkspaceSnapshots,
@@ -3507,8 +3798,9 @@ impl AnalyzerStore {
     /// own writer-connection queries, which hold that connection already. The
     /// selection it leaves behind is the one the writer-backed reader fallback
     /// then sees.
-    #[cfg(test)]
-    fn select_writer_workspace_snapshots(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn select_writer_workspace_snapshots(
         &self,
         conn: &Connection,
         snapshots: &WorkspaceSnapshots,
@@ -3534,13 +3826,13 @@ impl AnalyzerStore {
             return Ok(());
         }
         if selection.is_none() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.workspace_selection_counters
                 .view_creations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             ensure_revisioned_workspace_views(conn)?;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.workspace_selection_counters
             .selection_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3576,8 +3868,9 @@ impl AnalyzerStore {
     }
 
     /// Runs of the revisioned view script, and rewrites of the selection rows.
-    #[cfg(test)]
-    pub(crate) fn workspace_selection_counts_for_test(&self) -> (usize, usize) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn workspace_selection_counts_for_test(&self) -> (usize, usize) {
         (
             self.workspace_selection_counters
                 .view_creations
@@ -3588,7 +3881,8 @@ impl AnalyzerStore {
         )
     }
 
-    fn active_read_conn(&self) -> Result<ReaderGuard<'_>> {
+    #[doc(hidden)]
+    pub fn active_read_conn(&self) -> Result<ReaderGuard<'_>> {
         let conn = self.read_conn_from_pool(
             &self.active_readers,
             crate::cache_db::open_readonly_temp_connection,
@@ -3746,15 +4040,6 @@ impl AnalyzerStore {
         })
     }
 
-    pub fn ensure_language_epoch(
-        &self,
-        language: Language,
-        ts_language: &TsLanguage,
-    ) -> Result<GenerationId> {
-        let epoch = epoch::epoch_for(language, ts_language);
-        self.ensure_language_epoch_value(language.config_label(), epoch.as_ref())
-    }
-
     pub fn ensure_language_epoch_value(
         &self,
         lang: &str,
@@ -3764,7 +4049,8 @@ impl AnalyzerStore {
         Ok(self.ensure_language_epoch_values(&entries)?[lang])
     }
 
-    pub(crate) fn ensure_language_epoch_values(
+    #[doc(hidden)]
+    pub fn ensure_language_epoch_values(
         &self,
         entries: &[(String, String)],
     ) -> Result<HashMap<String, GenerationId>> {
@@ -3894,7 +4180,8 @@ impl AnalyzerStore {
     /// `semantic_ir_epoch` is the producer epoch of the adapter's parse-time
     /// lowerer, or `None` when the adapter has none. The caller holds the
     /// adapter; this method does not, so it cannot derive the epoch itself.
-    pub(crate) fn missing_published_complete_analysis_blob_keys_at_generations(
+    #[doc(hidden)]
+    pub fn missing_published_complete_analysis_blob_keys_at_generations(
         &self,
         requests: &[CompleteAnalysisBlobRequest],
         generations: &HashMap<String, GenerationId>,
@@ -4009,13 +4296,14 @@ impl AnalyzerStore {
     /// Read-path membership for one blob at the caller's generation. Uses
     /// [`read_path_parsed_blob_condition`], the same predicate the batched
     /// hydration query uses.
-    pub(crate) fn contains_parsed_blob_at_generation(
+    #[doc(hidden)]
+    pub fn contains_parsed_blob_at_generation(
         &self,
         oid: Oid,
         lang: &str,
         generation: GenerationId,
     ) -> Result<bool> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.parsed_blob_point_contains_queries
             .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.read_conn()?;
@@ -4026,8 +4314,9 @@ impl AnalyzerStore {
         Ok(exists)
     }
 
-    #[cfg(test)]
-    pub(crate) fn load_structural_facts_rows(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn load_structural_facts_rows(
         &self,
         oid: Oid,
         lang: &str,
@@ -4050,7 +4339,8 @@ impl AnalyzerStore {
         }
     }
 
-    pub(crate) fn load_structural_facts_rows_limited(
+    #[doc(hidden)]
+    pub fn load_structural_facts_rows_limited(
         &self,
         oid: Oid,
         lang: &str,
@@ -4153,20 +4443,23 @@ impl AnalyzerStore {
         result
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_parsed_blob_point_contains_queries_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn reset_parsed_blob_point_contains_queries_for_test(&self) {
         self.parsed_blob_point_contains_queries
             .store(0, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
-    pub(crate) fn parsed_blob_point_contains_queries_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn parsed_blob_point_contains_queries_for_test(&self) -> usize {
         self.parsed_blob_point_contains_queries
             .load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_parsed_blob_incomplete_for_test(&self, oid: Oid, lang: &str) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn mark_parsed_blob_incomplete_for_test(&self, oid: Oid, lang: &str) {
         let lang = lang.to_string();
         self.conn.execute(move |conn| {
             conn.execute(
@@ -4177,121 +4470,17 @@ impl AnalyzerStore {
         });
     }
 
-    #[cfg(test)]
-    pub(crate) fn write_parsed_blob<A: LanguageAdapter>(
-        &self,
-        oid: Oid,
-        lang: &str,
-        adapter: &A,
-        state: &FileState,
-    ) -> Result<()> {
-        let generation = self.current_generation(lang)?;
-        self.write_parsed_blob_at_generation(
-            &test_blob_file(),
-            oid,
-            lang,
-            generation,
-            adapter,
-            state,
-        )
-    }
-
-    pub(crate) fn write_parsed_blob_at_generation<A: LanguageAdapter>(
-        &self,
-        file: &ProjectFile,
-        oid: Oid,
-        lang: &str,
-        generation: GenerationId,
-        adapter: &A,
-        state: &FileState,
-    ) -> Result<()> {
-        let mut generations = HashMap::default();
-        generations.insert(lang.to_owned(), generation);
-        if !state.additional_projections.is_empty() {
-            let conn = self.active_read_conn()?;
-            for (projection_lang, _) in &state.additional_projections {
-                let projection_generation = current_generation_conn(&conn, projection_lang)?;
-                if generations
-                    .insert((*projection_lang).to_owned(), projection_generation)
-                    .is_some()
-                {
-                    return Err(StoreError::new(format!(
-                        "duplicate parsed storage projection {projection_lang} for blob {oid}"
-                    )));
-                }
-            }
-        }
-        for storage_language in generations.keys() {
-            self.ensure_resolution_producer_epoch(storage_language, adapter.language())?;
-            if let Some(lowerer) = adapter.parse_time_semantic_lowerer() {
-                self.ensure_semantic_ir_producer_epoch(
-                    storage_language,
-                    &semantic_ir_producer_epoch(&lowerer.lowerer().identity()),
-                )?;
-            }
-        }
-        require_complete_file_state(state)?;
-        let syntax = match reparse_retained_source(adapter, file, state, None) {
-            PreparedSyntaxPreparation::Complete(Some(syntax)) => syntax,
-            PreparedSyntaxPreparation::Refused(reason) => {
-                return Err(StoreError::new(format!(
-                    "refusing to write parsed blob {oid}/{lang}: {reason}"
-                )));
-            }
-            PreparedSyntaxPreparation::Complete(None) | PreparedSyntaxPreparation::TimedOut => {
-                return Err(StoreError::new(format!(
-                    "parsed blob {oid}/{lang} source does not parse within its budget"
-                )));
-            }
-            PreparedSyntaxPreparation::Cancelled => {
-                unreachable!("no cancellation token supplied")
-            }
-        };
-        let prepared = match prepare_parsed_blob_at_generations(
-            file,
-            &syntax,
-            oid,
-            lang,
-            &generations,
-            adapter,
-            Arc::new(state.clone()),
-            &[],
-            &CancellationToken::default(),
-        )? {
-            PreparedParsedBlobPreparation::Prepared(prepared) => *prepared,
-            PreparedParsedBlobPreparation::Cancelled => {
-                return Err(StoreError::new("parsed blob preparation was cancelled"));
-            }
-        };
-        let (mut outcomes, _) =
-            self.persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
-        let outcome = outcomes.pop().expect("one prepared blob has one outcome");
-        match outcome.error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn parsed_blob_transaction_starts_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn parsed_blob_transaction_starts_for_test(&self) -> usize {
         self.parsed_blob_transaction_starts.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_parsed_blob_transaction_starts_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn reset_parsed_blob_transaction_starts_for_test(&self) {
         self.parsed_blob_transaction_starts
             .store(0, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepare_parsed_blob<A: LanguageAdapter>(
-        oid: Oid,
-        lang: &str,
-        generation: GenerationId,
-        adapter: &A,
-        state: Arc<FileState>,
-    ) -> Result<PreparedParsedBlob> {
-        prepare_parsed_blob(oid, lang, generation, adapter, state)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4319,13 +4508,15 @@ impl AnalyzerStore {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn current_generation(&self, lang: &str) -> Result<GenerationId> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn current_generation(&self, lang: &str) -> Result<GenerationId> {
         let conn = self.read_conn()?;
         current_generation_conn(&conn, lang)
     }
 
-    pub(crate) fn persist_prepared_blobs(
+    #[doc(hidden)]
+    pub fn persist_prepared_blobs(
         &self,
         prepared: Vec<PreparedParsedBlob>,
         limits: PersistBatchTargets,
@@ -4358,7 +4549,8 @@ impl AnalyzerStore {
         )
     }
 
-    pub(crate) fn persist_prepared_blobs_with_cancellation(
+    #[doc(hidden)]
+    pub fn persist_prepared_blobs_with_cancellation(
         &self,
         prepared: Vec<PreparedParsedBlob>,
         cancellation: &CancellationToken,
@@ -4406,26 +4598,28 @@ impl AnalyzerStore {
         Ok(())
     }
 
-    pub(crate) fn repair_prepared_blob(&self, prepared: PreparedParsedBlob) -> Result<()> {
+    #[doc(hidden)]
+    pub fn repair_prepared_blob(&self, prepared: PreparedParsedBlob) -> Result<()> {
         self.conn
             .repair_prepared_blob(prepared, self.prepared_write_counters())
     }
 
     fn prepared_write_counters(&self) -> PreparedWriteCounters {
         PreparedWriteCounters {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             transaction_starts: Arc::clone(&self.parsed_blob_transaction_starts),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             generation_lookups: Arc::clone(&self.prepared_generation_lookup_queries),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             replacement_lookups: Arc::clone(&self.replacement_cost_lookup_queries),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             replacement_fallbacks: Arc::clone(&self.replacement_cost_fallback_queries),
         }
     }
 
-    #[cfg(test)]
-    fn stored_blob_cascade_costs(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stored_blob_cascade_costs(
         &self,
         conn: &Connection,
         prepared: &[PreparedParsedBlob],
@@ -4475,8 +4669,9 @@ impl AnalyzerStore {
             .load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
-    pub(crate) fn hydrate_file_state<A: LanguageAdapter>(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn hydrate_file_state<A: LanguageAdapter>(
         &self,
         oid: Oid,
         lang: &str,
@@ -4573,7 +4768,8 @@ impl AnalyzerStore {
     /// Read every metadata alternative for one unit without hydrating or
     /// reparsing its file. Unlike the bounded API, this preserves the existing
     /// unbounded Vec contract and does not silently apply a byte cutoff.
-    pub(crate) fn signature_metadata_for_unit(
+    #[doc(hidden)]
+    pub fn signature_metadata_for_unit(
         &self,
         oid: Oid,
         lang: &str,
@@ -4627,7 +4823,8 @@ impl AnalyzerStore {
     /// discriminator. Callers supply a one-row lookahead in `limit`; a batch
     /// that fills the limit is therefore incomplete and must not be treated as
     /// authoritative.
-    pub(crate) fn signature_metadata_for_unit_limited(
+    #[doc(hidden)]
+    pub fn signature_metadata_for_unit_limited(
         &self,
         oid: Oid,
         lang: &str,
@@ -4830,7 +5027,8 @@ impl AnalyzerStore {
     /// Hydrate imports only from a blob whose canonical source publication is
     /// complete. Unlike the legacy reader above, a missing row is an
     /// unavailable answer, not an import-free file.
-    pub(crate) fn hydrate_canonical_import_facts_by_key<A: LanguageAdapter>(
+    #[doc(hidden)]
+    pub fn hydrate_canonical_import_facts_by_key<A: LanguageAdapter>(
         &self,
         entries: &[(ProjectFile, Oid, String)],
         generations: &HashMap<String, GenerationId>,
@@ -5174,7 +5372,8 @@ impl AnalyzerStore {
         Ok(result)
     }
 
-    pub(crate) fn import_infos_for_key_limited(
+    #[doc(hidden)]
+    pub fn import_infos_for_key_limited(
         &self,
         oid: Oid,
         lang: &str,
@@ -5953,7 +6152,8 @@ impl AnalyzerStore {
     /// (issue #1199): a broad request over this repository previously paid for
     /// ~13 MB of signature/range columns and a temp-B-tree sort to answer a
     /// query whose result was a few dozen rows.
-    pub(crate) fn search_candidate_name_rows_for_langs(
+    #[doc(hidden)]
+    pub fn search_candidate_name_rows_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
@@ -6042,7 +6242,8 @@ impl AnalyzerStore {
     /// `code_units` is keyed by `(blob_id, unit_key)`, so each requested tuple is
     /// a primary-key seek, and the work is proportional to the matched units
     /// instead of rescanning every declaration in a matched blob or language.
-    pub(crate) fn search_candidate_rows_for_keys(
+    #[doc(hidden)]
+    pub fn search_candidate_rows_for_keys(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
@@ -6149,7 +6350,8 @@ impl AnalyzerStore {
         )
     }
 
-    pub(crate) fn workspace_snapshots_for_langs(
+    #[doc(hidden)]
+    pub fn workspace_snapshots_for_langs(
         &self,
         workspace_id: &WorkspaceId,
         langs: &[String],
@@ -6163,7 +6365,8 @@ impl AnalyzerStore {
         Ok(snapshots)
     }
 
-    pub(crate) fn workspace_snapshots_for_current_languages(
+    #[doc(hidden)]
+    pub fn workspace_snapshots_for_current_languages(
         &self,
         workspace_id: &WorkspaceId,
         langs: &[String],
@@ -6591,7 +6794,8 @@ impl AnalyzerStore {
         })
     }
 
-    pub(crate) fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
+    #[doc(hidden)]
+    pub fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
         self.execute_selection_publication(move |conn| {
             reclaim_stale_generations_conn(conn, max_logical_rows)
         })
@@ -6611,7 +6815,8 @@ impl AnalyzerStore {
     /// Returns the number of `workspace_revisions` rows removed; the file
     /// versions and their package, edge, anchor and path-symbol rows follow
     /// through `ON DELETE CASCADE`.
-    pub(crate) fn delete_workspace_projection(&self, workspace_id: &WorkspaceId) -> Result<usize> {
+    #[doc(hidden)]
+    pub fn delete_workspace_projection(&self, workspace_id: &WorkspaceId) -> Result<usize> {
         let workspace_id = workspace_id.as_str().to_string();
         self.execute_selection_publication(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -6652,8 +6857,9 @@ impl AnalyzerStore {
     /// conservative namespace gate. Production reconciliation does not expose
     /// an API for publishing this deliberately inconsistent intermediate
     /// state.
-    #[cfg(test)]
-    pub(crate) fn delete_workspace_package_membership_for_test(&self, package: &str) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn delete_workspace_package_membership_for_test(&self, package: &str) {
         let package = package.to_string();
         self.conn.execute(move |conn| {
             conn.execute(
@@ -6689,7 +6895,8 @@ impl AnalyzerStore {
     /// knows the file reads it directly; a caller searching by name reaches
     /// these rows through the inverted lookups below and then verifies each
     /// candidate against its facts.
-    pub(crate) fn rust_usage_facts(&self, oid: Oid, lang: &str) -> Result<RustUsageFacts> {
+    #[doc(hidden)]
+    pub fn rust_usage_facts(&self, oid: Oid, lang: &str) -> Result<RustUsageFacts> {
         let mut conn = self.read_conn()?;
         // The fact families are one publication, even if replacement or
         // reclamation commits between individual family reads.
@@ -6701,11 +6908,8 @@ impl AnalyzerStore {
 
     /// Blobs that import `module_path`, spelled exactly as the importing file
     /// writes it. The inverted direction of `rust_import_targets`.
-    pub(crate) fn rust_import_target_blobs(
-        &self,
-        lang: &str,
-        module_path: &str,
-    ) -> Result<Vec<Oid>> {
+    #[doc(hidden)]
+    pub fn rust_import_target_blobs(&self, lang: &str, module_path: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
             "SELECT DISTINCT keys.blob_oid
              FROM rust_import_targets AS facts
@@ -6724,7 +6928,8 @@ impl AnalyzerStore {
     /// final component of the written module path. This avoids both a suffix
     /// scan of the import table and offering ordinary code mentions to the
     /// semantic import verifier.
-    pub(crate) fn rust_module_import_candidate_blobs(
+    #[doc(hidden)]
+    pub fn rust_module_import_candidate_blobs(
         &self,
         lang: &str,
         component: &str,
@@ -6734,7 +6939,8 @@ impl AnalyzerStore {
 
     /// Blobs that re-export `exported_name`. The inverted direction of
     /// `rust_exports`, and the seed of an export-chain walk.
-    pub(crate) fn rust_export_blobs(&self, lang: &str, exported_name: &str) -> Result<Vec<Oid>> {
+    #[doc(hidden)]
+    pub fn rust_export_blobs(&self, lang: &str, exported_name: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
             "SELECT DISTINCT keys.blob_oid
              FROM rust_exports AS facts
@@ -6755,7 +6961,8 @@ impl AnalyzerStore {
     /// its `(blob, declaration)`: two byte-identical files are one blob, and
     /// only the file says which of them the question is about. The answer is
     /// one query's result: nothing here outlives the call.
-    pub(crate) fn rust_traits_implemented_by(
+    #[doc(hidden)]
+    pub fn rust_traits_implemented_by(
         &self,
         blob: Oid,
         declaration_id: u32,
@@ -6772,7 +6979,8 @@ impl AnalyzerStore {
     /// The placed types that implement one placed trait declaration. The
     /// reverse of [`Self::rust_traits_implemented_by`], seeked on the Rust
     /// summary endpoint target index.
-    pub(crate) fn rust_types_implementing(
+    #[doc(hidden)]
+    pub fn rust_types_implementing(
         &self,
         blob: Oid,
         declaration_id: u32,
@@ -6827,7 +7035,8 @@ impl AnalyzerStore {
     /// resolving every impl header in the impl files. A NULL impl declaration
     /// or an unbridged subject is returned as `None`; the reader resolves that
     /// impl's header as it would without the row.
-    pub(crate) fn rust_trait_impl_rows(
+    #[doc(hidden)]
+    pub fn rust_trait_impl_rows(
         &self,
         blob: Oid,
         declaration_id: u32,
@@ -6883,7 +7092,8 @@ impl AnalyzerStore {
 
     /// The traits one placed impl item states, as placed declarations. Seeked
     /// on the Rust summary endpoint impl index.
-    pub(crate) fn rust_traits_of_impl(
+    #[doc(hidden)]
+    pub fn rust_traits_of_impl(
         &self,
         impl_blob: Oid,
         impl_declaration_id: u32,
@@ -6905,7 +7115,8 @@ impl AnalyzerStore {
     /// decided it; a file no crate places has no decision. A decided
     /// invocation's items are compiled unless its decoration is inactive in
     /// every such crate, as the crate's own cfg atoms evaluate it.
-    pub(crate) fn rust_item_macro_decisions(
+    #[doc(hidden)]
+    pub fn rust_item_macro_decisions(
         &self,
         snapshots: &WorkspaceSnapshots,
         blob: Oid,
@@ -6997,7 +7208,8 @@ impl AnalyzerStore {
     /// File granularity throughout: a blob that defines several macros offers
     /// all of them, and a blob that writes a macro's name need not invoke it.
     /// The caller decides what each blob's invocations can expand to.
-    pub(crate) fn rust_macro_expansion_blobs(
+    #[doc(hidden)]
+    pub fn rust_macro_expansion_blobs(
         &self,
         names: &[String],
     ) -> Result<Vec<StoredMacroExpansionBlob>> {
@@ -7043,7 +7255,8 @@ impl AnalyzerStore {
     /// its own identifier, and any name a `use ... as` or a re-export gave it.
     /// A member walk resolves only the impl headers spelled one of these ways;
     /// a header spelled otherwise cannot name this trait.
-    pub(crate) fn rust_trait_impl_spellings(
+    #[doc(hidden)]
+    pub fn rust_trait_impl_spellings(
         &self,
         blob: Oid,
         declaration_id: u32,
@@ -7073,11 +7286,8 @@ impl AnalyzerStore {
     /// to offer, so the two conditions together are a much smaller set than
     /// either alone. Aliases are rare -- 531 items in the whole of tract -- so
     /// this is normally empty and always short.
-    pub(crate) fn rust_alias_blobs_mentioning(
-        &self,
-        lang: &str,
-        identifier: &str,
-    ) -> Result<Vec<Oid>> {
+    #[doc(hidden)]
+    pub fn rust_alias_blobs_mentioning(&self, lang: &str, identifier: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
             "SELECT DISTINCT keys.blob_oid
              FROM rust_identifier_occurrences AS occurrence
@@ -7098,7 +7308,8 @@ impl AnalyzerStore {
     /// that wants to answer that has to be told where they are. The indexed
     /// Rust summary endpoint rows preserve each spelling under the unit's live
     /// summary version.
-    pub(crate) fn rust_unresolved_trait_impl_files(
+    #[doc(hidden)]
+    pub fn rust_unresolved_trait_impl_files(
         &self,
         spelling: &str,
     ) -> Result<Vec<(Oid, String, Option<u32>)>> {
@@ -7134,7 +7345,8 @@ impl AnalyzerStore {
     /// table, not of the workspace. The one caller is the inverse-scan file
     /// selection, which has to know which files are spliced into another
     /// before it can decide whether to read them.
-    pub(crate) fn rust_include_host_blobs(&self, lang: &str) -> Result<Vec<Oid>> {
+    #[doc(hidden)]
+    pub fn rust_include_host_blobs(&self, lang: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blob_oids(
             "SELECT DISTINCT keys.blob_oid
                  FROM rust_include_edges AS facts
@@ -7154,7 +7366,8 @@ impl AnalyzerStore {
     /// A candidate set: two directories can both hold a `table.rs`, so the
     /// caller confirms each candidate by resolving that candidate's own stored
     /// `relative_path` against its own directory.
-    pub(crate) fn rust_include_blobs(&self, lang: &str, file_name: &str) -> Result<Vec<Oid>> {
+    #[doc(hidden)]
+    pub fn rust_include_blobs(&self, lang: &str, file_name: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
             "SELECT DISTINCT keys.blob_oid
              FROM rust_include_edges AS facts
@@ -7170,7 +7383,8 @@ impl AnalyzerStore {
     /// occurs, and the caller must still resolve it against the candidate's
     /// own facts. Comparison is case-sensitive, matching the spelling the
     /// declaration side stores.
-    pub(crate) fn rust_identifier_occurrence_blobs(
+    #[doc(hidden)]
+    pub fn rust_identifier_occurrence_blobs(
         &self,
         lang: &str,
         identifier: &str,
@@ -7209,9 +7423,10 @@ impl AnalyzerStore {
     /// path can be asked to produce on demand. It follows
     /// `mark_parsed_blob_incomplete_for_test`, the store's existing way of
     /// putting itself into a state only recovery code should see.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
-    pub(crate) fn delete_rust_facts_for_test(&self, lang: &str) {
+    #[doc(hidden)]
+    pub fn delete_rust_facts_for_test(&self, lang: &str) {
         let lang = lang.to_string();
         self.conn.execute(move |conn| {
             // Lose the whole module family, not just its witness. Keeping
@@ -7246,9 +7461,10 @@ impl AnalyzerStore {
     /// catching up" -- is only observable when the read actually fails
     /// (#2325). Same intent as `delete_rust_facts_for_test` above: put the
     /// store into a state only recovery code should see.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
-    pub(crate) fn drop_rust_modules_table_for_test(&self) {
+    #[doc(hidden)]
+    pub fn drop_rust_modules_table_for_test(&self) {
         self.conn.execute(move |conn| {
             conn.execute("DROP VIEW rust_published_fact_blobs", [])
                 .expect("make Rust publication probe unreadable")
@@ -7257,8 +7473,9 @@ impl AnalyzerStore {
 
     /// Exercise inverse-read failure and retry against real SQL while retaining
     /// the publication rows. The callback runs without holding the writer.
-    #[cfg(test)]
-    pub(crate) fn with_unreadable_rust_identifier_occurrences_for_test<T>(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_unreadable_rust_identifier_occurrences_for_test<T>(
         &self,
         check: impl FnOnce() -> T,
     ) -> T {
@@ -7292,7 +7509,8 @@ impl AnalyzerStore {
     /// `parsed_blob_keys_conn_with_condition`: each chunk is a batch of index
     /// seeks, so the cost tracks the live file set rather than the table's
     /// accumulated history.
-    pub(crate) fn blobs_with_rust_facts(
+    #[doc(hidden)]
+    pub fn blobs_with_rust_facts(
         &self,
         lang: &str,
         generation: GenerationId,
@@ -7316,7 +7534,8 @@ impl AnalyzerStore {
         Ok(present)
     }
 
-    fn blobs_with_rust_facts_sql(placeholders: &str) -> String {
+    #[doc(hidden)]
+    pub fn blobs_with_rust_facts_sql(placeholders: &str) -> String {
         format!(
             "SELECT keys.blob_oid
          FROM rust_published_fact_blobs AS keys
@@ -7336,7 +7555,8 @@ impl AnalyzerStore {
     ///
     /// A blob with no rows is absent from the result, which the caller
     /// distinguishes from "this file declares nothing".
-    pub(crate) fn rust_module_route_facts_while(
+    #[doc(hidden)]
+    pub fn rust_module_route_facts_while(
         &self,
         lang: &str,
         generation: GenerationId,
@@ -7685,18 +7905,25 @@ fn trait_impl_counterpart_sql(asked: &str, counterpart: &str) -> String {
 /// One item-position macro invocation, as
 /// [`AnalyzerStore::rust_item_macro_decisions`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredItemMacroDecision {
-    pub(crate) invocation: u32,
-    pub(crate) name: Option<String>,
-    pub(crate) decided: brokk_bifrost_rust::graph_support::RustItemMacroDecided,
+#[doc(hidden)]
+pub struct StoredItemMacroDecision {
+    #[doc(hidden)]
+    pub invocation: u32,
+    #[doc(hidden)]
+    pub name: Option<String>,
+    #[doc(hidden)]
+    pub decided: brokk_bifrost_rust::graph_support::RustItemMacroDecided,
 }
 
 /// One blob [`AnalyzerStore::rust_macro_expansion_blobs`] returns, with the
 /// macro and its defining blob when it is there by a macro's name.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct StoredMacroExpansionBlob {
-    pub(crate) blob: Oid,
-    pub(crate) via: Option<(String, Oid)>,
+#[doc(hidden)]
+pub struct StoredMacroExpansionBlob {
+    #[doc(hidden)]
+    pub blob: Oid,
+    #[doc(hidden)]
+    pub via: Option<(String, Oid)>,
 }
 
 /// `source_position` 0 and 1 are the item positions: a direct item
@@ -7766,11 +7993,16 @@ const RUST_MACRO_EXPANSION_BLOBS_SQL: &str = "WITH RECURSIVE
 
 /// One impl row of a trait, as [`AnalyzerStore::rust_trait_impl_rows`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct StoredTraitImplRow {
-    pub(crate) impl_blob: Oid,
-    pub(crate) impl_rel_path: String,
-    pub(crate) impl_declaration: Option<u32>,
-    pub(crate) subject: Option<(Oid, u32, String)>,
+#[doc(hidden)]
+pub struct StoredTraitImplRow {
+    #[doc(hidden)]
+    pub impl_blob: Oid,
+    #[doc(hidden)]
+    pub impl_rel_path: String,
+    #[doc(hidden)]
+    pub impl_declaration: Option<u32>,
+    #[doc(hidden)]
+    pub subject: Option<(Oid, u32, String)>,
 }
 
 /// One placed trait's impl rows, with each impl's source declaration and its
@@ -8043,7 +8275,8 @@ fn limited_identifier_candidate_for_blob_sql() -> String {
     )
 }
 
-fn limited_identifier_candidate_sql() -> String {
+#[doc(hidden)]
+pub fn limited_identifier_candidate_sql() -> String {
     format!(
         "{} LIMIT (
            SELECT request_limit
@@ -8812,7 +9045,8 @@ fn candidate_rows_for_languages_with<'a, T>(
     Ok(rows)
 }
 
-fn candidate_rows_for_identifier_languages_limited(
+#[doc(hidden)]
+pub fn candidate_rows_for_identifier_languages_limited(
     conn: &Connection,
     langs: &[String],
     identifier: &str,
@@ -9058,7 +9292,8 @@ struct PreparedUnitRow {
 /// that can fail, and failing them must not abort a batch mid-commit. Empty for
 /// every language except Rust.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct RustFactRows {
+#[doc(hidden)]
+pub struct RustFactRows {
     exports: Vec<RustExportRow>,
     import_targets: Vec<RustImportTargetRow>,
     /// `(identifier, context_mask)`
@@ -9386,7 +9621,8 @@ impl RustFactRows {
         })
     }
 
-    fn logical_rows(&self) -> usize {
+    #[doc(hidden)]
+    pub fn logical_rows(&self) -> usize {
         saturating_sum([
             self.exports.len(),
             self.import_targets.len(),
@@ -9400,7 +9636,8 @@ impl RustFactRows {
         ])
     }
 
-    fn string_bytes(&self) -> usize {
+    #[doc(hidden)]
+    pub fn string_bytes(&self) -> usize {
         saturating_sum([
             saturating_sum(self.exports.iter().map(|row| {
                 saturating_sum([
@@ -9626,15 +9863,17 @@ fn insert_rust_fact_rows(
 
 // ==== store/mod.rs lines 8261-8560 at the Phase 1 merge ====
 /// Read back one blob's `rust_*` fact rows through the common bulk decoder.
-fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<RustUsageFacts> {
+#[doc(hidden)]
+pub fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<RustUsageFacts> {
     require_unbounded_hydration(
         read_rust_usage_facts_with_session(conn, oid, lang, None)?,
         "unbounded Rust usage-fact hydration stopped unexpectedly",
     )
 }
 
-#[cfg(test)]
-fn read_rust_usage_facts_bulk(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn read_rust_usage_facts_bulk(
     conn: &Connection,
     lang: &str,
     oids: &[String],
@@ -9645,7 +9884,8 @@ fn read_rust_usage_facts_bulk(
     )
 }
 
-fn rust_import_targets_sql(placeholders: &str) -> String {
+#[doc(hidden)]
+pub fn rust_import_targets_sql(placeholders: &str) -> String {
     format!(
         "SELECT keys.blob_oid, facts.module_path, facts.bound_name,
                 facts.imported_name, facts.is_glob, facts.leading_absolute,
@@ -9662,7 +9902,8 @@ fn rust_import_targets_sql(placeholders: &str) -> String {
     )
 }
 
-fn rust_import_module_segments_sql(placeholders: &str) -> String {
+#[doc(hidden)]
+pub fn rust_import_module_segments_sql(placeholders: &str) -> String {
     format!(
         "SELECT keys.blob_oid, segments.import_ordinal, segments.ordinal, segments.segment
          FROM blobs AS keys
@@ -9677,7 +9918,8 @@ fn rust_import_module_segments_sql(placeholders: &str) -> String {
 /// its already validated mount inventory, so this is a bounded inventory read,
 /// not a workspace scan. Values within each family remain source-ordered by
 /// their persisted ordinal (or identifier key where that is the writer order).
-fn read_rust_usage_facts_bulk_with_session(
+#[doc(hidden)]
+pub fn read_rust_usage_facts_bulk_with_session(
     conn: &Connection,
     lang: &str,
     oids: &[String],
@@ -10256,13 +10498,15 @@ fn attach_rust_module_route_gate(
 }
 
 #[derive(Debug)]
-pub(crate) enum PreparedParsedBlobPreparation {
+#[doc(hidden)]
+pub enum PreparedParsedBlobPreparation {
     Prepared(Box<PreparedParsedBlob>),
     Cancelled,
 }
 
 #[derive(Debug)]
-pub(crate) enum StructuralFactRowsRead {
+#[doc(hidden)]
+pub enum StructuralFactRowsRead {
     Ready(PersistedStructuralFacts),
     Exceeded { minimum_work_items: usize },
     Unavailable,
@@ -10270,7 +10514,8 @@ pub(crate) enum StructuralFactRowsRead {
 }
 
 #[derive(Debug)]
-pub(crate) struct PreparedParsedBlob {
+#[doc(hidden)]
+pub struct PreparedParsedBlob {
     oid: Oid,
     oid_text: String,
     lang: String,
@@ -10308,21 +10553,25 @@ pub(crate) struct PreparedParsedBlob {
     children: Vec<(i64, i64, i64)>,
     imports: ImportRows,
     scala_exports: Vec<(i64, i64, Vec<u8>)>,
-    rust_facts: RustFactRows,
+    #[doc(hidden)]
+    pub rust_facts: RustFactRows,
     type_identifiers: Vec<String>,
     ruby_dispatch_modes: Vec<(i64, i64)>,
     scala_traits: Vec<i64>,
     materialization_records: Vec<(i64, Option<i64>, Vec<u8>)>,
     contains_tests: i64,
     content_package: String,
-    resolution: PreparedResolutionBundle,
+    #[doc(hidden)]
+    pub resolution: PreparedResolutionBundle,
     /// The blob's semantic IR rows, lowered at parse time. `None` for a
     /// language whose adapter has no parse-time lowerer.
     semantic_ir: Option<PreparedSemanticIr>,
     logical_rows: usize,
     payload_bytes: usize,
-    mutation_logical_rows: usize,
-    mutation_payload_bytes: usize,
+    #[doc(hidden)]
+    pub mutation_logical_rows: usize,
+    #[doc(hidden)]
+    pub mutation_payload_bytes: usize,
     /// Prepared row-sets for the same blob under other storage language keys
     /// (see [`FileState::additional_projections`]). Always empty on a nested
     /// entry, so flattening the persistence envelope is one bounded pass.
@@ -10508,11 +10757,13 @@ impl PreparedParsedBlob {
         }));
     }
 
-    pub(crate) fn mutation_logical_rows(&self) -> usize {
+    #[doc(hidden)]
+    pub fn mutation_logical_rows(&self) -> usize {
         self.mutation_logical_rows
     }
 
-    pub(crate) fn mutation_payload_bytes(&self) -> usize {
+    #[doc(hidden)]
+    pub fn mutation_payload_bytes(&self) -> usize {
         self.mutation_payload_bytes
     }
 
@@ -10520,8 +10771,9 @@ impl PreparedParsedBlob {
         self.payload_bytes.saturating_sub(self.state.source.len())
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_invalid_range_for_test(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn inject_invalid_range_for_test(&mut self) {
         self.ranges.push((i64::MAX, 0, 0, 0, 0, 0));
         self.logical_rows = self.logical_rows.saturating_add(1);
     }
@@ -10532,10 +10784,14 @@ impl PreparedParsedBlob {
 /// rows) may exceed them and is published alone. These are not per-file
 /// admission limits or a bound on preparation memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PersistBatchTargets {
-    pub(crate) max_blobs: usize,
-    pub(crate) max_rows: usize,
-    pub(crate) max_payload_bytes: usize,
+#[doc(hidden)]
+pub struct PersistBatchTargets {
+    #[doc(hidden)]
+    pub max_blobs: usize,
+    #[doc(hidden)]
+    pub max_rows: usize,
+    #[doc(hidden)]
+    pub max_payload_bytes: usize,
 }
 
 impl PersistBatchTargets {
@@ -10543,7 +10799,8 @@ impl PersistBatchTargets {
     // page cache, 256-blob/400 k-row batches cut commit cost ~3.5x versus the
     // previous 64-blob/100 k-row batches. Keep these grouping targets without
     // rejecting a prepared source whose complete publication exceeds them.
-    pub(crate) const PRODUCTION: Self = Self {
+    #[doc(hidden)]
+    pub const PRODUCTION: Self = Self {
         max_blobs: 256,
         max_rows: 400_000,
         max_payload_bytes: 32 * 1024 * 1024,
@@ -10559,22 +10816,35 @@ impl PersistBatchTargets {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PersistBatchStats {
-    pub(crate) transactions: usize,
+#[doc(hidden)]
+pub struct PersistBatchStats {
+    #[doc(hidden)]
+    pub transactions: usize,
     pub(crate) failed_transaction_attempts: usize,
-    pub(crate) committed_blobs: usize,
-    pub(crate) failed_blobs: usize,
-    pub(crate) committed_fragments: usize,
-    pub(crate) failed_fragments: usize,
-    pub(crate) logical_rows: usize,
-    pub(crate) payload_bytes: usize,
+    #[doc(hidden)]
+    pub committed_blobs: usize,
+    #[doc(hidden)]
+    pub failed_blobs: usize,
+    #[doc(hidden)]
+    pub committed_fragments: usize,
+    #[doc(hidden)]
+    pub failed_fragments: usize,
+    #[doc(hidden)]
+    pub logical_rows: usize,
+    #[doc(hidden)]
+    pub payload_bytes: usize,
     pub(crate) peak_batch_blobs: usize,
     pub(crate) peak_batch_fragments: usize,
-    pub(crate) peak_batch_rows: usize,
-    pub(crate) peak_batch_payload_bytes: usize,
-    pub(crate) peak_in_flight_items: usize,
-    pub(crate) peak_in_flight_payload_bytes: usize,
-    pub(crate) configured_max_in_flight_items: usize,
+    #[doc(hidden)]
+    pub peak_batch_rows: usize,
+    #[doc(hidden)]
+    pub peak_batch_payload_bytes: usize,
+    #[doc(hidden)]
+    pub peak_in_flight_items: usize,
+    #[doc(hidden)]
+    pub peak_in_flight_payload_bytes: usize,
+    #[doc(hidden)]
+    pub configured_max_in_flight_items: usize,
 }
 
 impl PersistBatchStats {
@@ -10608,26 +10878,31 @@ impl PersistBatchStats {
 }
 
 #[derive(Debug)]
-pub(crate) struct PersistBlobOutcome {
+#[doc(hidden)]
+pub struct PersistBlobOutcome {
     pub(crate) prepared: PreparedParsedBlob,
-    pub(crate) error: Option<StoreError>,
+    #[doc(hidden)]
+    pub error: Option<StoreError>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct PersistedMutationCost {
-    logical_rows: usize,
-    payload_bytes: usize,
+#[doc(hidden)]
+pub struct PersistedMutationCost {
+    #[doc(hidden)]
+    pub logical_rows: usize,
+    #[doc(hidden)]
+    pub payload_bytes: usize,
 }
 
 #[derive(Clone, Default)]
 struct PreparedWriteCounters {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     transaction_starts: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     generation_lookups: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     replacement_lookups: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     replacement_fallbacks: Arc<AtomicUsize>,
 }
 
@@ -11053,9 +11328,9 @@ fn try_persist_prepared_chunk_tx(
     if cancellation.is_cancelled() {
         return Err(StoreError::new("prepared blob persistence was cancelled"));
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let _ = counters;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     counters.transaction_starts.fetch_add(1, Ordering::SeqCst);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut fragments = Vec::new();
@@ -11101,7 +11376,7 @@ fn try_persist_prepared_chunk_tx(
         }
     }
     for (lang, generation) in generations {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         counters.generation_lookups.fetch_add(1, Ordering::SeqCst);
         require_current_generation(&tx, lang, generation)?;
     }
@@ -11113,7 +11388,7 @@ fn try_persist_prepared_chunk_tx(
         &tx,
         &unique_fragments,
         || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             counters.replacement_lookups.fetch_add(1, Ordering::SeqCst);
         },
         &mut restored_roots,
@@ -11126,7 +11401,7 @@ fn try_persist_prepared_chunk_tx(
             StoredCascadeCost::Missing => PersistedMutationCost::default(),
             StoredCascadeCost::Known(cost) => cost,
             StoredCascadeCost::Legacy => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 counters
                     .replacement_fallbacks
                     .fetch_add(1, Ordering::SeqCst);
@@ -11479,43 +11754,9 @@ fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
         .fold(0usize, |total, value| total.saturating_add(value))
 }
 
-#[cfg(test)]
-fn prepare_parsed_blob<A: LanguageAdapter>(
-    oid: Oid,
-    lang: &str,
-    generation: GenerationId,
-    adapter: &A,
-    state: Arc<FileState>,
-) -> Result<PreparedParsedBlob> {
-    if !state.additional_projections.is_empty() {
-        return Err(StoreError::new(
-            "preparing projected parsed blobs requires the captured generation map",
-        ));
-    }
-    let mut generations = HashMap::default();
-    generations.insert(lang.to_owned(), generation);
-    let file = test_blob_file();
-    let syntax = test_blob_syntax(adapter, &file, &state);
-    match prepare_parsed_blob_at_generations(
-        &file,
-        &syntax,
-        oid,
-        lang,
-        &generations,
-        adapter,
-        state,
-        &[],
-        &CancellationToken::default(),
-    )? {
-        PreparedParsedBlobPreparation::Prepared(prepared) => Ok(*prepared),
-        PreparedParsedBlobPreparation::Cancelled => {
-            Err(StoreError::new("parsed blob preparation was cancelled"))
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
     oid: Oid,
@@ -12414,23 +12655,10 @@ fn lower_parse_time_semantic_ir(
 
 /// The file a test blob is parsed and lowered as when the test does not name
 /// one. It has no extension, so it takes its language's default grammar.
-#[cfg(test)]
-pub(crate) fn test_blob_file() -> ProjectFile {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_blob_file() -> ProjectFile {
     ProjectFile::new(std::env::temp_dir(), "test_blob")
-}
-
-/// The tree a test blob's state is prepared with: the state's source parsed
-/// again, the way a path that dropped its tree does.
-#[cfg(test)]
-fn test_blob_syntax<A: LanguageAdapter>(
-    adapter: &A,
-    file: &ProjectFile,
-    state: &FileState,
-) -> Arc<PreparedSyntaxTree> {
-    match reparse_retained_source(adapter, file, state, None) {
-        PreparedSyntaxPreparation::Complete(Some(syntax)) => syntax,
-        _ => panic!("a test blob's source must parse within its budget"),
-    }
 }
 
 fn write_prepared_blob_rows_tx(
@@ -12822,7 +13050,8 @@ impl SideFactFamilies {
     }
 }
 
-pub(crate) fn require_complete_file_state(state: &FileState) -> Result<()> {
+#[doc(hidden)]
+pub fn require_complete_file_state(state: &FileState) -> Result<()> {
     if !state.parse_complete {
         return Err(StoreError::new(
             "timed-out file analysis cannot be published as a complete parsed blob",
@@ -12947,8 +13176,9 @@ fn stored_unit_keys_from_units(units: &[StoredUnit]) -> HashMap<CodeUnit, i64> {
         .collect()
 }
 
-#[cfg(test)]
-pub(crate) fn stored_unit_keys<A: LanguageAdapter>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn stored_unit_keys<A: LanguageAdapter>(
     adapter: &A,
     state: &FileState,
 ) -> HashMap<CodeUnit, i64> {
@@ -12974,7 +13204,8 @@ fn stored_unit_order_key(
     )
 }
 
-struct UnitRow {
+#[doc(hidden)]
+pub struct UnitRow {
     key: i64,
     unit: CodeUnit,
     is_type_alias: bool,
@@ -13906,7 +14137,8 @@ fn unique_rust_fact_oid_strings(oids: &[Oid]) -> Vec<String> {
     unique
 }
 
-fn rust_fact_oid_query_parameters(
+#[doc(hidden)]
+pub fn rust_fact_oid_query_parameters(
     lang: &str,
     generation: GenerationId,
     chunk: &[String],
@@ -13955,7 +14187,8 @@ fn padded_arity(len: usize, ladder: &[usize]) -> usize {
 /// `NULL`s. `NULL` never matches `IN`, so the padding is semantics-preserving:
 /// `x IN (a, b, NULL)` returns exactly what `x IN (a, b)` returns for the
 /// non-null `blob_oid`s we query.
-fn chunk_params(lang: &str, chunk: &[String]) -> Vec<Option<String>> {
+#[doc(hidden)]
+pub fn chunk_params(lang: &str, chunk: &[String]) -> Vec<Option<String>> {
     let arity = padded_arity(chunk.len(), &IN_CHUNK_ARITY_LADDER);
     let mut params = Vec::with_capacity(arity + 1);
     params.push(Some(lang.to_string()));
@@ -13964,7 +14197,8 @@ fn chunk_params(lang: &str, chunk: &[String]) -> Vec<Option<String>> {
     params
 }
 
-fn chunk_placeholders(chunk: &[String]) -> String {
+#[doc(hidden)]
+pub fn chunk_placeholders(chunk: &[String]) -> String {
     let arity = padded_arity(chunk.len(), &IN_CHUNK_ARITY_LADDER);
     std::iter::repeat_n("?", arity)
         .collect::<Vec<_>>()
@@ -14289,7 +14523,8 @@ fn import_info_from_statement_row(
     })
 }
 
-fn import_path_children_sql(
+#[doc(hidden)]
+pub fn import_path_children_sql(
     table: &str,
     value_columns: &str,
     child_ordinal: &str,
@@ -14370,7 +14605,8 @@ fn attach_import_path_children(
     Ok(true)
 }
 
-fn read_import_infos_bulk(
+#[doc(hidden)]
+pub fn read_import_infos_bulk(
     conn: &Connection,
     lang: &str,
     oids: &[String],
@@ -14381,7 +14617,8 @@ fn read_import_infos_bulk(
     )
 }
 
-fn import_infos_bulk_sql(placeholders: &str) -> String {
+#[doc(hidden)]
+pub fn import_infos_bulk_sql(placeholders: &str) -> String {
     format!(
         "SELECT keys.blob_oid, imports.statement, imports.is_wildcard,
                 imports.is_global, imports.identifier, imports.alias,
@@ -15588,7 +15825,8 @@ fn search_candidate_sql(predicate: &str) -> String {
 
 /// Fixed arities for the tuple list used by key hydration. Padding with NULLs
 /// keeps a small set of prepared SQL shapes; the inner joins discard padding.
-const SEARCH_CANDIDATE_KEY_BATCH_SIZE: usize = 400;
+#[doc(hidden)]
+pub const SEARCH_CANDIDATE_KEY_BATCH_SIZE: usize = 400;
 const SEARCH_CANDIDATE_KEY_ARITY_LADDER: [usize; 4] =
     [16, 64, 256, SEARCH_CANDIDATE_KEY_BATCH_SIZE];
 
@@ -15923,7 +16161,8 @@ fn sync_active_blob_oids(conn: &Connection, active_blobs: &[ActiveSearchBlob]) -
     )
 }
 
-const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
+#[doc(hidden)]
+pub const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
      FROM temp.reverse_import_lookup_keys AS requested
      CROSS JOIN source_import_segments AS segments
        INDEXED BY idx_source_import_segments_by_segment
@@ -16002,7 +16241,8 @@ const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT DISTINCT files.rel_
       AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
      WHERE requested.kind = 2";
 
-fn sync_reverse_reference_lookup_keys(
+#[doc(hidden)]
+pub fn sync_reverse_reference_lookup_keys(
     conn: &Connection,
     explicit_import_segments: &HashSet<String>,
     wildcard_import_segments: &HashSet<String>,
@@ -16262,7 +16502,8 @@ fn read_unit_rows<A: LanguageAdapter>(
 }
 
 /// Mount canonical unit identities for source-family declaration bridges.
-pub(in crate::analyzer) fn read_source_unit_map<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn read_source_unit_map<A: LanguageAdapter>(
     conn: &Connection,
     oid: &str,
     lang: &str,
@@ -16276,7 +16517,8 @@ pub(in crate::analyzer) fn read_source_unit_map<A: LanguageAdapter>(
     )
 }
 
-fn read_unit_rows_while<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn read_unit_rows_while<A: LanguageAdapter>(
     conn: &Connection,
     oid: &str,
     lang: &str,
@@ -16337,7 +16579,8 @@ fn read_unit_rows_while<A: LanguageAdapter>(
     Ok(keep_going().then_some(out))
 }
 
-fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<ImportInfo>> {
+#[doc(hidden)]
+pub fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<ImportInfo>> {
     require_unbounded_hydration(
         read_import_infos_with_session(conn, oid, lang, None)?,
         "unbounded import-info hydration stopped unexpectedly",
@@ -16518,7 +16761,8 @@ fn direct_children_limited_candidate_sql() -> String {
 /// The per-unit signature-metadata read. Named so a plan pin can
 /// assert it seeks the table's primary key rather than scanning it.
 /// The unbounded API binds a negative SQL limit and does not consume row bytes.
-fn signature_metadata_for_unit_sql() -> &'static str {
+#[doc(hidden)]
+pub fn signature_metadata_for_unit_sql() -> &'static str {
     static SQL: LazyLock<String> = LazyLock::new(|| {
         let row_bytes = signature_metadata_row_bytes_sql("metadata");
         let columns = signature_metadata_projection_columns_sql("metadata");
@@ -17119,7 +17363,8 @@ fn require_generation_map<'a>(
     Ok(())
 }
 
-fn current_generation_conn(conn: &Connection, lang: &str) -> Result<GenerationId> {
+#[doc(hidden)]
+pub fn current_generation_conn(conn: &Connection, lang: &str) -> Result<GenerationId> {
     let generation = conn
         .prepare_cached("SELECT generation FROM analysis_epochs WHERE lang = ?1")?
         .query_row([lang], |row| row.get(0))
@@ -17148,7 +17393,8 @@ fn contains_parsed_blob_conn(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StoredCascadeCost {
+#[doc(hidden)]
+pub enum StoredCascadeCost {
     Missing,
     Legacy,
     Known(PersistedMutationCost),
@@ -17275,7 +17521,8 @@ fn semantic_ir_cascade_payload_bytes_sql(blob_id: &str) -> String {
     )
 }
 
-fn rust_projection_cascade_rows_sql(blob_id: &str) -> String {
+#[doc(hidden)]
+pub fn rust_projection_cascade_rows_sql(blob_id: &str) -> String {
     RUST_PROJECTION_PAYLOAD_COLUMNS
         .iter()
         .map(|(table, _)| format!("(SELECT COUNT(*) FROM {table} WHERE blob_id = {blob_id})"))
@@ -17283,7 +17530,8 @@ fn rust_projection_cascade_rows_sql(blob_id: &str) -> String {
         .join(" + ")
 }
 
-fn rust_projection_cascade_payload_bytes_sql(blob_id: &str) -> String {
+#[doc(hidden)]
+pub fn rust_projection_cascade_payload_bytes_sql(blob_id: &str) -> String {
     RUST_PROJECTION_PAYLOAD_COLUMNS
         .iter()
         .map(|(table, columns)| {
@@ -17349,7 +17597,8 @@ fn complete_blob_cascade_rows_sql(blob_id: &str) -> String {
     )
 }
 
-fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
+#[doc(hidden)]
+pub fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
     assert!((1..=PersistBatchTargets::PRODUCTION.max_blobs).contains(&key_count));
     let requested = (0..key_count)
         .map(|ordinal| format!("({ordinal}, ?, ?)"))
@@ -17616,7 +17865,8 @@ fn class_set_summary_owner_or_surface_predicate(summary: &str, blob_id: &str) ->
     )
 }
 
-fn persisted_blob_mutation_cost_fallback_statement(
+#[doc(hidden)]
+pub fn persisted_blob_mutation_cost_fallback_statement(
     statement: &mut rusqlite::Statement<'_>,
     oid: &str,
     lang: &str,
@@ -17631,7 +17881,8 @@ fn persisted_blob_mutation_cost_fallback_statement(
         .map_err(StoreError::from)
 }
 
-fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
+#[doc(hidden)]
+pub fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
     // The signature-metadata term is composed rather than written out so that
     // it cannot drift from `SIGNATURE_METADATA_TEXT_COLUMNS`. The subquery
     // leaves the table unaliased on purpose: a plan pin asserts
@@ -18073,7 +18324,8 @@ fn parsed_blob_keys_conn_with_condition(
     Ok(present)
 }
 
-fn stale_generation_blob_costs_sql() -> &'static str {
+#[doc(hidden)]
+pub fn stale_generation_blob_costs_sql() -> &'static str {
     static SQL: LazyLock<String> = LazyLock::new(|| {
         let complete_rows = complete_blob_cascade_rows_sql("blobs.id");
         format!(
@@ -18174,10 +18426,14 @@ fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
         .map_err(|err| StoreError::new(format!("analyzer store serialization error: {err}")))
 }
 
-struct PersistedUnitFq {
-    anchor: Option<PackageAnchor>,
-    package_tail_segments: usize,
-    tail: FqName,
+#[doc(hidden)]
+pub struct PersistedUnitFq {
+    #[doc(hidden)]
+    pub anchor: Option<PackageAnchor>,
+    #[doc(hidden)]
+    pub package_tail_segments: usize,
+    #[doc(hidden)]
+    pub tail: FqName,
 }
 
 #[derive(Debug)]
@@ -18193,7 +18449,8 @@ struct PreparedUnitFq {
     segments: Vec<(i64, &'static str, String)>,
 }
 
-fn segment_kind_sql(kind: SegmentKind) -> &'static str {
+#[doc(hidden)]
+pub fn segment_kind_sql(kind: SegmentKind) -> &'static str {
     match kind {
         SegmentKind::Path => "path",
         SegmentKind::Package => "package",
@@ -18220,7 +18477,8 @@ fn segment_kind_from_sql(value: &str) -> Result<SegmentKind> {
     }
 }
 
-fn persisted_unit_fq<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn persisted_unit_fq<A: LanguageAdapter>(
     adapter: &A,
     unit: &CodeUnit,
     content_qualifier: &str,
@@ -18378,7 +18636,8 @@ impl RelationalUnitFq {
 
 /// Hydrate the structured identity and its package boundary from authoritative
 /// relational segments. There is no binary or rendered-name fallback.
-pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn hydrate_unit_fq<A: LanguageAdapter>(
     adapter: &A,
     persisted: Option<&RelationalUnitFq>,
     content_qualifier: &str,
@@ -18855,7 +19114,8 @@ impl SignatureMetadataColumns {
 ///
 /// It is inside the stored value on purpose: a reader that sees a label needs
 /// no side channel to learn that the rendering is partial.
-const SIGNATURE_LABEL_ELISION: &str = " /* label elided */";
+#[doc(hidden)]
+pub const SIGNATURE_LABEL_ELISION: &str = " /* label elided */";
 
 /// A declaration label and its parameter spans, clamped to the label column's
 /// byte cap.
@@ -19108,7 +19368,8 @@ fn deserialize_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
 }
 
-fn bool_to_i64(value: bool) -> i64 {
+#[doc(hidden)]
+pub fn bool_to_i64(value: bool) -> i64 {
     i64::from(value)
 }
 
@@ -19343,7 +19604,8 @@ fn structural_fact_manifest_sql() -> String {
     )
 }
 
-pub(crate) fn usize_to_i64(value: usize) -> Result<i64> {
+#[doc(hidden)]
+pub fn usize_to_i64(value: usize) -> Result<i64> {
     sqlite_integer(value)
         .ok_or_else(|| StoreError::new(format!("value does not fit in SQLite INTEGER: {value}")))
 }
@@ -19361,7 +19623,8 @@ fn rusqlite_error_from_store(err: StoreError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(err))
 }
 
-fn code_unit_kind_to_i64(kind: CodeUnitType) -> i64 {
+#[doc(hidden)]
+pub fn code_unit_kind_to_i64(kind: CodeUnitType) -> i64 {
     match kind {
         CodeUnitType::Class => 0,
         CodeUnitType::Function => 1,
@@ -19403,83 +19666,55 @@ fn ruby_dispatch_mode_from_i64(value: i64) -> Result<RubyMethodDispatchMode> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "resolution_producer_tests.rs"]
-mod resolution_producer_tests;
+#[doc(hidden)]
+pub mod resolution_producer_tests;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod js_ts_resolution_producer_support;
 
 #[cfg(test)]
-mod tests {
+#[doc(hidden)]
+pub mod tests {
+    use super::test_support::assert_prior_parsed_blob_invalidated;
+
+    pub(super) use super::test_support::*;
+
     use super::*;
+
     use crate::test_support::write_file;
-    pub(super) fn blob_id(conn: &Connection, oid: Oid) -> i64 {
-        conn.query_row(
-            "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-            [oid.to_string()],
-            |row| row.get(0),
-        )
-        .expect("published Rust blob id")
-    }
-
-    pub(super) fn assert_rust_source_read_cancellation_retries<T>(
-        mut read: impl FnMut(&dyn Fn() -> bool) -> Option<T>,
-        minimum_checkpoints: usize,
-        check_retry: impl FnOnce(&T, &T),
-    ) {
-        let checks = std::cell::Cell::new(0usize);
-        let complete = read(&|| {
-            checks.set(checks.get() + 1);
-            true
-        })
-        .expect("complete Rust source-fact read");
-        let total_checks = checks.get();
-        assert!(
-            total_checks > minimum_checkpoints,
-            "Rust source-fact read had too few checkpoints: {total_checks}"
-        );
-
-        let cancelled_checks = std::cell::Cell::new(0usize);
-        assert!(
-            read(&|| {
-                cancelled_checks.set(cancelled_checks.get() + 1);
-                cancelled_checks.get() < total_checks
-            })
-            .is_none(),
-            "cancelled Rust source-fact read returned partial rows"
-        );
-        assert!(
-            cancelled_checks.get() >= total_checks,
-            "cancelled Rust source-fact read skipped checkpoints"
-        );
-
-        let retried = read(&|| true).expect("retry Rust source-fact read");
-        check_retry(&complete, &retried);
-    }
 
     // The EXPLAIN QUERY PLAN pins below take their SQL and bindings from the
     // pinned-query registry in `planner_statistics`, so each pinned statement
     // is written once, and run each assertion in both planner-statistics
     // states (issue #3016).
     use super::planner_statistics::pinned_plans::DEFINITION_CANDIDATE_ARITY_LADDER;
-    use super::planner_statistics::tests::{explain_pin, pinned, prepare_pin_context};
-    pub(super) use super::test_blob_oid as oid_for;
-    use crate::analyzer::cpp::CppAdapter;
-    use crate::analyzer::csharp::CSharpAdapter;
-    use crate::analyzer::go::GoAdapter;
+
+    use super::planner_statistics::tests::explain_pin;
+
+    use super::planner_statistics::tests::pinned;
+
     use crate::analyzer::java::JavaAdapter;
+
     use crate::analyzer::kotlin::KotlinAdapter;
-    use crate::analyzer::model::{StructuredTypeIdentityBuilder, StructuredTypeName};
-    use crate::analyzer::php::PhpAdapter;
-    use crate::analyzer::python::PythonAdapter;
-    use crate::analyzer::ruby::RubyAdapter;
-    use crate::analyzer::rust::RustAdapter;
+
     use crate::analyzer::scala::ScalaAdapter;
-    use crate::analyzer::tree_sitter_analyzer::{ParsedFile, TreeSitterAnalyzer};
-    use crate::analyzer::typescript::TypescriptAdapter;
-    use crate::gitblob::test_repo::{commit_all, init_repo};
+
+    use crate::gitblob::test_repo::commit_all;
+
+    use crate::gitblob::test_repo::init_repo;
+
     use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
     use git2::ObjectType;
-    use tree_sitter::Parser;
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -19526,460 +19761,6 @@ mod tests {
         assert_eq!(error.kind(), StoreErrorKind::ResourceBound);
         assert!(error.is_resource_bound());
         assert_eq!(error.to_string(), "repairing blob: over budget");
-    }
-
-    #[test]
-    fn explicit_root_rust_unit_persists_full_identity_despite_empty_qualifier() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "src/tools/clippy/tests/ui/from_over_into.rs",
-            "struct ExplicitPaths;\n",
-        );
-        let unit = CodeUnit::with_signature(
-            file.clone(),
-            CodeUnitType::Function,
-            "",
-            "ExplicitPaths.into",
-            Some(
-                "impl core::convert::Into<bool> for crate::ExplicitPaths::fn into(self) -> bool { ... }"
-                    .to_string(),
-            ),
-            false,
-        );
-        let adapter = RustAdapter;
-        let content_qualifier = adapter.storage_content_qualifier(&unit, "");
-
-        assert!(content_qualifier.is_empty());
-        let persisted = persisted_unit_fq(&adapter, &unit, &content_qualifier).unwrap();
-        assert_eq!(persisted.anchor, None);
-        let interner = segment_interner();
-        let segments = persisted
-            .tail
-            .segments()
-            .iter()
-            .map(|&id| {
-                let (text, kind) = interner.resolve(id);
-                (kind, text.to_string())
-            })
-            .collect::<Vec<_>>();
-        let relational = RelationalUnitFq {
-            anchor: persisted.anchor,
-            package_tail_segments: persisted.package_tail_segments,
-            expected_segment_count: persisted.tail.len(),
-            expected_segment_bytes: segments
-                .iter()
-                .map(|(kind, segment)| segment_kind_sql(*kind).len() + segment.len())
-                .sum(),
-            segments,
-        };
-        let (hydrated_fq, hydrated_package_segment_count) =
-            hydrate_unit_fq(&adapter, Some(&relational), &content_qualifier, &file).unwrap();
-        assert_eq!(hydrated_fq, unit.fq().clone());
-        assert_eq!(hydrated_package_segment_count, 0);
-    }
-
-    /// One `SignatureMetadata` with every field carrying a non-default value.
-    ///
-    /// The round-trip test below is only as strong as this value is complete:
-    /// a field that stays at its default here would round-trip through a
-    /// column that the encoder never writes and the decoder never reads.
-    fn fully_populated_signature_metadata() -> SignatureMetadata {
-        let named = |path: &str| {
-            StructuredTypeName::new(vec![path.to_string()], vec!["outer".to_string()], true)
-                .expect("structured type name")
-        };
-        let mut builder = StructuredTypeIdentityBuilder::default();
-        let key = builder.named(named("String")).unwrap();
-        let value = builder.named(named("Widget")).unwrap();
-        let map = builder.map(key, value).unwrap();
-        let base = builder.named(named("Registry")).unwrap();
-        let generic = builder.generic(base, vec![map]).unwrap();
-        let return_type_identity = builder.finish(generic).expect("return identity");
-
-        let mut underlying = StructuredTypeIdentityBuilder::default();
-        let element = underlying.named(named("Operation")).unwrap();
-        let pointer = underlying.pointer(element).unwrap();
-        let array = underlying.array(pointer).unwrap();
-        let underlying_type_identity = underlying.finish(array).expect("underlying identity");
-
-        let mut receiver = StructuredTypeIdentityBuilder::default();
-        let receiver_named = receiver.named(named("Receiver")).unwrap();
-        let receiver_slice = receiver.slice(receiver_named).unwrap();
-        let extension_receiver_type_identity = receiver.finish(receiver_slice).expect("receiver");
-
-        // Two declared results, so the round trip pins the positional column
-        // rather than only the single `return_type_identity` beside it. A
-        // reader that dropped this column would still decode every other
-        // field, which is exactly how it went unnoticed the first time.
-        let mut first_result = StructuredTypeIdentityBuilder::default();
-        let first_named = first_result.named(named("Tx")).unwrap();
-        let first_pointer = first_result.pointer(first_named).unwrap();
-        let first_result_identity = first_result.finish(first_pointer).expect("first result");
-        let mut second_result = StructuredTypeIdentityBuilder::default();
-        let second_named = second_result.named(named("error")).unwrap();
-        let second_result_identity = second_result.finish(second_named).expect("second result");
-
-        SignatureMetadata::new(
-            "fn build(first: String, second: Widget) -> Registry<Map<String, Widget>>",
-            vec![
-                ParameterMetadata::new("first: String", 9, 22).with_name("first"),
-                ParameterMetadata::new("second: Widget", 24, 38).with_name("second"),
-            ],
-        )
-        .with_return_type_text(Some("Registry<Map<String, Widget>>"))
-        .with_return_type_identity(Some(return_type_identity))
-        .with_parameter_type_identities(vec![Some(first_result_identity.clone()), None])
-        .with_result_type_identities(vec![first_result_identity, second_result_identity])
-        .with_callable_override_modifier(CallableOverrideModifier::Override)
-        .with_underlying_type_identity(Some(underlying_type_identity))
-        .with_declaration_only(true)
-        .with_callable_arity(CallableArity::new(2, 3, true))
-        // The recorded builder, so the round trip pins the flag column beside
-        // the list. `bare` beside this row is the unrecorded reading, which is
-        // what a row written before #1651 reads back as.
-        .with_recorded_type_parameters(vec!["T".to_string(), "U".to_string()])
-        .with_bare_return_type_parameter(Some("T"))
-        .with_callable_linkage(CallableLinkage::External)
-        .with_dispatch_extensibility(DispatchExtensibility::Closed)
-        .with_extension_receiver_type(Some("Receiver"))
-        .with_extension_receiver_type_identity(Some(extension_receiver_type_identity))
-        .with_extension_receiver_is_unconstrained_type_parameter(true)
-        .with_field_modifiers(true, true)
-        .with_field_initializer(true)
-        .with_cpp_field_linkage(CppFieldLinkage::InternalUnlessExternalPeer)
-        .with_companion_object(true)
-        .with_callable_modifiers(true, true, DeclaredVisibility::PackagePrivate)
-        .with_callable_parameter_types(vec!["String".to_string(), "Widget".to_string()])
-        .with_callable_native(true)
-        .with_class_like_kind(brokk_bifrost_core::analyzer::model::ClassLikeKind::Interface)
-        .with_class_like_static(true)
-    }
-
-    fn replace_test_metadata_bridges(state: &mut FileState, target: &CodeUnit, count: usize) {
-        let original = state
-            .source_declaration_metadata
-            .iter()
-            .filter(|link| link.unit == *target && link.metadata_ordinal == 0)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            !original.is_empty(),
-            "fixture metadata needs source declarations"
-        );
-        state
-            .source_declaration_metadata
-            .retain(|link| link.unit != *target);
-        for link in original {
-            state
-                .source_declaration_metadata
-                .extend((0..count).map(|metadata_ordinal| {
-                    let mut alternative = link.clone();
-                    alternative.metadata_ordinal = metadata_ordinal;
-                    alternative
-                }));
-        }
-    }
-
-    /// Write `metadata` as the signature rows of one unit of `file`, then read
-    /// them back through every reader the store has.
-    ///
-    /// The queries decode this table positionally from one shared column
-    /// list, so a round trip that exercises only one does not cover the
-    /// other readers.
-    fn assert_signature_metadata_round_trips<A: LanguageAdapter>(
-        adapter: &A,
-        lang: &str,
-        file: &ProjectFile,
-        metadata: &[SignatureMetadata],
-    ) {
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let mut state = parse_state(adapter, file);
-        let target = state
-            .signature_metadata
-            .iter()
-            .find(|(_, entries)| !entries.is_empty())
-            .map(|(unit, _)| unit.clone())
-            .expect("fixture should produce signature metadata");
-        let mut projected_metadata = metadata.to_vec();
-        if let Some(shape) = state.signature_metadata[&target][0].java_type_constructor_shape() {
-            for alternative in &mut projected_metadata {
-                *alternative = alternative.clone().with_java_type_constructor_shape(shape);
-            }
-        }
-        if adapter.declaration_visibility_facts_version().is_some() {
-            let link = state
-                .source_declaration_metadata
-                .iter()
-                .find(|link| link.unit == target)
-                .expect("actual Java metadata has a canonical declaration link")
-                .clone();
-            let visibility = state
-                .source_facts
-                .as_ref()
-                .unwrap()
-                .declaration_visibilities
-                .as_ref()
-                .unwrap()
-                .iter()
-                .find(|fact| fact.declaration == link.declaration)
-                .unwrap()
-                .visibility;
-            for alternative in &mut projected_metadata {
-                *alternative = alternative
-                    .clone()
-                    .with_source_declared_visibility(visibility);
-            }
-        }
-        replace_test_metadata_bridges(&mut state, &target, metadata.len());
-        state
-            .source_declaration_metadata
-            .retain(|link| link.unit == target);
-        let metadata = projected_metadata.as_slice();
-        let signatures = state
-            .signatures
-            .get_mut(&target)
-            .expect("metadata target should have a signature");
-        signatures.clear();
-        signatures.extend([
-            metadata[2].label().to_string(),
-            metadata[0].label().to_string(),
-        ]);
-        state.signature_metadata.clear();
-        state.signature_metadata_signature_ordinals.clear();
-        state
-            .signature_metadata
-            .insert(target.clone(), metadata.to_vec());
-        assert_eq!(
-            metadata.len(),
-            3,
-            "pair test needs three metadata alternatives"
-        );
-        let expected_pairs = (0..metadata.len())
-            .map(|ordinal| match ordinal {
-                0 | 1 => 1,
-                _ => 0,
-            })
-            .collect::<Vec<_>>();
-        state
-            .signature_metadata_signature_ordinals
-            .insert(target.clone(), expected_pairs.clone());
-        let state = Arc::new(state);
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value(lang, "signature-metadata-round-trip")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                lang,
-                generation,
-                adapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        let conn = store.read_conn().unwrap();
-        let pair_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM unit_signature_metadata_signatures
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
-                params![oid.to_string(), lang],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(pair_count, i64::try_from(metadata.len()).unwrap());
-        let manifest_count: i64 = conn
-            .query_row(
-                "SELECT row_count FROM blob_optional_fact_manifest
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-                   AND fact_kind = ?3",
-                params![
-                    oid.to_string(),
-                    lang,
-                    OPTIONAL_FACT_KIND_SIGNATURE_METADATA_SIGNATURE
-                ],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(manifest_count, pair_count);
-        drop(conn);
-
-        let limited = store
-            .signature_metadata_for_unit_limited(oid, lang, generation, &target, usize::MAX)
-            .unwrap();
-        assert!(limited.complete, "{lang}: bounded read must complete");
-        assert_eq!(limited.rows, metadata, "{lang}: bounded per-unit reader");
-
-        assert_eq!(
-            store
-                .signature_metadata_for_unit(oid, lang, generation, &target)
-                .unwrap(),
-            metadata,
-            "{lang}: unbounded per-unit reader"
-        );
-
-        let hydrated = store
-            .hydrate_file_state_with_source(oid, lang, generation, adapter, file, &source)
-            .unwrap()
-            .expect("single-file hydration");
-        assert_eq!(
-            hydrated.signature_metadata.get(&target).map(Vec::as_slice),
-            Some(metadata),
-            "{lang}: single-file hydration reader"
-        );
-        assert_eq!(
-            hydrated
-                .signature_metadata_signature_ordinals
-                .get(&target)
-                .map(Vec::as_slice),
-            Some(expected_pairs.as_slice()),
-            "{lang}: single-file metadata/signature pair reader"
-        );
-
-        let bulk = store
-            .hydrate_file_states(
-                &[(file.clone(), oid)],
-                lang,
-                adapter,
-                &HashMap::from_iter([(file.clone(), source.clone())]),
-            )
-            .unwrap();
-        assert_eq!(
-            bulk.get(file)
-                .expect("bulk hydration")
-                .signature_metadata
-                .get(&target)
-                .map(Vec::as_slice),
-            Some(metadata),
-            "{lang}: bulk hydration reader"
-        );
-        assert_eq!(
-            bulk.get(file)
-                .expect("bulk hydration")
-                .signature_metadata_signature_ordinals
-                .get(&target)
-                .map(Vec::as_slice),
-            Some(expected_pairs.as_slice()),
-            "{lang}: bulk metadata/signature pair reader"
-        );
-
-        // The usage-fact projection selects the first metadata row paired with
-        // signature ordinal zero, and only for units in declarations.
-        let usage_row = store
-            .usage_fact_rows_by_lang(lang)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.candidate.short_name == target.short_name())
-            .expect("usage-fact row for the target unit");
-        let first_signature_metadata_ordinal = expected_pairs
-            .iter()
-            .position(|&signature_ordinal| signature_ordinal == 0)
-            .expect("fixture should pair the first signature");
-        assert_eq!(
-            usage_row.signature_metadata.as_ref(),
-            metadata.get(first_signature_metadata_ordinal),
-            "{lang}: usage-fact projection reader"
-        );
-    }
-
-    #[test]
-    fn signature_metadata_columns_round_trip_through_every_reader() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let populated = fully_populated_signature_metadata();
-        let bare = SignatureMetadata::new(populated.label(), Vec::new());
-        let different_label = SignatureMetadata::new("different", Vec::new());
-        let rows = [populated, bare, different_label];
-
-        assert_signature_metadata_round_trips(
-            &RubyAdapter,
-            "ruby",
-            &write_file(
-                temp.path(),
-                "factory.rb",
-                "class Factory\n  def make(value)\n    value\n  end\nend\n",
-            ),
-            &rows,
-        );
-        assert_signature_metadata_round_trips(
-            &JavaAdapter,
-            "java",
-            &write_file(temp.path(), "Factory.java", "class Factory {}\n"),
-            &rows,
-        );
-    }
-
-    #[test]
-    fn usage_projection_keeps_plain_first_signature_unpaired() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
-            .file(
-                "factory.rb",
-                "class Factory\n  def make(value)\n    value\n  end\nend\n",
-            )
-            .build();
-        let file = fixture.file("factory.rb");
-        let source = file.read_to_string().unwrap();
-        let mut state = parse_state(&RubyAdapter, &file);
-        let target = state
-            .signature_metadata
-            .keys()
-            .next()
-            .cloned()
-            .expect("fixture should produce a metadata-bearing unit");
-        state.signatures.insert(
-            target.clone(),
-            vec![
-                "plain first signature".to_owned(),
-                "metadata-bearing second signature".to_owned(),
-            ],
-        );
-        let metadata = vec![
-            SignatureMetadata::new("later alternative one", Vec::new()),
-            SignatureMetadata::new("later alternative two", Vec::new()),
-        ];
-        replace_test_metadata_bridges(&mut state, &target, metadata.len());
-        state
-            .signature_metadata
-            .insert(target.clone(), metadata.clone());
-        state
-            .signature_metadata_signature_ordinals
-            .insert(target.clone(), vec![1, 1]);
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("ruby", "unpaired-first-signature")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
-                generation,
-                &RubyAdapter,
-                &state,
-            )
-            .unwrap();
-
-        let usage_row = store
-            .usage_fact_rows_by_lang("ruby")
-            .unwrap()
-            .into_iter()
-            .find(|row| row.candidate.short_name == target.short_name())
-            .expect("usage-fact row for the target unit");
-        assert_eq!(
-            usage_row.signature.as_deref(),
-            Some("plain first signature")
-        );
-        assert_eq!(usage_row.signature_metadata, None);
-        assert_eq!(
-            store
-                .signature_metadata_for_unit(oid, "ruby", generation, &target)
-                .unwrap(),
-            metadata,
-            "the unbounded callable reader must retain later alternatives"
-        );
     }
 
     #[test]
@@ -20125,140 +19906,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic(expected = "beyond")]
-    fn signature_metadata_pair_preparation_rejects_out_of_range_coordinate() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
-            .file(
-                "factory.rb",
-                "class Factory\n  def make(value)\n    value\n  end\nend\n",
-            )
-            .build();
-        let file = fixture.file("factory.rb");
-        let mut state = parse_state(&RubyAdapter, &file);
-        let target = state
-            .signature_metadata
-            .keys()
-            .next()
-            .cloned()
-            .expect("fixture should produce metadata");
-        let metadata_len = state.signature_metadata[&target].len();
-        state
-            .signature_metadata_signature_ordinals
-            .insert(target, vec![usize::MAX; metadata_len]);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("ruby", "invalid-signature-metadata-pair")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
-                generation,
-                &RubyAdapter,
-                &state,
-            )
-            .expect("invalid metadata/signature coordinate must panic during preparation");
-    }
-
-    #[test]
-    fn signature_metadata_unbounded_reader_preserves_rows_beyond_bounded_byte_budget() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
-            .file(
-                "factory.rb",
-                "class Factory\n  def make(value)\n    value\n  end\nend\n",
-            )
-            .build();
-        let file = fixture.file("factory.rb");
-        let mut state = parse_state(&RubyAdapter, &file);
-        let target = state.signature_metadata.keys().next().unwrap().clone();
-        let metadata = (0..=MAX_LIMITED_QUERY_AGGREGATE_BYTES
-            / MAX_SIGNATURE_METADATA_COLUMN_BYTES)
-            .map(|ordinal| {
-                SignatureMetadata::new(format!("make_{ordinal}"), Vec::new())
-                    .with_return_type_text(Some("x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES)))
-            })
-            .collect::<Vec<_>>();
-        replace_test_metadata_bridges(&mut state, &target, metadata.len());
-        state
-            .signature_metadata
-            .insert(target.clone(), metadata.clone());
-        state
-            .signature_metadata_signature_ordinals
-            .insert(target.clone(), vec![0; metadata.len()]);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("ruby", "unbounded-signature-metadata")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
-                generation,
-                &RubyAdapter,
-                &state,
-            )
-            .unwrap();
-
-        let limited = store
-            .signature_metadata_for_unit_limited(oid, "ruby", generation, &target, usize::MAX)
-            .unwrap();
-        assert!(
-            !limited.complete,
-            "the bounded API must enforce its byte budget"
-        );
-        assert_eq!(
-            store
-                .signature_metadata_for_unit(oid, "ruby", generation, &target)
-                .unwrap(),
-            metadata,
-            "the Vec API must preserve every alternative, without an implicit byte cutoff"
-        );
-
-        let assert_indexed = || {
-            let conn = store.read_conn().unwrap();
-            let mut statement = conn
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    signature_metadata_for_unit_sql()
-                ))
-                .unwrap();
-            let plan = statement
-                .query_map(
-                    params![
-                        oid.to_string(),
-                        "ruby",
-                        target.fq_name(),
-                        code_unit_kind_to_i64(target.kind()),
-                        target.short_name(),
-                        target.signature(),
-                        bool_to_i64(target.is_synthetic()),
-                        -1i64,
-                    ],
-                    |row| row.get::<_, String>(3),
-                )
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert!(
-                plan.iter()
-                    .any(|detail| detail.contains("SEARCH metadata USING PRIMARY KEY")),
-                "unbounded metadata must seek the populated primary key: {plan:?}"
-            );
-            assert!(
-                plan.iter().all(|detail| !detail.contains("SCAN metadata")),
-                "unbounded metadata must not scan unrelated metadata: {plan:?}"
-            );
-        };
-        assert_indexed();
-        store.refresh_planner_statistics().unwrap();
-        assert_indexed();
-    }
-
     /// Plain SQL over the persisted table answers a question about real parsed
     /// source, with no Rust decoding step in between.
     ///
@@ -20316,189 +19963,6 @@ mod tests {
         assert_eq!(
             initialized, 1,
             "exactly the initialized field must report one: {labels}"
-        );
-    }
-
-    /// The size cap is a schema CHECK now, not a read-side gate, so an
-    /// oversized row must fail its INSERT and take the whole blob's
-    /// transaction with it. The previous shape of this test corrupted a stored
-    /// blob with `zeroblob` and asserted the readers nulled it out; there is no
-    /// longer a column that can hold such a value.
-    ///
-    /// The column under test is `return_type_text` rather than `label`: since
-    /// issue #2351 the encoder clamps an oversized label, because a label is a
-    /// rendering that can always be made shorter. Every other oversized column
-    /// still fails loudly, which is what this pins.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2351: oversized persisted return-type metadata must fail and roll back instead of publishing a partial blob"
-    )]
-    #[test]
-    fn oversized_signature_metadata_is_rejected_by_the_schema_and_publishes_nothing() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "factory.rb",
-            "class Factory\n  def make(value)\n    value\n  end\nend\n",
-        );
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let mut state = parse_state(&RubyAdapter, &file);
-        let target = state
-            .signature_metadata
-            .keys()
-            .next()
-            .cloned()
-            .expect("fixture should produce signature metadata");
-        state.signature_metadata.insert(
-            target.clone(),
-            vec![
-                SignatureMetadata::new("make(value)", Vec::new()).with_return_type_text(Some(
-                    "x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES + 1),
-                )),
-            ],
-        );
-        state
-            .signature_metadata_signature_ordinals
-            .insert(target, vec![0]);
-        let state = Arc::new(state);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("ruby", "oversized-signature-metadata-write-v1")
-            .unwrap();
-
-        let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            "ruby",
-            generation,
-            &RubyAdapter,
-            Arc::clone(&state),
-        )
-        .expect("preparation encodes columns without enforcing the cap");
-        let (outcomes, _) = store.persist_prepared_blobs(
-            vec![prepared],
-            PersistBatchTargets {
-                max_blobs: usize::MAX,
-                max_rows: usize::MAX,
-                max_payload_bytes: usize::MAX,
-            },
-        );
-        let prepared_error = outcomes[0]
-            .error
-            .as_ref()
-            .expect("the prepared write must fail")
-            .to_string();
-        assert!(
-            prepared_error.contains("CHECK constraint failed"),
-            "SQLite must reject the oversized column itself: {prepared_error}"
-        );
-
-        let write_error = store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
-                generation,
-                &RubyAdapter,
-                state.as_ref(),
-            )
-            .expect_err("direct persistence must reject oversized signature metadata")
-            .to_string();
-        assert!(
-            write_error.contains("CHECK constraint failed"),
-            "SQLite must reject the oversized column itself: {write_error}"
-        );
-        assert!(
-            !store
-                .contains_parsed_blob_at_generation(oid, "ruby", generation)
-                .unwrap(),
-            "a rejected metadata row must roll back instead of publishing a complete omission"
-        );
-    }
-
-    /// Issue #2351: a label is a rendering, so an oversized one is clamped and
-    /// the file still indexes. The parameter spans index the label, so the
-    /// clamp must drop the ones that no longer land inside it.
-    #[brokk_bifrost_test_macros::hardwon(
-        "9b24a4c0ceb1: oversized generated labels aborted persistence instead of being clamped"
-    )]
-    #[test]
-    fn an_oversized_label_is_clamped_instead_of_failing_the_blob() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "factory.rb",
-            "class Factory\n  def make(value)\n    value\n  end\nend\n",
-        );
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let mut state = parse_state(&RubyAdapter, &file);
-        let target = state
-            .signature_metadata
-            .keys()
-            .next()
-            .cloned()
-            .expect("fixture should produce signature metadata");
-        let oversized = format!(
-            "make({})",
-            "x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES + 1)
-        );
-        let far_end = oversized.len() - 1;
-        state.signature_metadata.insert(
-            target.clone(),
-            vec![SignatureMetadata::new(
-                oversized,
-                vec![
-                    ParameterMetadata::new("mak", 0, 3),
-                    ParameterMetadata::new("tail", far_end - 4, far_end),
-                ],
-            )],
-        );
-        state
-            .signature_metadata_signature_ordinals
-            .insert(target, vec![0]);
-        let state = Arc::new(state);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("ruby", "clamped-signature-label-write-v1")
-            .unwrap();
-
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
-                generation,
-                &RubyAdapter,
-                state.as_ref(),
-            )
-            .expect("a clamped label must not fail the blob");
-        assert!(
-            store
-                .contains_parsed_blob_at_generation(oid, "ruby", generation)
-                .unwrap(),
-            "the file must still index despite one pathological declaration"
-        );
-
-        let conn = store.conn.lock().expect("store mutex");
-        let (label, parameters): (String, String) = conn
-            .query_row(
-                "SELECT label, parameters FROM unit_signature_metadata_values",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert!(
-            label.len() <= MAX_SIGNATURE_METADATA_COLUMN_BYTES,
-            "the stored label must respect the column cap, got {} bytes",
-            label.len()
-        );
-        assert!(
-            label.ends_with(SIGNATURE_LABEL_ELISION),
-            "a clamped label must say so in the value itself"
-        );
-        assert!(
-            parameters.contains("\"mak\"") && !parameters.contains("\"tail\""),
-            "only spans inside the retained prefix may survive: {parameters}"
         );
     }
 
@@ -20852,124 +20316,6 @@ mod tests {
     }
 
     #[test]
-    fn resource_bound_oversized_current_epoch_import_row_fails_closed() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "main.go",
-            "package sample\nimport \"fmt\"\nfunc run() { fmt.Println(\"ok\") }\n",
-        );
-        let state = parse_state(&GoAdapter, &file);
-        assert_eq!(state.imports.len(), 1, "fixture should persist one import");
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("go", "limited-import-row-bytes-v1")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "go",
-                generation,
-                &GoAdapter,
-                &state,
-            )
-            .unwrap();
-        let ordinary = store
-            .import_infos_for_key_limited(oid, "go", generation, usize::MAX)
-            .unwrap();
-        assert!(ordinary.complete);
-        assert_eq!(ordinary.rows, state.imports);
-
-        {
-            let conn = store.conn.lock().unwrap();
-            // Corrupt one canonical row deliberately; ordinary publication
-            // cannot mutate sealed import facts.
-            conn.execute_batch("DROP TRIGGER source_imports_no_update_after_seal")
-                .unwrap();
-            assert_eq!(
-                conn.execute(
-                    // `hex` doubles its argument's length, so this writes a
-                    // statement two bytes past the per-row cap.
-                    "UPDATE source_imports
-                     SET statement = hex(zeroblob(?3))
-                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
-                    params![
-                        oid.to_string(),
-                        "go",
-                        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES / 2 + 1).unwrap(),
-                    ],
-                )
-                .unwrap(),
-                1
-            );
-        }
-
-        let limited = store
-            .import_infos_for_key_limited(oid, "go", generation, usize::MAX)
-            .unwrap();
-        assert!(!limited.complete);
-        assert!(limited.rows.is_empty());
-        assert_eq!(limited.inspected, 1);
-    }
-
-    #[test]
-    fn resource_bound_inconsistent_current_epoch_import_count_fails_closed() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "main.go",
-            "package sample\nimport (\n  \"fmt\"\n  \"os\"\n)\nfunc run() { fmt.Println(os.Args) }\n",
-        );
-        let state = parse_state(&GoAdapter, &file);
-        assert_eq!(state.imports.len(), 2, "fixture should persist two imports");
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("go", "limited-import-count-integrity-v1")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "go",
-                generation,
-                &GoAdapter,
-                &state,
-            )
-            .unwrap();
-
-        {
-            let conn = store.conn.lock().unwrap();
-            assert_eq!(
-                conn.execute(
-                    "UPDATE blob_meta
-                     SET import_statement_count = 1
-                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
-                    params![oid.to_string(), "go"],
-                )
-                .unwrap(),
-                1
-            );
-        }
-
-        let capped = store
-            .import_infos_for_key_limited(oid, "go", generation, 1)
-            .unwrap();
-        assert!(!capped.complete);
-        assert_eq!(capped.rows.len(), 1);
-        assert_eq!(capped.inspected, 1);
-
-        let wider = store
-            .import_infos_for_key_limited(oid, "go", generation, 3)
-            .unwrap();
-        assert!(!wider.complete);
-        assert_eq!(wider.rows.len(), 2);
-        assert_eq!(wider.inspected, 2);
-    }
-
-    #[test]
     fn resource_bound_oversized_current_epoch_supertype_rows_fail_closed() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -21105,77 +20451,6 @@ mod tests {
         assert!(!limited.complete);
         assert!(limited.rows.is_empty());
         assert_eq!(limited.inspected, 1);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#4510: STAT4 recompiled the cached identifier-candidate query for distinct names"
-    )]
-    #[test]
-    fn limited_identifier_candidate_query_does_not_reprepare_for_distinct_names() {
-        use rusqlite::StatementStatus;
-
-        const IDENTIFIERS: usize = 1_024;
-        let temp = tempfile::TempDir::new().unwrap();
-        let source = (0..IDENTIFIERS)
-            .map(|index| format!("pub struct Module{index:04};\n"))
-            .collect::<String>();
-        let rust_file = write_file(temp.path(), "src/lib.rs", &source);
-        let java_source = (0..IDENTIFIERS)
-            .map(|index| format!("class Module{index:04} {{}}\n"))
-            .collect::<String>();
-        let java_file = write_file(temp.path(), "src/Library.java", &java_source);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(
-                oid_for(rust_file.read_to_string().unwrap().as_bytes()),
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &rust_file),
-            )
-            .unwrap();
-        store
-            .write_parsed_blob(
-                oid_for(java_file.read_to_string().unwrap().as_bytes()),
-                "java",
-                &JavaAdapter,
-                &parse_state(&JavaAdapter, &java_file),
-            )
-            .unwrap();
-        store.refresh_planner_statistics().unwrap();
-
-        let sql = limited_identifier_candidate_sql();
-        let langs = vec!["rust".to_string(), "java".to_string()];
-        let mut conn = store.read_conn().unwrap();
-        let tx = conn.transaction().unwrap();
-        for index in 0..IDENTIFIERS {
-            let identifier = format!("Module{index:04}");
-            let rows =
-                candidate_rows_for_identifier_languages_limited(&tx, &langs, &identifier, &sql, 3)
-                    .unwrap();
-            assert!(rows.complete, "{identifier} candidate query was incomplete");
-            assert_eq!(rows.rows.len(), 2, "{identifier} candidate count");
-            assert_eq!(
-                rows.rows
-                    .iter()
-                    .map(|candidate| candidate.lang.as_str())
-                    .collect::<Vec<_>>(),
-                ["rust", "java"],
-                "{identifier} candidate language order"
-            );
-        }
-        tx.commit().unwrap();
-
-        let statement = conn.prepare_cached(&sql).unwrap();
-        assert_eq!(
-            statement.get_status(StatementStatus::Run),
-            IDENTIFIERS as i32,
-            "one cached statement must execute once per requested identifier"
-        );
-        assert_eq!(
-            statement.get_status(StatementStatus::RePrepare),
-            0,
-            "temp-table request values must not trigger STAT4 statement re-preparation"
-        );
     }
 
     /// The actionable cache-denial message reaches the workspace entry point,
@@ -21448,142 +20723,6 @@ mod tests {
         assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), PRE_EMPTY_LAMBDA_EPOCH);
     }
 
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2911: type aliases gained their own type identity, which stale cache rows could not represent"
-    )]
-    #[test]
-    fn rust_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "tags.rs",
-            "pub mod tags {\n    pub type MaxVal = u32;\n    pub const MaxVal: u32 = 1;\n}\n",
-        );
-        let state = Arc::new(parse_state(&RustAdapter, &file));
-        let alias = state
-            .declarations
-            .iter()
-            .find(|unit| unit.short_name() == "tags.MaxVal" && unit.is_class())
-            .expect("the current walk mints the alias as a type declaration");
-        assert!(
-            state
-                .declarations
-                .iter()
-                .any(|unit| unit.short_name() == "tags.MaxVal" && unit.is_field()),
-            "the const keeps its own field declaration beside {alias:?}: {:?}",
-            state.declarations
-        );
-        let prior_epoch = epoch::rust_epoch_before_type_alias_type_identity();
-        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "6dc4d18752fb: recovered macro fragment bindings change persisted Rust resolution facts"
-    )]
-    #[test]
-    fn rust_recovered_macro_fragment_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "issue_70446.rs",
-            r#"//@ check-pass
-
-macro_rules! foo {
-    ($(: $p:path)? $(: $l:lifetime)? ) => { bar! {$(: $p)? $(: $l)? } };
-}
-
-macro_rules! bar {
-    ($(: $p:path)? $(: $l:lifetime)? ) => {};
-}
-
-foo! {: 'a }
-
-fn main() {}
-"#,
-        );
-        let state = Arc::new(parse_state(&RustAdapter, &file));
-        let prior_epoch = epoch::rust_epoch_before_recovered_macro_fragment_bindings();
-        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#4458: stale Rust cache rows retained cfg_attr transformation boundaries"
-    )]
-    #[test]
-    fn rust_cfg_attr_item_boundary_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "lib.rs",
-            "#[cfg_attr(test, track_caller)]\npub fn visit() {}\n",
-        );
-        let state = Arc::new(parse_state(&RustAdapter, &file));
-        let prior_epoch = epoch::rust_epoch_before_cfg_attr_effective_item_attributes();
-        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#4458: reference impl receivers change persisted Rust resolution facts"
-    )]
-    #[test]
-    fn rust_reference_impl_member_owner_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "reference_impl.rs",
-            "pub struct Widget; impl Hook for &mut Widget { fn call(self) { self.ping(); } }\n",
-        );
-        let state = Arc::new(parse_state(&RustAdapter, &file));
-        let prior_epoch = epoch::rust_epoch_before_reference_impl_member_owners();
-        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#4458: derive-helper boundaries change persisted Rust resolution facts"
-    )]
-    #[test]
-    fn rust_derive_helper_attribute_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "lib.rs",
-            "#[derive(Parser)]\n#[command(name = \"tool\")]\npub struct Args;\n",
-        );
-        let state = Arc::new(parse_state(&RustAdapter, &file));
-        let prior_epoch = epoch::rust_epoch_before_conditional_derive_helper_attributes();
-        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    /// The TypeScript half of the same #2911 bump.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2911: TypeScript aliases gained their own type identity, which stale cache rows could not represent"
-    )]
-    #[test]
-    fn ts_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "tags.ts",
-            "export type MaxVal = number;\n\nexport const MaxVal = 1;\n",
-        );
-        let state = Arc::new(parse_state(&TypescriptAdapter, &file));
-        let alias = state
-            .declarations
-            .iter()
-            .find(|unit| unit.fq_name() == "tags.ts.MaxVal" && unit.is_class())
-            .expect("the current walk mints the alias as a type declaration");
-        assert!(
-            state
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "tags.ts.MaxVal" && unit.is_field()),
-            "the const keeps its own field declaration beside {alias:?}: {:?}",
-            state.declarations
-        );
-        let prior_epoch = epoch::typescript_epoch_before_type_alias_type_identity();
-        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
-    }
-
     #[test]
     fn kotlin_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -21721,73 +20860,6 @@ fn main() {}
         let state = Arc::new(parse_state(&ScalaAdapter, &file));
         let prior_epoch = epoch::scala_epoch_before_tree_sitter_scala_0_26_2();
         assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "4b3f6065fca9: batched parsed-blob membership must preserve mixed-language and incomplete-key semantics"
-    )]
-    #[test]
-    fn parsed_blob_keys_batches_mixed_languages_and_incomplete_rows() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let python_file = write_file(root, "pkg/model.py", "class Model:\n    pass\n");
-        let java_file = write_file(root, "src/Model.java", "class Model {}\n");
-        let python_oid = oid_for(python_file.read_to_string().unwrap().as_bytes());
-        let java_oid = oid_for(java_file.read_to_string().unwrap().as_bytes());
-        let incomplete_oid = oid_for(b"registered but not parsed");
-        let missing_oid = oid_for(b"not registered");
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(
-                python_oid,
-                "python",
-                &PythonAdapter::for_test_file(&python_file),
-                &parse_state(&PythonAdapter::for_test_file(&python_file), &python_file),
-            )
-            .unwrap();
-        store
-            .write_parsed_blob(
-                java_oid,
-                "java",
-                &JavaAdapter,
-                &parse_state(&JavaAdapter, &java_file),
-            )
-            .unwrap();
-        store
-            .register_blobs(&[incomplete_oid], "rust", GenerationId::BOOTSTRAP)
-            .unwrap();
-
-        let mut entries = vec![
-            (python_oid, "python".to_string()),
-            (python_oid, "java".to_string()),
-            (java_oid, "java".to_string()),
-            (incomplete_oid, "rust".to_string()),
-            (missing_oid, "python".to_string()),
-            (python_oid, "python".to_string()),
-        ];
-        let bulk_missing = (0..405)
-            .map(|index| oid_for(format!("bulk missing {index}").as_bytes()))
-            .collect::<Vec<_>>();
-        entries.extend(bulk_missing.iter().map(|oid| (*oid, "python".to_string())));
-        assert_eq!(
-            store.parsed_blob_keys(&entries).unwrap(),
-            [
-                (python_oid, "python".to_string()),
-                (java_oid, "java".to_string()),
-            ]
-            .into_iter()
-            .collect::<HashSet<_>>()
-        );
-        let missing = store.missing_parsed_blob_keys(&entries).unwrap();
-        assert_eq!(missing.len(), 408);
-        assert!(missing.contains(&(python_oid, "java".to_string())));
-        assert!(missing.contains(&(incomplete_oid, "rust".to_string())));
-        assert!(missing.contains(&(missing_oid, "python".to_string())));
-        assert!(
-            bulk_missing
-                .iter()
-                .all(|oid| missing.contains(&(*oid, "python".to_string())))
-        );
     }
 
     #[test]
@@ -22138,66 +21210,6 @@ fn main() {}
         assert_eq!(store.readers.idle_len(), 0);
     }
 
-    #[test]
-    fn active_symbol_candidate_scan_batches_languages() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let java_file = write_file(
-            temp.path(),
-            "java/Service.java",
-            "package java; class Service { void run() {} }\n",
-        );
-        let rust_file = write_file(temp.path(), "rust/service.rs", "pub fn run() {}\n");
-        let java_oid = oid_for(java_file.read_to_string().unwrap().as_bytes());
-        let rust_oid = oid_for(rust_file.read_to_string().unwrap().as_bytes());
-        let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
-        store
-            .write_parsed_blob(
-                java_oid,
-                "java",
-                &JavaAdapter,
-                &parse_state(&JavaAdapter, &java_file),
-            )
-            .unwrap();
-        store
-            .write_parsed_blob(
-                rust_oid,
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &rust_file),
-            )
-            .unwrap();
-
-        let languages = vec!["java".to_string(), "rust".to_string()];
-        let generations = HashMap::from_iter([
-            ("java".to_string(), GenerationId::BOOTSTRAP),
-            ("rust".to_string(), GenerationId::BOOTSTRAP),
-        ]);
-        let rows = store
-            .search_candidate_name_rows_for_langs(
-                &languages,
-                &generations,
-                &[
-                    ActiveSearchBlob::unfiltered(java_oid),
-                    ActiveSearchBlob::unfiltered(rust_oid),
-                ],
-                Some(&[vec!["run".to_string()], vec!["Service".to_string()]]),
-                None,
-            )
-            .unwrap();
-
-        assert!(rows.complete);
-        assert!(
-            rows.rows
-                .iter()
-                .any(|row| row.lang_index == 0 && row.blob_oid == java_oid)
-        );
-        assert!(
-            rows.rows
-                .iter()
-                .any(|row| row.lang_index == 1 && row.blob_oid == rust_oid)
-        );
-    }
-
     /// The prefilter must not change how the candidate scan is driven. A
     /// `LIKE '%literal%'` can never seek an index, so what is pinned here is the
     /// join order it could have flipped: the live blob set stays the outer table
@@ -22337,204 +21349,6 @@ fn main() {}
                 && sql.contains("requested.unit_key")
                 && sql.contains("active_blob.generation"),
             "the by-key query must retain blob, language, and live-generation predicates: {sql}"
-        );
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2785: by-key hydration crossed blob or language boundaries and skipped padded batches"
-    )]
-    #[test]
-    fn search_candidate_key_hydration_preserves_multi_blob_language_parity() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let java_alpha = write_file(
-            root,
-            "java/Alpha.java",
-            "package demo; class Alpha { int value; }\n",
-        );
-        let java_beta = write_file(
-            root,
-            "java/Beta.java",
-            "package demo; class Beta { void run() {} int other; }\n",
-        );
-        let rust_gamma = write_file(root, "rust/gamma.rs", "pub struct Gamma;\n");
-        let java_alpha_oid = oid_for(java_alpha.read_to_string().unwrap().as_bytes());
-        let java_beta_oid = oid_for(java_beta.read_to_string().unwrap().as_bytes());
-        let rust_gamma_oid = oid_for(rust_gamma.read_to_string().unwrap().as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(
-                java_alpha_oid,
-                "java",
-                &JavaAdapter,
-                &parse_state(&JavaAdapter, &java_alpha),
-            )
-            .unwrap();
-        store
-            .write_parsed_blob(
-                java_beta_oid,
-                "java",
-                &JavaAdapter,
-                &parse_state(&JavaAdapter, &java_beta),
-            )
-            .unwrap();
-        store
-            .write_parsed_blob(
-                rust_gamma_oid,
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &rust_gamma),
-            )
-            .unwrap();
-
-        let languages = vec!["java".to_string(), "rust".to_string()];
-        let generations = HashMap::from_iter([
-            ("java".to_string(), GenerationId::BOOTSTRAP),
-            ("rust".to_string(), GenerationId::BOOTSTRAP),
-        ]);
-        let java_baseline = store.search_candidate_rows_by_lang("java").unwrap();
-        let rust_baseline = store.search_candidate_rows_by_lang("rust").unwrap();
-        let alpha = java_baseline
-            .iter()
-            .find(|row| row.candidate.short_name == "Alpha")
-            .expect("Alpha declaration");
-        let beta = java_baseline
-            .iter()
-            .find(|row| row.candidate.short_name == "Beta")
-            .expect("Beta declaration");
-        let alpha_keys = java_baseline
-            .iter()
-            .filter(|row| row.candidate.blob_oid == java_alpha_oid)
-            .map(|row| row.candidate.unit_key)
-            .collect::<HashSet<_>>();
-        let beta_only_unit_key = java_baseline
-            .iter()
-            .filter(|row| row.candidate.blob_oid == java_beta_oid)
-            .map(|row| row.candidate.unit_key)
-            .find(|unit_key| !alpha_keys.contains(unit_key))
-            .expect("Beta fixture must have a unit key absent from Alpha");
-        let gamma = rust_baseline
-            .iter()
-            .find(|row| row.candidate.short_name == "Gamma")
-            .expect("Gamma declaration");
-
-        let requested = vec![
-            SearchCandidateKey {
-                lang_index: 0,
-                blob_oid: java_alpha_oid,
-                unit_key: alpha.candidate.unit_key,
-            },
-            SearchCandidateKey {
-                lang_index: 0,
-                blob_oid: java_beta_oid,
-                unit_key: beta.candidate.unit_key,
-            },
-            SearchCandidateKey {
-                lang_index: 1,
-                blob_oid: rust_gamma_oid,
-                unit_key: gamma.candidate.unit_key,
-            },
-            // A valid unit key from another blob must not cross the blob
-            // boundary, and a nonexistent key must remain a near miss.
-            SearchCandidateKey {
-                lang_index: 0,
-                blob_oid: java_alpha_oid,
-                unit_key: beta_only_unit_key,
-            },
-            SearchCandidateKey {
-                lang_index: 0,
-                blob_oid: java_alpha_oid,
-                unit_key: i64::MAX,
-            },
-            // The OID exists, but only for Rust; the language scope must
-            // prevent this request from reaching the Rust declaration.
-            SearchCandidateKey {
-                lang_index: 0,
-                blob_oid: rust_gamma_oid,
-                unit_key: gamma.candidate.unit_key,
-            },
-        ];
-        // More than one fixed-arity batch must remain equivalent to one
-        // request. These missing keys exercise the padded 400-tuple query and
-        // ensure near misses do not cause declaration-range over-reading.
-        let mut requested = requested;
-        requested.extend((0..401).map(|index| SearchCandidateKey {
-            lang_index: 0,
-            blob_oid: java_alpha_oid,
-            unit_key: i64::MIN + i64::from(index),
-        }));
-        assert!(requested.len() > SEARCH_CANDIDATE_KEY_BATCH_SIZE);
-        let hydrated = store
-            .search_candidate_rows_for_keys(&languages, &generations, &requested, None)
-            .unwrap();
-        assert!(hydrated.complete);
-
-        let expected = [alpha, beta, gamma]
-            .into_iter()
-            .map(|row| {
-                (
-                    row.candidate.blob_oid,
-                    row.candidate.lang.clone(),
-                    row.candidate.unit_key,
-                )
-            })
-            .collect::<HashSet<_>>();
-        let actual = hydrated
-            .rows
-            .iter()
-            .map(|row| {
-                (
-                    row.candidate.blob_oid,
-                    row.candidate.lang.clone(),
-                    row.candidate.unit_key,
-                )
-            })
-            .collect::<HashSet<_>>();
-        assert_eq!(actual, expected);
-        assert_eq!(hydrated.rows.len(), expected.len());
-        for row in &hydrated.rows {
-            let baseline = java_baseline
-                .iter()
-                .chain(rust_baseline.iter())
-                .find(|candidate| {
-                    candidate.candidate.blob_oid == row.candidate.blob_oid
-                        && candidate.candidate.lang == row.candidate.lang
-                        && candidate.candidate.unit_key == row.candidate.unit_key
-                })
-                .expect("hydrated row must have a baseline projection");
-            assert_eq!(row, baseline, "by-key hydration changed projection fields");
-            assert!(
-                row.primary_range.is_some(),
-                "fixture should retain declaration range"
-            );
-        }
-    }
-
-    #[test]
-    fn search_candidate_projection_proves_repeated_callable_definitions() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "src/conditional.cpp",
-            "#if FIRST\nint selected() { return 1; }\n#else\nlong selected() { return 2; }\n#endif\n",
-        );
-        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
-            .unwrap();
-
-        let candidates = store.search_candidate_rows_by_lang("cpp").unwrap();
-        let selected = candidates
-            .iter()
-            .find(|row| row.candidate.short_name == "selected")
-            .expect("repeated conditional definition");
-
-        assert!(selected.has_multiple_ranges, "{selected:#?}");
-        assert!(selected.all_ranges_are_definitions, "{selected:#?}");
-        assert_eq!(
-            selected.primary_range.map(|range| range.start_line),
-            Some(2)
         );
     }
 
@@ -23328,63 +22142,6 @@ fn main() {}
     }
 
     #[test]
-    fn checked_import_facts_require_and_recover_source_publication() {
-        let content = "package main\nfunc main() {}\n";
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
-            .file("main.go", content)
-            .build();
-        let file = fixture.file("main.go");
-        let oid = oid_for(content.as_bytes());
-        let adapter = GoAdapter;
-        let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generations = HashMap::from_iter([("go".to_string(), GenerationId::BOOTSTRAP)]);
-        let entry = [(file.clone(), oid, "go".to_string())];
-
-        store
-            .write_parsed_blob(oid, "go", &adapter, &state)
-            .unwrap();
-        let complete = store
-            .hydrate_canonical_import_facts_by_key(&entry, &generations, &adapter)
-            .unwrap();
-        assert_eq!(complete.get(&file).unwrap().imports, Vec::new());
-
-        {
-            let conn = store.conn.lock().unwrap();
-            // Deliberately damage publication witnesses, not their sealed
-            // children. The Go family seal otherwise correctly rejects the
-            // source-manifest cascade through occurrence-linked type rows.
-            conn.execute_batch(
-                "DROP TRIGGER source_go_manifests_no_delete_after_seal;
-                 DELETE FROM source_go_manifests;
-                 DROP TRIGGER source_fact_manifests_no_direct_delete;",
-            )
-            .unwrap();
-            conn.execute(
-                "DELETE FROM source_fact_manifests
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'go')",
-                [oid.to_string()],
-            )
-            .unwrap();
-        }
-        assert!(
-            !store
-                .hydrate_canonical_import_facts_by_key(&entry, &generations, &adapter)
-                .unwrap()
-                .contains_key(&file),
-            "metadata without the source publication witness is unavailable"
-        );
-
-        store
-            .write_parsed_blob(oid, "go", &adapter, &state)
-            .unwrap();
-        let repaired = store
-            .hydrate_canonical_import_facts_by_key(&entry, &generations, &adapter)
-            .unwrap();
-        assert_eq!(repaired.get(&file).unwrap().imports, Vec::new());
-    }
-
-    #[test]
     fn literal_substring_candidates_keep_members_of_matching_java_types() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
@@ -23990,973 +22747,6 @@ fn main() {}
     }
 
     #[test]
-    fn metadata_unit_count_mismatch_is_treated_as_incomplete() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let file = write_file(root, "pkg/corrupt.py", "class Corrupt:\n    pass\n");
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let adapter = PythonAdapter::for_test_file(&file);
-        let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "python", &adapter, &state)
-            .unwrap();
-
-        {
-            let conn = store.conn.lock().unwrap();
-            assert!(
-                conn.execute(
-                    "DELETE FROM code_units WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python')",
-                    [oid.to_string()],
-                )
-                .is_err()
-            );
-            // Canonical source links prevent deleting published units. Damage
-            // the expected count directly to exercise independent read checks.
-            conn.execute(
-                "UPDATE blob_meta SET stored_unit_count = stored_unit_count + 1
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python')",
-                [oid.to_string()],
-            )
-            .unwrap();
-        }
-
-        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
-        assert!(
-            store
-                .hydrate_file_state(oid, "python", &adapter, &file)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn unknown_optional_fact_kind_fails_closed() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "pkg/unknown.py", "class Unknown:\n    pass\n");
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(
-                oid,
-                "python",
-                &PythonAdapter::for_test_file(&file),
-                &parse_state(&PythonAdapter::for_test_file(&file), &file),
-            )
-            .unwrap();
-
-        {
-            let conn = store.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO blob_optional_fact_manifest(blob_id, fact_kind, row_count)
-                 VALUES(
-                   (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python'),
-                   99, 1
-                 )",
-                [oid.to_string()],
-            )
-            .unwrap();
-        }
-
-        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
-        let error = store
-            .hydrate_file_state(oid, "python", &PythonAdapter::for_test_file(&file), &file)
-            .unwrap_err();
-        assert!(error.to_string().contains("unknown optional analyzer fact"));
-    }
-
-    #[test]
-    fn missing_optional_fact_manifest_row_is_treated_as_incomplete() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "include/missing.h",
-            "template <typename T, typename U = T*> class Missing {};\n",
-        );
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
-            .unwrap();
-
-        {
-            let conn = store.conn.lock().unwrap();
-            // Two schema-117 defences stand between this store and the
-            // damaged one the test needs: the seal keeps a published
-            // C++ class-template manifest row immutable, and the family's
-            // foreign key cascades the header rows away with it. Drop the
-            // seal and suspend foreign keys so the manifest row alone
-            // disappears, which is what a store damaged outside SQLite looks
-            // like.
-            conn.execute_batch(
-                "DROP TRIGGER blob_optional_fact_manifest_cpp_class_templates_no_delete_after_seal;
-                 PRAGMA foreign_keys = OFF;",
-            )
-            .unwrap();
-            let deleted = conn
-                .execute(
-                    "DELETE FROM blob_optional_fact_manifest
-                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'cpp') AND fact_kind = 1",
-                    [oid.to_string()],
-                )
-                .unwrap();
-            assert_eq!(deleted, 1);
-            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-            let surviving: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM unit_cpp_class_templates
-                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'cpp')",
-                    [oid.to_string()],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(surviving > 0, "the orphaned fact rows must survive");
-        }
-
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert!(
-            store
-                .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
-                .unwrap()
-                .is_none()
-        );
-        let hydrated = store
-            .hydrate_file_states(
-                &[(file.clone(), oid)],
-                "cpp",
-                &CppAdapter,
-                &HashMap::from_iter([(file.clone(), source)]),
-            )
-            .unwrap();
-        assert!(!hydrated.contains_key(&file));
-    }
-
-    #[test]
-    fn metadata_side_table_count_mismatches_are_treated_as_incomplete() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let ruby_file = write_file(
-            root,
-            "lib/demo.rb",
-            "require 'json'\nclass Demo\n  attr_reader :name\n  alias_method :label, :name\n  def initialize(name)\n    @name = name\n  end\n  def self.build(value)\n    new(value)\n  end\nend\n",
-        );
-        let python_file = write_file(
-            root,
-            "pkg/corrupt.py",
-            "import os\nfrom sys import path\nclass Corrupt:\n    def run(self):\n        return os.getcwd()\n",
-        );
-        let java_file = write_file(
-            root,
-            "src/demo/Corrupt.java",
-            "package demo;\nimport java.util.List;\nclass Corrupt extends Base { List<String> names; void run(List<String> input) {} }\nclass Base {}\n",
-        );
-        let scala_file = write_file(
-            root,
-            "src/main/scala/app/Corrupt.scala",
-            "package app\ntrait Runnable\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
-        );
-        let cpp_file = write_file(
-            root,
-            "include/corrupt.h",
-            "template <typename T, typename U = T*> class Corrupt {};\ntemplate <typename T> class Corrupt<T, T*> {};\n",
-        );
-        let typescript_file = write_file(
-            root,
-            "src/corrupt.ts",
-            "export interface Shape { area(): number }\nexport class Corrupt implements Shape { area(): number { return 1; } }\n",
-        );
-
-        for table in [
-            "unit_ranges",
-            "unit_signatures",
-            "unit_signature_metadata",
-            "unit_signature_metadata_signatures",
-            "unit_children",
-            "ruby_method_dispatch_modes",
-        ] {
-            assert_deleting_side_table_marks_incomplete(&RubyAdapter, "ruby", &ruby_file, table);
-        }
-        assert_deleting_side_table_marks_incomplete(
-            &PythonAdapter::for_test_file(&python_file),
-            "python",
-            &python_file,
-            "import_statements",
-        );
-        for table in ["unit_supertypes", "reference_identifiers"] {
-            assert_deleting_side_table_marks_incomplete(&JavaAdapter, "java", &java_file, table);
-        }
-        for table in ["scala_traits", "scala_exports"] {
-            assert_deleting_side_table_marks_incomplete(&ScalaAdapter, "scala", &scala_file, table);
-        }
-        assert_deleting_side_table_marks_incomplete(
-            &TypescriptAdapter,
-            "typescript",
-            &typescript_file,
-            "materialization_records",
-        );
-        assert_deleting_side_table_marks_incomplete(
-            &CppAdapter,
-            "cpp",
-            &cpp_file,
-            "unit_cpp_class_templates",
-        );
-    }
-
-    #[test]
-    fn cpp_raw_quoted_include_header_epoch_invalidates_prior_parsed_blobs() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
-            .file(
-                "main.cpp",
-                "#include \"C:\\Users\\ADMINI~1\\include\\helper.h\"\nint main() {}\n",
-            )
-            .build();
-        let file = fixture.file("main.cpp");
-        let state = parse_state(&CppAdapter, &file);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior = epoch::cpp_epoch_before_raw_quoted_include_header_paths();
-        let prior_generation = store.ensure_language_epoch_value("cpp", &prior).unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                &state,
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-        assert_ne!(current, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_owned())])
-                .unwrap(),
-            vec![(oid, "cpp".to_owned())]
-        );
-        store
-            .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-        let imports = store
-            .hydrate_import_infos(&[(file.clone(), oid)], "cpp", &CppAdapter)
-            .unwrap();
-        assert_eq!(imports.get(&file), Some(&state.imports));
-        assert_eq!(
-            state.imports[0].raw_snippet,
-            "#include \"C:\\Users\\ADMINI~1\\include\\helper.h\""
-        );
-    }
-
-    /// One header of the SQLite amalgamation's shape: an include guard around
-    /// an `extern "C"` block that `#if 0` opens and a second `#if 0` closes.
-    fn amalgamated_c_header(guard: &str, aggregate: &str) -> String {
-        format!(
-            "#ifndef {guard}\n#define {guard}\n#if 0\nextern \"C\" {{\n#endif\n\
-             struct {aggregate} {{ int value; }};\n\
-             #if 0\n}}  /* End of the 'extern \"C\"' block */\n#endif\n#endif\n"
-        )
-    }
-
-    /// Two amalgamated headers and a definition: tree-sitter returns an ERROR
-    /// root with the first include guard left open, and every declaration
-    /// lies inside it (#3501).
-    fn two_amalgamated_c_headers() -> String {
-        format!(
-            "#include <stdarg.h>\n{}{}int sqlite3_open(void) {{ return 0; }}\n",
-            amalgamated_c_header("SQLITE3_H", "sqlite3_file"),
-            amalgamated_c_header("_SQLITE3RTREE_H_", "sqlite3_rtree_geometry")
-        )
-    }
-
-    /// #3501: a genuinely unclosed translation unit is persisted and hydrated
-    /// as partial, with every recovered declaration kept. ABI 15 now reads the
-    /// original one- and two-header linkage witnesses as complete positives.
-    #[test]
-    fn a_parse_left_inside_an_unclosed_construct_persists_as_partial() {
-        let one = format!(
-            "#include <stdarg.h>\n{}int sqlite3_open(void) {{ return 0; }}\n",
-            amalgamated_c_header("SQLITE3_H", "sqlite3_file")
-        );
-        let temp = tempfile::TempDir::new().unwrap();
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("cpp:c", "parse-completeness-v1")
-            .unwrap();
-        for (name, source, expected) in [
-            ("one.c", one, crate::analyzer::ParseCompleteness::Complete),
-            (
-                "two.c",
-                two_amalgamated_c_headers(),
-                crate::analyzer::ParseCompleteness::Complete,
-            ),
-            (
-                "unclosed.c",
-                format!("{}\n{}", "{".repeat(32), two_amalgamated_c_headers()),
-                crate::analyzer::ParseCompleteness::Partial,
-            ),
-        ] {
-            let file = write_file(temp.path(), name, &source);
-            assert_eq!(CppAdapter.storage_language_key_for_file(&file), "cpp:c");
-            let oid = oid_for(source.as_bytes());
-            let state = parse_state(&CppAdapter, &file);
-            assert_eq!(state.completeness, expected, "{name}");
-            store
-                .write_parsed_blob_at_generation(
-                    &crate::analyzer::store::test_blob_file(),
-                    oid,
-                    "cpp:c",
-                    generation,
-                    &CppAdapter,
-                    &state,
-                )
-                .unwrap();
-
-            let persisted: String = store
-                .read_conn()
-                .unwrap()
-                .query_row(
-                    "SELECT meta.parse_completeness
-                     FROM blob_meta AS meta
-                     JOIN blobs ON blobs.id = meta.blob_id
-                     WHERE blobs.blob_oid = ?1 AND blobs.lang = 'cpp:c'",
-                    [oid.to_string()],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(persisted, expected.label(), "{name}");
-
-            let hydrated = store
-                .hydrate_file_state_with_source(
-                    oid,
-                    "cpp:c",
-                    generation,
-                    &CppAdapter,
-                    &file,
-                    &source,
-                )
-                .unwrap()
-                .expect("hydration should succeed");
-            assert_eq!(hydrated.completeness, expected, "{name}");
-            assert_eq!(hydrated.declarations, state.declarations, "{name}");
-            assert!(
-                hydrated
-                    .declarations
-                    .iter()
-                    .any(|unit| unit.fq_name() == "sqlite3_open"),
-                "{name}: recovery keeps its declarations: {:?}",
-                hydrated.declarations
-            );
-        }
-    }
-
-    #[test]
-    fn cpp_partial_parse_completeness_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        // Enough unmatched braces keep recovery at an ERROR root rather than
-        // letting the parser synthesize local closing tokens. Preserve the
-        // partial-blob epoch contract with genuinely malformed source.
-        let source = format!("{}\n{}", "{".repeat(32), two_amalgamated_c_headers());
-        let file = write_file(temp.path(), "sqlite3.h", &source);
-        let state = parse_state(&CppAdapter, &file);
-        assert_eq!(
-            state.completeness,
-            crate::analyzer::ParseCompleteness::Partial
-        );
-        let prior_epoch = epoch::cpp_epoch_before_partial_parse_completeness();
-        assert_prior_parsed_blob_invalidated(&CppAdapter, &state, &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#1208: recovered C++ typedef bases changed without invalidating stored declarations"
-    )]
-    #[test]
-    fn cpp_recovered_typedef_base_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "levelrangefilter.h",
-            "class LOG4CXX_EXPORT LevelRangeFilter : public spi::Filter {\n\
-             typedef spi::Filter BASE_CLASS;\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        // Recompute the immediately preceding C++ epoch for this target from
-        // the complete pre-#1208 language salt, rather than passing an
-        // arbitrary old label through the store's generic epoch API. The live
-        // grammar fingerprint is target-specific, so the durable contract is
-        // the generation cutover below, not one target's full epoch digest.
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "recovered-typedef-base-alias-identity-2026-07",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    /// #3493: the C and C++ walk now records callable modifier metadata, and
-    /// it recorded none before. A blob persisted under the prior epoch
-    /// deserializes as "nobody read the modifiers", which is indistinguishable
-    /// from an adapter that honestly declares none, so `receiver_contract_of`
-    /// reports no contract and every C or C++ procedure summary stays inert.
-    /// The salt is the only thing that retires those rows.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#3493: persisted C and C++ callables lacked modifier metadata for receiver contracts"
-    )]
-    #[test]
-    fn cpp_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "client.cpp",
-            "namespace shop {\n\
-             class Client { public: void send(int order); static int count(); };\n\
-             void Client::send(int order) { (void)order; }\n\
-             int total(int order) { return order; }\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "cpp-callable-modifier-metadata-2026-09",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_source_member_prototype_units_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "client.h",
-            "namespace shop {\n\
-             class Client { public: void send(int order); static int count(); };\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "cpp-source-member-prototype-units-2026-09",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_namespace_recovery_ancestry_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "recovered_namespace.cpp",
-            "#define APP_IF_ACTIVE if (active) {\n\
-             namespace app { namespace detail {\n\
-             bool check(bool active) { APP_IF_ACTIVE return true; }\n\
-             class Tail {}; } }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "namespace-recovery-ancestry-authority-2026-09",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_complete_sentinel_class_tail_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "raw_hash_set.h",
-            "namespace absl { namespace container_internal {\n\
-             template <class T> class raw_hash_set { using hasher = T; };\n\
-             }}\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "complete-sentinel-class-tail-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_sentinel_class_before_member_callable_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "distribution.h",
-            "namespace absl { ABSL_NAMESPACE_BEGIN\n\
-             template <class T> class distribution { using result_type = T;\n\
-             result_type operator()() { return result_type{}; } }; }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "sentinel-class-before-member-callable-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_namespaced_plain_fragment_boundary_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "types.h",
-            "#define DEPRECATED(message)\n\
-             namespace demo {\n\
-             struct Base {\n\
-             int legacy() const DEPRECATED(\"use replacement\") { return 1; }\n\
-             int replacement() const;\n\
-             };\n\
-             struct Derived : Base {};\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "namespaced-plain-fragment-boundary-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_templated_plain_fragment_ownership_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "particle_tile.h",
-            "namespace demo {\n\
-             template <class T> struct ParticleTile {\n\
-             using Alias = T;\n\
-             Alias get() const;\n\
-             };\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "templated-plain-fragment-prefix-and-sibling-ownership-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_macro_displaced_callable_name_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "real_box.h",
-            "class RealBox {\n\
-             public:\n\
-             [[nodiscard]] AMREX_GPU_HOST_DEVICE\n\
-             Real hi(int dir) const noexcept { return dir; }\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "macro-displaced-scalar-return-callable-name-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "9d8e13727de8: C++ explicit-object parameters were counted as ordinary callable arity"
-    )]
-    #[test]
-    fn cpp_explicit_object_arity_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "visitor.h",
-            "struct Visitor {\n\
-             void fail(this auto const& self) {}\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "explicit-object-callable-arity-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_macro_template_return_owner_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "ops-inl.h",
-            "template <class T> struct Vec128 {};\n\
-             template <class T> using Vec64 = Vec128<T>;\n\
-             HWY_API Vec64<unsigned> LowerHalf(Vec128<unsigned> value) { return {}; }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::cpp_epoch_before_macro_template_return_free_function_ownership();
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    /// A cache written before headers gained a stored C reading (#1970) holds
-    /// `cpp` rows for a header with no `cpp:c` companion, which the loader
-    /// would read as "the two readings agree". The salt bump is what stops
-    /// that from being believed.
-    #[test]
-    fn cpp_c_header_projection_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "tags.h",
-            "struct outer {\n\
-             struct inner { int value; } item;\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch =
-            epoch::epoch_before_bump(epoch::TestEpochLanguage::Cpp, "c-header-projection-2026-08");
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_c_tag_scope_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "tags.c",
-            "struct outer {\n\
-             struct inner { int value; } item;\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch =
-            epoch::epoch_before_bump(epoch::TestEpochLanguage::Cpp, "c-tag-scope-2026-08");
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    /// A `.c` blob and a byte-identical `.cpp` blob are two different
-    /// extractions of one content hash, so they must live under different cache
-    /// `lang` keys or the second one analyzed would read the first one's rows.
-    #[test]
-    fn c_and_cpp_projections_of_one_blob_use_distinct_storage_language_keys() {
-        use crate::analyzer::LanguageAdapter;
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let source = "struct outer {\n\
-             struct inner { int value; } item;\n\
-             };\n";
-        let c_file = write_file(temp.path(), "tags.c", source);
-        let cpp_file = write_file(temp.path(), "tags.cpp", source);
-        let header_file = write_file(temp.path(), "tags.h", source);
-
-        assert_eq!(CppAdapter.storage_language_key_for_file(&c_file), "cpp:c");
-        assert_eq!(CppAdapter.storage_language_key_for_file(&cpp_file), "cpp");
-        assert_eq!(
-            CppAdapter.storage_language_key_for_file(&header_file),
-            "cpp"
-        );
-        assert_eq!(
-            CppAdapter
-                .storage_language_keys()
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect::<Vec<_>>(),
-            vec!["cpp".to_string(), "cpp:c".to_string()]
-        );
-
-        let state = Arc::new(parse_state(&CppAdapter, &c_file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let epochs = CppAdapter
-            .storage_language_keys()
-            .into_iter()
-            .map(|(key, ts_language)| {
-                (
-                    key,
-                    epoch::epoch_for(Language::Cpp, &ts_language).to_string(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let generations = store.ensure_language_epoch_values(&epochs).unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "cpp:c",
-                generations["cpp:c"],
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-
-        assert!(store.contains_parsed_blob(oid, "cpp:c").unwrap());
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-    }
-
-    #[test]
-    fn cpp_abstract_reference_declarator_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "refs.h",
-            "struct Sink {\n\
-             void accept(const int&);\n\
-             };\n\
-             auto ref_of(int& value) -> int&;\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "abstract-reference-declarator-identity-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_structured_parameter_types_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "overloads.h",
-            "template <typename T, ENABLE(T)>\n\
-             T choose(T value) { return value; }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "structured-callable-parameter-types-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_plain_fragmented_class_sibling_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "analyzer.h",
-            "struct Analyzer {\n\
-             struct Action {};\n\
-             template<class T> void analyze(T value) { Action action; }\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "plain-fragmented-class-sibling-ownership-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_fragmented_export_sibling_class_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "token.h",
-            "#define SIMPLECPP_LIB\n\
-             namespace simplecpp {\n\
-             using TokenString = std::string;\n\
-             struct Location {};\n\
-             class SIMPLECPP_LIB Token {\n\
-             public:\n\
-               Token(const TokenString &s, const Location &loc) :\n\
-                   location(loc), string(s) {\n\
-               }\n\
-               TokenString string;\n\
-               Location location;\n\
-             };\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "fragmented-export-sibling-class-parent-scope-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_macro_decorated_template_class_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "span.h",
-            "namespace absl {\n\
-             ABSL_NAMESPACE_BEGIN\n\
-             template <typename T>\n\
-             class ABSL_ATTRIBUTE_VIEW Span {\n\
-             public:\n\
-               int begin() const;\n\
-               int back() const;\n\
-             };\n\
-             int begin();\n\
-             int back();\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "macro-decorated-template-class-scope-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_conditional_alias_physical_ranges_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "mathlib.h",
-            "class MathLib {\n\
-             public:\n\
-             #if defined(HAVE_BOOST) && defined(HAVE_BOOST_INT128)\n\
-               using bigint = boost::multiprecision::int128_t;\n\
-               using biguint = boost::multiprecision::uint128_t;\n\
-             #else\n\
-               using bigint = long long;\n\
-               using biguint = unsigned long long;\n\
-             #endif\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "conditional-alias-physical-ranges-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn cpp_macro_argument_typedef_declarator_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "internal/cgen/base/token-public.h",
-            "#define WUFFS_BASE__SLICE(T) struct { T* ptr; size_t len; }\n\
-             typedef struct wuffs_base__token__struct {\n\
-               unsigned long long repr;\n\
-             } wuffs_base__token;\n\
-             typedef WUFFS_BASE__SLICE(wuffs_base__token) wuffs_base__slice_token;\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "macro-argument-typedef-declarator-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    /// #2597: the JavaScript walk now records callable modifier metadata.
-    /// A blob written under the prior epoch says "nobody read the modifiers",
-    /// which every consumer reads as "undecided" rather than as an error, so
-    /// the salt is the only thing that retires those rows.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2597: persisted JavaScript callables lacked modifier metadata needed for call binding"
-    )]
-    #[test]
-    fn js_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "widget.js",
-            "export class Widget {\n    static build(spec) { return new Widget(spec); }\n    render(target) { return target; }\n}\n",
-        );
-        let state = Arc::new(parse_state(
-            &crate::analyzer::javascript::JavascriptAdapter,
-            &file,
-        ));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::JavaScript,
-            "js-ts-callable-modifier-metadata-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(
-            &crate::analyzer::javascript::JavascriptAdapter,
-            state.as_ref(),
-            &prior_epoch,
-        );
-    }
-
-    /// #2593: `Receiver.#field = value` no longer mints a Field declaration.
-    /// A blob written under the prior epoch still carries the parentless
-    /// duplicate of the class field, and nothing in the row says it is stale,
-    /// so the salt is the only thing that retires it.
-    #[test]
-    fn js_private_name_assignment_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "pointers.js",
-            "class CurrentPointers {\n    static #pointerType = null;\n    static set(pointerType) { CurrentPointers.#pointerType = pointerType; }\n}\n",
-        );
-        let state = Arc::new(parse_state(
-            &crate::analyzer::javascript::JavascriptAdapter,
-            &file,
-        ));
-        let prior_epoch = epoch::javascript_epoch_before_private_name_assignment_declarations();
-        assert_prior_parsed_blob_invalidated(
-            &crate::analyzer::javascript::JavascriptAdapter,
-            state.as_ref(),
-            &prior_epoch,
-        );
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "5304870f83d5: production C# test-like calls were misclassified by runner-name matching"
-    )]
-    #[test]
-    fn csharp_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "Http3RequestTests.cs",
-            "public class Http3RequestTests {\n\
-             [ConditionalTheory]\n\
-             public void RequestAbortRaised() { }\n\
-             }\n",
-        );
-        let mut state = parse_state(&CSharpAdapter, &file);
-        assert!(state.contains_tests);
-        // The direct-name classifier used before this epoch did not recognize
-        // custom xUnit attributes and persisted this runnable test as false.
-        state.contains_tests = false;
-        let state = Arc::new(state);
-        let prior_epoch = epoch::csharp_epoch_before_structured_runnable_test_classification();
-        assert_prior_parsed_blob_invalidated(&CSharpAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "1396a5373c5b: inherited C# test methods were missing from derived-class blast radius"
-    )]
-    #[test]
-    fn csharp_inherited_test_classification_epoch_invalidates_prior_owner_facts() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "BaseSpec.cs",
-            "public abstract class BaseSpec {\n\
-             [Fact]\n\
-             public virtual void Inherited() { }\n\
-             }\n",
-        );
-        let mut state = parse_state(&CSharpAdapter, &file);
-        assert!(state.contains_tests);
-        assert_eq!(1, state.test_region_units.len());
-        // The immediately preceding C# epoch retained only the file-level
-        // boolean. It did not identify which declaring type owns the runner
-        // method, so a hierarchy walk could not classify derived files.
-        state.test_region_units.clear();
-        let state = Arc::new(state);
-        let prior_epoch = epoch::csharp_epoch_before_inherited_test_classification();
-        assert_prior_parsed_blob_invalidated(&CSharpAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
     fn scala_top_level_extension_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -24985,433 +22775,6 @@ fn main() {}
         let state = Arc::new(state);
         let prior_epoch = epoch::scala_epoch_before_top_level_extension_declarations();
         assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "65984c3656f2: imports nested in Rust inline modules were absent from persisted facts"
-    )]
-    #[test]
-    fn rust_nested_import_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "lib.rs",
-            "pub fn run() {}\n\n#[cfg(test)]\nmod tests {\n    use crate::run;\n}\n",
-        );
-        let mut state = parse_state(&RustAdapter, &file);
-        assert!(
-            state
-                .imports
-                .iter()
-                .any(|import| import.raw_snippet.contains("use crate::run")),
-            "the current walk records the import written inside `mod tests`: {:?}",
-            state.imports
-        );
-        // Before this epoch the walk collected only the file's top-level `use`
-        // declarations, so an import written inside an inline module was absent
-        // from the persisted family the coarse file graph reads.
-        state
-            .imports
-            .retain(|import| !import.raw_snippet.contains("use crate::run"));
-        assert!(state.imports.is_empty());
-        state
-            .source_facts
-            .as_mut()
-            .expect("Rust producer source facts")
-            .generic_imports
-            .clear();
-        let state = Arc::new(state);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::rust_epoch_before_nested_and_extern_crate_import_facts();
-        let prior_generation = store
-            .ensure_language_epoch_value("rust", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "rust",
-                prior_generation,
-                &RustAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "rust").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "rust").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "rust".to_string())])
-                .unwrap(),
-            vec![(oid, "rust".to_string())]
-        );
-    }
-
-    #[test]
-    fn cpp_nested_include_claim_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "dense.h",
-            "class Dense {\npublic:\n#include \"dense_plugin.h\"\n};\n",
-        );
-        let mut state = parse_state(&CppAdapter, &file);
-        assert!(
-            state
-                .imports
-                .iter()
-                .any(|import| import.raw_snippet.contains("dense_plugin.h")),
-            "the current walk records the include written inside the class body: {:?}",
-            state.imports
-        );
-        // Before this epoch includes were collected by the declaration walk,
-        // which descends only through declaration scopes, so a directive inside
-        // a class body was never recorded as an include claim.
-        state
-            .imports
-            .retain(|import| !import.raw_snippet.contains("dense_plugin.h"));
-        let source_facts = state
-            .source_facts
-            .as_mut()
-            .expect("canonical C++ source facts");
-        source_facts.imports.clear();
-        source_facts.generic_imports.clear();
-        source_facts
-            .cpp
-            .as_mut()
-            .expect("C++ properties")
-            .includes
-            .clear();
-        let state = Arc::new(state);
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::Cpp,
-            "nested-include-claims-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "6684f234106d: production JavaScript calls containing `it(` were falsely classified as tests"
-    )]
-    #[test]
-    fn js_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "runtime.js",
-            "export function emit(value, callback) { callback(value); }\nemit(1, () => {});\n",
-        );
-        let mut state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &file);
-        assert!(!state.contains_tests);
-        // This is the stale value produced by the former `it(` substring
-        // matcher for the `emit(...)` production call above.
-        state.contains_tests = true;
-        let state = Arc::new(state);
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::JavaScript,
-            "structured-js-ts-test-classification-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(
-            &crate::analyzer::javascript::JavascriptAdapter,
-            state.as_ref(),
-            &prior_epoch,
-        );
-    }
-
-    /// The TypeScript half of the same #2597 bump.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2597: persisted TypeScript callables lacked modifier metadata needed for call binding"
-    )]
-    #[test]
-    fn ts_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "widget.ts",
-            "export class Widget {\n    static build(spec: string): Widget { return new Widget(); }\n    render(target: string): string { return target; }\n}\n",
-        );
-        let state = Arc::new(parse_state(&TypescriptAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::TypeScript,
-            "js-ts-callable-modifier-metadata-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "6684f234106d: production TypeScript calls containing `it(` were falsely classified as tests"
-    )]
-    #[test]
-    fn ts_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "runtime.ts",
-            "export function init(value: number, callback: (value: number) => void): void { callback(value); }\ninit(1, () => {});\n",
-        );
-        let mut state = parse_state(&TypescriptAdapter, &file);
-        assert!(!state.contains_tests);
-        // This is the stale value produced by the former `it(` substring
-        // matcher for the `init(...)` production call above.
-        state.contains_tests = true;
-        let state = Arc::new(state);
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::TypeScript,
-            "structured-js-ts-test-classification-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn ts_inline_return_type_members_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        // The Authelia shape of #2159: the members `id` and `label` exist as
-        // declarations only because the inline return type states them, so a
-        // blob written under the prior epoch holds a strictly smaller unit set.
-        let file = write_file(
-            temp.path(),
-            "hooks.ts",
-            "export function useShape(): { id?: string; label?: string } {\n    return build();\n}\n",
-        );
-        let state = Arc::new(parse_state(&TypescriptAdapter, &file));
-        let prior_epoch = epoch::epoch_before_bump(
-            epoch::TestEpochLanguage::TypeScript,
-            "ts-inline-return-type-members-2026-08",
-        );
-        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    fn assert_ts_tsx_bump_invalidates_prior_dialect_blobs(bump_token: &str) {
-        fn check<A: LanguageAdapter>(adapter: &A, prior_epoch: &str, file: &ProjectFile) {
-            let state = parse_state(adapter, file);
-            let oid = oid_for(state.source.as_bytes());
-            let store = AnalyzerStore::open_ephemeral().unwrap();
-            let keys = adapter.storage_language_keys();
-            for (key, _) in &keys {
-                let generation = store.ensure_language_epoch_value(key, prior_epoch).unwrap();
-                store
-                    .write_parsed_blob_at_generation(
-                        &crate::analyzer::store::test_blob_file(),
-                        oid,
-                        key,
-                        generation,
-                        adapter,
-                        &state,
-                    )
-                    .unwrap();
-                assert!(store.contains_parsed_blob(oid, key).unwrap());
-            }
-            // Follow the production path, including its language-level memoization.
-            let epochs = keys
-                .iter()
-                .map(|(key, parser)| {
-                    (
-                        key.clone(),
-                        epoch::epoch_for(adapter.language(), parser).to_string(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            store.ensure_language_epoch_values(&epochs).unwrap();
-            for (key, _) in &keys {
-                assert!(!store.contains_parsed_blob(oid, key).unwrap(), "{key}");
-            }
-        }
-
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("view.js", "export const view = 1;")
-            .file("view.ts", "export const view = 1;")
-            .build();
-        for (path, language) in [
-            ("view.js", epoch::TestEpochLanguage::JavaScript),
-            ("view.ts", epoch::TestEpochLanguage::TypeScript),
-        ] {
-            let file = fixture.file(path);
-            let prior = epoch::epoch_before_bump(language, bump_token);
-            if path.ends_with(".js") {
-                check(
-                    &crate::analyzer::javascript::JavascriptAdapter,
-                    &prior,
-                    &file,
-                );
-            } else {
-                check(&TypescriptAdapter, &prior, &file);
-            }
-        }
-    }
-
-    #[test]
-    fn tsx_ampersand_repair_invalidates_prior_dialect_blobs() {
-        assert_ts_tsx_bump_invalidates_prior_dialect_blobs("tsx-literal-ampersands-0.23.5");
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#4479: raw NUL grammar repairs must invalidate cached JS/TSX parser blobs"
-    )]
-    #[test]
-    fn ts_tsx_raw_nul_content_invalidates_prior_dialect_blobs() {
-        assert_ts_tsx_bump_invalidates_prior_dialect_blobs("ts-tsx-raw-nul-content-0.23.6-4479");
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#5336: the contextual using parser repair must invalidate persisted TS, TSX, and JSX facts"
-    )]
-    #[test]
-    fn ts_tsx_contextual_using_grammar_invalidates_prior_dialect_blobs() {
-        assert_ts_tsx_bump_invalidates_prior_dialect_blobs(
-            "ts-tsx-contextual-using-grammar-0.23.7-5336",
-        );
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#3864: warm JS/TS blobs must not retain merged wrapper export identities"
-    )]
-    #[test]
-    fn jsts_bundled_export_owners_invalidate_prior_dialect_blobs() {
-        assert_ts_tsx_bump_invalidates_prior_dialect_blobs(
-            "jsts-commonjs-lexical-export-owners-3864-landing-2026-10-17",
-        );
-    }
-
-    /// #3451: Python now records callable modifier metadata, and it recorded
-    /// none before. A blob persisted under the prior epoch deserializes as
-    /// "nobody read the modifiers", which is indistinguishable from a callable
-    /// whose adapter honestly never looked, so `receiver_contract_of` reports
-    /// no contract and every Python procedure summary stays inert. The salt is
-    /// the only thing that retires those rows.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#3451: persisted Python callables lacked modifier metadata needed for receiver contracts"
-    )]
-    #[test]
-    fn python_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "widget.py",
-            "class Widget:\n    @staticmethod\n    def build(spec):\n        return spec\n\n    def render(self, target):\n        return target\n",
-        );
-        let state = Arc::new(parse_state(&PythonAdapter::for_test_file(&file), &file));
-        let prior_epoch = epoch::python_epoch_before_callable_modifier_metadata();
-        assert_prior_parsed_blob_invalidated(
-            &PythonAdapter::for_test_file(&file),
-            state.as_ref(),
-            &prior_epoch,
-        );
-    }
-
-    /// #3455: Go now records callable modifier metadata, and it recorded none
-    /// before. A blob persisted under the prior epoch deserializes as "nobody
-    /// read the modifiers", which is indistinguishable from a callable whose
-    /// adapter honestly never looked, so `receiver_contract_of` reports no
-    /// contract and every Go procedure summary stays inert. The salt is the
-    /// only thing that retires those rows.
-    #[test]
-    fn go_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "client.go",
-            "package shop\n\ntype Client struct{}\n\nfunc (c *Client) Send(orderID string) {}\n\nfunc Total(orderID string) int64 { return 0 }\n",
-        );
-        let state = Arc::new(parse_state(&GoAdapter, &file));
-        let prior_epoch = epoch::go_epoch_before_callable_modifier_metadata();
-        assert_prior_parsed_blob_invalidated(&GoAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn go_source_membership_digest_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "client.go", "package shop\n\nfunc Send() {}\n");
-        let state = Arc::new(parse_state(&GoAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::go_epoch_before_source_membership_digest();
-        let prior_generation = store
-            .ensure_language_epoch_value("go", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &ProjectFile::new(temp.path(), "client.go"),
-                oid,
-                "go",
-                prior_generation,
-                &GoAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "go").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "go").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "go".to_string())])
-                .unwrap(),
-            vec![(oid, "go".to_string())]
-        );
-    }
-
-    #[test]
-    fn go_source_owned_package_lookup_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "client.go", "package shop\n\nfunc Send() {}\n");
-        let state = Arc::new(parse_state(&GoAdapter, &file));
-        let prior_epoch = epoch::go_epoch_before_source_owned_package_lookups();
-        assert_prior_parsed_blob_invalidated(&GoAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn go_argument_independent_call_coverage_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "client.go", "package shop\n\nfunc Send() {}\n");
-        let state = Arc::new(parse_state(&GoAdapter, &file));
-        let prior_epoch = epoch::go_epoch_before_argument_independent_call_reference_coverage();
-        assert_prior_parsed_blob_invalidated(&GoAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    #[test]
-    fn php_conditional_free_function_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "functions.php",
-            "<?php\nnamespace FastRoute;\nif (true) { function route(): void {} }\n",
-        );
-        let state = Arc::new(parse_state(&PhpAdapter, &file));
-        let prior_epoch = epoch::php_epoch_before_conditional_free_function_declarations();
-        assert_prior_parsed_blob_invalidated(&PhpAdapter, state.as_ref(), &prior_epoch);
-    }
-
-    /// #1713: PHP now records the FQ names a file imports in
-    /// `type_identifiers`, and it wrote no row of that family before. A blob
-    /// persisted under the prior epoch deserializes as "this file imports
-    /// nothing", which is indistinguishable from a file that truly imports
-    /// nothing, so the salt is the only thing that retires it.
-    #[test]
-    fn php_imported_type_names_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "RouteCollector.php",
-            "<?php\nnamespace FastRoute;\n\nclass RouteCollector {\n    public function __construct(RouteParser $parser) {}\n}\n",
-        );
-        let state = Arc::new(parse_state(&PhpAdapter, &file));
-        assert!(
-            state.type_identifiers.contains("FastRoute.RouteParser"),
-            "the current walk records the same-namespace import: {:?}",
-            state.type_identifiers
-        );
-        let prior_epoch = epoch::php_epoch_before_imported_type_names();
-        assert_prior_parsed_blob_invalidated(&PhpAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[brokk_bifrost_test_macros::hardwon(
@@ -25510,35 +22873,6 @@ fn main() {}
     }
 
     #[test]
-    fn parsed_blob_presence_allows_zero_persisted_units() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let file = write_file(root, "pkg/side_effect_only.py", "import os\n");
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let adapter = PythonAdapter::for_test_file(&file);
-        let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-
-        store
-            .write_parsed_blob(oid, "python", &adapter, &state)
-            .unwrap();
-
-        assert!(store.contains_parsed_blob(oid, "python").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "python".to_string())])
-                .unwrap(),
-            Vec::<(Oid, String)>::new()
-        );
-        let hydrated = store
-            .hydrate_file_state(oid, "python", &adapter, &file)
-            .unwrap()
-            .unwrap();
-        assert_file_state_equivalent(&state, &hydrated);
-    }
-
-    #[test]
     fn gc_drops_unreachable_blob_registry_rows() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let reachable = Oid::hash_object(ObjectType::Blob, b"reachable").unwrap();
@@ -25556,48 +22890,6 @@ fn main() {}
                 .unwrap(),
             vec![unreachable]
         );
-    }
-
-    #[test]
-    fn language_epoch_mismatch_deletes_only_that_language() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let java_file = write_file(root, "src/demo/One.java", "package demo;\nclass One {}\n");
-        let ts_file = write_file(root, "src/two.ts", "export class Two {}\n");
-        let java_oid = oid_for(java_file.read_to_string().unwrap().as_bytes());
-        let ts_oid = oid_for(ts_file.read_to_string().unwrap().as_bytes());
-        let java = JavaAdapter;
-        let ts = TypescriptAdapter;
-        let java_state = parse_state(&java, &java_file);
-        let ts_state = parse_state(&ts, &ts_file);
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .ensure_language_epoch_value("java", "epoch-a")
-            .unwrap();
-        store
-            .ensure_language_epoch_value("typescript", "epoch-a")
-            .unwrap();
-        store
-            .write_parsed_blob(java_oid, "java", &java, &java_state)
-            .unwrap();
-        store
-            .write_parsed_blob(ts_oid, "typescript", &ts, &ts_state)
-            .unwrap();
-
-        store
-            .ensure_language_epoch_value("java", "epoch-b")
-            .unwrap();
-        assert_eq!(
-            store.missing_blobs(&[java_oid], "java").unwrap(),
-            vec![java_oid]
-        );
-        assert_eq!(
-            store.missing_blobs(&[ts_oid], "typescript").unwrap(),
-            vec![]
-        );
-        assert_eq!(store.content_row_count(java_oid, "java").unwrap(), 0);
-        assert!(store.content_row_count(ts_oid, "typescript").unwrap() > 0);
     }
 
     #[test]
@@ -25782,347 +23074,6 @@ fn main() {}
                 .unwrap()
                 .len(),
             1
-        );
-    }
-
-    #[test]
-    fn candidate_and_path_queries_do_not_leak_across_generation_cutover() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
-        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
-        let state = parse_state(&JavaAdapter, &file);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let a = store.ensure_language_epoch_value("java", "a").unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "java",
-                a,
-                &JavaAdapter,
-                &state,
-            )
-            .unwrap();
-        let row = PathSymbolRow {
-            rel_path: "Model.java".to_string(),
-            blob_oid: oid,
-            kind: CodeUnitType::Module,
-            package_name: String::new(),
-            short_name: "Model".to_string(),
-            exact_fqn: "Model".to_string(),
-            normalized_fqn: "Model".to_string(),
-            requires_imports: false,
-        };
-        store
-            .sync_workspace_snapshot(
-                "java",
-                a,
-                &[WorkspaceFileRow {
-                    rel_path: row.rel_path.clone(),
-                    blob_oid: row.blob_oid,
-                }],
-                std::slice::from_ref(&row),
-                &[],
-                &[],
-                &[],
-                &[],
-            )
-            .unwrap();
-        let langs = vec!["java".to_string()];
-        let a_map = HashMap::from_iter([("java".to_string(), a)]);
-        assert!(
-            !store
-                .declaration_candidate_rows_for_langs(&langs, &a_map)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            store
-                .path_symbol_rows_by_fqn_for_langs(&langs, &a_map, "Model", "Model")
-                .unwrap()
-                .len(),
-            1
-        );
-
-        // Keep both query sources nonempty: exact and normalized lookups must
-        // share one cap, including when they admit the same persisted row.
-        let normalized_row = PathSymbolRow {
-            normalized_fqn: "normalized.Model".to_string(),
-            ..row.clone()
-        };
-        let second_file = write_file(temp.path(), "Other.java", "class Model {}\n");
-        assert_eq!(
-            oid_for(second_file.read_to_string().unwrap().as_bytes()),
-            oid
-        );
-        let second_row = PathSymbolRow {
-            rel_path: "Other.java".to_string(),
-            ..normalized_row.clone()
-        };
-        let snapshot_a = store
-            .sync_workspace_snapshot(
-                "java",
-                a,
-                &[
-                    WorkspaceFileRow {
-                        rel_path: row.rel_path.clone(),
-                        blob_oid: oid,
-                    },
-                    WorkspaceFileRow {
-                        rel_path: second_row.rel_path.clone(),
-                        blob_oid: oid,
-                    },
-                ],
-                &[normalized_row.clone(), second_row],
-                &[],
-                &[],
-                &[],
-                &[],
-            )
-            .unwrap();
-        let selected_a = HashMap::from_iter([("java".to_string(), snapshot_a)]);
-        let bounded = |limit, continue_query: &mut dyn FnMut() -> bool| {
-            store
-                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
-                    &selected_a,
-                    &langs,
-                    &a_map,
-                    ("Model", "normalized.Model"),
-                    limit,
-                    continue_query,
-                )
-                .unwrap()
-        };
-        let ample = bounded(5, &mut || true);
-        assert!(ample.complete);
-        assert_eq!(ample.inspected, 4);
-        assert_eq!(ample.rows.len(), 4);
-        assert!(ample.rows.iter().all(|(lang, item)| lang == "java"
-            && matches!(item.rel_path.as_str(), "Model.java" | "Other.java")
-            && item.blob_oid == oid));
-        for limit in [0, 1, 2, 3, 4] {
-            let capped = bounded(limit, &mut || true);
-            assert!(!capped.complete, "reaching the cap is not an absence proof");
-            assert_eq!(capped.inspected, limit);
-            assert_eq!(capped.rows.len(), limit);
-        }
-        let stopped = bounded(5, &mut || false);
-        assert!(!stopped.complete);
-        assert!(stopped.rows.is_empty());
-        assert_eq!(stopped.inspected, 0);
-        let mut polls = 0;
-        let interrupted = bounded(5, &mut || {
-            polls += 1;
-            polls <= 2
-        });
-        assert!(!interrupted.complete);
-        assert_eq!(interrupted.inspected, 1);
-        assert_eq!(interrupted.rows.len(), 1);
-        assert_eq!(interrupted.rows[0].1.rel_path, "Model.java");
-        let missing = store
-            .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
-                &selected_a,
-                &langs,
-                &a_map,
-                ("Missing", "normalized.Missing"),
-                3,
-                || true,
-            )
-            .unwrap();
-        assert!(missing.complete);
-        assert!(missing.rows.is_empty());
-        assert_eq!(missing.inspected, 0);
-
-        // These are generic storage rows, not Java/Python resolution. A second
-        // language proves the cap is not reset for each language's SQL cursor.
-        let python_file = write_file(temp.path(), "other.py", "pass\n");
-        let python_adapter = PythonAdapter::for_test_file(&python_file);
-        let python_oid = oid_for(python_file.read_to_string().unwrap().as_bytes());
-        let python_generation = store.ensure_language_epoch_value("python", "a").unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                python_oid,
-                "python",
-                python_generation,
-                &python_adapter,
-                &parse_state(&python_adapter, &python_file),
-            )
-            .unwrap();
-        let python_row = PathSymbolRow {
-            rel_path: "other.py".to_string(),
-            blob_oid: python_oid,
-            ..normalized_row.clone()
-        };
-        let python_snapshot = store
-            .sync_workspace_snapshot(
-                "python",
-                python_generation,
-                &[WorkspaceFileRow {
-                    rel_path: python_row.rel_path.clone(),
-                    blob_oid: python_oid,
-                }],
-                &[python_row],
-                &[],
-                &[],
-                &[],
-                &[],
-            )
-            .unwrap();
-        let mut selected_both = selected_a.clone();
-        selected_both.insert("python".to_string(), python_snapshot);
-        let both_langs = vec!["java".to_string(), "python".to_string()];
-        let both_generations = HashMap::from_iter([
-            ("java".to_string(), a),
-            ("python".to_string(), python_generation),
-        ]);
-        let across_languages = |limit| {
-            store
-                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
-                    &selected_both,
-                    &both_langs,
-                    &both_generations,
-                    ("Model", "normalized.Model"),
-                    limit,
-                    || true,
-                )
-                .unwrap()
-        };
-        let capped_languages = across_languages(5);
-        assert!(!capped_languages.complete);
-        assert_eq!(capped_languages.inspected, 5);
-        assert_eq!(
-            capped_languages
-                .rows
-                .iter()
-                .map(|(lang, _)| lang.as_str())
-                .collect::<Vec<_>>(),
-            vec!["java", "java", "java", "java", "python"]
-        );
-        let all_languages = across_languages(7);
-        assert!(all_languages.complete);
-        assert_eq!(all_languages.inspected, 6);
-        assert_eq!(
-            all_languages
-                .rows
-                .iter()
-                .map(|(lang, _)| lang.as_str())
-                .collect::<Vec<_>>(),
-            vec!["java", "java", "java", "java", "python", "python"]
-        );
-
-        let b = store.ensure_language_epoch_value("java", "b").unwrap();
-        let b_map = HashMap::from_iter([("java".to_string(), b)]);
-        assert!(
-            store
-                .declaration_candidate_rows_for_langs(&langs, &a_map)
-                .unwrap_err()
-                .is_stale_generation()
-        );
-        assert!(
-            store
-                .declaration_candidate_rows_for_langs(&langs, &b_map)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            store
-                .path_symbol_rows_by_fqn_for_langs(&langs, &b_map, "Model", "Model")
-                .unwrap()
-                .is_empty()
-        );
-
-        assert!(
-            store
-                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
-                    &selected_a,
-                    &langs,
-                    &a_map,
-                    ("Model", "normalized.Model"),
-                    8,
-                    || true,
-                )
-                .unwrap_err()
-                .is_stale_generation()
-        );
-        let after_cutover = store
-            .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
-                &selected_a,
-                &langs,
-                &b_map,
-                ("Model", "normalized.Model"),
-                8,
-                || true,
-            )
-            .unwrap();
-        assert!(after_cutover.complete);
-        assert!(after_cutover.rows.is_empty());
-        assert_eq!(after_cutover.inspected, 0);
-
-        let current_file = write_file(temp.path(), "Model.java", "class Model { int current; }\n");
-        let current_oid = oid_for(current_file.read_to_string().unwrap().as_bytes());
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                current_oid,
-                "java",
-                b,
-                &JavaAdapter,
-                &parse_state(&JavaAdapter, &current_file),
-            )
-            .unwrap();
-        let current_row = PathSymbolRow {
-            blob_oid: current_oid,
-            ..normalized_row
-        };
-        let snapshot_b = store
-            .sync_workspace_snapshot(
-                "java",
-                b,
-                &[WorkspaceFileRow {
-                    rel_path: current_row.rel_path.clone(),
-                    blob_oid: current_oid,
-                }],
-                &[current_row],
-                &[],
-                &[],
-                &[],
-                &[],
-            )
-            .unwrap();
-        let selected_b = HashMap::from_iter([("java".to_string(), snapshot_b)]);
-        let current = store
-            .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
-                &selected_b,
-                &langs,
-                &b_map,
-                ("Model", "normalized.Model"),
-                8,
-                || true,
-            )
-            .unwrap();
-        assert!(current.complete);
-        assert_eq!(current.inspected, 2);
-        assert_eq!(current.rows.len(), 2);
-        assert!(
-            current
-                .rows
-                .iter()
-                .all(|(_, item)| item.blob_oid == current_oid)
-        );
-        assert_ne!(current_oid, oid);
-        assert!(
-            store
-                .path_symbol_rows_by_fqn_for_langs_limited_at_snapshots(
-                    &selected_b,
-                    &langs,
-                    &a_map,
-                    ("Model", "normalized.Model"),
-                    8,
-                    || true,
-                )
-                .unwrap_err()
-                .is_stale_generation()
         );
     }
 
@@ -27414,45 +24365,6 @@ fn main() {}
         }
     }
 
-    #[test]
-    fn limited_identifier_candidate_seeks_the_identifier_index_with_both_statistics_states() {
-        for state in PlannerStatisticsState::BOTH {
-            let temp = tempfile::TempDir::new().unwrap();
-            let file = write_file(temp.path(), "src/lib.rs", "pub struct Widget;\n");
-            let oid = oid_for(file.read_to_string().unwrap().as_bytes());
-            let store = AnalyzerStore::open_ephemeral().unwrap();
-            store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
-                .unwrap();
-
-            let conn = store.conn.lock().expect("store mutex");
-            prepare_pin_context(&conn);
-            conn.execute(
-                "INSERT INTO temp.declaration_candidate_requests(
-                   request_ordinal, lang, identifier, request_limit
-                 ) VALUES (0, 'rust', 'Widget', 16)",
-                [],
-            )
-            .unwrap();
-            state.install(&conn);
-            let plan = explain_pin(&conn, &pinned("limited_identifier_candidate"));
-
-            assert!(
-                plan.iter().any(|detail| detail
-                    .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
-                "limited candidate query must seek the identifier index {state}: {plan:#?}"
-            );
-            assert!(
-                plan.iter().all(|detail| {
-                    !detail.contains("SCAN units")
-                        && !detail.contains("AUTOMATIC")
-                        && !detail.contains("CO-ROUTINE")
-                }),
-                "limited candidate query must retain indexed execution {state}: {plan:#?}"
-            );
-        }
-    }
-
     fn identifier_lookup_uses_index_in(
         state: PlannerStatisticsState,
         query_name: &str,
@@ -27853,767 +24765,6 @@ fn main() {}
         assert_eq!(analyzer_db_path(&repo_root), analyzer_db_path(&linked_root));
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn round_trips_java_python_and_typescript_file_states() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let java_file = write_file(
-            root,
-            "src/demo/Example.java",
-            "package demo;\nimport java.util.List;\nclass Example { void run() {} }\n",
-        );
-        let python_init = write_file(root, "pkg/__init__.py", "");
-        let python_file = write_file(
-            root,
-            "pkg/mod.py",
-            "import os\nclass Example:\n    def run(self):\n        return os.getcwd()\n",
-        );
-        let ts_file = write_file(
-            root,
-            "src/example.test.ts",
-            "import {Thing} from './thing';\nexport class Example { run(): Thing { return new Thing(); } }\n",
-        );
-        let _ = python_init;
-
-        assert_round_trip(&JavaAdapter, "java", &java_file);
-        assert_round_trip(
-            &PythonAdapter::for_test_file(&python_file),
-            "python",
-            &python_file,
-        );
-        assert_round_trip(&TypescriptAdapter, "typescript", &ts_file);
-    }
-
-    #[test]
-    fn round_trips_python_crlf_class_signature() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let python_file = write_file(
-            root,
-            "pkg/documented.py",
-            "# Comment before class\r\nclass DocumentedClass:\r\n    pass\r\n",
-        );
-        let source = python_file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let adapter = PythonAdapter::for_test_file(&python_file);
-        let parsed = parse_state(&adapter, &python_file);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "python", &adapter, &parsed)
-            .unwrap();
-
-        let hydrated = store
-            .hydrate_file_state(oid, "python", &adapter, &python_file)
-            .unwrap()
-            .unwrap();
-        assert_file_state_equivalent(&parsed, &hydrated);
-        assert!(
-            hydrated
-                .signatures
-                .values()
-                .flatten()
-                .any(|signature| signature == "class DocumentedClass:"),
-            "expected CRLF class signature to survive store round trip, got {:?}",
-            hydrated.signatures
-        );
-    }
-
-    #[test]
-    fn round_trips_optional_fact_manifest_languages_and_unrelated_language() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let ruby_file = write_file(
-            root,
-            "lib/demo.rb",
-            "module Demo\n  module_function\n  def build(value)\n    Product.new(value)\n  end\n  class Product\n    attr_reader :name\n    alias_method :label, :name\n    def initialize(name)\n      @name = name\n    end\n    def self.featured\n      new('sample')\n    end\n  end\nend\n",
-        );
-        let scala_file = write_file(
-            root,
-            "src/main/scala/app/Demo.scala",
-            "package app\ntrait Runnable { def run(first: Int = 0)(rest: String*): Int }\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
-        );
-        let cpp_file = write_file(
-            root,
-            "include/demo.h",
-            "template <typename T, typename U = T*> class Demo {};\ntemplate <typename T> class Demo<T, T*> {};\n",
-        );
-        let python_file = write_file(root, "pkg/demo.py", "class Demo:\n    pass\n");
-
-        assert_round_trip(&RubyAdapter, "ruby", &ruby_file);
-        assert_round_trip(&ScalaAdapter, "scala", &scala_file);
-        assert_round_trip(&CppAdapter, "cpp", &cpp_file);
-        assert_round_trip(
-            &PythonAdapter::for_test_file(&python_file),
-            "python",
-            &python_file,
-        );
-
-        let source = python_file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(
-                oid,
-                "python",
-                &PythonAdapter::for_test_file(&python_file),
-                &parse_state(&PythonAdapter::for_test_file(&python_file), &python_file),
-            )
-            .unwrap();
-        let conn = store.conn.lock().unwrap();
-        let manifest_rows: usize = conn
-            .query_row(
-                "SELECT COUNT(*) FROM blob_optional_fact_manifest
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python')",
-                [oid.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(manifest_rows, 0);
-    }
-
-    #[test]
-    fn direct_adapter_write_matches_explicit_prepared_write() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let ruby_file = write_file(
-            root,
-            "lib/demo.rb",
-            "module Demo\n  module_function\n  def build(value)\n    Product.new(value)\n  end\n  class Product\n    attr_reader :name\n    alias_method :label, :name\n  end\nend\n",
-        );
-        let scala_file = write_file(
-            root,
-            "src/main/scala/app/Demo.scala",
-            "package app\nimport scala.collection.mutable.ListBuffer\ntrait Runnable\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
-        );
-        let ts_file = write_file(
-            root,
-            "src/demo.test.ts",
-            "import {Thing} from './thing';\nexport class Demo { run(value: Thing): Thing { return value; } }\n",
-        );
-        let cpp_file = write_file(
-            root,
-            "include/demo.h",
-            "template <typename T, typename U = T*> class Demo {};\ntemplate <typename T> class Demo<T, T*> {};\n",
-        );
-
-        assert_direct_prepared_parity(&RubyAdapter, "ruby", &ruby_file);
-        assert_direct_prepared_parity(&ScalaAdapter, "scala", &scala_file);
-        assert_direct_prepared_parity(&TypescriptAdapter, "typescript", &ts_file);
-        assert_direct_prepared_parity(&CppAdapter, "cpp", &cpp_file);
-    }
-
-    #[test]
-    fn identical_python_blob_hydrates_with_live_path_names() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let content = "class Shared:\n    def run(self):\n        return 1\n";
-        let _ = write_file(root, "pkg_a/__init__.py", "");
-        let _ = write_file(root, "pkg_b/__init__.py", "");
-        let _ = write_file(root, "pkg_b/sub/__init__.py", "");
-        let file_a = write_file(root, "pkg_a/mod.py", content);
-        let file_b = write_file(root, "pkg_b/sub/mod.py", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = PythonAdapter::for_test_file(&file_a);
-        let state_a = parse_state(&adapter, &file_a);
-        let state_b = parse_state(&adapter, &file_b);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-
-        store
-            .write_parsed_blob(oid, "python", &adapter, &state_a)
-            .unwrap();
-        let first_count = store.content_row_count(oid, "python").unwrap();
-        store
-            .write_parsed_blob(oid, "python", &adapter, &state_b)
-            .unwrap();
-        assert_eq!(store.content_row_count(oid, "python").unwrap(), first_count);
-
-        let hydrated_a = store
-            .hydrate_file_state(oid, "python", &adapter, &file_a)
-            .unwrap()
-            .unwrap();
-        let hydrated_b = store
-            .hydrate_file_state(oid, "python", &adapter, &file_b)
-            .unwrap()
-            .unwrap();
-        assert_file_state_equivalent(&state_a, &hydrated_a);
-        assert_file_state_equivalent(&state_b, &hydrated_b);
-        assert_eq!(hydrated_a.package_name, "pkg_a.mod");
-        assert_eq!(hydrated_b.package_name, "pkg_b.sub.mod");
-        assert!(
-            hydrated_a
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "pkg_a.mod.Shared")
-        );
-        assert!(
-            hydrated_b
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "pkg_b.sub.mod.Shared")
-        );
-    }
-
-    /// The relational anchor, package boundary, and content-stable tail for
-    /// the unit whose rendered name is `fq_name`.
-    fn persisted_unit_row<A: LanguageAdapter>(
-        adapter: &A,
-        state: &FileState,
-        fq_name: &str,
-    ) -> (Option<PackageAnchor>, usize, String) {
-        let unit = state
-            .declarations
-            .iter()
-            .find(|unit| unit.fq_name() == fq_name)
-            .unwrap_or_else(|| panic!("fixture must declare {fq_name}: {:?}", state.declarations));
-        let content_qualifier = adapter.storage_content_qualifier(unit, &state.content_qualifier);
-        let persisted = persisted_unit_fq(adapter, unit, &content_qualifier).unwrap();
-        let interner = segment_interner();
-        let tail = persisted.tail.display(interner);
-        (persisted.anchor, persisted.package_tail_segments, tail)
-    }
-
-    /// A crate-root-qualified impl owner (`use crate::JsError; impl T for
-    /// JsError`) has a package that is neither the file's own nor foreign: it
-    /// is the crate root. Persisting it in full would bake the extracting
-    /// mount's directory names into a content-addressed row, and treating it as
-    /// the file's own package would be wrong wherever those differ. It must
-    /// persist as a crate-root anchor plus a package-free tail, and hydrate
-    /// with each mount's own crate root.
-    #[test]
-    fn identical_rust_crate_impl_blob_hydrates_with_live_crate_roots() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let _ = write_file(root, "src/lib.rs", "pub struct JsError;\n");
-        let _ = write_file(root, "crates/webidl/src/lib.rs", "pub struct JsError;\n");
-        let content = "use crate::JsError;\n\npub trait WasmDescribe {\n    fn describe();\n}\n\nimpl WasmDescribe for JsError {\n    fn describe() {}\n}\n";
-        let file_a = write_file(root, "src/describe.rs", content);
-        let file_b = write_file(root, "crates/webidl/src/describe.rs", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = RustAdapter;
-        let state = parse_state(&adapter, &file_a);
-
-        let (anchor, boundary_in_tail, tail) =
-            persisted_unit_row(&adapter, &state, "JsError.describe");
-        assert_eq!(anchor, Some(PackageAnchor::CrateRoot));
-        assert_eq!(boundary_in_tail, 0);
-        assert_eq!(tail, "JsError.describe");
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
-            .unwrap();
-        let workspace_files = [&file_a, &file_b]
-            .into_iter()
-            .map(|file| WorkspaceFileRow {
-                rel_path: crate::path_utils::rel_path_string(file),
-                blob_oid: oid,
-            })
-            .collect::<Vec<_>>();
-        let anchors = [&file_a, &file_b]
-            .into_iter()
-            .map(|file| WorkspaceAnchorRow {
-                rel_path: crate::path_utils::rel_path_string(file),
-                anchor: PackageAnchor::CrateRoot,
-                package_name: adapter
-                    .resolve_package_anchor(PackageAnchor::CrateRoot, "", file)
-                    .unwrap()
-                    .display_native(Language::Rust, segment_interner()),
-            })
-            .collect::<Vec<_>>();
-        let mut packages = anchors
-            .iter()
-            .map(|anchor| anchor.package_name.clone())
-            .collect::<Vec<_>>();
-        packages.sort();
-        packages.dedup();
-        store
-            .sync_workspace_snapshot(
-                "rust",
-                GenerationId::BOOTSTRAP,
-                &workspace_files,
-                &[],
-                &packages,
-                &[],
-                &[],
-                &anchors,
-            )
-            .unwrap();
-        let hydrated_a = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_a)
-            .unwrap()
-            .unwrap();
-        let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
-            .unwrap()
-            .unwrap();
-
-        assert!(
-            hydrated_a
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "JsError.describe")
-        );
-        assert!(
-            hydrated_b
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "crates.webidl.src.JsError.describe"),
-            "{:?}",
-            hydrated_b.declarations
-        );
-        let mounted_names = {
-            let conn = store.conn.lock().expect("store mutex");
-            let mut statement = conn
-                .prepare(
-                    "SELECT prefix, tail, rel_path
-                     FROM live_definition_exact_names
-                     WHERE lang = 'rust' AND tail = 'JsError.describe'
-                     ORDER BY rel_path",
-                )
-                .unwrap();
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        assert_eq!(
-            mounted_names,
-            [
-                (
-                    "crates.webidl.src".to_string(),
-                    "JsError.describe".to_string(),
-                    "crates/webidl/src/describe.rs".to_string(),
-                ),
-                (
-                    String::new(),
-                    "JsError.describe".to_string(),
-                    "src/describe.rs".to_string(),
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn csharp_nested_type_persists_structural_and_namespace_visibility() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let content = "namespace Demo { class Outer { public class Nested<T> {} } }\n";
-        let file = write_file(temp.path(), "Nested.cs", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = CSharpAdapter;
-        let state = parse_state(&adapter, &file);
-        let nested = state
-            .declarations
-            .iter()
-            .find(|unit| unit.is_class() && unit.identifier().starts_with("Nested"))
-            .expect("fixture declares a nested type");
-        assert_eq!(nested.package_name(), "Demo");
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "csharp", &adapter, &state)
-            .unwrap();
-        let workspace_file = WorkspaceFileRow {
-            rel_path: crate::path_utils::rel_path_string(&file),
-            blob_oid: oid,
-        };
-        store
-            .sync_workspace_snapshot(
-                "csharp",
-                GenerationId::BOOTSTRAP,
-                &[workspace_file],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-            )
-            .unwrap();
-
-        let conn = store.conn.lock().expect("store mutex");
-        let containers = conn
-            .prepare(
-                "SELECT exact_parent_tail
-                 FROM live_visible_members
-                 WHERE lang = 'csharp' AND identifier LIKE 'Nested%'
-                 ORDER BY exact_parent_tail",
-            )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(containers, ["Demo", "Demo.Outer"]);
-
-        let (simple_name, normalized_tail, segment_count): (String, String, i64) = conn
-            .query_row(
-                "SELECT units.simple_type_name, units.normalized_fqn_tail,
-                        COUNT(segments.seg_ordinal)
-                 FROM code_units AS units
-                 JOIN code_unit_fq_segments AS segments
-                   ON segments.blob_id = units.blob_id
-                  AND segments.unit_key = units.unit_key
-                 WHERE units.blob_id = (
-                         SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'csharp'
-                       )
-                   AND units.identifier LIKE 'Nested%'
-                 GROUP BY units.blob_id, units.unit_key",
-                [oid.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(simple_name, "Nested");
-        assert_eq!(normalized_tail, "Demo.Outer.Nested");
-        assert_eq!(segment_count, nested.fq().len() as i64);
-    }
-
-    /// The same impl-bearing blob mounted at two directory depths must hydrate
-    /// with per-mount package prefixes: an own-module impl stores only the
-    /// declaration tail, never the directory names it was extracted under.
-    #[test]
-    fn identical_rust_impl_blob_hydrates_with_live_module_packages() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let content = "pub struct Client;\n\nimpl Client {\n    pub fn connect(&self) {}\n}\n";
-        let file_a = write_file(root, "alpha/src/service.rs", content);
-        let file_b = write_file(root, "beta/nested/src/service.rs", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = RustAdapter;
-        let state = parse_state(&adapter, &file_a);
-
-        let (anchor, boundary_in_tail, tail) =
-            persisted_unit_row(&adapter, &state, "alpha.src.service.Client.connect");
-        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
-        assert_eq!(boundary_in_tail, 0);
-        assert_eq!(tail, "Client.connect");
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
-            .unwrap();
-        let hydrated_a = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_a)
-            .unwrap()
-            .unwrap();
-        let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
-            .unwrap()
-            .unwrap();
-
-        assert!(
-            hydrated_a
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "alpha.src.service.Client.connect")
-        );
-        assert!(
-            hydrated_b
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "beta.nested.src.service.Client.connect"),
-            "{:?}",
-            hydrated_b.declarations
-        );
-    }
-
-    /// `super` pops the LEXICAL package, which inside an inline `mod` starts
-    /// with a content-written component. Only the pops that survive past those
-    /// components cross the file-package boundary, so this owner resolves back
-    /// to the file's own module with an effective pop of zero. Counting the
-    /// `super` naively would anchor one level up and push the file's
-    /// path-derived final component (`b`) into the content-addressed tail.
-    #[test]
-    fn inline_module_super_impl_owner_persists_no_path_derived_segments() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let content = "mod m {\n    use super::T;\n\n    pub trait X {\n        fn f();\n    }\n\n    impl X for T {\n        fn f() {}\n    }\n}\n";
-        let file = write_file(root, "src/a/b.rs", content);
-        let adapter = RustAdapter;
-        let state = parse_state(&adapter, &file);
-
-        let (anchor, boundary_in_tail, tail) = persisted_unit_row(&adapter, &state, "a.b.T.f");
-        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
-        assert_eq!(boundary_in_tail, 0);
-        assert_eq!(tail, "T.f");
-    }
-
-    /// An import and the `impl` it feeds can sit in different lexical scopes: a
-    /// file-level `use super::T` resolves against the file's package while an
-    /// `impl` inside `mod m` resolves against `<file>.m`. The anchor is derived
-    /// from the package the owner actually ends up with, so the two scopes
-    /// disagreeing cannot produce an anchor that fails to place its own package
-    /// (the debug assertions this suite runs under would abort if it did).
-    #[test]
-    fn file_level_import_feeding_an_inline_module_impl_stays_placeable() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let content = "use super::T;\n\nmod m {\n    pub trait X {\n        fn f();\n    }\n\n    impl X for T {\n        fn f() {}\n    }\n}\n";
-        let file_a = write_file(root, "src/a/b.rs", content);
-        let file_b = write_file(root, "crates/z/src/a/b.rs", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = RustAdapter;
-        let state = parse_state(&adapter, &file_a);
-
-        // The file-level binding is not in scope inside `mod m` (the module
-        // body gets its own binder), so this owner resolves as a bare local
-        // name under the inline module and keeps `m` in the content tail.
-        let (anchor, boundary_in_tail, tail) = persisted_unit_row(&adapter, &state, "a.b.m.T.f");
-        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
-        assert_eq!(boundary_in_tail, 0);
-        assert_eq!(tail, "m.T.f");
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
-            .unwrap();
-        let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
-            .unwrap()
-            .unwrap();
-        assert!(
-            hydrated_b
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "crates.z.src.a.b.m.T.f"),
-            "{:?}",
-            hydrated_b.declarations
-        );
-    }
-
-    /// `impl crate::foo::Bar` names a module below the crate root, so the
-    /// crate-root anchor leaves a source-written `foo` package segment inside
-    /// the persisted tail. The package boundary is one segment past the anchor,
-    /// and that offset must survive the round trip at a mount whose crate root
-    /// has a different depth.
-    #[test]
-    fn crate_rooted_module_impl_owner_persists_a_package_segment_in_its_tail() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let _ = write_file(root, "crates/webidl/src/lib.rs", "pub mod foo;\n");
-        let _ = write_file(root, "src/lib.rs", "pub mod foo;\n");
-        let content = "use crate::foo::Bar;\n\npub trait X {\n    fn f();\n}\n\nimpl X for Bar {\n    fn f() {}\n}\n";
-        let file_a = write_file(root, "crates/webidl/src/generator.rs", content);
-        let file_b = write_file(root, "src/generator.rs", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = RustAdapter;
-        let state = parse_state(&adapter, &file_a);
-
-        let (anchor, boundary_in_tail, tail) =
-            persisted_unit_row(&adapter, &state, "crates.webidl.src.foo.Bar.f");
-        assert_eq!(anchor, Some(PackageAnchor::CrateRoot));
-        assert_eq!(boundary_in_tail, 1);
-        assert_eq!(tail, "foo.Bar.f");
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
-            .unwrap();
-        let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
-            .unwrap()
-            .unwrap();
-        let member = hydrated_b
-            .declarations
-            .iter()
-            .find(|unit| unit.fq_name() == "foo.Bar.f")
-            .unwrap_or_else(|| panic!("{:?}", hydrated_b.declarations));
-        assert_eq!(member.package_name(), "foo");
-    }
-
-    /// A file-level `use super::T` genuinely crosses the file-package boundary,
-    /// so the owner anchors one module above the file and hydrates against the
-    /// live mount's parent package rather than the extraction-time one.
-    #[test]
-    fn cross_file_super_impl_owner_persists_a_popped_own_module_anchor() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let content =
-            "use super::T;\n\npub trait X {\n    fn f();\n}\n\nimpl X for T {\n    fn f() {}\n}\n";
-        let file_a = write_file(root, "src/a/b.rs", content);
-        let file_b = write_file(root, "crates/z/src/a/b.rs", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = RustAdapter;
-        let state = parse_state(&adapter, &file_a);
-
-        let (anchor, boundary_in_tail, tail) = persisted_unit_row(&adapter, &state, "a.T.f");
-        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 1 }));
-        assert_eq!(boundary_in_tail, 0);
-        assert_eq!(tail, "T.f");
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
-            .unwrap();
-        let hydrated_b = store
-            .hydrate_file_state(oid, "rust", &adapter, &file_b)
-            .unwrap()
-            .unwrap();
-        assert!(
-            hydrated_b
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "crates.z.src.a.T.f"),
-            "{:?}",
-            hydrated_b.declarations
-        );
-    }
-
-    /// An impl owner rooted in another crate has no placeable anchor: its
-    /// package is not derived from this file's path at any depth. It keeps its
-    /// complete persisted name, and because the anchor came from the adapter
-    /// default rather than the extractor, that fallback is silent (a debug
-    /// build would abort here if it were treated as an extractor bug).
-    #[test]
-    fn foreign_crate_impl_owner_persists_its_complete_name() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let content = "pub trait Local {\n    fn f();\n}\n\nimpl Local for serde::Value {\n    fn f() {}\n}\n";
-        let file = write_file(root, "src/model.rs", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = RustAdapter;
-        let state = parse_state(&adapter, &file);
-
-        let (anchor, _, tail) = persisted_unit_row(&adapter, &state, "serde.Value.f");
-        assert_eq!(anchor, None);
-        assert_eq!(tail, "serde.Value.f");
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &adapter, &state)
-            .unwrap();
-        let hydrated = store
-            .hydrate_file_state(oid, "rust", &adapter, &file)
-            .unwrap()
-            .unwrap();
-        assert!(
-            hydrated
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "serde.Value.f"),
-            "{:?}",
-            hydrated.declarations
-        );
-    }
-
-    /// The anchored encoding changes only Rust rows. Rust blobs cached under
-    /// the pre-change salt must be discarded, and a Go blob cached alongside
-    /// them must stay warm through that cutover.
-    #[test]
-    fn rust_anchored_fq_epoch_invalidates_rust_blobs_and_leaves_go_warm() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let rust_file = write_file(
-            root,
-            "src/service.rs",
-            "pub struct Client;\n\nimpl Client {\n    pub fn connect(&self) {}\n}\n",
-        );
-        let rust_state = Arc::new(parse_state(&RustAdapter, &rust_file));
-        let rust_oid = oid_for(rust_state.source.as_bytes());
-        let _ = write_file(root, "go.mod", "module example.com/demo\n");
-        let go_file = write_file(
-            root,
-            "internal/service/service.go",
-            "package service\ntype Client struct{}\n",
-        );
-        let go_state = Arc::new(parse_state(&GoAdapter, &go_file));
-        let go_oid = oid_for(go_state.source.as_bytes());
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_rust_generation = store
-            .ensure_language_epoch_value("rust", &epoch::rust_epoch_before_anchored_fq_encoding())
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                rust_oid,
-                "rust",
-                prior_rust_generation,
-                &RustAdapter,
-                rust_state.as_ref(),
-            )
-            .unwrap();
-        let go_generation = store
-            .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                go_oid,
-                "go",
-                go_generation,
-                &GoAdapter,
-                go_state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(rust_oid, "rust").unwrap());
-        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
-
-        let current_rust_generation = store
-            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_rust_generation, prior_rust_generation);
-        assert!(!store.contains_parsed_blob(rust_oid, "rust").unwrap());
-        assert_eq!(
-            store
-                .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
-                .unwrap(),
-            go_generation,
-            "the Rust salt bump must not move Go's epoch"
-        );
-        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
-    }
-
-    #[test]
-    fn identical_go_blob_hydrates_with_live_import_paths() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        let _ = write_file(root, "go.mod", "module example.com/demo\n");
-        let content = "package service\ntype Client struct{}\n";
-        let file_a = write_file(root, "alpha/client.go", content);
-        let file_b = write_file(root, "beta/client.go", content);
-        let oid = oid_for(content.as_bytes());
-        let adapter = GoAdapter;
-        let state = parse_state(&adapter, &file_a);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-
-        store
-            .write_parsed_blob(oid, "go", &adapter, &state)
-            .unwrap();
-        let hydrated_a = store
-            .hydrate_file_state(oid, "go", &adapter, &file_a)
-            .unwrap()
-            .unwrap();
-        let hydrated_b = store
-            .hydrate_file_state(oid, "go", &adapter, &file_b)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(hydrated_a.content_qualifier, "service");
-        assert_eq!(hydrated_b.content_qualifier, "service");
-        assert_eq!(hydrated_a.package_name, "example.com/demo/alpha");
-        assert_eq!(hydrated_b.package_name, "example.com/demo/beta");
-        assert!(
-            hydrated_a
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "example.com/demo/alpha.Client")
-        );
-        assert!(
-            hydrated_b
-                .declarations
-                .iter()
-                .any(|unit| unit.fq_name() == "example.com/demo/beta.Client")
-        );
-    }
-
     #[test]
     fn writer_is_idempotent_for_same_blob() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -28738,298 +24889,6 @@ fn main() {}
             })
             .unwrap_err();
         assert_constraint_error(python_module_err, "CHECK");
-    }
-
-    fn assert_round_trip<A: LanguageAdapter>(adapter: &A, lang: &str, file: &ProjectFile) {
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let parsed = parse_state(adapter, file);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, lang, adapter, &parsed)
-            .unwrap();
-        let hydrated = store
-            .hydrate_file_state(oid, lang, adapter, file)
-            .unwrap()
-            .unwrap();
-        assert_file_state_equivalent(&parsed, &hydrated);
-        assert!(hydrated.source.is_empty());
-        assert!(hydrated.parse_errors.is_none());
-    }
-
-    pub(super) fn assert_direct_prepared_parity<A: LanguageAdapter>(
-        adapter: &A,
-        lang: &str,
-        file: &ProjectFile,
-    ) {
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let parsed = Arc::new(parse_state(adapter, file));
-        let direct = AnalyzerStore::open_ephemeral().unwrap();
-        direct
-            .write_parsed_blob(oid, lang, adapter, parsed.as_ref())
-            .unwrap();
-        let prepared_store = AnalyzerStore::open_ephemeral().unwrap();
-        let prepared = AnalyzerStore::prepare_parsed_blob(
-            oid,
-            lang,
-            GenerationId::BOOTSTRAP,
-            adapter,
-            Arc::clone(&parsed),
-        )
-        .unwrap();
-        let (outcomes, stats) =
-            prepared_store.persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
-        assert_eq!(stats.transactions, 1);
-        assert_eq!(stats.committed_blobs, 1);
-        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
-
-        let direct_state = direct
-            .hydrate_file_state(oid, lang, adapter, file)
-            .unwrap()
-            .unwrap();
-        let prepared_state = prepared_store
-            .hydrate_file_state(oid, lang, adapter, file)
-            .unwrap()
-            .unwrap();
-        assert_file_state_equivalent(parsed.as_ref(), &direct_state);
-        assert_file_state_equivalent(parsed.as_ref(), &prepared_state);
-        assert_file_state_equivalent(&direct_state, &prepared_state);
-        let bulk_states = prepared_store
-            .hydrate_file_states(
-                &[(file.clone(), oid)],
-                lang,
-                adapter,
-                &HashMap::from_iter([(file.clone(), source)]),
-            )
-            .unwrap();
-        assert_eq!(
-            bulk_states
-                .get(file)
-                .expect("prepared blob should bulk hydrate")
-                .scala_exports,
-            parsed.scala_exports
-        );
-        assert_eq!(
-            direct.content_row_count(oid, lang).unwrap(),
-            prepared_store.content_row_count(oid, lang).unwrap()
-        );
-    }
-
-    fn assert_deleting_side_table_marks_incomplete<A: LanguageAdapter>(
-        adapter: &A,
-        lang: &str,
-        file: &ProjectFile,
-        table: &str,
-    ) {
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let parsed = parse_state(adapter, file);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, lang, adapter, &parsed)
-            .unwrap();
-
-        {
-            let conn = store.conn.lock().unwrap();
-            let count_sql = format!(
-                "SELECT COUNT(*) FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"
-            );
-            let count: usize = conn
-                .query_row(&count_sql, params![oid.to_string(), lang], |row| row.get(0))
-                .unwrap();
-            assert!(
-                count > 0,
-                "fixture should persist at least one {table} row for {lang}"
-            );
-            let delete_sql = format!(
-                "DELETE FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"
-            );
-            let corruption_setup = match table {
-                "import_statements" => {
-                    Some("DROP TRIGGER import_statements_no_delete_after_source_seal;")
-                }
-                "unit_cpp_class_templates" => Some(
-                    "DROP TRIGGER unit_cpp_class_templates_no_delete_after_seal;
-                     DROP TRIGGER unit_cpp_class_template_parameters_no_delete_after_seal;
-                     DROP TRIGGER unit_cpp_class_template_alias_components_no_delete_after_seal;
-                     DROP TRIGGER unit_cpp_class_template_expressions_no_delete_after_seal;
-                     DROP TRIGGER unit_cpp_class_template_terms_no_delete_after_seal;",
-                ),
-                "unit_signatures" => Some(
-                    "DROP TRIGGER unit_signatures_no_delete_after_pair_seal;
-                     DROP TRIGGER unit_signature_metadata_signatures_no_delete_after_seal;",
-                ),
-                "unit_signature_metadata" => Some(
-                    "DROP TRIGGER unit_signature_metadata_no_delete_after_pair_seal;
-                     DROP TRIGGER unit_signature_metadata_signatures_no_delete_after_seal;
-                     DROP TRIGGER unit_signature_parameters_no_delete_after_seal;
-                     DROP TRIGGER source_declaration_metadata_bridges_no_delete_after_seal;",
-                ),
-                "unit_signature_metadata_signatures" => {
-                    Some("DROP TRIGGER unit_signature_metadata_signatures_no_delete_after_seal;")
-                }
-                _ => None,
-            };
-            if let Some(corruption_setup) = corruption_setup {
-                assert!(
-                    conn.execute(&delete_sql, params![oid.to_string(), lang])
-                        .is_err()
-                );
-                // Bypass only the tested immutability guards to model external
-                // cache damage, then exercise the independent read validation.
-                conn.execute_batch(corruption_setup).unwrap();
-            }
-            if table == "unit_signature_metadata" {
-                // Metadata bridges have a deferred NO ACTION foreign key, so
-                // remove those links before damaging their referenced rows.
-                conn.execute(
-                    "DELETE FROM source_declaration_metadata_bridges
-                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
-                    params![oid.to_string(), lang],
-                )
-                .unwrap();
-            }
-            conn.execute(&delete_sql, params![oid.to_string(), lang])
-                .unwrap_or_else(|error| panic!("injecting {table} corruption for {lang}: {error}"));
-        }
-
-        assert!(!store.contains_parsed_blob(oid, lang).unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, lang.to_string())])
-                .unwrap(),
-            vec![(oid, lang.to_string())]
-        );
-        assert!(
-            store
-                .hydrate_file_state(oid, lang, adapter, file)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            !store
-                .hydrate_file_states(&[(file.clone(), oid)], lang, adapter, &HashMap::default())
-                .unwrap()
-                .contains_key(file)
-        );
-    }
-
-    pub(super) fn parse_state<A: LanguageAdapter>(adapter: &A, file: &ProjectFile) -> FileState {
-        let source = file.read_to_string().unwrap();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&adapter.parser_language())
-            .expect("set parser language");
-        let tree = parser.parse(source.as_str(), None).expect("parse file");
-        let mut parsed: ParsedFile = adapter.parse_file(file, &source, &tree);
-        parsed.add_file_scope(file, &source);
-        let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
-        TreeSitterAnalyzer::<A>::file_state_from_parsed(
-            source,
-            parsed,
-            contains_tests,
-            Some(Vec::new()),
-            true,
-        )
-    }
-
-    fn assert_prior_parsed_blob_invalidated<A: LanguageAdapter>(
-        adapter: &A,
-        state: &FileState,
-        prior_epoch: &str,
-    ) {
-        let language = adapter.language();
-        let language_key = language.config_label();
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_generation = store
-            .ensure_language_epoch_value(language_key, prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                language_key,
-                prior_generation,
-                adapter,
-                state,
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, language_key).unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(language, &adapter.parser_language())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, language_key).unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, language_key.to_string())])
-                .unwrap(),
-            vec![(oid, language_key.to_string())]
-        );
-    }
-
-    fn assert_file_state_equivalent(expected: &FileState, actual: &FileState) {
-        assert_eq!(actual.package_name, expected.package_name);
-        assert_eq!(actual.completeness, expected.completeness);
-        assert_eq!(
-            actual.top_level_declarations,
-            expected.top_level_declarations
-        );
-        assert_eq!(actual.declarations, expected.declarations);
-        assert_eq!(actual.scala_exports, expected.scala_exports);
-        assert_eq!(
-            actual.definition_lookup_units,
-            expected.definition_lookup_units
-        );
-        assert_eq!(actual.imports, expected.imports);
-        assert_eq!(
-            non_empty_vec_entries(&actual.raw_supertypes),
-            non_empty_vec_entries(&expected.raw_supertypes)
-        );
-        assert_eq!(
-            non_empty_vec_entries(&actual.supertype_lookup_paths),
-            non_empty_vec_entries(&expected.supertype_lookup_paths)
-        );
-        assert_eq!(actual.type_identifiers, expected.type_identifiers);
-        assert_eq!(actual.signatures, expected.signatures);
-        assert_eq!(actual.signature_metadata, expected.signature_metadata);
-        assert_eq!(
-            actual.signature_metadata_signature_ordinals,
-            expected.signature_metadata_signature_ordinals
-        );
-        assert_eq!(
-            actual.materialization_records,
-            expected.materialization_records
-        );
-        assert_eq!(actual.cpp_template_metadata, expected.cpp_template_metadata);
-        assert_eq!(actual.ranges, expected.ranges);
-        assert_eq!(
-            non_empty_vec_entries(&actual.children),
-            non_empty_vec_entries(&expected.children)
-        );
-        assert_eq!(actual.type_aliases, expected.type_aliases);
-        assert_eq!(
-            actual.ruby_method_dispatch_modes,
-            expected.ruby_method_dispatch_modes
-        );
-        assert_eq!(actual.scala_traits, expected.scala_traits);
-        assert_eq!(actual.contains_tests, expected.contains_tests);
-        assert_eq!(actual.test_region_units, expected.test_region_units);
-        assert!(actual.source.is_empty());
-        assert!(actual.parse_errors.is_none());
-    }
-
-    fn non_empty_vec_entries<T: Clone>(
-        map: &HashMap<CodeUnit, Vec<T>>,
-    ) -> HashMap<CodeUnit, Vec<T>> {
-        map.iter()
-            .filter(|(_, values)| !values.is_empty())
-            .map(|(unit, values)| (unit.clone(), values.clone()))
-            .collect()
     }
 
     const TEST_OID: &str = "1111111111111111111111111111111111111111";
@@ -29222,55 +25081,6 @@ fn main() {}
         tx.commit().unwrap();
     }
 
-    /// SQL hydration retains the producer's import interpretation independently
-    /// of the rendered snippet consumed by display clients.
-    #[test]
-    fn hydrated_rust_import_binder_uses_structured_form_not_display_text() {
-        let source =
-            "extern crate serde as serialization;\nuse crate::model::{Thing as Local, lower};\n";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let imports =
-            brokk_bifrost_rust::imports::rust_import_projection(tree.root_node(), source, "")
-                .into_iter()
-                .map(|projected| projected.import.info)
-                .collect::<Vec<_>>();
-        // Publish through production: a structured import path is stored in
-        // the canonical `source_import_*` families, which the hydrator reads
-        // back through the `source_import_lexical_*` projections.
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "src/lib.rs", source);
-        let oid = oid_for(source.as_bytes());
-        let state = parse_state(&RustAdapter, &file);
-        assert_eq!(state.imports, imports);
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        let mut hydrated = read_import_infos(&conn, &oid.to_string(), "rust").unwrap();
-        assert_eq!(hydrated, imports);
-        let mut binder = crate::analyzer::usages::ImportBinder::empty();
-        for import in &mut hydrated {
-            import.raw_snippet = "use wrong::DisplayOnly;".to_string();
-            brokk_bifrost_rust::lexical_scope::insert_rust_import_binding(&mut binder, import);
-        }
-        assert!(!binder.bindings.contains_key("serialization"));
-        assert!(!binder.bindings.contains_key("DisplayOnly"));
-        let local = &binder.bindings["Local"];
-        assert_eq!(local.module_specifier, "crate::model");
-        assert_eq!(local.imported_name.as_deref(), Some("Thing"));
-        // The existing parser renders grouped leaves as normalized imports;
-        // preserve the incumbent lowercase namespace interpretation.
-        let lower = &binder.bindings["lower"];
-        assert_eq!(lower.module_specifier, "crate::model::lower");
-        assert!(lower.imported_name.is_none());
-        assert_eq!(binder.bindings.len(), 2);
-    }
-
     /// Deleting the blob has to reach its import statements. Schema 117 stores
     /// an import's structure in the canonical `source_import_*` families, which
     /// cascade from `source_fact_manifests`; `import_statements` is the only
@@ -29458,263 +25268,6 @@ fn main() {}
         assert_eq!(batched, singles);
     }
 
-    #[test]
-    fn workspace_package_facts_include_declaration_free_go_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let _ = write_file(temp.path(), "go.mod", "module example.com/demo\n");
-        let source = "package service\n";
-        let file = write_file(temp.path(), "service/service.go", source);
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "go", &GoAdapter, &parse_state(&GoAdapter, &file))
-            .unwrap();
-
-        let generation = store.current_generation("go").unwrap();
-        let outcome = store
-            .workspace_content_package_facts(
-                "go",
-                generation,
-                &[oid],
-                Some(PackageAnchor::OwnModule { pop: 0 }),
-            )
-            .unwrap();
-
-        assert!(outcome.complete);
-        let facts = outcome.facts;
-        assert_eq!(facts.len(), 1, "one file must publish one package fact");
-        assert_eq!(facts[0].blob_oid, oid);
-        assert_eq!(facts[0].anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
-        assert_eq!(facts[0].content_qualifier, "service");
-        assert!(facts[0].package_tail.is_empty());
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "43a2c41d9d02: a package read reported complete after a requested blob had no index rows"
-    )]
-    #[test]
-    fn anchored_workspace_package_facts_report_an_unindexed_blob_incomplete() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = "package service\n";
-        let file = write_file(temp.path(), "service/service.go", source);
-        let persisted_oid = oid_for(source.as_bytes());
-        let missing_oid = oid_for(b"package missing\n");
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(
-                persisted_oid,
-                "go",
-                &GoAdapter,
-                &parse_state(&GoAdapter, &file),
-            )
-            .unwrap();
-
-        let generation = store.current_generation("go").unwrap();
-        let outcome = store
-            .workspace_content_package_facts(
-                "go",
-                generation,
-                &[persisted_oid, missing_oid],
-                Some(PackageAnchor::OwnModule { pop: 0 }),
-            )
-            .unwrap();
-
-        assert!(!outcome.complete);
-        assert_eq!(outcome.facts.len(), 1);
-        assert_eq!(outcome.facts[0].blob_oid, persisted_oid);
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "85a5d7d8ac62: Java reverse-import candidate reads scanned globally instead of following seed names"
-    )]
-    #[test]
-    fn reverse_reference_candidates_use_name_first_indexes() {
-        for state in PlannerStatisticsState::BOTH {
-            reverse_reference_candidates_use_name_first_indexes_in(state);
-        }
-    }
-
-    fn reverse_reference_candidates_use_name_first_indexes_in(state: PlannerStatisticsState) {
-        let fixture = crate::inline_project::InlineTestProject::with_language(
-            crate::analyzer::Language::Java,
-        )
-        .file(
-            "src/Canonical.java",
-            "import pkg.Target; class Canonical {}\n",
-        )
-        .file(
-            "src/Distractor.java",
-            "import noise.Other; class Distractor {}\n",
-        )
-        .build();
-        let canonical_state = parse_state(&JavaAdapter, &fixture.file("src/Canonical.java"));
-        let distractor_state = parse_state(&JavaAdapter, &fixture.file("src/Distractor.java"));
-        let canonical_oid = oid_for(canonical_state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(canonical_oid, "java", &JavaAdapter, &canonical_state)
-            .unwrap();
-        let generation = store.current_generation("java").unwrap();
-        let canonical_distractor_oids: Vec<_> = (0..900)
-            .map(|index| oid_for(format!("canonical reverse distractor {index}").as_bytes()))
-            .collect();
-        let prepared = canonical_distractor_oids
-            .iter()
-            .map(|oid| {
-                AnalyzerStore::prepare_parsed_blob(
-                    *oid,
-                    "java",
-                    generation,
-                    &JavaAdapter,
-                    Arc::new(distractor_state.clone()),
-                )
-                .unwrap()
-            })
-            .collect();
-        let (outcomes, stats) =
-            store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
-        assert_eq!(stats.committed_blobs, canonical_distractor_oids.len());
-        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
-        let conn = store.conn.lock().expect("store mutex");
-        let workspace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        conn.execute(
-            "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
-             VALUES(?1, 'java', ?2, 1)",
-            params![workspace_id, generation.get()],
-        )
-        .unwrap();
-        let projection_digest = "0".repeat(64);
-        let mut expected_paths = std::collections::BTreeSet::new();
-        let insert_file = |oid: Oid, path: String| {
-            conn.execute(
-                "INSERT INTO workspace_file_versions(
-                   workspace_id, lang, generation, rel_path, blob_oid,
-                   projection_digest, valid_from
-                 ) VALUES(?1, 'java', ?2, ?3, ?4, ?5, 1)",
-                params![
-                    workspace_id,
-                    generation.get(),
-                    path,
-                    oid.to_string(),
-                    projection_digest
-                ],
-            )
-            .unwrap();
-        };
-        insert_file(canonical_oid, "src/Canonical.java".to_owned());
-        expected_paths.insert("src/Canonical.java".to_owned());
-        for (index, oid) in canonical_distractor_oids.iter().enumerate() {
-            insert_file(*oid, format!("src/canonical-distractor-{index}.java"));
-        }
-        let snapshots = [(
-            "java".to_owned(),
-            WorkspaceSnapshotId {
-                workspace_id: WorkspaceId(workspace_id.to_owned()),
-                lang: "java".to_owned(),
-                generation,
-                revision: 1,
-            },
-        )]
-        .into_iter()
-        .collect();
-        store
-            .select_writer_workspace_snapshots(&conn, &snapshots)
-            .unwrap();
-        sync_reverse_reference_lookup_keys(
-            &conn,
-            &["Target".to_string(), "Deserialize".to_string()]
-                .into_iter()
-                .collect(),
-            &["java".to_string()].into_iter().collect(),
-            &["Target".to_string()].into_iter().collect(),
-        )
-        .unwrap();
-        let execute_imports = || {
-            conn.prepare(REVERSE_IMPORT_CANDIDATE_BLOBS_SQL)
-                .unwrap()
-                .query_map(["java"], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
-                .unwrap()
-        };
-
-        state.install(&conn);
-        let imports = explain_pin(&conn, &pinned("reverse_import_candidate_blobs"));
-        assert_eq!(execute_imports(), expected_paths);
-        {
-            let label = state;
-            assert!(
-                imports.iter().any(|detail| {
-                    detail.contains(
-                        "SEARCH segments USING COVERING INDEX idx_source_import_segments_by_segment",
-                    )
-                }),
-                "canonical reverse import lookup must seek the source segment ({label}): {imports:#?}"
-            );
-            assert!(
-                imports.iter().all(|detail| {
-                    !detail.contains("SCAN segments")
-                        && !detail.contains("SCAN source_import_segments")
-                        && !detail.contains("SCAN links")
-                        && !detail.contains("SCAN imports")
-                        && !detail.contains("SCAN source_imports")
-                        && !detail.contains("SCAN import_statements")
-                        && !detail.contains("SCAN keys")
-                        && !detail.contains("SCAN files")
-                }),
-                "reverse import lookup must not scan persisted candidate tables ({label}): {imports:#?}"
-            );
-            assert!(
-                imports
-                    .iter()
-                    .any(|detail| { detail.contains("idx_workspace_file_versions_snapshot_blob") }),
-                "reverse import lookup must seek snapshot membership by blob ({label}): {imports:#?}"
-            );
-        }
-
-        let identifiers = explain_pin(&conn, &pinned("reverse_type_candidate_blobs"));
-        assert!(
-            identifiers.iter().any(|detail| {
-                detail.contains(
-                    "SEARCH identifiers USING COVERING INDEX idx_reference_identifiers_by_identifier",
-                )
-            }),
-            "reverse type lookup must seek the requested identifier {state}: {identifiers:#?}"
-        );
-        assert!(
-            identifiers
-                .iter()
-                .all(|detail| !detail.contains("SCAN identifiers")),
-            "reverse type lookup must not scan reference_identifiers {state}: {identifiers:#?}"
-        );
-
-        let paths = explain_pin(&conn, &pinned("reverse_identifier_candidate_paths"));
-        assert!(
-            paths.iter().any(|detail| detail.contains(
-                "SEARCH identifiers USING COVERING INDEX idx_reference_identifiers_by_identifier"
-            )),
-            "reverse path lookup must seek the requested identifier {state}: {paths:#?}"
-        );
-        assert!(
-            paths
-                .iter()
-                .any(|detail| detail.contains("idx_workspace_file_versions_snapshot_blob")),
-            "reverse path lookup must seek snapshot membership by blob {state}: {paths:#?}"
-        );
-        assert!(
-            paths.iter().all(|detail| {
-                !detail.contains("SCAN identifiers") && !detail.contains("SCAN files")
-            }),
-            "reverse path lookup must not scan persisted facts {state}: {paths:#?}"
-        );
-        assert!(
-            identifiers
-                .iter()
-                .any(|detail| { detail.contains("idx_workspace_file_versions_snapshot_blob") }),
-            "reverse type lookup must seek snapshot membership by blob {state}: {identifiers:#?}"
-        );
-    }
-
     fn insert_test_blob_and_unit(conn: &Connection) {
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
@@ -29737,3204 +25290,6 @@ fn main() {}
         assert!(
             message.contains(expected),
             "expected {expected} constraint error, got {message}"
-        );
-    }
-
-    /// Ruby generation provenance (issue #1476) survives the store: the
-    /// producer records literal `attr_*`/`alias_method` generation and the
-    /// dynamic site, and both hydration paths return the records verbatim.
-    #[test]
-    fn materialization_records_round_trip_through_persistence() {
-        use crate::analyzer::structural::materialization::{
-            GenerationInputClass, GenerationKind, MaterializationRecord,
-        };
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "provenance.rb",
-            "class Widget\n  attr_accessor :name\n  attr_reader label.to_sym\n  def base; end\n  alias_method :aliased, :base\nend\n",
-        );
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let state = parse_state(&RubyAdapter, &file);
-
-        let records = &state.materialization_records;
-        let generated_units: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::GeneratedDeclaration { kind, unit, .. } => {
-                    Some((*kind, unit.fq_name().to_string()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            generated_units,
-            vec![
-                (GenerationKind::AccessorMacro, "Widget.@name".to_string()),
-                (GenerationKind::AccessorMacro, "Widget.name".to_string()),
-                (GenerationKind::AccessorMacro, "Widget.name=".to_string()),
-                (GenerationKind::AliasMacro, "Widget.aliased".to_string()),
-            ],
-            "complete recorded generation set: {records:?}"
-        );
-        let dynamic_sites: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::DynamicGenerationSite { kind, .. } => Some(*kind),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(dynamic_sites, vec![GenerationKind::AccessorMacro]);
-        for record in records {
-            if let MaterializationRecord::GeneratedDeclaration { site, argument, .. } = record {
-                assert!(
-                    site.start_byte <= argument.start_byte && argument.end_byte <= site.end_byte,
-                    "argument must lie inside its generation site: {record:?}"
-                );
-                assert_eq!(GenerationInputClass::Literal.label(), "literal");
-            }
-        }
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("ruby", "materialization-round-trip-v1")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                "ruby",
-                generation,
-                &RubyAdapter,
-                &state,
-            )
-            .unwrap();
-
-        let hydrated = store
-            .hydrate_file_state_with_source(oid, "ruby", generation, &RubyAdapter, &file, &source)
-            .unwrap()
-            .expect("hydration should succeed");
-        assert_eq!(
-            hydrated.materialization_records,
-            state.materialization_records
-        );
-
-        let bulk = store
-            .hydrate_file_states(
-                &[(file.clone(), oid)],
-                "ruby",
-                &RubyAdapter,
-                &HashMap::from_iter([(file.clone(), source)]),
-            )
-            .unwrap();
-        assert_eq!(
-            bulk.get(&file)
-                .expect("bulk hydration")
-                .materialization_records,
-            state.materialization_records
-        );
-    }
-
-    /// C++ materialization provenance (issue #1476): a `#define` is a
-    /// generation site producing its macro unit, a preprocessor conditional
-    /// is a recorded configuration gate, and an export-macro class the parser
-    /// broke is recorded as a recovered declaration.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2552: export-macro recovery lost the displaced C++ class constructor and its provenance"
-    )]
-    #[test]
-    fn cpp_macro_config_and_recovery_records() {
-        use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "config.h",
-            concat!(
-                "#define WIDGET_MAX 8\n",
-                "#ifdef USE_FAST\n",
-                "int fast_path();\n",
-                "#else\n",
-                "int slow_path();\n",
-                "#endif\n",
-            ),
-        );
-        let state = parse_state(&CppAdapter, &file);
-        let records = &state.materialization_records;
-        let generated: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::GeneratedDeclaration { kind, unit, .. } => {
-                    Some((*kind, unit.fq_name().to_string()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            generated,
-            vec![(
-                GenerationKind::PreprocessorDefinition,
-                "WIDGET_MAX".to_string()
-            )],
-            "records: {records:?}"
-        );
-        let gates: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::ConfigurationConditional { range } => Some(*range),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(gates.len(), 1, "records: {records:?}");
-        let source = file.read_to_string().unwrap();
-        let ifdef_start = source.find("#ifdef").unwrap();
-        assert_eq!(gates[0].start_byte, ifdef_start);
-        assert!(
-            gates[0].end_byte >= source.find("slow_path").unwrap(),
-            "the gate interval must cover the else branch: {:?}",
-            gates[0]
-        );
-
-        // The f7a2bb5 shape: an export-annotation macro on a single-base class
-        // makes tree-sitter parse the class as a bogus function definition;
-        // recovery re-derives the class and must say it did so.
-        let recovered_file = write_file(
-            temp.path(),
-            "exported.h",
-            concat!(
-                "class CORE_EXPORT QgsPoint : public QgsAbstractGeometry\n",
-                "{\n",
-                "  public:\n",
-                "    QgsPoint( double x, double y );\n",
-                "};\n",
-            ),
-        );
-        let state = parse_state(&CppAdapter, &recovered_file);
-        let recovered: Vec<_> = state
-            .materialization_records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::RecoveredDeclaration { unit, .. } => {
-                    Some(unit.fq_name().to_string())
-                }
-                _ => None,
-            })
-            .collect();
-        // The class, and the constructor its access label swallowed: the
-        // reparsed body reads `QgsPoint( double x, double y );` as a call
-        // statement under `public:`, and recovery reparses the declarator from
-        // that call (#2552).
-        assert_eq!(
-            recovered,
-            vec!["QgsPoint".to_string(), "QgsPoint.QgsPoint".to_string()],
-            "records: {:?}",
-            state.materialization_records
-        );
-    }
-
-    /// C++ recovered-origin provenance for the remaining recovery shapes
-    /// (issue #1657): a sentinel-macro region reparse records every unit the
-    /// reparse walk mints, a fragmented multiple-base export declaration
-    /// records its recovered class, and a fragmented partial specialization
-    /// records the recovered member scope.
-    #[brokk_bifrost_test_macros::hardwon(
-        "#1657+5554beb0001d: remaining C++ recovery shapes must retain Recovered source provenance"
-    )]
-    #[test]
-    fn cpp_remaining_recovery_shapes_record_recovered_origin() {
-        use crate::analyzer::structural::materialization::MaterializationRecord;
-        use brokk_bifrost_core::analyzer::model::Range;
-
-        fn recovered_units(state: &FileState) -> Vec<(String, Range)> {
-            state
-                .materialization_records
-                .iter()
-                .filter_map(|record| match record {
-                    MaterializationRecord::RecoveredDeclaration { recovery, unit } => {
-                        Some((unit.fq_name().to_string(), *recovery))
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
-
-        let temp = tempfile::TempDir::new().unwrap();
-
-        // Issue #941: file-scope macro sentinels make tree-sitter swallow the
-        // wrapped namespace/struct region as one bogus function definition.
-        // The region reparse mints the namespace, struct, and method directly
-        // (there is no single recovered envelope unit), so every minted unit
-        // carries the reparse window; the sibling outside the region stays
-        // parsed.
-        let sentinel = write_file(
-            temp.path(),
-            "sentinel.cpp",
-            concat!(
-                "BEGIN_NS\n",
-                "namespace demo { struct Widget { void doWork(); }; }\n",
-                "END_NS\n",
-                "void callWidget() {\n",
-                "    demo::Widget w;\n",
-                "    w.doWork();\n",
-                "}\n",
-            ),
-        );
-        let state = parse_state(&CppAdapter, &sentinel);
-        let recovered = recovered_units(&state);
-        let names: Vec<&str> = recovered.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["demo", "demo.Widget", "demo.Widget.doWork"],
-            "records: {:?}",
-            state.materialization_records
-        );
-        let source = sentinel.read_to_string().unwrap();
-        let widget_start = source.find("struct Widget").unwrap();
-        for (name, recovery) in &recovered {
-            assert!(
-                recovery.start_byte <= widget_start && widget_start < recovery.end_byte,
-                "the reparse window must cover the recovered struct for {name}: {recovery:?}"
-            );
-        }
-
-        // Issue #938: a multiple-base export-macro class parses as a broken
-        // `declaration` whose members tree-sitter scatters; the recovery
-        // records the recovered class over its full class range.
-        let fragmented = write_file(
-            temp.path(),
-            "two_base.h",
-            concat!(
-                "#define VIEWS_EXPORT\n",
-                "namespace views {\n",
-                "class VIEWS_EXPORT TwoBase : public internal::NativeWidgetDelegate,\n",
-                "                             public ui::EventSource {\n",
-                "public:\n",
-                "    TwoBase();\n",
-                "};\n",
-                "}\n",
-            ),
-        );
-        let state = parse_state(&CppAdapter, &fragmented);
-        let recovered = recovered_units(&state);
-        assert_eq!(
-            recovered.len(),
-            1,
-            "records: {:?}",
-            state.materialization_records
-        );
-        let (name, recovery) = &recovered[0];
-        assert_eq!(
-            name, "views.TwoBase",
-            "records: {:?}",
-            state.materialization_records
-        );
-        let source = fragmented.read_to_string().unwrap();
-        let class_start = source.find("class VIEWS_EXPORT").unwrap();
-        assert_eq!(recovery.start_byte, class_start, "recovery: {recovery:?}");
-        assert!(
-            recovery.end_byte > source.find("TwoBase();").unwrap(),
-            "the recovery window must span to the displaced closing brace: {recovery:?}"
-        );
-
-        // A macro-constrained template parameter fragments a partial
-        // specialization; the recovered member scope is recorded over the
-        // proven specialization range while the ordinary forward declaration
-        // stays parsed.
-        let specialization = write_file(
-            temp.path(),
-            "expected.hpp",
-            concat!(
-                "namespace lib {\n",
-                "#if USE_STANDARD\n",
-                "using std::expected;\n",
-                "#else\n",
-                "template<typename T, typename E> class expected;\n",
-                "\n",
-                "template<typename E>\n",
-                "class expected<void, E> {\n",
-                "public:\n",
-                "    constexpr expected() noexcept\n",
-                "        : contained(true)\n",
-                "    {}\n",
-                "\n",
-                "    constexpr explicit expected(in_place_t(void))\n",
-                "        : contained(true)\n",
-                "    {}\n",
-                "\n",
-                "    template<typename G = E\n",
-                "        nsel_REQUIRES_T(\n",
-                "            !std::is_convertible<G const&, E>::value\n",
-                "        )\n",
-                "    >\n",
-                "    nsel_constexpr14 explicit expected(G const& error)\n",
-                "        : contained(false)\n",
-                "    {\n",
-                "        contained.construct_error(E{error.error()});\n",
-                "    }\n",
-                "\n",
-                "    template<typename G = E\n",
-                "        nsel_REQUIRES_T(\n",
-                "            std::is_convertible<G const&, E>::value\n",
-                "        )\n",
-                "    >\n",
-                "    nsel_constexpr14 expected(G const& error)\n",
-                "        : contained(false)\n",
-                "    {\n",
-                "        contained.construct_error(error.error());\n",
-                "    }\n",
-                "\n",
-                "    bool has_value() const { return contained.has_value(); }\n",
-                "\n",
-                "private:\n",
-                "    bool contained;\n",
-                "};\n",
-                "\n",
-                "void after_specialization() {}\n",
-                "#endif\n",
-                "}\n",
-            ),
-        );
-        let state = parse_state(&CppAdapter, &specialization);
-        let recovered = recovered_units(&state);
-        assert_eq!(
-            recovered.len(),
-            1,
-            "records: {:?}",
-            state.materialization_records
-        );
-        let (name, recovery) = &recovered[0];
-        assert_eq!(
-            name, "lib.expected<void, E>",
-            "records: {:?}",
-            state.materialization_records
-        );
-        let source = specialization.read_to_string().unwrap();
-        let specialization_start = source.find("class expected<void, E>").unwrap();
-        let member_start = source.find("bool has_value").unwrap();
-        assert!(
-            recovery.start_byte <= specialization_start && member_start < recovery.end_byte,
-            "the recovery window must cover the specialization scope: {recovery:?}"
-        );
-    }
-
-    /// TS export provenance (issue #1476): the TypeScript dialect's own
-    /// visitor records the same export-row vocabulary, including type-space
-    /// exports (interfaces, type aliases) and the default re-export.
-    #[test]
-    fn typescript_export_records_state_their_forms() {
-        use crate::analyzer::structural::materialization::{ExportForm, MaterializationRecord};
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "exports.ts",
-            concat!(
-                "export interface Shape { area(): number }\n",
-                "export type Alias = Shape;\n",
-                "export const answer = 42;\n",
-                "export const { high, low: renamed } = bounds;\n",
-                "export class Widget {}\n",
-                "const table = { greet: 'hi' };\n",
-                "export default table;\n",
-            ),
-        );
-        let state = parse_state(&TypescriptAdapter, &file);
-        let exports: Vec<_> = state
-            .materialization_records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::Export {
-                    form,
-                    exported_name,
-                    ..
-                } => Some((*form, exported_name.clone())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            exports,
-            vec![
-                (ExportForm::Named, "Shape".to_string()),
-                (ExportForm::Named, "Alias".to_string()),
-                (ExportForm::Named, "answer".to_string()),
-                (ExportForm::Named, "high".to_string()),
-                (ExportForm::Named, "renamed".to_string()),
-                (ExportForm::Named, "Widget".to_string()),
-                (ExportForm::DefaultNamed, "default".to_string()),
-            ],
-            "records: {:?}",
-            state.materialization_records
-        );
-    }
-
-    /// JS export provenance (issue #1476): the producer records default,
-    /// named, and CommonJS export rows with their forms, and the anonymous
-    /// default's synthetic `default` unit is the row's target.
-    #[test]
-    fn javascript_export_records_state_their_forms() {
-        use crate::analyzer::structural::materialization::{ExportForm, MaterializationRecord};
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "exports.js",
-            concat!(
-                "export const answer = 42;\n",
-                "export const { alpha, beta: renamed = 1, ...rest } = source;\n",
-                "export const [first, second] = pair;\n",
-                "export function makeWidget() {}\n",
-                "const messages = { greet: 'hi' };\n",
-                "export default messages;\n",
-            ),
-        );
-        let state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &file);
-        let exports: Vec<_> = state
-            .materialization_records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::Export {
-                    form,
-                    exported_name,
-                    target,
-                    ..
-                } => Some((*form, exported_name.clone(), target.is_some())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            exports,
-            vec![
-                (ExportForm::Named, "answer".to_string(), false),
-                (ExportForm::Named, "alpha".to_string(), false),
-                (ExportForm::Named, "renamed".to_string(), false),
-                (ExportForm::Named, "rest".to_string(), false),
-                (ExportForm::Named, "first".to_string(), false),
-                (ExportForm::Named, "second".to_string(), false),
-                (ExportForm::Named, "makeWidget".to_string(), false),
-                (ExportForm::DefaultNamed, "default".to_string(), false),
-            ],
-            "records: {:?}",
-            state.materialization_records
-        );
-
-        let commonjs = write_file(
-            temp.path(),
-            "commonjs.js",
-            concat!(
-                "const local = () => 1;\n",
-                "module.exports = {\n",
-                "  inline() { return 2; },\n",
-                "  local,\n",
-                "};\n",
-            ),
-        );
-        let state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &commonjs);
-        let exports: Vec<_> = state
-            .materialization_records
-            .iter()
-            .filter_map(|record| match record {
-                MaterializationRecord::Export {
-                    form,
-                    exported_name,
-                    target,
-                    ..
-                } => Some((
-                    *form,
-                    exported_name.clone(),
-                    target.as_ref().map(|unit| unit.fq_name().to_string()),
-                )),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            exports,
-            vec![
-                (ExportForm::CommonJsRoot, "module.exports".to_string(), None),
-                (
-                    ExportForm::CommonJsMember,
-                    "inline".to_string(),
-                    Some("inline".to_string())
-                ),
-                (ExportForm::CommonJsMember, "local".to_string(), None),
-            ],
-            "records: {:?}",
-            state.materialization_records
-        );
-
-        let anonymous = write_file(
-            temp.path(),
-            "anonymous.js",
-            "export default { greet: 'hi' };\n",
-        );
-        let state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &anonymous);
-        let default_export = state
-            .materialization_records
-            .iter()
-            .find_map(|record| match record {
-                MaterializationRecord::Export {
-                    form: ExportForm::DefaultAnonymous,
-                    exported_name,
-                    target,
-                    ..
-                } => Some((exported_name.clone(), target.clone())),
-                _ => None,
-            })
-            .expect("anonymous default export row");
-        assert_eq!(default_export.0, "default");
-        assert_eq!(
-            default_export.1.expect("synthetic default unit").fq_name(),
-            "default"
-        );
-    }
-
-    #[test]
-    fn rust_fact_tables_record_exports_imports_modules_and_occurrences() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        let facts = store.rust_usage_facts(oid, "rust").unwrap();
-
-        let exports: Vec<_> = facts
-            .exports
-            .iter()
-            .map(|export| {
-                (
-                    export.exported_name.as_deref(),
-                    export.source_path.as_str(),
-                    export.imported_name.as_deref(),
-                    export.is_glob,
-                )
-            })
-            .collect();
-        assert_eq!(
-            exports,
-            vec![
-                (Some("Exported"), "alpha", Some("Exported"), false),
-                (Some("Alias"), "beta", Some("Renamed"), false),
-                (None, "gamma", None, true),
-            ],
-            "private and non-root `use` declarations are not exports: {:?}",
-            facts.exports
-        );
-
-        let imports: Vec<_> = facts
-            .import_targets
-            .iter()
-            .map(|target| {
-                (
-                    target
-                        .module_path
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                    target.bound_name.as_deref(),
-                    target.is_glob,
-                    target.is_extern_crate,
-                    target.is_macro_use,
-                    target.owner_module.as_str(),
-                    target.local_extent.is_some(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            imports,
-            vec![
-                (
-                    Vec::<&str>::new(),
-                    Some("facade"),
-                    false,
-                    true,
-                    true,
-                    "",
-                    false
-                ),
-                (
-                    vec!["alpha"],
-                    Some("Exported"),
-                    false,
-                    false,
-                    false,
-                    "",
-                    false
-                ),
-                (vec!["beta"], Some("Alias"), false, false, false, "", false),
-                (vec!["gamma"], None, true, false, false, "", false),
-                (
-                    vec!["delta"],
-                    Some("Private"),
-                    false,
-                    false,
-                    false,
-                    "",
-                    false
-                ),
-                (
-                    vec!["crate"],
-                    Some("Scoped"),
-                    false,
-                    false,
-                    false,
-                    "inline",
-                    false,
-                ),
-                (
-                    vec!["crate"],
-                    Some("Local"),
-                    false,
-                    false,
-                    false,
-                    "inline",
-                    true,
-                ),
-            ],
-            "import rows were {:?}",
-            facts.import_targets
-        );
-        assert_eq!(facts.import_targets[1].visibility, RustVisibility::Public);
-        assert_eq!(facts.import_targets[4].visibility, RustVisibility::Private);
-
-        let modules: Vec<_> = facts
-            .modules
-            .iter()
-            .map(|module| (module.module_name.as_str(), module.is_inline))
-            .collect();
-        assert_eq!(
-            modules,
-            vec![("", true), ("detached", false), ("inline", true)],
-            "module rows were {:?}",
-            facts.modules
-        );
-        assert_eq!(facts.modules[0].start_byte, 0);
-        assert_eq!(facts.modules[0].end_byte, RUST_USAGE_FACT_FIXTURE.len());
-
-        let mask = |name: &str| {
-            facts
-                .identifier_occurrences
-                .iter()
-                .find(|occurrence| occurrence.identifier == name)
-                .map(|occurrence| occurrence.context_mask)
-        };
-        assert_eq!(
-            mask("helper"),
-            Some(brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE)
-        );
-        assert_eq!(
-            mask("in_a_comment"),
-            Some(brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_COMMENT)
-        );
-        assert_eq!(
-            mask("in_a_string"),
-            Some(brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_STRING)
-        );
-
-        // The include edge records the literal as written and its last
-        // component, never the resolved target: two byte-identical files at
-        // different paths share this row set, so resolution is the reader's.
-        let edges: Vec<_> = facts
-            .include_edges
-            .iter()
-            .map(|edge| (edge.relative_path.as_str(), edge.file_name.as_str()))
-            .collect();
-        assert_eq!(edges, vec![("generated/table.rs", "table.rs")]);
-        let bindings: Vec<_> = facts.include_edges[0]
-            .host_bindings
-            .iter()
-            .map(|binding| {
-                (
-                    binding.local_name.as_str(),
-                    binding.module_specifier.as_str(),
-                    binding.imported_name.as_deref(),
-                    binding.kind,
-                )
-            })
-            .collect();
-        assert_eq!(
-            bindings,
-            vec![
-                (
-                    "*",
-                    "gamma",
-                    None,
-                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Glob
-                ),
-                (
-                    "Alias",
-                    "beta",
-                    Some("Renamed"),
-                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Named
-                ),
-                (
-                    "Exported",
-                    "alpha",
-                    Some("Exported"),
-                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Named
-                ),
-                (
-                    "Private",
-                    "delta",
-                    Some("Private"),
-                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Named
-                ),
-                (
-                    "facade",
-                    "facade",
-                    None,
-                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Namespace
-                ),
-            ],
-            "only the root-scope bindings reach a root-scope include: {:?}",
-            facts.include_edges[0].host_bindings
-        );
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "3bb3fbdffb31: selected Rust inverse reads lost canonical import occurrence locations"
-    )]
-    #[test]
-    fn canonical_import_locations_reopen_and_seek_exact_ordinals() {
-        let mut source = String::from(
-            "extern crate serde as serialization;\nuse crate::model::{Thing as Local, *};\nmod nested { use crate::Nested; }\nfn f() { use crate::LocalOnly; }\n",
-        );
-        for index in 0..128 {
-            source.push_str(&format!("use crate::model::Thing as Alias{index};\n"));
-        }
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", &source)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
-        let oid = oid_for(source.as_bytes());
-        let db_path = fixture.root().join("import-locations.db");
-        let store = AnalyzerStore::open_persistent(&db_path).unwrap();
-        let generation = store
-            .ensure_language_epoch_value("rust", "canonical-import-location-test")
-            .unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        let requested = [0, 1, 2, 3, 4, 132].into_iter().collect();
-        let cancellation = CancellationToken::new();
-        let check_locations = |store: &AnalyzerStore| {
-            let locations = store
-                .load_rust_import_source_locations(oid, generation, &requested, &cancellation)
-                .unwrap()
-                .unwrap();
-            // The projection carries the path's target token only. An `as`
-            // alias is the name a use declaration binds, not a naming of the
-            // imported item (the Rust Reference, use declarations), so the
-            // selected reference index has no edge to place at it.
-            assert_eq!(locations[&0].target.unwrap().text(&source), "serde");
-            assert_eq!(locations[&1].target.unwrap().text(&source), "Thing");
-            assert!(locations[&2].target.is_none());
-            assert!(!locations[&3].root_owned);
-            assert!(!locations[&4].root_owned);
-            assert_eq!(locations[&132].target.unwrap().text(&source), "Thing");
-            let facts = store.rust_usage_facts(oid, "rust").unwrap();
-            assert_eq!(facts.import_targets, state.rust_usage_facts.import_targets);
-        };
-        check_locations(&store);
-        store.refresh_planner_statistics().unwrap();
-        check_locations(&store);
-        drop(store);
-        let reopened = AnalyzerStore::open_persistent(&db_path).unwrap();
-        check_locations(&reopened);
-        let absent = [1000].into_iter().collect();
-        assert!(
-            reopened
-                .load_rust_import_source_locations(oid, generation, &absent, &cancellation)
-                .unwrap()
-                .is_none()
-        );
-        cancellation.cancel();
-        assert!(
-            reopened
-                .load_rust_import_source_locations(oid, generation, &requested, &cancellation)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn primary_route_only_module_properties_survive_reopen_without_display_links() {
-        use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustDeclarationKind};
-        let source = r#"
-#[cfg(feature = "outer")]
-fn gated() { pub(crate) mod local {} }
-#[cfg(feature = "one")]
-pub mod repeated;
-#[cfg(not(feature = "one"))]
-mod repeated;
-pub(crate) mod inline { mod nested; }
-"#;
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
-        let facts = state.source_facts.as_ref().unwrap();
-        let local = facts
-            .rust_declaration_properties
-            .iter()
-            .find(|property| {
-                if property.kind != RustDeclarationKind::InlineModule {
-                    return false;
-                }
-                let declaration = facts.occurrences.declaration(property.declaration);
-                let name = facts
-                    .occurrences
-                    .occurrence(declaration.name.unwrap())
-                    .range;
-                &source[name.start_byte..name.end_byte] == "local"
-            })
-            .expect("route-only primary module has a canonical source declaration")
-            .clone();
-        assert_eq!(local.visibility, RustVisibility::Crate);
-        assert_eq!(
-            local.cfg_condition,
-            RustCfgCondition::Atom("feature = \"outer\"".into()),
-            "the retained local module carries its enclosing function predicate"
-        );
-        assert!(
-            !state
-                .source_declaration_units
-                .iter()
-                .any(|(id, _)| *id == local.declaration)
-        );
-        assert!(
-            facts
-                .native_declaration_sources
-                .iter()
-                .any(|(_, id)| *id == local.declaration)
-        );
-        let expected = state.rust_usage_facts.module_routes.clone();
-        let local_scope = expected
-            .scopes
-            .iter()
-            .find(|scope| scope.module_name == "local")
-            .unwrap();
-        assert_eq!(local_scope.visibility, local.visibility);
-        assert!(local_scope.resolution_scope.is_some());
-        let oid = oid_for(source.as_bytes());
-        let path = fixture.root().join("primary-module-properties.db");
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        drop(state);
-        drop(store);
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap().module_routes,
-            expected
-        );
-        let persisted = store
-            .read_conn()
-            .unwrap()
-            .query_row(
-                "SELECT property.visibility, property.cfg_condition,
-                    (SELECT COUNT(*) FROM source_declaration_units AS bridge
-                     WHERE bridge.blob_id = property.blob_id
-                       AND bridge.declaration_id = property.declaration_id)
-             FROM source_rust_declaration_properties AS property
-             JOIN blobs ON blobs.id = property.blob_id
-             WHERE blobs.blob_oid = ?1 AND blobs.lang = 'rust' AND property.declaration_id = ?2",
-                params![oid.to_string(), i64::from(local.declaration.get())],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            persisted,
-            (
-                encode_rust_visibility(&local.visibility),
-                encode_rust_cfg_condition(&local.cfg_condition),
-                0
-            )
-        );
-    }
-
-    #[test]
-    fn shared_embedded_module_properties_reopen_with_fifo_routes_and_exact_links() {
-        use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind;
-        use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
-
-        let source = r#"
-macro_rules! discard { ($($tokens:tt)*) => {}; }
-outer! { pub mod first; nested! { pub(crate) mod deep; } }
-discard! { pub mod hidden { mod child; } }
-outer! { mod first; }
-mod primary;
-"#;
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let mut state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
-        let facts = state.source_facts.as_ref().unwrap();
-        let modules = facts
-            .rust_declaration_properties
-            .iter()
-            .filter(|property| {
-                matches!(
-                    property.kind,
-                    RustDeclarationKind::InlineModule | RustDeclarationKind::ExternalModule
-                )
-            })
-            .map(|property| {
-                let declaration = facts.occurrences.declaration(property.declaration);
-                let name = facts.occurrences.occurrence(declaration.name.unwrap());
-                (
-                    source[name.range.start_byte..name.range.end_byte].to_owned(),
-                    property.declaration,
-                    name.provenance,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(modules.len(), 6, "exact module properties: {modules:?}");
-        for (name, id, provenance) in &modules {
-            let links = state
-                .source_declaration_units
-                .iter()
-                .filter(|(declaration, _)| declaration == id)
-                .count();
-            assert_eq!(
-                links,
-                usize::from(!matches!(name.as_str(), "hidden" | "child")),
-                "display admission for {name} / {id:?}"
-            );
-            if name != "primary" {
-                assert_eq!(*provenance, SourceOccurrenceProvenance::Embedded);
-                assert!(
-                    !facts
-                        .native_declaration_sources
-                        .iter()
-                        .any(|(_, declaration)| declaration == id)
-                );
-            }
-        }
-        let first = modules
-            .iter()
-            .filter(|(name, _, _)| name == "first")
-            .map(|(_, id, _)| *id)
-            .collect::<Vec<_>>();
-        assert_eq!(first.len(), 2);
-        assert_ne!(first[0], first[1]);
-        let routes = state.rust_usage_facts.module_routes.clone();
-        assert_eq!(
-            routes
-                .routes
-                .iter()
-                .map(|route| route.module_name.as_str())
-                .collect::<Vec<_>>(),
-            ["primary", "first", "child", "first", "deep"]
-        );
-        let child = routes
-            .routes
-            .iter()
-            .find(|route| route.module_name == "child")
-            .unwrap();
-        assert_eq!(routes.scopes[child.scope].module_name, "hidden");
-        let inventory = state.rust_usage_facts.modules.clone();
-        let canonical = state
-            .source_facts
-            .as_ref()
-            .unwrap()
-            .rust_modules
-            .as_ref()
-            .unwrap()
-            .clone();
-        // The DTOs are consumer views, not writable source authority. Even
-        // replacing whole collections must not change canonical publication.
-        state.rust_usage_facts.modules.clear();
-        state.rust_usage_facts.module_routes.scopes.clear();
-        state.rust_usage_facts.module_routes.routes.clear();
-        let oid = oid_for(source.as_bytes());
-        let path = fixture.root().join("shared-embedded-modules.db");
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        drop(state);
-        drop(store);
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap().modules,
-            inventory
-        );
-        assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap().module_routes,
-            routes
-        );
-        let conn = store.read_conn().unwrap();
-        let root: u32 = conn
-            .query_row(
-                "SELECT root_occurrence_id FROM source_rust_module_manifests
-             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')",
-                [oid.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(root, canonical.root.get());
-        let links = conn.prepare(
-            "SELECT declaration_id, body_occurrence_id, module_name FROM source_rust_module_declarations
-             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-             ORDER BY declaration_id"
-        ).unwrap().query_map([oid.to_string()], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<u32>>(1)?, row.get::<_, String>(2)?)))
-            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        let mut expected_links = canonical
-            .declarations
-            .iter()
-            .map(|row| {
-                (
-                    row.declaration.get(),
-                    row.body.map(|id| id.get()),
-                    row.name.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        expected_links.sort_unstable_by_key(|row| row.0);
-        assert_eq!(links, expected_links);
-        let gates = conn.prepare(
-            "SELECT route_ordinal, gate_ordinal, invocation_occurrence_id FROM source_rust_module_route_gates
-             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-             ORDER BY route_ordinal, gate_ordinal"
-        ).unwrap().query_map([oid.to_string()], |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?, row.get::<_, u32>(2)?)))
-            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        let expected_gates = canonical
-            .routes
-            .iter()
-            .enumerate()
-            .flat_map(|(route, row)| {
-                row.gates
-                    .iter()
-                    .enumerate()
-                    .map(move |(gate, id)| (route, gate, id.get()))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(gates, expected_gates);
-        drop(conn);
-        for (name, id, _) in modules {
-            let links: i64 = store
-                .read_conn()
-                .unwrap()
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM source_declaration_units AS bridge
-                         WHERE bridge.blob_id = property.blob_id
-                           AND bridge.declaration_id = property.declaration_id)
-                     FROM source_rust_declaration_properties AS property
-                     JOIN blobs ON blobs.id = property.blob_id
-                     WHERE blobs.blob_oid = ?1 AND blobs.lang = 'rust'
-                       AND property.declaration_id = ?2",
-                    params![oid.to_string(), i64::from(id.get())],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                links,
-                i64::from(!matches!(name.as_str(), "hidden" | "child"))
-            );
-        }
-    }
-
-    #[test]
-    fn canonical_module_publication_requires_source_facts_and_repairs_missing_witness() {
-        let source = "#[macro_use] mod inline { pub mod leaf; } outer! { mod gated; }";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
-        let expected = state.rust_usage_facts.clone();
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store.current_generation("rust").unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        let mut missing = state.clone();
-        missing.source_facts.as_mut().unwrap().rust_modules = None;
-        let error = store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &missing)
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("canonical module source facts"),
-            "{error}"
-        );
-        assert_eq!(store.rust_usage_facts(oid, "rust").unwrap(), expected);
-        store.delete_rust_facts_for_test("rust");
-        assert!(
-            store
-                .blobs_with_rust_facts("rust", generation, &[oid])
-                .unwrap()
-                .is_empty()
-        );
-        assert!(store.rust_usage_facts(oid, "rust").is_err());
-        {
-            let conn = store.read_conn().unwrap();
-            assert!(read_rust_usage_facts_bulk(&conn, "rust", &[oid.to_string()]).is_err());
-        }
-        assert!(
-            store
-                .rust_module_route_facts_while("rust", generation, &[oid], &|| true)
-                .unwrap()
-                .unwrap()
-                .is_empty()
-        );
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        assert_eq!(store.rust_usage_facts(oid, "rust").unwrap(), expected);
-        assert_eq!(
-            store
-                .blobs_with_rust_facts("rust", generation, &[oid])
-                .unwrap(),
-            [oid].into_iter().collect()
-        );
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "9fba40a6cb46: stale Rust macro DTOs overrode canonical declaration identities and route ranges"
-    )]
-    #[test]
-    fn canonical_rust_macro_properties_ignore_stale_dto_and_reopen_exact_links() {
-        let source = "#[macro_export]\nmacro_rules! public_macro { () => {}; }\nmacro_rules! private_macro { () => {}; }\nmod nested { macro_rules! local_macro { () => {}; } }\n";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let mut state = parse_state(&RustAdapter, &file);
-        let expected = state.rust_usage_facts.module_routes.item_macros.clone();
-        assert_eq!(expected.len(), 3);
-        assert!(expected[0].exported);
-        assert!(!expected[1].exported);
-        assert_ne!(expected[0].declaration, expected[1].declaration);
-        assert_eq!(expected[0].scope_start, expected[1].scope_start);
-        assert!(expected[2].scope_start > expected[1].scope_start);
-        assert!(expected[2].scope_end < expected[1].scope_end);
-        let source_facts = state.source_facts.as_ref().unwrap();
-        for definition in &expected {
-            let declaration = source_facts.occurrences.declaration(definition.declaration);
-            let declaration_occurrence =
-                source_facts.occurrences.occurrence(declaration.occurrence);
-            let macro_fact = source_facts
-                .rust_items
-                .macro_definitions
-                .iter()
-                .find(|fact| fact.declaration == definition.declaration)
-                .unwrap();
-            let context = source_facts.occurrences.occurrence(macro_fact.context);
-            assert_eq!(
-                definition.visible_after,
-                declaration_occurrence.range.end_byte
-            );
-            assert_eq!(definition.scope_start, context.range.start_byte);
-            assert_eq!(definition.scope_end, context.range.end_byte);
-        }
-        for definition in &mut state.rust_usage_facts.module_routes.item_macros {
-            definition.exported = !definition.exported;
-            definition.visible_after = usize::MAX;
-            definition.scope_start = usize::MAX;
-            definition.scope_end = usize::MAX;
-        }
-        let oid = oid_for(source.as_bytes());
-        let path = fixture.root().join("macro-declarations.db");
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        let mut invalid = state.clone();
-        invalid.rust_usage_facts.module_routes.item_macros[0].declaration =
-            brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId::new(u32::MAX);
-        assert!(
-            store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &invalid)
-                .is_err()
-        );
-        assert_eq!(
-            store
-                .read_conn()
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-                    [oid.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            0,
-            "invalid macro identity must roll back the entire publication"
-        );
-        drop(invalid);
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        drop(state);
-        drop(store);
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        assert_eq!(
-            store
-                .rust_usage_facts(oid, "rust")
-                .unwrap()
-                .module_routes
-                .item_macros,
-            expected
-        );
-        let generation = store.current_generation("rust").unwrap();
-        let routes = store
-            .rust_module_route_facts_while("rust", generation, &[oid], &|| true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(routes[&oid].item_macros, expected);
-        let conn = store.read_conn().unwrap();
-        let columns: Vec<String> = conn
-            .prepare("PRAGMA table_info(source_rust_item_macros)")
-            .unwrap()
-            .query_map([], |row| row.get(1))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(
-            !columns.iter().any(|column| matches!(
-                column.as_str(),
-                "exported" | "visible_after" | "scope_start" | "scope_end"
-            )),
-            "{columns:?}"
-        );
-        drop(conn);
-        // Simulate a legacy or damaged publication without bypassing either
-        // typed reader: NULL is unavailable, never a private/non-macro result.
-        store.conn.execute(|conn| {
-            conn.execute_batch(
-                "DROP TRIGGER source_rust_declaration_properties_no_update_after_seal;
-                 UPDATE source_rust_declaration_properties SET declaration_kind = NULL, macro_exported = NULL;",
-            ).unwrap();
-        });
-        assert!(store.rust_usage_facts(oid, "rust").is_err());
-        let generation = store.current_generation("rust").unwrap();
-        assert!(
-            store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
-                .is_err()
-        );
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "9fba40a6cb46: persisted macro scope trusted stale context instead of canonical source identity"
-    )]
-    #[test]
-    fn canonical_rust_macro_scope_requires_source_context_and_repairs() {
-        let source = "mod nested { macro_rules! local_macro { () => {}; } }\n";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
-        let expected = state.rust_usage_facts.module_routes.item_macros.clone();
-        assert_eq!(expected.len(), 1);
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        store.conn.execute(|conn| {
-            conn.execute_batch(
-                "DROP TRIGGER source_rust_macro_definitions_no_update_after_seal;
-                 UPDATE source_rust_macro_definitions SET context_occurrence_id = NULL;",
-            )
-            .unwrap();
-        });
-        assert!(store.rust_usage_facts(oid, "rust").is_err());
-        let generation = store.current_generation("rust").unwrap();
-        assert!(
-            store
-                .rust_module_route_facts_while("rust", generation, &[oid], &|| true)
-                .is_err()
-        );
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        assert_eq!(
-            store
-                .rust_usage_facts(oid, "rust")
-                .unwrap()
-                .module_routes
-                .item_macros,
-            expected
-        );
-    }
-
-    #[test]
-    fn canonical_rust_declaration_properties_reopen_preserve_alternatives_and_fail_closed() {
-        use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustDeclarationBoundary};
-        let source = r#"
-pub struct Unit;
-#[non_exhaustive]
-pub struct Restricted(pub usize, pub(crate) usize);
-pub struct Named { pub field: usize }
-pub trait Owner { fn defaulted() {} }
-impl Unit { pub fn inherent() {} }
-pub fn outer() { const LOCAL: u8 = 0; }
-macro_rules! replay { ($($item:item)*) => { $($item)* }; }
-replay! {
-    #[cfg(feature = "x")]
-    pub fn repeated() {}
-    #[cfg(not(feature = "x"))]
-    pub fn repeated() {}
-}
-"#;
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
-        let facts = state.source_facts.as_ref().unwrap();
-        let local_property = facts
-            .rust_declaration_properties
-            .iter()
-            .find(|property| {
-                property.nearest_declaration_boundary
-                    == RustDeclarationBoundary::LocalBlockOrFunction
-            })
-            .expect("the native-only local constant has a source property")
-            .clone();
-        let mut expected = state
-            .source_declaration_units
-            .iter()
-            .map(|(id, unit)| {
-                let property = facts
-                    .rust_declaration_properties
-                    .iter()
-                    .find(|property| property.declaration == *id)
-                    .unwrap();
-                (unit.clone(), property.clone())
-            })
-            .collect::<Vec<_>>();
-        expected.sort_by_key(|(_, property)| property.declaration.get());
-        let oid = oid_for(source.as_bytes());
-        let path = fixture.root().join("declaration-properties.db");
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        let generation = store
-            .ensure_language_epoch_value("rust", "declaration-property-test")
-            .unwrap();
-        let mut invalid = state.clone();
-        let invalid_property = &mut invalid
-            .source_facts
-            .as_mut()
-            .unwrap()
-            .rust_declaration_properties[0];
-        invalid_property.has_impl_or_trait_ancestor = false;
-        invalid_property.nearest_declaration_boundary = RustDeclarationBoundary::Impl;
-        assert!(
-            store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &invalid)
-                .is_err()
-        );
-        assert_eq!(
-            store
-                .read_conn()
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-                    [oid.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            0,
-            "invalid ancestry must roll back the complete blob"
-        );
-        drop(invalid);
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        drop(state);
-        drop(store);
-
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        let read = || {
-            store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
-                .unwrap()
-                .unwrap()
-        };
-        let actual = read();
-        assert_eq!(actual, expected);
-        // The display declaration walk does not admit function-body items.
-        // Their canonical native source rows still survive ordinary publication.
-        let local_boundary = store
-            .read_conn()
-            .unwrap()
-            .query_row(
-                "SELECT property.has_impl_or_trait_ancestor, property.nearest_declaration_boundary
-             FROM source_rust_declaration_properties AS property
-             JOIN blobs ON blobs.id = property.blob_id
-             WHERE blobs.blob_oid = ?1 AND blobs.lang = 'rust' AND property.declaration_id = ?2",
-                params![oid.to_string(), i64::from(local_property.declaration.get())],
-                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .unwrap();
-        assert_eq!(local_boundary, (false, 1));
-        {
-            let conn = store.read_conn().unwrap();
-            let checks = std::cell::Cell::new(0);
-            assert!(
-                read_unit_rows_while(
-                    &conn,
-                    &oid.to_string(),
-                    "rust",
-                    &RustAdapter,
-                    &file,
-                    &|| {
-                        checks.set(checks.get() + 1);
-                        true
-                    }
-                )
-                .unwrap()
-                .is_some()
-            );
-            // Exercise cancellation throughout raw rows, FQ segments, and
-            // mounted CodeUnit construction, including the final checkpoint.
-            for stop in 1..=checks.get() {
-                let step = std::cell::Cell::new(0);
-                assert!(
-                    read_unit_rows_while(
-                        &conn,
-                        &oid.to_string(),
-                        "rust",
-                        &RustAdapter,
-                        &file,
-                        &|| {
-                            step.set(step.get() + 1);
-                            step.get() < stop
-                        }
-                    )
-                    .unwrap()
-                    .is_none(),
-                    "unit hydration ignored cancellation at {stop}"
-                );
-            }
-        }
-        let repeated: Vec<_> = actual
-            .iter()
-            .filter(|(unit, _)| unit.identifier() == "repeated")
-            .collect();
-        assert_eq!(repeated.len(), 2);
-        assert_eq!(repeated[0].0, repeated[1].0);
-        assert_ne!(repeated[0].1.declaration, repeated[1].1.declaration);
-        assert!(matches!(
-            repeated[0].1.cfg_condition,
-            RustCfgCondition::Atom(_)
-        ));
-        assert!(
-            repeated[0]
-                .1
-                .cfg_condition
-                .proven_mutually_exclusive(&repeated[1].1.cfg_condition)
-        );
-        let property = |name| {
-            &actual
-                .iter()
-                .find(|(unit, _)| unit.identifier() == name)
-                .unwrap_or_else(|| panic!("missing property for {name} in {actual:?}"))
-                .1
-        };
-        for (name, ancestor, boundary) in [
-            ("Unit", false, RustDeclarationBoundary::ModuleOrFile),
-            ("defaulted", true, RustDeclarationBoundary::Trait),
-            ("inherent", true, RustDeclarationBoundary::Impl),
-            ("repeated", false, RustDeclarationBoundary::ModuleOrFile),
-        ] {
-            assert_eq!(
-                property(name).has_impl_or_trait_ancestor,
-                ancestor,
-                "{name}"
-            );
-            assert_eq!(
-                property(name).nearest_declaration_boundary,
-                boundary,
-                "{name}"
-            );
-        }
-        assert!(
-            property("Unit")
-                .value_constructor
-                .as_ref()
-                .unwrap()
-                .field_visibilities
-                .is_empty()
-        );
-        assert!(property("Named").value_constructor.is_none());
-        let restricted = property("Restricted").value_constructor.as_ref().unwrap();
-        assert!(restricted.non_exhaustive);
-        assert_eq!(
-            restricted.field_visibilities,
-            [RustVisibility::Public, RustVisibility::Crate]
-        );
-        let remounted = store
-            .rust_declaration_properties(
-                oid,
-                generation,
-                &RustAdapter,
-                &fixture.file("src/copied.rs"),
-                &|| true,
-            )
-            .unwrap()
-            .unwrap();
-        for ((original_unit, original), (mounted_unit, mounted)) in actual.iter().zip(&remounted) {
-            assert_eq!(original, mounted);
-            assert_ne!(original_unit.source(), mounted_unit.source());
-        }
-        assert!(
-            store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| false)
-                .unwrap()
-                .is_none()
-        );
-        let steps = std::cell::Cell::new(0);
-        assert!(
-            store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| {
-                    steps.set(steps.get() + 1);
-                    steps.get() < 3
-                })
-                .unwrap()
-                .is_none()
-        );
-        let damaged_declaration = i64::from(property("Unit").declaration.get());
-        store.conn.execute(move |conn| {
-            conn.execute_batch(
-                "DROP TRIGGER source_rust_declaration_properties_no_delete_after_seal",
-            )
-            .unwrap();
-            conn.execute(
-                "DELETE FROM source_rust_declaration_properties WHERE declaration_id = ?1",
-                [damaged_declaration],
-            )
-            .unwrap();
-        });
-        assert!(
-            store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
-                .is_err()
-        );
-        let repaired = parse_state(&RustAdapter, &file);
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &repaired)
-            .unwrap();
-        assert_eq!(read(), expected);
-        store.conn.execute(|conn| {
-            conn.execute_batch(
-                "DROP TRIGGER source_rust_declaration_properties_no_update_after_seal",
-            )
-            .unwrap();
-        });
-        for column in ["has_impl_or_trait_ancestor", "nearest_declaration_boundary"] {
-            store.conn.execute(move |conn| {
-                conn.execute(
-                    &format!("UPDATE source_rust_declaration_properties SET {column} = NULL"),
-                    [],
-                )
-                .unwrap();
-            });
-            assert!(
-                store
-                    .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
-                    .is_err(),
-                "legacy NULL {column} must remain unavailable"
-            );
-            store
-                .write_parsed_blob(oid, "rust", &RustAdapter, &repaired)
-                .unwrap();
-            assert_eq!(read(), expected);
-        }
-        store
-            .ensure_language_epoch_value("rust", "new-declaration-property-test")
-            .unwrap();
-        assert!(
-            store
-                .rust_declaration_properties(oid, generation, &RustAdapter, &file, &|| true)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn embedded_rust_declaration_identities_survive_store_reopen() {
-        let source = "macro_rules! replay { ($($item:item)*) => { $($item)* }; }\nreplay! { pub struct Item { pub field: usize } pub fn repeated() {} pub fn repeated() {} }\n";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
-        let facts = state.source_facts.as_ref().unwrap();
-        let expected = state.source_declaration_units.iter()
-            .filter_map(|(id, unit)| {
-                let declaration = facts.occurrences.declaration(*id);
-                let occurrence = facts.occurrences.occurrence(declaration.occurrence);
-                (occurrence.provenance == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded)
-                    .then(|| (i64::from(id.get()), unit.identifier().to_owned(),
-                        occurrence.range.start_byte as i64, occurrence.range.end_byte as i64))
-            }).collect::<Vec<_>>();
-        assert_eq!(expected.len(), 4);
-        let repeated = expected
-            .iter()
-            .filter(|row| row.1 == "repeated")
-            .collect::<Vec<_>>();
-        assert_eq!(repeated.len(), 2);
-        assert_ne!(repeated[0].0, repeated[1].0);
-        assert_ne!(repeated[0].2, repeated[1].2);
-        let oid = oid_for(source.as_bytes());
-        let path = fixture.root().join("embedded-declarations.db");
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        drop(state);
-        drop(store);
-
-        let reopened = AnalyzerStore::open_persistent(&path).unwrap();
-        let conn = reopened.read_conn().unwrap();
-        let actual = conn.prepare(
-            "SELECT declaration.declaration_id, unit.identifier, occurrence.start_byte, occurrence.end_byte
-             FROM blobs AS blob
-             JOIN source_declarations AS declaration ON declaration.blob_id = blob.id
-             JOIN source_occurrences AS occurrence
-               ON occurrence.blob_id = declaration.blob_id
-              AND occurrence.occurrence_id = declaration.occurrence_id
-             JOIN source_declaration_units AS link
-               ON link.blob_id = declaration.blob_id
-              AND link.declaration_id = declaration.declaration_id
-             JOIN code_units AS unit ON unit.blob_id = link.blob_id AND unit.unit_key = link.unit_key
-             WHERE blob.blob_oid = ?1 AND blob.lang = 'rust' AND occurrence.provenance = 'embedded'
-             ORDER BY declaration.declaration_id"
-        ).unwrap().query_map([oid.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
-            .unwrap().collect::<rusqlite::Result<Vec<(i64, String, i64, i64)>>>().unwrap();
-        assert_eq!(actual, expected);
-    }
-
-    /// The items of a same-file, arguments-only passthrough invocation are
-    /// declared once, against the identity declaration replay gave them, and
-    /// bridged to a native definition site. Their access authority names the
-    /// module that holds the invocation: replay parses the invocation's
-    /// arguments as their own tree, whose root is a file-root context whose
-    /// parent is the invocation's context, and that root is not a module. The
-    /// projection continues through it to the enclosing module, which is a
-    /// primary context, so the primary-module requirement holds for an
-    /// embedded declaration exactly as it does for a primary one.
-    #[test]
-    fn bridged_macro_items_take_the_module_that_holds_their_invocation() {
-        let source = "macro_rules! replay { ($($item:item)*) => { $($item)* }; }\npub mod inner {\n    replay! { pub fn nested() {} }\n}\nreplay! { pub fn top() {} }\n";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
-        let oid = oid_for(source.as_bytes());
-        let path = fixture.root().join("bridged-macro-items.db");
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        drop(state);
-        let conn = store.read_conn().unwrap();
-        let actual = conn
-            .prepare(
-                "SELECT unit.identifier, occurrence.provenance, module_unit.identifier
-                 FROM blobs AS blob
-                 JOIN resolution_rust_declaration_authorities AS authority
-                   ON authority.blob_id = blob.id
-                 JOIN source_native_declaration_bridges AS bridge
-                   ON bridge.blob_id = authority.blob_id
-                  AND bridge.declaration_id = authority.declaration
-                 JOIN source_declarations AS declaration
-                   ON declaration.blob_id = authority.blob_id
-                  AND declaration.declaration_id = authority.declaration
-                 JOIN source_occurrences AS occurrence
-                   ON occurrence.blob_id = declaration.blob_id
-                  AND occurrence.occurrence_id = declaration.occurrence_id
-                 JOIN source_declaration_units AS link
-                   ON link.blob_id = authority.blob_id
-                  AND link.declaration_id = authority.declaration
-                 JOIN code_units AS unit
-                   ON unit.blob_id = link.blob_id AND unit.unit_key = link.unit_key
-                 LEFT JOIN source_declaration_units AS module_link
-                   ON module_link.blob_id = authority.blob_id
-                  AND module_link.declaration_id = authority.module_declaration
-                 LEFT JOIN code_units AS module_unit
-                   ON module_unit.blob_id = module_link.blob_id
-                  AND module_unit.unit_key = module_link.unit_key
-                 WHERE blob.blob_oid = ?1 AND blob.lang = 'rust'
-                   AND unit.identifier IN ('nested', 'top')
-                 ORDER BY unit.identifier",
-            )
-            .unwrap()
-            .query_map([oid.to_string()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<(String, String, Option<String>)>>>()
-            .unwrap();
-        assert_eq!(
-            actual,
-            [
-                (
-                    "nested".to_owned(),
-                    "embedded".to_owned(),
-                    Some("inner".to_owned())
-                ),
-                ("top".to_owned(), "embedded".to_owned(), None),
-            ]
-        );
-    }
-
-    #[test]
-    fn raw_embedded_imports_survive_store_reopen_without_projection_membership() {
-        use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
-
-        let source = r#"
-wrap! {
-    use crate::{First as Alias, Other};
-    mod inside {
-        use crate::Thing as Nested;
-        extern crate dep as renamed;
-    }
-}
-helper::wrap! {
-    use crate::{Hidden, HiddenOther};
-    extern crate rejected as hidden_dep;
-}
-"#;
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
-        let source_facts = state.source_facts.as_ref().unwrap();
-        let expected_imports = source_facts.imports.clone();
-        let expected_generic = state.imports.clone();
-        let expected_generic_ids = source_facts
-            .generic_imports
-            .iter()
-            .map(|id| i64::from(id.get()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            source_facts
-                .generic_imports
-                .iter()
-                .map(|id| expected_imports[id.index()].identifier.as_deref())
-                .collect::<Vec<_>>(),
-            [Some("First"), Some("Other")]
-        );
-        let embedded_import_indices = expected_imports
-            .iter()
-            .enumerate()
-            .filter_map(|(index, import)| {
-                (source_facts
-                    .occurrences
-                    .occurrence(import.declaration)
-                    .provenance
-                    == SourceOccurrenceProvenance::Embedded)
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(embedded_import_indices.len(), expected_imports.len());
-        let source_only_import_indices = embedded_import_indices
-            .iter()
-            .copied()
-            .filter(|index| !expected_generic_ids.contains(&i64::try_from(*index).unwrap()))
-            .collect::<Vec<_>>();
-        assert_eq!(source_only_import_indices.len(), 5);
-        let source_only = |identifier: &str| {
-            source_only_import_indices
-                .iter()
-                .map(|index| &expected_imports[*index])
-                .find(|import| import.identifier.as_deref() == Some(identifier))
-                .unwrap_or_else(|| panic!("source-only import {identifier}"))
-        };
-        let nested = source_only("Thing");
-        assert_eq!(nested.alias.as_deref(), Some("Nested"));
-        let dependency = source_only("dep");
-        assert_eq!(dependency.alias.as_deref(), Some("renamed"));
-        assert_eq!(
-            dependency.path.as_ref().unwrap().kind,
-            Some(StructuredImportPathKind::ExternCrate)
-        );
-        let hidden = source_only("Hidden");
-        let hidden_other = source_only("HiddenOther");
-        assert_eq!(hidden.alias, None);
-        assert_eq!(hidden_other.alias, None);
-        assert_eq!(hidden.declaration, hidden_other.declaration);
-        let rejected = source_only("rejected");
-        assert_eq!(rejected.alias.as_deref(), Some("hidden_dep"));
-        assert_eq!(
-            rejected.path.as_ref().unwrap().kind,
-            Some(StructuredImportPathKind::ExternCrate)
-        );
-
-        let expected_rows = expected_imports
-            .iter()
-            .enumerate()
-            .map(|(index, import)| {
-                (
-                    i64::try_from(index).unwrap(),
-                    import.statement.clone(),
-                    i64::from(import.is_wildcard),
-                    i64::from(import.is_global),
-                    import.identifier.clone(),
-                    import.alias.clone(),
-                    import
-                        .path
-                        .as_ref()
-                        .and_then(|path| path.kind)
-                        .map(|kind| kind.persist_tag().to_owned()),
-                    i64::from(import.declaration.get()),
-                    import.target.map(|id| i64::from(id.get())),
-                    import.alias_occurrence.map(|id| i64::from(id.get())),
-                )
-            })
-            .collect::<Vec<_>>();
-        let expected_raw_provenance = embedded_import_indices
-            .iter()
-            .map(|index| {
-                let import = &expected_imports[*index];
-                (
-                    i64::try_from(*index).unwrap(),
-                    "embedded".to_string(),
-                    import.target.map(|id| {
-                        assert_eq!(
-                            source_facts.occurrences.occurrence(id).provenance,
-                            SourceOccurrenceProvenance::Embedded
-                        );
-                        "embedded".to_string()
-                    }),
-                    import.alias_occurrence.map(|id| {
-                        assert_eq!(
-                            source_facts.occurrences.occurrence(id).provenance,
-                            SourceOccurrenceProvenance::Embedded
-                        );
-                        "embedded".to_string()
-                    }),
-                )
-            })
-            .collect::<Vec<_>>();
-        let expected_usage = state.rust_usage_facts.clone();
-        let oid = oid_for(source.as_bytes());
-        let path = fixture.root().join("raw-embedded-imports.db");
-        let store = AnalyzerStore::open_persistent(&path).unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        drop(state);
-        drop(store);
-
-        let reopened = AnalyzerStore::open_persistent(&path).unwrap();
-        let conn = reopened.read_conn().unwrap();
-        let actual_rows = conn
-            .prepare(
-                "SELECT import_id, statement, is_wildcard, is_global, identifier, alias,
-                        path_kind, declaration_occurrence_id, target_occurrence_id,
-                        alias_occurrence_id
-                 FROM source_imports
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-                 ORDER BY import_id",
-            )
-            .unwrap()
-            .query_map([oid.to_string()], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(actual_rows, expected_rows);
-
-        let actual_raw_provenance = conn
-            .prepare(
-                "SELECT import.import_id, declaration.provenance,
-                        target.provenance, alias.provenance
-                 FROM source_imports AS import
-                 JOIN source_occurrences AS declaration
-                   ON declaration.blob_id = import.blob_id
-                  AND declaration.occurrence_id = import.declaration_occurrence_id
-                 LEFT JOIN source_occurrences AS target
-                   ON target.blob_id = import.blob_id
-                  AND target.occurrence_id = import.target_occurrence_id
-                 LEFT JOIN source_occurrences AS alias
-                   ON alias.blob_id = import.blob_id
-                  AND alias.occurrence_id = import.alias_occurrence_id
-                 WHERE import.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-                   AND declaration.provenance = 'embedded'
-                 ORDER BY import.import_id",
-            )
-            .unwrap()
-            .query_map([oid.to_string()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(actual_raw_provenance, expected_raw_provenance);
-
-        let persisted_generic_ids = conn
-            .prepare(
-                "SELECT source_import_id FROM import_statements
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-                 ORDER BY ordinal",
-            )
-            .unwrap()
-            .query_map([oid.to_string()], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(persisted_generic_ids, expected_generic_ids);
-        let persisted_target_ids = conn
-            .prepare(
-                "SELECT source_import_id FROM rust_import_targets
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-                   AND source_import_id IS NOT NULL
-                 ORDER BY source_import_id",
-            )
-            .unwrap()
-            .query_map([oid.to_string()], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        let persisted_export_ids = conn
-            .prepare(
-                "SELECT source_import_id FROM rust_exports
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-                   AND source_import_id IS NOT NULL
-                 ORDER BY source_import_id",
-            )
-            .unwrap()
-            .query_map([oid.to_string()], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(persisted_target_ids.is_empty());
-        assert!(persisted_export_ids.is_empty());
-        drop(conn);
-        assert_eq!(
-            read_import_infos(&reopened.read_conn().unwrap(), &oid.to_string(), "rust").unwrap(),
-            expected_generic
-        );
-        assert_eq!(
-            reopened.rust_usage_facts(oid, "rust").unwrap(),
-            expected_usage
-        );
-    }
-
-    #[test]
-    fn canonical_import_local_scope_is_preserved_and_publication_validated() {
-        let source = "fn local() { use crate::Thing; }\n";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("rust", "missing-import-scope")
-            .unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        let facts = store.rust_usage_facts(oid, "rust").unwrap();
-        assert_eq!(facts.import_targets, state.rust_usage_facts.import_targets);
-        assert_eq!(facts.import_targets.len(), 1);
-        assert!(facts.import_targets[0].local_extent.is_some());
-        let locations = store
-            .load_rust_import_source_locations(
-                oid,
-                generation,
-                &[0].into_iter().collect(),
-                &CancellationToken::new(),
-            )
-            .unwrap()
-            .unwrap();
-        assert!(!locations[&0].root_owned);
-        assert_eq!(locations[&0].target.unwrap().text(source), "Thing");
-
-        // Reopen only inside this rolled-back fixture transaction to exercise
-        // the publication boundary with otherwise valid production rows.
-        let mut conn = store.conn.lock().unwrap();
-        let tx = conn.transaction().unwrap();
-        tx.execute_batch(
-            "DROP TRIGGER source_fact_manifests_no_reopen;
-             UPDATE source_fact_manifests SET publication_state = 'building';",
-        )
-        .unwrap();
-        let blob_id: i64 = tx
-            .query_row(
-                "SELECT blob_id FROM source_rust_import_contexts",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let error = tx
-            .execute(
-                "UPDATE source_rust_import_contexts SET local_scope_start_byte = NULL
-                 WHERE blob_id = ?1",
-                [blob_id],
-            )
-            .expect_err("a present local scope requires its inline span");
-        assert!(
-            error.to_string().contains("CHECK constraint failed"),
-            "{error}"
-        );
-        assert!(
-            error.to_string().contains("local_scope_start_byte"),
-            "{error}"
-        );
-        tx.rollback().unwrap();
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "440ca895ccfb: missing canonical Rust import segments were accepted as complete authority"
-    )]
-    #[test]
-    fn missing_canonical_import_segments_fail_and_republication_recovers() {
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", "use crate::model::Thing as Local;\n")
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
-        let oid = oid_for(b"use crate::model::Thing as Local;\n");
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        {
-            // Deliberate damaged-cache input, impossible through the sealed writer.
-            let conn = store.conn.lock().unwrap();
-            conn.execute_batch("DROP TRIGGER source_import_segments_no_delete_after_seal")
-                .unwrap();
-            conn.execute("DELETE FROM source_import_segments", [])
-                .unwrap();
-        }
-        let error = store.rust_usage_facts(oid, "rust").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("segments disagree with lookup header"),
-            "{error}"
-        );
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap(),
-            state.rust_usage_facts
-        );
-    }
-
-    #[test]
-    fn canonical_import_properties_ignore_stale_dtos_and_store_once() {
-        let source = "pub use crate::model::Public as Exported;\nfn local() { use crate::LocalOnly; mod inner { use crate::Inside; } }\nextern crate serde as serialization;\nmod nested { use crate::model::{Thing as Local, *}; }\n";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", source)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let mut state = parse_state(&RustAdapter, &file);
-        let expected = state.imports.clone();
-        let source_facts = state
-            .source_facts
-            .as_ref()
-            .expect("Rust producer source facts");
-        let expected_source_imports = source_facts.imports.clone();
-        let expected_generic_imports = source_facts.generic_imports.clone();
-        let expected_import_contexts = source_facts.rust_import_contexts.clone();
-        let expected_rust_facts = state.rust_usage_facts.clone();
-        assert_eq!(expected.len(), 4);
-        assert_eq!(expected_source_imports.len(), 6);
-        assert_eq!(expected_generic_imports.len(), expected.len());
-        assert_eq!(expected_import_contexts.len(), 5);
-        assert!(
-            expected
-                .iter()
-                .any(|import| !import.path.as_ref().unwrap().lexical_scopes.is_empty())
-        );
-        // Consumer DTO ranges and duplicated semantic fields are no longer
-        // publication inputs. Deliberately make them unusable while preserving
-        // the producer's exact source-import ids and owner extensions.
-        for import in &mut state.imports {
-            import.raw_snippet = "stale display statement".to_string();
-            import.is_wildcard = !import.is_wildcard;
-            import.is_global = !import.is_global;
-            import.identifier = Some("stale_identifier".to_string());
-            import.alias = Some("stale_alias".to_string());
-            let path = import.path.as_mut().unwrap();
-            path.declaration_start_byte = usize::MAX;
-            path.kind = Some(StructuredImportPathKind::ExternCrate);
-            path.segments = vec!["stale".to_string()];
-            path.lexical_prefixes = vec!["stale_prefix".to_string()];
-            path.lexical_scopes.clear();
-            import.binder_span = None;
-        }
-        for target in &mut state.rust_usage_facts.import_targets {
-            target.native_scope = None;
-            target.module_path = vec!["stale_module".to_string()];
-            target.bound_name = Some("stale_bound".to_string());
-            target.imported_name = Some("stale_imported".to_string());
-            target.is_glob = !target.is_glob;
-            target.leading_absolute = !target.leading_absolute;
-            target.is_extern_crate = !target.is_extern_crate;
-            target.owner_module = "stale_owner".to_string();
-            target.owner_start = usize::MAX;
-            target.owner_end = usize::MAX;
-            target.local_extent = Some((usize::MAX, usize::MAX));
-            target.visibility = RustVisibility::InPath(vec!["stale".to_string()]);
-            target.cfg_condition =
-                brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Unknown;
-        }
-        for export in &mut state.rust_usage_facts.exports {
-            export.exported_name = Some("stale_exported".to_string());
-            export.source_path = "stale_source".to_string();
-            export.imported_name = Some("stale_imported".to_string());
-            export.is_glob = !export.is_glob;
-        }
-        let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &state)
-            .unwrap();
-        let conn = store.read_conn().unwrap();
-        assert_eq!(
-            read_import_infos(&conn, &oid.to_string(), "rust").unwrap(),
-            expected
-        );
-        drop(conn);
-        assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap(),
-            expected_rust_facts,
-            "Rust projections are rehydrated from canonical source-import properties"
-        );
-
-        let conn = store.read_conn().unwrap();
-        let blob_id: i64 = conn
-            .query_row(
-                "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-                [oid.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let (generic_rows, stale_generic_rows): (i64, i64) = conn
-            .query_row(
-                "SELECT count(*), count(*) FILTER (WHERE source_import_id IS NOT NULL
-                    AND statement IS NULL AND is_wildcard IS NULL AND is_global IS NULL
-                    AND identifier IS NULL AND alias IS NULL AND path_kind IS NULL
-                    AND declaration_start_byte IS NULL AND binder_start IS NULL
-                    AND binder_end IS NULL)
-                 FROM import_statements WHERE blob_id = ?1",
-                [blob_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(generic_rows, expected.len() as i64);
-        assert_eq!(stale_generic_rows, generic_rows);
-        let generic_source_ids = conn
-            .prepare(
-                "SELECT source_import_id FROM import_statements
-                 WHERE blob_id = ?1 ORDER BY ordinal",
-            )
-            .unwrap()
-            .query_map([blob_id], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            generic_source_ids,
-            expected_generic_imports
-                .iter()
-                .map(|id| i64::from(id.get()))
-                .collect::<Vec<_>>()
-        );
-        let canonical_rows: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM source_imports WHERE blob_id = ?1",
-                [blob_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(canonical_rows, expected_source_imports.len() as i64);
-        let stored_context_count: i64 = conn
-            .query_row(
-                "SELECT rust_import_context_count FROM source_fact_manifests WHERE blob_id = ?1",
-                [blob_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored_context_count, expected_import_contexts.len() as i64);
-
-        let mut expected_context_rows = expected_import_contexts
-            .iter()
-            .map(|context| {
-                (
-                    i64::from(context.declaration.get()),
-                    context.owner_module.clone(),
-                    context.owner_scope.map(|id| i64::from(id.get())),
-                    context.local_scope.map(|id| i64::from(id.get())),
-                    encode_rust_visibility(&context.visibility),
-                    encode_rust_cfg_condition(&context.cfg_condition),
-                )
-            })
-            .collect::<Vec<_>>();
-        expected_context_rows.sort_by_key(|row| row.0);
-        let actual_context_rows = conn
-            .prepare(
-                "SELECT declaration_occurrence_id, owner_module,
-                        owner_scope_occurrence_id, local_scope_occurrence_id,
-                        visibility, cfg_condition
-                 FROM source_rust_import_contexts
-                 WHERE blob_id = ?1 ORDER BY declaration_occurrence_id",
-            )
-            .unwrap()
-            .query_map([blob_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<(i64, String, Option<i64>, Option<i64>, String, String)>>>();
-        assert_eq!(actual_context_rows.unwrap(), expected_context_rows);
-        let local_declaration = expected_source_imports
-            .iter()
-            .find(|import| import.statement.contains("use crate::LocalOnly"))
-            .expect("local import source fact")
-            .declaration;
-        let root_declaration = expected_source_imports
-            .iter()
-            .find(|import| import.statement.contains("use crate::model::Public"))
-            .expect("root import source fact")
-            .declaration;
-        let inner_declaration = expected_source_imports
-            .iter()
-            .find(|import| import.statement.contains("use crate::Inside"))
-            .expect("function-nested module import source fact")
-            .declaration;
-        let bounds = conn
-            .prepare(
-                "SELECT context.declaration_occurrence_id,
-                        declaration.start_byte, declaration.end_byte,
-                        owner.start_byte, owner.end_byte,
-                        local.start_byte, local.end_byte
-                 FROM source_rust_import_contexts AS context
-                 JOIN source_occurrences AS declaration
-                   ON declaration.blob_id = context.blob_id
-                  AND declaration.occurrence_id = context.declaration_occurrence_id
-                 LEFT JOIN source_occurrences AS owner
-                   ON owner.blob_id = context.blob_id
-                  AND owner.occurrence_id = context.owner_scope_occurrence_id
-                 LEFT JOIN source_occurrences AS local
-                   ON local.blob_id = context.blob_id
-                  AND local.occurrence_id = context.local_scope_occurrence_id
-                 WHERE context.blob_id = ?1
-                   AND context.declaration_occurrence_id IN (?2, ?3, ?4)
-                 ORDER BY context.declaration_occurrence_id",
-            )
-            .unwrap()
-            .query_map(
-                rusqlite::params![
-                    blob_id,
-                    i64::from(root_declaration.get()),
-                    i64::from(local_declaration.get()),
-                    i64::from(inner_declaration.get()),
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                    ))
-                },
-            )
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(bounds.len(), 3);
-        let root_bounds = bounds
-            .iter()
-            .find(|row| row.0 == i64::from(root_declaration.get()))
-            .unwrap();
-        assert!(root_bounds.1 >= 0 && root_bounds.2 as usize <= source.len());
-        assert!(root_bounds.3.is_none() && root_bounds.5.is_none());
-        let local_bounds = bounds
-            .iter()
-            .find(|row| row.0 == i64::from(local_declaration.get()))
-            .unwrap();
-        assert!(local_bounds.3.is_none() && local_bounds.4.is_none());
-        assert!(local_bounds.5.unwrap() <= local_bounds.1);
-        assert!(local_bounds.2 <= local_bounds.6.unwrap());
-        let inner_bounds = bounds
-            .iter()
-            .find(|row| row.0 == i64::from(inner_declaration.get()))
-            .unwrap();
-        assert!(inner_bounds.3.unwrap() <= inner_bounds.1);
-        assert!(inner_bounds.2 <= inner_bounds.4.unwrap());
-        assert!(inner_bounds.5.unwrap() <= inner_bounds.1);
-        assert!(inner_bounds.2 <= inner_bounds.6.unwrap());
-
-        let (target_rows, canonical_target_headers): (i64, i64) = conn
-            .query_row(
-                "SELECT count(*), count(*) FILTER (WHERE source_import_id IS NOT NULL
-                    AND module_path IS NOT NULL
-                    AND ((SELECT is_wildcard FROM source_imports
-                          WHERE source_imports.blob_id = rust_import_targets.blob_id
-                            AND source_imports.import_id = rust_import_targets.source_import_id) = 1
-                         AND bound_name IS NULL
-                         OR (SELECT is_wildcard FROM source_imports
-                             WHERE source_imports.blob_id = rust_import_targets.blob_id
-                               AND source_imports.import_id = rust_import_targets.source_import_id) = 0
-                         AND bound_name IS NOT NULL)
-                    AND imported_name IS NULL AND is_glob IS NULL
-                    AND leading_absolute IS NULL AND is_extern_crate IS NULL
-                    AND declaration_occurrence_id IS NULL AND target_occurrence_id IS NULL
-                    AND alias_occurrence_id IS NULL
-                    AND source_context_occurrence_id IS NOT NULL
-                    AND owner_module IS NULL AND owner_start IS NULL AND owner_end IS NULL
-                    AND local_start IS NULL AND local_end IS NULL
-                    AND visibility IS NULL AND cfg_condition IS NULL)
-                 FROM rust_import_targets WHERE blob_id = ?1",
-                [blob_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(target_rows, expected_rust_facts.import_targets.len() as i64);
-        assert_eq!(canonical_target_headers, target_rows);
-        let target_source_ids = conn
-            .prepare(
-                "SELECT source_import_id FROM rust_import_targets
-                 WHERE blob_id = ?1 ORDER BY ordinal",
-            )
-            .unwrap()
-            .query_map([blob_id], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            target_source_ids,
-            expected_rust_facts
-                .import_targets
-                .iter()
-                .map(|target| {
-                    i64::from(
-                        target
-                            .source_import_id
-                            .expect("Rust target has canonical source-import id")
-                            .get(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        );
-        let target_context_ids = conn
-            .prepare(
-                "SELECT source_import_id, source_context_occurrence_id
-                 FROM rust_import_targets
-                 WHERE blob_id = ?1 ORDER BY ordinal",
-            )
-            .unwrap()
-            .query_map([blob_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            target_context_ids,
-            expected_rust_facts
-                .import_targets
-                .iter()
-                .map(|target| {
-                    let source_import = &expected_source_imports[target
-                        .source_import_id
-                        .expect("Rust target has canonical source-import id")
-                        .index()];
-                    (
-                        i64::from(target.source_import_id.unwrap().get()),
-                        i64::from(source_import.declaration.get()),
-                    )
-                })
-                .collect::<Vec<_>>()
-        );
-
-        let (export_rows, canonical_exports): (i64, i64) = conn
-            .query_row(
-                "SELECT count(*), count(*) FILTER (WHERE source_import_id IS NOT NULL
-                    AND exported_name IS NOT NULL AND source_path IS NULL
-                    AND imported_name IS NULL AND is_glob IS NULL)
-                 FROM rust_exports WHERE blob_id = ?1",
-                [blob_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(export_rows, expected_rust_facts.exports.len() as i64);
-        assert_eq!(canonical_exports, export_rows);
-        let export_source_ids = conn
-            .prepare(
-                "SELECT source_import_id FROM rust_exports
-                 WHERE blob_id = ?1 ORDER BY ordinal",
-            )
-            .unwrap()
-            .query_map([blob_id], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            export_source_ids,
-            expected_rust_facts
-                .exports
-                .iter()
-                .map(|export| {
-                    i64::from(
-                        export
-                            .source_import_id
-                            .expect("Rust export has canonical source-import id")
-                            .get(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        );
-
-        let (canonical_segments, canonical_scopes, canonical_prefixes): (i64, i64, i64) = conn
-            .query_row(
-                "SELECT
-                    (SELECT count(*) FROM source_import_segments WHERE blob_id = ?1),
-                    (SELECT count(*) FROM source_import_scopes WHERE blob_id = ?1),
-                    (SELECT count(*) FROM source_import_prefixes WHERE blob_id = ?1)",
-                [blob_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            canonical_segments as usize,
-            expected_source_imports
-                .iter()
-                .map(|import| import.path.as_ref().map_or(0, |path| path.segments.len()))
-                .sum::<usize>()
-        );
-        assert_eq!(
-            canonical_scopes as usize,
-            expected_source_imports
-                .iter()
-                .map(|import| import
-                    .path
-                    .as_ref()
-                    .map_or(0, |path| path.lexical_scopes.len()))
-                .sum::<usize>()
-        );
-        assert_eq!(
-            canonical_prefixes as usize,
-            expected_source_imports
-                .iter()
-                .map(|import| import
-                    .path
-                    .as_ref()
-                    .map_or(0, |path| path.lexical_prefixes.len()))
-                .sum::<usize>()
-        );
-    }
-
-    #[test]
-    fn canonical_generic_import_batches_seek_900_oids_before_and_after_statistics() {
-        const SOURCE: &str = "mod nested { use crate::model::Thing as Local; mod leaf; }\npub struct Tuple(pub usize, usize);\n#[macro_export]\nmacro_rules! exported { () => {}; }\nouter! { mod gated; }\n";
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("src/lib.rs", SOURCE)
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
-        assert_eq!(state.imports.len(), 1);
-        assert!(
-            state
-                .imports
-                .first()
-                .and_then(|import| import.path.as_ref())
-                .is_some_and(|path| !path.lexical_scopes.is_empty())
-        );
-        assert!(
-            state
-                .source_facts
-                .as_ref()
-                .is_some_and(|facts| facts.generic_imports.len() == state.imports.len())
-        );
-
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store.current_generation("rust").unwrap();
-        let oids: Vec<_> = (0..4096)
-            .map(|index| oid_for(format!("canonical generic import plan blob {index}").as_bytes()))
-            .collect();
-        let requested: Vec<_> = oids.iter().take(900).map(ToString::to_string).collect();
-        let prepared = oids
-            .iter()
-            .map(|oid| {
-                AnalyzerStore::prepare_parsed_blob(
-                    *oid,
-                    "rust",
-                    generation,
-                    &RustAdapter,
-                    Arc::new(state.clone()),
-                )
-            })
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        let (outcomes, stats) =
-            store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
-        assert_eq!(stats.committed_blobs, oids.len());
-        assert_eq!(
-            stats.failed_blobs, 0,
-            "persisted canonical import rows: {stats:?}"
-        );
-        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
-
-        let placeholders = chunk_placeholders(&requested);
-        assert_eq!(requested.len(), 900);
-
-        let check_plan = |label: &str, plan: &[String]| {
-            assert!(
-                plan.iter().any(|detail| {
-                    detail.contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")
-                }),
-                "{label} must seek requested parent blobs: {plan:#?}"
-            );
-            // Canonical import spans live on the import and lexical-scope
-            // rows. Each relation must be reached by an equality seek rather
-            // than scanning the publication or decoding its occurrence arena.
-            let seeks = |alias: &str| {
-                plan.iter().any(|detail| {
-                    detail.starts_with(&format!("SEARCH {alias} USING")) && detail.contains("=?")
-                })
-            };
-            assert!(
-                seeks("import")
-                    || seeks("import_statements")
-                    || seeks("imports")
-                    || seeks("scope")
-                    || seeks("facts"),
-                "{label} must seek canonical import rows by parent key: {plan:#?}"
-            );
-            assert!(
-                plan.iter().any(|detail| {
-                    (detail.starts_with("SEARCH source USING")
-                        || detail.starts_with("SEARCH scope USING"))
-                        && detail.contains("blob_id=? AND import_id=?")
-                }),
-                "{label} must seek inline spans by canonical import key: {plan:#?}"
-            );
-            assert!(
-                plan.iter().all(|detail| {
-                    (!detail.starts_with("SCAN ") || detail.starts_with("SCAN CONSTANT ROW"))
-                        && !detail.contains("MATERIALIZE")
-                }),
-                "{label} must not scan or materialize unbounded canonical rows: {plan:#?}"
-            );
-        };
-
-        let check = |store: &AnalyzerStore| {
-            let routes = store
-                .rust_module_route_facts_while("rust", generation, &oids[..400], &|| true)
-                .unwrap()
-                .unwrap();
-            assert_eq!(routes.len(), 400);
-            assert!(
-                routes
-                    .values()
-                    .all(|route| route.item_macros.len() == 1 && route.item_macros[0].exported)
-            );
-            let properties = store
-                .rust_declaration_properties(oids[0], generation, &RustAdapter, &file, &|| true)
-                .unwrap()
-                .unwrap();
-            assert_eq!(properties.len(), 5);
-            assert_eq!(
-                properties
-                    .iter()
-                    .find(|(unit, _)| unit.identifier() == "Tuple")
-                    .unwrap()
-                    .1
-                    .value_constructor
-                    .as_ref()
-                    .unwrap()
-                    .field_visibilities,
-                [RustVisibility::Public, RustVisibility::Private]
-            );
-            let conn = store.read_conn().unwrap();
-            let blob_id: i64 = conn
-                .query_row(
-                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-                    [&requested[0]],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            for (label, sql) in [
-                (
-                    "source_rust_declaration_properties",
-                    source_facts::RUST_DECLARATION_PROPERTIES_SQL,
-                ),
-                (
-                    "source_rust_constructor_fields",
-                    source_facts::RUST_CONSTRUCTOR_FIELDS_SQL,
-                ),
-                (
-                    "source_declaration_units",
-                    source_facts::SOURCE_DECLARATION_UNITS_SQL,
-                ),
-            ] {
-                let plan = conn
-                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                    .unwrap()
-                    .query_map([blob_id], |row| row.get::<_, String>(3))
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap();
-                assert!(
-                    plan.iter()
-                        .any(|line| line.contains(&format!("SEARCH {label} USING PRIMARY KEY"))),
-                    "{label}: {plan:?}"
-                );
-                assert!(
-                    plan.iter()
-                        .all(|line| !line.starts_with("SCAN ") && !line.contains("MATERIALIZE")),
-                    "{label}: {plan:?}"
-                );
-            }
-            let property_manifest_plan = conn
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    source_facts::RUST_DECLARATION_PROPERTY_MANIFEST_SQL
-                ))
-                .unwrap()
-                .query_map(
-                    params![
-                        requested[0],
-                        generation.get(),
-                        source_facts::SOURCE_FACTS_VERSION
-                    ],
-                    |row| row.get::<_, String>(3),
-                )
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert!(
-                property_manifest_plan
-                    .iter()
-                    .all(|line| !line.starts_with("SCAN ") && !line.contains("MATERIALIZE")),
-                "declaration publication must seek populated rows: {property_manifest_plan:?}"
-            );
-            let hydrated = read_import_infos_bulk(&conn, "rust", &requested).unwrap();
-            assert_eq!(hydrated.len(), requested.len());
-            assert!(hydrated.values().all(|imports| {
-                imports.len() == 1
-                    && imports[0]
-                        .path
-                        .as_ref()
-                        .is_some_and(|path| path.lexical_scopes.len() == 1)
-            }));
-            let rust_facts = read_rust_usage_facts_bulk(&conn, "rust", &requested).unwrap();
-            assert_eq!(rust_facts.len(), requested.len());
-            assert!(rust_facts.values().all(|facts| {
-                facts.import_targets.len() == 1
-                    && facts.import_targets[0].module_path
-                        == ["crate".to_owned(), "model".to_owned()]
-                    && facts.import_targets[0].source_import_id.is_some()
-            }));
-
-            let params = chunk_params("rust", &requested);
-            let readiness_plan = conn
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN SELECT keys.blob_oid FROM blobs AS keys
-                 JOIN blob_meta AS meta ON meta.blob_id = keys.id
-                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-                   AND NOT EXISTS (SELECT 1 FROM rust_published_fact_blobs AS ready
-                                   WHERE ready.blob_id = keys.id)"
-                ))
-                .unwrap()
-                .query_map(params_from_iter(params.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert!(
-                readiness_plan
-                    .iter()
-                    .all(|line| !line.starts_with("SCAN ") && !line.contains("MATERIALIZE")),
-                "canonical module readiness must remain selected-blob bounded: {readiness_plan:#?}"
-            );
-            let macro_plan = conn
-                .prepare(&format!(
-                "EXPLAIN QUERY PLAN SELECT keys.blob_oid, facts.macro_name, facts.visible_after,
-                    facts.scope_start, facts.scope_end, facts.passthrough,
-                    facts.exported, facts.declaration_id
-                 FROM blobs AS keys JOIN rust_item_macros AS facts ON facts.blob_id = keys.id
-                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-                 ORDER BY keys.blob_oid, facts.ordinal"
-            ))
-                .unwrap()
-                .query_map(params_from_iter(params.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            // Declaration/context spans are inline; occurrence joins are gone.
-            for table in ["macro", "property", "declaration", "definition", "context"] {
-                assert!(
-                    macro_plan
-                        .iter()
-                        .any(|line| line.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
-                    "{macro_plan:?}"
-                );
-            }
-            assert!(
-                macro_plan
-                    .iter()
-                    .all(|line| !line.starts_with("SCAN ") && !line.contains("MATERIALIZE")),
-                "{macro_plan:?}"
-            );
-            assert!(
-                rust_facts
-                    .values()
-                    .all(|facts| facts.module_routes.item_macros.len() == 1
-                        && facts.module_routes.item_macros[0].exported)
-            );
-            // The route reader uses exact 400-OID batches, unlike the
-            // primitive reader's padded arity ladder.
-            let route_placeholders = std::iter::repeat_n("?", 400).collect::<Vec<_>>().join(", ");
-            let mut route_params = vec![
-                rusqlite::types::Value::Text("rust".into()),
-                rusqlite::types::Value::Integer(generation.get()),
-            ];
-            route_params.extend(
-                requested[..400]
-                    .iter()
-                    .cloned()
-                    .map(rusqlite::types::Value::Text),
-            );
-            let route_plan = conn.prepare(&format!(
-                "EXPLAIN QUERY PLAN SELECT keys.blob_oid, facts.macro_name, facts.visible_after,
-                     facts.scope_start, facts.scope_end, facts.passthrough, facts.exported, facts.declaration_id
-                 FROM rust_published_fact_blobs AS keys
-                 JOIN rust_item_macros AS facts ON facts.blob_id = keys.blob_id AND facts.lang = keys.lang
-                 WHERE keys.lang = ?1 AND keys.generation = ?2 AND keys.blob_oid IN ({route_placeholders})
-                 ORDER BY keys.blob_oid, facts.ordinal"
-            )).unwrap().query_map(params_from_iter(route_params.iter()), |row| row.get::<_, String>(3))
-                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-            for table in ["macro", "property", "declaration", "definition", "context"] {
-                assert!(
-                    route_plan
-                        .iter()
-                        .any(|line| line.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
-                    "{route_plan:?}"
-                );
-            }
-            assert!(
-                route_plan
-                    .iter()
-                    .all(|line| !line.starts_with("SCAN ") && !line.contains("MATERIALIZE")),
-                "{route_plan:?}"
-            );
-            for (table, fields, order) in [
-                (
-                    "rust_modules",
-                    "facts.module_name, facts.is_inline, facts.start_byte, facts.end_byte, facts.cfg_condition",
-                    "facts.ordinal",
-                ),
-                (
-                    "rust_module_scopes",
-                    "facts.parent_ordinal, facts.module_name, facts.path_attribute, facts.visibility, facts.imports_macros, facts.resolution_scope, facts.body_start, facts.body_end",
-                    "facts.ordinal",
-                ),
-                (
-                    "rust_module_routes",
-                    "facts.scope_ordinal, facts.module_name, facts.path_attribute, facts.visibility, facts.imports_macros, facts.test_gated, facts.cfg_condition, facts.declaration_start, facts.declaration_end",
-                    "facts.ordinal",
-                ),
-                (
-                    "rust_module_route_gates",
-                    "facts.route_ordinal, facts.macro_name, facts.invocation_start",
-                    "facts.route_ordinal, facts.gate_ordinal",
-                ),
-            ] {
-                let sql = format!(
-                    "SELECT keys.blob_oid, {fields} FROM rust_published_fact_blobs AS keys
-                     JOIN {table} AS facts ON facts.blob_id = keys.blob_id AND facts.lang = keys.lang
-                     WHERE keys.lang = ?1 AND keys.generation = ?2 AND keys.blob_oid IN ({route_placeholders})
-                     ORDER BY keys.blob_oid, {order}"
-                );
-                let plan = conn
-                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                    .unwrap()
-                    .query_map(params_from_iter(route_params.iter()), |row| {
-                        row.get::<_, String>(3)
-                    })
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap();
-                assert!(
-                    plan.iter()
-                        .all(|line| !line.starts_with("SCAN ") && !line.contains("MATERIALIZE")),
-                    "selected canonical {table} rows must use bounded index seeks: {plan:#?}"
-                );
-                let rows = conn
-                    .prepare(&sql)
-                    .unwrap()
-                    .query_map(params_from_iter(route_params.iter()), |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap();
-                assert!(
-                    rows.len() >= 400,
-                    "{table} must exercise populated rows, got {rows:?}"
-                );
-            }
-            let location_plan = conn
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    source_facts::IMPORT_SOURCE_LOCATIONS_SQL
-                ))
-                .unwrap()
-                .query_map(
-                    params![requested[0], 0, source_facts::SOURCE_FACTS_VERSION],
-                    |row| row.get::<_, String>(3),
-                )
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            // The helper selects one import, walks its blob arena once, and
-            // retains at most the declaration and target occurrences. Scans
-            // of those bounded CTEs do not become per-occurrence arena joins.
-            assert!(
-                location_plan.iter().all(|detail| {
-                    !detail.starts_with("SCAN ")
-                        || [
-                            "SCAN requested",
-                            "SCAN imports",
-                            "SCAN declaration",
-                            "SCAN target",
-                            "SCAN entry VIRTUAL TABLE",
-                        ]
-                        .iter()
-                        .any(|prefix| detail.starts_with(prefix))
-                }),
-                "exact import locations must keep persistent rows keyed: {location_plan:#?}"
-            );
-            assert_eq!(
-                location_plan
-                    .iter()
-                    .filter(|detail| detail.starts_with("SCAN entry VIRTUAL TABLE"))
-                    .count(),
-                1,
-                "exact import locations decode one arena: {location_plan:#?}"
-            );
-            for (table, key) in [
-                ("arena", "blob_id=?"),
-                ("source", "blob_id=? AND import_id=?"),
-                ("target", "blob_id=? AND ordinal=?"),
-                ("context", "blob_id=? AND declaration_occurrence_id=?"),
-            ] {
-                assert!(
-                    location_plan.iter().any(|detail| detail
-                        .contains(&format!("SEARCH {table} USING PRIMARY KEY ({key})"))),
-                    "exact import locations must seek {table}: {location_plan:#?}"
-                );
-            }
-            assert!(
-                location_plan
-                    .iter()
-                    .any(|detail| detail.contains("SEARCH keys USING")
-                        && detail.contains("blob_oid=? AND lang=?")),
-                "{location_plan:#?}"
-            );
-            assert!(
-                location_plan
-                    .iter()
-                    .all(|detail| !detail.contains("MATERIALIZE")
-                        || detail == "MATERIALIZE requested"
-                        || detail == "MATERIALIZE source_occurrences"),
-                "{location_plan:#?}"
-            );
-            let target_sql = rust_import_targets_sql(&placeholders);
-            let target_plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {target_sql}"))
-                .unwrap()
-                .query_map(params_from_iter(params.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert!(
-                target_plan
-                    .iter()
-                    .any(|detail| detail.contains("SEARCH context USING PRIMARY KEY")),
-                "Rust target hydration must seek each declaration context: {target_plan:#?}"
-            );
-            assert!(
-                target_plan.iter().all(|detail| {
-                    (!detail.starts_with("SCAN ") || detail.starts_with("SCAN CONSTANT ROW"))
-                        && !detail.contains("MATERIALIZE")
-                }),
-                "Rust target hydration must not scan or materialize source rows: {target_plan:#?}"
-            );
-            let import_sql = import_infos_bulk_sql(&placeholders);
-            let import_plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {import_sql}"))
-                .unwrap()
-                .query_map(params_from_iter(params.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            check_plan("canonical import statement batch", &import_plan);
-
-            let scope_sql = import_path_children_sql(
-                "source_import_lexical_scopes",
-                "start_byte, end_byte",
-                "scope_ordinal",
-                &placeholders,
-            );
-            let scope_plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {scope_sql}"))
-                .unwrap()
-                .query_map(params_from_iter(params.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            check_plan("canonical lexical-scope batch", &scope_plan);
-
-            let rust_segment_sql = rust_import_module_segments_sql(&placeholders);
-            let rust_segment_plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {rust_segment_sql}"))
-                .unwrap()
-                .query_map(params_from_iter(params.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert!(
-                rust_segment_plan.iter().any(|detail| {
-                    detail.contains("SEARCH source_rust_import_module_segments")
-                        || detail.contains("SEARCH segments")
-                        || detail.contains("SEARCH segment")
-                }),
-                "canonical Rust segment batch must seek the source segment view: {rust_segment_plan:#?}"
-            );
-            assert!(
-                rust_segment_plan.iter().all(|detail| {
-                    (!detail.starts_with("SCAN ") || detail.starts_with("SCAN CONSTANT ROW"))
-                        && !detail.contains("MATERIALIZE")
-                }),
-                "canonical Rust segment batch must not scan or materialize unbounded rows: {rust_segment_plan:#?}"
-            );
-        };
-
-        check(&store);
-        store.refresh_planner_statistics().unwrap();
-        check(&store);
-    }
-
-    #[test]
-    fn canonical_import_segment_batches_seek_before_and_after_statistics() {
-        // Schema 117 stores an import's module path once, in the canonical
-        // `source_import_segments` family that `rust_import_targets` points at,
-        // so this pin publishes real blobs rather than assembling the rows by
-        // hand: the canonical chain a Rust target depends on spans the source
-        // manifest, its occurrences, its imports and the Rust module and item
-        // manifests.
-        const SOURCE: &str = "use crate::model::Target;\nfn consume(value: Target) {}\n";
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "src/lib.rs", SOURCE);
-        let state = Arc::new(parse_state(&RustAdapter, &file));
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store.current_generation("rust").unwrap();
-        let oids: Vec<_> = (0..1_200)
-            .map(|index| oid_for(format!("import blob {index}").as_bytes()))
-            .collect();
-        let requested: Vec<_> = oids.iter().take(900).map(ToString::to_string).collect();
-        let prepared = oids
-            .iter()
-            .map(|oid| {
-                AnalyzerStore::prepare_parsed_blob(
-                    *oid,
-                    "rust",
-                    generation,
-                    &RustAdapter,
-                    Arc::clone(&state),
-                )
-            })
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        let (outcomes, stats) =
-            store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
-        assert_eq!(stats.committed_blobs, oids.len());
-        assert_eq!(stats.failed_blobs, 0, "persisted import blobs: {stats:?}");
-        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
-
-        let check = || {
-            let conn = store.read_conn().unwrap();
-            let sql = rust_import_module_segments_sql(&chunk_placeholders(&requested));
-            let params = chunk_params("rust", &requested);
-            let plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .unwrap()
-                .query_map(params_from_iter(params.iter()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert!(
-                plan.iter()
-                    .any(|detail| detail.contains("SEARCH segment USING PRIMARY KEY")),
-                "{plan:?}"
-            );
-            assert!(
-                !plan.iter().any(|detail| detail.starts_with("SCAN ")),
-                "{plan:?}"
-            );
-            let rows = read_rust_usage_facts_bulk(&conn, "rust", &requested).unwrap();
-            assert_eq!(rows.len(), requested.len());
-            for oid in &requested {
-                assert_eq!(
-                    rows[oid].import_targets[0].module_path,
-                    ["crate".to_owned(), "model".to_owned()]
-                );
-            }
-            let plan = conn.prepare(
-                "EXPLAIN QUERY PLAN SELECT blob_id FROM rust_import_targets WHERE module_path = ?1"
-            ).unwrap().query_map(["crate::model"], |row| row.get::<_, String>(3)).unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
-            assert!(
-                plan.iter()
-                    .any(|detail| detail.contains("idx_rust_import_targets_module")),
-                "{plan:?}"
-            );
-            assert!(
-                !plan.iter().any(|detail| detail.starts_with("SCAN ")),
-                "{plan:?}"
-            );
-        };
-        check();
-        store.refresh_planner_statistics().unwrap();
-        check();
-    }
-
-    #[test]
-    fn rust_absolute_import_targets_round_trip_per_leaf() {
-        const SOURCE: &str =
-            "use {route::relative, ::route::absolute};\nuse ::route::group::{named, *};\n";
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "src/lib.rs", SOURCE);
-        let oid = oid_for(SOURCE.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
-            .unwrap();
-
-        let facts = store.rust_usage_facts(oid, "rust").unwrap();
-        assert_eq!(
-            facts
-                .import_targets
-                .iter()
-                .map(|target| (
-                    target
-                        .module_path
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                    target.imported_name.as_deref(),
-                    target.leading_absolute,
-                    target.is_glob,
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (vec!["route"], Some("relative"), false, false),
-                (vec!["route"], Some("absolute"), true, false),
-                (vec!["route", "group"], Some("named"), true, false),
-                (vec!["route", "group"], None, true, true),
-            ]
-        );
-
-        let conn = store.conn.lock().unwrap();
-        let persisted = conn
-            .prepare(
-                "SELECT leading_absolute FROM source_rust_import_targets
-                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')
-                 ORDER BY ordinal",
-            )
-            .unwrap()
-            .query_map([oid.to_string()], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(persisted, vec![0, 1, 1, 1]);
-    }
-
-    #[test]
-    fn rust_fact_tables_answer_the_inverted_name_lookups() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-
-        assert_eq!(store.rust_export_blobs("rust", "Alias").unwrap(), vec![oid]);
-        assert!(
-            store
-                .rust_export_blobs("rust", "Private")
-                .unwrap()
-                .is_empty(),
-            "a private import must not answer an export lookup"
-        );
-        assert_eq!(
-            store.rust_import_target_blobs("rust", "delta").unwrap(),
-            vec![oid]
-        );
-        assert_eq!(
-            store
-                .rust_module_import_candidate_blobs("rust", "delta")
-                .unwrap(),
-            vec![oid]
-        );
-        assert_eq!(
-            store
-                .rust_identifier_occurrence_blobs("rust", "helper")
-                .unwrap(),
-            vec![(
-                oid,
-                brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE
-            )]
-        );
-        assert!(
-            store
-                .rust_identifier_occurrence_blobs("rust", "HELPER")
-                .unwrap()
-                .is_empty(),
-            "identifier lookups are case-sensitive"
-        );
-        assert!(
-            store
-                .rust_identifier_occurrence_blobs("java", "helper")
-                .unwrap()
-                .is_empty(),
-            "identifier lookups are scoped to one language"
         );
     }
 
@@ -33002,600 +25357,69 @@ helper::wrap! {
         }
     }
 
-    #[test]
-    fn rust_fact_rows_cascade_with_their_blob() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        let count = |store: &AnalyzerStore| {
-            let conn = store.conn.lock().unwrap();
-            [
-                "rust_exports",
-                "rust_import_targets",
-                "rust_modules",
-                "rust_identifier_occurrences",
-                "rust_module_scopes",
-                "rust_module_routes",
-                "rust_module_route_gates",
-                "rust_item_macros",
-                "rust_include_edges",
-                "rust_include_host_bindings",
-            ]
-            .into_iter()
-            .map(|table| {
-                conn.query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"),
-                    params![oid.to_string(), "rust"],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap()
-            })
-            .sum::<usize>()
-        };
-
-        assert!(count(&store) > 0, "fixture must persist fact rows");
-        {
-            let conn = store.conn.lock().unwrap();
-            conn.execute(
-                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
-                params![oid.to_string(), "rust"],
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            count(&store),
-            0,
-            "deleting the blob must cascade every rust_* fact row away"
-        );
-    }
-
-    #[test]
-    fn rust_fact_rows_are_stable_across_a_re_analysis_of_the_same_content() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        let first = store.rust_usage_facts(oid, "rust").unwrap();
-
-        // Same bytes at a different path: the content key is unchanged, so the
-        // second analysis must produce byte-identical rows. Nothing persisted
-        // here may be path-derived.
-        let moved = write_file(temp.path(), "src/other/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        store
-            .write_parsed_blob(
-                oid,
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &moved),
-            )
-            .unwrap();
-        let second = store.rust_usage_facts(oid, "rust").unwrap();
-
-        assert_eq!(first, second);
-
-        let route_file = write_file(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
-        let route_oid = oid_for(RUST_MODULE_ROUTE_FIXTURE.as_bytes());
-        store
-            .write_parsed_blob(
-                route_oid,
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &route_file),
-            )
-            .unwrap();
-        let first_routes = store
-            .rust_usage_facts(route_oid, "rust")
-            .unwrap()
-            .module_routes;
-        assert!(
-            !first_routes.routes.is_empty(),
-            "fixture must persist route rows"
-        );
-
-        let moved_route_file = write_file(
-            temp.path(),
-            "src/deep/nested/mod.rs",
-            RUST_MODULE_ROUTE_FIXTURE,
-        );
-        store
-            .write_parsed_blob(
-                route_oid,
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &moved_route_file),
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .rust_usage_facts(route_oid, "rust")
-                .unwrap()
-                .module_routes,
-            first_routes
-        );
-    }
-
-    #[test]
-    fn rust_module_route_tables_record_scopes_routes_gates_and_item_macros() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
-        let routes = store.rust_usage_facts(oid, "rust").unwrap().module_routes;
-
-        let scopes: Vec<_> = routes
-            .scopes
-            .iter()
-            .map(|scope| {
-                (
-                    scope.parent,
-                    scope.module_name.as_str(),
-                    scope.path_attribute.as_deref(),
-                    scope.imports_macros,
-                )
-            })
-            .collect();
-        assert_eq!(
-            scopes,
-            vec![
-                (None, "", None, true),
-                (Some(0), "scope", Some("elsewhere"), false),
-            ],
-            "scopes were {:?}",
-            routes.scopes
-        );
-        assert_eq!(routes.scopes[0].body_start, 0);
-        assert_eq!(
-            routes.scopes[0].body_end,
-            RUST_MODULE_ROUTE_FIXTURE.len(),
-            "the root scope spans the whole source"
-        );
-        assert_eq!(
-            routes
-                .scopes
-                .iter()
-                .map(|scope| scope.resolution_scope.map(ResolutionScopeId::get))
-                .collect::<Vec<_>>(),
-            vec![Some(0), Some(1)],
-            "common-resolution attachment scopes must survive the store round trip"
-        );
-
-        let described: Vec<_> = routes
-            .routes
-            .iter()
-            .map(|route| {
-                (
-                    route.scope,
-                    route.module_name.as_str(),
-                    route.path_attribute.as_deref(),
-                    route.imports_macros,
-                    route.test_gated,
-                    encode_rust_cfg_condition(&route.cfg_condition),
-                    route
-                        .gates
-                        .iter()
-                        .map(|gate| gate.macro_name.as_str())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            described,
-            vec![
-                (0, "plain", None, false, false, "always".to_string(), vec![]),
-                (
-                    0,
-                    "macro_source",
-                    None,
-                    true,
-                    false,
-                    "always".to_string(),
-                    vec![]
-                ),
-                (
-                    0,
-                    "gated",
-                    None,
-                    false,
-                    true,
-                    "atom test".to_string(),
-                    vec![]
-                ),
-                (
-                    0,
-                    "relocated",
-                    Some("custom/target.rs"),
-                    false,
-                    false,
-                    "always".to_string(),
-                    vec![]
-                ),
-                (1, "deep", None, false, false, "always".to_string(), vec![]),
-                (
-                    0,
-                    "replayed",
-                    None,
-                    false,
-                    false,
-                    "always".to_string(),
-                    vec!["replay"]
-                ),
-            ],
-            "routes were {:?}",
-            routes.routes
-        );
-        assert_eq!(
-            routes
-                .item_macros
-                .iter()
-                .map(|definition| {
-                    (
-                        definition.name.as_str(),
-                        definition.passthrough,
-                        definition.exported,
-                    )
-                })
-                .collect::<Vec<_>>(),
-            vec![("replay", true, true)],
-            "item macros were {:?}",
-            routes.item_macros
-        );
-        let gate = &routes.routes[5].gates[0];
-        assert_eq!(
-            RUST_MODULE_ROUTE_FIXTURE
-                .get(gate.invocation_start..)
-                .map(|rest| rest.starts_with("replay! { mod replayed; }")),
-            Some(true),
-            "the gate points at the invocation that produced the route"
-        );
-    }
-
-    #[test]
-    fn rust_module_route_rows_cascade_with_their_blob() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
-        let counts = |store: &AnalyzerStore| {
-            let conn = store.conn.lock().unwrap();
-            [
-                "rust_module_scopes",
-                "rust_module_routes",
-                "rust_module_route_gates",
-                "rust_item_macros",
-            ]
-            .map(|table| {
-                conn.query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"),
-                    params![oid.to_string(), "rust"],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap()
-            })
-        };
-
-        assert!(
-            counts(&store).iter().all(|count| *count > 0),
-            "every module-route table must carry rows for this fixture: {:?}",
-            counts(&store)
-        );
-        {
-            let conn = store.conn.lock().unwrap();
-            conn.execute(
-                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
-                params![oid.to_string(), "rust"],
-            )
-            .unwrap();
-        }
-        assert_eq!(counts(&store), [0, 0, 0, 0]);
-    }
-
-    /// The Cargo-route build reads every live blob at once, and that batched
-    /// read must agree with the per-blob one it replaces column for column.
-    #[test]
-    fn batched_module_route_facts_match_the_per_blob_read() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
-        let other = write_file(temp.path(), "src/plain.rs", "mod leaf;\n");
-        let other_oid = oid_for(b"mod leaf;\n");
-        store
-            .write_parsed_blob(
-                other_oid,
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &other),
-            )
-            .unwrap();
-        let absent = oid_for(b"pub struct NeverAnalyzed;\n");
-        let generation = store.current_generation("rust").unwrap();
-
-        let batched = store
-            .rust_module_route_facts_while("rust", generation, &[oid, other_oid, absent], &|| true)
-            .unwrap()
-            .expect("uninterrupted route read");
-
-        assert_eq!(batched.len(), 2, "an unanalyzed blob contributes no entry");
-        let checkpoints = std::cell::Cell::new(0);
-        let cancelled = store
-            .rust_module_route_facts_while("rust", generation, &[oid, other_oid, absent], &|| {
-                let visited = checkpoints.get();
-                checkpoints.set(visited + 1);
-                visited < 2
-            })
-            .unwrap();
-        assert!(
-            cancelled.is_none(),
-            "cancelled route rows must not escape as a partial map"
-        );
-        let retried = store
-            .rust_module_route_facts_while("rust", generation, &[oid, other_oid, absent], &|| true)
-            .unwrap()
-            .expect("retry after dropping the cancelled read transaction");
-        assert_eq!(retried, batched);
-        for key in [oid, other_oid] {
-            assert_eq!(
-                batched.get(&key),
-                Some(&store.rust_usage_facts(key, "rust").unwrap().module_routes),
-                "batched and per-blob reads disagree for {key}"
-            );
-        }
-    }
-
-    /// Compare the Rust usage-fact bulk reader with the analyzer's original
-    /// pre-persistence values, rather than another store decoder, so every
-    /// family and each family's persisted order are covered independently. A
-    /// registered blob with no fact rows remains absent from the bulk map and
-    /// hydrates through the scalar facade as the default value.
-    #[test]
-    fn batched_rust_usage_facts_match_analyzer_all_families_and_empty_rows() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let first_file = write_file(temp.path(), "src/facts.rs", RUST_USAGE_FACT_FIXTURE);
-        let route_file = write_file(temp.path(), "src/routes.rs", RUST_MODULE_ROUTE_FIXTURE);
-        let first_oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
-        let route_oid = oid_for(RUST_MODULE_ROUTE_FIXTURE.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let first_state = parse_state(&RustAdapter, &first_file);
-        let expected_first = first_state.rust_usage_facts.clone();
-        store
-            .write_parsed_blob(first_oid, "rust", &RustAdapter, &first_state)
-            .unwrap();
-        let route_state = parse_state(&RustAdapter, &route_file);
-        let expected_route = route_state.rust_usage_facts.clone();
-        store
-            .write_parsed_blob(route_oid, "rust", &RustAdapter, &route_state)
-            .unwrap();
-
-        let empty_oid = oid_for(b"a registered Rust blob with no fact rows");
-        let generation = store.current_generation("rust").unwrap();
-        store
-            .register_blobs(&[empty_oid], "rust", generation)
-            .unwrap();
-
-        let requested = [
-            first_oid.to_string(),
-            route_oid.to_string(),
-            empty_oid.to_string(),
-        ];
-        let conn = store.conn.lock().unwrap();
-        let bulk = read_rust_usage_facts_bulk(&conn, "rust", &requested).unwrap();
-        assert_eq!(bulk.get(&first_oid.to_string()), Some(&expected_first));
-        assert_eq!(bulk.get(&route_oid.to_string()), Some(&expected_route));
-        assert!(!bulk.contains_key(&empty_oid.to_string()));
-        assert_eq!(
-            read_rust_usage_facts(&conn, &empty_oid.to_string(), "rust").unwrap(),
-            RustUsageFacts::default(),
-            "a zero-row blob must hydrate as the empty fact value"
-        );
-
-        let repeated = [
-            first_oid.to_string(),
-            first_oid.to_string(),
-            route_oid.to_string(),
-            empty_oid.to_string(),
-        ];
-        let repeated_bulk = read_rust_usage_facts_bulk(&conn, "rust", &repeated).unwrap();
-        assert_eq!(
-            repeated_bulk, bulk,
-            "duplicate OIDs must not duplicate facts"
-        );
-    }
-
-    #[test]
-    fn batched_rust_usage_facts_session_stop_discards_partial_map() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "src/facts.rs", RUST_USAGE_FACT_FIXTURE);
-        let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
-            .unwrap();
-
-        let requested = [oid.to_string()];
-        let conn = store.conn.lock().unwrap();
-        let session = ResolutionSession::bounded(
-            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
-                ..Default::default()
-            },
-            None,
-        );
-        let stopped =
-            read_rust_usage_facts_bulk_with_session(&conn, "rust", &requested, Some(&session))
-                .unwrap();
-        assert!(
-            stopped.is_none(),
-            "a stopped bulk read must expose no partial map"
-        );
-        assert!(matches!(
-            session.finish(()),
-            brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Exceeded { .. }
-        ));
-    }
-
     // ---- fixtures the parked tests above use ----
+}
 
-    /// The fixture the `rust_*` fact-table tests share: one file that
-    /// re-exports, imports (named, glob, aliased, function-local), declares an
-    /// inline and a file module, and mentions identifiers in code, a comment,
-    /// and a string.
-    const RUST_USAGE_FACT_FIXTURE: &str = "\
-#[macro_use]
-extern crate facade;
-pub use alpha::Exported;
-pub use beta::Renamed as Alias;
-pub use gamma::*;
-use delta::Private;
-mod detached;
-mod inline {
-    use crate::Scoped;
-    pub fn helper() {
-        use crate::Local;
-        let _ = \"in_a_string\";
+#[doc(hidden)]
+pub mod rust_macro_source_sql;
+
+impl WorkspaceAnchorRow {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(rel_path: String, anchor: PackageAnchor, package_name: String) -> Self {
+        Self {
+            rel_path,
+            anchor,
+            package_name,
+        }
     }
 }
-include!(\"generated/table.rs\");
-// in_a_comment
-";
 
-    /// The module-route fixture (issue #1793): a file whose declarations cover
-    /// every column the Cargo route index reads -- an inline scope with a
-    /// `#[path]`, a `#[macro_use]` declaration, a bare `#[cfg(test)]` gate, a
-    /// `#[path]` on a declaration, an item macro definition, and a declaration
-    /// that only exists inside that macro's expansion.
-    const RUST_MODULE_ROUTE_FIXTURE: &str = "\
-#[macro_export]
-macro_rules! replay {
-    ($($item:item)*) => { $($item)* };
-}
-mod plain;
-#[macro_use]
-mod macro_source;
-#[cfg(test)]
-mod gated;
-#[path = \"custom/target.rs\"]
-mod relocated;
-#[path = \"elsewhere\"]
-mod scope {
-    mod deep;
-}
-replay! { mod replayed; }
-";
-
-    fn rust_fixture_store(temp: &Path, rel_path: &str, fixture: &str) -> (AnalyzerStore, Oid) {
-        let file = write_file(temp, rel_path, fixture);
-        let oid = oid_for(fixture.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
-            .unwrap();
-        (store, oid)
-    }
-
-    /// Every `short_name` the store holds for one parsed blob.
-    fn persisted_short_names<A: LanguageAdapter>(
-        adapter: &A,
-        lang: &str,
-        file: &ProjectFile,
-    ) -> Vec<String> {
-        let state = parse_state(adapter, file);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let generation = store
-            .ensure_language_epoch_value(lang, "short-name-vocabulary-pin-v1")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                &crate::analyzer::store::test_blob_file(),
-                oid,
-                lang,
-                generation,
-                adapter,
-                &state,
-            )
-            .unwrap();
-        let conn = store.conn.lock().unwrap();
-        let mut statement = conn
-            .prepare("SELECT short_name FROM code_units WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)")
-            .unwrap();
-        let names: Vec<String> = statement
-            .query_map(params![oid.to_string(), lang], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap();
-        assert!(
-            !names.is_empty(),
-            "the {lang} fixture must persist declarations for the pin to mean anything"
-        );
-        names
-    }
-
-    /// The storage contract issue #1748's structural-miss filter rests on,
-    /// pinned end to end rather than inferred from the renderer.
-    ///
-    /// `definition_candidate_short_names` drops a lookup spelling that carries
-    /// a separator `absent_segment_separators` reports for the adapter's
-    /// language, on the ground that no stored `short_name` for that language
-    /// can contain one. This asserts the property against rows the store wrote,
-    /// over the Rust shapes most likely to smuggle a path separator into a name -- nested
-    /// inline modules, a generic inherent impl, a qualified trait impl, and an
-    /// associated const.
-    ///
-    /// If a future extractor or schema change starts persisting `::`-bearing
-    /// rust short names, the filter would begin dropping spellings that can
-    /// match. This fails first, and says so.
-    #[test]
-    fn short_name_vocabulary_excludes_separators_absent_from_the_renderer() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "src/lib.rs",
-            "pub mod outer {\n\
-             \x20   pub mod inner {\n\
-             \x20       pub struct Widget<T> { pub value: T }\n\
-             \x20       impl<T: core::fmt::Debug> Widget<T> {\n\
-             \x20           pub const LIMIT: usize = 4;\n\
-             \x20           pub fn make(value: T) -> Self { Widget { value } }\n\
-             \x20       }\n\
-             \x20       impl<T> core::default::Default for Widget<T>\n\
-             \x20       where T: core::default::Default {\n\
-             \x20           fn default() -> Self { Widget { value: T::default() } }\n\
-             \x20       }\n\
-             \x20   }\n\
-             }\n\
-             pub fn top() -> usize { outer::inner::Widget::<usize>::LIMIT }\n",
-        );
-
-        let names = persisted_short_names(&RustAdapter, "rust", &file);
-        let absent = crate::analyzer::fq_name::absent_segment_separators(Language::Rust);
-        assert_eq!(
-            &["::"],
-            absent,
-            "rust has no `::` rendering rule, so `::` is the separator the filter drops"
-        );
-        let offenders: Vec<&String> = names
-            .iter()
-            .filter(|name| absent.iter().any(|separator| name.contains(separator)))
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "persisted rust short names must not contain {absent:?}; offenders: {offenders:?} \
-             out of {names:?}"
-        );
-    }
-
-    /// The contract is per language, not global. C++ renders `::` between
-    /// namespace segments, so nothing may be dropped for it -- and its
-    /// persisted vocabulary is free to carry `::`.
-    #[test]
-    fn cpp_short_name_vocabulary_is_not_narrowed_by_the_filter() {
-        assert!(
-            crate::analyzer::fq_name::absent_segment_separators(Language::Cpp).is_empty(),
-            "cpp renders every separator the lookup vocabulary can carry"
-        );
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "sample.cpp",
-            "namespace ns1 { namespace ns2 { struct Outer { void method(); }; } }\n\
-             void ns1::ns2::Outer::method() {}\n",
-        );
-        let names = persisted_short_names(&CppAdapter, "cpp", &file);
-        assert!(
-            names.iter().any(|name| name.contains("Outer")),
-            "cpp fixture should persist the nested type: {names:?}"
-        );
+impl RelationalUnitFq {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(
+        anchor: Option<PackageAnchor>,
+        package_tail_segments: usize,
+        expected_segment_count: usize,
+        expected_segment_bytes: usize,
+        segments: Vec<(SegmentKind, String)>,
+    ) -> Self {
+        Self {
+            anchor,
+            package_tail_segments,
+            expected_segment_count,
+            expected_segment_bytes,
+            segments,
+        }
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "resolution_producer_tests_go_support.rs"]
+pub mod resolution_producer_tests_go_support;
+
+#[doc(hidden)]
+pub mod active_models;
+#[doc(hidden)]
+pub mod model_catalog;
+#[doc(hidden)]
+pub mod model_provenance;
+
+#[doc(hidden)]
+pub mod maven_xml;
+
+#[doc(hidden)]
+pub mod xml_name;
+
+#[doc(hidden)]
+pub mod cache_gc;
+#[doc(hidden)]
+pub mod file_set_identity;
+#[doc(hidden)]
+pub mod file_state;
+#[doc(hidden)]
+pub mod maven;
+#[doc(hidden)]
+pub mod structural_vocabulary;

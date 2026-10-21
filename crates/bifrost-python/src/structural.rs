@@ -513,26 +513,20 @@ fn python_comparison_shape(node: Node<'_>) -> PythonComparisonShape<'_> {
     let mut left = None;
     let mut right = None;
     let mut operator = None;
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            if cursor.field_name() == Some("operators") {
-                operator_count += 1;
-                operator.get_or_insert(child);
-            } else if child.is_named() && !child.is_extra() {
-                operand_count += 1;
-                if left.is_none() {
-                    left = Some(child);
-                } else if right.is_none() {
-                    right = Some(child);
-                }
-            }
-            if !cursor.goto_next_sibling() {
-                break;
+    visit_python_comparison_children(node, |child, is_operator| {
+        if is_operator {
+            operator_count += 1;
+            operator.get_or_insert(child);
+        } else if child.is_named() && !child.is_extra() {
+            operand_count += 1;
+            if left.is_none() {
+                left = Some(child);
+            } else if right.is_none() {
+                right = Some(child);
             }
         }
-    }
+        true
+    });
     debug_assert!(
         node.has_error() || operand_count == operator_count.saturating_add(1),
         "well-formed Python comparison must have one more operand than operators: {node:?}"
@@ -544,6 +538,25 @@ fn python_comparison_shape(node: Node<'_>) -> PythonComparisonShape<'_> {
         right,
         operator,
     }
+}
+
+/// Shared grammar-field traversal for singular roles and transient domains.
+fn visit_python_comparison_children<'tree>(
+    node: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>, bool) -> bool,
+) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if !visit(cursor.node(), cursor.field_name() == Some("operators")) {
+                return false;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    true
 }
 
 /// Whether a wrapper is a constant form used by comparison-of-constants:
@@ -966,19 +979,6 @@ fn python_collect_all_members(
     ReadableSurface::Yes
 }
 
-/// Find a recovered `__all__` identifier inside a syntax error node.
-fn python_error_contains_all_identifier(error: Node<'_>, source: &str) -> bool {
-    let mut pending = vec![error];
-    while let Some(node) = pending.pop() {
-        if node.kind() == "identifier" && node_source_text(node, source) == "__all__" {
-            return true;
-        }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
-    }
-    false
-}
-
 fn python_module_export_bindings(
     root: Node<'_>,
     source: &str,
@@ -1135,7 +1135,9 @@ fn python_source_export_facts(root: Node<'_>, source: &str) -> SourceExportFacts
     let definitions_complete = !python_module_definition_is_dynamic(root, source);
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
-        if statement.kind() == "ERROR" && python_error_contains_all_identifier(statement, source) {
+        if statement.kind() == "ERROR"
+            && crate::syntax::python_contains_all_identifier(statement, source)
+        {
             stated = true;
             readable = ReadableSurface::No;
             continue;
@@ -1146,7 +1148,7 @@ fn python_source_export_facts(root: Node<'_>, source: &str) -> SourceExportFacts
         let mut inner = statement.walk();
         for expression in statement.named_children(&mut inner) {
             match expression.kind() {
-                "ERROR" if python_error_contains_all_identifier(expression, source) => {
+                "ERROR" if crate::syntax::python_contains_all_identifier(expression, source) => {
                     stated = true;
                     readable = ReadableSurface::No;
                 }
@@ -1606,6 +1608,41 @@ impl StructuralSpec for PythonStructuralSpec {
                 }),
         );
         facts
+    }
+
+    fn comparison_operator_spans(
+        &self,
+        node: Node<'_>,
+        step: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<Span>> {
+        if !step() || node.kind() != "comparison_operator" || node.has_error() || node.is_missing()
+        {
+            return None;
+        }
+        let mut operators = Vec::new();
+        let mut operands = 0usize;
+        let complete = visit_python_comparison_children(node, |child, is_operator| {
+            if !step() || child.is_missing() || child.has_error() {
+                return false;
+            }
+            if is_operator {
+                if child.start_byte() >= child.end_byte() {
+                    return false;
+                }
+                operators.push(Span {
+                    start_byte: child.start_byte(),
+                    end_byte: child.end_byte(),
+                });
+            } else if child.is_named() && !child.is_extra() {
+                operands += 1;
+            }
+            true
+        });
+        (complete
+            && !operators.is_empty()
+            && operands == operators.len().saturating_add(1)
+            && step())
+        .then_some(operators)
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

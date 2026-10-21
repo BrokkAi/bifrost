@@ -1,7 +1,4 @@
-use super::java_artifact::{
-    MAX_ARCHIVE_ENTRIES, MAX_SOURCE_ENTRY_BYTES, MAX_TOTAL_ARCHIVE_BYTES, ZipDirectoryStatus,
-    zip_directory_status,
-};
+use super::java_artifact::{ZipDirectoryStatus, zip_directory_status};
 use super::parent_index;
 use super::{restrict_effective_visibility, take_artifact_record as take_record};
 use crate::CancellationToken;
@@ -13,9 +10,9 @@ use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredShard, BoundedProducerDiagnostics, Completeness, ExactArtifact, ExternalArtifactKind,
     HierarchyFact, HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter,
-    Signature, StructuredTypeExpression, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
-    is_canonical_relative_path, member_declaration_id, read_exact_artifact_while,
-    type_declaration_id,
+    ParameterPassingMode, Signature, StructuredTypeExpression, TypeFact, TypeIdentity, TypeKind,
+    TypeRef, Visibility, is_canonical_relative_path, member_declaration_id,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
@@ -29,9 +26,7 @@ use brokk_bifrost_jvm::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
 use brokk_bifrost_jvm::kotlin::syntax::{
     kotlin_declared_type_parameter_names, kotlin_type_spelling, kotlin_user_type_segments,
 };
-use std::io::{Cursor, Read};
 use tree_sitter::{Node, Tree};
-use zip::ZipArchive;
 
 const KOTLIN_PACKAGE_MARKER: &str = "bifrost:kotlin-package";
 const MAX_LOCATOR_PATH_BYTES: usize = 1_024;
@@ -78,6 +73,21 @@ crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
 );
 
 impl KotlinSourceJarPackProducer {
+    /// Name-only extraction uses the same recoverable declaration walk as workspace files.
+    /// Body and signature errors do not reject an otherwise named declaration.
+    #[cfg(test)]
+    pub(super) fn parse_names(&self, source: &str) -> (tree_sitter::Tree, ParsedFile) {
+        let tree = super::parse_source_tree(
+            language::LANGUAGE.into(),
+            source,
+            "kotlin inventory grammar",
+        )
+        .expect("source parser returns a tree");
+        let file = ProjectFile::new(std::env::temp_dir(), "inventory.kt");
+        let parsed = parse_kotlin_file(&file, source, &tree);
+        (tree, parsed)
+    }
+
     fn produce(
         &self,
         request: &ArtifactProductionRequest,
@@ -124,100 +134,19 @@ impl KotlinSourceJarPackProducer {
                 );
             }
         }
-        let mut archive = match ZipArchive::new(Cursor::new(artifact.bytes())) {
-            Ok(archive) => archive,
-            Err(_) => {
-                return crate::analyzer::semantic_model::failed_artifact_production(
-                    "kotlin.archive.invalid",
-                    "artifact is not a readable ZIP/JAR archive",
-                    limits,
-                );
-            }
-        };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        let mut entries = Vec::new();
-        let mut total_bytes = 0u64;
-        let entry_limit = archive.len().min(MAX_ARCHIVE_ENTRIES);
-        if archive.len() > MAX_ARCHIVE_ENTRIES {
-            diagnostics.warning(
-                "limit.archive_entries",
-                None,
-                format!("producer inspected at most {MAX_ARCHIVE_ENTRIES} archive entries"),
-            );
-        }
-        for index in 0..entry_limit {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return crate::analyzer::semantic_model::failed_artifact_production(
-                    "artifact.cancelled",
-                    "Kotlin archive production was cancelled",
-                    limits,
-                );
-            }
-            let Ok(mut entry) = archive.by_index(index) else {
-                diagnostics.warning(
-                    "kotlin.archive.entry",
-                    None,
-                    format!("could not read archive entry at index {index}"),
-                );
-                continue;
-            };
-            let name = match entry.name() {
-                Ok(name) => name.into_owned(),
-                Err(error) => {
-                    diagnostics.warning(
-                        "kotlin.archive.entry_name",
-                        None,
-                        format!("could not decode archive entry name at index {index}: {error}"),
-                    );
-                    continue;
-                }
-            };
-            if !name.ends_with(".kt") {
-                continue;
-            }
-            if name.len() > MAX_LOCATOR_PATH_BYTES {
-                diagnostics.warning(
-                    "limit.locator_path",
-                    None,
-                    "Kotlin source entry path exceeded the locator length limit",
-                );
-                continue;
-            }
-            let next_total = total_bytes.saturating_add(entry.size());
-            if entry.size() > MAX_SOURCE_ENTRY_BYTES || next_total > MAX_TOTAL_ARCHIVE_BYTES {
-                diagnostics.warning(
-                    "limit.archive_bytes",
-                    Some(name),
-                    "archive entry exceeded the bounded Kotlin extraction budget",
-                );
-                continue;
-            }
-            total_bytes = next_total;
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
-            if entry
-                .by_ref()
-                .take(MAX_SOURCE_ENTRY_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .is_err()
-                || bytes.len() as u64 > MAX_SOURCE_ENTRY_BYTES
-            {
-                diagnostics.warning(
-                    "kotlin.archive.entry_read",
-                    Some(name),
-                    "could not read bounded archive entry bytes",
-                );
-                continue;
-            }
-            match String::from_utf8(bytes) {
-                Ok(source) => entries.push((name, source)),
-                Err(_) => diagnostics.warning(
-                    "kotlin.source.encoding",
-                    Some(name),
-                    "Kotlin source entry is not valid UTF-8",
-                ),
-            }
-        }
-        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let entries = match super::source_archive_entries(
+            artifact,
+            &[".kt"],
+            "kotlin",
+            MAX_LOCATOR_PATH_BYTES,
+            limits,
+            cancellation,
+            &mut diagnostics,
+        ) {
+            Ok(entries) => entries,
+            Err(production) => return *production,
+        };
 
         if limits.max_records == 0 {
             diagnostics.warning(
@@ -854,6 +783,7 @@ fn signature(
     depth_limit_hit: &mut bool,
 ) -> Option<Signature> {
     let type_parameters = type_parameters(node, source);
+    let mut vararg_seen = false;
     let parameters = metadata
         .into_iter()
         .flat_map(|value| value.parameters())
@@ -863,6 +793,15 @@ fn signature(
                 .map(|value| node_source_text_trimmed(value, source))
                 .filter(|value| value.len() <= MAX_QUALIFIED_NAME_BYTES)
                 .map(str::to_owned);
+            let variadic = parameter_is_variadic(parameter_node, source);
+            let passing_mode = if variadic {
+                vararg_seen = true;
+                ParameterPassingMode::PositionalOrNamed
+            } else if vararg_seen {
+                ParameterPassingMode::NamedOnly
+            } else {
+                ParameterPassingMode::PositionalOrNamed
+            };
             Some(Parameter {
                 name,
                 r#type: first_type_descendant(parameter_node).map_or_else(any_type, |value| {
@@ -878,9 +817,9 @@ fn signature(
                     )
                 }),
                 optional: parameter_is_optional(parameter_node),
-                variadic: parameter_is_variadic(parameter_node, source),
+                variadic,
                 role: None,
-                passing_mode: Default::default(),
+                passing_mode,
             })
         })
         .collect();
@@ -1691,6 +1630,7 @@ object Registry {
 }
 fun topLevelHelper(value: String): String = value
 fun topLevelHelper(value: Int): String = value.toString()
+fun collect(prefix: String, vararg values: String, tail: Int = 0): String = prefix + values.joinToString() + tail
 fun String.relay(times: Int): String = repeat(times)
 fun Int.relay(times: Int): String = toString().repeat(times)
 fun <T> T.applyLike(): T = this
@@ -1765,6 +1705,39 @@ private fun hidden(): Unit = Unit
             2
         );
         assert!(members.iter().any(|fact| fact.name == "relay"));
+        let collect = members
+            .iter()
+            .find(|fact| fact.name == "collect")
+            .and_then(|fact| fact.signature.as_ref())
+            .expect("collect signature");
+        assert_eq!(
+            collect
+                .parameters
+                .iter()
+                .map(|parameter| parameter.passing_mode)
+                .collect::<Vec<_>>(),
+            vec![
+                ParameterPassingMode::PositionalOrNamed,
+                ParameterPassingMode::PositionalOrNamed,
+                ParameterPassingMode::NamedOnly,
+            ]
+        );
+        assert_eq!(
+            collect
+                .parameters
+                .iter()
+                .map(|parameter| parameter.optional)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        assert_eq!(
+            collect
+                .parameters
+                .iter()
+                .map(|parameter| parameter.variadic)
+                .collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
         let dependency = types
             .iter()
             .find(|fact| fact.name == "kotlin.example.Dependency")

@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/java-jvm/0.1/java-source-identity.schema.json",
+  "title": "CSMI csmi.java-source-identity 0.1 payload",
+  "description": "Deterministic source-declaration identity for Java, Kotlin, and Scala declarations. This payload does not establish JVM binary identity.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileVersion", "language", "package", "ownerPath", "declaration"],
+  "properties": {
+    "profileVersion": { "const": "0.1" },
+    "language": { "enum": ["java", "kotlin", "scala"] },
+    "package": { "$ref": "#/$defs/namePath" },
+    "ownerPath": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/owner" }
+    },
+    "declaration": { "$ref": "#/$defs/declaration" },
+    "origin": { "enum": ["named", "generated", "synthetic", "local"] },
+    "generation": { "$ref": "#/$defs/generation" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "origin": { "enum": ["generated", "synthetic", "local"] } },
+        "required": ["origin"]
+      },
+      "then": { "required": ["generation"] }
+    },
+    {
+      "if": { "required": ["generation"] },
+      "then": {
+        "properties": { "origin": { "enum": ["generated", "synthetic", "local"] } },
+        "required": ["origin"]
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\s./;\\[\\]<>:]+$"
+    },
+    "namePath": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "enum": ["class", "interface", "enum", "annotation", "record", "object", "trait"] },
+        "name": { "$ref": "#/$defs/identifier" },
+        "genericArity": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "sourceType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonicalName"],
+      "properties": {
+        "canonicalName": { "type": "string", "minLength": 1 },
+        "nullability": { "enum": ["non-null", "nullable", "platform", "unspecified"] },
+        "parameterMode": { "enum": ["value", "vararg", "by-name", "repeated"] }
+      }
+    },
+    "callableSignature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parameterTypes"],
+      "properties": {
+        "receiverType": { "$ref": "#/$defs/sourceType" },
+        "parameterTypes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sourceType" }
+        },
+        "genericArity": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "declaration": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "const": "type" },
+            "name": { "$ref": "#/$defs/identifier" },
+            "genericArity": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "enum": ["field", "property", "enum-case", "annotation-member"] },
+            "name": { "$ref": "#/$defs/identifier" },
+            "declaredType": { "$ref": "#/$defs/sourceType" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "signature"],
+          "properties": {
+            "kind": { "enum": ["method", "function", "getter", "setter", "operator"] },
+            "name": { "$ref": "#/$defs/identifier" },
+            "signature": { "$ref": "#/$defs/callableSignature" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "signature"],
+          "properties": {
+            "kind": { "const": "constructor" },
+            "signature": { "$ref": "#/$defs/callableSignature" }
+          }
+        }
+      ]
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "stableKey"],
+      "properties": {
+        "kind": { "enum": ["language-lowering", "annotation-processing", "macro-expansion", "compiler-synthesis", "other"] },
+        "stableKey": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

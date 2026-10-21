@@ -42,10 +42,10 @@ use crate::analyzer::semantic::{
     BindingOriginIndex, CallBoundary, CallInvocationMode, CallSiteId, CallableTarget,
     CallableTargetResolution, CandidateCoverage, EvidenceCompleteness, IcfgProvider,
     IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemoryLocationKind, ProcedureHandle,
-    ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect, SemanticExecutionBudget,
-    SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, ValueFlowKind,
-    ValueId,
+    ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect,
+    SemanticExecutionBudget, SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
+    ValueFlowKind, ValueId,
 };
 use crate::dataflow::{
     DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
@@ -358,7 +358,7 @@ impl ProductionTypestateSummaryRepository {
         &self,
         key: ProductionSummaryResultKey,
         result: Arc<TypestateSummaryResult>,
-        semantic_charge: SemanticWork,
+        semantic_charge: crate::analyzer::semantic::SemanticBudgetReplay,
         solver_charge: SolverWork,
         execution_charge: Option<SemanticExecutionBudgetCharge>,
     ) -> (bool, usize) {
@@ -544,7 +544,7 @@ impl Drop for ProductionSummaryFlightLeader<'_> {
 #[derive(Debug, Clone)]
 struct CachedTypestateSummaryResult {
     result: Arc<TypestateSummaryResult>,
-    semantic_charge: SemanticWork,
+    semantic_charge: crate::analyzer::semantic::SemanticBudgetReplay,
     solver_charge: SolverWork,
     execution_charge: Option<SemanticExecutionBudgetCharge>,
     published_sequence: u64,
@@ -693,7 +693,7 @@ where
     ProjectionProvider: IcfgProvider + ?Sized,
 {
     let mut lifecycle = ProductionSummaryLifecycleCounters::default();
-    let semantic_work_before = semantic_budget.used();
+    let semantic_work_before = semantic_budget.replay_snapshot();
     let solver_work_before = request.budget.used();
     let execution_before = execution_context.snapshot();
     let provider_behavior = production_icfg_behavior(provider.behavior_identity());
@@ -739,13 +739,21 @@ where
     } else if let Some(cached) = repository.result(&result_key) {
         let mut replay_semantic_budget = semantic_budget.clone();
         let mut replay_solver_budget = request.budget.clone();
+        let mut replay_charge = cached.semantic_charge;
+        let already_held = replay_semantic_budget.has_replay_holder(&cached.result);
+        if already_held {
+            replay_charge.retained = SemanticWork::default();
+        }
         let replayed = replay_semantic_budget
-            .charge(cached.semantic_charge)
+            .replay_continuation(replay_charge)
             .is_ok()
             && replay_solver_budget.charge(cached.solver_charge).is_ok()
             && execution_context
                 .replay_charge(execution_before.as_ref(), cached.execution_charge.as_ref());
         if replayed {
+            if !already_held {
+                replay_semantic_budget.track_replay_holder(&cached.result, replay_charge.retained);
+            }
             *semantic_budget = replay_semantic_budget;
             *request.budget = replay_solver_budget;
             repository.record_hit();
@@ -804,7 +812,8 @@ where
                 &result,
                 execution_context,
                 execution_before.as_ref(),
-                semantic_budget.used().saturating_sub(semantic_work_before),
+                semantic_budget,
+                &semantic_work_before,
                 request.budget.used().saturating_sub(solver_work_before),
                 &mut lifecycle,
             );
@@ -885,7 +894,8 @@ where
             &result,
             execution_context,
             execution_before.as_ref(),
-            semantic_budget.used().saturating_sub(semantic_work_before),
+            semantic_budget,
+            &semantic_work_before,
             request.budget.used().saturating_sub(solver_work_before),
             &mut lifecycle,
         )
@@ -941,10 +951,13 @@ fn publish_exact_result(
     result: &Arc<TypestateSummaryResult>,
     execution_context: ProductionTypestateExecutionContext<'_>,
     execution_before: Option<&SemanticExecutionBudgetSnapshot>,
-    semantic_charge: SemanticWork,
+    semantic_budget: &mut SemanticBudget,
+    semantic_before: &crate::analyzer::semantic::SemanticBudgetReplaySnapshot,
     solver_charge: SolverWork,
     lifecycle: &mut ProductionSummaryLifecycleCounters,
 ) -> TypestateProductionCacheStatus {
+    // The result can outlive its cache entry, including capacity rejection.
+    semantic_budget.bind_replay_holder(result, semantic_before);
     let coverage = result.result().coverage();
     let budget_dependent = matches!(
         coverage.semantic_status(),
@@ -959,6 +972,7 @@ fn publish_exact_result(
     {
         TypestateProductionCacheStatus::MissIncomplete
     } else if let Some(execution_charge) = execution_context.charge_since(execution_before) {
+        let semantic_charge = semantic_budget.replay_since(semantic_before);
         let (published, evictions) = repository.publish_result(
             key,
             Arc::clone(result),

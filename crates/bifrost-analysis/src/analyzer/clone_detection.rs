@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::Parser;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CloneSyntaxProfile {
+#[doc(hidden)]
+pub struct CloneSyntaxProfile {
     language: Language,
     candidate_kinds: &'static [&'static str],
     identifier_kinds: &'static [&'static str],
@@ -20,7 +21,8 @@ pub(crate) struct CloneSyntaxProfile {
 }
 
 impl CloneSyntaxProfile {
-    pub(crate) const fn new(
+    #[doc(hidden)]
+    pub const fn new(
         language: Language,
         candidate_kinds: &'static [&'static str],
         identifier_kinds: &'static [&'static str],
@@ -40,7 +42,8 @@ impl CloneSyntaxProfile {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CloneCandidateData {
+#[doc(hidden)]
+pub struct CloneCandidateData {
     pub(crate) unit: CodeUnit,
     pub(crate) normalized_tokens: Vec<String>,
     pub(crate) ast_signature: String,
@@ -54,7 +57,8 @@ pub(crate) struct CloneCandidateProfile {
     pub(crate) shingle_count: usize,
 }
 
-pub(crate) fn build_clone_candidate_data(
+#[doc(hidden)]
+pub fn build_clone_candidate_data(
     source: Option<String>,
     code_unit: &CodeUnit,
     weights: CloneSmellWeights,
@@ -80,7 +84,8 @@ pub(crate) fn build_clone_candidate_data(
     })
 }
 
-pub(crate) fn build_tree_sitter_clone_candidate_data(
+#[doc(hidden)]
+pub fn build_tree_sitter_clone_candidate_data(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     weights: CloneSmellWeights,
@@ -456,7 +461,8 @@ impl CloneCandidateIndex {
     }
 }
 
-pub(crate) fn detect_language_structural_clone_smells<F>(
+#[doc(hidden)]
+pub fn detect_language_structural_clone_smells<F>(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
     weights: CloneSmellWeights,
@@ -485,7 +491,8 @@ where
     )
 }
 
-pub(crate) fn detect_structural_clone_smells_for_corpus<F>(
+#[doc(hidden)]
+pub fn detect_structural_clone_smells_for_corpus<F>(
     analyzer: &dyn IAnalyzer,
     requested_files: &[ProjectFile],
     corpus_units: &[CodeUnit],

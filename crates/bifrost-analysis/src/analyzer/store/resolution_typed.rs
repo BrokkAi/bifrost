@@ -7,59 +7,148 @@
 //! selected-first and keyset-paged, and parent rows are emitted only after all
 //! ordered children and completion reasons have been decoded.
 
-mod external_owners;
+pub(super) mod external_owners;
 pub(super) mod go_members;
 pub(super) mod java_access;
 pub(super) mod java_inheritance;
 
 use std::cell::Cell;
+
 use std::collections::BTreeSet;
+
 use std::rc::Rc;
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, Row, params_from_iter};
+
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use rusqlite::Row;
+use rusqlite::params_from_iter;
 
 use crate::CancellationToken;
+
 use crate::analyzer::Language;
+
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
-use crate::analyzer::resolution::{
-    BindingFragmentId, BindingNodeId, CompanionTypeRelation, DeferredMemberOwnerLookupName,
-    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
-    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument, LoweredDeferredMemberOwner,
-    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
-    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredIntrinsicTypeDescriptor,
-    LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredRustDeclarationAuthority,
-    LoweredRustReferenceContext, LoweredSupertypeProperty, LoweredTypeArgument,
-    LoweredTypeComponent, LoweredTypeProduction, LoweredTypeTransfer, LoweredTypedFrontier,
-    LoweredUnderlyingType, MAX_TYPED_FACT_ROWS_PER_PAGE, NamedArgumentLabel,
-    NamedArgumentLabelRead, PolledCompletionAccumulator, QualifiedRouteSlotLookup,
-    ResolutionCompletion, ResolutionIncompleteReason, RustImplementedTraits,
-    SelectedGapReasonProvenance, SelectedNodeProvenance, SelectedQualifiedRoute,
-    SelectedResolutionMountOrdinal, SelectedSemanticProvenance, SelectedTypeFrontierCompletion,
-    SelectedTypedFactSource, SelectedTypedRow, SemanticId, SharedNameInterner,
-    TypedFactPageVisitor, TypedFactReadOutcome, TypedFactRequest, language_identity_domain,
-    language_type_qualifiers_search_companion_members,
-};
+use crate::analyzer::resolution::BindingFragmentId;
+use crate::analyzer::resolution::BindingNodeId;
+use crate::analyzer::resolution::CompanionTypeRelation;
+use crate::analyzer::resolution::DeferredMemberOwnerLookupName;
+use crate::analyzer::resolution::LoweredBindingProjection;
+use crate::analyzer::resolution::LoweredCallApplicabilityObligation;
+use crate::analyzer::resolution::LoweredCallableSignatureProperty;
+use crate::analyzer::resolution::LoweredConstructionRequirementProperty;
+use crate::analyzer::resolution::LoweredDeclarationTypeProperty;
+use crate::analyzer::resolution::LoweredDeclarationVisibilityProperty;
+use crate::analyzer::resolution::LoweredDeclaredTypeArgument;
+use crate::analyzer::resolution::LoweredDeferredMemberOwner;
+use crate::analyzer::resolution::LoweredDefinitionPropertyGap;
+use crate::analyzer::resolution::LoweredGenericFormal;
+use crate::analyzer::resolution::LoweredGenericFormalDefault;
+use crate::analyzer::resolution::LoweredGenericTypeAliasParameter;
+use crate::analyzer::resolution::LoweredIntrinsicSeed;
+use crate::analyzer::resolution::LoweredIntrinsicTypeDescriptor;
+use crate::analyzer::resolution::LoweredMemberOwnerProperty;
+use crate::analyzer::resolution::LoweredMemberScopeProperty;
+use crate::analyzer::resolution::LoweredRustDeclarationAuthority;
+use crate::analyzer::resolution::LoweredRustReferenceContext;
+use crate::analyzer::resolution::LoweredSupertypeProperty;
+use crate::analyzer::resolution::LoweredTypeArgument;
+use crate::analyzer::resolution::LoweredTypeComponent;
+use crate::analyzer::resolution::LoweredTypeProduction;
+use crate::analyzer::resolution::LoweredTypeTransfer;
+use crate::analyzer::resolution::LoweredTypedFrontier;
+use crate::analyzer::resolution::LoweredUnderlyingType;
+use crate::analyzer::resolution::MAX_TYPED_FACT_ROWS_PER_PAGE;
+use crate::analyzer::resolution::NamedArgumentLabel;
+use crate::analyzer::resolution::NamedArgumentLabelRead;
+use crate::analyzer::resolution::PolledCompletionAccumulator;
+use crate::analyzer::resolution::QualifiedRouteSlotLookup;
+use crate::analyzer::resolution::ResolutionCompletion;
+use crate::analyzer::resolution::ResolutionIncompleteReason;
+use crate::analyzer::resolution::RustImplementedTraits;
+use crate::analyzer::resolution::SelectedGapReasonProvenance;
+use crate::analyzer::resolution::SelectedNodeProvenance;
+use crate::analyzer::resolution::SelectedQualifiedRoute;
+use crate::analyzer::resolution::SelectedResolutionMountOrdinal;
+use crate::analyzer::resolution::SelectedSemanticProvenance;
+use crate::analyzer::resolution::SelectedTypeFrontierCompletion;
+use crate::analyzer::resolution::SelectedTypedFactSource;
+use crate::analyzer::resolution::SelectedTypedRow;
+use crate::analyzer::resolution::SemanticId;
+use crate::analyzer::resolution::SharedNameInterner;
+use crate::analyzer::resolution::TypedFactPageVisitor;
+use crate::analyzer::resolution::TypedFactReadOutcome;
+use crate::analyzer::resolution::TypedFactRequest;
+use crate::analyzer::resolution::language_identity_domain;
+use crate::analyzer::resolution::language_type_qualifiers_search_companion_members;
 
-use super::resolution::{
-    TypedFactRelation, json_array, mount_ordinal, nonnegative_i64, read_resolution_statement,
-    require_selected_mount_record,
-};
+use super::resolution::TypedFactRelation;
+use super::resolution::json_array;
+use super::resolution::mount_ordinal;
+use super::resolution::nonnegative_i64;
+use super::resolution::read_resolution_statement;
+use super::resolution::require_selected_mount_record;
+
 use super::resolution_authority::SelectedResolutionAuthority;
+
 use super::resolution_prepare::rust_authority;
-use super::resolution_prepare::typed_rows::{self, TypedRowContext};
-use super::resolution_selection::{
-    SelectedResolutionMountInventory, SelectedResolutionMountRecord, SelectedResolutionReadStamp,
-};
-use super::{Result as StoreResult, StoreError};
+
+use super::resolution_prepare::typed_rows;
+use super::resolution_prepare::typed_rows::TypedRowContext;
+
+use super::resolution_selection::SelectedResolutionMountInventory;
+use super::resolution_selection::SelectedResolutionMountRecord;
+use super::resolution_selection::SelectedResolutionReadStamp;
+
+use super::Result as StoreResult;
+use super::StoreError;
 
 pub(in crate::analyzer::store) const INVOCATION_ROLES_FOR_REFERENCES_SQL: &str = "SELECT role.site, role.role FROM json_each(?2) request \
      CROSS JOIN main.resolution_semantic_sites site ON site.blob_id=?1 \
          AND site.semantic_role='reference' AND site.semantic_key=request.value \
      CROSS JOIN main.resolution_invocation_roles role ON role.blob_id=site.blob_id \
          AND role.site=site.source_site";
+
+// TEMP request tables have no corpus statistics. CROSS JOIN keeps the small
+// request outermost even when SQLite estimates the corpus as cheaper (#5658).
+pub(super) const GENERIC_PARAMETER_DECLARATIONS_SQL: &str = r#"
+    SELECT request.mount_ordinal, request.key0
+    FROM temp.selected_resolution_typed_requests_1 AS request
+    CROSS JOIN temp.selected_resolution_mounts AS mount ON mount.mount_ordinal=request.mount_ordinal
+    CROSS JOIN main.resolution_fragment_interiors AS interior
+      ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
+     AND interior.semantic_language=mount.semantic_language
+     AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest
+     AND interior.publication_state='complete'
+    CROSS JOIN main.resolution_semantic_sites AS semantic
+      ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
+     AND semantic.semantic_key=request.key0 AND semantic.namespace='type'
+    CROSS JOIN main.source_native_declaration_bridges AS bridge
+      ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
+    CROSS JOIN main.source_declarations AS declaration
+      ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
+    WHERE declaration.lexical_kind='parameter'
+"#;
+
+// Enumerate the selected scope before probing any corpus publication.
+pub(super) const QUALIFIED_ROUTE_MOUNTS_SQL: &str = r#"SELECT m.mount_ordinal
+               FROM temp.selected_resolution_scope_mounts AS scope
+               CROSS JOIN temp.selected_resolution_mounts AS m
+ ON m.mount_ordinal = scope.mount_ordinal
+               CROSS JOIN main.resolution_fragment_interiors AS interior
+ ON interior.blob_id = m.blob_id
+AND interior.lang = m.storage_language
+AND interior.semantic_language = m.semantic_language
+AND interior.producer_epoch = m.producer_epoch
+AND interior.interior_digest = m.interior_digest
+AND interior.publication_state = 'complete'
+               WHERE EXISTS (
+ SELECT 1 FROM main.resolution_typed_fact_lookups AS route
+ WHERE route.blob_id = m.blob_id AND route.relation = ?1
+               )
+               ORDER BY m.mount_ordinal"#;
 
 /// The one tier 1 family every typed read's membership comes from: which
 /// blobs hold a fact of a named relation under an interned identity.
@@ -77,7 +166,8 @@ pub(super) const FRONTIER_SOURCE_READY_SQL: &str =
     "SELECT 1 FROM main.source_fact_readiness WHERE blob_id=?1 AND available=1";
 
 /// Operation-local typed reader over one retained selected inventory.
-pub(crate) struct SelectedResolutionTypedSource<'selection, 'store> {
+#[doc(hidden)]
+pub struct SelectedResolutionTypedSource<'selection, 'store> {
     selection: &'selection SelectedResolutionMountInventory<'store>,
     selected_interiors_validation_stamp: Cell<Option<SelectedResolutionReadStamp>>,
     authority: Rc<SelectedResolutionAuthority<'selection>>,
@@ -89,9 +179,8 @@ pub(crate) struct SelectedResolutionTypedSource<'selection, 'store> {
 }
 
 impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
-    pub(crate) fn new_on_demand(
-        selection: &'selection SelectedResolutionMountInventory<'store>,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn new_on_demand(selection: &'selection SelectedResolutionMountInventory<'store>) -> Self {
         Self::with_authority(
             selection,
             Rc::new(SelectedResolutionAuthority::from_selection(selection)),
@@ -366,28 +455,9 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         &self,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<SelectedResolutionMountOrdinal>>> {
-        let sql = format!(
-            r#"SELECT m.mount_ordinal
-               FROM temp.selected_resolution_mounts AS m
-               JOIN temp.selected_resolution_scope_mounts AS scope
-                 ON scope.mount_ordinal = m.mount_ordinal
-               JOIN main.resolution_fragment_interiors AS interior
-                 ON interior.blob_id = m.blob_id
-                AND interior.lang = m.storage_language
-                AND interior.semantic_language = m.semantic_language
-                AND interior.producer_epoch = m.producer_epoch
-                AND interior.interior_digest = m.interior_digest
-                AND interior.publication_state = 'complete'
-               WHERE EXISTS (
-                 SELECT 1 FROM main.{TYPED_FACT_LOOKUP_FAMILY} AS route
-                 WHERE route.blob_id = m.blob_id AND route.relation = {relation}
-               )
-               ORDER BY m.mount_ordinal"#,
-            relation = TypedFactRelation::QualifiedRouteLookup.code(),
-        );
         self.read_statement(cancellation, |conn| {
-            let mut statement = conn.prepare_cached(&sql)?;
-            let mut rows = statement.query([])?;
+            let mut statement = conn.prepare_cached(QUALIFIED_ROUTE_MOUNTS_SQL)?;
+            let mut rows = statement.query([TypedFactRelation::QualifiedRouteLookup.code()])?;
             let mut mounts = Vec::new();
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
@@ -605,7 +675,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             else {
                 return Ok(None);
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             shared_request_probe::observe(
                 relation,
                 shared.len(),
@@ -765,15 +835,15 @@ pub(super) fn shared_membership_sql(requests: usize, relation: TypedFactRelation
         r#"WITH requested(request_ordinal, identity_id) AS (VALUES {values})
            SELECT r.request_ordinal, m.mount_ordinal, membership.identity_id
            FROM requested AS r
-           JOIN main.{TYPED_FACT_LOOKUP_FAMILY} AS membership
+           CROSS JOIN main.{TYPED_FACT_LOOKUP_FAMILY} AS membership
              ON membership.relation = {relation}
             AND membership.identity_id = r.identity_id
-           JOIN temp.selected_resolution_mounts AS m
+           CROSS JOIN temp.selected_resolution_mounts AS m
                 INDEXED BY selected_resolution_mounts_blob_ordinal
              ON m.blob_id = membership.blob_id
-           JOIN temp.selected_resolution_scope_mounts AS scope
+           CROSS JOIN temp.selected_resolution_scope_mounts AS scope
              ON scope.mount_ordinal = m.mount_ordinal
-           JOIN main.resolution_fragment_interiors AS interior
+           CROSS JOIN main.resolution_fragment_interiors AS interior
              ON interior.blob_id = m.blob_id
             AND interior.lang = m.storage_language
             AND interior.semantic_language = m.semantic_language
@@ -827,8 +897,9 @@ fn usize_from_nonnegative(row: &Row<'_>, index: usize, label: &str) -> StoreResu
 /// exactly like a read that never ran. This records both, per relation, in a
 /// fixed-size array of counters on the operation's own thread -- the thread
 /// that owns the retained connection `semantic_coordinates` reads through.
-#[cfg(test)]
-pub(super) mod shared_request_probe {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod shared_request_probe {
     use std::cell::Cell;
 
     use super::TypedFactRelation;
@@ -840,7 +911,8 @@ pub(super) mod shared_request_probe {
             const { [const { Cell::new(0) }; TypedFactRelation::COUNT] };
     }
 
-    pub(crate) fn reset() {
+    #[doc(hidden)]
+    pub fn reset() {
         REQUESTS.with(|counters| counters.iter().for_each(|counter| counter.set(0)));
         MOUNTS.with(|counters| counters.iter().for_each(|counter| counter.set(0)));
     }
@@ -854,7 +926,8 @@ pub(super) mod shared_request_probe {
     /// Every relation that answered a shared request since the last [`reset`],
     /// with its request and mount counts. A pin prints this when it needs to
     /// say which reads a request actually entered.
-    pub(crate) fn observed_all() -> Vec<(&'static str, usize, usize)> {
+    #[doc(hidden)]
+    pub fn observed_all() -> Vec<(&'static str, usize, usize)> {
         TypedFactRelation::ALL
             .iter()
             .map(|relation| {
@@ -867,7 +940,8 @@ pub(super) mod shared_request_probe {
 
     /// The shared requests this relation answered, and the distinct mounts
     /// they resolved to, since the last [`reset`].
-    pub(crate) fn observed(relation: TypedFactRelation) -> (usize, usize) {
+    #[doc(hidden)]
+    pub fn observed(relation: TypedFactRelation) -> (usize, usize) {
         let index = counter_index(relation);
         (
             REQUESTS.with(|counters| counters[index].get()),
@@ -915,7 +989,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         let Some(ordinal) = reference.ordinal() else {
             return Ok(false);
         };
-        Ok(crate::analyzer::languages::language_support(
+        Ok(crate::analyzer::languages::language_knowledge(
             self.mount(SelectedResolutionMountOrdinal::new(ordinal))?
                 .semantic_language(),
         )
@@ -1010,7 +1084,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         ordinal: u32,
     ) -> StoreResult<u32> {
         let language = self.fragment_language(fragment)?;
-        Ok(crate::analyzer::languages::language_support(language)
+        Ok(crate::analyzer::languages::language_knowledge(language)
             .and_then(|support| support.call_target_lookup_routes())
             .and_then(|routes| routes.iter().find(|(_, candidate)| *candidate == namespace))
             .map_or(ordinal, |(rank, _)| *rank))
@@ -1429,32 +1503,26 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                 return Ok(None);
             }
             let Some(rows) = self.read_statement(cancellation, |connection| {
-                let mut statement = connection.prepare_cached(r#"
-                    SELECT request.mount_ordinal, request.key0
-                    FROM temp.selected_resolution_typed_requests_1 AS request
-                    JOIN temp.selected_resolution_mounts AS mount ON mount.mount_ordinal=request.mount_ordinal
-                    JOIN main.resolution_fragment_interiors AS interior
-                      ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
-                     AND interior.semantic_language=mount.semantic_language
-                     AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest
-                     AND interior.publication_state='complete'
-                    JOIN main.resolution_semantic_sites AS semantic
-                      ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
-                     AND semantic.semantic_key=request.key0 AND semantic.namespace='type'
-                    JOIN main.source_native_declaration_bridges AS bridge
-                      ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
-                    JOIN main.source_declarations AS declaration
-                      ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
-                    WHERE declaration.lexical_kind='parameter'
-                "#)?;
+                let mut statement =
+                    connection.prepare_cached(GENERIC_PARAMETER_DECLARATIONS_SQL)?;
                 let mut rows = statement.query([])?;
                 let mut result = Vec::new();
                 while let Some(row) = rows.next()? {
-                    if cancellation.is_cancelled() { return Ok(None); }
-                    result.push(coordinates[&(SelectedResolutionMountOrdinal::new(row.get(0)?), row.get::<_, i64>(1)?)]);
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    result.push(
+                        coordinates[&(
+                            SelectedResolutionMountOrdinal::new(row.get(0)?),
+                            row.get::<_, i64>(1)?,
+                        )],
+                    );
                 }
                 Ok(Some(result))
-            })? else { return Ok(None); };
+            })?
+            else {
+                return Ok(None);
+            };
             found.extend(rows);
         }
         Ok((!cancellation.is_cancelled()).then_some(found))
@@ -2945,7 +3013,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberOwnerProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -2965,7 +3033,27 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        let external = self.visit_external_member_owners_for_definitions(
+            definitions.as_slice(),
+            cancellation,
+            visitor,
+        )?;
+        let completion = source.evidence().combine(external.evidence());
+        Ok(match external.terminal() {
+            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
+                TypedFactReadOutcome::exhausted(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
+                TypedFactReadOutcome::stopped(completion)
+            }
+            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
+                TypedFactReadOutcome::cancelled(completion)
+            }
+        })
     }
 
     fn visit_member_owner_pages_for_owners(
@@ -3453,7 +3541,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     .filter(|key| !memo.rust_reason_owners.contains_key(&(blob_id, *key)))
                     .collect::<Vec<_>>()
             };
-            #[cfg(all(test, debug_assertions))]
+            #[cfg(all(any(test, feature = "test-support"), debug_assertions))]
             let had_hits = misses.len() < keys.len();
             if !misses.is_empty() {
                 let missing_mounts = [(ordinal, misses)];
@@ -3494,7 +3582,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             raw_rows.sort_unstable();
             // Test builds verify reuse against the publication, including negative
             // hits. Production never issues this extra read.
-            #[cfg(all(test, debug_assertions))]
+            #[cfg(all(any(test, feature = "test-support"), debug_assertions))]
             if had_hits {
                 let mut fresh_rows = Vec::<(i64, i64)>::new();
                 let outcome = self.visit_typed_rows(
@@ -4302,137 +4390,28 @@ fn decode_typed_page<T: TypedRowEvidence>(
     Ok(Some(decoded))
 }
 
+impl TypedRowEvidence for SelectedTypedRow<LoweredGenericFormalDefault> {}
+
 #[cfg(test)]
 mod row_evidence_tests {
     use super::*;
-    use crate::analyzer::Language;
-    use crate::analyzer::resolution::{
-        LoweredTypedFragment, PreloadedFactResolutionService, ResolutionSlotValue,
-        ResolutionTypeRef, SharedNameId, TypedFrontierState,
-    };
-    use brokk_bifrost_core::analyzer::resolution_facts::{
-        IntrinsicTypeKind, ResolutionTypeSlotRole,
-    };
 
-    #[test]
-    fn rust_reason_owner_memo_rebases_shared_blob_and_preserves_terminals() {
-        use super::super::resolution_selection::tests::SelectionFixture;
-        let fixture = SelectionFixture::shared_rust_source(
-            2,
-            "pub trait Service { fn run<T>(&self, value: T); } fn main() { missing(); }",
-        );
-        let selection = fixture.open_ready(&[]);
-        let (blob, reasons, expected) = {
-            let connection = selection.connection();
-            let blob: i64 = connection
-                .query_row(
-                    "SELECT blob_id FROM temp.selected_resolution_mounts WHERE mount_ordinal=0",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let reasons = connection
-                .prepare(
-                    "SELECT gap.reason, authority.semantic_key FROM resolution_gap_reasons gap
-                 LEFT JOIN resolution_sites site ON site.blob_id=gap.blob_id
-                   AND site.site=gap.site AND site.role=1
-                 LEFT JOIN resolution_rust_declaration_authorities authority
-                   ON authority.blob_id=site.blob_id AND authority.source_site=site.site
-                 WHERE gap.blob_id=?1 ORDER BY gap.reason",
-                )
-                .unwrap()
-                .query_map([blob], |row| {
-                    Ok((row.get::<_, u32>(0)?, row.get::<_, Option<u32>>(1)?))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert!(
-                reasons.iter().any(|(_, owner)| owner.is_some()),
-                "{reasons:?}"
-            );
-            assert!(
-                reasons.iter().any(|(_, owner)| owner.is_none()),
-                "{reasons:?}"
-            );
-            let expected = reasons
-                .iter()
-                .filter_map(|(reason, owner)| owner.map(|owner| (*reason, owner)))
-                .collect::<Vec<_>>();
-            (blob, reasons, expected)
-        };
-        let source = SelectedResolutionTypedSource::new_on_demand(&selection);
-        let read = |ordinal, cancellation: &CancellationToken, keep_going| {
-            let requested = reasons
-                .iter()
-                .map(|(reason, _)| SemanticId::local(ordinal, *reason))
-                .collect::<Vec<_>>();
-            let mut pages = Vec::new();
-            let outcome = source
-                .visit_rust_reason_owners(
-                    TypedFactRequest::new(&requested),
-                    cancellation,
-                    &mut TypedFactPageVisitor::with_maximum_rows(
-                        &mut |page| {
-                            pages.push(page.to_vec());
-                            Ok(keep_going)
-                        },
-                        1,
-                    ),
-                )
-                .unwrap();
-            (outcome, pages)
-        };
-        let live = CancellationToken::new();
-        for ordinal in [0, 1, 0] {
-            let (outcome, pages) = read(ordinal, &live, true);
-            assert!(outcome.is_exhausted());
-            assert_eq!(
-                pages.into_iter().flatten().collect::<Vec<_>>(),
-                expected
-                    .iter()
-                    .map(|(reason, owner)| {
-                        (
-                            SemanticId::local(ordinal, *reason),
-                            SemanticId::local(ordinal, *owner),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            );
-            let memo = selection.authority_request_memo().borrow();
-            assert_eq!(memo.rust_reason_owners.len(), reasons.len());
-            for (reason, owner) in &reasons {
-                assert_eq!(
-                    memo.rust_reason_owners[&(blob, i64::from(*reason))],
-                    owner.map(i64::from)
-                );
-            }
-        }
-        let (outcome, pages) = read(1, &live, false);
-        assert_eq!(
-            outcome.terminal(),
-            crate::analyzer::resolution::TypedFactReadTerminal::Stopped
-        );
-        assert_eq!(pages.len(), 1);
-        let (outcome, pages) = read(0, &CancellationToken::cancel_after_checks_for_test(0), true);
-        assert!(outcome.is_cancelled());
-        assert!(pages.is_empty());
-        drop(source);
-        drop(selection);
-        let fresh_selection = fixture.open_ready(&[]);
-        assert!(
-            fresh_selection
-                .authority_request_memo()
-                .borrow()
-                .rust_reason_owners
-                .is_empty()
-        );
-    }
+    use crate::analyzer::Language;
+
+    use crate::analyzer::resolution::LoweredTypedFragment;
+    use crate::analyzer::resolution::PreloadedFactResolutionService;
+    use crate::analyzer::resolution::ResolutionSlotValue;
+    use crate::analyzer::resolution::ResolutionTypeRef;
+    use crate::analyzer::resolution::SharedNameId;
+    use crate::analyzer::resolution::TypedFrontierState;
+
+    use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotRole;
 
     #[test]
     fn selected_hierarchy_terminals_preserve_mounts_and_cancellation() {
         use crate::analyzer::resolution::LoweringGapOrigin;
-        use crate::analyzer::store::resolution_selection::tests::SelectionFixture;
+        use crate::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
         use brokk_bifrost_core::analyzer::resolution_facts::{ResolutionGapKind, ResolutionSiteId};
         let fixture = SelectionFixture::custom_source(2, "class Base {} class Box extends Base {}");
         let selection = fixture.open_ready(&[]);
@@ -4513,7 +4492,7 @@ mod row_evidence_tests {
 
     #[test]
     fn frontier_completion_validates_requested_authority_without_unrelated_mounts() {
-        use super::super::resolution_selection::tests::SelectionFixture;
+        use super::super::resolution_selection::selection_test_support::SelectionFixture;
         for damage in ["unrelated", "missing", "stale", "withdrawn_blob"] {
             let fixture =
                 SelectionFixture::custom_source(2, "package demo; class Model { int value = 1; }");
@@ -4608,7 +4587,7 @@ mod row_evidence_tests {
     #[test]
     fn invocation_role_reader_is_keyed_under_both_statistics_states() {
         use super::super::planner_statistics::pinned_plans::{pinned, plan_rows};
-        use super::super::resolution_selection::tests::SelectionFixture;
+        use super::super::resolution_selection::selection_test_support::SelectionFixture;
         use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
         for statistics in PlannerStatisticsState::BOTH {
             let fixture = SelectionFixture::new(32);
@@ -4641,7 +4620,7 @@ mod row_evidence_tests {
     #[test]
     fn frontier_source_visibility_pin_is_keyed_under_both_statistics_states() {
         use super::super::planner_statistics::pinned_plans::{pinned, plan_rows};
-        use super::super::resolution_selection::tests::SelectionFixture;
+        use super::super::resolution_selection::selection_test_support::SelectionFixture;
         use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
         use rusqlite::StatementStatus;
         for statistics in PlannerStatisticsState::BOTH {
@@ -4973,5 +4952,3 @@ mod row_evidence_tests {
         }
     }
 }
-
-impl TypedRowEvidence for SelectedTypedRow<LoweredGenericFormalDefault> {}

@@ -28,21 +28,68 @@
 
 use std::collections::HashMap;
 
-use super::facts::{FileFacts, Span};
+use super::facts::FileFacts;
+
+use super::facts::Span;
+
 use super::kinds::NormalizedKind;
-use super::occurrence_rows::{OccurrenceRow, ast_id};
-use super::occurrences::{Namespace, OccurrenceRole};
-use super::resolution::{
-    BindingKind, BindingScopeCandidate, BindingScopeSelection, BoundaryStatus, DeclaredVisibility,
-    EnvironmentAxis, HoistingClass, ImportActivation, LexicalEnvironmentSupport, ScopeFormation,
-};
+
+use super::occurrence_rows::OccurrenceRow;
+
+use super::occurrence_rows::ast_id;
+
+use super::occurrences::Namespace;
+
+use super::occurrences::OccurrenceRole;
+
+use super::resolution::BindingKind;
+
+use super::resolution::BindingScopeCandidate;
+
+use super::resolution::BindingScopeSelection;
+
+use super::resolution::BoundaryStatus;
+
+use super::resolution::DeclaredVisibility;
+
+use super::resolution::EnvironmentAxis;
+
+use super::resolution::HoistingClass;
+
+use super::resolution::ImportActivation;
+
+use super::resolution::LexicalEnvironmentSupport;
+
+use super::resolution::ScopeFormation;
+
 use super::spec::StructuralSpec;
+
 use crate::analyzer::common::language_for_file;
+
 use crate::analyzer::semantic::ContentIdentity;
+
 use crate::analyzer::structural_spec_for;
+
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use crate::analyzer::{CodeUnit, FqName, IAnalyzer, ImportInfo, Language, ProjectFile, Range};
+
+use crate::analyzer::AnalyzerQueryScope;
+
+use crate::analyzer::QueryScope;
+
+use crate::analyzer::CodeUnit;
+
+use crate::analyzer::FqName;
+
+use crate::analyzer::IAnalyzer;
+
+use crate::analyzer::ImportInfo;
+
+use crate::analyzer::Language;
+
+use crate::analyzer::ProjectFile;
+
+use crate::analyzer::Range;
+
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 /// The axes this producer answers. The two candidate axes
@@ -1102,166 +1149,15 @@ pub fn binding_of_occurrence(
     positional
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
+
     use super::*;
-    use crate::test_support::AnalyzerFixture;
-
-    struct Fixture {
-        analyzer: AnalyzerFixture,
-        file: ProjectFile,
-        source: String,
-    }
-
-    impl Fixture {
-        fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            let analyzer = AnalyzerFixture::new_for_language(language, &[(relative_path, source)]);
-            let file = ProjectFile::new(analyzer.project_root(), relative_path);
-            Self {
-                analyzer,
-                file,
-                source: source.to_owned(),
-            }
-        }
-
-        fn environment(&self) -> EnvironmentFileResult {
-            environment_for_file(self.analyzer.analyzer().analyzer(), &self.file)
-        }
-
-        /// Byte offset of `needle`; the marker keeps a position assertion
-        /// readable without re-scanning the fixture.
-        fn at(&self, needle: &str) -> usize {
-            crate::test_support::fixture_marker(&self.source, needle)
-        }
-    }
-
-    fn binding<'env>(env: &'env EnvironmentFileResult, name: &str) -> &'env BindingRow {
-        let mut matches = env.bindings.iter().filter(|row| row.name == name);
-        let found = matches
-            .next()
-            .unwrap_or_else(|| panic!("no binding named {name:?}; bindings: {:?}", env.bindings));
-        assert!(
-            matches.next().is_none(),
-            "more than one binding named {name:?}; bindings: {:?}",
-            env.bindings
-        );
-        found
-    }
-
-    /// The single binding in effect at `position`, failing with the whole
-    /// environment when the answer is anything else.
-    fn reached<'env>(
-        env: &'env EnvironmentFileResult,
-        name: &str,
-        position: usize,
-    ) -> &'env BindingRow {
-        match binding_of(env, name, position, None) {
-            BindingOfOutcome::Reached(index) => &env.bindings[index],
-            BindingOfOutcome::Shadowed { winner, .. } => &env.bindings[winner],
-            other => panic!(
-                "expected {name:?} to reach a binding at byte {position}, got {other:?}; \
-                 bindings: {:?}",
-                env.bindings
-            ),
-        }
-    }
-
-    #[test]
-    fn js_var_read_before_its_declaration_reaches_the_hoisted_binding() {
-        let source = concat!(
-            "function render() {\n",
-            "    const before = value;\n",
-            "    var value = 2;\n",
-            "    return before + value;\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::JavaScript, "src/app.js", source);
-        let env = fixture.environment();
-
-        let value = binding(&env, "value");
-        assert_eq!(value.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(
-            reached(&env, "value", fixture.at("value;\n    var")).node,
-            value.node
-        );
-    }
-
-    #[test]
-    fn python_function_local_assigned_in_a_block_reaches_after_the_block() {
-        let source = concat!(
-            "def render(choose):\n",
-            "    if choose:\n",
-            "        value = 1\n",
-            "    return value\n",
-        );
-        let fixture = Fixture::new(Language::Python, "src/app.py", source);
-        let env = fixture.environment();
-
-        let value = binding(&env, "value");
-        assert_eq!(value.kind, BindingKind::Local);
-        assert_eq!(
-            env.scope(value.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Function),
-            "Python's if block does not open a lexical scope"
-        );
-        assert_eq!(
-            reached(&env, "value", fixture.at("return value") + "return ".len()).node,
-            value.node
-        );
-    }
-
-    #[test]
-    fn python_module_root_keeps_top_level_imports_in_file_scope() {
-        let fixture = Fixture::new(
-            Language::Python,
-            "src/app.py",
-            "import json\nvalue = json\n",
-        );
-        let env = fixture.environment();
-
-        assert_eq!(env.scopes.len(), 1, "scopes: {:?}", env.scopes);
-        let json = binding(&env, "json");
-        assert_eq!(json.declaring_scope, 0);
-        assert_eq!(env.scope(json.declaring_scope).anchor, ScopeAnchor::File);
-    }
-
-    /// One import statement can introduce several names, and a rename can make
-    /// two rows' spellings collide with each other's targets. The binder token
-    /// is joined by the adapter-recorded span (#1600), so each row lands on
-    /// its own alias token; a spelling comparison would send the first row to
-    /// the second selector's *name* token, which also spells `beta`.
-    #[test]
-    fn python_swapped_import_aliases_keep_their_own_binder_tokens() {
-        let source = "from pkg import alpha as beta, beta as alpha\n";
-        let fixture = Fixture::new(Language::Python, "src/app.py", source);
-        let env = fixture.environment();
-
-        let beta = binding(&env, "beta");
-        let alpha = binding(&env, "alpha");
-        assert_eq!(beta.kind, BindingKind::ImportBinder);
-        assert_eq!(alpha.kind, BindingKind::ImportBinder);
-        // Both rows keep the scope-wide interval the shared default states:
-        // Python does not override `import_binder_activation`, so #2925 left
-        // its rows exactly as they were.
-        assert_eq!(beta.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(alpha.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(beta.activation, env.scopes[0].range);
-        assert_eq!(alpha.activation, env.scopes[0].range);
-        assert_eq!(
-            beta.range.start_byte,
-            fixture.at("beta,"),
-            "the row bound as beta anchors on its own alias token: {beta:?}"
-        );
-        assert_eq!(
-            alpha.range.start_byte,
-            fixture.at("as alpha") + "as ".len(),
-            "the row bound as alpha anchors on its own alias token: {alpha:?}"
-        );
-        assert_ne!(
-            beta.node, alpha.node,
-            "two rows of one declaration keep distinct AST identities"
-        );
-    }
 
     /// Two wildcard imports in one file can both supply a simple name, which is
     /// exactly the collision the Java resolver answers today by returning
@@ -1455,115 +1351,6 @@ mod tests {
             binding_of(&env, "value", fixture.at("build(base)"), None),
             BindingOfOutcome::NoBinding,
             "and nowhere else"
-        );
-    }
-
-    /// An unbraced `namespace N;` makes the rest of the file that namespace,
-    /// so a `use` written under it binds over the file scope. PHP resolves the
-    /// imported name at compile time but sequentially: a reference written
-    /// above the `use` does not resolve through it, which is `SourceOrder`.
-    #[test]
-    fn php_use_aliases_bind_from_their_declaration_over_an_unbraced_namespace() {
-        let source = concat!(
-            "<?php\n",
-            "\n",
-            "namespace App\\Util;\n",
-            "\n",
-            "use App\\Model\\Widget as Gadget;\n",
-            "\n",
-            "function make(): Gadget {\n",
-            "    return new Gadget();\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Php, "src/make.php", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        let gadget = binding(&env, "Gadget");
-        assert_eq!(gadget.kind, BindingKind::ImportBinder);
-        assert_eq!(gadget.hoisting, HoistingClass::SourceOrder);
-        assert_eq!(
-            gadget.declaring_scope, 0,
-            "an unbraced namespace does not open a body, so the file scope is the namespace scope"
-        );
-        let detail = gadget
-            .import
-            .as_ref()
-            .expect("an import binder carries a detail");
-        assert_eq!(detail.alias.as_deref(), Some("Gadget"));
-        assert_eq!(detail.imported_name.as_deref(), Some("Widget"));
-        assert_eq!(detail.target_segments, ["App", "Model", "Widget"]);
-        assert!(!detail.wildcard, "PHP has no wildcard import");
-
-        assert_eq!(
-            reached(&env, "Gadget", fixture.at("new Gadget()")).node,
-            gadget.node,
-            "the alias is in effect below its declaration"
-        );
-        assert_eq!(
-            binding_of(&env, "Gadget", fixture.at("namespace App"), None),
-            BindingOfOutcome::NoBinding,
-            "and not above it"
-        );
-
-        assert_eq!(
-            env.package
-                .package_fq
-                .as_ref()
-                .map(|fq| fq.display(brokk_bifrost_core::analyzer::fq_name::segment_interner())),
-            Some("App.Util".to_owned())
-        );
-        assert!(
-            env.package.syntactic,
-            "PHP writes its namespace in the source"
-        );
-    }
-
-    /// A braced `namespace N { ... }` is its own scope, and the `use` names it
-    /// imports stop at its closing brace.
-    #[test]
-    fn php_use_aliases_stop_at_the_end_of_a_braced_namespace() {
-        let source = concat!(
-            "<?php\n",
-            "\n",
-            "namespace First {\n",
-            "    use App\\Model\\Widget as Gadget;\n",
-            "\n",
-            "    function first(): Gadget {\n",
-            "        return new Gadget();\n",
-            "    }\n",
-            "}\n",
-            "\n",
-            "namespace Second {\n",
-            "    function second(): int {\n",
-            "        return 1;\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Php, "src/braced.php", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        let gadget = binding(&env, "Gadget");
-        assert_eq!(gadget.kind, BindingKind::ImportBinder);
-        let namespace = env.scope(gadget.declaring_scope);
-        assert_eq!(
-            namespace.anchor.kind(),
-            Some(NormalizedKind::Module),
-            "a braced namespace body is the scope its imports are written in"
-        );
-        assert_eq!(
-            gadget.activation.end_byte, namespace.range.end_byte,
-            "and the alias stops where that namespace does"
-        );
-        assert_eq!(
-            reached(&env, "Gadget", fixture.at("new Gadget()")).node,
-            gadget.node
-        );
-        assert_eq!(
-            binding_of(&env, "Gadget", fixture.at("return 1"), None),
-            BindingOfOutcome::NoBinding,
-            "the sibling namespace never sees it"
         );
     }
 }

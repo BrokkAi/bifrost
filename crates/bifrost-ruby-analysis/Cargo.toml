@@ -1,0 +1,58 @@
+[package]
+name = "brokk-bifrost-ruby-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ruby analyzer and receiver-aware usage resolution for brokk-bifrost"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = true
+readme = "README.md"
+
+[lib]
+name = "brokk_bifrost_ruby_analysis"
+
+[lints]
+workspace = true
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0" }
+brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.14.0" }
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+git2 = { version = "0.20.2", default-features = false }
+moka = { version = "0.12.11", features = ["sync"] }
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+"hooks",
+"functions",
+] }
+rubund = { version = "=0.1.0", default-features = false }
+semver = "1.0.28"
+tempfile = "3.23.0"
+tree-sitter = "0.25.10"
+tree-sitter-rbs = "=0.2.2"
+tree-sitter-ruby = "0.23.1"
+tar = { version = "0.4.44", default-features = false }
+
+[features]
+default = []
+test-support = ["brokk-bifrost-analysis/test-support"]
+randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
+
+[dev-dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0", features = ["test-support"] }
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+] }

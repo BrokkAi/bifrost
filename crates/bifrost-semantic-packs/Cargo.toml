@@ -20,6 +20,7 @@ name = "brokk_bifrost_semantic_packs"
 [features]
 default = []
 release-tooling = [
+    "dep:brokk-bifrost-tools",
     "dep:semver",
     "dep:serde",
     "dep:serde_json",
@@ -48,8 +49,18 @@ path = "src/bin/bifrost-semantic-pack.rs"
 required-features = ["release-tooling"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.13.1" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.13.1" }
+brokk-bifrost-rust-analysis = { path = "../bifrost-rust-analysis", version = "=0.14.0" }
+brokk-bifrost-go-analysis = { path = "../bifrost-go-analysis", version = "=0.14.0" }
+brokk-bifrost-php-analysis = { path = "../bifrost-php-analysis", version = "=0.14.0" }
+brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.14.0" }
+brokk-bifrost-ruby-analysis = { path = "../bifrost-ruby-analysis", version = "=0.14.0" }
+brokk-bifrost-csharp-analysis = { path = "../bifrost-csharp-analysis", version = "=0.14.0" }
+brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.14.0" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.14.0" }
+# The bifrost-semantic-pack binary links the complete language table, which
+# only brokk-bifrost-tools defines.
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.14.0", optional = true }
 semver = { version = "1.0.28", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }
@@ -64,8 +75,12 @@ ureq = { version = "3.4.0", default-features = false, features = ["rustls"], opt
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"], optional = true }
 
 [dev-dependencies]
+brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.14.0", features = ["test-support"] }
+
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.14.0", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.13.1", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0", features = ["test-support"] }
 jsonschema = { version = "0.48.0", default-features = false }
 tempfile = "3.23.0"
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"] }

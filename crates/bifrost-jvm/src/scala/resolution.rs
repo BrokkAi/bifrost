@@ -11,13 +11,14 @@ use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole, DeclarationTypeSlotFact,
     FileResolutionFacts, PositionedIdentifierFact, ResolutionAdditionalDefinitionNamespaceFact,
-    ResolutionBinderFact, ResolutionBinderKind, ResolutionCallArgumentListFact, ResolutionCallFact,
-    ResolutionCallTypeArgumentFact, ResolutionCallableParameterFact,
-    ResolutionCallableParameterListFact, ResolutionCallableParameterSemanticsFact,
-    ResolutionCallableReceiverOrigin, ResolutionCallableReceiverOriginFact,
-    ResolutionCallableSignatureFact, ResolutionDeclarationVisibilityFact,
-    ResolutionDefinitionUnitFact, ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind,
-    ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole, ResolutionImportRouteFact,
+    ResolutionBinaryOwnerRoute, ResolutionBinderFact, ResolutionBinderKind,
+    ResolutionCallArgumentListFact, ResolutionCallFact, ResolutionCallTypeArgumentFact,
+    ResolutionCallableParameterFact, ResolutionCallableParameterListFact,
+    ResolutionCallableParameterSemanticsFact, ResolutionCallableReceiverOrigin,
+    ResolutionCallableReceiverOriginFact, ResolutionCallableSignatureFact,
+    ResolutionDeclarationVisibilityFact, ResolutionDefinitionUnitFact,
+    ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind, ResolutionGapFact,
+    ResolutionGapKind, ResolutionIdentifierRole, ResolutionImportRouteFact,
     ResolutionImportRouteKind, ResolutionImportRouteSegmentFact, ResolutionImportSelectorFact,
     ResolutionImportSelectorKind, ResolutionInvocationRole, ResolutionInvocationRoleFact,
     ResolutionJvmAliasFact, ResolutionJvmAliasId, ResolutionJvmAliasKind,
@@ -30,12 +31,12 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionRootImportAnchor, ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
     ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
     ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
-    ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
-    ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSingletonRelationFact,
-    ResolutionSingletonRelationKind, ResolutionSiteFact, ResolutionSiteId, ResolutionSiteKind,
-    ResolutionSupertypeFact, ResolutionSupertypeKind, ResolutionTypeSlotFact, ResolutionTypeSlotId,
-    ResolutionTypeSlotRole, ResolutionTypeTransferFact, ResolutionTypeTransferKind,
-    ResolutionTypeTransferValueTransform,
+    ResolutionRootReferenceSegmentFact, ResolutionRouteGap, ResolutionRouteOwner,
+    ResolutionScopeFact, ResolutionScopeId, ResolutionScopeInheritance, ResolutionScopeKind,
+    ResolutionSingletonRelationFact, ResolutionSingletonRelationKind, ResolutionSiteFact,
+    ResolutionSiteId, ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
+    ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
+    ResolutionTypeTransferFact, ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
 };
 use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceId, SourceOccurrenceProvenance,
@@ -46,7 +47,9 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingKind, DeclaredVisibility, HoistingClass,
 };
 use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
-use brokk_bifrost_core::analyzer::tree_walk::{expression_target_node, node_range};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    expression_target_node, node_range, unwrap_parenthesized_expression,
+};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -338,11 +341,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             }
 
             if node.kind() == "call_expression" || node.kind() == "infix_expression" {
-                let curried_function = node.kind() == "call_expression"
-                    && node.parent().is_some_and(|parent| {
-                        parent.kind() == "call_expression"
-                            && field_name_in_parent(parent, node) == Some("function")
-                    });
+                let curried_function = application_is_curried_function(node);
                 // Scala parses later argument lists of `new C(first)(second)`
                 // as a call_expression over the instance_expression. The
                 // constructor call-shape owns those lists; treating this node
@@ -964,7 +963,15 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     // This is a missing lexical owner, independent of the
                     // coarse modifier's access obligation. Ordinary private
                     // access must not discharge invalid-qualifier evidence.
-                    self.gap(site, ResolutionGapKind::UnsupportedRoute);
+                    {
+                        let classified_route = ResolutionRouteGap::UnknownAlias {
+                            owner: ResolutionRouteOwner::DeclarationAccess(site),
+                            binary_owner: self.binary_owner_prefix(scope),
+                            name: None,
+                            kind: None,
+                        };
+                        self.facts.add_route_gap(site, classified_route);
+                    };
                     if !publish_reference {
                         continue;
                     }
@@ -977,7 +984,15 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         ResolutionNamespace::Value,
                         None,
                     );
-                    self.gap(reference, ResolutionGapKind::UnsupportedRoute);
+                    {
+                        let classified_route = ResolutionRouteGap::UnknownAlias {
+                            owner: ResolutionRouteOwner::DeclarationAccess(site),
+                            binary_owner: self.binary_owner_prefix(scope),
+                            name: None,
+                            kind: None,
+                        };
+                        self.facts.add_route_gap(reference, classified_route);
+                    };
                     self.facts
                         .reference_owners
                         .push(ResolutionReferenceOwnerFact {
@@ -1495,7 +1510,19 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 && let Some(chain) = nearest_path_chain(node)
             {
                 let route = self.add_site(chain, ResolutionSiteKind::UnsupportedRoute, scope);
-                self.gap(route, ResolutionGapKind::UnsupportedRoute);
+                {
+                    let classified_route = ResolutionRouteGap::OmittedReference {
+                        scope,
+                        terminal: terminal_identifier(chain)
+                            .map(|terminal| self.intern_name(node_text(terminal, self.source))),
+                        namespace: terminal_identifier(chain).and_then(|terminal| {
+                            scala_occurrence_role(terminal).and_then(|role| {
+                                scala_occurrence_namespace(terminal, role, self.source)
+                            })
+                        }),
+                    };
+                    self.facts.add_route_gap(route, classified_route);
+                };
                 if !self
                     .facts
                     .reference_enumeration_gaps
@@ -2065,7 +2092,15 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let clauses = import_clauses(node);
         if clauses.is_empty() {
             let site = self.add_site(node, ResolutionSiteKind::ImportDeclaration, scope);
-            self.gap(site, ResolutionGapKind::UnsupportedRoute);
+            self.facts.add_route_gap(
+                site,
+                ResolutionRouteGap::UnknownBinder {
+                    scope,
+                    name: None,
+                    namespace: None,
+                    may_publish: false,
+                },
+            );
             self.facts
                 .reference_enumeration_gaps
                 .push(ResolutionReferenceEnumerationGapFact {
@@ -2107,7 +2142,16 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         || source.is_none() && !star
                         || path.is_empty() && source.is_none()
                     {
-                        self.gap(site, ResolutionGapKind::UnsupportedRoute);
+                        {
+                            let classified_route = ResolutionRouteGap::UnknownBinder {
+                                scope,
+                                name: local
+                                    .map(|local| self.intern_name(node_text(local, self.source))),
+                                namespace: None,
+                                may_publish: false,
+                            };
+                            self.facts.add_route_gap(site, classified_route);
+                        };
                         self.facts.reference_enumeration_gaps.push(
                             ResolutionReferenceEnumerationGapFact {
                                 site,
@@ -2158,7 +2202,15 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             }
             if path.is_empty() {
                 let site = self.add_site(node, ResolutionSiteKind::ImportDeclaration, scope);
-                self.gap(site, ResolutionGapKind::UnsupportedRoute);
+                self.facts.add_route_gap(
+                    site,
+                    ResolutionRouteGap::UnknownBinder {
+                        scope,
+                        name: None,
+                        namespace: None,
+                        may_publish: false,
+                    },
+                );
                 self.facts
                     .reference_enumeration_gaps
                     .push(ResolutionReferenceEnumerationGapFact {
@@ -2678,6 +2730,29 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             },
         );
         self.facts.package_references.extend(references);
+    }
+
+    fn binary_owner_prefix(&self, scope: ResolutionScopeId) -> ResolutionBinaryOwnerRoute {
+        let scope = self.package_scope_for(scope);
+        assert!(
+            self.facts
+                .packages
+                .iter()
+                .any(|package| package.root_scope == scope),
+            "an unknown binary owner needs a known source package prefix"
+        );
+        let mut prefix = self
+            .facts
+            .package_segments
+            .iter()
+            .filter(|segment| segment.root_scope == scope)
+            .map(|segment| (segment.ordinal, segment.name))
+            .collect::<Vec<_>>();
+        prefix.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        ResolutionBinaryOwnerRoute::UnknownWithin {
+            scope,
+            prefix: prefix.into_iter().map(|(_, name)| name).collect(),
+        }
     }
 
     fn package_scope_for(&self, mut scope: ResolutionScopeId) -> ResolutionScopeId {
@@ -3408,7 +3483,15 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 // source route. Its written lexical owner is still exact.
                 // Keep its implicit import open rather than resolving the
                 // enum's name through declarations in its own body.
-                self.gap(import, ResolutionGapKind::UnsupportedRoute);
+                {
+                    let classified_route = ResolutionRouteGap::UnknownBinder {
+                        scope: enum_scope,
+                        name: Some(self.intern_name(node_text(name, self.source))),
+                        namespace: None,
+                        may_publish: false,
+                    };
+                    self.facts.add_route_gap(import, classified_route);
+                };
                 self.facts
                     .reference_enumeration_gaps
                     .push(ResolutionReferenceEnumerationGapFact {
@@ -3851,16 +3934,37 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 continue;
             };
             let mut application_nodes = Vec::new();
+            let mut infix_receiver = None;
             let mut function = if node.kind() == "call_expression" {
                 let mut function = node.child_by_field_name("function");
                 application_nodes.push(node);
-                while let Some(inner) = function.filter(|inner| inner.kind() == "call_expression") {
-                    application_nodes.push(inner);
-                    function = inner.child_by_field_name("function");
+                while let Some(expression) = function {
+                    // Parentheses around a curried function value, as in
+                    // `(parsedxml2 \\ "book") { ... }`, do not separate the
+                    // applied callee from the inner application. Both lists
+                    // belong to one call fact, exactly as `f(a)(b)` does.
+                    let application = unwrap_parenthesized_expression(expression);
+                    match application.kind() {
+                        "call_expression" => {
+                            application_nodes.push(application);
+                            function = application.child_by_field_name("function");
+                        }
+                        "infix_expression" => {
+                            application_nodes.push(application);
+                            infix_receiver = application.child_by_field_name("left");
+                            function = application.child_by_field_name("operator");
+                            break;
+                        }
+                        _ => {
+                            function = Some(application);
+                            break;
+                        }
+                    }
                 }
                 function
             } else {
                 application_nodes.push(node);
+                infix_receiver = node.child_by_field_name("left");
                 node.child_by_field_name("operator")
             };
             application_nodes.reverse();
@@ -3919,14 +4023,12 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             // consumed by the shared JVM callable-result projector. The typed
             // lowerer excludes this origin from lexical declaration gaps.
             self.gap(callee, ResolutionGapKind::UnsupportedCallApplicability);
-            let receiver_node = if node.kind() == "infix_expression" {
-                node.child_by_field_name("left")
-            } else {
-                function
-                    .child_by_field_name("value")
-                    .filter(|_| function.kind() == "field_expression")
+            let receiver_node = infix_receiver.or_else(|| {
+                (function.kind() == "field_expression")
+                    .then(|| function.child_by_field_name("value"))
+                    .flatten()
                     .filter(|_| !self.current_instance_members.contains(&callee))
-            };
+            });
             let call_scope = self.facts.sites[call.index()].scope;
             let receiver = receiver_node.map(|receiver_node| {
                 let input = self.expression_slot(receiver_node, call_scope);
@@ -4373,7 +4475,16 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             {
                 let scope = self.facts.sites[site.index()].scope;
                 if !self.add_object_module_alias(site, name, scope) {
-                    self.gap(site, ResolutionGapKind::UnsupportedRoute);
+                    {
+                        let classified_route = ResolutionRouteGap::UnknownAlias {
+                            owner: ResolutionRouteOwner::Declaration(site),
+                            binary_owner: self
+                                .binary_owner_prefix(self.facts.sites[site.index()].scope),
+                            name: Some(self.intern_name("MODULE$")),
+                            kind: Some(ResolutionJvmAliasKind::SingletonInstance),
+                        };
+                        self.facts.add_route_gap(site, classified_route);
+                    };
                 }
             } else if node.kind() == "object_definition"
                 && let Some(name) = declaration_name(node)
@@ -4382,10 +4493,28 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             {
                 let scope = self.facts.sites[site.index()].scope;
                 if !self.add_object_module_alias(site, name, scope) {
-                    self.gap(site, ResolutionGapKind::UnsupportedRoute);
+                    {
+                        let classified_route = ResolutionRouteGap::UnknownAlias {
+                            owner: ResolutionRouteOwner::Declaration(site),
+                            binary_owner: self
+                                .binary_owner_prefix(self.facts.sites[site.index()].scope),
+                            name: Some(self.intern_name("MODULE$")),
+                            kind: Some(ResolutionJvmAliasKind::SingletonInstance),
+                        };
+                        self.facts.add_route_gap(site, classified_route);
+                    };
                 }
             } else if node.kind() == "object_definition" {
-                self.gap(site, ResolutionGapKind::UnsupportedRoute);
+                {
+                    let classified_route = ResolutionRouteGap::UnknownAlias {
+                        owner: ResolutionRouteOwner::Declaration(site),
+                        binary_owner: self
+                            .binary_owner_prefix(self.facts.sites[site.index()].scope),
+                        name: Some(self.intern_name("MODULE$")),
+                        kind: Some(ResolutionJvmAliasKind::SingletonInstance),
+                    };
+                    self.facts.add_route_gap(site, classified_route);
+                };
             }
         }
 
@@ -4639,7 +4768,25 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             return;
         }
         let site = self.add_site(node, ResolutionSiteKind::UnsupportedRoute, scope);
-        self.gap(site, ResolutionGapKind::UnsupportedRoute);
+        let names = scala_export_info_from_node(node, self.source).map(|export| {
+            export.selectors.into_iter().filter_map(|selector| match selector {
+                brokk_bifrost_core::analyzer::model::ScalaExportSelector::Named { visible_name, .. } => visible_name.map(Some),
+                brokk_bifrost_core::analyzer::model::ScalaExportSelector::Wildcard
+                | brokk_bifrost_core::analyzer::model::ScalaExportSelector::GivenWildcard => Some(None),
+            }).collect::<Vec<_>>()
+        }).unwrap_or_else(|| vec![None]);
+        for name in names {
+            let name = name.as_deref().map(|name| self.intern_name(name));
+            self.facts.add_route_gap(
+                site,
+                ResolutionRouteGap::UnknownBinder {
+                    scope,
+                    name,
+                    namespace: None,
+                    may_publish: true,
+                },
+            );
+        }
         self.facts
             .reference_enumeration_gaps
             .push(ResolutionReferenceEnumerationGapFact {
@@ -5229,7 +5376,30 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let name = declaration_name(node).expect("named Scala case class declaration");
         let scope = self.facts.sites[declaration.index()].scope;
         let Some(owner_segments) = self.jvm_type_owner_segments(scope, name, "$") else {
-            self.gap(declaration, ResolutionGapKind::UnsupportedRoute);
+            for (member, spelling) in [
+                (apply, "apply"),
+                (
+                    unapply,
+                    if scala_case_class_has_repeated_parameter(node) {
+                        "unapplySeq"
+                    } else {
+                        "unapply"
+                    },
+                ),
+            ] {
+                if let Some(member) = member {
+                    let name = self.intern_name(spelling);
+                    self.facts.add_route_gap(
+                        member,
+                        ResolutionRouteGap::UnknownAlias {
+                            owner: ResolutionRouteOwner::Declaration(declaration),
+                            binary_owner: self.binary_owner_prefix(scope),
+                            name: Some(name),
+                            kind: Some(ResolutionJvmAliasKind::Method),
+                        },
+                    );
+                }
+            }
             return;
         };
         if let Some(apply) = apply {
@@ -5268,6 +5438,14 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         name: Node<'source>,
         suffix: &str,
     ) -> Option<Vec<ResolutionNameId>> {
+        if !matches!(
+            self.scope(scope).kind,
+            ResolutionScopeKind::CompilationUnit
+                | ResolutionScopeKind::Package
+                | ResolutionScopeKind::TypeBody
+        ) {
+            return None;
+        }
         let package_root_scope = self.package_scope_for(scope);
         assert!(
             self.facts
@@ -5278,8 +5456,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let mut owner_names = Vec::new();
         let mut owner = self.scope(scope).owner;
         while let Some(owner_site) = owner {
-            if self.facts.sites[owner_site.index()].kind != ResolutionSiteKind::TypeDeclaration {
-                break;
+            match self.facts.sites[owner_site.index()].kind {
+                ResolutionSiteKind::TypeDeclaration => {}
+                ResolutionSiteKind::PackageDeclaration => break,
+                _ => return None,
             }
             let owner_name = self.facts.identifiers.iter().find_map(|identifier| {
                 (identifier.site == owner_site
@@ -5344,16 +5524,53 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             );
     }
 
+    /// Name the direct methods whose receiver contract is missing. Local
+    /// functions inside those methods keep their independent binder identity.
+    fn extension_route_binders(
+        &self,
+        extension: Node<'source>,
+    ) -> Vec<(ResolutionScopeId, Option<ResolutionNameId>)> {
+        self.facts
+            .identifiers
+            .iter()
+            .filter_map(|identifier| {
+                let site = self.facts.sites[identifier.site.index()];
+                if identifier.role != ResolutionIdentifierRole::Declaration
+                    || identifier.namespace != ResolutionNamespace::Callable
+                    || site.start_byte < extension.start_byte()
+                    || site.end_byte > extension.end_byte()
+                {
+                    return None;
+                }
+                let node = *self.declaration_nodes.get(&identifier.site)?;
+                if !matches!(node.kind(), "function_definition" | "function_declaration") {
+                    return None;
+                }
+                let enclosing_callable = node
+                    .parent()
+                    .and_then(|parent| nearest_ancestor(parent, "function_definition"));
+                if enclosing_callable.is_some_and(|owner| {
+                    extension.start_byte() <= owner.start_byte()
+                        && owner.end_byte() <= extension.end_byte()
+                }) {
+                    return None;
+                }
+                Some((site.scope, Some(identifier.name)))
+            })
+            .collect()
+    }
+
     fn lower_extension_receivers(&mut self, extension: Node<'source>) {
+        let extension_scope = self.scopes_by_node[&extension.id()];
+        let binding_scope = self
+            .scope(extension_scope)
+            .parent
+            .expect("extension has an enclosing binding scope");
         if nearest_ancestor(extension, "given_definition").is_some() {
             // Native facts do not yet model given discovery or given imports.
             // Keep the named omission visible in the enclosing scope, without
             // exporting an ordinary callable as a substitute for that search.
-            let extension_scope = self.scopes_by_node[&extension.id()];
-            let scope = self
-                .scope(extension_scope)
-                .parent
-                .expect("extension has an enclosing scope");
+            let scope = binding_scope;
             let mut stack = vec![extension];
             while let Some(node) = stack.pop() {
                 if node.id() != extension.id()
@@ -5395,9 +5612,23 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             let site = self.add_site(
                 extension,
                 ResolutionSiteKind::UnsupportedRoute,
-                self.facts.scopes[0].id,
+                binding_scope,
             );
-            self.gap(site, ResolutionGapKind::UnsupportedRoute);
+            let mut binders = self.extension_route_binders(extension);
+            if binders.is_empty() {
+                binders.push((binding_scope, None));
+            }
+            for (scope, name) in binders {
+                self.facts.add_route_gap(
+                    site,
+                    ResolutionRouteGap::UnknownBinder {
+                        scope,
+                        name,
+                        namespace: Some(ResolutionNamespace::Callable),
+                        may_publish: true,
+                    },
+                );
+            }
             return;
         };
         let mut cursor = parameters.walk();
@@ -5438,13 +5669,26 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             stack.extend(children.into_iter().rev());
         }
         if unsupported || method_count == 0 {
-            let scope = self
-                .scopes_by_node
-                .get(&extension.id())
-                .copied()
-                .unwrap_or(self.root_scope);
-            let site = self.add_site(extension, ResolutionSiteKind::UnsupportedRoute, scope);
-            self.gap(site, ResolutionGapKind::UnsupportedRoute);
+            let site = self.add_site(
+                extension,
+                ResolutionSiteKind::UnsupportedRoute,
+                binding_scope,
+            );
+            let mut binders = self.extension_route_binders(extension);
+            if binders.is_empty() {
+                binders.push((binding_scope, None));
+            }
+            for (scope, name) in binders {
+                self.facts.add_route_gap(
+                    site,
+                    ResolutionRouteGap::UnknownBinder {
+                        scope,
+                        name,
+                        namespace: Some(ResolutionNamespace::Callable),
+                        may_publish: true,
+                    },
+                );
+            }
             self.facts
                 .reference_enumeration_gaps
                 .push(ResolutionReferenceEnumerationGapFact {
@@ -6020,8 +6264,12 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
     }
 
     fn gap(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
-        if !self.facts.gaps.contains(&ResolutionGapFact { site, kind }) {
-            self.facts.gaps.push(ResolutionGapFact { site, kind });
+        if !self
+            .facts
+            .gaps
+            .contains(&ResolutionGapFact::new(site, kind))
+        {
+            self.facts.gaps.push(ResolutionGapFact::new(site, kind));
         }
     }
 
@@ -7048,6 +7296,26 @@ fn scala_constructor_instance(mut node: Node<'_>) -> Option<Node<'_>> {
     (node.kind() == "instance_expression").then_some(node)
 }
 
+/// Does an enclosing call expression apply this application's value?
+///
+/// `f(a)(b)` puts the inner application directly in the outer call's function
+/// field, and `(f(a))(b)` wraps it in parentheses. Both apply one source
+/// callee, so the call site and call fact belong to the outer application.
+/// Without this, the parenthesized spelling publishes two call facts that
+/// share one callee reference, which the typed lowerer rejects.
+fn application_is_curried_function(node: Node<'_>) -> bool {
+    let mut expression = node;
+    while let Some(parent) = expression.parent() {
+        if parent.kind() == "parenthesized_expression" {
+            expression = parent;
+            continue;
+        }
+        return parent.kind() == "call_expression"
+            && field_name_in_parent(parent, expression) == Some("function");
+    }
+    false
+}
+
 /// Only definitions directly owned by an extension group inherit its receiver.
 /// A local def nested inside an extension method is an ordinary local callable.
 fn enclosing_extension_definition(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -7079,6 +7347,460 @@ mod tests {
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala syntax tree");
         crate::scala::declarations::parse_scala_file(&file, source, &tree)
+    }
+
+    #[test]
+    #[hardwon("#5177: method-local case classes received global JVM aliases")]
+    fn method_local_case_classes_publish_lexical_synthesized_companions() {
+        let source = "object Example {\n\
+            def first(): Unit = {\n\
+              case class Same(value: Int)\n\
+              Same(1)\n\
+            }\n\
+            def second(): Unit = {\n\
+              case class Same(value: String)\n\
+              Same(\"two\")\n\
+            }\n\
+            object NestedTemplate { case class Nested(value: Long) }\n\
+          }\n";
+        let parsed = parse(source);
+        let facts = &parsed.resolution_facts;
+        let source_facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("Scala source facts are published");
+
+        let declaration_named_at = |name: &str, prefix: &str| {
+            facts
+                .identifiers
+                .iter()
+                .find_map(|identifier| {
+                    if identifier.role != ResolutionIdentifierRole::Declaration
+                        || facts.names[identifier.name.index()].spelling != name
+                    {
+                        return None;
+                    }
+                    let site = facts.sites[identifier.site.index()];
+                    (site.kind == ResolutionSiteKind::TypeDeclaration
+                        && source[site.start_byte..site.end_byte].starts_with(prefix))
+                    .then_some(identifier.site)
+                })
+                .unwrap_or_else(|| panic!("missing declaration `{name}` at `{prefix}`"))
+        };
+        let declaration_source = |site: ResolutionSiteId| {
+            let declarations = source_facts
+                .native_declaration_sources
+                .iter()
+                .filter_map(|(candidate, declaration)| (*candidate == site).then_some(*declaration))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations.len(),
+                1,
+                "each native site has exactly one source declaration bridge: {site:?}"
+            );
+            declarations[0]
+        };
+        let companion_for = |class: ResolutionSiteId| {
+            facts
+                .singleton_relations
+                .iter()
+                .find(|relation| {
+                    relation.kind == ResolutionSingletonRelationKind::Companion
+                        && relation.enclosing_type == Some(class)
+                })
+                .unwrap_or_else(|| panic!("missing synthesized companion for {class:?}"))
+                .declaration
+        };
+
+        let first = declaration_named_at("Same", "case class Same");
+        let second_offset = source
+            .match_indices("case class Same")
+            .nth(1)
+            .expect("second local class source")
+            .0;
+        let second = facts
+            .identifiers
+            .iter()
+            .find_map(|identifier| {
+                if identifier.role != ResolutionIdentifierRole::Declaration
+                    || facts.names[identifier.name.index()].spelling != "Same"
+                {
+                    return None;
+                }
+                let site = facts.sites[identifier.site.index()];
+                (site.kind == ResolutionSiteKind::TypeDeclaration
+                    && site.start_byte >= second_offset
+                    && source[site.start_byte..site.end_byte].starts_with("case class Same"))
+                .then_some(identifier.site)
+            })
+            .expect("second local case class declaration");
+        let local_classes = [first, second];
+        let local_companions = local_classes.map(companion_for);
+
+        assert_ne!(
+            first, second,
+            "same-spelled local classes have distinct sites"
+        );
+        assert_ne!(
+            facts.sites[first.index()].scope,
+            facts.sites[second.index()].scope,
+            "same-spelled local classes retain distinct method scopes"
+        );
+        assert_ne!(
+            local_companions[0], local_companions[1],
+            "same-spelled local companions have distinct sites"
+        );
+
+        for (class, companion) in local_classes.into_iter().zip(local_companions) {
+            let class_declaration = declaration_source(class);
+            let companion_declaration = declaration_source(companion);
+            let class_scope = facts.sites[class.index()].scope;
+            let companion_scope = facts
+                .scopes
+                .iter()
+                .find(|scope| {
+                    scope.owner == Some(companion) && scope.kind == ResolutionScopeKind::TypeBody
+                })
+                .unwrap_or_else(|| panic!("missing synthesized companion scope for {companion:?}"));
+
+            assert_ne!(class, companion, "the companion is not the class site");
+            assert_ne!(
+                class_declaration, companion_declaration,
+                "the companion has its own source declaration identity"
+            );
+            assert_eq!(
+                facts.sites[companion.index()].scope,
+                class_scope,
+                "the companion declaration site stays in the enclosing lexical scope"
+            );
+            assert_eq!(
+                companion_scope.parent,
+                Some(class_scope),
+                "the companion scope remains under the class's lexical scope"
+            );
+            assert_eq!(
+                source_facts
+                    .occurrences
+                    .lexical_declaration(class_declaration)
+                    .map(|fact| fact.kind),
+                Some(DeclarationKind::BlockLocalItem)
+            );
+            assert_eq!(
+                source_facts
+                    .occurrences
+                    .lexical_declaration(companion_declaration)
+                    .map(|fact| (fact.kind, fact.identifier.as_str())),
+                Some((DeclarationKind::BlockLocalItem, "Same")),
+                "a unitless companion is published as its real lexical declaration"
+            );
+            assert!(
+                !parsed
+                    .source_declaration_units
+                    .iter()
+                    .any(|(declaration, _)| *declaration == class_declaration
+                        || *declaration == companion_declaration),
+                "method-local class and companion must not be assigned global parser units"
+            );
+            assert!(
+                !facts
+                    .definition_units
+                    .iter()
+                    .any(|definition| definition.declaration == companion),
+                "the unitless companion must not publish a synthetic CodeUnit"
+            );
+
+            for member_name in ["apply", "unapply"] {
+                let member = facts
+                    .member_owners
+                    .iter()
+                    .find(|member| {
+                        member.owner == companion
+                            && facts.identifiers.iter().any(|identifier| {
+                                identifier.site == member.member
+                                    && identifier.role == ResolutionIdentifierRole::Declaration
+                                    && facts.names[identifier.name.index()].spelling == member_name
+                            })
+                    })
+                    .unwrap_or_else(|| panic!("synthesized companion must own `{member_name}`"));
+                assert_eq!(
+                    facts.sites[member.member.index()].scope,
+                    companion_scope.id,
+                    "generated `{member_name}` is in the matching companion scope"
+                );
+                assert_eq!(
+                    declaration_source(member.member),
+                    class_declaration,
+                    "generated `{member_name}` is located at the local class constructor source"
+                );
+                assert!(
+                    !facts
+                        .jvm_aliases
+                        .iter()
+                        .any(|alias| alias.declaration == member.member),
+                    "method-local `{member_name}` has no fabricated JVM alias"
+                );
+                assert!(facts.gaps.iter().any(|gap| {
+                    gap.site == member.member
+                        && matches!(
+                            gap.route(),
+                            Some(ResolutionRouteGap::UnknownAlias {
+                                owner: ResolutionRouteOwner::Declaration(owner),
+                                name: Some(name),
+                                kind: Some(ResolutionJvmAliasKind::Method),
+                                ..
+                            }) if owner == class && facts.names[name.index()].spelling == member_name
+                        )
+                }), "the missing `{member_name}` JVM alias retains its classified boundary");
+            }
+        }
+
+        let nested_class = declaration_named_at("Nested", "case class Nested");
+        let nested_class_declaration = declaration_source(nested_class);
+        let nested_companion = companion_for(nested_class);
+        let nested_companion_declaration = declaration_source(nested_companion);
+        let nested_class_unit = parsed
+            .source_declaration_units
+            .iter()
+            .find_map(|(declaration, unit)| {
+                (*declaration == nested_class_declaration).then_some(unit)
+            })
+            .expect("nested-template class retains its indexed unit");
+        assert!(nested_class_unit.is_class() && !nested_class_unit.is_synthetic());
+        let nested_companion_unit = facts
+            .definition_units
+            .iter()
+            .find_map(|definition| {
+                (definition.declaration == nested_companion).then_some(&definition.unit)
+            })
+            .expect("ordinary nested-template companion retains its synthetic unit");
+        assert!(nested_companion_unit.is_class() && nested_companion_unit.is_synthetic());
+        assert!(
+            parsed
+                .source_declaration_units
+                .iter()
+                .any(
+                    |(declaration, unit)| *declaration == nested_companion_declaration
+                        && unit == nested_companion_unit
+                )
+        );
+    }
+
+    #[test]
+    #[hardwon("#5177: operator-named case classes lost their indexed declaration and constructor")]
+    fn operator_named_top_level_case_class_keeps_its_parser_units() {
+        let parsed = parse(
+            "package scala.collection.immutable\nfinal case class ::[+A](head: A, tail: List[A])\n",
+        );
+        let classes = parsed
+            .source_declaration_units
+            .iter()
+            .filter(|(_, unit)| unit.short_name() == "::" && unit.is_class())
+            .collect::<Vec<_>>();
+        assert_eq!(classes.len(), 1, "operator case class units={classes:?}");
+        let (class_declaration, class_unit) = classes[0];
+        assert!(!class_unit.is_synthetic());
+
+        let constructors = parsed
+            .source_declaration_units
+            .iter()
+            .filter(|(_, unit)| {
+                unit.short_name() == "::.::" && unit.is_function() && unit.is_synthetic()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            constructors.len(),
+            1,
+            "primary constructor units={constructors:?}"
+        );
+        assert_ne!(
+            *class_declaration, constructors[0].0,
+            "the primary constructor keeps its own source declaration identity"
+        );
+
+        let facts = &parsed.resolution_facts;
+        let class_site = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && facts.names[identifier.name.index()].spelling == "::"
+                    && facts.sites[identifier.site.index()].kind
+                        == ResolutionSiteKind::TypeDeclaration
+            })
+            .expect("operator case class has a native type site")
+            .site;
+        let companion = facts
+            .singleton_relations
+            .iter()
+            .find(|relation| {
+                relation.kind == ResolutionSingletonRelationKind::Companion
+                    && relation.enclosing_type == Some(class_site)
+            })
+            .expect("operator case class has its synthesized companion")
+            .declaration;
+        let companion_declaration = parsed
+            .source_facts
+            .as_ref()
+            .expect("Scala source facts are published")
+            .native_declaration_sources
+            .iter()
+            .find_map(|(site, declaration)| (*site == companion).then_some(*declaration))
+            .expect("synthetic companion source mapping");
+        let companion_unit = parsed
+            .source_declaration_units
+            .iter()
+            .find_map(|(declaration, unit)| (*declaration == companion_declaration).then_some(unit))
+            .expect("top-level synthesized companion keeps its synthetic parser unit");
+        assert!(companion_unit.is_class() && companion_unit.is_synthetic());
+        assert_eq!(
+            companion_unit.short_name(),
+            format!("{}$", class_unit.short_name())
+        );
+    }
+
+    #[test]
+    fn braced_package_case_class_keeps_its_jvm_companion_routes() {
+        let parsed = parse("package demo.pkg { case class Point(value: Int) }\n");
+        let facts = &parsed.resolution_facts;
+        let companion = facts
+            .singleton_relations
+            .iter()
+            .find(|relation| relation.kind == ResolutionSingletonRelationKind::Companion)
+            .expect("the indexed case class has a companion")
+            .declaration;
+        for name in ["apply", "unapply"] {
+            let member = facts
+                .member_owners
+                .iter()
+                .find(|member| {
+                    member.owner == companion
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == member.member
+                                && facts.names[identifier.name.index()].spelling == name
+                        })
+                })
+                .expect("the companion owns its generated member");
+            let alias = facts
+                .jvm_aliases
+                .iter()
+                .find(|alias| alias.declaration == member.member)
+                .unwrap_or_else(|| panic!("package-owned `{name}` retains its JVM alias"));
+            let mut segments = facts
+                .jvm_alias_owner_segments
+                .iter()
+                .filter(|segment| segment.alias == alias.id)
+                .collect::<Vec<_>>();
+            segments.sort_unstable_by_key(|segment| segment.ordinal);
+            assert_eq!(
+                segments
+                    .iter()
+                    .map(|segment| facts.names[segment.name.index()].spelling.as_str())
+                    .collect::<Vec<_>>(),
+                ["demo", "pkg", "Point$"],
+                "a package boundary is not a local executable owner"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#5177: initializer-local companions received global JVM aliases")]
+    fn case_class_and_written_companion_in_initializer_block_have_no_jvm_route() {
+        let source = "object Container {\n\
+            {\n\
+              case class LocalWithCompanion(value: Int)\n\
+              object LocalWithCompanion\n\
+              LocalWithCompanion(1).value\n\
+            }\n\
+          }\n";
+        let parsed = parse(source);
+        let facts = &parsed.resolution_facts;
+        let source_facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("Scala source facts are published");
+        let declaration_named_at = |name: &str, prefix: &str| {
+            facts
+                .identifiers
+                .iter()
+                .find_map(|identifier| {
+                    if identifier.role != ResolutionIdentifierRole::Declaration
+                        || facts.names[identifier.name.index()].spelling != name
+                    {
+                        return None;
+                    }
+                    let site = facts.sites[identifier.site.index()];
+                    (site.kind == ResolutionSiteKind::TypeDeclaration
+                        && source[site.start_byte..site.end_byte].starts_with(prefix))
+                    .then_some(identifier.site)
+                })
+                .unwrap_or_else(|| panic!("missing declaration `{name}` at `{prefix}`"))
+        };
+        let declaration_source = |site: ResolutionSiteId| {
+            let declarations = source_facts
+                .native_declaration_sources
+                .iter()
+                .filter_map(|(candidate, declaration)| (*candidate == site).then_some(*declaration))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations.len(),
+                1,
+                "each native site has exactly one source declaration bridge: {site:?}"
+            );
+            declarations[0]
+        };
+
+        let class = declaration_named_at("LocalWithCompanion", "case class LocalWithCompanion");
+        let companion = declaration_named_at("LocalWithCompanion", "object LocalWithCompanion");
+        let class_declaration = declaration_source(class);
+        let companion_declaration = declaration_source(companion);
+        assert!(
+            !parsed
+                .source_declaration_units
+                .iter()
+                .any(|(declaration, _)| {
+                    *declaration == class_declaration || *declaration == companion_declaration
+                }),
+            "initializer-block declarations remain unitless"
+        );
+
+        for member_name in ["apply", "unapply"] {
+            let member = facts
+                .member_owners
+                .iter()
+                .find(|member| {
+                    member.owner == companion
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == member.member
+                                && identifier.role == ResolutionIdentifierRole::Declaration
+                                && facts.names[identifier.name.index()].spelling == member_name
+                        })
+                })
+                .unwrap_or_else(|| panic!("written local companion must own `{member_name}`"));
+            assert_eq!(
+                declaration_source(member.member),
+                class_declaration,
+                "generated `{member_name}` keeps the local constructor source mapping"
+            );
+            assert!(
+                !facts
+                    .jvm_aliases
+                    .iter()
+                    .any(|alias| alias.declaration == member.member),
+                "initializer-block `{member_name}` has no fabricated JVM alias"
+            );
+            assert!(facts.gaps.iter().any(|gap| {
+                gap.site == member.member
+                    && matches!(
+                        gap.route(),
+                        Some(ResolutionRouteGap::UnknownAlias {
+                            owner: ResolutionRouteOwner::Declaration(owner),
+                            name: Some(name),
+                            kind: Some(ResolutionJvmAliasKind::Method),
+                            ..
+                        }) if owner == class && facts.names[name.index()].spelling == member_name
+                    )
+            }), "the missing `{member_name}` JVM alias retains its classified boundary");
+        }
     }
 
     #[test]
@@ -8834,10 +9556,10 @@ object Writes {
                     facts.type_slots[observations[0].output.index()].role,
                     ResolutionTypeSlotRole::AssignmentValue
                 );
-                assert!(facts.gaps.contains(&ResolutionGapFact {
-                    site: incoming,
-                    kind: ResolutionGapKind::InferredType,
-                }));
+                assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                    incoming,
+                    ResolutionGapKind::InferredType
+                )));
                 assert!(!facts.type_transfers.iter().any(|row| row.output == input));
             } else if name == "direct" {
                 assert_eq!(observations.len(), 1);
@@ -9215,7 +9937,7 @@ object Writes {
             .map(|relation| relation.declaration)
             .expect("a case class has a distinct companion");
         assert!(!facts.gaps.iter().any(|gap| {
-            gap.site == pair_type && gap.kind == ResolutionGapKind::UnsupportedRoute
+            matches!(gap.route(), Some(ResolutionRouteGap::UnknownAlias { owner: ResolutionRouteOwner::Declaration(owner), .. }) if owner == pair_type)
         }));
         assert_ne!(pair_type, pair_companion);
         let visibility_of = |declaration| {
@@ -9739,7 +10461,7 @@ object Writes {
             .map(|relation| relation.declaration)
             .expect("a nested case class has a distinct companion");
         assert!(!facts.gaps.iter().any(|gap| {
-            gap.site == nested_case && gap.kind == ResolutionGapKind::UnsupportedRoute
+            matches!(gap.route(), Some(ResolutionRouteGap::UnknownAlias { owner: ResolutionRouteOwner::Declaration(owner), .. }) if owner == nested_case)
         }));
         assert!(facts.additional_definition_namespaces.iter().any(|fact| {
             fact.declaration == nested_companion && fact.namespace == ResolutionNamespace::Value

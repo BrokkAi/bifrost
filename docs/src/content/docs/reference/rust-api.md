@@ -36,7 +36,7 @@ Keep every direct Bifrost dependency on the same version.
 | `brokk-bifrost-ruby` | `brokk_bifrost_ruby` | Ruby language adapter. |
 | `brokk-bifrost-rust` | `brokk_bifrost_rust` | Rust language adapter. |
 
-The minimum Rust version is 1.97, and the crates use the 2024 edition.
+The minimum Rust version is 1.99, and the crates use the 2024 edition.
 
 ## Facade Features
 
@@ -353,10 +353,15 @@ unresolved reference. Use `SearchToolsService::query_code_result` for those.
 | `max_scanned_source_bytes` | 128 MiB |
 | `max_fact_nodes` | 2,000,000 |
 | `max_pipeline_rows` | 50,000 |
-| `semantic` (`CodeQuerySemanticLimits`) | `max_materialized_files` 256, `max_source_bytes` 16 MiB, `max_rows_per_dimension` 1,000,000, `max_retained_bytes` 256 MiB, `max_traversal_steps` 1,000,000, `rows_per_dimension` `None` |
+| `semantic` (`CodeQuerySemanticLimits`) | `max_materialized_files` 256, `max_source_bytes` 16 MiB, `max_rows_per_dimension` 1,000,000, `max_retained_bytes` 256 MiB, `rows_per_dimension` `None` |
 | `typestate` (`CodeQueryTypestateLimits`) | `max_reached_rows` 1,000,000, `max_candidates` 8,192, `max_witness_steps` 64, `max_witness_expansions` 4,096, `max_total_witness_expansions` 1,000,000, `max_witness_bytes` 64 MiB, `solver_work` engine default |
 | `value_flow` (`CodeQueryValueFlowLimits`) | `max_retained_relations` 262,144, `max_retained_bytes` 16 MiB, `max_endpoints` 50,000, `max_witnesses` 4,096, `max_witness_steps` 4,096, `max_witness_expansions` 16,384, `max_witness_bytes` 4 MiB, `max_total_witness_steps` 262,144, `max_total_witness_expansions` 1,048,576, `max_total_witness_bytes` 16 MiB, `solver_work` engine default |
 | `taint` (`CodeQueryTaintLimits`) | `max_findings` 50,000, `max_projected_bytes` 64 MiB, `max_origins_per_finding` 4,096, `max_witnesses_per_finding` 4,096, `max_steps_per_witness` 4,096, `max_witness_bytes` 4 MiB |
+
+Semantic source and row capacities bound resident admissions. Scans and traversal
+visits never refuse: receipts report their cumulative counts and largest
+per-root work balances separately from resident peaks. Cumulative counts include
+admissions plus work, so the same held-and-scanned bytes can count twice.
 
 For the typestate, value-flow, and taint groups, a zero value or a value above
 the group's hard maximum makes a query that uses that analysis return an

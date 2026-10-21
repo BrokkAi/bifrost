@@ -12,7 +12,7 @@ use crate::graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
 };
 use crate::graph::resolver::{
-    annotation_class_qualifier_site, annotation_reference_candidates, member_name,
+    annotation_class_qualifier_sites, annotation_reference_candidates, member_name,
     normalized_receiver_type, receiver_annotation_matches_target,
     resolve_callable_parameter_default_types, resolve_constructor_types, resolve_receiver_type,
     resolve_visible_named_import_candidates, resolved_member_declarations, target_owner_code_unit,
@@ -219,14 +219,42 @@ pub fn scan_file_for_seeds(
     seeds: &BTreeSet<(ProjectFile, String)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ScanResult, ProjectFile> {
-    let parser_language = tree_sitter_python::LANGUAGE.into();
-    let target = scan_target.target;
-    let target_short = scan_target.target_short.as_str();
-    let target_member = scan_target.target_member.as_deref();
-    let target_owner = scan_target.target_owner.as_ref();
+    scan_file_for_seed_batch(
+        graph,
+        python,
+        project_graph,
+        file,
+        &[(graph, scan_target, seeds)],
+        cancellation,
+    )
+    .pop()
+    .expect("one scan target has one result")
+}
 
+/// One target's resolver snapshot, immutable facts and import/re-export seeds.
+pub type PythonSeedScan<'a> = (
+    &'a PythonGraphSource<'a>,
+    &'a PythonScanTarget<'a>,
+    &'a BTreeSet<(ProjectFile, String)>,
+);
+
+/// Share syntax, scope facts and one iterative walk; bindings and hits stay target-local.
+pub fn scan_file_for_seed_batch(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    project_graph: &PythonProjectGraph,
+    file: &ProjectFile,
+    targets: &[PythonSeedScan<'_>],
+    cancellation: Option<&CancellationToken>,
+) -> Vec<Result<ScanResult, ProjectFile>> {
+    let empty = || {
+        (0..targets.len())
+            .map(|_| Ok(ScanResult::default()))
+            .collect()
+    };
+    let parser_language = tree_sitter_python::LANGUAGE.into();
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Ok(ScanResult::default());
+        return empty();
     }
     let owned_source: Option<Arc<String>>;
     let owned_tree: Option<Tree>;
@@ -236,17 +264,17 @@ pub fn scan_file_for_seeds(
             (parsed.source.as_str(), &parsed.tree)
         } else {
             let Ok(source) = file.read_to_string() else {
-                return Ok(ScanResult::default());
+                return empty();
             };
             if source.is_empty() {
-                return Ok(ScanResult::default());
+                return empty();
             }
             let mut parser = Parser::new();
             if parser.set_language(&parser_language).is_err() {
-                return Ok(ScanResult::default());
+                return empty();
             }
             let Some(tree) = parser.parse(source.as_str(), None) else {
-                return Ok(ScanResult::default());
+                return empty();
             };
             owned_source = Some(Arc::new(source));
             owned_tree = Some(tree);
@@ -257,30 +285,42 @@ pub fn scan_file_for_seeds(
         }
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Ok(ScanResult::default());
+        return empty();
     }
 
-    let edges = {
-        let _scope = brokk_bifrost_core::profiling::scope("python_graph::matching_edges");
-        usage_matching_edges(python, file, seeds)
-    };
-    // This is an AST-name gate, not a source-text resolver. Every usage
-    // accepted by the later structural walk has a matching identifier or
-    // can occur inside an annotation string. Skip files that lack both
-    // before building their scope facts and performing that expensive walk.
-    let may_reference_target = {
-        let _scope = brokk_bifrost_core::profiling::scope("python_graph::target_ast_gate");
-        file_may_reference_target(
-            tree_ref.root_node(),
-            source_str,
-            target,
-            target_short,
-            target_member,
-            &edges,
-        )
-    };
-    if !may_reference_target {
-        return Ok(ScanResult::default());
+    let edges: Vec<_> = targets
+        .iter()
+        .map(|(_, _, seeds)| usage_matching_edges(python, file, seeds))
+        .collect();
+    let mut names = HashSet::default();
+    let mut has_string = false;
+    let mut stack = vec![tree_ref.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            names.insert(slice(node, source_str));
+        }
+        has_string |= node.kind() == "string";
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let active: Vec<_> = targets
+        .iter()
+        .zip(&edges)
+        .map(|((_, target, _), edges)| {
+            target.target.is_module()
+                || has_string
+                || names.contains(target.target_short.as_str())
+                || target
+                    .target_member
+                    .as_deref()
+                    .is_some_and(|name| names.contains(name))
+                || edges
+                    .iter()
+                    .any(|edge| names.contains(edge.local_name.as_str()))
+        })
+        .collect();
+    if !active.iter().any(|active| *active) {
+        return empty();
     }
     let imports = python.import_info_of(graph.token, file);
     let raw_module_bindings = {
@@ -289,11 +329,21 @@ pub fn scan_file_for_seeds(
             collect_module_binding_timeline(tree_ref.root_node(), source_str, &imports)
         })
     };
-    let module_bindings =
-        classify_module_binding_timeline(python, file, raw_module_bindings.as_ref(), seeds, &edges);
+    let module_bindings: Vec<_> = targets
+        .iter()
+        .zip(&edges)
+        .map(|((_, _, seeds), edges)| {
+            classify_module_binding_timeline(
+                python,
+                file,
+                raw_module_bindings.as_ref(),
+                seeds,
+                edges,
+            )
+        })
+        .collect();
     let scoped_import_bindings =
         python_import_bindings_from_imports(&imports, tree_ref.root_node(), source_str.len());
-    let target_self_file = file == target.source();
     let scope_facts = {
         let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_facts");
         usage_scope_facts(python, file, || {
@@ -307,87 +357,72 @@ pub fn scan_file_for_seeds(
         })
     };
     let Some(scope_facts) = scope_facts else {
-        return Err(file.clone());
+        return active
+            .iter()
+            .map(|active| {
+                if *active {
+                    Err(file.clone())
+                } else {
+                    Ok(ScanResult::default())
+                }
+            })
+            .collect();
     };
     let scope_range_index = {
         let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_range_index");
         build_scope_range_index(graph, scope_facts.as_ref())
     };
 
-    let mut local_hits = BTreeSet::new();
-    let mut local_unproven_hits = BTreeSet::new();
     let line_starts = compute_line_starts(source_str);
-
-    let mut scan_ctx = ScanCtx {
-        python,
-        file,
-        source: source_str,
-        line_starts: &line_starts,
-        graph,
-        target,
-        target_short,
-        target_member,
-        target_owner: target_owner.cloned(),
-        target_is_module: target.is_module(),
-        target_source: target.source(),
-        seeds,
-        edges: &edges,
-        target_self_file,
-        member_best_effort_unique: target_self_file && scan_target.member_unique_in_target_file,
-        raw_module_bindings: raw_module_bindings.as_ref(),
-        module_bindings: &module_bindings,
-        scoped_import_bindings: &scoped_import_bindings,
-        scope_facts: scope_facts.as_ref(),
-        scope_range_index: &scope_range_index,
-        hits: &mut local_hits,
-        unproven_hits: &mut local_unproven_hits,
-    };
-
+    let mut results: Vec<ScanResult> = (0..targets.len()).map(|_| ScanResult::default()).collect();
+    let mut contexts: Vec<_> = targets
+        .iter()
+        .zip(&edges)
+        .zip(&module_bindings)
+        .zip(results.iter_mut())
+        .map(
+            |((((target_graph, scan_target, seeds), edges), module_bindings), result)| {
+                let target = scan_target.target;
+                let target_self_file = file == target.source();
+                ScanCtx {
+                    python,
+                    file,
+                    source: source_str,
+                    line_starts: &line_starts,
+                    graph: target_graph,
+                    target,
+                    target_short: &scan_target.target_short,
+                    target_member: scan_target.target_member.as_deref(),
+                    target_owner: scan_target.target_owner.clone(),
+                    target_is_module: target.is_module(),
+                    target_source: target.source(),
+                    seeds,
+                    edges,
+                    target_self_file,
+                    member_best_effort_unique: target_self_file
+                        && scan_target.member_unique_in_target_file,
+                    raw_module_bindings: raw_module_bindings.as_ref(),
+                    module_bindings,
+                    scoped_import_bindings: &scoped_import_bindings,
+                    scope_facts: scope_facts.as_ref(),
+                    scope_range_index: &scope_range_index,
+                    hits: &mut result.hits,
+                    unproven_hits: &mut result.unproven_hits,
+                }
+            },
+        )
+        .collect();
     {
         let _scope = brokk_bifrost_core::profiling::scope("python_graph::scan_tree");
-        scan_node(tree_ref.root_node(), &mut scan_ctx);
+        scan_nodes_for_targets(
+            tree_ref.root_node(),
+            source_str,
+            graph,
+            &mut contexts,
+            &active,
+        );
     }
-
-    Ok(ScanResult {
-        hits: local_hits,
-        unproven_hits: local_unproven_hits,
-    })
-}
-
-fn file_may_reference_target(
-    root: Node<'_>,
-    source: &str,
-    target: &CodeUnit,
-    target_short: &str,
-    target_member: Option<&str>,
-    edges: &[ImportEdge],
-) -> bool {
-    if target.is_module() {
-        return true;
-    }
-
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "string" {
-            // Annotation strings can use an FQN or a re-export alias that is
-            // not an exact identifier node. Keep them for the structured
-            // annotation resolver below.
-            return true;
-        }
-        if node.kind() == "identifier" {
-            let name = slice(node, source);
-            if name == target_short
-                || target_member.is_some_and(|member| name == member)
-                || edges.iter().any(|edge| edge.local_name == name)
-            {
-                return true;
-            }
-        }
-
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
+    results.into_iter().map(Ok).collect()
 }
 
 #[derive(Default)]
@@ -970,58 +1005,192 @@ pub(crate) fn function_declaration_expression_is_outer_scoped(node: Node<'_>) ->
     false
 }
 
-fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "import_statement" | "import_from_statement" => {
-                handle_import_candidate(node, ctx);
-                continue;
-            }
-            "identifier" => {
-                if handle_annotation_reference_candidate(node, ctx) {
-                    continue;
-                }
-                handle_identifier_candidate(node, ctx);
-            }
-            "attribute" => {
-                if handle_annotation_reference_candidate(node, ctx) {
-                    continue;
-                }
-                handle_attribute_candidate(node, ctx);
-            }
-            "string_content" => {
-                handle_annotation_reference_candidate(node, ctx);
-            }
-            "keyword_argument" => {
-                handle_keyword_argument_candidate(node, ctx);
-                if let Some(value) = node.child_by_field_name("value") {
-                    stack.push(value);
-                }
-                continue;
-            }
-            _ => {}
+fn scan_nodes_for_targets(
+    root: Node<'_>,
+    source: &str,
+    graph: &PythonGraphSource<'_>,
+    contexts: &mut [ScanCtx<'_>],
+    active: &[bool],
+) {
+    // Terminal names include each target's local import/re-export aliases. Module
+    // qualifiers and constructors can have arbitrary spellings, so those targets
+    // are also visited independently of the terminal bucket.
+    let mut by_terminal: HashMap<String, Vec<usize>> = HashMap::default();
+    let mut broad = Vec::new();
+    for (index, ctx) in contexts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| active[*index])
+    {
+        if ctx.target_is_module || ctx.target_member == Some("__init__") {
+            broad.push(index);
         }
+        let mut names = HashSet::default();
+        names.insert(ctx.target_short);
+        names.extend(ctx.target_member);
+        names.extend(ctx.seeds.iter().map(|(_, name)| name.as_str()));
+        names.extend(ctx.edges.iter().map(|edge| edge.local_name.as_str()));
+        if ctx.target_member.is_none() {
+            names.extend(ctx.module_bindings.iter().filter_map(|(name, events)| {
+                events
+                    .iter()
+                    .any(|event| event.kind != ModuleBindingKind::Other)
+                    .then_some(name.as_str())
+            }));
+        }
+        for name in names {
+            by_terminal.entry(name.to_owned()).or_default().push(index);
+        }
+    }
+    let python = contexts[0].python;
+    let file = contexts[0].file;
+    let has_self = contexts
+        .iter()
+        .enumerate()
+        .any(|(index, ctx)| active[index] && ctx.target_self_file);
+    let has_foreign = contexts
+        .iter()
+        .enumerate()
+        .any(|(index, ctx)| active[index] && !ctx.target_self_file);
+    let has_class = contexts
+        .iter()
+        .enumerate()
+        .any(|(index, ctx)| active[index] && ctx.target.is_class());
+    let mut consumed_until = vec![0; contexts.len()];
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        if matches!(kind, "import_statement" | "import_from_statement") {
+            for (_, ctx) in contexts
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| active[*index] && node.start_byte() >= consumed_until[*index])
+            {
+                handle_import_candidate(node, ctx);
+            }
+            continue;
+        }
+        if matches!(
+            kind,
+            "identifier" | "attribute" | "string_content" | "keyword_argument"
+        ) {
+            let mut selected = if kind == "string_content" {
+                Vec::new()
+            } else {
+                broad.clone()
+            };
+            let terminal = match kind {
+                "attribute" => node.child_by_field_name("attribute"),
+                "keyword_argument" => node.child_by_field_name("name"),
+                "identifier" => Some(node),
+                _ => None,
+            };
+            if let Some(indices) = terminal.and_then(|node| by_terminal.get(slice(node, source))) {
+                selected.extend(indices);
+            }
+            if kind == "attribute"
+                && let Some(object) = node.child_by_field_name("object")
+                && let Some(indices) = by_terminal.get(slice(object, source))
+            {
+                selected.extend(indices);
+            }
+            selected.sort_unstable();
+            selected.dedup();
 
+            // Annotation binding depends on the file and on whether the target
+            // is declared in it, not on the target's identity. Resolve these two
+            // variants once, then apply each target's proof and consumption rules.
+            let annotation_node = kind != "keyword_argument"
+                && crate::syntax::python_node_is_in_annotation(node)
+                && active
+                    .iter()
+                    .enumerate()
+                    .any(|(index, active)| *active && node.start_byte() >= consumed_until[index]);
+            let own = if annotation_node && has_self {
+                annotation_reference_candidates(graph, python, file, source, node, true)
+            } else {
+                None
+            };
+            let foreign = if annotation_node && has_foreign {
+                annotation_reference_candidates(graph, python, file, source, node, false)
+            } else {
+                None
+            };
+            if own.is_some() || foreign.is_some() {
+                let qualifiers: Vec<_> = if has_class {
+                    annotation_class_qualifier_sites(graph, python, file, source, node).collect()
+                } else {
+                    Vec::new()
+                };
+                for (index, ctx) in contexts.iter_mut().enumerate() {
+                    if !active[index] || node.start_byte() < consumed_until[index] {
+                        continue;
+                    }
+                    let candidates = if ctx.target_self_file { &own } else { &foreign }
+                        .as_deref()
+                        .expect("every active annotation target has its binding variant");
+                    let consumed =
+                        handle_annotation_reference_candidate(node, ctx, candidates, &qualifiers);
+                    if consumed {
+                        if kind == "attribute" {
+                            consumed_until[index] = node.end_byte();
+                        }
+                    } else if selected.binary_search(&index).is_ok() {
+                        debug_assert_eq!(
+                            kind, "attribute",
+                            "only attribute annotations fall through"
+                        );
+                        handle_attribute_candidate(node, ctx);
+                    }
+                }
+            } else {
+                // A bare constructor call has one canonical class set, even
+                // when several targets are inherited or competing initializers.
+                let constructors = if kind == "identifier"
+                    && parent_if_field(node, "call", "function").is_some()
+                    && selected.iter().any(|&index| {
+                        contexts[index].target_member == Some("__init__")
+                            && node.start_byte() >= consumed_until[index]
+                    }) {
+                    resolve_constructor_types(graph, python, file, source, node)
+                } else {
+                    Vec::new()
+                };
+                for index in selected {
+                    if node.start_byte() < consumed_until[index] {
+                        continue;
+                    }
+                    let ctx = &mut contexts[index];
+                    match kind {
+                        "identifier" => handle_identifier_candidate(node, ctx, &constructors),
+                        "attribute" => handle_attribute_candidate(node, ctx),
+                        "keyword_argument" => handle_keyword_argument_candidate(node, ctx),
+                        // Ordinary strings are values, not annotation references.
+                        "string_content" => {}
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        if kind == "keyword_argument" {
+            if let Some(value) = node.child_by_field_name("value") {
+                stack.push(value);
+            }
+            continue;
+        }
         let mut cursor = node.walk();
-        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
         children.reverse();
         stack.extend(children);
     }
 }
 
-fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
-    let Some(candidates) = annotation_reference_candidates(
-        ctx.graph,
-        ctx.python,
-        ctx.file,
-        ctx.source,
-        node,
-        ctx.target_self_file,
-    ) else {
-        return false;
-    };
-
+fn handle_annotation_reference_candidate(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    candidates: &[CodeUnit],
+    qualifiers: &[(Node<'_>, CodeUnit)],
+) -> bool {
     // Method annotations are part of the surrounding class declaration. A
     // qualifier such as `types.Handler` therefore uses the class field
     // `types` when that field was defined earlier in the class body, even
@@ -1047,10 +1216,10 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
         record_hit(site, ctx);
     }
 
-    if let Some(site) = annotation_class_qualifier_site(
-        ctx.graph, ctx.python, ctx.file, ctx.source, node, ctx.target,
-    ) {
-        record_hit(site, ctx);
+    if ctx.target.is_class()
+        && let Some((site, _)) = qualifiers.iter().find(|(_, owner)| owner == ctx.target)
+    {
+        record_hit(*site, ctx);
     }
 
     // An attribute annotation the resolver could not turn into a candidate is
@@ -1191,7 +1360,7 @@ fn handle_import_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>, constructors: &[CodeUnit]) {
     if node
         .parent()
         .is_some_and(|parent| parent.kind() == "attribute")
@@ -1209,9 +1378,9 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             let Some(target_owner) = ctx.target_owner.as_ref() else {
                 return;
             };
-            if resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, node)
-                .into_iter()
-                .any(|class| constructed_class_matches_target_owner(ctx, &class, target_owner))
+            if constructors
+                .iter()
+                .any(|class| constructed_class_matches_target_owner(ctx, class, target_owner))
             {
                 record_hit(node, ctx);
             }

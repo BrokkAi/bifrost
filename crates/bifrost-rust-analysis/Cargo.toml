@@ -1,0 +1,63 @@
+[package]
+name = "brokk-bifrost-rust-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rust analyzer and native usage resolution for brokk-bifrost"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = true
+readme = "README.md"
+
+[lib]
+name = "brokk_bifrost_rust_analysis"
+
+[lints]
+workspace = true
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0" }
+brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.0" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0" }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.0" }
+git2 = { version = "0.20.2", default-features = false }
+glob = "0.3.3"
+moka = { version = "0.12.11", features = ["sync"] }
+rayon = "1.10.0"
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+"hooks",
+"functions",
+] }
+rustdoc-types = { version = "=0.61.0", default-features = false }
+semver = "1.0.28"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+toml = "0.8.23"
+tempfile = "3.23.0"
+tree-sitter = "0.25.10"
+tree-sitter-rust = { package = "brokk-tree-sitter-rust", version = "=0.24.5" }
+toml_edit = "0.22.27"
+
+[dev-dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.0", features = ["test-support"] }
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+] }
+
+[features]
+default = []
+test-support = ["brokk-bifrost-analysis/test-support"]
+randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]

@@ -1,0 +1,4705 @@
+use brokk_bifrost_analysis::analyzer::common::language_for_file;
+
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+
+use brokk_bifrost_analysis::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use brokk_bifrost_analysis::analyzer::usages::reference_site::ResolvedReferenceSite;
+use brokk_bifrost_analysis::analyzer::usages::reference_site::smallest_named_node_covering;
+use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
+
+use brokk_bifrost_analysis::analyzer::CodeUnit;
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
+use brokk_bifrost_analysis::analyzer::Language;
+use brokk_bifrost_analysis::analyzer::ProjectFile;
+use brokk_bifrost_analysis::analyzer::Range;
+use brokk_bifrost_analysis::cancellation::CancellationToken;
+use brokk_bifrost_analysis::hash::HashMap;
+use brokk_bifrost_analysis::hash::HashSet;
+use brokk_bifrost_analysis::navigation::NavigationOperation;
+use brokk_bifrost_analysis::path_utils::rel_path_string;
+use brokk_bifrost_core::analyzer::definition_lookup::BoundedDefinitionLookup;
+
+use std::sync::Arc;
+use tree_sitter::Node;
+use tree_sitter::Tree;
+
+use crate::analyzer::usages::get_definition::js_ts;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use brokk_bifrost_core::analyzer::usages::reference_site::simple_reference_name;
+
+use brokk_bifrost_analysis::analyzer::usages::get_definition::*;
+
+use brokk_bifrost_js_ts::tsconfig::AliasResolver;
+
+use brokk_bifrost_js_ts::graph::receiver_analysis::JsTsReceiverSyntaxIndex;
+
+use brokk_bifrost_js_ts::graph::receiver_analysis::build_js_ts_receiver_syntax_index;
+
+use brokk_bifrost_js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
+
+#[derive(Clone)]
+pub(crate) struct JsTsDefinitionContext {
+    pub(crate) imports: JsTsImportBinder,
+    pub(crate) aliases: Arc<AliasResolver>,
+    pub(crate) syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+    /// This file's module-member write evidence, shared by every reference the
+    /// batch resolves in it. The proof walks the whole file, so asking it per
+    /// reference would make a file's resolution quadratic in its own size
+    /// (#3427).
+    pub(crate) module_member_writes: Arc<brokk_bifrost_js_ts::syntax::JsTsModuleMemberWriteMemo>,
+}
+
+#[derive(Default)]
+pub(crate) struct JsTsDefinitionState {
+    js_ts_contexts: HashMap<(ProjectFile, Language), JsTsDefinitionContext>,
+}
+
+impl JsTsDefinitionState {
+    /// The per-file JS/TS state this batch reuses. `host` supplies the analyzer's
+    /// own alias resolver rather than a fresh one, so every file in the batch
+    /// resolves specifiers through one warm `tsconfig` memo and one warm
+    /// workspace-package index instead of rebuilding both per file.
+    pub(crate) fn js_ts_context(
+        &mut self,
+        host: &dyn JsTsSource,
+        file: &ProjectFile,
+        language: Language,
+        source: &str,
+        tree: &Tree,
+    ) -> JsTsDefinitionContext {
+        self.js_ts_contexts
+            .entry((file.clone(), language))
+            .or_insert_with(|| {
+                let (syntax_index, _) =
+                    build_js_ts_receiver_syntax_index(tree.root_node(), source, None)
+                        .expect("uncancelled JS/TS syntax index build");
+                JsTsDefinitionContext {
+                    imports: compute_jsts_import_binder(source, tree),
+                    aliases: Arc::clone(host.alias_resolver()),
+                    syntax_index,
+                    module_member_writes: Arc::default(),
+                }
+            })
+            .clone()
+    }
+}
+
+use brokk_bifrost_js_ts::graph::receiver_analysis::JsTsReceiverFactProvider;
+
+use crate::analyzer::usages::js_ts_graph::cached_jsts_index;
+
+use crate::analyzer::js_ts::providers::resolve_js_ts_source;
+
+use brokk_bifrost_js_ts::graph::resolver::browser_global_property_shape;
+
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
+use brokk_bifrost_core::analyzer::js_ts_facts::JsTsReceiverBinding;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor;
+use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
+use brokk_bifrost_js_ts::access_chain::JsTsImportedMemberChainResolution;
+use brokk_bifrost_js_ts::access_chain::resolve_import_member_chain;
+use brokk_bifrost_js_ts::graph::source::declaration_ids_for_unit;
+use brokk_bifrost_js_ts::imports::js_ts_direct_import_export_name;
+use brokk_bifrost_js_ts::imports::js_ts_module_identity;
+use brokk_bifrost_js_ts::imports::js_ts_module_specifier_probed_paths;
+use brokk_bifrost_js_ts::imports::require_call_module_specifier;
+use brokk_bifrost_js_ts::imports::resolve_js_ts_direct_import_candidates;
+use brokk_bifrost_js_ts::imports::resolve_js_ts_imported_member_chain;
+use brokk_bifrost_js_ts::imports::resolve_js_ts_module_binding_candidates;
+use brokk_bifrost_js_ts::providers::JsTsSource;
+use brokk_bifrost_js_ts::syntax::JsTsDestructuringSource;
+use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
+use brokk_bifrost_js_ts::syntax::JsTsImportBindingResolution;
+use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
+use brokk_bifrost_js_ts::syntax::JsTsModuleMemberMutation;
+use brokk_bifrost_js_ts::syntax::MAX_STATIC_IMPORT_BINDINGS_PER_NAME;
+use brokk_bifrost_js_ts::syntax::destructured_property_key_source;
+use brokk_bifrost_js_ts::syntax::direct_property_definitions;
+use brokk_bifrost_js_ts::syntax::is_declaration_identifier;
+use brokk_bifrost_js_ts::syntax::is_explicit_object_literal_key;
+use brokk_bifrost_js_ts::syntax::is_export_alias_identifier;
+use brokk_bifrost_js_ts::syntax::is_known_js_ts_global;
+use brokk_bifrost_js_ts::syntax::js_program_is_external_module;
+use brokk_bifrost_js_ts::syntax::js_ts_is_var_scope_kind;
+use brokk_bifrost_js_ts::syntax::js_ts_statement_module_specifier;
+use brokk_bifrost_js_ts::syntax::js_ts_var_declarator_binding_scope;
+use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
+use brokk_bifrost_js_ts::syntax::pattern_binder_identifiers;
+use brokk_bifrost_js_ts::syntax::slice;
+use brokk_bifrost_js_ts::syntax::static_member_property;
+use brokk_bifrost_js_ts::syntax::typescript_enclosing_enum_initializer;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::TsReceiverResolution;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::jsts_constructor_owner_candidates;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::jsts_enclosing_function_scope;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::jsts_identifier_candidates;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::jsts_member_candidates;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::node_text_matches;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_binding_is_assigned_before;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_call_expression_callees;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_contextual_object_literal_type_node;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_direct_object_literal_value;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_expand_call_return_property_owners;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_nodes_for_code_unit;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_parameter_name_node;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_receiver_owner_candidates_at_byte;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_resolve_type_node_to_property_owner_outcome;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_resolve_type_text_to_property_owners;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_simple_call_reference_name;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use brokk_bifrost_js_ts::ts_owners::visit_local_receiver_binding_writes;
+use brokk_bifrost_js_ts::type_text::jsts_type_space_candidates;
+use brokk_bifrost_js_ts::type_text::jsts_unit_is_type_only;
+use brokk_bifrost_js_ts::type_text::jsts_value_space_candidates;
+use brokk_bifrost_js_ts::type_text::ts_type_annotation_text;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+
+use brokk_bifrost_analysis::analyzer::semantic::PropertyReachingLimits;
+
+use brokk_bifrost_analysis::analyzer::semantic::PropertySourceQueryResult;
+
+use brokk_bifrost_analysis::analyzer::semantic::PropertyStoreRecord;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableKey;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol;
+
+use crate::analyzer::semantic_model::TypeRef;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsTsAliasCandidateKey {
+    source: ProjectFile,
+    kind: brokk_bifrost_core::analyzer::model::CodeUnitType,
+    signature: Option<String>,
+    ranges: Vec<Range>,
+}
+
+/// The member attribution the JS/TS member lookups accumulate while they run
+/// (#1477).
+///
+/// Every candidate here was found by asking the index for
+/// `<owner fq>.<member>` (or its `$static` companion form). Direct candidates
+/// name the receiver as their owner; inherited candidates name the declaring
+/// ancestor and retain the bounded hierarchy route that reached it.
+///
+/// Applicability stays `Unknown`: these lookups select by owner and name and
+/// never inspect the call shape.
+#[derive(Default)]
+struct JsTsMemberFinds {
+    by_fq_name: Vec<(String, trace::MemberEnrichment)>,
+}
+
+impl JsTsMemberFinds {
+    fn record(
+        &mut self,
+        owner: &CodeUnit,
+        found: &[CodeUnit],
+        dispatch_tier: brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier,
+    ) {
+        if !trace::recording() {
+            return;
+        }
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::member_enrichment_with_tier(
+                    owner.clone(),
+                    0,
+                    dispatch_tier,
+                    brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Unknown,
+                    Vec::new(),
+                ),
+            ));
+        }
+    }
+
+    fn record_inherited(
+        &mut self,
+        owner: &CodeUnit,
+        found: &[CodeUnit],
+        dispatch_tier: brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier,
+        hierarchy_depth: usize,
+        route: &[trace::HierarchyHopRecord],
+    ) {
+        if !trace::recording() {
+            return;
+        }
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::member_enrichment_with_tier(
+                    owner.clone(),
+                    hierarchy_depth,
+                    dispatch_tier,
+                    brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Unknown,
+                    route.to_vec(),
+                ),
+            ));
+        }
+    }
+
+    /// Stage the attribution for the outcome constructor the caller is about to
+    /// reach. Staging nothing leaves the rows unattributed, which is what an
+    /// unrecorded trace and an uninstrumented lookup must both look like.
+    fn stage(&self) {
+        if self.by_fq_name.is_empty() {
+            return;
+        }
+        trace::stage_member_context(self.by_fq_name.clone());
+    }
+}
+
+const MAX_JS_TS_MEMBER_FRONTIER: usize = 512;
+
+/// The first-discovery parents and depths of a bounded JS/TS hierarchy walk.
+///
+/// The analyzer's hierarchy provider deliberately exposes only direct edges;
+/// retaining the parent chain here lets member attribution report the exact
+/// route without re-deriving it after resolution. A breadth-first walk gives
+/// the nearest declaring owner precedence and the bound keeps malformed or
+/// unusually broad hierarchies finite.
+#[derive(Default)]
+struct JsTsMemberHierarchy {
+    parents: HashMap<CodeUnit, CodeUnit>,
+    depths: HashMap<CodeUnit, usize>,
+}
+
+impl JsTsMemberHierarchy {
+    fn route(
+        &self,
+        receiver: &CodeUnit,
+        owner: &CodeUnit,
+    ) -> Option<(usize, Vec<trace::HierarchyHopRecord>)> {
+        use brokk_bifrost_core::analyzer::structural::resolution::HierarchyRelation;
+
+        let depth = *self.depths.get(owner)?;
+        let (route, reached_receiver) = trace::hierarchy_route_from_predecessors(
+            owner,
+            depth,
+            |current, _| current == receiver,
+            |current| {
+                self.parents
+                    .get(current)
+                    .cloned()
+                    .map(|parent| (parent, HierarchyRelation::Extends))
+            },
+            |unit| Some(unit.clone()),
+        )?;
+        if !reached_receiver {
+            return None;
+        }
+        debug_assert_eq!(route.len(), depth);
+        Some((depth, route))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inherited_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    receiver: &CodeUnit,
+    member: &str,
+    value_position: bool,
+    static_access: bool,
+    finds: &mut JsTsMemberFinds,
+) -> Vec<CodeUnit> {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return Vec::new();
+    };
+    let mut hierarchy = JsTsMemberHierarchy::default();
+    let mut seen = HashSet::default();
+    seen.insert(receiver.clone());
+    let mut level = provider.get_direct_ancestors(receiver);
+    let mut depth = 0usize;
+    let mut visited = 0usize;
+    let mut candidates = Vec::new();
+
+    while !level.is_empty() && visited < MAX_JS_TS_MEMBER_FRONTIER {
+        depth += 1;
+        let mut next_level = Vec::new();
+        let mut level_candidates = Vec::new();
+        for owner in level {
+            if !seen.insert(owner.clone()) {
+                continue;
+            }
+            if visited == MAX_JS_TS_MEMBER_FRONTIER {
+                break;
+            }
+            visited += 1;
+            hierarchy.depths.insert(owner.clone(), depth);
+            hierarchy
+                .parents
+                .entry(owner.clone())
+                .or_insert_with(|| receiver.clone());
+
+            let plain = jsts_file_scoped_dotted_candidates(
+                host,
+                support,
+                owner.source(),
+                &format!("{}.{}", owner.fq_name(), member),
+                value_position,
+            );
+            let static_members = if static_access {
+                jsts_file_scoped_dotted_candidates(
+                    host,
+                    support,
+                    owner.source(),
+                    &format!("{}.{}$static", owner.fq_name(), member),
+                    value_position,
+                )
+            } else {
+                Vec::new()
+            };
+            let found = if static_access {
+                if static_members.is_empty() {
+                    plain
+                } else {
+                    static_members
+                }
+            } else if plain.is_empty() {
+                jsts_file_scoped_dotted_candidates(
+                    host,
+                    support,
+                    owner.source(),
+                    &format!("{}.{}$static", owner.fq_name(), member),
+                    value_position,
+                )
+            } else {
+                plain
+            };
+            if !found.is_empty() {
+                let Some((hierarchy_depth, route)) = hierarchy.route(receiver, &owner) else {
+                    continue;
+                };
+                finds.record_inherited(
+                    &owner,
+                    &found,
+                    brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier::InheritedOrPromoted,
+                    hierarchy_depth,
+                    &route,
+                );
+                level_candidates.extend(found);
+                continue;
+            }
+
+            for next in provider.get_direct_ancestors(&owner) {
+                hierarchy
+                    .parents
+                    .entry(next.clone())
+                    .or_insert_with(|| owner.clone());
+                next_level.push(next);
+            }
+        }
+        if !level_candidates.is_empty() {
+            candidates = level_candidates;
+            break;
+        }
+        level = next_level;
+    }
+    candidates.sort_by_key(CodeUnit::fq_name);
+    candidates.dedup();
+    candidates
+}
+
+fn js_ts_candidates_outcome(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> DefinitionLookupOutcome {
+    candidates_outcome(prefer_js_ts_alias_representatives(analyzer, candidates))
+}
+
+fn prefer_js_ts_alias_representatives(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    let mut representatives: HashMap<JsTsAliasCandidateKey, CodeUnit> = HashMap::default();
+    for candidate in candidates {
+        let key = JsTsAliasCandidateKey {
+            source: candidate.source().clone(),
+            kind: candidate.kind(),
+            signature: candidate.signature().map(str::to_string),
+            ranges: analyzer.ranges(&candidate).to_vec(),
+        };
+        representatives
+            .entry(key)
+            .and_modify(|current| {
+                if js_ts_alias_preference(&candidate) < js_ts_alias_preference(current) {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    representatives.into_values().collect()
+}
+
+fn js_ts_alias_preference(unit: &CodeUnit) -> (usize, String) {
+    let fq_name = unit.fq_name();
+    (fq_name.matches('.').count(), fq_name)
+}
+
+/// Exact external callable selected by one direct static named import.
+///
+/// Every admitted fact comes from the tree-sitter import binder, lexical
+/// binding index, and call-expression fields. The local callee spelling is not
+/// an identity: the returned proof names the import's module specifier in its
+/// canonical spelling -- `node:child_process` and `child_process` are one
+/// module (#2609) -- and its imported symbol, and only when the import is the
+/// one unshadowed, unreassigned program binding at this call site.
+pub(crate) fn exact_direct_named_import_call(
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+) -> Option<ExactExternalCallProof> {
+    let root = tree.root_node();
+    let callee = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let call = callee.parent()?;
+    if call.kind() != "call_expression"
+        || call
+            .child_by_field_name("function")
+            .is_none_or(|function| function.id() != callee.id())
+    {
+        return None;
+    }
+
+    let local_name = source.get(callee.byte_range())?;
+    if imports.has_competing_static_imports(local_name) || imports.was_truncated(local_name) {
+        return None;
+    }
+    let mut bindings = imports.direct_bindings_for(local_name);
+    let binding = bindings.next()?;
+    if bindings.next().is_some() || binding.kind != ImportKind::Named {
+        return None;
+    }
+    let imported_name = binding.imported_name.as_deref()?;
+    let module = js_ts_module_identity(&binding.module_specifier)?;
+
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source);
+    if !lexical_bindings.is_program_binding_at(local_name, callee.start_byte(), root)
+        || lexical_bindings.is_program_binding_reassigned(local_name, root)
+    {
+        return None;
+    }
+    let binding_ranges =
+        lexical_bindings.binding_identifier_ranges_at(local_name, callee.start_byte());
+    if binding_ranges.len() != 1 || !jsts_binding_range_belongs_to_import(root, binding_ranges[0]) {
+        return None;
+    }
+
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+    Some(ExactExternalCallProof::js_ts_direct_named_import(
+        module.specifier,
+        imported_name,
+        parameter_count,
+    ))
+}
+
+/// The global object identity a receiverless runtime-global call resolves
+/// through.
+///
+/// JavaScript and TypeScript write a global function as a bare identifier
+/// (`fetch(url)`), which carries no receiver for the dotted modeled-call route
+/// to name. The language defines exactly one object that supplies such a name
+/// at program scope, and `globalThis` is that object's own spelling. A bare
+/// call binds it only when the active declaration model names the member, so
+/// the identity comes from the reviewed model rather than from the callee's
+/// spelling.
+const JSTS_GLOBAL_OBJECT_NAME: &str = "globalThis";
+
+/// How the modeled callee receives the object it is a member of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeledExternalReceiver {
+    /// The call writes `owner.member(...)`, so the written value binds the
+    /// member.
+    BoundMember,
+    /// The call writes `member(...)`, so the program scope supplies the global
+    /// object and no written value participates.
+    GlobalObject,
+}
+
+#[derive(Debug)]
+struct ModeledExternalCall<'a> {
+    owner: &'a SemanticModelSymbol,
+    callable: &'a SemanticModelSymbol,
+    parameter_count: u32,
+    receiver: ModeledExternalReceiver,
+}
+
+impl ModeledExternalCall<'_> {
+    fn proof(&self) -> ExactExternalCallProof {
+        match self.receiver {
+            ModeledExternalReceiver::BoundMember => {
+                ExactExternalCallProof::js_ts_bound_external_member(
+                    &self.owner.qualified_name,
+                    &self.callable.name,
+                    self.parameter_count,
+                )
+            }
+            ModeledExternalReceiver::GlobalObject => ExactExternalCallProof::js_ts_global_function(
+                &self.owner.qualified_name,
+                &self.callable.name,
+                self.parameter_count,
+            ),
+        }
+    }
+}
+
+/// Resolve a JS/TS external call solely from structured source and activated
+/// declaration facts. Each chained rung uses the previous callable's declared
+/// return type; no rendered call or type name is re-parsed (#2862).
+pub(crate) fn exact_modeled_external_call(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<ExactExternalCallProof> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let lexical = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+    modeled_external_call_at_site(
+        overlay.as_ref(),
+        language,
+        source,
+        tree.root_node(),
+        site,
+        &lexical,
+    )
+    .map(|call| call.proof())
+}
+
+fn modeled_external_call_at_site<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    lexical: &JsTsLexicalBindingIndex,
+) -> Option<ModeledExternalCall<'a>> {
+    let focused = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let call = enclosing_callee_call(focused)?;
+    modeled_external_call_expression(overlay, language, source, call, lexical, 8)
+}
+
+fn enclosing_callee_call(mut node: Node<'_>) -> Option<Node<'_>> {
+    for _ in 0..3 {
+        if let Some(call) = parent_if_field(node, "call_expression", "function") {
+            return Some(call);
+        }
+        let parent = node.parent()?;
+        if !matches!(parent.kind(), "member_expression" | "subscript_expression") {
+            return None;
+        }
+        node = parent;
+    }
+    None
+}
+
+fn modeled_external_call_expression<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    source: &str,
+    call: Node<'_>,
+    lexical: &JsTsLexicalBindingIndex,
+    remaining: usize,
+) -> Option<ModeledExternalCall<'a>> {
+    let remaining = remaining.checked_sub(1)?;
+    let function = call.child_by_field_name("function")?;
+    if function.kind() == "identifier" {
+        return modeled_global_call_expression(overlay, language, source, call, function, lexical);
+    }
+    let (receiver, member_node) = jsts_dotted_access_parts(function)?;
+    let member = simple_reference_name(member_node, source, language)?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+
+    let owner = if receiver.kind() == "identifier" {
+        let receiver_name = simple_reference_name(receiver, source, language)?;
+        if !is_known_js_ts_global(receiver_name)
+            || !lexical
+                .binding_identifier_ranges_at(receiver_name, receiver.start_byte())
+                .is_empty()
+        {
+            return None;
+        }
+        exact_modeled_type_named(overlay, language, receiver_name)?
+    } else if receiver.kind() == "call_expression" {
+        let inner = modeled_external_call_expression(
+            overlay, language, source, receiver, lexical, remaining,
+        )?;
+        callable_declared_return_owner(overlay, language, inner.callable)?
+    } else {
+        return None;
+    };
+
+    let matched = overlay.callable_for_target(SemanticModelCallableKey::new(
+        language.config_label(),
+        &owner.qualified_name,
+        member,
+        true,
+        parameter_count,
+    ));
+    let callable = matched.unique()?;
+    Some(ModeledExternalCall {
+        owner,
+        callable,
+        parameter_count,
+        receiver: ModeledExternalReceiver::BoundMember,
+    })
+}
+
+/// Resolve one receiverless callee against the modeled global object.
+///
+/// Both halves of the proof are structural. The callee identifier must carry no
+/// lexical binding at the call site, so the reference resolves through the
+/// program scope; and the active model must declare the global object with
+/// exactly one matching member at the written arity. A parameter, a local
+/// declaration, a function declaration, or an import all bind the name and
+/// therefore mint no identity, which is what keeps a shadowed `fetch` from
+/// borrowing the global model's effect by spelling.
+fn modeled_global_call_expression<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    source: &str,
+    call: Node<'_>,
+    callee: Node<'_>,
+    lexical: &JsTsLexicalBindingIndex,
+) -> Option<ModeledExternalCall<'a>> {
+    let member = simple_reference_name(callee, source, language)?;
+    if !lexical
+        .binding_identifier_ranges_at(member, callee.start_byte())
+        .is_empty()
+    {
+        return None;
+    }
+    let owner = exact_modeled_type_named(overlay, language, JSTS_GLOBAL_OBJECT_NAME)?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+    let matched = overlay.callable_for_target(SemanticModelCallableKey::new(
+        language.config_label(),
+        &owner.qualified_name,
+        member,
+        false,
+        parameter_count,
+    ));
+    let callable = matched.unique()?;
+    Some(ModeledExternalCall {
+        owner,
+        callable,
+        parameter_count,
+        receiver: ModeledExternalReceiver::GlobalObject,
+    })
+}
+
+fn exact_modeled_type_named<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    name: &str,
+) -> Option<&'a SemanticModelSymbol> {
+    let matched = overlay.symbols_named(name);
+    if matched.disposition != SemanticModelOverlayDisposition::Unique {
+        return None;
+    }
+    let [symbol] = matched.records.as_slice() else {
+        return None;
+    };
+    (symbol.owner_id.is_none()
+        && symbol.qualified_name == name
+        && symbol.language == language.config_label()
+        && !symbol.provenance.ambiguous)
+        .then_some(*symbol)
+}
+
+fn callable_declared_return_owner<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    callable: &SemanticModelSymbol,
+) -> Option<&'a SemanticModelSymbol> {
+    let TypeRef::Declared {
+        id,
+        nullable: false,
+        ..
+    } = callable.structured_signature()?.returns.as_ref()?
+    else {
+        return None;
+    };
+    let matched = overlay.symbols_with_id(id);
+    if matched.disposition != SemanticModelOverlayDisposition::Unique {
+        return None;
+    }
+    let [owner] = matched.records.as_slice() else {
+        return None;
+    };
+    (owner.owner_id.is_none()
+        && owner.language == language.config_label()
+        && !owner.provenance.ambiguous)
+        .then_some(*owner)
+}
+
+fn jsts_binding_range_belongs_to_import(root: Node<'_>, range: Range) -> bool {
+    let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    loop {
+        if node.kind() == "import_statement" {
+            return true;
+        }
+        if node.id() == root.id() {
+            return false;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+pub(crate) fn resolve_js_ts(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_, '_>,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    let Some(tree) = tree else {
+        return no_definition("jsts_parse_failed", "JS/TS source could not be parsed");
+    };
+    // The one downcast for the whole route: the JS/TS candidate logic is
+    // parameterized on `JsTsSource`, and `host` is threaded from here
+    // rather than re-derived at each call. Without the matching analyzer there
+    // is no JS/TS declaration index either, so every candidate this route could
+    // produce would be empty anyway.
+    let Some(host) = resolve_js_ts_source(analyzer, language) else {
+        return no_definition(
+            "jsts_analyzer_unavailable",
+            "no JavaScript/TypeScript analyzer is registered for this workspace",
+        );
+    };
+    let batch = context
+        .language_state::<JsTsDefinitionState>()
+        .js_ts_context(host, file, language, source, tree);
+    let support = context.bounded_support();
+    let value_position = jsts_reference_is_value_position(tree, site);
+    let imports = &batch.imports;
+    let aliases = batch.aliases.as_ref();
+    let lexical_bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
+    let structured_reference =
+        focused.and_then(|node| jsts_static_member_reference_at_focus(node, source, language));
+    let reference = structured_reference
+        .as_deref()
+        .unwrap_or(site.text.as_str());
+
+    if focused.is_some_and(|node| {
+        jsts_is_commonjs_host_export_assignment_object(node, source)
+            && jsts_visible_receiver_binding_scope(
+                tree.root_node(),
+                source,
+                "module",
+                site.focus_start_byte,
+            )
+            .is_none()
+    }) {
+        return no_definition(
+            "commonjs_host_binding",
+            "the CommonJS `module` host binding is provided by the runtime and has no workspace definition",
+        );
+    }
+
+    if let Some(targets) = focused.and_then(|node| {
+        JsTsReceiverFactProvider::new_with_batch_data(
+            host,
+            support,
+            language,
+            file,
+            source,
+            tree.root_node(),
+            imports.clone(),
+            Arc::clone(&batch.aliases),
+            Arc::clone(&batch.syntax_index),
+        )
+        .resolve_jsx_attribute_targets(node, ReceiverAnalysisBudget::default())
+    }) {
+        return if targets.is_empty() {
+            no_definition(
+                "unresolved_jsx_attribute_owner",
+                format!("the JSX component's `{reference}` prop owner could not be proven"),
+            )
+        } else {
+            js_ts_candidates_outcome(analyzer, targets)
+        };
+    }
+
+    if language == Language::TypeScript {
+        let contextual_members = ts_contextual_object_literal_key_candidates(
+            analyzer, host, support, file, source, tree, site, imports, aliases,
+        );
+        if !contextual_members.is_empty() {
+            return js_ts_candidates_outcome(analyzer, contextual_members);
+        }
+    }
+
+    if focused.is_some_and(is_export_alias_identifier) {
+        return no_definition(
+            DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+            "JS/TS export aliases declare outward bindings and do not reference indexed definitions",
+        );
+    }
+    // An import specifier and an `export ... from` specifier name something in
+    // the module the statement points at, not something bound in this file, so
+    // they are answered from the module specifier before the declaration-site
+    // terminals below claim them (#1648).
+    if let Some((module, target)) =
+        focused.and_then(|node| jsts_module_specifier_site(node, source))
+    {
+        return match target {
+            JsTsSpecifierTarget::Exported(name) => resolve_js_ts_module_binding(
+                file,
+                language,
+                &module,
+                name,
+                analyzer,
+                host,
+                support,
+                Some(aliases),
+                value_position,
+            ),
+            JsTsSpecifierTarget::Module => {
+                resolve_js_ts_module_as_namespace(analyzer, file, language, &module, Some(aliases))
+            }
+        };
+    }
+    // A renamed destructuring key is a property read on the destructured value,
+    // so it is answered before the declaration terminal below claims the whole
+    // `pair_pattern` (#2039).
+    if let Some(candidates) = focused.and_then(|node| {
+        jsts_destructured_property_key_candidates(
+            analyzer,
+            host,
+            support,
+            file,
+            language,
+            source,
+            tree,
+            imports,
+            aliases,
+            &lexical_bindings,
+            &batch,
+            node,
+        )
+    }) && !candidates.is_empty()
+    {
+        return js_ts_candidates_outcome(analyzer, candidates);
+    }
+    if focused
+        .is_some_and(|node| is_declaration_identifier(node) || is_explicit_object_literal_key(node))
+    {
+        return no_definition(
+            "declaration_site",
+            "JS/TS declaration and explicit object-key names do not reference indexed definitions",
+        );
+    }
+    if !reference.contains(['.', ':'])
+        && jsts_visible_receiver_binding_scope(
+            tree.root_node(),
+            source,
+            reference,
+            site.focus_start_byte,
+        )
+        .is_some_and(|scope| {
+            scope.start_byte != tree.root_node().start_byte()
+                || scope.end_byte != tree.root_node().end_byte()
+        })
+    {
+        return no_definition(
+            "local_binding",
+            format!("`{reference}` is a local JS/TS binding, which is not indexed"),
+        );
+    }
+    if language == Language::TypeScript
+        && !reference.contains(['.', ':'])
+        && let Some(candidates) = focused.and_then(|node| {
+            ts_enclosing_enum_initializer_member_candidates(
+                analyzer, support, file, source, node, site, reference,
+            )
+        })
+        && !candidates.is_empty()
+    {
+        return js_ts_candidates_outcome(analyzer, candidates);
+    }
+
+    // Calls and constructions have expression receivers rather than dotted
+    // identifier qualifiers. Resolve their exact owners from the AST.
+    if let Some(members) = jsts_expression_receiver_members(
+        analyzer,
+        host,
+        support,
+        file,
+        language,
+        source,
+        tree,
+        site,
+        imports,
+        aliases,
+        &lexical_bindings,
+    ) {
+        return jsts_local_dotted_outcome(analyzer, reference, members);
+    }
+
+    if let Some(overlay) = analyzer.semantic_model_overlay()
+        && let Some(modeled) = modeled_external_call_at_site(
+            overlay.as_ref(),
+            language,
+            source,
+            tree.root_node(),
+            site,
+            &lexical_bindings,
+        )
+    {
+        let reference = format!("{}.{}", modeled.owner.qualified_name, modeled.callable.name);
+        trace::record_named_boundary_with_target(reference.clone(), modeled.callable.id.clone());
+        return boundary_unchecked(
+            format!("`{reference}` resolves through an active JS/TS declaration-model return type"),
+            UnindexedClaim::resolved_external(reference, ClaimSubjectRole::Member),
+        );
+    }
+
+    // #3427: a member read off an external module object answers from this
+    // file's own write before any import route answers from the module, because
+    // the write replaced the value the reference reads.
+    if let Some(outcome) = focused.and_then(|node| {
+        jsts_replaced_external_module_member(
+            analyzer,
+            host,
+            support,
+            file,
+            language,
+            source,
+            tree.root_node(),
+            site,
+            imports,
+            aliases,
+            &batch.module_member_writes,
+            &lexical_bindings,
+            node,
+            reference,
+            value_position,
+        )
+    }) {
+        return outcome;
+    }
+
+    if let Some(member_expression) =
+        focused.and_then(|focus| jsts_import_member_expression_at_focus(focus, source))
+        && let JsTsImportedMemberChainResolution::Exact(chain) =
+            resolve_import_member_chain(member_expression, source)
+        && imports.has_binding_records(chain.root_name(source))
+        // Ambiguity is handled by the dotted route below, which merges every
+        // structurally visible import binding and retains its candidates.
+        && !matches!(
+            imports.binding_at(chain.root_name(source), chain.root.start_byte()),
+            JsTsImportBindingResolution::Ambiguous
+        )
+    {
+        let binding = match imports.binding_at(chain.root_name(source), chain.root.start_byte()) {
+            JsTsImportBindingResolution::Exact(binding) => binding,
+            JsTsImportBindingResolution::Ambiguous
+            | JsTsImportBindingResolution::Shadowed
+            | JsTsImportBindingResolution::Reassigned
+            | JsTsImportBindingResolution::Truncated
+            | JsTsImportBindingResolution::Inactive
+            | JsTsImportBindingResolution::Incomplete
+            | JsTsImportBindingResolution::Unresolved => {
+                return no_definition(
+                    "unproven_import_binding",
+                    format!(
+                        "`{}` is not one exact active JS/TS import binding at this reference",
+                        chain.root_name(source)
+                    ),
+                );
+            }
+        };
+        match resolve_js_ts_imported_member_chain(
+            host,
+            support,
+            language,
+            file,
+            &binding.binding,
+            &chain,
+            Some(aliases),
+            value_position,
+            ReceiverAnalysisBudget::default(),
+        ) {
+            ReceiverAnalysisOutcome::Precise(endpoints) => {
+                let candidates = endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.declaration)
+                    .collect();
+                return js_ts_candidates_outcome(analyzer, candidates);
+            }
+            ReceiverAnalysisOutcome::Ambiguous(endpoints) if !endpoints.is_empty() => {
+                let candidates = endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.declaration)
+                    .collect();
+                return js_ts_candidates_outcome(analyzer, candidates);
+            }
+            ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unknown
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
+                return no_definition(
+                    "unresolved_import_member_chain",
+                    format!(
+                        "`{reference}` did not resolve through one complete imported member chain"
+                    ),
+                );
+            }
+        }
+    }
+
+    if let Some((qualifier, name)) = reference.split_once('.') {
+        let visible_bindings = jsts_all_visible_import_bindings(
+            imports,
+            &lexical_bindings,
+            tree.root_node(),
+            qualifier,
+            site.focus_start_byte,
+        );
+        let namespace_outcomes = visible_bindings
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.kind,
+                    ImportKind::Namespace | ImportKind::CommonJsRequire
+                )
+            })
+            .map(|binding| {
+                resolve_js_ts_module_binding(
+                    file,
+                    language,
+                    &binding.module_specifier,
+                    name,
+                    analyzer,
+                    host,
+                    support,
+                    Some(aliases),
+                    value_position,
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(outcome) = merge_js_ts_binding_outcomes(
+            analyzer,
+            reference,
+            namespace_outcomes,
+            imports.was_truncated(qualifier),
+        ) {
+            return outcome;
+        }
+        let imported_receiver_binding = !visible_bindings.is_empty()
+            && imports
+                .resolvable_direct_bindings_for(qualifier)
+                .next()
+                .is_some();
+        let receiver_candidates = if imported_receiver_binding {
+            resolve_js_ts_direct_import_candidates(
+                host,
+                support,
+                language,
+                file,
+                imports,
+                qualifier,
+                Some(aliases),
+                value_position,
+            )
+            .unwrap_or_default()
+        } else {
+            let mut same_file = support.file_identifier(file, qualifier);
+            if value_position {
+                same_file = jsts_value_space_candidates(host, same_file);
+            } else {
+                same_file = jsts_type_space_candidates(host, same_file);
+            }
+            same_file
+        };
+        let dotted_lookup = JstsDottedLookup {
+            analyzer,
+            host,
+            support,
+            file,
+            root: tree.root_node(),
+            source,
+            reference,
+            receiver: qualifier,
+            value_position,
+            before_byte: site.range.start_byte,
+        };
+        if language == Language::TypeScript
+            && context.navigation_operation == Some(NavigationOperation::Definition)
+            && !imported_receiver_binding
+        {
+            let declared_receivers = ts_local_annotation_receiver_owners(
+                &dotted_lookup,
+                imports,
+                aliases,
+                &lexical_bindings,
+                site.focus_start_byte,
+            );
+            let mut declared_finds = JsTsMemberFinds::default();
+            let declared_members = ts_member_candidates(
+                analyzer,
+                host,
+                support,
+                declared_receivers,
+                name,
+                value_position,
+                &mut declared_finds,
+            );
+            if !declared_members.is_empty() {
+                declared_finds.stage();
+                return js_ts_candidates_outcome(analyzer, declared_members);
+            }
+        }
+        let lexical_receiver_candidates = if imported_receiver_binding {
+            Vec::new()
+        } else {
+            jsts_lexically_bound_receiver_candidates(
+                dotted_lookup,
+                &lexical_bindings,
+                &receiver_candidates,
+            )
+        };
+        // One accumulator per candidate set, staged at the return that reports
+        // that exact set (#1477). The JavaScript fallback below goes through the
+        // shared `jsts_member_candidates`, whose per-receiver split is not
+        // recoverable from its flattened result, so those candidates stay
+        // unattributed rather than attributed to a guess.
+        let mut generic_finds = JsTsMemberFinds::default();
+        let generic_member_candidates =
+            if language == Language::JavaScript && imported_receiver_binding {
+                jsts_file_scoped_member_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    receiver_candidates,
+                    name,
+                    value_position,
+                    &mut generic_finds,
+                )
+            } else if language == Language::TypeScript && imported_receiver_binding {
+                ts_member_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    receiver_candidates,
+                    name,
+                    value_position,
+                    &mut generic_finds,
+                )
+            } else if language == Language::JavaScript {
+                jsts_member_candidates(host, support, receiver_candidates, name, value_position)
+            } else {
+                Vec::new()
+            };
+        if !imported_receiver_binding
+            && let Some(local_candidates) = focused.and_then(|node| {
+                jsts_exact_local_dotted_candidates(
+                    dotted_lookup,
+                    &lexical_bindings,
+                    node,
+                    &generic_member_candidates,
+                )
+            })
+        {
+            return jsts_local_dotted_outcome(analyzer, reference, local_candidates);
+        }
+        let mut lexical_finds = JsTsMemberFinds::default();
+        let lexical_member_candidates = if language == Language::TypeScript {
+            ts_member_candidates(
+                analyzer,
+                host,
+                support,
+                lexical_receiver_candidates,
+                name,
+                value_position,
+                &mut lexical_finds,
+            )
+        } else {
+            jsts_member_candidates(
+                host,
+                support,
+                lexical_receiver_candidates,
+                name,
+                value_position,
+            )
+        };
+        if !lexical_member_candidates.is_empty() {
+            lexical_finds.stage();
+            return js_ts_candidates_outcome(analyzer, lexical_member_candidates);
+        }
+        if imported_receiver_binding && !generic_member_candidates.is_empty() {
+            generic_finds.stage();
+            return js_ts_candidates_outcome(analyzer, generic_member_candidates);
+        }
+        match jsts_receiver_provider_member_candidates(
+            host, support, file, language, source, tree, site, name, &batch,
+        ) {
+            ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
+                // The receiver-fact provider proves the value shape but
+                // intentionally returns only target declarations. Re-run the
+                // TypeScript owner lookup when it can name the declared
+                // receiver so member tracing records the same direct or
+                // inherited owner and route as the ordinary resolver path.
+                if language == Language::TypeScript {
+                    let receiver_owners = ts_local_receiver_owner_candidates(
+                        host, support, file, source, tree, site, imports, aliases, qualifier,
+                    );
+                    let receiver_owners = if receiver_owners.is_empty() {
+                        ts_parameter_annotation_receiver_owners(
+                            host, support, file, source, tree, site, imports, aliases, qualifier,
+                        )
+                    } else {
+                        receiver_owners
+                    };
+                    let mut provider_finds = JsTsMemberFinds::default();
+                    let attributed = ts_member_candidates(
+                        analyzer,
+                        host,
+                        support,
+                        receiver_owners,
+                        name,
+                        value_position,
+                        &mut provider_finds,
+                    );
+                    if !attributed.is_empty() {
+                        provider_finds.stage();
+                        return js_ts_candidates_outcome(analyzer, attributed);
+                    }
+                }
+                let candidates = if language == Language::TypeScript {
+                    if value_position {
+                        jsts_value_space_candidates(host, candidates)
+                    } else {
+                        jsts_type_space_candidates(host, candidates)
+                    }
+                } else {
+                    jsts_value_space_candidates(host, candidates)
+                };
+                if !imported_receiver_binding
+                    && let Some(local_candidates) = focused.and_then(|node| {
+                        jsts_exact_local_dotted_candidates(
+                            dotted_lookup,
+                            &lexical_bindings,
+                            node,
+                            &candidates,
+                        )
+                    })
+                {
+                    return jsts_local_dotted_outcome(analyzer, reference, local_candidates);
+                }
+                return js_ts_candidates_outcome(analyzer, candidates);
+            }
+            ReceiverAnalysisOutcome::Ambiguous(candidates)
+                if language == Language::TypeScript && !candidates.is_empty() =>
+            {
+                // An ambiguous provider result can still be enriched when
+                // the receiver's structured annotation is itself precise.
+                // Structured owner recovery rejects ambiguous/open
+                // annotations, so an unresolved arm keeps the existing
+                // no-definition outcome.
+                let receiver_owners = ts_local_receiver_owner_candidates(
+                    host, support, file, source, tree, site, imports, aliases, qualifier,
+                );
+                let receiver_owners = if receiver_owners.is_empty() {
+                    ts_parameter_annotation_receiver_owners(
+                        host, support, file, source, tree, site, imports, aliases, qualifier,
+                    )
+                } else {
+                    receiver_owners
+                };
+                let mut provider_finds = JsTsMemberFinds::default();
+                let attributed = ts_member_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    receiver_owners,
+                    name,
+                    value_position,
+                    &mut provider_finds,
+                );
+                if !attributed.is_empty() {
+                    provider_finds.stage();
+                    return js_ts_candidates_outcome(analyzer, attributed);
+                }
+                return no_definition(
+                    "receiver_analysis_not_precise",
+                    format!("`{reference}` did not resolve to a precise JS/TS receiver"),
+                );
+            }
+            ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
+                return no_definition(
+                    "receiver_analysis_not_precise",
+                    format!("`{reference}` did not resolve to a precise JS/TS receiver"),
+                );
+            }
+            ReceiverAnalysisOutcome::Unknown
+                if language == Language::TypeScript
+                    && jsts_enclosing_function_scope(tree.root_node(), site.focus_start_byte)
+                        .is_some_and(|scope| {
+                            ts_binding_is_assigned_before(
+                                scope,
+                                source,
+                                qualifier,
+                                site.focus_start_byte,
+                            )
+                        }) =>
+            {
+                // The shared receiver provider observed an unknown value in
+                // this binding's write history. Do not let owner-candidate
+                // fallbacks erase that typed uncertainty and resurrect the
+                // receiver's annotation as an exact nominal owner (#2495).
+                return no_definition(
+                    "receiver_analysis_not_precise",
+                    format!("`{reference}` did not resolve to a precise JS/TS receiver"),
+                );
+            }
+            ReceiverAnalysisOutcome::Precise(_) | ReceiverAnalysisOutcome::Unknown => {}
+        }
+        let new_receiver_candidates = jsts_local_new_receiver_owner_candidates(
+            analyzer,
+            host,
+            support,
+            file,
+            language,
+            source,
+            tree.root_node(),
+            imports,
+            aliases,
+            qualifier,
+            site.range.start_byte,
+            0,
+        );
+        let mut new_receiver_finds = JsTsMemberFinds::default();
+        let new_receiver_member_candidates = if language == Language::TypeScript {
+            ts_member_candidates(
+                analyzer,
+                host,
+                support,
+                new_receiver_candidates,
+                name,
+                value_position,
+                &mut new_receiver_finds,
+            )
+        } else {
+            jsts_member_candidates(host, support, new_receiver_candidates, name, value_position)
+        };
+        if !new_receiver_member_candidates.is_empty() {
+            new_receiver_finds.stage();
+            return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
+        }
+        if language == Language::TypeScript {
+            let inferred_receivers = ts_local_receiver_owner_candidates(
+                host, support, file, source, tree, site, imports, aliases, qualifier,
+            );
+            let mut inferred_finds = JsTsMemberFinds::default();
+            let inferred_member_candidates = ts_member_candidates(
+                analyzer,
+                host,
+                support,
+                inferred_receivers,
+                name,
+                value_position,
+                &mut inferred_finds,
+            );
+            if !inferred_member_candidates.is_empty() {
+                inferred_finds.stage();
+                return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
+            }
+            let inferred_receivers = ts_local_receiver_owner_candidates(
+                host, support, file, source, tree, site, imports, aliases, qualifier,
+            );
+            let mut inferred_finds = JsTsMemberFinds::default();
+            let inferred_member_candidates = jsts_file_scoped_member_candidates(
+                analyzer,
+                host,
+                support,
+                inferred_receivers,
+                name,
+                value_position,
+                &mut inferred_finds,
+            );
+            if !inferred_member_candidates.is_empty() {
+                inferred_finds.stage();
+                return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
+            }
+            if let Some(receiver_type) = ts_global_object_receiver_type(qualifier) {
+                let global_receivers = support
+                    .fqn(receiver_type)
+                    .into_iter()
+                    .filter(|unit| jsts_unit_is_type_only(host, unit))
+                    .collect();
+                let mut global_finds = JsTsMemberFinds::default();
+                let global_member_candidates = ts_member_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    global_receivers,
+                    name,
+                    value_position,
+                    &mut global_finds,
+                );
+                if !global_member_candidates.is_empty() {
+                    global_finds.stage();
+                    return js_ts_candidates_outcome(analyzer, global_member_candidates);
+                }
+            }
+        }
+        if language == Language::TypeScript {
+            let exact_global = ts_exact_global_dotted_candidates(
+                analyzer,
+                host,
+                support,
+                reference,
+                value_position,
+            );
+            if !exact_global.is_empty() {
+                return js_ts_candidates_outcome(analyzer, exact_global);
+            }
+            if let Some(target) = analyzer.semantic_model_overlay().and_then(|model| {
+                model
+                    .typescript_global_member_target(qualifier, name)
+                    .map(|symbol| symbol.id.clone())
+            }) {
+                if !support.file_identifier(file, qualifier).is_empty() {
+                    return no_definition(
+                        "workspace_internal",
+                        format!("`{reference}` is declared in this workspace"),
+                    );
+                }
+                // gated upstream: the structured file-identifier check above
+                // proved that the receiver is not declared in this workspace.
+                trace::record_named_boundary_with_target(reference.to_owned(), target);
+                return boundary_unchecked(
+                    format!(
+                        "`{reference}` resolves to an active TypeScript declaration-model member"
+                    ),
+                    UnindexedClaim::resolved_external(reference, ClaimSubjectRole::Member),
+                );
+            }
+        } else {
+            let exact_project = jsts_exact_dotted_candidates(
+                analyzer,
+                host,
+                support,
+                file,
+                reference,
+                value_position,
+            );
+            if !exact_project.is_empty() {
+                return js_ts_candidates_outcome(analyzer, exact_project);
+            }
+        }
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+        );
+    }
+
+    if let Some(outcome) = resolve_js_ts_visible_module_bindings(
+        jsts_visible_import_bindings(
+            imports,
+            &lexical_bindings,
+            tree.root_node(),
+            reference,
+            site.focus_start_byte,
+        ),
+        imports.was_truncated(reference),
+        file,
+        language,
+        reference,
+        analyzer,
+        host,
+        support,
+        Some(aliases),
+        value_position,
+    ) {
+        return outcome;
+    }
+    if let Some(outcome) = resolve_js_ts_visible_namespace_bindings(
+        jsts_all_visible_import_bindings(
+            imports,
+            &lexical_bindings,
+            tree.root_node(),
+            reference,
+            site.focus_start_byte,
+        )
+        .into_iter()
+        .filter(|binding| binding.kind == ImportKind::Namespace)
+        .collect(),
+        imports.was_truncated(reference),
+        file,
+        language,
+        reference,
+        analyzer,
+        Some(aliases),
+    ) {
+        return outcome;
+    }
+
+    let same_file_candidates = support.file_identifier(file, reference);
+    let mut same_file: Vec<_> = same_file_candidates
+        .iter()
+        .filter(|candidate| jsts_candidate_is_bare_declaration(file, reference, candidate))
+        .cloned()
+        .collect();
+    let binding_ranges =
+        lexical_bindings.binding_identifier_ranges_at(reference, site.focus_start_byte);
+    // TypeScript keeps value and type declarations in separate namespaces. A
+    // visible `const Widget` must narrow a value-position `Widget`, but it must
+    // not hide an `interface Widget` or `type Widget` at an annotation site.
+    // The lexical binding index records value binders, so apply its declaration
+    // range filter only in the value namespace (#2114).
+    if value_position && !binding_ranges.is_empty() {
+        same_file.retain(|candidate| {
+            analyzer.ranges(candidate).iter().any(|declaration_range| {
+                binding_ranges.iter().any(|binding_range| {
+                    declaration_range.start_byte <= binding_range.start_byte
+                        && binding_range.end_byte <= declaration_range.end_byte
+                })
+            })
+        });
+    }
+    if same_file.is_empty() && binding_ranges.is_empty() && language == Language::JavaScript {
+        same_file =
+            jsts_exact_browser_global_bare_candidates(host, support, reference, value_position);
+    }
+    if value_position {
+        same_file = jsts_value_space_candidates(host, same_file);
+    } else {
+        same_file = jsts_type_space_candidates(host, same_file);
+    }
+    if !same_file.is_empty() {
+        return js_ts_candidates_outcome(analyzer, same_file);
+    }
+    if !binding_ranges.is_empty() {
+        // The binding index PROVED this name bound, so what is left is which
+        // binder it named. A binder in a scope narrower than the program is a
+        // local that no analyzer publishes as a CodeUnit -- a `catch` clause's
+        // exception binder is the shape the earlier `local_binding` guard does
+        // not model, because `jsts_scope_contains_binding_before` recognizes
+        // only parameter and declarator binders -- so the answer is the
+        // adjudicated local, not a gap (#2154). A program-scope binder that no
+        // indexed declaration covers in the requested namespace is a real
+        // index gap and keeps the generic kind.
+        if !lexical_bindings.is_program_binding_at(
+            reference,
+            site.focus_start_byte,
+            tree.root_node(),
+        ) {
+            return no_definition(
+                LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                format!("`{reference}` binds to a local JS/TS binder, which is not indexed"),
+            );
+        }
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "the lexical binding for `{reference}` is not indexed in the requested namespace"
+            ),
+        );
+    }
+
+    // Last resort for a bare name, symmetric with the dotted one above (#1787).
+    // Script files share one global scope -- Angular concatenates `src/*.js` at
+    // build time, so `src/ng/parse.js` calls the `isNumber` that
+    // `src/Angular.js` declares without importing it -- while a module's
+    // top-level binding is file-private. So both sides must be scripts, which
+    // is the same `js_program_is_external_module` question the dotted route
+    // asks of its receiver. A name the binding index proves bound never
+    // reaches here: the `binding_ranges` branch above answers every one of
+    // them, whether the binder is local or at the program scope.
+    if !js_program_is_external_module(tree.root_node(), source) {
+        let script_global =
+            jsts_script_global_bare_candidates(analyzer, host, support, reference, value_position);
+        if !script_global.is_empty() {
+            return js_ts_candidates_outcome(analyzer, script_global);
+        }
+    }
+
+    if is_known_js_ts_global(reference) {
+        return no_definition(
+            PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND,
+            format!("`{reference}` is provided by the JS/TS language or runtime host"),
+        );
+    }
+
+    no_definition(
+        "no_indexed_definition",
+        format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+    )
+}
+
+fn ts_enclosing_enum_initializer_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    focused: Node<'_>,
+    site: &ResolvedReferenceSite,
+    reference: &str,
+) -> Option<Vec<CodeUnit>> {
+    if !matches!(focused.kind(), "identifier" | "property_identifier") {
+        return None;
+    }
+    let (enum_declaration, assignment) = typescript_enclosing_enum_initializer(focused)?;
+    let enum_name = enum_declaration.child_by_field_name("name")?;
+    let enclosing = analyzer.enclosing_code_unit(file, &site.range)?;
+    let owner = if enclosing.is_field() {
+        analyzer.parent_of(&enclosing)?
+    } else {
+        enclosing
+    };
+    if !owner.is_class()
+        || owner.source() != file
+        || owner.terminal_name() != slice(enum_name, source)
+    {
+        return None;
+    }
+
+    let member_fqn = format!("{}.{}", owner.fq_name(), reference);
+    Some(
+        support
+            .fqn(&member_fqn)
+            .into_iter()
+            .filter(|candidate| candidate.is_field() && candidate.source() == file)
+            .filter(|candidate| {
+                analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.end_byte <= assignment.start_byte())
+            })
+            .collect(),
+    )
+}
+
+/// Bare names another script contributes to the shared script global scope.
+///
+/// The project-wide question is the one `jsts_exact_dotted_candidates` asks --
+/// `support.fqn` on the reference as written -- and the declaration-side gate
+/// is the one `jsts_dotted_receiver_has_global_identity` applies:
+/// the declaring file must be a script, and the name must bind at that script's
+/// program scope, the only scope the shared global has.
+///
+/// Every surviving candidate is reported. The workspace is the program, so two
+/// scripts that both declare the name really are two contenders, and the shared
+/// outcome machinery calls that Ambiguous (#1811).
+///
+/// The JS/TS indexer gives each program-scope script binding a bare qualified
+/// name. Module fields keep a file-scoped identity and fail the script gate
+/// below.
+fn jsts_script_global_bare_candidates(
+    _analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let candidates = support
+        .fqn(reference)
+        .into_iter()
+        .filter(|candidate| {
+            brokk_bifrost_js_ts::graph::source::code_unit_is_script_global_binding(
+                host, candidate, reference,
+            )
+        })
+        .collect();
+    if value_position {
+        jsts_value_space_candidates(host, candidates)
+    } else {
+        jsts_type_space_candidates(host, candidates)
+    }
+}
+
+/// Whether `candidate` is a program-scope binding of `name` in a script file.
+///
+/// The scope is read from the declaration through the same
+/// `jsts_binding_scope_for_declaration` the local routes use, not from the
+/// shape of the fq name: a member (`Ctor.prototype.isNumber`,
+/// `holder.isNumber`) carries its owner in its fq name and a function nested in
+/// another function is not indexed at all, so neither reaches this filter
+/// today, but a name that binds anywhere narrower than the program is not part
+/// of the shared global scope even if it does.
+#[allow(clippy::too_many_arguments)]
+fn resolve_js_ts_visible_module_bindings(
+    bindings: Vec<&brokk_bifrost_core::analyzer::usages::model::ImportBinding>,
+    bindings_truncated: bool,
+    file: &ProjectFile,
+    language: Language,
+    reference: &str,
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Option<DefinitionLookupOutcome> {
+    let outcomes = bindings
+        .into_iter()
+        .map(|binding| {
+            let exported_name = js_ts_direct_import_export_name(binding, reference);
+            resolve_js_ts_module_binding(
+                file,
+                language,
+                &binding.module_specifier,
+                exported_name,
+                analyzer,
+                host,
+                support,
+                aliases,
+                value_position,
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_js_ts_binding_outcomes(analyzer, reference, outcomes, bindings_truncated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_js_ts_visible_namespace_bindings(
+    bindings: Vec<&brokk_bifrost_core::analyzer::usages::model::ImportBinding>,
+    bindings_truncated: bool,
+    file: &ProjectFile,
+    language: Language,
+    reference: &str,
+    analyzer: &dyn IAnalyzer,
+    aliases: Option<&AliasResolver>,
+) -> Option<DefinitionLookupOutcome> {
+    let outcomes = bindings
+        .into_iter()
+        .map(|binding| {
+            resolve_js_ts_module_as_namespace(
+                analyzer,
+                file,
+                language,
+                &binding.module_specifier,
+                aliases,
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_js_ts_binding_outcomes(analyzer, reference, outcomes, bindings_truncated)
+}
+
+/// The whole module a namespace binding names: the file scopes the module
+/// specifier resolves to. An unresolved specifier fails closed the same way a
+/// named binding does, so the two routes report one shape.
+fn resolve_js_ts_module_as_namespace(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+    module: &str,
+    aliases: Option<&AliasResolver>,
+) -> DefinitionLookupOutcome {
+    let files = brokk_bifrost_js_ts::imports::resolve_js_ts_module_specifier(
+        file, module, language, aliases,
+    );
+    if files.is_empty() {
+        record_unresolved_module_specifier(analyzer, file, language, module, aliases);
+        return gated_boundary(
+            || !is_bare_js_ts_specifier(module),
+            format!("`{module}` is a package import outside this partial workspace analysis"),
+            UnindexedClaim::external_boundary(module, ClaimSubjectRole::Module),
+            "no_indexed_definition",
+            format!("`{module}` could not be resolved to a workspace JS/TS file"),
+        );
+    }
+
+    let mut candidates = files
+        .into_iter()
+        .map(CodeUnit::file_scope)
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    js_ts_candidates_outcome(analyzer, candidates)
+}
+
+fn merge_js_ts_binding_outcomes(
+    analyzer: &dyn IAnalyzer,
+    reference: &str,
+    mut outcomes: Vec<DefinitionLookupOutcome>,
+    bindings_truncated: bool,
+) -> Option<DefinitionLookupOutcome> {
+    if outcomes.is_empty() {
+        return None;
+    }
+    if outcomes.len() == 1 && !bindings_truncated {
+        return outcomes.pop();
+    }
+
+    let mut definitions = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut crossed_external_boundary = false;
+    let mut unresolved_import = false;
+    let mut unavailable = false;
+    let mut incomplete = false;
+    let mut stopped = None;
+    for outcome in outcomes {
+        match outcome.status {
+            DefinitionLookupStatus::Unavailable => unavailable = true,
+            DefinitionLookupStatus::Incomplete => incomplete = true,
+            DefinitionLookupStatus::Cancelled => stopped = Some(DefinitionLookupStatus::Cancelled),
+            DefinitionLookupStatus::ExceededBudget(limit) => {
+                stopped = Some(DefinitionLookupStatus::ExceededBudget(limit))
+            }
+            DefinitionLookupStatus::UnresolvableImportBoundary => crossed_external_boundary = true,
+            DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::UnsupportedLanguage
+            | DefinitionLookupStatus::InvalidLocation
+            | DefinitionLookupStatus::NotFound => unresolved_import = true,
+            DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
+        }
+        definitions.extend(outcome.definitions);
+        diagnostics.extend(outcome.diagnostics);
+    }
+    let competing_imports = format!("`{reference}` is supplied by multiple visible imports");
+    let mut outcome = if definitions.is_empty() {
+        // no candidates: several imports supply the name and none of them
+        // reached an indexed definition, so there is no unit to offer.
+        let mut outcome = ambiguous_without_candidates(competing_imports);
+        outcome.diagnostics.extend(diagnostics);
+        outcome
+    } else {
+        let mut outcome = js_ts_candidates_outcome(analyzer, definitions);
+        outcome.status = DefinitionLookupStatus::Ambiguous;
+        outcome.diagnostics.extend(diagnostics);
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "ambiguous_definition".to_string(),
+            message: competing_imports,
+        });
+        outcome
+    };
+    if unavailable {
+        outcome.status = DefinitionLookupStatus::Unavailable;
+    }
+    if incomplete {
+        outcome.status = DefinitionLookupStatus::Incomplete;
+    }
+    if let Some(status) = stopped.as_ref().copied() {
+        // A stopped import branch cannot publish the prefix accumulated by
+        // sibling branches. Preserve the operational terminal status and its
+        // diagnostics, but withhold all target candidates.
+        outcome.status = status;
+        outcome.definitions.clear();
+        outcome.lexical_definition = None;
+    }
+    if crossed_external_boundary {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
+            kind: PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC.to_string(),
+            message: format!(
+                "at least one competing import for `{reference}` crosses the indexed workspace boundary"
+            ),
+        });
+    }
+    if unresolved_import {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC.to_string(),
+            message: format!(
+                "at least one competing import for `{reference}` could not be resolved"
+            ),
+        });
+    }
+    if bindings_truncated {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
+            kind: IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC.to_string(),
+            message: format!(
+                "competing imports for `{reference}` exceeded the per-name limit of {MAX_STATIC_IMPORT_BINDINGS_PER_NAME}"
+            ),
+        });
+    }
+    Some(outcome)
+}
+
+fn jsts_candidate_is_bare_declaration(
+    file: &ProjectFile,
+    reference: &str,
+    candidate: &CodeUnit,
+) -> bool {
+    if candidate.short_name() == reference {
+        return true;
+    }
+    let Some(file_name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    // A module-scope binding carries a file-qualified short name: a `const` or
+    // `let` mints a field and a `type` alias mints a class (#2911), and both
+    // spell `<file>.<name>`. Every other declaration has the bare short name
+    // the first branch already answered.
+    (candidate.is_field() || candidate.is_class())
+        && candidate.short_name() == format!("{file_name}.{reference}")
+}
+
+fn jsts_exact_browser_global_bare_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = ["window", "globalThis"]
+        .into_iter()
+        .flat_map(|object| support.fqn(&format!("{object}.{reference}")))
+        .filter(|candidate| {
+            browser_global_property_shape(candidate)
+                .is_some_and(|(_, property)| property == reference)
+        })
+        .filter(|candidate| {
+            let Some(facts) = host.source_facts(candidate.source()) else {
+                return false;
+            };
+            let declarations = declaration_ids_for_unit(&facts, candidate);
+            facts.facts.property_receivers.iter().any(|property| {
+                declarations.contains(&property.declaration)
+                    && matches!(property.binding, JsTsReceiverBinding::Unbound)
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if value_position {
+        jsts_value_space_candidates(host, candidates)
+    } else {
+        candidates
+    }
+}
+
+fn jsts_is_commonjs_host_export_assignment_object(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "identifier" || node_text(node, source) != "module" {
+        return false;
+    }
+    let Some(exports_member) = node.parent().filter(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == node.id())
+            && parent
+                .child_by_field_name("property")
+                .is_some_and(|property| node_text(property, source) == "exports")
+    }) else {
+        return false;
+    };
+
+    let mut assignment_target = exports_member;
+    while let Some(parent) = assignment_target.parent().filter(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == assignment_target.id())
+    }) {
+        assignment_target = parent;
+    }
+
+    assignment_target
+        .parent()
+        .filter(|parent| parent.kind() == "assignment_expression")
+        .and_then(|assignment| assignment.child_by_field_name("left"))
+        .is_some_and(|left| left.id() == assignment_target.id())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_contextual_object_literal_key_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+) -> Vec<CodeUnit> {
+    let Some(node) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
+        return Vec::new();
+    };
+    let Some((property, object, name)) = ts_object_literal_property_at_key(node, source) else {
+        return Vec::new();
+    };
+    if !(property.start_byte() <= site.focus_start_byte
+        && site.focus_end_byte <= property.end_byte())
+    {
+        return Vec::new();
+    }
+    let owners =
+        ts_contextual_object_literal_owners(host, support, file, source, imports, aliases, object);
+    let mut finds = JsTsMemberFinds::default();
+    let members = ts_member_candidates(analyzer, host, support, owners, &name, true, &mut finds);
+    finds.stage();
+    members
+}
+
+fn ts_object_literal_property_at_key<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>, String)> {
+    brokk_bifrost_js_ts::typescript::ts_object_literal_property_at_key(node, source)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_contextual_object_literal_owners(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    object: Node<'_>,
+) -> Vec<CodeUnit> {
+    let Some(type_node) = ts_contextual_object_literal_type_node(object) else {
+        return Vec::new();
+    };
+    ts_resolve_type_text_to_property_owners(
+        host,
+        support,
+        file,
+        source,
+        imports,
+        aliases,
+        ts_type_annotation_text(type_node, source).as_str(),
+        0,
+    )
+}
+
+fn ts_global_object_receiver_type(receiver: &str) -> Option<&'static str> {
+    match receiver {
+        "window" => Some("Window"),
+        _ => None,
+    }
+}
+
+/// Record the workspace paths one module specifier probed and did not find.
+///
+/// A specifier that resolves to a file makes the reader open it, and the file
+/// key names what it read. A specifier that resolves to nothing makes the
+/// reader return with no key at all, and yet the answer is about the
+/// workspace: the sibling could be added in the next commit. Naming each
+/// probed path is the exact form of that dependency -- one key per path the
+/// resolver stat'ed -- and the head answers it from its own path map.
+fn record_unresolved_module_specifier(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+    module: &str,
+    aliases: Option<&AliasResolver>,
+) {
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    for candidate in js_ts_module_specifier_probed_paths(file, module, language, aliases) {
+        analyzer.record_read(ReadKey::path_absent(
+            language,
+            rel_path_string(&candidate).as_str(),
+        ));
+    }
+}
+
+/// What a JS/TS import or `export ... from` specifier token names in the module
+/// its statement points at.
+///
+/// The token is a specifier, not a reference to something in this file, so the
+/// answer is whatever the other module publishes under that name. Each variant
+/// carries the published thing, never a spelling in this file: `import { a as
+/// b }` binds `b` here but names `a` there, so both tokens of that clause ask
+/// the same question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsTsSpecifierTarget<'src> {
+    /// The name the target module exports: `import { name }`, `import { name as
+    /// alias }`, `export { name } from`, `export { name as alias } from`, and
+    /// `default` for `import name from`, which is the spelling
+    /// `resolve_js_ts_module_binding_candidates` already keys the default
+    /// export under.
+    Exported(&'src str),
+    /// The target module itself: `import * as ns from`.
+    Module,
+}
+
+/// Classify the focused token as an import or `export ... from` specifier and
+/// name the module its target comes from.
+///
+/// Every fact is a tree-sitter field: the specifier's `name` and `alias`
+/// fields, and the statement's `source` field. A local `export { x }` has no
+/// `source` field and is not this shape -- it resolves through whatever binds
+/// `x` in this file, which the ordinary reference route already answers -- and
+/// an `export ... from` alias is the outward binding this module declares, so
+/// it stays with the export-alias answer above rather than pointing at the
+/// origin (#1648).
+fn jsts_module_specifier_site<'src>(
+    node: Node<'_>,
+    source: &'src str,
+) -> Option<(String, JsTsSpecifierTarget<'src>)> {
+    let parent = node.parent()?;
+    let statement = nearest_ancestor(node, |kind| {
+        matches!(kind, "import_statement" | "export_statement")
+    })?;
+    let module = js_ts_statement_module_specifier(statement, source)?;
+    match parent.kind() {
+        "import_specifier" | "export_specifier" => {
+            debug_assert!(
+                !is_export_alias_identifier(node),
+                "the export-alias answer claims this token before the specifier route sees it: {node:?}"
+            );
+            let name = parent.child_by_field_name("name")?;
+            Some((module, JsTsSpecifierTarget::Exported(slice(name, source))))
+        }
+        "namespace_import" => Some((module, JsTsSpecifierTarget::Module)),
+        // The default binding is the one identifier that is a direct child of
+        // the clause; `named_imports` and `namespace_import` wrap the others.
+        "import_clause" if node.kind() == "identifier" => {
+            Some((module, JsTsSpecifierTarget::Exported("default")))
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_js_ts_module_binding(
+    file: &ProjectFile,
+    language: Language,
+    module: &str,
+    exported_name: &str,
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> DefinitionLookupOutcome {
+    let files = brokk_bifrost_js_ts::imports::resolve_js_ts_module_specifier(
+        file, module, language, aliases,
+    );
+    if files.is_empty() {
+        record_unresolved_module_specifier(analyzer, file, language, module, aliases);
+        // Only a bare specifier (`react`, `lodash`) is a confident external
+        // package boundary. A relative/absolute specifier (`./`, `../`, `/`)
+        // that resolves to no file is an in-workspace path that did not land —
+        // a typo or a not-yet-indexed sibling — never a confident cross-workspace
+        // claim (#1158): treat the relative shape as workspace-internal so the
+        // gate yields `no_definition` instead of `boundary`.
+        return gated_boundary(
+            || !is_bare_js_ts_specifier(module),
+            format!("`{module}` is a package import outside this partial workspace analysis"),
+            UnindexedClaim::external_boundary(module, ClaimSubjectRole::Module),
+            "no_indexed_definition",
+            format!("`{module}` could not be resolved to a workspace JS/TS file"),
+        );
+    }
+
+    let candidates = resolve_js_ts_module_binding_candidates(
+        host,
+        support,
+        language,
+        file,
+        module,
+        exported_name,
+        aliases,
+        value_position,
+    );
+    if candidates.is_empty() {
+        if let Some((reexport_file, external_module)) = cached_jsts_index(analyzer, language, None)
+            .and_then(|index| index.unresolved_reexport_boundary(&files, exported_name))
+        {
+            // gated upstream: `unresolved_reexport_boundary` only returns Some for
+            // a re-export chain that terminates outside the indexed workspace.
+            return boundary_unchecked(
+                format!(
+                    "`{exported_name}` is re-exported by `{}` from `{external_module}`, which is outside the indexed workspace",
+                    rel_path_string(&reexport_file)
+                ),
+                UnindexedClaim::external_boundary(external_module, ClaimSubjectRole::Module),
+            );
+        }
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{exported_name}` is not indexed in `{module}`"),
+        );
+    }
+    js_ts_candidates_outcome(analyzer, candidates)
+}
+
+/// Resolve a dotted FQN within one exact declaration file. JS/TS FQNs omit module
+/// paths, so callers that have already resolved a receiver must retain this scope.
+fn jsts_file_scoped_dotted_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates: Vec<_> = support
+        .fqn(reference)
+        .into_iter()
+        .filter(|unit| unit.source() == file)
+        .collect();
+    if value_position {
+        candidates = jsts_value_space_candidates(host, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(host, candidates);
+    }
+    candidates
+}
+
+#[derive(Clone, Copy)]
+struct JstsDottedLookup<'a, 'tree> {
+    analyzer: &'a dyn IAnalyzer,
+    host: &'a dyn JsTsSource,
+    support: &'a dyn BoundedDefinitionLookup,
+    file: &'a ProjectFile,
+    root: Node<'tree>,
+    source: &'a str,
+    reference: &'a str,
+    receiver: &'a str,
+    value_position: bool,
+    before_byte: usize,
+}
+
+impl JstsDottedLookup<'_, '_> {
+    fn same_file_candidates(self) -> Vec<CodeUnit> {
+        jsts_file_scoped_dotted_candidates(
+            self.host,
+            self.support,
+            self.file,
+            self.reference,
+            self.value_position,
+        )
+    }
+}
+
+struct JstsLocalDottedCandidates {
+    candidates: Vec<CodeUnit>,
+    incomplete: bool,
+}
+
+fn jsts_local_dotted_outcome(
+    analyzer: &dyn IAnalyzer,
+    reference: &str,
+    local: JstsLocalDottedCandidates,
+) -> DefinitionLookupOutcome {
+    let mut outcome = if local.candidates.is_empty() {
+        no_definition(
+            "no_indexed_definition",
+            format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+        )
+    } else {
+        js_ts_candidates_outcome(analyzer, local.candidates)
+    };
+    if local.incomplete {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            format!("property reaching for `{reference}`").into_boxed_str(),
+        ));
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
+            kind: "analysis_incomplete".to_string(),
+            message: format!(
+                "structured property reaching evidence for `{reference}` was incomplete; candidates require retained control-flow evidence"
+            ),
+        });
+    }
+    outcome
+}
+
+/// The same-file answer for a member read off an external module object this
+/// file replaces (#3427).
+///
+/// `const cp = require("child_process"); cp.execSync = f; cp.execSync(x)` reads
+/// the value the write installed, not `child_process`'s own export, so the
+/// import routes must not answer for the module and no exact external member
+/// identity may be minted for it. The evidence is the #3406 proof: a write to
+/// the member, a computed-key write that can name it, an `Object.assign` or any
+/// other module-object escape, and a `delete` each refuse it and name the range
+/// that refused it.
+///
+/// A refused reference then resolves through the same structured
+/// property-definition and reaching evidence an ordinary same-file receiver
+/// uses, so an arrow assigned to the member resolves to that arrow. When no
+/// workspace binding is visible the answer is an open boundary that names the
+/// refusing site instead of the module's member.
+///
+/// Only an unresolvable specifier is in scope. A bare specifier that does
+/// resolve to workspace files names real exports, and those exports stay the
+/// definition this route would otherwise displace.
+#[allow(clippy::too_many_arguments)]
+fn jsts_replaced_external_module_member(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    module_member_writes: &brokk_bifrost_js_ts::syntax::JsTsModuleMemberWriteMemo,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    focused: Node<'_>,
+    reference: &str,
+    value_position: bool,
+) -> Option<DefinitionLookupOutcome> {
+    let (qualifier, member) = reference.split_once('.')?;
+    // One member off the module object is the shape the proof covers. A deeper
+    // chain reads off a value the module member returned, which this file-local
+    // write evidence says nothing about.
+    if member.contains(['.', ':']) {
+        return None;
+    }
+    let bindings = jsts_all_visible_import_bindings(
+        imports,
+        lexical_bindings,
+        root,
+        qualifier,
+        site.focus_start_byte,
+    );
+    if bindings.is_empty()
+        || !bindings.iter().all(|binding| {
+            matches!(
+                binding.kind,
+                ImportKind::Namespace | ImportKind::CommonJsRequire
+            )
+        })
+    {
+        return None;
+    }
+    let mut mutation = None;
+    for binding in &bindings {
+        if !brokk_bifrost_js_ts::imports::resolve_js_ts_module_specifier(
+            file,
+            &binding.module_specifier,
+            language,
+            Some(aliases),
+        )
+        .is_empty()
+        {
+            return None;
+        }
+        mutation = mutation.or_else(|| {
+            module_member_writes
+                .writes(
+                    root,
+                    source,
+                    &binding.module_specifier,
+                    lexical_bindings,
+                    imports,
+                )
+                .mutation(member)
+                .map(|mutation| (binding.module_specifier.clone(), mutation))
+        });
+    }
+    let (module, mutation) = mutation?;
+
+    let local = jsts_exact_local_dotted_candidates(
+        JstsDottedLookup {
+            analyzer,
+            host,
+            support,
+            file,
+            root,
+            source,
+            reference,
+            receiver: qualifier,
+            value_position,
+            before_byte: site.range.start_byte,
+        },
+        lexical_bindings,
+        focused,
+        &[],
+    );
+    if let Some(local) = local.filter(|local| !local.candidates.is_empty()) {
+        return Some(jsts_local_dotted_outcome(analyzer, reference, local));
+    }
+    let cause = match mutation {
+        JsTsModuleMemberMutation::Write(range) => format!(
+            "a write at line {} replaces it",
+            range.start_line.saturating_add(1)
+        ),
+        JsTsModuleMemberMutation::Escape(range) => format!(
+            "`{qualifier}` escapes at line {} to a writer that can replace it",
+            range.start_line.saturating_add(1)
+        ),
+        JsTsModuleMemberMutation::Budget => {
+            "this module's write evidence exceeded its traversal budget".to_string()
+        }
+    };
+    Some(no_definition(
+        "replaced_external_module_member",
+        format!(
+            "`{reference}` does not read `{module}.{member}`: {cause}, and the replacement has no visible workspace definition at this reference"
+        ),
+    ))
+}
+
+/// Resolves an exact same-file property read from structured stores and CFG
+/// reaching relations.
+///
+/// Source spans only join a CodeUnit's tree-sitter property definition to the
+/// semantic event lowered from that source. They never decide which event
+/// executes first. When property, receiver, alias, or CFG evidence is
+/// incomplete, same-receiver lexical candidates require retained CFG paths and the
+/// caller publishes typed incompleteness instead of treating missing rows as a
+/// clean negative.
+fn jsts_exact_local_dotted_candidates(
+    ctx: JstsDottedLookup<'_, '_>,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    focused: Node<'_>,
+    hinted_candidates: &[CodeUnit],
+) -> Option<JstsLocalDottedCandidates> {
+    let binding_scope = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte);
+    let (reference_receiver, property) =
+        jsts_focused_reference_receiver_property(focused, ctx.source)?;
+    let target_member = slice(property, ctx.source);
+    if target_member.is_empty() || slice(reference_receiver.root, ctx.source) != ctx.receiver {
+        return None;
+    }
+
+    let mut candidates = ctx.same_file_candidates();
+    candidates.extend(
+        hinted_candidates
+            .iter()
+            .filter(|candidate| candidate.source() == ctx.file)
+            .cloned(),
+    );
+    candidates.extend(
+        ctx.support
+            .file_identifier(ctx.file, target_member)
+            .into_iter()
+            .filter(|candidate| candidate.source() == ctx.file),
+    );
+    if ctx.value_position {
+        candidates = jsts_value_space_candidates(ctx.host, candidates);
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let candidates_with_definitions: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let definitions: Vec<_> = direct_property_definitions(
+                ctx.root,
+                ctx.source,
+                &ctx.analyzer.ranges(&candidate),
+                target_member,
+            )
+            .into_iter()
+            .collect();
+            (!definitions.is_empty()).then_some((candidate, definitions))
+        })
+        .collect();
+    if candidates_with_definitions.is_empty() {
+        return None;
+    }
+    let reference_fallback_scope = binding_scope
+        .is_none()
+        .then(|| jsts_reference_fallback_scope(focused, ctx.root));
+    let property_range = Range {
+        start_byte: property.start_byte(),
+        end_byte: property.end_byte(),
+        start_line: property.start_position().row,
+        end_line: property.end_position().row,
+    };
+    let local_cancellation = CancellationToken::new();
+    let active_cancellation = ctx.analyzer.active_query_cancellation();
+    let evidence = ctx.analyzer.property_reaching_provider().map(|_| {
+        ctx.analyzer.property_reaching_for_source_range(
+            ctx.file,
+            &property_range,
+            PropertyReachingLimits::default(),
+            active_cancellation.as_ref().unwrap_or(&local_cancellation),
+        )
+    });
+    let evidence_complete = evidence
+        .as_ref()
+        .is_some_and(PropertySourceQueryResult::properties_complete);
+    let mut has_local_definition = false;
+    let candidates: Vec<CodeUnit> = candidates_with_definitions
+        .into_iter()
+        .filter_map(|(candidate, definitions)| {
+            definitions
+                .into_iter()
+                .any(|definition| {
+                    let same_receiver = slice(definition.receiver.root, ctx.source) == ctx.receiver
+                        && definition.receiver.members.len() == reference_receiver.members.len()
+                        && definition
+                            .receiver
+                            .members
+                            .iter()
+                            .zip(&reference_receiver.members)
+                            .all(|(actual, expected)| {
+                                slice(*actual, ctx.source) == slice(*expected, ctx.source)
+                            })
+                        && match binding_scope {
+                            Some(binding_scope) => {
+                                lexical_bindings.binding_scope_at(
+                                    ctx.receiver,
+                                    definition.receiver.root.start_byte(),
+                                ) == Some(binding_scope)
+                            }
+                            None => {
+                                lexical_bindings
+                                    .binding_scope_at(
+                                        ctx.receiver,
+                                        definition.receiver.root.start_byte(),
+                                    )
+                                    .is_none()
+                                    && Some(jsts_reference_fallback_scope(
+                                        definition.receiver.root,
+                                        ctx.root,
+                                    )) == reference_fallback_scope
+                            }
+                        };
+                    has_local_definition |= same_receiver;
+                    jsts_property_definition_reaches(&definition.property_range, evidence.as_ref())
+                        || (!evidence_complete
+                            && same_receiver
+                            && (jsts_property_is_binding_literal_declaration(
+                                definition.receiver.root,
+                            ) || evidence.as_ref().is_some_and(|evidence| {
+                                evidence.candidate_store_can_reach(&Range {
+                                    start_byte: definition.establishment.start_byte(),
+                                    end_byte: definition.establishment.end_byte(),
+                                    start_line: definition.establishment.start_position().row,
+                                    end_line: definition.establishment.end_position().row,
+                                })
+                            }) || jsts_program_sequence_proves_reaching(
+                                definition.establishment,
+                                focused,
+                            )))
+                })
+                .then_some(candidate)
+        })
+        .collect();
+    if !evidence_complete && candidates.is_empty() && !has_local_definition {
+        ctx.analyzer
+            .record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                format!("property reaching for `{}.{target_member}`", ctx.receiver)
+                    .into_boxed_str(),
+            ));
+        return None;
+    }
+    Some(JstsLocalDottedCandidates {
+        candidates,
+        incomplete: !evidence_complete,
+    })
+}
+
+fn jsts_property_definition_reaches(
+    definition: &Range,
+    evidence: Option<&PropertySourceQueryResult>,
+) -> bool {
+    evidence.is_some_and(|evidence| {
+        evidence.matches().iter().any(|result| {
+            result
+                .reaching()
+                .iter()
+                .any(|relation| jsts_property_definition_matches_store(definition, &relation.store))
+        })
+    })
+}
+
+/// An object-literal key bound by a variable declarator is a declaration of
+/// that binding's initial shape, not a later mutation store. Definition lookup
+/// may therefore retain it when heap reaching is incomplete, just as it retains
+/// the lexical declaration itself. Assignment-bound literals do not satisfy
+/// this shape and still require execution evidence.
+fn jsts_property_is_binding_literal_declaration(receiver_root: Node<'_>) -> bool {
+    receiver_root.parent().is_some_and(|declarator| {
+        declarator.kind() == "variable_declarator"
+            && declarator
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == receiver_root.id())
+    })
+}
+
+/// Prove the small part of program-scope execution order that tree-sitter
+/// represents exhaustively without adding a semantic module procedure. A
+/// direct eager program statement completes before a later program statement;
+/// a store below conditional control or either node below a deferred function
+/// or class body is deliberately left incomplete.
+fn jsts_program_sequence_proves_reaching(establishment: Node<'_>, focused: Node<'_>) -> bool {
+    let Some(establishment_site) = jsts_program_site(establishment) else {
+        return false;
+    };
+    let Some(read_site) = jsts_program_site(focused) else {
+        return false;
+    };
+    if establishment_site.program.id() != read_site.program.id()
+        || establishment_site
+            .ancestors
+            .iter()
+            .any(|ancestor| jsts_deferred_evaluation_boundary(ancestor.kind()))
+        || read_site
+            .ancestors
+            .iter()
+            .any(|ancestor| jsts_deferred_evaluation_boundary(ancestor.kind()))
+        || establishment_site
+            .ancestors
+            .iter()
+            .any(|ancestor| jsts_conditional_program_establishment(ancestor.kind()))
+    {
+        return false;
+    }
+    let mut establishment_ordinal = None;
+    let mut read_ordinal = None;
+    let mut cursor = establishment_site.program.walk();
+    for (ordinal, child) in establishment_site
+        .program
+        .named_children(&mut cursor)
+        .enumerate()
+    {
+        if child.id() == establishment_site.child.id() {
+            establishment_ordinal = Some(ordinal);
+        }
+        if child.id() == read_site.child.id() {
+            read_ordinal = Some(ordinal);
+        }
+    }
+    matches!(
+        (establishment_ordinal, read_ordinal),
+        (Some(establishment), Some(read)) if establishment < read
+    )
+}
+
+struct JstsProgramSite<'tree> {
+    program: Node<'tree>,
+    child: Node<'tree>,
+    ancestors: Vec<Node<'tree>>,
+}
+
+fn jsts_program_site(node: Node<'_>) -> Option<JstsProgramSite<'_>> {
+    let mut child = node;
+    let mut ancestors = Vec::new();
+    while let Some(parent) = child.parent() {
+        if parent.kind() == "program" {
+            return Some(JstsProgramSite {
+                program: parent,
+                child,
+                ancestors,
+            });
+        }
+        ancestors.push(parent);
+        child = parent;
+    }
+    None
+}
+
+fn jsts_deferred_evaluation_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+            | "class_declaration"
+            | "class"
+            | "class_body"
+            | "field_definition"
+            | "public_field_definition"
+            | "class_static_block"
+    )
+}
+
+fn jsts_conditional_program_establishment(kind: &str) -> bool {
+    matches!(
+        kind,
+        "statement_block"
+            | "if_statement"
+            | "switch_statement"
+            | "switch_body"
+            | "switch_case"
+            | "switch_default"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_statement"
+            | "do_statement"
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+            | "with_statement"
+            | "ternary_expression"
+            | "binary_expression"
+            | "assignment_pattern"
+            | "augmented_assignment_expression"
+    )
+}
+
+fn jsts_property_definition_matches_store(definition: &Range, store: &PropertyStoreRecord) -> bool {
+    let source = store.source_locator.anchor().span();
+    source.start_byte() as usize <= definition.start_byte
+        && source.end_byte() as usize >= definition.end_byte
+}
+
+/// Keeps only declaration candidates that share the reference receiver's
+/// lexical binding. Member expansion can then support indexed declaration
+/// shapes that `direct_property_definitions` does not model, such as object
+/// methods and schema-builder fields, without accepting a same-name owner.
+fn jsts_lexically_bound_receiver_candidates(
+    ctx: JstsDottedLookup<'_, '_>,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    receiver_candidates: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    let Some(binding_scope) = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte)
+    else {
+        return Vec::new();
+    };
+    receiver_candidates
+        .iter()
+        .filter(|candidate| candidate.source() == ctx.file)
+        .filter(|candidate| {
+            ctx.analyzer.ranges(candidate).iter().any(|range| {
+                lexical_bindings.binding_scope_at(ctx.receiver, range.start_byte)
+                    == Some(binding_scope)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn jsts_reference_fallback_scope(node: Node<'_>, root: Node<'_>) -> JstsReceiverBindingScope {
+    jsts_nearest_lexical_scope(node)
+        .or_else(|| jsts_nearest_var_scope(node))
+        .unwrap_or(JstsReceiverBindingScope {
+            start_byte: root.start_byte(),
+            end_byte: root.end_byte(),
+        })
+}
+
+fn jsts_all_visible_import_bindings<'a>(
+    imports: &'a JsTsImportBinder,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+) -> Vec<&'a brokk_bifrost_core::analyzer::usages::model::ImportBinding> {
+    jsts_visible_program_bindings(
+        lexical_bindings,
+        root,
+        name,
+        byte,
+        imports.bindings_for(name),
+    )
+}
+
+fn jsts_visible_import_bindings<'a>(
+    imports: &'a JsTsImportBinder,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+) -> Vec<&'a brokk_bifrost_core::analyzer::usages::model::ImportBinding> {
+    jsts_visible_program_bindings(
+        lexical_bindings,
+        root,
+        name,
+        byte,
+        imports.resolvable_direct_bindings_for(name),
+    )
+}
+
+fn jsts_visible_program_bindings<'a>(
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+    bindings: impl Iterator<Item = &'a brokk_bifrost_core::analyzer::usages::model::ImportBinding>,
+) -> Vec<&'a brokk_bifrost_core::analyzer::usages::model::ImportBinding> {
+    if lexical_bindings.is_program_binding_at(name, byte, root) {
+        bindings.collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn jsts_focused_reference_receiver_property<'tree>(
+    focused: Node<'tree>,
+    source: &str,
+) -> Option<(
+    brokk_bifrost_js_ts::syntax::JsTsStaticMemberReceiver<'tree>,
+    Node<'tree>,
+)> {
+    let member_expression = match focused.kind() {
+        "member_expression" | "subscript_expression" => focused,
+        "property_identifier" | "string_fragment" => focused
+            .parent()
+            .filter(|parent| matches!(parent.kind(), "member_expression" | "string"))
+            .and_then(|parent| {
+                if parent.kind() == "string" {
+                    parent.parent()
+                } else {
+                    Some(parent)
+                }
+            })
+            .filter(|parent| {
+                matches!(parent.kind(), "member_expression" | "subscript_expression")
+            })?,
+        _ => return None,
+    };
+    let object = member_expression.child_by_field_name("object")?;
+    let (property, _) = static_member_property(member_expression, source)?;
+    let receiver = brokk_bifrost_js_ts::syntax::static_member_receiver(object, source)?;
+    Some((receiver, property))
+}
+
+fn jsts_exact_dotted_candidates(
+    _analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let qualifier = reference.split_once('.').map(|(qualifier, _)| qualifier);
+    let mut candidates = support.fqn(reference);
+    if let Some(top_level) = jsts_top_level_path_component(file) {
+        let preferred: Vec<_> = candidates
+            .iter()
+            .filter(|unit| jsts_top_level_path_component(unit.source()) == Some(top_level))
+            .cloned()
+            .collect();
+        if !preferred.is_empty() {
+            candidates = preferred;
+        }
+    }
+    if let Some(qualifier) = qualifier {
+        candidates.retain(|unit| jsts_dotted_receiver_has_global_identity(host, unit, qualifier));
+    }
+    if value_position {
+        candidates = jsts_value_space_candidates(host, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(host, candidates);
+    }
+    candidates
+}
+
+fn jsts_dotted_receiver_has_global_identity(
+    host: &dyn JsTsSource,
+    candidate: &CodeUnit,
+    receiver: &str,
+) -> bool {
+    let Some(facts) = host.source_facts(candidate.source()) else {
+        return false;
+    };
+    if facts.facts.file_is_external_module {
+        return false;
+    }
+    let declarations = declaration_ids_for_unit(&facts, candidate);
+    facts.facts.declaration_bindings.iter().any(|binding| {
+        declarations.contains(&binding.declaration)
+            && binding.name == receiver
+            && binding.is_program
+    }) || facts.facts.property_receivers.iter().any(|property| {
+        declarations.contains(&property.declaration)
+            && property.receiver_root == receiver
+            && matches!(property.binding, JsTsReceiverBinding::Program)
+    })
+}
+
+fn ts_exact_global_dotted_candidates(
+    _analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = support
+        .fqn(reference)
+        .into_iter()
+        .filter(|candidate| ts_unit_is_global_declaration(host, candidate))
+        .collect();
+    if value_position {
+        candidates = jsts_value_space_candidates(host, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(host, candidates);
+    }
+    candidates
+}
+
+fn ts_unit_is_global_declaration(host: &dyn JsTsSource, unit: &CodeUnit) -> bool {
+    let Some(facts) = host.source_facts(unit.source()) else {
+        return false;
+    };
+    let declarations = declaration_ids_for_unit(&facts, unit);
+    if !facts.facts.file_is_esm {
+        return !declarations.is_empty();
+    }
+    facts
+        .facts
+        .declarations
+        .iter()
+        .any(|declaration| declarations.contains(&declaration.declaration) && declaration.is_global)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JstsReceiverBindingScope {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+fn jsts_visible_receiver_binding_scope(
+    root: Node<'_>,
+    source: &str,
+    receiver: &str,
+    before_byte: usize,
+) -> Option<JstsReceiverBindingScope> {
+    let mut node = smallest_named_node_covering(root, before_byte, before_byte)?;
+    loop {
+        if jsts_lexical_scope_kind(node.kind())
+            && jsts_scope_declares_name_before(node, source, receiver, before_byte)
+        {
+            return Some(JstsReceiverBindingScope {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            });
+        }
+        node = node.parent()?;
+    }
+}
+
+fn jsts_lexical_scope_kind(kind: &str) -> bool {
+    js_ts_is_var_scope_kind(kind)
+        || matches!(
+            kind,
+            "statement_block"
+                | "for_statement"
+                | "for_in_statement"
+                | "switch_statement"
+                | "catch_clause"
+        )
+}
+
+fn jsts_scope_declares_name_before(
+    scope: Node<'_>,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+) -> bool {
+    let scope_range = JstsReceiverBindingScope {
+        start_byte: scope.start_byte(),
+        end_byte: scope.end_byte(),
+    };
+    jsts_scope_contains_binding_before(scope, source, name, before_byte, scope_range)
+}
+
+fn jsts_scope_contains_binding_before(
+    scope: Node<'_>,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+    scope_range: JstsReceiverBindingScope,
+) -> bool {
+    let root_id = scope.id();
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        if node.id() != root_id
+            && (js_ts_is_var_scope_kind(node.kind()) || node.kind() == "class_declaration")
+        {
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "formal_parameter"
+                | "required_parameter"
+                | "optional_parameter"
+                | "variable_declarator"
+        ) && let Some(pattern) = node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))
+            && jsts_pattern_contains_name(pattern, source, name)
+            && jsts_binding_scope_for_declaration(node) == Some(scope_range)
+        {
+            return true;
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier")
+            && jsts_identifier_is_parameter(node)
+            && source
+                .get(node.start_byte()..node.end_byte())
+                .is_some_and(|text| text.trim() == name)
+            && jsts_binding_scope_for_declaration(node) == Some(scope_range)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node
+            .named_children(&mut cursor)
+            .take_while(|child| child.start_byte() < before_byte)
+            .collect();
+        stack.extend(children.into_iter().rev());
+    }
+    false
+}
+
+fn jsts_identifier_is_parameter(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    matches!(parent.kind(), "formal_parameters" | "parameters")
+        || (parent.kind() == "arrow_function"
+            && parent
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| parameter.id() == node.id()))
+}
+
+fn jsts_binding_scope_for_declaration(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    if node.kind() == "variable_declarator"
+        && let Some(scope) = js_ts_var_declarator_binding_scope(node)
+    {
+        return Some(JstsReceiverBindingScope {
+            start_byte: scope.start_byte(),
+            end_byte: scope.end_byte(),
+        });
+    }
+    jsts_nearest_lexical_scope(node)
+}
+
+fn jsts_nearest_var_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if js_ts_is_var_scope_kind(parent.kind()) {
+            return Some(JstsReceiverBindingScope {
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+            });
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn jsts_nearest_lexical_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if jsts_lexical_scope_kind(parent.kind()) {
+            return Some(JstsReceiverBindingScope {
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+            });
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn jsts_pattern_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
+    pattern_binder_identifiers(node)
+        .into_iter()
+        .any(|binder| slice(binder, source) == name)
+}
+
+fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
+    file.rel_path()
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+}
+
+/// Narrows a dotted site to the chain the caret actually names: a caret on a
+/// segment other than the last one names the chain that ends at that segment
+/// (`row.dataset` in `row.dataset.raw`), not the whole chain.
+///
+/// The site text is canonical, so it drops the `?` of an optional chain (#1781)
+/// and is one byte shorter than its source span per operator. The focused
+/// segment therefore comes from the access nodes rather than from offsets into
+/// the text: byte arithmetic matched no segment at all once an operator
+/// preceded the caret, kept the whole chain, and resolved a caret on `dataset`
+/// in `row?.dataset.raw` to the `raw` field (#1792).
+pub(crate) fn jsts_site_for_focus(
+    mut site: ResolvedReferenceSite,
+    root: Node<'_>,
+    source: &str,
+    language: Language,
+) -> ResolvedReferenceSite {
+    if let Some((reference, end_byte)) = jsts_focused_chain_prefix(&site, root, source, language) {
+        site.range.end_byte = end_byte;
+        site.text = reference;
+    }
+    site
+}
+
+fn jsts_focused_chain_prefix(
+    site: &ResolvedReferenceSite,
+    root: Node<'_>,
+    source: &str,
+    language: Language,
+) -> Option<(String, usize)> {
+    if !site.text.contains('.') {
+        return None;
+    }
+    let focused = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let access = focused.parent()?;
+    let (receiver, member) = jsts_dotted_access_parts(access)?;
+    // The caret names the access that ends at its own segment: the access
+    // itself when the caret is on the member, the bare root when it is on the
+    // receiver of the innermost access.
+    let prefix = if member.id() == focused.id() {
+        access
+    } else if receiver.id() == focused.id() {
+        focused
+    } else {
+        return None;
+    };
+    if prefix.end_byte() >= site.range.end_byte {
+        return None;
+    }
+    Some((
+        jsts_dotted_chain_text(prefix, source, language)?,
+        prefix.end_byte(),
+    ))
+}
+
+/// The receiver and member of one dotted JS/TS access. `?.` is an
+/// `optional_chain` child sitting between the two fields, so reading the fields
+/// steps over it.
+fn jsts_dotted_access_parts<'tree>(node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    match node.kind() {
+        "member_expression" => Some((
+            node.child_by_field_name("object")?,
+            node.child_by_field_name("property")?,
+        )),
+        "subscript_expression" => Some((
+            node.child_by_field_name("object")?,
+            node.child_by_field_name("index")?,
+        )),
+        "nested_type_identifier" => Some((
+            node.child_by_field_name("module")?,
+            node.child_by_field_name("name")?,
+        )),
+        _ => None,
+    }
+}
+
+/// The canonical dotted text of `node`, rebuilt from its segment names so that
+/// no `?` reaches a caller that splits the text on `.`.
+fn jsts_dotted_chain_text(node: Node<'_>, source: &str, language: Language) -> Option<String> {
+    let mut names = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "member_expression" | "subscript_expression" => {
+                let receiver = current.child_by_field_name("object")?;
+                let (_, member) = static_member_property(current, source)?;
+                names.push(member);
+                current = receiver;
+            }
+            "nested_type_identifier" => {
+                let (receiver, member) = jsts_dotted_access_parts(current)?;
+                names.push(simple_reference_name(member, source, language)?.to_string());
+                current = receiver;
+            }
+            _ => break,
+        }
+    }
+    names.push(simple_reference_name(current, source, language)?.to_string());
+    names.reverse();
+    Some(names.join("."))
+}
+
+fn jsts_static_member_reference_at_focus(
+    focus: Node<'_>,
+    source: &str,
+    language: Language,
+) -> Option<String> {
+    let mut current = Some(focus);
+    for _ in 0..4 {
+        let node = current?;
+        if matches!(node.kind(), "member_expression" | "subscript_expression") {
+            let object = node.child_by_field_name("object")?;
+            let (name_node, name) = static_member_property(node, source)?;
+            if name_node.start_byte() <= focus.start_byte()
+                && focus.end_byte() <= name_node.end_byte()
+            {
+                let receiver = jsts_dotted_chain_text(object, source, language)?;
+                return Some(format!("{receiver}.{name}"));
+            }
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn jsts_import_member_expression_at_focus<'tree>(
+    focus: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut current = Some(focus);
+    while let Some(node) = current {
+        if matches!(node.kind(), "member_expression" | "subscript_expression")
+            && static_member_property(node, source).is_some_and(|(property, _)| {
+                property.start_byte() <= focus.start_byte()
+                    && focus.end_byte() <= property.end_byte()
+            })
+        {
+            return Some(node);
+        }
+        current = node.parent();
+    }
+    None
+}
+
+/// Resolve members of constructed values and indexed factory results through
+/// the same owner expansion. A bound member callee retains its lexical property
+/// proof, including incomplete reaching evidence, before its returns are read.
+#[allow(clippy::too_many_arguments)]
+fn jsts_expression_receiver_members(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+) -> Option<JstsLocalDottedCandidates> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.range.start_byte, site.range.end_byte)?;
+    // The site may resolve to the property identifier or to the whole
+    // member-expression (`new Foo().bar`).
+    let member_expr = if matches!(node.kind(), "member_expression" | "subscript_expression") {
+        node
+    } else if node
+        .parent()
+        .is_some_and(|p| matches!(p.kind(), "member_expression" | "subscript_expression"))
+    {
+        node.parent()?
+    } else {
+        return None;
+    };
+    let object = member_expr.child_by_field_name("object")?;
+    let (_, member) = static_member_property(member_expr, source)?;
+    let (receiver_candidates, incomplete) = match object.kind() {
+        "new_expression" => {
+            let constructor = object.child_by_field_name("constructor")?;
+            if constructor.kind() != "identifier" {
+                return None;
+            }
+            let class_name = slice(constructor, source);
+            let mut candidates = support.file_identifier(file, class_name);
+            candidates.extend(
+                resolve_js_ts_direct_import_candidates(
+                    host,
+                    support,
+                    language,
+                    file,
+                    imports,
+                    class_name,
+                    Some(aliases),
+                    true,
+                )
+                .unwrap_or_default(),
+            );
+            (jsts_value_space_candidates(host, candidates), false)
+        }
+        "call_expression" => {
+            let function = object.child_by_field_name("function")?;
+            let receiver = brokk_bifrost_js_ts::syntax::static_member_receiver(function, source)
+                .filter(|receiver| !receiver.members.is_empty())?;
+            let reference = jsts_dotted_chain_text(function, source, language)?;
+            let local = jsts_exact_local_dotted_candidates(
+                JstsDottedLookup {
+                    analyzer,
+                    host,
+                    support,
+                    file,
+                    root: tree.root_node(),
+                    source,
+                    reference: &reference,
+                    receiver: slice(receiver.root, source),
+                    value_position: true,
+                    before_byte: function.start_byte(),
+                },
+                lexical_bindings,
+                function,
+                &[],
+            )?;
+            (
+                ts_expand_call_return_property_owners(host, support, local.candidates, 0),
+                local.incomplete,
+            )
+        }
+        _ => return None,
+    };
+    let mut finds = JsTsMemberFinds::default();
+    let members = if language == Language::TypeScript {
+        ts_member_candidates(
+            analyzer,
+            host,
+            support,
+            receiver_candidates,
+            &member,
+            true,
+            &mut finds,
+        )
+    } else {
+        jsts_member_candidates(host, support, receiver_candidates, &member, true)
+    };
+    if members.is_empty() {
+        return None;
+    }
+    finds.stage();
+    Some(JstsLocalDottedCandidates {
+        candidates: members,
+        incomplete,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_receiver_provider_member_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    member: &str,
+    batch: &JsTsDefinitionContext,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
+    let Some(node) = node else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let provider = JsTsReceiverFactProvider::new_with_batch_data(
+        host,
+        support,
+        language,
+        file,
+        source,
+        tree.root_node(),
+        batch.imports.clone(),
+        Arc::clone(&batch.aliases),
+        Arc::clone(&batch.syntax_index),
+    );
+    provider
+        .resolve_member_targets_at_site(
+            node,
+            Some(member),
+            site.focus_start_byte,
+            ReceiverAnalysisBudget::default(),
+        )
+        .map(|report| report.analysis.outcome)
+        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+}
+
+/// Resolve a renamed destructuring key as the property read it is (#2039).
+///
+/// `const { texture: frameTexture } = frame` declares `frameTexture` at the
+/// pair's VALUE child and names `texture` at whatever `frame` is, so the key
+/// must resolve exactly as the equivalent `frame.texture` member expression
+/// does. Every strategy below is one the dotted member route already runs, in
+/// the same order and against the same owner machinery; only the receiver
+/// differs, because a destructuring pattern spells it as the initializer
+/// instead of as the access object. A `require` call initializer needs no
+/// spelled receiver at all: the call names its module in its own argument
+/// (#2211), so the key resolves against that module's export surface.
+///
+/// `None` means the site is not a renamed destructuring key. `Some([])` is a
+/// key whose owner this file cannot prove -- an untyped parameter, an external
+/// package result, a nested or parameter pattern -- which the caller then
+/// reports as the declaration terminal it otherwise is.
+#[allow(clippy::too_many_arguments)]
+fn jsts_destructured_property_key_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    batch: &JsTsDefinitionContext,
+    key: Node<'_>,
+) -> Option<Vec<CodeUnit>> {
+    let destructured = destructured_property_key_source(key)?;
+    let member = node_text(key, source);
+    debug_assert!(
+        !member.is_empty(),
+        "a destructuring key node always spells a property name: {key:?}"
+    );
+    let provider = JsTsReceiverFactProvider::new_with_batch_data(
+        host,
+        support,
+        language,
+        file,
+        source,
+        tree.root_node(),
+        batch.imports.clone(),
+        Arc::clone(&batch.aliases),
+        Arc::clone(&batch.syntax_index),
+    );
+    let budget = ReceiverAnalysisBudget::default();
+
+    // The receiver-fact provider is the machinery a member-expression read uses
+    // for its own object: `this`, a construction, an object literal, a lexical
+    // binding and its type, and a summarized call.
+    let value = match destructured {
+        JsTsDestructuringSource::Element(iterable) => {
+            return Some(
+                provider.resolve_iterable_element_member_targets(iterable, member, budget),
+            );
+        }
+        JsTsDestructuringSource::Value(value) => value,
+    };
+    let mut candidates =
+        match provider.resolve_member_targets(value, member, key.start_byte(), budget) {
+            ReceiverAnalysisOutcome::Precise(targets) => targets,
+            ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unknown
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+        };
+
+    // `await` and parentheses wrap the initializer without changing what it
+    // produces. An `as` or `satisfies` cast does change it, so it stays for the
+    // owner strategies below, which read the asserted type.
+    let mut initializer = value;
+    while matches!(
+        initializer.kind(),
+        "await_expression" | "parenthesized_expression"
+    ) {
+        let Some(inner) = initializer.named_child(0) else {
+            break;
+        };
+        initializer = inner;
+    }
+
+    if candidates.is_empty() {
+        let owners = jsts_local_receiver_value_owner_candidates(
+            analyzer,
+            host,
+            support,
+            file,
+            language,
+            source,
+            tree.root_node(),
+            imports,
+            aliases,
+            initializer,
+            key.start_byte(),
+            0,
+        );
+        candidates =
+            jsts_destructured_member_candidates(analyzer, host, support, language, owners, member);
+    }
+    if candidates.is_empty()
+        && let Some(specifier) = require_call_module_specifier(initializer, source)
+    {
+        // A `require` call names its module in its own argument, the same fact
+        // the inverse binder reads through `declarator_module_value_specifier`
+        // (#2211). The member resolves against that module's export surface
+        // exactly as a dotted read off a require-bound namespace does; an
+        // external or unresolvable specifier yields no files and stays closed.
+        candidates = resolve_js_ts_module_binding_candidates(
+            host,
+            support,
+            language,
+            file,
+            &specifier,
+            member,
+            Some(aliases),
+            true,
+        );
+    }
+    if candidates.is_empty() && language == Language::TypeScript {
+        candidates = ts_call_type_argument_member_candidates(
+            analyzer,
+            host,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            initializer,
+            member,
+        );
+    }
+    if candidates.is_empty() && matches!(initializer.kind(), "identifier") {
+        let receiver = node_text(initializer, source);
+        let receiver_candidates = if imports.binding(receiver).is_some() {
+            resolve_js_ts_direct_import_candidates(
+                host,
+                support,
+                language,
+                file,
+                imports,
+                receiver,
+                Some(aliases),
+                true,
+            )
+            .unwrap_or_default()
+        } else {
+            // A same-file receiver must be the binding this reference actually
+            // sees: a module-level object and a same-named parameter are
+            // different owners, and only the lexical index separates them.
+            let reference = format!("{receiver}.{member}");
+            jsts_lexically_bound_receiver_candidates(
+                JstsDottedLookup {
+                    analyzer,
+                    host,
+                    support,
+                    file,
+                    root: tree.root_node(),
+                    source,
+                    reference: &reference,
+                    receiver,
+                    value_position: true,
+                    before_byte: key.start_byte(),
+                },
+                lexical_bindings,
+                &support.file_identifier(file, receiver),
+            )
+        };
+        candidates = jsts_destructured_member_candidates(
+            analyzer,
+            host,
+            support,
+            language,
+            receiver_candidates,
+            member,
+        );
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn jsts_destructured_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    owners: Vec<CodeUnit>,
+    member: &str,
+) -> Vec<CodeUnit> {
+    if language == Language::TypeScript {
+        let mut finds = JsTsMemberFinds::default();
+        let candidates =
+            ts_member_candidates(analyzer, host, support, owners, member, true, &mut finds);
+        if !candidates.is_empty() {
+            finds.stage();
+        }
+        candidates
+    } else {
+        jsts_member_candidates(host, support, owners, member, true)
+    }
+}
+
+/// The owners an explicit type argument names for a call's result.
+///
+/// `importActual<typeof UseBaseQueryModule>('../useBaseQuery')` types its own
+/// result at the call site: the author wrote the module the result carries,
+/// which is why this row resolves while the untyped `zxcvbn(password)` next to
+/// it stays closed. Exactly one type argument is required, so a multi-argument
+/// generic such as `new Map<string, User>()` never claims one of its arguments
+/// as the result type.
+#[allow(clippy::too_many_arguments)]
+fn ts_call_type_argument_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    call: Node<'_>,
+    member: &str,
+) -> Vec<CodeUnit> {
+    if call.kind() != "call_expression" {
+        return Vec::new();
+    }
+    let Some(arguments) = call.child_by_field_name("type_arguments") else {
+        return Vec::new();
+    };
+    if arguments.named_child_count() != 1 {
+        return Vec::new();
+    }
+    let Some(argument) = arguments.named_child(0) else {
+        return Vec::new();
+    };
+    // `typeof M` where `M` is a module namespace binding names that module's
+    // export surface, which the index publishes per module rather than under a
+    // type name, so it resolves through the module route the dotted `M.member`
+    // read uses.
+    if argument.kind() == "type_query"
+        && let Some(namespace) = argument.named_child(0)
+        && matches!(namespace.kind(), "identifier" | "nested_identifier")
+        && let Some(binding) = imports.binding(node_text(namespace, source))
+        && matches!(
+            binding.kind,
+            ImportKind::Namespace | ImportKind::CommonJsRequire
+        )
+    {
+        return resolve_js_ts_module_binding_candidates(
+            host,
+            support,
+            Language::TypeScript,
+            file,
+            &binding.module_specifier,
+            member,
+            Some(aliases),
+            true,
+        );
+    }
+    let owners = ts_resolve_type_text_to_property_owners(
+        host,
+        support,
+        file,
+        source,
+        imports,
+        aliases,
+        ts_type_annotation_text(argument, source).as_str(),
+        0,
+    );
+    jsts_destructured_member_candidates(
+        analyzer,
+        host,
+        support,
+        Language::TypeScript,
+        owners,
+        member,
+    )
+}
+
+fn jsts_file_scoped_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    receiver_candidates: Vec<CodeUnit>,
+    member: &str,
+    value_position: bool,
+    finds: &mut JsTsMemberFinds,
+) -> Vec<CodeUnit> {
+    use brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier;
+
+    let mut candidates = Vec::new();
+    for receiver in receiver_candidates {
+        let found = jsts_file_scoped_dotted_candidates(
+            host,
+            support,
+            receiver.source(),
+            &format!("{}.{}", receiver.fq_name(), member),
+            value_position,
+        );
+        if found.is_empty() {
+            candidates.extend(inherited_member_candidates(
+                analyzer,
+                host,
+                support,
+                &receiver,
+                member,
+                value_position,
+                false,
+                finds,
+            ));
+        } else {
+            finds.record(&receiver, &found, MemberDispatchTier::InherentOrDirect);
+            candidates.extend(found);
+        }
+    }
+    candidates
+}
+
+fn ts_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    receiver_candidates: Vec<CodeUnit>,
+    member: &str,
+    value_position: bool,
+    finds: &mut JsTsMemberFinds,
+) -> Vec<CodeUnit> {
+    use brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier;
+
+    let mut candidates = Vec::new();
+    for receiver in receiver_candidates {
+        let plain_fqn = format!("{}.{}", receiver.fq_name(), member);
+        let static_fqn = format!("{plain_fqn}$static");
+        let static_access = value_position && receiver.is_class();
+
+        let mut members = jsts_file_scoped_dotted_candidates(
+            host,
+            support,
+            receiver.source(),
+            &plain_fqn,
+            value_position,
+        );
+        // The tier follows the form the lookup answered from: the plain member
+        // form is a direct member of the receiver, the `$static` form is the
+        // receiver's static/companion side (#1477).
+        let mut tier = MemberDispatchTier::InherentOrDirect;
+        if static_access {
+            let static_members = jsts_file_scoped_dotted_candidates(
+                host,
+                support,
+                receiver.source(),
+                &static_fqn,
+                value_position,
+            );
+            if !static_members.is_empty() {
+                members = static_members;
+                tier = MemberDispatchTier::StaticOrCompanion;
+            }
+        } else if members.is_empty() {
+            members = jsts_file_scoped_dotted_candidates(
+                host,
+                support,
+                receiver.source(),
+                &static_fqn,
+                value_position,
+            );
+            tier = MemberDispatchTier::StaticOrCompanion;
+        }
+        if members.is_empty() {
+            let inherited = inherited_member_candidates(
+                analyzer,
+                host,
+                support,
+                &receiver,
+                member,
+                value_position,
+                static_access,
+                finds,
+            );
+            let has_synthetic = inherited.iter().any(CodeUnit::is_synthetic);
+            if has_synthetic
+                && !jsts_unit_is_type_only(host, &receiver)
+                && !ts_synthetic_member_is_supported_by_receiver_initializer(
+                    analyzer, host, support, &receiver, member,
+                )
+            {
+                candidates.extend(
+                    inherited
+                        .into_iter()
+                        .filter(|member| !member.is_synthetic()),
+                );
+            } else {
+                candidates.extend(inherited);
+            }
+            continue;
+        }
+        finds.record(&receiver, &members, tier);
+
+        let has_synthetic = members.iter().any(CodeUnit::is_synthetic);
+        if has_synthetic
+            && !jsts_unit_is_type_only(host, &receiver)
+            && !ts_synthetic_member_is_supported_by_receiver_initializer(
+                analyzer, host, support, &receiver, member,
+            )
+        {
+            candidates.extend(members.into_iter().filter(|member| !member.is_synthetic()));
+        } else {
+            candidates.extend(members);
+        }
+    }
+    candidates
+}
+
+fn ts_synthetic_member_is_supported_by_receiver_initializer(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    receiver: &CodeUnit,
+    member: &str,
+) -> bool {
+    let Ok(source) = receiver.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(receiver.source(), &source, Language::TypeScript) else {
+        return false;
+    };
+    let Some(file_facts) = host.source_facts(receiver.source()) else {
+        return false;
+    };
+    let imports = JsTsImportBinder::from_source_facts_with_lexical_bindings(
+        &file_facts.facts,
+        &file_facts.imports,
+        &file_facts.source,
+        tree.root_node(),
+        JsTsLexicalBindingIndex::build(tree.root_node(), &source),
+    );
+    // The analyzer's shared resolver, so this route reuses its warm config and
+    // workspace-package memos instead of building cold ones per call.
+    let aliases = host.alias_resolver().as_ref();
+
+    let mut saw_receiver_node = false;
+    for node in ts_nodes_for_code_unit(analyzer, receiver, tree.root_node()) {
+        let Some(declarator) = ts_variable_declarator_for_unit_node(node, receiver, &source) else {
+            continue;
+        };
+        saw_receiver_node = true;
+        let Some(value) = declarator.child_by_field_name("value") else {
+            continue;
+        };
+        let Some(call) =
+            ts_unwrap_expression(value).filter(|value| value.kind() == "call_expression")
+        else {
+            return true;
+        };
+        let Some(argument_index) =
+            ts_call_direct_object_argument_index_with_member(call, &source, member)
+        else {
+            continue;
+        };
+        if ts_call_preserves_argument_shape(
+            analyzer,
+            host,
+            support,
+            receiver.source(),
+            &source,
+            tree.root_node(),
+            &imports,
+            aliases,
+            call,
+            argument_index,
+        ) {
+            return true;
+        }
+    }
+    // The question this answers is whether the receiver's INITIALIZER supports
+    // the member, so it applies only to a receiver that has one. A function
+    // receiver has none: its synthetic members are its own result surface, put
+    // there by its return literal or by its inline return type (#2159), which
+    // is direct evidence rather than something an initializer could contradict.
+    // Answering `false` there dropped every return-surface member of a
+    // `function` declaration while keeping the same member on the
+    // `const f = () => ...` spelling, whose declarator reaches the `return
+    // true` above.
+    !saw_receiver_node
+}
+
+fn ts_variable_declarator_for_unit_node<'tree>(
+    node: Node<'tree>,
+    unit: &CodeUnit,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if node.kind() == "variable_declarator"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text_matches(name, source, unit.identifier()))
+    {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find_map(|child| {
+        (child.kind() == "variable_declarator"
+            && child
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text_matches(name, source, unit.identifier())))
+        .then_some(child)
+        .or_else(|| ts_variable_declarator_for_unit_node(child, unit, source))
+    })
+}
+
+fn ts_call_direct_object_argument_index_with_member(
+    call: Node<'_>,
+    source: &str,
+    member: &str,
+) -> Option<usize> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .enumerate()
+        .find_map(|(index, argument)| {
+            let object = ts_direct_object_literal_value(argument)?;
+            ts_object_literal_has_member(object, source, member).then_some(index)
+        })
+}
+
+fn ts_object_literal_has_member(object: Node<'_>, source: &str, member: &str) -> bool {
+    let mut cursor = object.walk();
+    object
+        .named_children(&mut cursor)
+        .filter_map(|child| {
+            brokk_bifrost_js_ts::typescript::ts_object_literal_property_name(child, source)
+        })
+        .any(|name| name == member)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_call_preserves_argument_shape(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    call: Node<'_>,
+    argument_index: usize,
+) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    ts_call_expression_callees(
+        host,
+        support,
+        file,
+        source,
+        root,
+        imports,
+        aliases,
+        function,
+        0,
+        &TsReceiverResolution::default(),
+    )
+    .into_iter()
+    .any(|callee| ts_function_preserves_parameter_shape(analyzer, &callee, argument_index))
+}
+
+/// Keep this source-time body/parameter analysis live: it proves whether a
+/// callable forwards the selected argument shape, which is not a persisted
+/// declaration fact. Import identity used by the surrounding initializer
+/// route is canonicalized separately.
+fn ts_function_preserves_parameter_shape(
+    analyzer: &dyn IAnalyzer,
+    callee: &CodeUnit,
+    parameter_index: usize,
+) -> bool {
+    let Ok(source) = callee.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(callee.source(), &source, Language::TypeScript) else {
+        return false;
+    };
+    ts_nodes_for_code_unit(analyzer, callee, tree.root_node())
+        .into_iter()
+        .any(|node| {
+            brokk_bifrost_js_ts::typescript::ts_function_node_preserves_parameter_shape(
+                node,
+                &source,
+                parameter_index,
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_local_receiver_owner_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+) -> Vec<CodeUnit> {
+    ts_receiver_owner_candidates_at_byte(
+        host,
+        support,
+        file,
+        source,
+        tree.root_node(),
+        imports,
+        aliases,
+        receiver,
+        site.focus_start_byte,
+    )
+}
+
+/// Exact dispatch follows runtime value evidence, but an explicit TypeScript
+/// annotation is the declaration users expect definition navigation to open.
+/// Prefer that declared owner until a later write invalidates it.
+fn ts_local_annotation_receiver_owners(
+    lookup: &JstsDottedLookup<'_, '_>,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    focus_start_byte: usize,
+) -> Vec<CodeUnit> {
+    if lexical_bindings.is_binding_reassigned_before_at(lookup.receiver, focus_start_byte) {
+        return Vec::new();
+    }
+    let mut owners = Vec::new();
+    for binding_range in
+        lexical_bindings.binding_identifier_ranges_at(lookup.receiver, focus_start_byte)
+    {
+        let Some(mut node) = smallest_named_node_covering(
+            lookup.root,
+            binding_range.start_byte,
+            binding_range.end_byte,
+        ) else {
+            continue;
+        };
+        loop {
+            if node.kind() == "variable_declarator" {
+                if let Some(type_node) = node.child_by_field_name("type")
+                    && let Some(resolved) = ts_resolve_type_node_to_property_owner_outcome(
+                        lookup.host,
+                        lookup.support,
+                        lookup.file,
+                        lookup.source,
+                        imports,
+                        aliases,
+                        type_node,
+                        0,
+                        ReceiverAnalysisBudget::default(),
+                    )
+                    .into_precise()
+                {
+                    owners.extend(resolved);
+                }
+                break;
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            node = parent;
+        }
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    owners
+}
+
+/// Resolve a parameter receiver's annotation directly from its structured AST
+/// when the general local-owner route has no result. The receiver fact provider
+/// already proved this parameter's value shape; this narrow fallback supplies
+/// the declaring owner needed to stage direct or inherited member enrichment.
+#[allow(clippy::too_many_arguments)]
+fn ts_parameter_annotation_receiver_owners(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+) -> Vec<CodeUnit> {
+    let Some(function) = jsts_enclosing_function_scope(tree.root_node(), site.focus_start_byte)
+    else {
+        return Vec::new();
+    };
+    let Some(parameters) = function
+        .child_by_field_name("parameters")
+        .or_else(|| function.child_by_field_name("parameter"))
+    else {
+        return Vec::new();
+    };
+    let mut owners = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        let Some(name) = ts_parameter_name_node(parameter) else {
+            continue;
+        };
+        if !node_text_matches(name, source, receiver) {
+            continue;
+        }
+        if ts_binding_is_assigned_before(function, source, receiver, site.focus_start_byte) {
+            // TypeScript annotations are structural. After a write, the
+            // annotation cannot establish the receiver's nominal owner; the
+            // general write-folding path must prove the new value instead.
+            continue;
+        }
+        let Some(type_node) = parameter.child_by_field_name("type") else {
+            continue;
+        };
+        let Some(resolved_owners) = ts_resolve_type_node_to_property_owner_outcome(
+            host,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            type_node,
+            0,
+            ReceiverAnalysisBudget::default(),
+        )
+        .into_precise() else {
+            // An unresolved or ambiguous annotation cannot establish one
+            // receiver owner for member enrichment. Leave the provider's
+            // candidates unattributed rather than collapsing an open union.
+            continue;
+        };
+        owners.extend(resolved_owners);
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    owners
+}
+
+fn jsts_enclosing_function_or_program_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
+    let mut current = smallest_named_node_covering(root, byte, byte)?;
+    loop {
+        if matches!(
+            current.kind(),
+            "program"
+                | "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_local_new_receiver_owner_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+    before_byte: usize,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let Some(scope) = jsts_enclosing_function_or_program_scope(root, before_byte) else {
+        return Vec::new();
+    };
+    let mut state = LocalReceiverWrites::Unseen;
+    jsts_collect_local_new_receiver_owner_candidates(
+        analyzer,
+        host,
+        support,
+        file,
+        language,
+        source,
+        root,
+        scope,
+        scope.id(),
+        imports,
+        aliases,
+        receiver,
+        before_byte,
+        depth,
+        &mut state,
+    );
+    match state {
+        LocalReceiverWrites::Owners(owners) => owners,
+        LocalReceiverWrites::Unseen | LocalReceiverWrites::Conflicted => Vec::new(),
+    }
+}
+
+/// The visible writes to one local receiver name, folded in source order.
+///
+/// Two writes that resolve to different owners are a merge, not a proof: this
+/// walk is flow-insensitive, so it cannot say which write reaches the use, and
+/// the symbol stays unresolved rather than taking the last write seen (#2717,
+/// the TypeScript edition of the #2495 rule). A write with no resolvable
+/// owners is an unknown write and conflicts permanently: a later resolved
+/// owner cannot erase earlier uncertainty.
+enum LocalReceiverWrites {
+    Unseen,
+    Owners(Vec<CodeUnit>),
+    Conflicted,
+}
+
+impl LocalReceiverWrites {
+    fn record(&mut self, owners: Vec<CodeUnit>) {
+        if owners.is_empty() {
+            *self = LocalReceiverWrites::Conflicted;
+            return;
+        }
+        match self {
+            LocalReceiverWrites::Conflicted => {}
+            LocalReceiverWrites::Owners(previous)
+                if !previous.is_empty() && !owners.is_empty() && *previous != owners =>
+            {
+                *self = LocalReceiverWrites::Conflicted;
+            }
+            _ => *self = LocalReceiverWrites::Owners(owners),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_collect_local_new_receiver_owner_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    root_id: usize,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+    before_byte: usize,
+    depth: usize,
+    state: &mut LocalReceiverWrites,
+) {
+    visit_local_receiver_binding_writes(node, root_id, source, receiver, before_byte, |node| {
+        if node.kind() == "variable_declarator"
+            && let Some(value) = node.child_by_field_name("value")
+        {
+            let owners = jsts_local_receiver_value_owner_candidates(
+                analyzer,
+                host,
+                support,
+                file,
+                language,
+                source,
+                root,
+                imports,
+                aliases,
+                value,
+                before_byte,
+                depth + 1,
+            );
+            state.record(owners);
+        }
+
+        if node.kind() == "assignment_expression" {
+            let owners = node
+                .child_by_field_name("right")
+                .map(|value| {
+                    jsts_local_receiver_value_owner_candidates(
+                        analyzer,
+                        host,
+                        support,
+                        file,
+                        language,
+                        source,
+                        root,
+                        imports,
+                        aliases,
+                        value,
+                        before_byte,
+                        depth + 1,
+                    )
+                })
+                .unwrap_or_default();
+            state.record(owners);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_local_receiver_value_owner_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    value: Node<'_>,
+    _before_byte: usize,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    match value.kind() {
+        "new_expression" => value
+            .child_by_field_name("constructor")
+            .map(|constructor| {
+                jsts_constructor_owner_candidates(
+                    host,
+                    support,
+                    file,
+                    language,
+                    source,
+                    imports,
+                    aliases,
+                    constructor,
+                    false,
+                )
+            })
+            .unwrap_or_default(),
+        "call_expression" => value
+            .child_by_field_name("function")
+            .map(|function| {
+                let callees = jsts_call_expression_callees(
+                    host, support, file, language, source, imports, aliases, function,
+                );
+                ts_expand_call_return_property_owners(host, support, callees, depth + 1)
+            })
+            .unwrap_or_default(),
+        "identifier" | "type_identifier" => source
+            .get(value.start_byte()..value.end_byte())
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+            .map(|alias| {
+                jsts_local_new_receiver_owner_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    file,
+                    language,
+                    source,
+                    root,
+                    imports,
+                    aliases,
+                    alias,
+                    value.start_byte(),
+                    depth + 1,
+                )
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_call_expression_callees(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    function: Node<'_>,
+) -> Vec<CodeUnit> {
+    let name = ts_simple_call_reference_name(function, source).or_else(|| {
+        (function.kind() == "type_identifier")
+            .then(|| source.get(function.start_byte()..function.end_byte()))
+            .flatten()
+            .map(|name| name.trim().to_string())
+    });
+    name.filter(|name| !name.is_empty())
+        .map(|name| {
+            jsts_identifier_candidates(
+                host, support, language, file, source, imports, aliases, &name, true,
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn jsts_reference_is_value_position(tree: &Tree, site: &ResolvedReferenceSite) -> bool {
+    let Some(node) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
+        return true;
+    };
+    !jsts_reference_is_type_position(node)
+}
+
+fn jsts_reference_is_type_position(mut node: Node<'_>) -> bool {
+    loop {
+        match node.kind() {
+            "type_identifier"
+            | "predefined_type"
+            | "type_annotation"
+            | "type_arguments"
+            | "type_parameters"
+            | "generic_type"
+            | "union_type"
+            | "intersection_type"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "extends_type_clause"
+            | "implements_clause"
+            | "constraint" => return true,
+            "call_expression"
+            | "arguments"
+            | "member_expression"
+            | "subscript_expression"
+            | "binary_expression"
+            | "unary_expression"
+            | "return_statement"
+            | "expression_statement"
+            | "variable_declarator"
+            | "assignment_expression" => return false,
+            _ => {}
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn is_bare_js_ts_specifier(module: &str) -> bool {
+    !module.starts_with("./") && !module.starts_with("../") && !module.starts_with('/')
+}
+
+pub(crate) fn jsts_call_reference_candidate(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "call_expression" if parent.child_by_field_name("function") == Some(current) => {
+                return true;
+            }
+            "new_expression"
+                if parent.child_by_field_name("function") == Some(current)
+                    || parent.child_by_field_name("constructor") == Some(current) =>
+            {
+                return true;
+            }
+            "member_expression"
+            | "subscript_expression"
+            | "identifier"
+            | "property_identifier"
+            | "nested_identifier"
+            | "qualified_identifier" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_definition_dispatch<'a>(
+    analyzer: &'a dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    context: &mut brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionBatchContext<
+        'a,
+        '_,
+    >,
+    request: &brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest,
+    source: &std::sync::Arc<str>,
+    tree: &Option<tree_sitter::Tree>,
+    site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+    _operation: Option<brokk_bifrost_analysis::navigation::NavigationOperation>,
+    _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    _go_session: Option<
+        &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+    >,
+) -> std::ops::ControlFlow<
+    brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
+    brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
+> {
+    let language = language_for_file(&request.file);
+    let mut evidence = CallEvidence::default();
+    let outcome = {
+        let mut outcome = js_ts::resolve_js_ts(
+            analyzer,
+            context,
+            &request.file,
+            language,
+            source,
+            tree.as_ref(),
+            site,
+        );
+        if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+            && let Some(proof) = tree.as_ref().and_then(|tree| {
+                let imports = &context
+                    .language_state::<JsTsDefinitionState>()
+                    .js_ts_contexts
+                    .get(&(request.file.clone(), language))?
+                    .imports;
+                js_ts::exact_direct_named_import_call(source.as_ref(), tree, site, imports).or_else(
+                    || {
+                        js_ts::exact_modeled_external_call(
+                            analyzer,
+                            language,
+                            source.as_ref(),
+                            tree,
+                            site,
+                        )
+                    },
+                )
+            })
+        {
+            let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
+            reference.text = proof.canonical_callee().to_owned();
+            outcome.reference = Some(reference);
+            evidence.call_application = proof.call_application();
+            evidence.dispatch_extensibility = proof.dispatch_extensibility();
+            evidence.exact_external_call = Some(proof);
+        }
+        outcome
+    };
+    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::analyzer::usages::get_definition::js_ts::JstsReceiverBindingScope;
+
+    use crate::analyzer::usages::get_definition::js_ts::jsts_binding_scope_for_declaration;
+
+    use crate::analyzer::usages::get_definition::js_ts::jsts_nearest_var_scope;
+
+    use crate::analyzer::usages::get_definition::js_ts::jsts_visible_receiver_binding_scope;
+    use brokk_bifrost_js_ts::syntax::slice;
+    use brokk_bifrost_js_ts::test_support::parse_javascript;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#4271: a generator var was assigned to the enclosing program scope")]
+    fn generator_var_reference_binds_in_generator_scope() {
+        let source =
+            "var value = 1;\nfunction* generate() {\n  var value = 2;\n  return value;\n}\n";
+        let tree = parse_javascript(source);
+        let root = tree.root_node();
+        let mut nodes = vec![root];
+        let mut generator = None;
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "generator_function_declaration" {
+                generator = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            nodes.extend(node.named_children(&mut cursor));
+        }
+        let generator = generator.expect("generator function declaration");
+        let expected_scope = JstsReceiverBindingScope {
+            start_byte: generator.start_byte(),
+            end_byte: generator.end_byte(),
+        };
+
+        let body = generator
+            .child_by_field_name("body")
+            .expect("generator body");
+        let mut nodes = vec![body];
+        let mut declaration = None;
+        let mut reference = None;
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "variable_declarator"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| slice(name, source) == "value")
+            {
+                declaration = Some(node);
+            } else if node.kind() == "identifier"
+                && slice(node, source) == "value"
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "return_statement")
+            {
+                reference = Some(node);
+            }
+            let mut cursor = node.walk();
+            nodes.extend(node.named_children(&mut cursor));
+        }
+        let declaration = declaration.expect("generator var declaration");
+        let reference = reference.expect("generator reference");
+
+        assert_eq!(
+            jsts_binding_scope_for_declaration(declaration),
+            Some(expected_scope)
+        );
+        assert_eq!(
+            jsts_visible_receiver_binding_scope(root, source, "value", reference.start_byte()),
+            Some(expected_scope)
+        );
+        assert_eq!(jsts_nearest_var_scope(declaration), Some(expected_scope));
+    }
+}

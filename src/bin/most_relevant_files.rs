@@ -1,6 +1,5 @@
-#[allow(dead_code)]
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/exit.rs"]
+mod exit;
 
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, WorkspaceAnalyzer,
@@ -9,7 +8,7 @@ use brokk_bifrost::{
         most_relevant_files_history_only,
     },
 };
-use common::finish_unit_result;
+use exit::finish_unit_result;
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;

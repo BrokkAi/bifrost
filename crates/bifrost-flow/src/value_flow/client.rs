@@ -276,7 +276,10 @@ impl<'plan> ValueFlowProblem<'plan> {
     ) -> Vec<ActiveFlow> {
         let mut generated = Vec::new();
         for source in self.plan.sources_at(point, phase) {
-            match source.activation_triggers.as_deref() {
+            match source
+                .activation_triggers
+                .map(|list| self.plan.source_list(list))
+            {
                 None if is_zero => generated.push(ActiveFlow {
                     source: source.id,
                     carrier: source.carrier,
@@ -1174,7 +1177,12 @@ impl ValueFlowProblem<'_> {
                 .edge_kills(edge.source(), edge.target().id(), kind);
             active.retain(|flow| {
                 !kills.iter().any(|kill| {
-                    kill.carrier == flow.carrier && kill.sources.binary_search(&flow.source).is_ok()
+                    kill.carrier == flow.carrier
+                        && self
+                            .plan
+                            .source_list(kill.sources)
+                            .binary_search(&flow.source)
+                            .is_ok()
                 })
             });
         }
@@ -1725,6 +1733,9 @@ mod tests {
             ProofStatus::Proven,
             EvidenceCompleteness::Complete,
         );
+        let mut sources = super::super::ValueFlowSources::from(vec![unrelated, trigger]);
+        let trigger_id = sources.id_for_key(&trigger_key).expect("seeded trigger");
+        let triggers = sources.intern_list(vec![trigger_id]);
         let before = ValueFlowSourceSpec::new(
             before_key,
             exit.clone(),
@@ -1733,7 +1744,7 @@ mod tests {
             ProofStatus::Proven,
             EvidenceCompleteness::Complete,
         )
-        .when_sources_reach(vec![trigger_key.clone()]);
+        .when_sources_reach(triggers);
         let after = ValueFlowSourceSpec::new(
             after_key,
             exit.clone(),
@@ -1742,15 +1753,11 @@ mod tests {
             ProofStatus::Proven,
             EvidenceCompleteness::Complete,
         )
-        .when_sources_reach(vec![trigger_key.clone()]);
-        let plan = ValueFlowPlan::try_new(
-            root,
-            Vec::new(),
-            Vec::new(),
-            vec![trigger, unrelated, before, after],
-            Vec::new(),
-        )
-        .expect("conditional source plan");
+        .when_sources_reach(triggers);
+        sources.push(before);
+        sources.push(after);
+        let plan = ValueFlowPlan::try_new(root, Vec::new(), Vec::new(), sources, Vec::new())
+            .expect("conditional source plan");
         let problem = ValueFlowProblem::new(&plan);
         let before_id = plan
             .sources()

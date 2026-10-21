@@ -1,0 +1,1068 @@
+use crate::analyzer::js_ts::semantic::*;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::field_matches;
+pub(super) use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
+use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
+
+pub(in crate::analyzer::js_ts::semantic) fn declaration_container_kind(
+    node: Node<'_>,
+) -> Option<DeclarationSegmentKind> {
+    match node.kind() {
+        "internal_module" => Some(DeclarationSegmentKind::Namespace),
+        "class"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "type_alias_declaration" => Some(DeclarationSegmentKind::Type),
+        _ => None,
+    }
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn declaration_container_name(
+    source: &str,
+    node: Node<'_>,
+) -> Option<Box<str>> {
+    brokk_bifrost_analysis::analyzer::common::declaration_container_name(source, node)
+        .or_else(|| enclosing_binding(source, node).map(|binding| binding.name))
+}
+
+struct EnclosingBinding {
+    name: Box<str>,
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn callable_name(
+    source: &str,
+    node: Node<'_>,
+) -> Option<Box<str>> {
+    if node.kind() == "program" {
+        return Some(
+            brokk_bifrost_analysis::analyzer::semantic::FILE_INITIALIZER_SEGMENT_NAME.into(),
+        );
+    }
+
+    if matches!(node.kind(), "field_definition" | "public_field_definition") {
+        let name = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"))?;
+        if name.kind() == "computed_property_name" {
+            return None;
+        }
+        return nonempty_node_text(source, name).map(Box::<str>::from);
+    }
+
+    if let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|name| nonempty_node_text(source, name))
+        .map(Box::<str>::from)
+    {
+        return Some(name);
+    }
+
+    enclosing_binding(source, node).map(|binding| binding.name)
+}
+
+fn enclosing_binding(source: &str, node: Node<'_>) -> Option<EnclosingBinding> {
+    let mut value = node;
+    loop {
+        let parent = value.parent()?;
+        match parent.kind() {
+            "parenthesized_expression" => {
+                if first_named_child(parent).is_some_and(|child| child.id() == value.id()) {
+                    value = parent;
+                    continue;
+                }
+                return None;
+            }
+            "as_expression" | "satisfies_expression" | "non_null_expression" | "type_assertion" => {
+                if ts_type_wrapper_operand(parent).is_some_and(|child| child.id() == value.id()) {
+                    value = parent;
+                    continue;
+                }
+                return None;
+            }
+            "variable_declarator" => {
+                if !field_matches(parent, "value", value) {
+                    return None;
+                }
+                let name = parent.child_by_field_name("name")?;
+                return simple_binding_name(source, name).map(|name| EnclosingBinding { name });
+            }
+            "assignment_expression" => {
+                if !field_matches(parent, "right", value) {
+                    return None;
+                }
+                let left = parent.child_by_field_name("left")?;
+                return assignment_binding(source, left);
+            }
+            "pair" => {
+                if !field_matches(parent, "value", value) {
+                    return None;
+                }
+                let key = parent.child_by_field_name("key")?;
+                return simple_binding_name(source, key).map(|name| EnclosingBinding { name });
+            }
+            "public_field_definition" | "field_definition" => {
+                if !field_matches(parent, "value", value) {
+                    return None;
+                }
+                let name = parent
+                    .child_by_field_name("name")
+                    .or_else(|| parent.child_by_field_name("property"))?;
+                return simple_binding_name(source, name).map(|name| EnclosingBinding { name });
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn assignment_binding(source: &str, left: Node<'_>) -> Option<EnclosingBinding> {
+    if left.kind() == "identifier" {
+        return simple_binding_name(source, left).map(|name| EnclosingBinding { name });
+    }
+    if left.kind() == "member_expression" {
+        let property = left.child_by_field_name("property")?;
+        return simple_binding_name(source, property).map(|name| EnclosingBinding { name });
+    }
+    None
+}
+
+fn has_children_in_field(parent: Node<'_>, field: &str) -> bool {
+    let mut cursor = parent.walk();
+    parent
+        .children_by_field_name(field, &mut cursor)
+        .next()
+        .is_some()
+}
+
+fn simple_binding_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    matches!(
+        node.kind(),
+        "identifier" | "property_identifier" | "private_property_identifier" | "type_identifier"
+    )
+    .then(|| nonempty_node_text(source, node))
+    .flatten()
+    .map(Box::<str>::from)
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn callable_shape<'tree>(
+    node: Node<'tree>,
+) -> Option<(
+    ProcedureKind,
+    DeclarationSegmentKind,
+    Node<'tree>,
+    ProcedureProperties,
+)> {
+    let (kind, segment_kind, body, generator, is_static, is_synthetic) = match node.kind() {
+        // The module body executes file-scope statements, so it is a procedure
+        // in its own right: without it a file-scope load could never join an
+        // executable `MemoryLoad` (#3374). Its statements are not a block, so
+        // the body is the program node itself. A module scope that holds only
+        // declarations has no statement to run and stays outside the frame.
+        "program" => {
+            if !module_body_has_statements(node) {
+                return None;
+            }
+            (
+                ProcedureKind::Initializer,
+                DeclarationSegmentKind::Initializer,
+                node,
+                false,
+                true,
+                true,
+            )
+        }
+        "function_declaration" | "function_expression" => (
+            ProcedureKind::Function,
+            DeclarationSegmentKind::Function,
+            node.child_by_field_name("body")?,
+            false,
+            false,
+            false,
+        ),
+        "generator_function_declaration" | "generator_function" => (
+            ProcedureKind::Function,
+            DeclarationSegmentKind::Function,
+            node.child_by_field_name("body")?,
+            true,
+            false,
+            false,
+        ),
+        "arrow_function" => (
+            ProcedureKind::Lambda,
+            DeclarationSegmentKind::Lambda,
+            node.child_by_field_name("body")?,
+            false,
+            false,
+            false,
+        ),
+        "method_definition" => (
+            ProcedureKind::Method,
+            DeclarationSegmentKind::Method,
+            node.child_by_field_name("body")?,
+            has_child_kind(node, "*"),
+            has_child_kind(node, "static") || has_child_kind(node, "static get"),
+            false,
+        ),
+        "class_static_block" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node.child_by_field_name("body")?,
+            false,
+            true,
+            false,
+        ),
+        "field_definition" | "public_field_definition" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node.child_by_field_name("value")?,
+            false,
+            has_child_kind(node, "static"),
+            false,
+        ),
+        _ => return None,
+    };
+    let mut cursor = node.walk();
+    let is_async = node
+        .children(&mut cursor)
+        .any(|child| child.kind() == "async");
+    Some((
+        kind,
+        segment_kind,
+        body,
+        ProcedureProperties {
+            is_async,
+            is_generator: generator,
+            is_static,
+            is_synthetic,
+            invocation: if generator {
+                ProcedureInvocationKind::Deferred
+            } else {
+                ProcedureInvocationKind::Immediate
+            },
+            ..ProcedureProperties::default()
+        },
+    ))
+}
+
+/// Whether the class body holding this member declares a `private
+/// constructor`.
+///
+/// TypeScript has no `final` keyword; a private constructor is the language's
+/// own statement that the class cannot be extended (`class D extends C`
+/// refuses to compile), so no subclass, and therefore no override of the
+/// member, exists. That is the same closed-dispatch declaration Java spells
+/// `final` and Python spells `@final` (#2717). The caller gates this on the
+/// TypeScript dialect: JavaScript has no accessibility modifiers, so no JS
+/// class can make the statement.
+pub(in crate::analyzer::js_ts::semantic) fn enclosing_class_has_private_constructor(
+    source: &str,
+    node: Node<'_>,
+) -> bool {
+    let Some(class_body) = node.parent().filter(|parent| parent.kind() == "class_body") else {
+        return false;
+    };
+    let mut cursor = class_body.walk();
+    class_body.named_children(&mut cursor).any(|member| {
+        member.kind() == "method_definition"
+            && member
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(source, name))
+                .is_some_and(|name| name == "constructor")
+            && {
+                let mut modifiers = member.walk();
+                member.children(&mut modifiers).any(|child| {
+                    child.kind() == "accessibility_modifier"
+                        && nonempty_node_text(source, child).is_some_and(|text| text == "private")
+                })
+            }
+    })
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn callable_field_belongs_to_procedure(
+    callable_kind: &str,
+    field: Option<&str>,
+) -> bool {
+    match callable_kind {
+        "field_definition" | "public_field_definition" => field == Some("value"),
+        "method_definition" => !matches!(field, Some("name" | "decorator")),
+        _ => true,
+    }
+}
+
+/// A statement that declares a name or a type in the file scope instead of
+/// executing in the module body's value flow.
+///
+/// The file scope owns exactly the declarations that are direct statements of
+/// the module body, so only such a child is a file-scope declaration. The
+/// module body frame is the frame of the statements around them, and it lists
+/// each declaration as a sibling rather than as a child: the declared
+/// procedure and declaration container keep the file scope as their lexical
+/// parent and declaration path, exactly as Ruby and Scala enumerate the
+/// members of a synthetic body. The body then schedules only the statements it
+/// actually runs (#3374).
+///
+/// An `export` wrapper is transparent: `export function f() {}` declares `f`
+/// in the file scope exactly as the unwrapped form does, while
+/// `export const x = ...` and `export default <expression>` execute in the
+/// body and stay with it.
+pub(in crate::analyzer::js_ts::semantic) fn is_file_scope_declaration(node: Node<'_>) -> bool {
+    if !node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "program")
+    {
+        return false;
+    }
+    let declaration = if node.kind() == "export_statement" {
+        match node.child_by_field_name("declaration") {
+            Some(declaration) => declaration,
+            None => return false,
+        }
+    } else {
+        node
+    };
+    matches!(
+        declaration.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "internal_module"
+            // `declare ...` is ambient: it declares names and types for the
+            // type checker and emits no runtime value flow at all (#3374).
+            | "ambient_declaration"
+    )
+}
+
+/// Whether the module body has a statement for its frame to run.
+///
+/// A comment is not a statement, and a file-scope declaration is enumerated as
+/// a sibling of the frame. A module scope without a statement therefore has no
+/// value flow to lower and allocates no frame.
+pub(in crate::analyzer::js_ts::semantic) fn module_body_has_statements(node: Node<'_>) -> bool {
+    assert_eq!(node.kind(), "program");
+    named_children(node)
+        .into_iter()
+        .any(|child| child.kind() != "comment" && !is_file_scope_declaration(child))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::analyzer::js_ts::semantic) struct ClassDefinitionEvaluation<'tree> {
+    pub(in crate::analyzer::js_ts::semantic) expressions: Vec<Node<'tree>>,
+    pub(in crate::analyzer::js_ts::semantic) has_decorators: bool,
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn class_definition_expressions<'tree>(
+    class: Node<'tree>,
+    cancellation: &CancellationToken,
+) -> Result<ClassDefinitionEvaluation<'tree>, LoweringCancelled> {
+    let mut expressions = Vec::new();
+    let mut has_decorators = false;
+    let mut cursor = class.walk();
+    for child in class.named_children(&mut cursor) {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        match child.kind() {
+            "decorator" => has_decorators = true,
+            "class_heritage" => {
+                let mut heritage_cursor = child.walk();
+                for heritage in child.named_children(&mut heritage_cursor) {
+                    if cancellation.is_cancelled() {
+                        return Err(LoweringCancelled);
+                    }
+                    match heritage.kind() {
+                        "extends_clause" => {
+                            let mut extends_cursor = heritage.walk();
+                            for (index, value) in heritage.children(&mut extends_cursor).enumerate()
+                            {
+                                if cancellation.is_cancelled() {
+                                    return Err(LoweringCancelled);
+                                }
+                                if heritage.field_name_for_child(index as u32) == Some("value") {
+                                    expressions.push(value);
+                                }
+                            }
+                        }
+                        "implements_clause" => {}
+                        _ => expressions.push(heritage),
+                    }
+                }
+            }
+            "class_body" => {
+                let mut body_cursor = child.walk();
+                for member in child.named_children(&mut body_cursor) {
+                    if cancellation.is_cancelled() {
+                        return Err(LoweringCancelled);
+                    }
+                    if member.kind() == "decorator" {
+                        has_decorators = true;
+                    } else {
+                        has_decorators |= member_has_decorators(member, cancellation)?;
+                        if let Some(name) = runtime_computed_member_name(member) {
+                            expressions.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(ClassDefinitionEvaluation {
+        expressions,
+        has_decorators,
+    })
+}
+
+fn member_has_decorators(
+    member: Node<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, LoweringCancelled> {
+    if has_children_in_field(member, "decorator") {
+        return Ok(true);
+    }
+    let Some(parameters) = member.child_by_field_name("parameters") else {
+        return Ok(false);
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        if has_children_in_field(parameter, "decorator") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn runtime_computed_member_name(member: Node<'_>) -> Option<Node<'_>> {
+    let executes_at_runtime = match member.kind() {
+        "method_definition" | "field_definition" => true,
+        "public_field_definition" => {
+            !has_child_kind(member, "abstract") && !has_child_kind(member, "declare")
+        }
+        _ => false,
+    };
+    executes_at_runtime
+        .then(|| {
+            member
+                .child_by_field_name("name")
+                .or_else(|| member.child_by_field_name("property"))
+        })
+        .flatten()
+        .filter(|name| name.kind() == "computed_property_name")
+}
+
+pub(super) use brokk_bifrost_core::analyzer::tree_walk::named_children;
+
+pub(in crate::analyzer::js_ts::semantic) fn default_parameter_values(
+    node: Node<'_>,
+) -> Vec<Node<'_>> {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    named_children(parameters)
+        .into_iter()
+        .filter_map(|parameter| match parameter.kind() {
+            "required_parameter" | "optional_parameter" => parameter.child_by_field_name("value"),
+            "assignment_pattern" => parameter.child_by_field_name("right"),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn has_nested_parameter_defaults(node: Node<'_>) -> bool {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return false;
+    };
+    for parameter in named_children(parameters) {
+        let binding = match parameter.kind() {
+            "required_parameter" | "optional_parameter" => parameter.child_by_field_name("pattern"),
+            "assignment_pattern" => parameter.child_by_field_name("left"),
+            _ => Some(parameter),
+        };
+        let Some(binding) = binding else {
+            continue;
+        };
+        let mut stack = vec![binding];
+        while let Some(current) = stack.pop() {
+            if current.kind() == "assignment_pattern" {
+                return true;
+            }
+            stack.extend(named_children(current));
+        }
+    }
+    false
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn declaration_initializers(
+    node: Node<'_>,
+) -> Vec<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| child.kind() == "variable_declarator")
+        .filter_map(|declarator| declarator.child_by_field_name("value"))
+        .collect()
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn abrupt_dependencies(node: Node<'_>) -> Vec<Node<'_>> {
+    match node.kind() {
+        "statement_block" | "program" => named_children(node)
+            .into_iter()
+            .filter(|child| child.kind() != "comment")
+            .collect(),
+        "if_statement" => {
+            let mut children = Vec::with_capacity(2);
+            if let Some(consequence) = node.child_by_field_name("consequence") {
+                children.push(consequence);
+            }
+            if let Some(alternative) = node.child_by_field_name("alternative") {
+                children.push(if alternative.kind() == "else_clause" {
+                    first_named_child(alternative).unwrap_or(alternative)
+                } else {
+                    alternative
+                });
+            }
+            children
+        }
+        "try_statement" => {
+            let mut children = Vec::with_capacity(3);
+            if let Some(body) = node.child_by_field_name("body") {
+                children.push(body);
+            }
+            if let Some(handler) = node
+                .child_by_field_name("handler")
+                .and_then(|handler| handler.child_by_field_name("body"))
+            {
+                children.push(handler);
+            }
+            if let Some(finalizer) = node
+                .child_by_field_name("finalizer")
+                .and_then(|finalizer| finalizer.child_by_field_name("body"))
+            {
+                children.push(finalizer);
+            }
+            children
+        }
+        "labeled_statement" => node.child_by_field_name("body").into_iter().collect(),
+        "else_clause" => first_named_child(node).into_iter().collect(),
+        "export_statement" => node
+            .child_by_field_name("declaration")
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn required_field<'tree>(
+    node: Node<'tree>,
+    field: &str,
+) -> Result<Node<'tree>, TsLoweringError> {
+    brokk_bifrost_analysis::analyzer::semantic::lowering::required_field_or_else(
+        node,
+        field,
+        missing_field,
+    )
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn js_ts_local_scope(
+    node: Node<'_>,
+) -> Option<(usize, usize)> {
+    let is_var = node.parent().is_some_and(|parent| {
+        parent.kind() == "variable_declaration"
+            || (parent.kind() == "for_in_statement" && has_child_kind(parent, "var"))
+    });
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        let is_scope = if is_var {
+            brokk_bifrost_js_ts::syntax::js_ts_is_var_scope_kind(parent.kind())
+        } else {
+            matches!(
+                parent.kind(),
+                "program"
+                    | "statement_block"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "switch_body"
+                    | "catch_clause"
+            )
+        };
+        if is_scope {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn body_contains_free_this(
+    body: Node<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, LoweringCancelled> {
+    brokk_bifrost_analysis::analyzer::semantic::lowering::body_contains_matching_node(
+        body,
+        cancellation,
+        |node| is_js_ts_nested_execution_boundary(node, body),
+        |node| node.kind() == "this",
+    )
+}
+
+/// The value kind one expression node mints. A value is minted once per node,
+/// so every lowering path must agree on it: a literal whose value the source
+/// fixes publishes that value, including a negated numeric literal.
+pub(in crate::analyzer::js_ts::semantic) fn expression_value_kind(
+    source: &str,
+    node: Node<'_>,
+) -> SemanticValueKind {
+    match node.kind() {
+        kind if is_callable_kind(kind) => SemanticValueKind::Callable,
+        "null" => SemanticValueKind::Null,
+        "true" => SemanticValueKind::Boolean(true),
+        "false" => SemanticValueKind::Boolean(false),
+        // BigInt, legacy octal and infinite tokens keep the payload-free kind.
+        "number" => {
+            signed_numeric_literal_kind(source, node).unwrap_or(SemanticValueKind::Constant)
+        }
+        "unary_expression" => {
+            signed_numeric_literal_kind(source, node).unwrap_or(SemanticValueKind::Temporary)
+        }
+        "string" | "template_string" | "undefined" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+/// The typed constant a numeric literal, optionally under one direct unary
+/// minus, denotes. An integer within the exact safe range publishes as an
+/// integer; every other finite Number publishes its binary64 bits. `-0` is the
+/// integer zero: it differs from `+0` only under division and `Object.is`,
+/// which publish no scalar fact.
+pub(in crate::analyzer::js_ts::semantic) fn signed_numeric_literal_kind(
+    source: &str,
+    node: Node<'_>,
+) -> Option<SemanticValueKind> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    let value = signed_numeric_literal_value(source, node)?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(if value.fract() == 0.0 && value.abs() <= MAX_SAFE_INTEGER {
+        if value >= 0.0 {
+            SemanticValueKind::UnsignedInteger(value as u128)
+        } else {
+            SemanticValueKind::SignedInteger(value as i128)
+        }
+    } else {
+        SemanticValueKind::FloatingPoint {
+            bits: value.to_bits(),
+        }
+    })
+}
+
+/// The identifier operand and exact offset of `x + c`, `c + x` or `x - c`,
+/// where `c` is an integer literal (optionally directly negated). On a Number
+/// operand the result is the operand plus the offset; any other operand
+/// converts or concatenates, which a consumer that computes offsets only on
+/// known integer facts never mistakes for addition.
+pub(in crate::analyzer::js_ts::semantic) fn integer_offset_operand<'tree>(
+    source: &str,
+    node: Node<'tree>,
+) -> Option<(Node<'tree>, SignedIntegerMagnitude)> {
+    if node.kind() != "binary_expression" {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    let operator = node.child_by_field_name("operator")?.kind();
+    brokk_bifrost_analysis::analyzer::semantic::type_flow::integer_offset_from_binary_operands(
+        operator,
+        left,
+        right,
+        |literal| {
+            let constant = integer_literal_value(source, literal)?;
+            Some(SignedIntegerMagnitude::new(
+                constant < 0,
+                constant.unsigned_abs(),
+            ))
+        },
+    )
+}
+
+/// The exact safe integer a numeric literal (optionally directly negated)
+/// denotes.
+pub(in crate::analyzer::js_ts::semantic) fn integer_literal_value(
+    source: &str,
+    node: Node<'_>,
+) -> Option<i128> {
+    match signed_numeric_literal_kind(source, node)? {
+        SemanticValueKind::UnsignedInteger(value) => {
+            Some(i128::try_from(value).expect("a safe integer literal fits i128"))
+        }
+        SemanticValueKind::SignedInteger(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether `node` is a literal of a primitive value. Converting a primitive
+/// to a number or primitive runs no user code.
+pub(in crate::analyzer::js_ts::semantic) fn is_primitive_literal(
+    source: &str,
+    node: Node<'_>,
+) -> bool {
+    matches!(node.kind(), "number" | "string" | "true" | "false" | "null")
+        || signed_numeric_literal_value(source, node).is_some()
+}
+
+/// The Number value of a numeric literal, or of one directly negated with
+/// unary minus (`-5`, not `-(5)`).
+pub(in crate::analyzer::js_ts::semantic) fn signed_numeric_literal_value(
+    source: &str,
+    node: Node<'_>,
+) -> Option<f64> {
+    match node.kind() {
+        "number" => numeric_literal_value(source, node),
+        "unary_expression"
+            if node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "-") =>
+        {
+            numeric_literal_value(source, node.child_by_field_name("argument")?).map(|value| -value)
+        }
+        _ => None,
+    }
+}
+
+/// The Number value of one `number` token under ECMAScript numeric-literal
+/// semantics: numeric separators, `0x`/`0o`/`0b` integers and decimal
+/// literals with fraction and exponent, each rounded to binary64 the way the
+/// language does (Rust's float parsing and integer conversion both round to
+/// nearest, ties to even). A BigInt (`10n`) is not a Number, and a
+/// leading-zero decimal (`017`, `08`) is a sloppy-mode legacy form, so both
+/// return `None`; so does a non-decimal integer wider than 128 bits.
+pub(in crate::analyzer::js_ts::semantic) fn numeric_literal_value(
+    source: &str,
+    node: Node<'_>,
+) -> Option<f64> {
+    if node.kind() != "number" {
+        return None;
+    }
+    let text = node_text(source, node)?;
+    if text.ends_with('n') {
+        return None;
+    }
+    let without_separators = |digits: &str| digits.replace('_', "");
+    let radix = match text.as_bytes() {
+        [b'0', b'x' | b'X', ..] => Some(16),
+        [b'0', b'o' | b'O', ..] => Some(8),
+        [b'0', b'b' | b'B', ..] => Some(2),
+        [b'0', next, ..] if next.is_ascii_digit() || *next == b'_' => return None,
+        _ => None,
+    };
+    match radix {
+        Some(radix) => u128::from_str_radix(&without_separators(&text[2..]), radix)
+            .ok()
+            .map(|value| value as f64),
+        None => without_separators(text).parse::<f64>().ok(),
+    }
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn is_callable_kind(kind: &str) -> bool {
+    brokk_bifrost_js_ts::syntax::is_function_like(kind)
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn is_js_ts_nested_execution_boundary(
+    node: Node<'_>,
+    traversal_root: Node<'_>,
+) -> bool {
+    // The traversal root is the current procedure's own body (a method body,
+    // a field initializer value, a static-block body), never a nested one.
+    if node.id() == traversal_root.id() {
+        return false;
+    }
+    if is_callable_kind(node.kind()) && node.kind() != "method_definition" {
+        return true;
+    }
+    if node.kind() == "class_static_block" {
+        return true;
+    }
+    node.parent().is_some_and(|parent| match parent.kind() {
+        "field_definition" | "public_field_definition" => field_matches(parent, "value", node),
+        "method_definition" => !field_matches(parent, "name", node),
+        _ => false,
+    })
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn is_runtime_leaf(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "property_identifier"
+            | "private_property_identifier"
+            | "statement_identifier"
+            | "type_identifier"
+            | "jsx_identifier"
+            | "jsx_namespace_name"
+            | "jsx_text"
+            | "html_character_reference"
+            | "string"
+            | "string_fragment"
+            | "escape_sequence"
+            | "number"
+            | "regex"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "this"
+            | "super"
+            | "meta_property"
+            | "optional_chain"
+            | "comment"
+    )
+}
+
+pub(super) use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_child_kind;
+
+pub(in crate::analyzer::js_ts::semantic) fn simple_for_of_binding(
+    statement: Node<'_>,
+) -> Option<Node<'_>> {
+    if statement.kind() != "for_in_statement"
+        || statement
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "of")
+        || !["const", "let", "var"]
+            .into_iter()
+            .any(|kind| has_child_kind(statement, kind))
+    {
+        return None;
+    }
+    let pattern = statement.child_by_field_name("left")?;
+    let binders = named_children(pattern);
+    (pattern.kind() == "array_pattern"
+        && binders.len() == 2
+        && binders.iter().all(|binder| binder.kind() == "identifier"))
+    .then_some(pattern)
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn short_circuit_operator(
+    node: Node<'_>,
+) -> Option<&'static str> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find_map(|child| match child.kind() {
+            "&&" => Some("&&"),
+            "||" => Some("||"),
+            "??" => Some("??"),
+            _ => None,
+        })
+}
+
+/// Whether an expression belongs to one continuous optional-chain spine.
+/// Only callee/object and transparent TypeScript wrappers are followed: an
+/// argument, computed key, or parenthesized expression starts an independent
+/// evaluation region and therefore cannot propagate a nullish skip outward.
+pub(in crate::analyzer::js_ts::semantic) fn continuous_optional_chain(mut node: Node<'_>) -> bool {
+    loop {
+        if has_child_kind(node, "?.")
+            || node.child_by_field_name("optional_chain").is_some()
+            || has_child_kind(node, "optional_chain")
+        {
+            return true;
+        }
+        node = match node.kind() {
+            "call_expression" => match node.child_by_field_name("function") {
+                Some(function) => function,
+                None => return false,
+            },
+            "member_expression" | "subscript_expression" => {
+                match node.child_by_field_name("object") {
+                    Some(object) => object,
+                    None => return false,
+                }
+            }
+            "non_null_expression" | "as_expression" | "satisfies_expression" | "type_assertion" => {
+                match ts_type_wrapper_operand(node) {
+                    Some(expression) => expression,
+                    None => return false,
+                }
+            }
+            "instantiation_expression" => match node.child_by_field_name("function") {
+                Some(function) => function,
+                None => return false,
+            },
+            // Parentheses deliberately terminate propagation. `(value?.x).y`
+            // attempts `.y` even when the nested chain produces undefined.
+            _ => return false,
+        };
+    }
+}
+
+/// Whether an expression is the direct callee of a call or constructor.
+/// Call-callee position determines the value's semantic kind, so capture
+/// diagnostics can use the same value row that call lowering requests without
+/// preloading it as a local. Transparent wrappers have their own expression
+/// value and are therefore deliberately not climbed here.
+pub(in crate::analyzer::js_ts::semantic) fn is_call_callee(node: Node<'_>) -> bool {
+    parent_if_field(node, "call_expression", "function").is_some()
+        || parent_if_field(node, "new_expression", "constructor").is_some()
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn logical_assignment_operator(
+    node: Node<'_>,
+) -> Option<&'static str> {
+    let operator = node.child_by_field_name("operator")?;
+    match operator.kind() {
+        "&&=" => Some("&&="),
+        "||=" => Some("||="),
+        "??=" => Some("??="),
+        _ => None,
+    }
+}
+
+/// An object literal whose evaluation yields an object with only data
+/// properties and the default `Object.prototype`. A property access on such an
+/// object cannot invoke an accessor or a proxy trap, and its field identities
+/// are fully declared by the literal plus in-procedure stores.
+///
+/// Spread members are plain: spreading copies enumerable own properties as
+/// data properties (source accessors run at literal evaluation, not at later
+/// accesses). A non-computed `__proto__` key replaces the prototype, and a
+/// `get`/`set` member installs an accessor, so both disqualify the literal.
+pub(in crate::analyzer::js_ts::semantic) fn is_plain_object_literal(
+    source: &str,
+    node: Node<'_>,
+) -> bool {
+    if node.kind() != "object" {
+        return false;
+    }
+    named_children(node).into_iter().all(|member| {
+        match member.kind() {
+            "comment" => true,
+            "shorthand_property_identifier" | "spread_element" => true,
+            "pair" => member.child_by_field_name("key").is_some_and(|key| {
+                match key.kind() {
+                    "property_identifier" => {
+                        node_text(source, key).is_some_and(|text| text != "__proto__")
+                    }
+                    "number" => true,
+                    // String and computed keys can spell `__proto__`
+                    // indirectly; a template key can also throw during
+                    // evaluation of the literal itself.
+                    _ => false,
+                }
+            }),
+            "method_definition" => {
+                let mut cursor = member.walk();
+                !member
+                    .children(&mut cursor)
+                    .any(|child| matches!(child.kind(), "get" | "set"))
+            }
+            _ => false,
+        }
+    })
+}
+
+pub(in crate::analyzer::js_ts::semantic) fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
+    match node.kind() {
+        "unary_expression"
+        | "update_expression"
+        | "augmented_assignment_expression"
+        | "template_string" => true,
+        // Intrinsic strict comparison neither coerces operands nor dispatches
+        // user code. Operand evaluation still has its own exception gaps.
+        "binary_expression" => node
+            .child_by_field_name("operator")
+            .is_none_or(|operator| !matches!(operator.kind(), "===" | "!==")),
+        "assignment_expression" => node.child_by_field_name("left").is_some_and(|left| {
+            matches!(left.kind(), "member_expression" | "subscript_expression")
+        }),
+        _ => false,
+    }
+}
+
+/// Procedure syntax roles for the shared JavaScript/TypeScript lowering.
+/// Procedures are exactly the nodes [`callable_shape`] lowers, so the
+/// assessment and the producer agree on ownership.
+pub(crate) const PROCEDURE_SYNTAX_ROLES:
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles =
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: js_ts_statement_kind,
+        loop_site: js_ts_loop_site,
+        loop_site_with_source: None,
+        procedure_matches: |_, node| callable_shape(node).is_some(),
+        nested_procedure: |node| node.kind() == "class_body" || callable_shape(node).is_some(),
+    };
+
+/// A `for` header without a condition spells it as `;` or an empty statement.
+fn js_ts_loop_site(
+    node: Node<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax<'_>> {
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopKind;
+
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax;
+    let kind = match node.kind() {
+        "while_statement" => LoopKind::While,
+        "for_statement" => LoopKind::For,
+        "do_statement" => LoopKind::Do,
+        _ => return None,
+    };
+    Some(LoopSyntax {
+        kind,
+        body: node.child_by_field_name("body"),
+        condition: node
+            .child_by_field_name("condition")
+            .filter(|condition| !matches!(condition.kind(), ";" | "empty_statement")),
+    })
+}
+
+/// Classify an executable JavaScript or TypeScript statement. Hoisted
+/// function declarations, type-only declarations and class declarations are
+/// excluded. A `var` without an initializer is excluded because only its
+/// hoisted binding exists; nothing runs at its position. A `for` header's
+/// initializer and condition are not statements, although the grammar spells
+/// them with statement nodes.
+fn js_ts_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "for_statement"
+        && parent
+            .child_by_field_name("body")
+            .is_none_or(|body| body.id() != node.id())
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "statement_block" => "block",
+        "expression_statement" => "expression",
+        "variable_declaration" => {
+            let mut cursor = node.walk();
+            let initialized = node
+                .named_children(&mut cursor)
+                .any(|declarator| declarator.child_by_field_name("value").is_some());
+            if !initialized {
+                return None;
+            }
+            "local_declaration"
+        }
+        "lexical_declaration" => "local_declaration",
+        "return_statement" => "return",
+        "throw_statement" => "throw",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "if_statement" => "if",
+        "while_statement" => "while",
+        "do_statement" => "do",
+        "for_statement" => "for",
+        "for_in_statement" => "for_in",
+        "switch_statement" => "switch",
+        "try_statement" => "try",
+        "with_statement" => "with",
+        "labeled_statement" => "labeled",
+        "debugger_statement" => "debugger",
+        "empty_statement" => "empty",
+        _ => return None,
+    })
+}

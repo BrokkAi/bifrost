@@ -29,7 +29,7 @@ fn axis(values: &[String], value: Option<&str>) -> bool {
 }
 enum VersionRange {
     Cargo(semver::VersionReq),
-    Npm(brokk_bifrost_analysis::analyzer::dependency_evidence::NpmVersionRange),
+    Npm(brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange),
 }
 /// Reuse the seed's strict ecosystem-specific version interpretation for a
 /// mitigation on this exact row. Unsupported evidence stays unknown.
@@ -41,7 +41,7 @@ pub(super) fn mitigation_version_predicate(
         .iter()
         .map(|requirement| match ecosystem {
             "npm" => VersionRange::Npm(
-                brokk_bifrost_analysis::analyzer::dependency_evidence::NpmVersionRange::parse(
+                brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange::parse(
                     requirement,
                 )
                 .expect("validated mitigation range"),
@@ -90,7 +90,7 @@ fn matches(
     for range in ranges {
         matched |= match range {
             VersionRange::Npm(range) => {
-                let value = brokk_bifrost_analysis::analyzer::dependency_evidence::npm_dependency_version_matches(row, range)
+                let value = brokk_bifrost_js_ts_analysis::dependency_evidence::npm_dependency_version_matches(row, range)
                     .map_err(|e| e.to_string())?;
                 let Some(value) = value else {
                     return Ok(None);
@@ -133,7 +133,7 @@ pub(super) fn execute_dependency_evidence_seed(
         .map(|range| {
             if seed.filter.ecosystems == ["npm"] {
                 VersionRange::Npm(
-                    brokk_bifrost_analysis::analyzer::dependency_evidence::NpmVersionRange::parse(
+                    brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange::parse(
                         range,
                     )
                     .expect("validated npm requirement"),

@@ -1119,58 +1119,253 @@ fn push_recovered_syntax_diagnostic(
     });
 }
 
-fn seed_constrains_comparison_pair_roles(seed: &CodeQuerySeed) -> bool {
-    let mut patterns = vec![&seed.root];
-    patterns.extend(seed.inside.iter());
-    patterns.extend(seed.inside_decl.iter());
-    patterns.extend(seed.not_inside.iter());
-    while let Some(pattern) = patterns.pop() {
-        let can_match_chain = pattern
-            .kinds
-            .iter()
-            .any(|kind| NormalizedKind::ComparisonChain.satisfies(*kind))
-            && !pattern
-                .not_kinds
-                .iter()
-                .any(|kind| NormalizedKind::ComparisonChain.satisfies(*kind));
-        if can_match_chain
-            && (pattern.left.is_some() || pattern.right.is_some() || pattern.operator.is_some())
-        {
-            return true;
-        }
-        patterns.extend(pattern.has.as_deref());
-        patterns.extend(pattern.local_value.as_deref());
-        patterns.extend(pattern.not_has.as_deref());
-        for &role in Role::single_target_roles() {
-            patterns.extend(pattern.single_role_pattern(role));
-        }
-        for &role in Role::list_target_roles() {
-            patterns.extend(pattern.list_role_patterns(role));
-        }
-        patterns.extend(pattern.kwargs.iter().map(|(_, nested)| nested));
+/// These domains never outlive one query. No persisted structural field or
+/// singular role is synthesized by this negative proof (#5964).
+pub(super) struct ComparisonChainOperators {
+    source: crate::analyzer::semantic::ContentIdentity,
+    domains: Option<HashMap<(usize, usize), Vec<Span>>>,
+}
+
+pub(super) fn collect_comparison_chain_operators(
+    facts: &FileFacts,
+    prepared: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
+    spec: &dyn brokk_bifrost_core::analyzer::structural::spec::StructuralSpec,
+    step: &mut dyn FnMut() -> bool,
+) -> Option<HashMap<(usize, usize), Vec<Span>>> {
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, try_walk_named_tree_preorder};
+
+    if !step() || prepared.source() != facts.source() || prepared.tree().root_node().has_error() {
+        return None;
     }
-    false
+    let mut wanted = HashMap::default();
+    for fact in facts.nodes() {
+        if !step() {
+            return None;
+        }
+        if fact.kind == NormalizedKind::ComparisonChain {
+            wanted.insert((fact.range.start_byte, fact.range.end_byte), fact.range);
+        }
+    }
+    let mut domains = HashMap::default();
+    try_walk_named_tree_preorder(prepared.tree().root_node(), true, |node| {
+        if !step() {
+            return Err(());
+        }
+        let range = (node.start_byte(), node.end_byte());
+        if let Some(expected) = wanted.get(&range) {
+            if *expected
+                != brokk_bifrost_core::analyzer::structural::adapter_helpers::node_range(node)
+            {
+                return Err(());
+            }
+            let operators = spec.comparison_operator_spans(node, step).ok_or(())?;
+            if operators.len() < 2 {
+                return Err(());
+            }
+            let mut previous_end = range.0;
+            for operator in &operators {
+                if !step()
+                    || operator.start_byte < previous_end
+                    || operator.start_byte >= operator.end_byte
+                    || operator.end_byte > range.1
+                    || facts
+                        .source()
+                        .get(operator.start_byte..operator.end_byte)
+                        .is_none()
+                {
+                    return Err(());
+                }
+                previous_end = operator.end_byte;
+            }
+            if !step() {
+                return Err(());
+            }
+            domains.insert(range, operators);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .ok()?;
+    (step() && !wanted.is_empty() && domains.len() == wanted.len()).then_some(domains)
 }
 
 fn push_comparison_chain_roles_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     seed: &CodeQuerySeed,
-    language: Language,
     file: &ProjectFile,
     facts: &FileFacts,
-) {
-    if language != Language::Python || !seed_constrains_comparison_pair_roles(seed) {
-        return;
+    provider: &dyn StructuralFactProvider,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+) -> SeedFileScanStatus {
+    let language = provider.structural_language();
+    if language != Language::Python {
+        return SeedFileScanStatus::Scanned;
     }
-    let ranges = facts
-        .nodes()
-        .iter()
-        .filter(|node| node.kind == NormalizedKind::ComparisonChain)
-        .map(|node| (node.range.start_byte, node.range.end_byte))
-        .collect::<Vec<_>>();
+    let mut stop = SeedFileScanStatus::Scanned;
+    let Some(demands) = ({
+        // The demand inventory walks the compiled query pattern, never
+        // source facts, so it must not charge fact_nodes: charging it would
+        // tax every comparison-free Python query with pattern-compilation
+        // overhead. Cancellation stays responsive through the walk.
+        let mut inventory_step = || {
+            if !matches!(stop, SeedFileScanStatus::Scanned) {
+                return false;
+            }
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                stop = SeedFileScanStatus::Cancelled;
+                return false;
+            }
+            true
+        };
+        super::super::planner::comparison_chain_role_demands(seed, &mut inventory_step)
+    }) else {
+        return stop;
+    };
+    if demands.is_empty() {
+        return SeedFileScanStatus::Scanned;
+    }
+    let mut step = || {
+        if !matches!(stop, SeedFileScanStatus::Scanned) {
+            return false;
+        }
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            stop = SeedFileScanStatus::Cancelled;
+            return false;
+        }
+        let mut projected = state.budget;
+        projected.fact_nodes = projected.fact_nodes.saturating_add(1);
+        if let Some(lease) = &state.parallel_seed_budget {
+            match lease.admit(projected) {
+                FairSeedBudgetAdmission::Admitted => {}
+                FairSeedBudgetAdmission::Rejected(global) => {
+                    push_budget_diagnostic(diagnostics, &global);
+                    stop = SeedFileScanStatus::BudgetExhausted;
+                    return false;
+                }
+                FairSeedBudgetAdmission::Cancelled => {
+                    stop = SeedFileScanStatus::Cancelled;
+                    return false;
+                }
+            }
+        } else if projected
+            .fact_nodes
+            .saturating_add(projected.examined_references)
+            > limits.max_fact_nodes
+        {
+            push_budget_diagnostic(diagnostics, &projected);
+            stop = SeedFileScanStatus::BudgetExhausted;
+            return false;
+        }
+        state.budget.fact_nodes = projected.fact_nodes;
+        true
+    };
+    // Demand collection is a necessary-condition analysis only. An opaque
+    // occurrence prevents discharge, including Boolean and negative contexts.
+    let domains = if demands.iter().all(Option::is_some) {
+        if !step() {
+            return stop;
+        }
+        let cached = state
+            .comparison_chain_operators
+            .get(file)
+            .filter(|cached| cached.source == facts.source_identity())
+            .cloned();
+        match cached {
+            Some(cached) => Some(cached),
+            None => {
+                let domains = match provider.structural_syntax_limited(
+                    file,
+                    facts.source().len(),
+                    state.cancellation,
+                ) {
+                    super::super::provider::StructuralSyntaxLimitedOutcome::Available(syntax) => {
+                        brokk_bifrost_analysis::analyzer::structural_spec_for(language).and_then(
+                            |spec| {
+                                collect_comparison_chain_operators(
+                                    facts,
+                                    syntax.prepared(),
+                                    spec,
+                                    &mut step,
+                                )
+                            },
+                        )
+                    }
+                    super::super::provider::StructuralSyntaxLimitedOutcome::Exceeded { .. }
+                    | super::super::provider::StructuralSyntaxLimitedOutcome::Unavailable => None,
+                    super::super::provider::StructuralSyntaxLimitedOutcome::Cancelled => {
+                        return SeedFileScanStatus::Cancelled;
+                    }
+                };
+                if !step() {
+                    return stop;
+                }
+                let cached = Arc::new(ComparisonChainOperators {
+                    source: facts.source_identity(),
+                    domains,
+                });
+                state
+                    .comparison_chain_operators
+                    .insert(file.clone(), Arc::clone(&cached));
+                Some(cached)
+            }
+        }
+    } else {
+        None
+    };
+    let mut ranges = Vec::new();
+    for fact in facts.nodes() {
+        if !step() {
+            return stop;
+        }
+        if fact.kind != NormalizedKind::ComparisonChain {
+            continue;
+        }
+        let range = (fact.range.start_byte, fact.range.end_byte);
+        let operators = domains
+            .as_ref()
+            .and_then(|cached| cached.domains.as_ref())
+            .and_then(|domains| domains.get(&range));
+        let mut impossible = operators.is_some();
+        for demand in &demands {
+            let Some(demand) = demand else {
+                impossible = false;
+                break;
+            };
+            let Some(operators) = operators else {
+                impossible = false;
+                break;
+            };
+            for operator in operators {
+                if !step() {
+                    return stop;
+                }
+                let text = operator.text(facts.source());
+                if demand.name_text_matches(Some(text), text) {
+                    impossible = false;
+                    break;
+                }
+            }
+            if !impossible {
+                break;
+            }
+        }
+        if !impossible {
+            ranges.push(range);
+        }
+    }
+    if !step() {
+        return stop;
+    }
     if ranges.is_empty() {
-        return;
+        return SeedFileScanStatus::Scanned;
     }
+    // No matcher or capture state was evaluated by this negative proof.
     diagnostics.push(CodeQueryDiagnostic {
         source: None,
         code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
@@ -1184,6 +1379,7 @@ fn push_comparison_chain_roles_diagnostic(
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
     });
+    SeedFileScanStatus::Scanned
 }
 
 pub(super) fn execute_seed(
@@ -1334,7 +1530,7 @@ pub(super) fn execute_seed(
                 index.file_count(),
                 None,
                 &plan,
-                language != Language::Rust,
+                !super::relations::declaration_owner_may_be_non_lexical(language),
                 state,
                 Some(index),
             );
@@ -1377,7 +1573,7 @@ pub(super) fn execute_seed(
                 provider_file_count,
                 Some(&files),
                 &plan,
-                language != Language::Rust,
+                !super::relations::declaration_owner_may_be_non_lexical(language),
                 state,
                 None,
             )
@@ -1443,11 +1639,14 @@ pub(super) fn execute_seed(
                 pipeline_halted: false,
             };
         }
-        // A Rust impl member can be owned by a type declaration in another
-        // file, so the owner's `inside_decl` name is not a sound source anchor
-        // for the member file. Other adapters retain lexical declaration
-        // containment and keep the stronger prefilter.
-        let source_index = plan.build_source_index(language != Language::Rust);
+        // A Rust impl member or an out-of-line C++ member can be owned by a
+        // type declaration in another file, so the owner's `inside_decl` name
+        // is not a sound source anchor for the member file. Other adapters
+        // retain lexical declaration containment and keep the stronger
+        // prefilter.
+        let source_index = plan.build_source_index(
+            !super::relations::declaration_owner_may_be_non_lexical(language),
+        );
         let indexed_file = access.index_file(&file);
         let source_definitely_absent = source_index.requires_source()
             && access.source_may_contain(&file, source_index.required_anchors()) == Some(false);
@@ -1739,7 +1938,23 @@ pub(super) fn execute_seed(
                 loaded
             }
         };
-        push_comparison_chain_roles_diagnostic(diagnostics, seed, language, &file, &facts);
+        match push_comparison_chain_roles_diagnostic(
+            diagnostics,
+            seed,
+            &file,
+            &facts,
+            provider,
+            state,
+            limits,
+        ) {
+            SeedFileScanStatus::Scanned => {}
+            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
+            SeedFileScanStatus::BudgetExhausted => {
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                break;
+            }
+        }
         let remaining = if has_custom_rule {
             facts.nodes().len()
         } else {
@@ -1817,8 +2032,11 @@ pub(super) fn execute_seed(
         let oracle = signature_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn super::super::matcher::CallableSignatureOracle);
-        let owner_oracle = (language == Language::Rust && seed.inside_decl.is_some())
-            .then(|| super::relations::RustDeclarationOwnerOracle::for_file(state.analyzer, &file));
+        let owner_oracle = (super::relations::declaration_owner_may_be_non_lexical(language)
+            && seed.inside_decl.is_some())
+        .then(|| {
+            super::relations::NonLexicalDeclarationOwnerOracle::for_file(state.analyzer, &file)
+        });
         let owner_oracle = owner_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn super::super::matcher::DeclarationOwnerOracle);
@@ -2075,6 +2293,7 @@ pub(super) fn execute_seed(
             PipelineRow {
                 value: PipelineValue::StructuralMatch(Arc::clone(&seed)),
                 traces: vec![PipelineTrace {
+                    window_order: None,
                     branch: Vec::new(),
                     seed,
                     steps: Vec::new(),

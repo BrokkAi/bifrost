@@ -24,10 +24,9 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
     CandidateCoverage, ClassIdentity, DeclarationSegmentKind, ExactResultProducer, IcfgProvider,
     IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemberAccessKind, MemberDeclaration,
-    ProcedureHandle, SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot,
-    SemanticIrVersion, SemanticWork, SourceMappingKind, SourceSiteKind, SourceSpan, StableDigest,
-    TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider, WorkspaceRelativePath,
-    type_flow_adapter,
+    ProcedureHandle, SemanticBudget, SemanticBudgetDimension, SemanticIrVersion, SemanticWork,
+    SourceMappingKind, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
+    WorkspaceIcfgProvider, WorkspaceRelativePath, type_flow_adapter,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
@@ -41,7 +40,7 @@ use brokk_bifrost_analysis::analyzer::store::class_set_root_results::{
 };
 use brokk_bifrost_flow::dataflow::{
     DataflowDirectionRequest, DataflowQueryPlanConfig, DataflowRequest, SolverBudget,
-    SolverBudgetDimension, SummaryWitness, SummaryWitnessError,
+    SolverBudgetDimension, SummaryWitnessError,
 };
 use brokk_bifrost_flow::flow_state::procedure_public_digest;
 use brokk_bifrost_flow::type_flow::{
@@ -125,11 +124,6 @@ pub(super) struct ReceiverDispatchQuery<'a> {
 #[derive(Clone)]
 struct QueryFieldSlots {
     index: Arc<FieldSlotIndex>,
-    /// Paid artifact identities from the independently bounded workspace
-    /// prepass and every root solved since it. The query-wide scalar ledger
-    /// can be narrower than that prepass and reject its aggregate charge; root
-    /// children still must not pay those same artifact censuses again.
-    semantic_scope: SemanticBudgetScopeSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +156,17 @@ pub(super) struct TypeFlowQueryState {
     witness_render_cache: super::PipelineRenderCache,
 }
 
+impl Drop for TypeFlowQueryState {
+    fn drop(&mut self) {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "type_flow.query.run_end value_flow_cached_artifact_bytes={}",
+                self.value_flow_cache.artifact_bytes()
+            )
+        });
+    }
+}
+
 impl Default for TypeFlowQueryState {
     fn default() -> Self {
         Self::new(ValueFlowCache::default(), Default::default())
@@ -169,6 +174,10 @@ impl Default for TypeFlowQueryState {
 }
 
 impl TypeFlowQueryState {
+    pub(super) fn release_file_window(&mut self) {
+        self.cache.clear();
+    }
+
     pub(super) fn new(
         value_flow_cache: ValueFlowCache,
         summary_state: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
@@ -252,7 +261,8 @@ pub(super) struct AbsentMemberRootEvidence {
     /// introduced the class.
     pub(super) origin_is_guard: bool,
     pub(super) caller: String,
-    pub(super) witness: Result<SummaryWitness, SummaryWitnessError>,
+    pub(super) witness:
+        Result<super::witness_projection::ProjectedSummaryWitness, SummaryWitnessError>,
 }
 
 #[derive(Debug, Clone)]
@@ -608,7 +618,7 @@ impl TypeFlowQueryState {
                 unreachable!("failed type-flow cache entries return None")
             }
         };
-        let caller = procedure_name(&result.root);
+        let caller = procedure_name(&procedure.handle);
         let mut rows: Vec<AbsentMemberFindingValue> = Vec::new();
         let mut seen: crate::hash::HashMap<_, usize> = crate::hash::HashMap::default();
         for finding in &result.findings {
@@ -647,7 +657,18 @@ impl TypeFlowQueryState {
                     also_fails_at: finding.also_fails_at.clone(),
                     origin_is_guard: finding.origin.kind == SourceSiteKind::NarrowingGuard,
                     caller: caller.clone(),
-                    witness: finding.witness.clone(),
+                    witness: finding
+                        .witness
+                        .as_ref()
+                        .map(|witness| {
+                            super::witness_projection::ProjectedSummaryWitness::new(
+                                workspace,
+                                witness,
+                                limits.max_witness_steps,
+                                limits.max_witness_bytes,
+                            )
+                        })
+                        .map_err(Clone::clone),
                 }],
             };
             if let Some(index) = seen.get(&key).copied() {
@@ -844,21 +865,11 @@ impl TypeFlowQueryState {
                         cancellation,
                     )
                 };
-                // Capture the paid identities before consuming the child
-                // charge. Applying its scalar work below can fail when the
-                // query's aggregate accounting limit is intentionally smaller
-                // than this independently bounded whole-workspace prepass.
-                let field_slot_scope = field_slot_budget.scope_snapshot();
-                if semantic_budget
-                    .apply_child_charge(
-                        SemanticWork::default(),
-                        field_slot_budget.into_child_charge(),
-                    )
-                    .is_err()
-                {
-                    // Query-wide accounting only; later roots keep their own
-                    // child budgets, matching the root-solve contract below.
-                }
+                // The prepass has finished using its procedure handles. Keep
+                // cumulative work and peaks, but release its admissions before
+                // folding the independently bounded child into the query.
+                field_slot_budget.release_resident();
+                semantic_budget.absorb_root_work(field_slot_budget);
                 match acquired {
                     Ok(acquired) => {
                         match acquired.kind {
@@ -904,6 +915,13 @@ impl TypeFlowQueryState {
                                 self.work.field_slot_publications.saturating_add(1);
                         }
                         let index = acquired.index;
+                        for refusal in index.source_refusals() {
+                            push_deduplicated_diagnostic(
+                                &mut self.diagnostics,
+                                CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                refusal.to_string(),
+                            );
+                        }
                         if index.semantic_budget_exhausted() {
                             self.semantic_budget_exhausted = true;
                             let detail = index.semantic_budget_exhaustion().map_or_else(
@@ -919,10 +937,7 @@ impl TypeFlowQueryState {
                                 ),
                             );
                         }
-                        let cached = QueryFieldSlots {
-                            index,
-                            semantic_scope: field_slot_scope,
-                        };
+                        let cached = QueryFieldSlots { index };
                         self.field_slots
                             .insert(field_slot_key.clone(), Some(cached.clone()));
                         cached
@@ -1034,14 +1049,11 @@ impl TypeFlowQueryState {
                 self.work.solves = self.work.solves.saturating_add(1);
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
-                // Each root solves against its own child of the query's
-                // semantic budget: the child inherits the artifact identities
-                // the query already paid but starts its scalar ledger at
-                // zero, so one root cannot starve the next.
-                let mut child_budget = SemanticBudget::new_child(
-                    semantic_budget.limits(),
-                    &query_field_slots.semantic_scope,
-                );
+                // Root work starts at zero, while its resident bound includes
+                // the parent's current file, which coexists with its callees.
+                // Historical admissions from the prepass or earlier roots do
+                // not make these new callee admissions free.
+                let mut child_budget = SemanticBudget::new_root_child(semantic_budget);
                 let outcome = solve_type_flow_for_root_with_refinements(
                     workspace,
                     adapter,
@@ -1056,34 +1068,14 @@ impl TypeFlowQueryState {
                     &mut request,
                     &mut self.refinements,
                 );
-                // A later root inherits both the workspace census paid by the
-                // prepass and any additional complete artifacts paid here,
-                // even if the query-wide scalar accounting fold is saturated.
-                let root_scope = child_budget.scope_snapshot();
-                // Fold the root's spend back into the query-wide ledger so
-                // later roots inherit the artifact identities this root paid
-                // (the child's charge carries them) and the profile's work
-                // counters keep measuring the query's real semantic spend.
-                // When the per-query aggregate is already saturated the
-                // apply is refused atomically: that ceiling is accounting
-                // only, and must NOT become `semantic_budget_exhausted` --
-                // the pipeline stops a step's remaining rows once that flag
-                // is set, which is exactly the starvation this child ledger
-                // exists to remove. A later root's child starts at zero
-                // either way, and a genuine refusal of the query's own
-                // direct spend is still reported by the shared budget's own
-                // paths.
-                if semantic_budget
-                    .apply_child_charge(SemanticWork::default(), child_budget.into_child_charge())
-                    .is_err()
-                {
-                    // Accounting-only ceiling saturated; see above.
-                }
+                // Callee handles are local to the completed root solve.
+                // Fold performed work and its peak into the parent without
+                // importing those now-released resident admissions.
+                semantic_budget.absorb_root_work(child_budget);
                 self.field_slots.insert(
                     field_slot_key,
                     Some(QueryFieldSlots {
                         index: Arc::clone(&field_slots),
-                        semantic_scope: root_scope,
                     }),
                 );
                 match outcome {
@@ -1220,16 +1212,15 @@ impl TypeFlowQueryState {
         if current_workspace.as_bytes() != &key.generation.workspace_content_digest {
             return RootResultPublicationOutcome::Continued;
         }
-        let attachment =
-            match workspace.semantic_artifact_store_attachment(result.root.artifact().key()) {
-                Ok(Some(attachment)) => attachment,
-                Ok(None) => return RootResultPublicationOutcome::Continued,
-                Err(_) => {
-                    self.work.root_result_store_failures =
-                        self.work.root_result_store_failures.saturating_add(1);
-                    return RootResultPublicationOutcome::Continued;
-                }
-            };
+        let attachment = match workspace.semantic_artifact_store_attachment(&result.root.key) {
+            Ok(Some(attachment)) => attachment,
+            Ok(None) => return RootResultPublicationOutcome::Continued,
+            Err(_) => {
+                self.work.root_result_store_failures =
+                    self.work.root_result_store_failures.saturating_add(1);
+                return RootResultPublicationOutcome::Continued;
+            }
+        };
         if projected.len() > limits.max_retained_relations {
             return RootResultPublicationOutcome::Continued;
         }
@@ -1373,6 +1364,8 @@ fn root_result_persistence_key(
     if workspace.store().is_none_or(|store| store.is_ephemeral()) {
         return None;
     }
+    let owner_storage_language_key =
+        workspace.semantic_artifact_storage_language_key(root.artifact().key())?;
     let workspace_content = workspace.analyzer().workspace_content_identity()?;
     let active_pack = active_semantic_model_pack_digest(active_semantic_model_snapshot);
     let semantics = root_result_semantics_digest(adapter, limits, semantic_limits);
@@ -1387,6 +1380,7 @@ fn root_result_persistence_key(
             representation_version: ROOT_RESULT_REPRESENTATION_VERSION,
         },
         root_public_digest: *procedure_public_digest(root).as_bytes(),
+        owner_storage_language_key,
     })
 }
 
@@ -1438,7 +1432,7 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v16";
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v17";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -1466,7 +1460,7 @@ fn receiver_site_matches_call(set: &ReceiverClassSet, range: Range) -> bool {
 }
 
 fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
-    let root_procedure_id = procedure_public_digest(&result.root).to_string();
+    let root_procedure_id = result.root.public_digest().to_string();
     // A call-shaped access `x.foo()` legitimately produces a Call sink and a
     // Load sink at the same durable identity (file, span, member). The row
     // surface answers one row per (member access site, atom), so merge those
@@ -2039,6 +2033,7 @@ mod tests {
 
     fn absent_finding(
         project: &BuiltInlineTestProject,
+        workspace: &WorkspaceAnalyzer,
         id: &str,
         witness: Result<SummaryWitness, SummaryWitnessError>,
     ) -> AbsentMemberFindingValue {
@@ -2070,7 +2065,14 @@ mod tests {
                 also_fails_at: Vec::new(),
                 origin_is_guard: false,
                 caller: "root".to_owned(),
-                witness,
+                witness: witness.map(|witness| {
+                    super::super::witness_projection::ProjectedSummaryWitness::new(
+                        workspace,
+                        &witness,
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                }),
             }],
         }
     }
@@ -2088,7 +2090,7 @@ mod tests {
     #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v16",
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v17",
             "a root cached as finding-free before the conditional absent-member tier may now carry a conditional finding"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");
@@ -2123,7 +2125,7 @@ mod tests {
         let (project, workspace, root) = witness_workspace();
         let unavailable = solve_witness(&workspace, &root, WitnessRetentionLimits::disabled(), 0);
         assert_eq!(unavailable, Err(SummaryWitnessError::RetentionDisabled));
-        let finding = absent_finding(&project, "finding-unavailable", unavailable);
+        let finding = absent_finding(&project, &workspace, "finding-unavailable", unavailable);
 
         let mut state = TypeFlowQueryState::default();
         let rows = state.absent_member_witnesses(
@@ -2169,7 +2171,7 @@ mod tests {
         .expect("best-effort retention returns a typed marker");
         assert!(marker.retention_truncated());
         assert!(marker.steps().is_empty());
-        let finding = absent_finding(&project, "finding-marker", Ok(marker));
+        let finding = absent_finding(&project, &workspace, "finding-marker", Ok(marker));
 
         let mut state = TypeFlowQueryState::default();
         let rows = state.absent_member_witnesses(
@@ -2220,7 +2222,8 @@ mod tests {
                 max_bytes: Some(0),
             },
         ] {
-            let finding = absent_finding(&project, "finding-zero", Ok(retained.clone()));
+            let finding =
+                absent_finding(&project, &workspace, "finding-zero", Ok(retained.clone()));
             let mut state = TypeFlowQueryState::default();
             let rows = state.absent_member_witnesses(
                 &workspace,
@@ -2258,7 +2261,7 @@ mod tests {
             max_witnesses: 1,
             ..CodeQueryValueFlowLimits::default()
         };
-        let finding = absent_finding(&project, "finding-cached", Ok(retained.clone()));
+        let finding = absent_finding(&project, &workspace, "finding-cached", Ok(retained.clone()));
         let mut state = TypeFlowQueryState::default();
 
         let first = state.absent_member_witnesses(
@@ -2291,7 +2294,12 @@ mod tests {
             max_witnesses: 2,
             ..CodeQueryValueFlowLimits::default()
         };
-        let request_finding = absent_finding(&project, "finding-request", Ok(retained.clone()));
+        let request_finding = absent_finding(
+            &project,
+            &workspace,
+            "finding-request",
+            Ok(retained.clone()),
+        );
         let mut request_state = TypeFlowQueryState::default();
         let zero_bytes = request_state.absent_member_witnesses(
             &workspace,
@@ -2334,8 +2342,12 @@ mod tests {
             1
         );
 
-        let mut distinct_roots =
-            absent_finding(&project, "finding-distinct-roots", Ok(retained.clone()));
+        let mut distinct_roots = absent_finding(
+            &project,
+            &workspace,
+            "finding-distinct-roots",
+            Ok(retained.clone()),
+        );
         let mut second_root = distinct_roots.roots[0].clone();
         second_root.root_procedure_id = "other-root".to_owned();
         distinct_roots.roots.push(second_root);
@@ -2377,7 +2389,7 @@ mod tests {
         .expect("strict retention keeps the fixture witness");
         assert!(retained.work().evidence_expansions() > 0);
 
-        let probe = absent_finding(&project, "finding-probe", Ok(retained.clone()));
+        let probe = absent_finding(&project, &workspace, "finding-probe", Ok(retained.clone()));
         let mut probe_state = TypeFlowQueryState::default();
         let probe_row = probe_state.absent_member_witnesses(
             &workspace,
@@ -2397,9 +2409,9 @@ mod tests {
             ..CodeQueryValueFlowLimits::default()
         };
         let mut state = TypeFlowQueryState::default();
-        let first = absent_finding(&project, "finding-one", Ok(retained.clone()));
-        let second = absent_finding(&project, "finding-two", Ok(retained.clone()));
-        let third = absent_finding(&project, "finding-three", Ok(retained));
+        let first = absent_finding(&project, &workspace, "finding-one", Ok(retained.clone()));
+        let second = absent_finding(&project, &workspace, "finding-two", Ok(retained.clone()));
+        let third = absent_finding(&project, &workspace, "finding-three", Ok(retained));
         assert_eq!(
             state
                 .absent_member_witnesses(

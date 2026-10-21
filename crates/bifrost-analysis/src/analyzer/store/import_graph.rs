@@ -434,19 +434,22 @@ pub(crate) fn insert_edge_pairs_sql(pair_count: usize) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceImportDirection {
+#[doc(hidden)]
+pub enum WorkspaceImportDirection {
     Forward,
     Reverse,
 }
 
 #[derive(Debug)]
-pub(crate) struct WorkspaceImportGraphRead {
+#[doc(hidden)]
+pub struct WorkspaceImportGraphRead {
     pub edges: Vec<(String, String)>,
     pub exhausted: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WorkspaceImportGraphSource {
+#[doc(hidden)]
+pub struct WorkspaceImportGraphSource {
     pub source_path: String,
     pub source_identity: [u8; 32],
     pub module_path_keys: Vec<String>,
@@ -458,7 +461,8 @@ pub(crate) struct WorkspaceImportGraphSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct WorkspaceImportGraphBinding {
+#[doc(hidden)]
+pub struct WorkspaceImportGraphBinding {
     pub module_path: String,
     pub name: String,
     pub namespace: String,
@@ -471,9 +475,8 @@ pub(crate) struct WorkspaceImportGraphBinding {
 }
 
 impl WorkspaceImportGraphBinding {
-    pub(crate) fn from_provider_surface(
-        binding: crate::analyzer::ImportGraphBindingSurface,
-    ) -> Vec<Self> {
+    #[doc(hidden)]
+    pub fn from_provider_surface(binding: crate::analyzer::ImportGraphBindingSurface) -> Vec<Self> {
         let route_paths = binding
             .route_files
             .iter()
@@ -501,7 +504,8 @@ impl WorkspaceImportGraphBinding {
 }
 
 #[derive(Debug)]
-pub(crate) struct WorkspaceImportGraphEdge {
+#[doc(hidden)]
+pub struct WorkspaceImportGraphEdge {
     pub importer_path: String,
     pub import_ordinal: u32,
     pub target_path: String,
@@ -510,14 +514,16 @@ pub(crate) struct WorkspaceImportGraphEdge {
 }
 
 #[derive(Debug)]
-pub(crate) struct WorkspaceImportGraphDependencies {
+#[doc(hidden)]
+pub struct WorkspaceImportGraphDependencies {
     pub importer_path: String,
     pub lookups: Vec<(u32, String, String)>,
     pub missing_module_path_keys: Vec<(u32, String)>,
 }
 
 #[derive(Debug)]
-pub(crate) struct WorkspaceImportGraphRefreshPlan {
+#[doc(hidden)]
+pub struct WorkspaceImportGraphRefreshPlan {
     pub current: bool,
     pub full_rebuild: bool,
     pub previous_identity: Option<[u8; 32]>,
@@ -621,7 +627,8 @@ impl AnalyzerStore {
         })
     }
 
-    pub(crate) fn plan_workspace_import_graph_refresh(
+    #[doc(hidden)]
+    pub fn plan_workspace_import_graph_refresh(
         &self,
         workspace_id: &WorkspaceId,
         content_identity: &[u8; 32],
@@ -1202,7 +1209,8 @@ impl AnalyzerStore {
 
     // Keep the snapshot identity, plan, and provider rows explicit at the store boundary.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn publish_workspace_import_graph_refresh(
+    #[doc(hidden)]
+    pub fn publish_workspace_import_graph_refresh(
         &self,
         workspace_id: &WorkspaceId,
         content_identity: &[u8; 32],
@@ -1801,7 +1809,8 @@ impl AnalyzerStore {
         })
     }
 
-    pub(crate) fn read_workspace_import_graph(
+    #[doc(hidden)]
+    pub fn read_workspace_import_graph(
         &self,
         workspace_id: &WorkspaceId,
         content_identity: &[u8; 32],
@@ -1911,20 +1920,10 @@ impl AnalyzerStore {
 
 #[cfg(test)]
 mod tests {
+    use super::rust_tests_test_support::*;
     use super::*;
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
     use rusqlite::{Connection, params};
-
-    fn source(path: &str, identity: u8) -> WorkspaceImportGraphSource {
-        WorkspaceImportGraphSource {
-            source_path: path.to_owned(),
-            source_identity: [identity; 32],
-            module_path_keys: Vec::new(),
-            complete_resolution_dependencies: true,
-            input_digests: None,
-            binding_surface: None,
-        }
-    }
 
     fn source_with_module(
         path: &str,
@@ -1964,25 +1963,6 @@ mod tests {
             complete_resolution_dependencies: false,
             input_digests: None,
             binding_surface: None,
-        }
-    }
-
-    fn edge(importer: &str, target: &str, dependencies: &[&str]) -> WorkspaceImportGraphEdge {
-        edge_with_ordinal(importer, 0, target, dependencies)
-    }
-
-    fn edge_with_ordinal(
-        importer: &str,
-        import_ordinal: u32,
-        target: &str,
-        dependencies: &[&str],
-    ) -> WorkspaceImportGraphEdge {
-        WorkspaceImportGraphEdge {
-            importer_path: importer.to_owned(),
-            import_ordinal,
-            target_path: target.to_owned(),
-            provenance_json: "[{\"kind\":\"test_import\"}]".to_owned(),
-            route_dependencies: dependencies.iter().map(|path| (*path).to_owned()).collect(),
         }
     }
 
@@ -2110,33 +2090,6 @@ mod tests {
         );
     }
 
-    fn publish_initial_with_dependencies(
-        store: &AnalyzerStore,
-        workspace_id: &WorkspaceId,
-        identity: &[u8; 32],
-        resolver_identity: &[u8; 32],
-        sources: &[WorkspaceImportGraphSource],
-        edges: &[WorkspaceImportGraphEdge],
-        dependencies: &[WorkspaceImportGraphDependencies],
-    ) {
-        let plan = store
-            .plan_workspace_import_graph_refresh(workspace_id, identity, resolver_identity, sources)
-            .expect("plan initial graph");
-        assert!(plan.full_rebuild);
-        store
-            .publish_workspace_import_graph_refresh(
-                workspace_id,
-                identity,
-                resolver_identity,
-                &plan,
-                sources.len(),
-                sources,
-                edges,
-                dependencies,
-            )
-            .expect("publish initial graph");
-    }
-
     #[test]
     fn edge_fact_publication_counter_excludes_unchanged_rows() {
         let store = AnalyzerStore::open_ephemeral().expect("edge fact delta store");
@@ -2252,421 +2205,6 @@ mod tests {
             )
             .expect("read updated edge provenance");
         assert_eq!(changed_provenance, "[{\"kind\":\"changed_provenance\"}]");
-    }
-
-    fn rust_graph_sources(
-        analyzer: &crate::analyzer::RustAnalyzer,
-        files: &[crate::analyzer::ProjectFile],
-    ) -> Vec<WorkspaceImportGraphSource> {
-        use crate::analyzer::IAnalyzer;
-
-        let provider = analyzer
-            .import_analysis_provider()
-            .expect("Rust analyzer exposes import graph facts");
-        let mut module_path_keys = provider
-            .import_graph_module_path_keys_for_files(files)
-            .expect("Rust module keys are available for every fixture source");
-        let mut binding_surfaces = provider
-            .import_graph_binding_surfaces_for_files(files, None)
-            .expect("Rust binding surfaces are available for every fixture source");
-        files
-            .iter()
-            .map(|file| {
-                let contents = std::fs::read(file.abs_path()).expect("read Rust source identity");
-                let mut hasher = CanonicalHasher::new(b"test-rust-import-source:v1");
-                hasher.field("path", crate::path_utils::rel_path_string(file).as_bytes());
-                hasher.field("contents", &contents);
-                let binding_surface = binding_surfaces
-                    .remove(file)
-                    .expect("Rust provider returns binding surfaces for every source")
-                    .into_iter()
-                    .flat_map(WorkspaceImportGraphBinding::from_provider_surface)
-                    .collect();
-                WorkspaceImportGraphSource {
-                    source_path: crate::path_utils::rel_path_string(file),
-                    source_identity: hasher.finish(),
-                    module_path_keys: module_path_keys
-                        .remove(file)
-                        .expect("Rust provider returns module keys for every source"),
-                    complete_resolution_dependencies: true,
-                    input_digests: None,
-                    binding_surface: Some(binding_surface),
-                }
-            })
-            .collect()
-    }
-
-    fn rust_graph_facts(
-        analyzer: &crate::analyzer::RustAnalyzer,
-        files: &[crate::analyzer::ProjectFile],
-        selected_ordinals: Option<&crate::hash::HashMap<crate::analyzer::ProjectFile, Vec<u32>>>,
-    ) -> crate::analyzer::structural::derived_cache::RequestLocalDirectImportGraph {
-        use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-        use crate::cancellation::CancellationToken;
-
-        let analyzed_files = brokk_bifrost_core::analyzer::CodeUnitIndex::analyzed_files(analyzer);
-        let mut graph =
-            crate::analyzer::structural::derived_cache::RequestLocalDirectImportGraph::from_files(
-                analyzed_files,
-            );
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let cancellation = CancellationToken::default();
-        let exhausted = if let Some(selected_ordinals) = selected_ordinals {
-            graph.ensure_forward_selected(
-                analyzer,
-                scope.token(),
-                files,
-                selected_ordinals,
-                files.len().saturating_add(1),
-                10_000,
-                Some(&cancellation),
-            )
-        } else {
-            graph.ensure_complete(
-                analyzer,
-                scope.token(),
-                files.len().saturating_add(1),
-                10_000,
-                Some(&cancellation),
-            )
-        };
-        assert!(!exhausted, "Rust import graph work fits the test limits");
-        graph
-    }
-
-    fn store_facts_from_request_graph(
-        graph: &crate::analyzer::structural::derived_cache::RequestLocalDirectImportGraph,
-    ) -> (
-        Vec<WorkspaceImportGraphEdge>,
-        Vec<WorkspaceImportGraphDependencies>,
-    ) {
-        let edges = graph
-            .persisted_edges()
-            .into_iter()
-            .map(|edge| WorkspaceImportGraphEdge {
-                importer_path: crate::path_utils::rel_path_string(&edge.importer),
-                import_ordinal: edge.import_ordinal,
-                target_path: crate::path_utils::rel_path_string(&edge.target),
-                provenance_json: edge.provenance_json,
-                route_dependencies: edge.route_dependencies,
-            })
-            .collect();
-        let dependencies = graph
-            .persisted_resolution_dependencies()
-            .into_iter()
-            .map(|dependency| WorkspaceImportGraphDependencies {
-                importer_path: crate::path_utils::rel_path_string(&dependency.importer),
-                lookups: dependency
-                    .facts
-                    .lookups
-                    .into_iter()
-                    .map(|lookup| {
-                        (
-                            lookup.import_ordinal,
-                            crate::path_utils::rel_path_string(&lookup.consulted_file),
-                            lookup.name,
-                        )
-                    })
-                    .collect(),
-                missing_module_path_keys: dependency.facts.missing_module_path_keys,
-            })
-            .collect();
-        (edges, dependencies)
-    }
-
-    fn stored_adjacency(
-        store: &AnalyzerStore,
-        workspace_id: &WorkspaceId,
-        identity: &[u8; 32],
-        sources: &[WorkspaceImportGraphSource],
-    ) -> Vec<(String, String)> {
-        store
-            .read_workspace_import_graph(
-                workspace_id,
-                identity,
-                WorkspaceImportDirection::Forward,
-                &sources
-                    .iter()
-                    .map(|source| source.source_path.clone())
-                    .collect::<Vec<_>>(),
-                10_000,
-            )
-            .expect("read stored Rust graph")
-            .expect("graph identity is current")
-            .edges
-    }
-
-    type StoredFactRow = (String, i64, String, String);
-    type StoredImportGraphFacts = (
-        Vec<StoredFactRow>,
-        Vec<StoredFactRow>,
-        Vec<StoredFactRow>,
-        Vec<(String, i64, String)>,
-    );
-
-    fn stored_import_graph_facts(
-        store: &AnalyzerStore,
-        workspace_id: &WorkspaceId,
-    ) -> StoredImportGraphFacts {
-        let connection = store.read_conn().expect("read stored import graph facts");
-        let edges = connection
-            .prepare(
-                "SELECT importer_path, import_ordinal, target_path, provenance_json
-                 FROM workspace_import_edge_facts WHERE workspace_id = ?1
-                 ORDER BY importer_path, import_ordinal, target_path",
-            )
-            .expect("prepare stored edge fact read")
-            .query_map([workspace_id.as_str()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .expect("query stored edge facts")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("decode stored edge facts");
-        let route_dependencies = connection
-            .prepare(
-                "SELECT importer_path, import_ordinal, traversed_path, name
-                 FROM workspace_import_route_dependencies WHERE workspace_id = ?1
-                 ORDER BY importer_path, import_ordinal, traversed_path, name",
-            )
-            .expect("prepare stored route dependency read")
-            .query_map([workspace_id.as_str()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .expect("query stored route dependencies")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("decode stored route dependencies");
-        let candidate_dependencies = connection
-            .prepare(
-                "SELECT importer_path, import_ordinal, consulted_path, name
-                 FROM workspace_import_candidate_file_dependencies WHERE workspace_id = ?1
-                 ORDER BY importer_path, import_ordinal, consulted_path, name",
-            )
-            .expect("prepare stored candidate dependency read")
-            .query_map([workspace_id.as_str()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .expect("query stored candidate dependencies")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("decode stored candidate dependencies");
-        let missing_module_dependencies = connection
-            .prepare(
-                "SELECT importer_path, import_ordinal, module_path_key
-                 FROM workspace_import_missing_module_dependencies WHERE workspace_id = ?1
-                 ORDER BY importer_path, import_ordinal, module_path_key",
-            )
-            .expect("prepare stored missing module dependency read")
-            .query_map([workspace_id.as_str()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .expect("query stored missing module dependencies")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("decode stored missing module dependencies");
-        (
-            edges,
-            route_dependencies,
-            candidate_dependencies,
-            missing_module_dependencies,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn refresh_rust_graph_and_compare_to_fresh(
-        store: &AnalyzerStore,
-        workspace_id: &WorkspaceId,
-        previous_identity: &[u8; 32],
-        current_identity: &[u8; 32],
-        resolver: &[u8; 32],
-        analyzer: &crate::analyzer::RustAnalyzer,
-        expected_work: (usize, usize, usize),
-        expected_lookup_ordinals: &[(&str, u32)],
-    ) {
-        let files = brokk_bifrost_core::analyzer::CodeUnitIndex::analyzed_files(analyzer);
-        let sources = rust_graph_sources(analyzer, &files);
-        assert!(
-            store
-                .read_workspace_import_graph(
-                    workspace_id,
-                    previous_identity,
-                    WorkspaceImportDirection::Forward,
-                    &sources
-                        .iter()
-                        .map(|source| source.source_path.clone())
-                        .collect::<Vec<_>>(),
-                    10_000,
-                )
-                .expect("read previous Rust graph")
-                .is_some(),
-            "incremental refresh starts from the previous graph identity"
-        );
-        let plan = store
-            .plan_workspace_import_graph_refresh(workspace_id, current_identity, resolver, &sources)
-            .expect("plan incremental Rust graph refresh");
-        assert!(!plan.full_rebuild);
-        assert_eq!(
-            plan.dirty_lookup_ordinals,
-            expected_lookup_ordinals
-                .iter()
-                .map(|(path, ordinal)| ((*path).to_owned(), *ordinal))
-                .collect::<Vec<_>>(),
-            "only imports whose candidate or missing-module lookup rows change are republished"
-        );
-        let before_facts = stored_import_graph_facts(store, workspace_id);
-        let dirty_lookup_ordinals = plan
-            .dirty_lookup_ordinals
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        let unchanged_candidate_rows = before_facts
-            .2
-            .iter()
-            .filter(|(path, ordinal, _, _)| {
-                plan.dirty_importer_paths.binary_search(path).is_err()
-                    && !dirty_lookup_ordinals.contains(&(
-                        path.clone(),
-                        u32::try_from(*ordinal).expect("stored import ordinal fits u32"),
-                    ))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let unchanged_missing_module_rows = before_facts
-            .3
-            .iter()
-            .filter(|(path, ordinal, _)| {
-                plan.dirty_importer_paths.binary_search(path).is_err()
-                    && !dirty_lookup_ordinals.contains(&(
-                        path.clone(),
-                        u32::try_from(*ordinal).expect("stored import ordinal fits u32"),
-                    ))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut dirty_paths = plan
-            .dirty_importer_paths
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        dirty_paths.extend(
-            plan.dirty_import_ordinals
-                .iter()
-                .map(|(path, _)| path.clone()),
-        );
-        let dirty_files = files
-            .iter()
-            .filter(|file| dirty_paths.contains(&crate::path_utils::rel_path_string(file)))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut selected_ordinals = crate::hash::HashMap::default();
-        for (path, ordinal) in &plan.dirty_import_ordinals {
-            if plan.dirty_importer_paths.binary_search(path).is_ok() {
-                continue;
-            }
-            let file = files
-                .iter()
-                .find(|file| crate::path_utils::rel_path_string(file) == *path)
-                .expect("dirty import ordinal belongs to an analyzed Rust source");
-            selected_ordinals
-                .entry(file.clone())
-                .or_insert_with(Vec::new)
-                .push(*ordinal);
-        }
-        let graph = rust_graph_facts(analyzer, &dirty_files, Some(&selected_ordinals));
-        assert_eq!(
-            (
-                graph.resolved_files(),
-                graph.resolved_imports(),
-                graph.resolved_edges(),
-            ),
-            expected_work,
-            "incremental refresh recomputes only affected import facts"
-        );
-        let (edges, dependencies) = store_facts_from_request_graph(&graph);
-        store
-            .publish_workspace_import_graph_refresh(
-                workspace_id,
-                current_identity,
-                resolver,
-                &plan,
-                sources.len(),
-                &sources,
-                &edges,
-                &dependencies,
-            )
-            .expect("publish incremental Rust graph");
-        let incremental = stored_adjacency(store, workspace_id, current_identity, &sources);
-        let incremental_facts = stored_import_graph_facts(store, workspace_id);
-        let carried_candidate_rows = incremental_facts
-            .2
-            .iter()
-            .filter(|(path, ordinal, _, _)| {
-                plan.dirty_importer_paths.binary_search(path).is_err()
-                    && !dirty_lookup_ordinals.contains(&(
-                        path.clone(),
-                        u32::try_from(*ordinal).expect("stored import ordinal fits u32"),
-                    ))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let carried_missing_module_rows = incremental_facts
-            .3
-            .iter()
-            .filter(|(path, ordinal, _)| {
-                plan.dirty_importer_paths.binary_search(path).is_err()
-                    && !dirty_lookup_ordinals.contains(&(
-                        path.clone(),
-                        u32::try_from(*ordinal).expect("stored import ordinal fits u32"),
-                    ))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            carried_candidate_rows, unchanged_candidate_rows,
-            "route-only invalidation carries candidate lookup rows without republishing them"
-        );
-        assert_eq!(
-            carried_missing_module_rows, unchanged_missing_module_rows,
-            "route-only invalidation carries missing-module lookup rows without republishing them"
-        );
-
-        let fresh_store = AnalyzerStore::open_ephemeral().expect("fresh Rust graph store");
-        let fresh_workspace_id = WorkspaceId::for_session();
-        let fresh_graph = rust_graph_facts(analyzer, &files, None);
-        let (fresh_edges, fresh_dependencies) = store_facts_from_request_graph(&fresh_graph);
-        publish_initial_with_dependencies(
-            &fresh_store,
-            &fresh_workspace_id,
-            current_identity,
-            resolver,
-            &sources,
-            &fresh_edges,
-            &fresh_dependencies,
-        );
-        let fresh_plan = fresh_store
-            .plan_workspace_import_graph_refresh(
-                &fresh_workspace_id,
-                current_identity,
-                resolver,
-                &sources,
-            )
-            .expect("read fresh Rust graph plan");
-        assert!(fresh_plan.current);
-        // Initial publication above intentionally uses the common helper; the
-        // already-current plan proves its query-facing rows match the snapshot.
-        let fresh = stored_adjacency(
-            &fresh_store,
-            &fresh_workspace_id,
-            current_identity,
-            &sources,
-        );
-        let fresh_facts = stored_import_graph_facts(&fresh_store, &fresh_workspace_id);
-        assert_eq!(
-            incremental, fresh,
-            "incremental graph equals a fresh rebuild"
-        );
-        assert_eq!(
-            incremental_facts, fresh_facts,
-            "incremental edge provenance and all dependency rows equal a fresh rebuild"
-        );
     }
 
     #[test]
@@ -2851,191 +2389,6 @@ mod tests {
             )
             .expect("read route dependency row");
         assert_eq!(route_file_count, 1);
-    }
-
-    #[test]
-    fn rust_incremental_import_graph_work_matches_fresh_rebuild_for_reexport_and_leaf_edits() {
-        use crate::analyzer::{IAnalyzer, Language, RustAnalyzer, TestProject};
-
-        let temp = tempfile::tempdir().expect("Rust import graph fixture");
-        let root = temp.path().canonicalize().expect("canonical fixture root");
-        std::fs::create_dir_all(root.join("src")).expect("create fixture source directory");
-        for (path, contents) in [
-            (
-                "Cargo.toml",
-                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "pub mod client;\npub mod facade;\npub mod leaf;\npub mod origin;\npub mod other;\n",
-            ),
-            ("src/facade.rs", "pub use crate::origin::Widget;\n"),
-            (
-                "src/client.rs",
-                "use crate::facade::Widget;\nuse crate::leaf::Leaf;\nuse crate::other::Other;\n",
-            ),
-            ("src/leaf.rs", "pub struct Leaf;\n"),
-            ("src/origin.rs", "pub struct Widget;\n"),
-            ("src/other.rs", "pub struct Other;\n"),
-        ] {
-            std::fs::write(root.join(path), contents).expect("write Rust fixture file");
-        }
-        let analyzer = RustAnalyzer::from_project(TestProject::new(root.clone(), Language::Rust));
-        let files = brokk_bifrost_core::analyzer::CodeUnitIndex::analyzed_files(&analyzer);
-        let sources = rust_graph_sources(&analyzer, &files);
-        let initial_graph = rust_graph_facts(&analyzer, &files, None);
-        assert_eq!(initial_graph.resolved_files(), files.len());
-        let (initial_edges, initial_dependencies) = store_facts_from_request_graph(&initial_graph);
-        let store = AnalyzerStore::open_ephemeral().expect("persistent graph fixture store");
-        let workspace_id = WorkspaceId::for_session();
-        let initial_identity = [91; 32];
-        let resolver = [92; 32];
-        publish_initial_with_dependencies(
-            &store,
-            &workspace_id,
-            &initial_identity,
-            &resolver,
-            &sources,
-            &initial_edges,
-            &initial_dependencies,
-        );
-
-        let facade = crate::analyzer::ProjectFile::new(root.clone(), "src/facade.rs");
-        std::fs::write(
-            facade.abs_path(),
-            "pub use crate::other::Other as Widget;\n",
-        )
-        .expect("edit re-export source");
-        let after_reexport = analyzer.update(&std::collections::BTreeSet::from([facade]));
-        let reexport_identity = [93; 32];
-        refresh_rust_graph_and_compare_to_fresh(
-            &store,
-            &workspace_id,
-            &initial_identity,
-            &reexport_identity,
-            &resolver,
-            &after_reexport,
-            (2, 2, 3),
-            &[("src/client.rs", 0)],
-        );
-
-        let leaf = crate::analyzer::ProjectFile::new(root.clone(), "src/leaf.rs");
-        std::fs::write(leaf.abs_path(), "pub struct Leaf;\npub struct LeafExtra;\n")
-            .expect("edit leaf source");
-        let after_leaf = after_reexport.update(&std::collections::BTreeSet::from([leaf]));
-        refresh_rust_graph_and_compare_to_fresh(
-            &store,
-            &workspace_id,
-            &reexport_identity,
-            &[94; 32],
-            &resolver,
-            &after_leaf,
-            (1, 0, 0),
-            &[],
-        );
-    }
-
-    #[test]
-    fn rust_name_surface_cutoff_matches_fresh_after_body_item_and_glob_edits() {
-        use crate::analyzer::{IAnalyzer, Language, RustAnalyzer, TestProject};
-
-        let temp = tempfile::tempdir().expect("Rust binding surface fixture");
-        let root = temp.path().canonicalize().expect("canonical fixture root");
-        std::fs::create_dir_all(root.join("src")).expect("create fixture source directory");
-        for (path, contents) in [
-            (
-                "Cargo.toml",
-                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "pub mod app;\npub mod facade;\npub mod glob_client;\npub mod origin;\npub mod unrelated;\nfn root_body() {}\n",
-            ),
-            (
-                "src/facade.rs",
-                "pub use crate::origin::Existing as Alias;\n",
-            ),
-            ("src/origin.rs", "pub struct Existing;\n"),
-            (
-                "src/app.rs",
-                "use crate::facade::Alias;\nuse crate::origin::Added;\n",
-            ),
-            ("src/glob_client.rs", "use crate::origin::*;\n"),
-            ("src/unrelated.rs", "use crate::origin::NeverAdded;\n"),
-        ] {
-            std::fs::write(root.join(path), contents).expect("write Rust fixture file");
-        }
-        let analyzer = RustAnalyzer::from_project(TestProject::new(root.clone(), Language::Rust));
-        let files = brokk_bifrost_core::analyzer::CodeUnitIndex::analyzed_files(&analyzer);
-        let sources = rust_graph_sources(&analyzer, &files);
-        let initial_graph = rust_graph_facts(&analyzer, &files, None);
-        let (initial_edges, initial_dependencies) = store_facts_from_request_graph(&initial_graph);
-        let store = AnalyzerStore::open_ephemeral().expect("name-granular graph store");
-        let workspace_id = WorkspaceId::for_session();
-        let initial_identity = [111; 32];
-        let resolver = [112; 32];
-        publish_initial_with_dependencies(
-            &store,
-            &workspace_id,
-            &initial_identity,
-            &resolver,
-            &sources,
-            &initial_edges,
-            &initial_dependencies,
-        );
-
-        let crate_root = crate::analyzer::ProjectFile::new(root.clone(), "src/lib.rs");
-        std::fs::write(
-            crate_root.abs_path(),
-            "pub mod app;\npub mod facade;\npub mod glob_client;\npub mod origin;\npub mod unrelated;\nfn root_body() { let _unused = (); }\n",
-        )
-        .expect("make a body-only crate-root edit");
-        let after_body = analyzer.update(&std::collections::BTreeSet::from([crate_root]));
-        refresh_rust_graph_and_compare_to_fresh(
-            &store,
-            &workspace_id,
-            &initial_identity,
-            &[113; 32],
-            &resolver,
-            &after_body,
-            (1, 0, 0),
-            &[],
-        );
-
-        let origin = crate::analyzer::ProjectFile::new(root.clone(), "src/origin.rs");
-        std::fs::write(
-            origin.abs_path(),
-            "pub struct Existing;\npub struct Added;\n",
-        )
-        .expect("add the named binding");
-        let after_named = after_body.update(&std::collections::BTreeSet::from([origin.clone()]));
-        refresh_rust_graph_and_compare_to_fresh(
-            &store,
-            &workspace_id,
-            &[113; 32],
-            &[114; 32],
-            &resolver,
-            &after_named,
-            (3, 2, 2),
-            &[("src/app.rs", 1), ("src/glob_client.rs", 0)],
-        );
-
-        std::fs::write(
-            origin.abs_path(),
-            "pub struct Existing;\npub struct Added;\npub struct GlobOnly;\n",
-        )
-        .expect("change the glob-visible binding set");
-        let after_glob = after_named.update(&std::collections::BTreeSet::from([origin]));
-        refresh_rust_graph_and_compare_to_fresh(
-            &store,
-            &workspace_id,
-            &[114; 32],
-            &[115; 32],
-            &resolver,
-            &after_glob,
-            (2, 1, 1),
-            &[("src/glob_client.rs", 0)],
-        );
     }
 
     #[test]
@@ -3782,5 +3135,140 @@ mod tests {
                 "{statistics}: import-graph triggers add hidden DML"
             );
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod rust_tests_test_support {
+    use super::*;
+
+    #[doc(hidden)]
+    pub fn source(path: &str, identity: u8) -> WorkspaceImportGraphSource {
+        WorkspaceImportGraphSource {
+            source_path: path.to_owned(),
+            source_identity: [identity; 32],
+            module_path_keys: Vec::new(),
+            complete_resolution_dependencies: true,
+            input_digests: None,
+            binding_surface: None,
+        }
+    }
+    #[doc(hidden)]
+    pub fn edge(importer: &str, target: &str, dependencies: &[&str]) -> WorkspaceImportGraphEdge {
+        edge_with_ordinal(importer, 0, target, dependencies)
+    }
+    pub(super) fn edge_with_ordinal(
+        importer: &str,
+        import_ordinal: u32,
+        target: &str,
+        dependencies: &[&str],
+    ) -> WorkspaceImportGraphEdge {
+        WorkspaceImportGraphEdge {
+            importer_path: importer.to_owned(),
+            import_ordinal,
+            target_path: target.to_owned(),
+            provenance_json: "[{\"kind\":\"test_import\"}]".to_owned(),
+            route_dependencies: dependencies.iter().map(|path| (*path).to_owned()).collect(),
+        }
+    }
+    #[doc(hidden)]
+    pub fn publish_initial_with_dependencies(
+        store: &AnalyzerStore,
+        workspace_id: &WorkspaceId,
+        identity: &[u8; 32],
+        resolver_identity: &[u8; 32],
+        sources: &[WorkspaceImportGraphSource],
+        edges: &[WorkspaceImportGraphEdge],
+        dependencies: &[WorkspaceImportGraphDependencies],
+    ) {
+        let plan = store
+            .plan_workspace_import_graph_refresh(workspace_id, identity, resolver_identity, sources)
+            .expect("plan initial graph");
+        assert!(plan.full_rebuild);
+        store
+            .publish_workspace_import_graph_refresh(
+                workspace_id,
+                identity,
+                resolver_identity,
+                &plan,
+                sources.len(),
+                sources,
+                edges,
+                dependencies,
+            )
+            .expect("publish initial graph");
+    }
+    type StoredFactRow = (String, i64, String, String);
+    type StoredImportGraphFacts = (
+        Vec<StoredFactRow>,
+        Vec<StoredFactRow>,
+        Vec<StoredFactRow>,
+        Vec<(String, i64, String)>,
+    );
+    #[doc(hidden)]
+    pub fn stored_import_graph_facts(
+        store: &AnalyzerStore,
+        workspace_id: &WorkspaceId,
+    ) -> StoredImportGraphFacts {
+        let connection = store.read_conn().expect("read stored import graph facts");
+        let edges = connection
+            .prepare(
+                "SELECT importer_path, import_ordinal, target_path, provenance_json
+                 FROM workspace_import_edge_facts WHERE workspace_id = ?1
+                 ORDER BY importer_path, import_ordinal, target_path",
+            )
+            .expect("prepare stored edge fact read")
+            .query_map([workspace_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query stored edge facts")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("decode stored edge facts");
+        let route_dependencies = connection
+            .prepare(
+                "SELECT importer_path, import_ordinal, traversed_path, name
+                 FROM workspace_import_route_dependencies WHERE workspace_id = ?1
+                 ORDER BY importer_path, import_ordinal, traversed_path, name",
+            )
+            .expect("prepare stored route dependency read")
+            .query_map([workspace_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query stored route dependencies")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("decode stored route dependencies");
+        let candidate_dependencies = connection
+            .prepare(
+                "SELECT importer_path, import_ordinal, consulted_path, name
+                 FROM workspace_import_candidate_file_dependencies WHERE workspace_id = ?1
+                 ORDER BY importer_path, import_ordinal, consulted_path, name",
+            )
+            .expect("prepare stored candidate dependency read")
+            .query_map([workspace_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query stored candidate dependencies")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("decode stored candidate dependencies");
+        let missing_module_dependencies = connection
+            .prepare(
+                "SELECT importer_path, import_ordinal, module_path_key
+                 FROM workspace_import_missing_module_dependencies WHERE workspace_id = ?1
+                 ORDER BY importer_path, import_ordinal, module_path_key",
+            )
+            .expect("prepare stored missing module dependency read")
+            .query_map([workspace_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query stored missing module dependencies")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("decode stored missing module dependencies");
+        (
+            edges,
+            route_dependencies,
+            candidate_dependencies,
+            missing_module_dependencies,
+        )
     }
 }

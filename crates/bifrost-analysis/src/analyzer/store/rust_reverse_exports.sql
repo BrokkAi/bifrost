@@ -16,8 +16,7 @@ WITH RECURSIVE exposed(summary_id, topology_id, crate_key, module_path, namespac
    AND exports.declaration_member_ordinal = member.member_ordinal
    AND exports.declaration_site = ?2
    AND exports.origin = 'declaration'
-  CROSS JOIN main.rust_resolution_unit_summary_placements AS placement
-    INDEXED BY rust_resolution_unit_summary_placements_member
+  CROSS JOIN main.rust_unit_summary_placements AS placement
     ON placement.summary_id = member.summary_id
    AND placement.member_ordinal = member.member_ordinal
    AND (placement.module_path = exports.module_path

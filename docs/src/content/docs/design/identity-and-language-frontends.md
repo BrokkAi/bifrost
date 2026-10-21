@@ -128,6 +128,26 @@ It preserves the physical source, signature, synthetic status, and structured
 segment roles. Range and signature reads follow the canonical-to-physical
 mapping back to the immutable extraction facts.
 
+Literal namespace heads can survive parser recovery inside a damaged
+function-like wrapper. Their namespace and name ranges remain anchored to the
+written keyword and name tokens. Namespace lifetime follows the existing real
+brace evidence, rather than the damaged wrapper's body extent. This structural
+recovery does not expand opaque macros or remove parser-recovery diagnostics.
+
+For a member written with one class owner, reconciliation validates the exact
+physical declaration and name against prepared syntax. Agreeing source records
+establish its lexical namespace independently of the provisional identity.
+Relative owners try enclosing namespace tiers from inner to outer before the
+existing global and using-namespace candidates; an explicit global qualifier
+uses only the global scope. Missing or conflicting proof cannot authorize a
+new owner. Multi-owner and template reconciliation retain their existing rules.
+
+Ordinary structured receiver types use lookup at the declaration site and
+preserve a selected alias. An ambiguous or missing lexical result cannot fall
+back to a pool of unrelated types with the same terminal name. Navigation of
+a standalone, non-template global declaration type also preserves its explicit
+global qualifier.
+
 The stored blob facts remain independent of the workspace's include graph.
 Reconciliation uses byte-bounded identifier and owner cohorts on the immutable
 analyzer snapshot; an update or persistent reopening constructs new caches.

@@ -236,7 +236,7 @@ fn helper_absent_from_macro_lookup(
     helper: &str,
 ) -> Result<bool> {
     let workspace_macro = connection
-        .prepare_cached(rust_crate_context::EXPORT)?
+        .prepare_cached(rust_crate_context::PUBLISHED_EXPORT)?
         .exists(rusqlite::params![
             topology, path, "macro", helper, topology, path
         ])?;
@@ -255,7 +255,7 @@ fn helper_absent_from_macro_lookup(
     let open_inventory = !workspace_macro
         && !external_binding
         && connection
-            .prepare_cached(rust_crate_context::OPEN_INVENTORY)?
+            .prepare_cached(rust_crate_context::PUBLISHED_OPEN_INVENTORY)?
             .exists(rusqlite::params![
                 topology, path, "macro", helper, topology, path
             ])?;

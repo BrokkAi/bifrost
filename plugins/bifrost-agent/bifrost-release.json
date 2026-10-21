@@ -1,12 +1,12 @@
 {
-  "binaryVersion": "0.13.1",
-  "minimumBinaryVersion": "0.13.0",
+  "binaryVersion": "0.14.0",
+  "minimumBinaryVersion": "0.14.0",
   "allowPrerelease": false,
   "archiveSha256": {
-    "aarch64-pc-windows-msvc": "9519229a9f68513d515d00cb514a897739f9f8c52049f32f584c9e560ab3973b",
-    "aarch64-unknown-linux-gnu": "e145acde6f6ca2a53ac93015b9a974104b609c6091de58f4d821317243db48f1",
-    "universal-apple-darwin": "9ccde919416208acb901963f56cdbefd49cbe5c25423048682f4e948b611c228",
-    "x86_64-pc-windows-msvc": "371ad3a27dfdf1b23a9b8d79e5a43ac092117cdb9012cecc20dceca43d8349f7",
-    "x86_64-unknown-linux-gnu": "8302b601f525c09caac6e50db5ad59d80ac0c4e2d9d0eb1618152c1eee54be54"
+    "aarch64-pc-windows-msvc": "e697ea50c7931fab04b31fba4edf6091ef40969d8506e1c713a17e955417065b",
+    "aarch64-unknown-linux-gnu": "fac66ce63c099e871ba5ced887cfd90da10afc5207aff574ab8cffde7b701903",
+    "universal-apple-darwin": "8fb7212912cda0d6fc97e72188339b53aec4ea1ce31cc6a076765763e2273604",
+    "x86_64-pc-windows-msvc": "da1bef293412d8cfe4c57b5e537ce199560311d6d3b210947f6ff2f79929df5a",
+    "x86_64-unknown-linux-gnu": "45d23d8e65dbbeb3e101bcd4f7afc808a3202a9eefb7a0083a5f5e29fefddcff"
   }
 }

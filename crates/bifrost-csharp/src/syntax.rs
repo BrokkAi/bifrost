@@ -1359,6 +1359,10 @@ pub fn normalize_csharp_type_fragment(reference: &str) -> String {
         .to_string()
 }
 
+/// Metadata member name used by C# indexer declarations.
+#[doc(hidden)]
+pub const CSHARP_INDEXER_MEMBER_NAME: &str = "Item";
+
 #[cfg(test)]
 mod tests {
     use super::{

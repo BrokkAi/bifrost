@@ -1,4 +1,4 @@
-use super::languages::{LanguageSupport, language_support};
+use super::languages::language_knowledge;
 use super::{Language, parser_language_for_path};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -106,8 +106,8 @@ pub fn ingest_source_bytes(
             path.display()
         ))
     })?;
-    let highlights = language_support(language)
-        .and_then(LanguageSupport::highlight_query)
+    let highlights = language_knowledge(language)
+        .and_then(|support| support.highlight_query())
         .ok_or_else(|| {
             SourceIngestionError(format!(
                 "no syntax-highlight query is registered for `{}`",

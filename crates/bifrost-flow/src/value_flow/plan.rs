@@ -34,7 +34,8 @@ use super::model::push_summary_identity;
 use super::{
     ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCarrierKey, ValueFlowEventKey,
     ValueFlowModelError, ValueFlowObservationPhase, ValueFlowSinkId, ValueFlowSinkSpec,
-    ValueFlowSourceId, ValueFlowSourceSpec,
+    ValueFlowSourceId, ValueFlowSourceListId, ValueFlowSourceLists, ValueFlowSourceSpec,
+    ValueFlowSources,
 };
 
 /// Target-directed binding of an external summary's formal ports to one call.
@@ -86,7 +87,7 @@ pub struct ValueFlowEdgeKillSpec {
     pub target: ProgramPointId,
     pub kind: ControlEdgeKind,
     pub carrier: ValueFlowCarrier,
-    pub sources: Vec<ValueFlowEventKey>,
+    pub sources: ValueFlowSourceListId,
 }
 
 /// One policy-authored point-local carrier relation.
@@ -124,7 +125,7 @@ impl ValueFlowLocalRuleSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundValueFlowEdgeKill {
     pub carrier: ValueFlowCarrierId,
-    pub sources: Box<[ValueFlowSourceId]>,
+    pub sources: ValueFlowSourceListId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1726,7 +1727,7 @@ pub(crate) struct BoundValueFlowSource {
     pub id: ValueFlowSourceId,
     pub spec: ValueFlowSourceSpec,
     pub carrier: ValueFlowCarrierId,
-    pub activation_triggers: Option<Box<[ValueFlowSourceId]>>,
+    pub activation_triggers: Option<ValueFlowSourceListId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1777,7 +1778,14 @@ fn same_propagation_configuration(left: &ValueFlowPlan, right: &ValueFlowPlan) -
         && left.unmodeled_call_behavior == right.unmodeled_call_behavior
         && left.external_summaries == right.external_summaries
         && left.curated_call_models == right.curated_call_models
-        && left.edge_kills == right.edge_kills
+        && left.edge_kills.len() == right.edge_kills.len()
+        && left.edge_kills.iter().zip(&right.edge_kills).all(|(a, b)| {
+            a.point == b.point
+                && a.target == b.target
+                && a.kind == b.kind
+                && a.carrier == b.carrier
+                && left.source_list_keys(a.sources) == right.source_list_keys(b.sources)
+        })
         && left.snapshot_procedures == right.snapshot_procedures
         && left.binding_pairs == right.binding_pairs
         && left.discovery_status == right.discovery_status
@@ -1839,14 +1847,7 @@ impl EdgeKillIndex {
             .saturating_add(
                 self.by_edge
                     .values()
-                    .map(|kills| {
-                        size_of_val(kills.as_ref()).saturating_add(
-                            kills
-                                .iter()
-                                .map(|kill| size_of_val(kill.sources.as_ref()))
-                                .fold(0usize, usize::saturating_add),
-                        )
-                    })
+                    .map(|kills| size_of_val(kills.as_ref()))
                     .fold(0usize, usize::saturating_add),
             )
     }
@@ -1889,11 +1890,14 @@ pub struct ValueFlowPlan {
     fallback_locations: FallbackLocationIndex,
     summary_location_bindings: Box<[BoundSummaryLocationBinding]>,
     sources: Box<[BoundValueFlowSource]>,
+    /// Canonical event-key order for external identity lookup; IDs remain insertion-local.
+    source_key_order: Box<[ValueFlowSourceId]>,
     /// Derived point/phase lookup; observation identity remains `sources`.
     source_index: ObservationIndex,
     sinks: Box<[BoundValueFlowSink]>,
     /// Derived point/phase lookup; observation identity remains `sinks`.
     sink_index: ObservationIndex,
+    source_lists: Box<[Box<[ValueFlowSourceId]>]>,
     edge_kills: Box<[ValueFlowEdgeKillSpec]>,
     /// Derived dense-ID lookup; canonical identity remains `edge_kills`.
     edge_kill_index: EdgeKillIndex,
@@ -1925,24 +1929,27 @@ pub struct ValueFlowPlan {
     owner: Arc<()>,
 }
 
+fn same_plan_structure(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
+    same_propagation_configuration(left, right)
+        && left.carriers == right.carriers
+        && left.carrier_keys == right.carrier_keys
+        && left.carrier_ids == right.carrier_ids
+        && left.local_rules == right.local_rules
+        && left.call_rules == right.call_rules
+        && left.fallback_profiles == right.fallback_profiles
+        && left.fallback_locations == right.fallback_locations
+        && left.summary_location_bindings == right.summary_location_bindings
+        && left.sinks == right.sinks
+        && left.resolved_external_calls == right.resolved_external_calls
+        && left.first_incomplete_cause == right.first_incomplete_cause
+        && left.snapshot_discoveries == right.snapshot_discoveries
+        && left.non_snapshot_discovery_complete == right.non_snapshot_discovery_complete
+        && left.ambiguous_dispatch == right.ambiguous_dispatch
+}
+
 impl PartialEq for ValueFlowPlan {
     fn eq(&self, other: &Self) -> bool {
-        same_propagation_configuration(self, other)
-            && self.carriers == other.carriers
-            && self.carrier_keys == other.carrier_keys
-            && self.carrier_ids == other.carrier_ids
-            && self.local_rules == other.local_rules
-            && self.call_rules == other.call_rules
-            && self.fallback_profiles == other.fallback_profiles
-            && self.fallback_locations == other.fallback_locations
-            && self.summary_location_bindings == other.summary_location_bindings
-            && self.sources == other.sources
-            && self.sinks == other.sinks
-            && self.resolved_external_calls == other.resolved_external_calls
-            && self.first_incomplete_cause == other.first_incomplete_cause
-            && self.snapshot_discoveries == other.snapshot_discoveries
-            && self.non_snapshot_discovery_complete == other.non_snapshot_discovery_complete
-            && self.ambiguous_dispatch == other.ambiguous_dispatch
+        same_plan_structure(self, other) && same_source_specs(self, other)
     }
 }
 
@@ -1964,9 +1971,45 @@ impl Hash for ValueFlowPlan {
         self.call_rules.hash(state);
         self.fallback_profiles.hash(state);
         self.summary_location_bindings.hash(state);
-        self.sources.hash(state);
+        let sources = self
+            .source_key_order
+            .iter()
+            .map(|id| &self.sources[id.index()])
+            .collect::<Vec<_>>();
+        // Keep SourceId as the element type: registration digests also encode
+        // Hasher write boundaries, which primitive slice hashing can combine.
+        let mut ranks = vec![ValueFlowSourceId::new(0); self.sources.len()];
+        for (rank, source) in sources.iter().enumerate() {
+            ranks[source.id.index()] =
+                ValueFlowSourceId::try_from_index(rank).expect("a validated source rank fits u32");
+        }
+        sources.len().hash(state);
+        for source in sources {
+            ranks[source.id.index()].hash(state);
+            hash_source_spec(self, &source.spec, state);
+            source.carrier.hash(state);
+            source
+                .activation_triggers
+                .map(|list| {
+                    let mut ids = self
+                        .source_list(list)
+                        .iter()
+                        .map(|id| ranks[id.index()])
+                        .collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    ids
+                })
+                .hash(state);
+        }
         self.sinks.hash(state);
-        self.edge_kills.hash(state);
+        self.edge_kills.len().hash(state);
+        for kill in &self.edge_kills {
+            kill.point.hash(state);
+            kill.target.hash(state);
+            kill.kind.hash(state);
+            kill.carrier.hash(state);
+            self.source_list_keys(kill.sources).hash(state);
+        }
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.resolved_external_calls.hash(state);
@@ -2137,16 +2180,12 @@ impl ValueFlowPlan {
             .iter()
             .filter_map(|source| relevant.contains(&source.carrier).then_some(source.id))
             .collect::<HashSet<_>>();
-        let retained_source_keys = self
-            .edge_kills
-            .iter()
-            .flat_map(|kill| kill.sources.iter())
-            .collect::<HashSet<_>>();
-        retained_source_ids.extend(self.sources.iter().filter_map(|source| {
-            retained_source_keys
-                .contains(source.spec.key())
-                .then_some(source.id)
-        }));
+        retained_source_ids.extend(
+            self.edge_kills
+                .iter()
+                .flat_map(|kill| self.source_list(kill.sources))
+                .copied(),
+        );
         let mut changed = true;
         while changed {
             changed = false;
@@ -2154,7 +2193,7 @@ impl ValueFlowPlan {
                 if retained_source_ids.contains(&source.id)
                     && let Some(triggers) = &source.activation_triggers
                 {
-                    for trigger in triggers {
+                    for trigger in self.source_list(*triggers) {
                         changed |= retained_source_ids.insert(*trigger);
                     }
                 }
@@ -2172,35 +2211,44 @@ impl ValueFlowPlan {
                 sources.push(source);
             }
         }
+        let mut source_lists = ValueFlowSourceLists::default();
+        let mut list_remap = HashMap::default();
+        for list in sources
+            .iter()
+            .filter_map(|source| source.activation_triggers)
+            .chain(self.edge_kills.iter().map(|kill| kill.sources))
+        {
+            list_remap.entry(list).or_insert_with(|| {
+                source_lists.intern(
+                    self.source_list(list)
+                        .iter()
+                        .map(|id| {
+                            *old_to_new_source_ids
+                                .get(id)
+                                .expect("retained source keeps its dependencies")
+                        })
+                        .collect(),
+                )
+            });
+        }
         for source in &mut sources {
-            if let Some(triggers) = source.activation_triggers.as_mut() {
-                *triggers = triggers
-                    .iter()
-                    .map(|trigger| {
-                        old_to_new_source_ids
-                            .get(trigger)
-                            .copied()
-                            .expect("retained conditional source keeps its triggers")
-                    })
-                    .collect();
+            source.activation_triggers = source.activation_triggers.map(|list| list_remap[&list]);
+            if let Some(list) = source.activation_triggers {
+                source.spec = source.spec.clone().when_sources_reach(list);
             }
         }
+        for kill in &mut self.edge_kills {
+            kill.sources = list_remap[&kill.sources];
+        }
+        self.source_lists = source_lists.into_lists();
+        self.source_key_order = source_key_order(&sources);
         self.sources = sources.into_boxed_slice();
         self.source_index = build_observation_index(&self.sources, |source| ObservationKey {
             point: source.spec.point().clone(),
             phase: source.spec.phase(),
         });
-        let source_specs = self
-            .sources
-            .iter()
-            .map(|source| source.spec.clone())
-            .collect::<Vec<_>>();
-        self.edge_kill_index = build_edge_kill_index(
-            &self.edge_kills,
-            &self.carrier_ids,
-            &SourceKeyIndex::new(&source_specs),
-        )
-        .expect("retained edge kills keep every referenced source");
+        self.edge_kill_index = build_edge_kill_index(&self.edge_kills, &self.carrier_ids)
+            .expect("retained kills keep their carriers");
 
         self.local_rules = self
             .local_rules
@@ -2227,7 +2275,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
     ) -> Result<Self, ValueFlowPlanError> {
         Self::try_new_with_edge_kills(root, snapshots, bindings, sources, sinks, Vec::new())
@@ -2237,7 +2285,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
         edge_kills: Vec<ValueFlowEdgeKillSpec>,
     ) -> Result<Self, ValueFlowPlanError> {
@@ -2256,7 +2304,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
         unmodeled_call_behavior: UnmodeledCallBehavior,
     ) -> Result<Self, ValueFlowPlanError> {
@@ -2275,7 +2323,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
         edge_kills: Vec<ValueFlowEdgeKillSpec>,
         unmodeled_call_behavior: UnmodeledCallBehavior,
@@ -2300,7 +2348,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
         edge_kills: Vec<ValueFlowEdgeKillSpec>,
         unmodeled_call_behavior: UnmodeledCallBehavior,
@@ -2310,7 +2358,7 @@ impl ValueFlowPlan {
             root,
             snapshots,
             bindings,
-            sources,
+            sources.into(),
             sinks,
             edge_kills,
             ValueFlowPlanLimits::default(),
@@ -2323,7 +2371,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
         limits: ValueFlowPlanLimits,
     ) -> Result<Self, ValueFlowPlanError> {
@@ -2342,7 +2390,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
         limits: ValueFlowPlanLimits,
         unmodeled_call_behavior: UnmodeledCallBehavior,
@@ -2364,7 +2412,7 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: Vec<ValueFlowSourceSpec>,
+        sources: impl Into<ValueFlowSources>,
         sinks: Vec<ValueFlowSinkSpec>,
         edge_kills: Vec<ValueFlowEdgeKillSpec>,
         limits: ValueFlowPlanLimits,
@@ -2374,7 +2422,7 @@ impl ValueFlowPlan {
             root,
             snapshots,
             bindings,
-            sources,
+            sources.into(),
             sinks,
             edge_kills,
             limits,
@@ -2388,13 +2436,17 @@ impl ValueFlowPlan {
         root: ProcedureHandle,
         mut snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         mut bindings: Vec<ValueFlowInput<CallBindings>>,
-        mut sources: Vec<ValueFlowSourceSpec>,
+        sources: ValueFlowSources,
         mut sinks: Vec<ValueFlowSinkSpec>,
         mut edge_kills: Vec<ValueFlowEdgeKillSpec>,
         limits: ValueFlowPlanLimits,
         unmodeled_call_behavior: UnmodeledCallBehavior,
         resolved_external_calls: Vec<CallSiteHandle>,
     ) -> Result<Self, ValueFlowPlanError> {
+        let ValueFlowSources {
+            specs: sources,
+            lists: source_lists,
+        } = sources;
         if sources.len() > limits.max_sources || sinks.len() > limits.max_sinks {
             return Err(ValueFlowPlanError::LimitExceeded);
         }
@@ -2408,21 +2460,15 @@ impl ValueFlowPlan {
         }
         snapshots.sort_by(|left, right| compare_snapshots(left.value(), right.value()));
         bindings.sort_by(|left, right| compare_bindings(left.value(), right.value()));
-        sources.sort_by(|left, right| left.key().cmp(right.key()));
         sinks.sort_by(|left, right| left.key().cmp(right.key()));
-        if adjacent_duplicate(sources.iter().map(ValueFlowSourceSpec::key))
+        if duplicate_source_keys(&sources)
             || adjacent_duplicate(sinks.iter().map(ValueFlowSinkSpec::key))
         {
             return Err(ValueFlowPlanError::DuplicateEventKey);
         }
-        let source_ids = SourceKeyIndex::new(&sources);
-        for kill in &mut edge_kills {
-            source_ids.sort_keys(&mut kill.sources);
-            kill.sources.dedup();
-        }
-        edge_kills.sort_by(compare_edge_kills);
+        validate_source_lists(&sources, &edge_kills, &source_lists)?;
+        edge_kills.sort_by(|left, right| compare_edge_kills(left, right, &sources, &source_lists));
         edge_kills.dedup();
-        let source_activation_triggers = bind_source_activation_triggers(&sources, &source_ids)?;
 
         let mount = root.artifact().key().mount();
         let mut discovery_status = SemanticInputStatus::Complete;
@@ -2704,7 +2750,9 @@ impl ValueFlowPlan {
         // An endpoint observed in a procedure the solve cannot enter was not
         // analyzed: a sink there can never report, and calling the region clean
         // would claim a verdict for a site the solve never visited (#2640).
-        for source in &sources {
+        let mut source_events = sources.iter().collect::<Vec<_>>();
+        source_events.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+        for source in source_events {
             validate_event(source.point(), source.carrier(), mount)?;
             let evidence_complete = matches!(source.proof(), ProofStatus::Proven)
                 && matches!(source.completeness(), EvidenceCompleteness::Complete);
@@ -2760,10 +2808,7 @@ impl ValueFlowPlan {
                 .semantics()
                 .successor_edges(kill.point.id())
                 .any(|(_, edge)| edge.target_point == kill.target && edge.kind == kill.kind);
-            if !edge_exists
-                || kill.sources.is_empty()
-                || kill.sources.iter().any(|key| source_ids.get(key).is_none())
-            {
+            if !edge_exists {
                 return Err(ValueFlowPlanError::InvalidEdgeKill);
             }
             carrier_candidates.push(kill.carrier.clone());
@@ -2839,20 +2884,18 @@ impl ValueFlowPlan {
             &carrier_components,
         );
 
-        let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids, &source_ids)?;
-        drop(source_ids);
+        let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids)?;
         let bound_sources = sources
             .into_iter()
-            .zip(source_activation_triggers)
             .enumerate()
-            .map(|(index, (spec, activation_triggers))| {
+            .map(|(index, spec)| {
                 Ok(BoundValueFlowSource {
                     id: ValueFlowSourceId::try_from_index(index)
                         .map_err(|_| ValueFlowPlanError::SourceIdOverflow)?,
                     carrier: *carrier_ids
                         .get(spec.carrier())
                         .ok_or(ValueFlowPlanError::MissingCarrier)?,
-                    activation_triggers,
+                    activation_triggers: spec.activation_triggers(),
                     spec,
                 })
             })
@@ -2900,10 +2943,12 @@ impl ValueFlowPlan {
             fallback_profiles: fallback_profiles.into_boxed_slice(),
             fallback_locations,
             summary_location_bindings: Box::default(),
+            source_key_order: source_key_order(&bound_sources),
             sources: bound_sources.into_boxed_slice(),
             source_index,
             sinks: bound_sinks.into_boxed_slice(),
             sink_index,
+            source_lists: source_lists.into_lists(),
             edge_kills: edge_kills.into_boxed_slice(),
             edge_kill_index,
             infeasible_points,
@@ -3014,14 +3059,7 @@ impl ValueFlowPlan {
         let source_heap = self.sources.iter().fold(0usize, |total, source| {
             total
                 .saturating_add(source.spec.key().retained_bytes())
-                .saturating_add(source.spec.activation_triggers_retained_bytes())
                 .saturating_add(size_of_val(source.spec.dispatch_obligations()))
-                .saturating_add(
-                    source
-                        .activation_triggers
-                        .as_ref()
-                        .map_or(0, |triggers| size_of_val(triggers.as_ref())),
-                )
                 .saturating_add(self.carrier_keys[source.carrier.index()].retained_bytes())
                 .saturating_add(source.spec.proof().retained_heap_bytes())
                 .saturating_add(source.spec.completeness().retained_heap_bytes())
@@ -3035,18 +3073,11 @@ impl ValueFlowPlan {
                 .saturating_add(sink.spec.completeness().retained_heap_bytes())
         });
         let edge_kill_heap = self.edge_kills.iter().fold(0usize, |total, kill| {
-            total
-                .saturating_add(
-                    kill.sources
-                        .iter()
-                        .map(ValueFlowEventKey::retained_bytes)
-                        .fold(0usize, usize::saturating_add),
-                )
-                .saturating_add(
-                    kill.carrier
-                        .stable_key()
-                        .map_or(0, |key| key.retained_bytes()),
-                )
+            total.saturating_add(
+                kill.carrier
+                    .stable_key()
+                    .map_or(0, |key| key.retained_bytes()),
+            )
         });
 
         std::mem::size_of::<Self>()
@@ -3094,11 +3125,19 @@ impl ValueFlowPlan {
             .saturating_add(self.fallback_locations.retained_heap_bytes())
             .saturating_add(size_of_val(self.summary_location_bindings.as_ref()))
             .saturating_add(size_of_val(self.sources.as_ref()))
+            .saturating_add(size_of_val(self.source_key_order.as_ref()))
             .saturating_add(self.source_index.retained_heap_bytes())
             .saturating_add(source_heap)
             .saturating_add(size_of_val(self.sinks.as_ref()))
             .saturating_add(self.sink_index.retained_heap_bytes())
             .saturating_add(sink_heap)
+            .saturating_add(size_of_val(self.source_lists.as_ref()))
+            .saturating_add(
+                self.source_lists
+                    .iter()
+                    .map(|list| size_of_val(list.as_ref()))
+                    .sum::<usize>(),
+            )
             .saturating_add(size_of_val(self.edge_kills.as_ref()))
             .saturating_add(edge_kill_heap)
             .saturating_add(self.edge_kill_index.retained_heap_bytes())
@@ -3433,8 +3472,10 @@ impl ValueFlowPlan {
         &self,
         key: &super::ValueFlowEventKey,
     ) -> Option<ValueFlowSourceId> {
-        event_key_index(&self.sources, key, |source| source.spec.key())
-            .map(|index| self.sources[index].id)
+        self.source_key_order
+            .binary_search_by(|id| self.sources[id.index()].spec.key().cmp(key))
+            .ok()
+            .map(|index| self.source_key_order[index])
     }
 
     /// Hash only the transfer semantics that determine propagation. Source and
@@ -3494,7 +3535,7 @@ impl ValueFlowPlan {
                 .map(|id| &self.carrier_keys[id.index()])
                 .expect("a validated edge-kill carrier is bound")
                 .hash(state);
-            kill.sources.hash(state);
+            self.source_list_keys(kill.sources).hash(state);
         }
         let conditional_sources = self
             .sources
@@ -3502,6 +3543,8 @@ impl ValueFlowPlan {
             .filter(|source| source.spec.activation_triggers().is_some())
             .collect::<Vec<_>>();
         conditional_sources.len().hash(state);
+        let mut conditional_sources = conditional_sources;
+        conditional_sources.sort_unstable_by(|left, right| left.spec.key().cmp(right.spec.key()));
         for source in conditional_sources {
             source.spec.key().hash(state);
             source.spec.point().hash(state);
@@ -3509,7 +3552,11 @@ impl ValueFlowPlan {
             self.carrier_keys[source.carrier.index()].hash(state);
             source.spec.proof().hash(state);
             source.spec.completeness().hash(state);
-            source.spec.activation_triggers().hash(state);
+            source
+                .spec
+                .activation_triggers()
+                .map(|list| self.source_list_keys(list))
+                .hash(state);
         }
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
@@ -3528,6 +3575,13 @@ impl ValueFlowPlan {
             && self.resolved_external_calls == other.resolved_external_calls
     }
 
+    /// Compare immutable inputs through stable source keys. A caller may keep
+    /// the old plan and its matching facts on equality; it must never interpret
+    /// an old source ID through the rebuilt plan's coordinates.
+    pub(crate) fn has_same_inputs(&self, other: &Self) -> bool {
+        same_plan_structure(self, other) && same_keyed_source_specs(self, other)
+    }
+
     /// Rebind source observations and source-selective edge kills after a
     /// refinement pass. Retained snapshots, call bindings, sinks, models, and
     /// call behavior remain the same; only demand observations and their
@@ -3535,30 +3589,31 @@ impl ValueFlowPlan {
     /// key index keeps IDs valid when refinement introduces a new carrier.
     pub(crate) fn with_replaced_sources_and_edge_kills(
         &self,
-        mut sources: Vec<ValueFlowSourceSpec>,
+        sources: ValueFlowSources,
         mut edge_kills: Vec<ValueFlowEdgeKillSpec>,
         uncertain_field_stores: &HashSet<(ProgramPointHandle, u32)>,
         descriptor_field_stores: &HashSet<(ProgramPointHandle, u32)>,
     ) -> Result<Self, ValueFlowPlanError> {
+        let ValueFlowSources {
+            specs: sources,
+            lists: source_lists,
+        } = sources;
         if sources.len() > MAX_VALUE_FLOW_SOURCES {
             return Err(ValueFlowPlanError::LimitExceeded);
         }
-        sources.sort_by(|left, right| left.key().cmp(right.key()));
-        if adjacent_duplicate(sources.iter().map(ValueFlowSourceSpec::key)) {
+        if duplicate_source_keys(&sources) {
             return Err(ValueFlowPlanError::DuplicateEventKey);
         }
 
-        let source_ids = SourceKeyIndex::new(&sources);
         let mount = self.root.artifact().key().mount();
-        for source in &sources {
+        let mut source_events = sources.iter().collect::<Vec<_>>();
+        source_events.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+        for source in source_events {
             validate_event(source.point(), source.carrier(), mount)?;
         }
 
-        for kill in &mut edge_kills {
-            source_ids.sort_keys(&mut kill.sources);
-            kill.sources.dedup();
-        }
-        edge_kills.sort_by(compare_edge_kills);
+        validate_source_lists(&sources, &edge_kills, &source_lists)?;
+        edge_kills.sort_by(|left, right| compare_edge_kills(left, right, &sources, &source_lists));
         edge_kills.dedup();
         for kill in &edge_kills {
             validate_event(&kill.point, &kill.carrier, mount)?;
@@ -3568,10 +3623,7 @@ impl ValueFlowPlan {
                 .semantics()
                 .successor_edges(kill.point.id())
                 .any(|(_, edge)| edge.target_point == kill.target && edge.kind == kill.kind);
-            if !edge_exists
-                || kill.sources.is_empty()
-                || kill.sources.iter().any(|key| source_ids.get(key).is_none())
-            {
+            if !edge_exists {
                 return Err(ValueFlowPlanError::InvalidEdgeKill);
             }
         }
@@ -3620,21 +3672,18 @@ impl ValueFlowPlan {
             binding.carrier = remap(binding.carrier)?;
         }
 
-        let source_activation_triggers = bind_source_activation_triggers(&sources, &source_ids)?;
-        let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids, &source_ids)?;
-        drop(source_ids);
+        let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids)?;
         let bound_sources = sources
             .into_iter()
-            .zip(source_activation_triggers)
             .enumerate()
-            .map(|(index, (spec, activation_triggers))| {
+            .map(|(index, spec)| {
                 Ok(BoundValueFlowSource {
                     id: ValueFlowSourceId::try_from_index(index)
                         .map_err(|_| ValueFlowPlanError::SourceIdOverflow)?,
                     carrier: *carrier_ids
                         .get(spec.carrier())
                         .ok_or(ValueFlowPlanError::MissingCarrier)?,
-                    activation_triggers,
+                    activation_triggers: spec.activation_triggers(),
                     spec,
                 })
             })
@@ -3681,10 +3730,12 @@ impl ValueFlowPlan {
             fallback_profiles: fallback_profiles.into_boxed_slice(),
             fallback_locations,
             summary_location_bindings: summary_location_bindings.into_boxed_slice(),
+            source_key_order: source_key_order(&bound_sources),
             sources: bound_sources.into_boxed_slice(),
             source_index,
             sinks: bound_sinks.into_boxed_slice(),
             sink_index,
+            source_lists: source_lists.into_lists(),
             edge_kills: edge_kills.into_boxed_slice(),
             edge_kill_index,
             infeasible_points: self.infeasible_points.clone(),
@@ -3749,36 +3800,74 @@ impl ValueFlowPlan {
             binding.carrier = remap(binding.carrier)?;
         }
 
-        let mut source_specs = plans
+        let mut source_origins = plans
             .iter()
-            .flat_map(|plan| plan.sources.iter().map(|source| source.spec.clone()))
+            .flat_map(|plan| plan.sources.iter().map(move |source| (*plan, source)))
             .collect::<Vec<_>>();
-        source_specs.sort_by(|left, right| left.key().cmp(right.key()));
-        source_specs.dedup();
-        if source_specs.len() > MAX_VALUE_FLOW_SOURCES
-            || source_specs
-                .windows(2)
-                .any(|pair| pair[0].key() == pair[1].key())
-        {
-            return Err(ValueFlowPlanError::DuplicateEventKey);
+        source_origins
+            .sort_unstable_by(|(_, left), (_, right)| left.spec.key().cmp(right.spec.key()));
+        let mut unique: Vec<(&ValueFlowPlan, &BoundValueFlowSource)> = Vec::new();
+        for (plan, source) in source_origins {
+            if let Some((previous_plan, previous_source)) = unique.last().copied()
+                && source.spec.key() == previous_source.spec.key()
+            {
+                if !same_source_spec(previous_plan, &previous_source.spec, plan, &source.spec) {
+                    return Err(ValueFlowPlanError::DuplicateEventKey);
+                }
+            } else {
+                unique.push((plan, source));
+            }
         }
-        let source_ids = SourceKeyIndex::new(&source_specs);
-        let source_activation_triggers =
-            bind_source_activation_triggers(&source_specs, &source_ids)?;
-        let edge_kill_index = build_edge_kill_index(&first.edge_kills, &carrier_ids, &source_ids)?;
-        drop(source_ids);
+        if unique.len() > MAX_VALUE_FLOW_SOURCES {
+            return Err(ValueFlowPlanError::LimitExceeded);
+        }
+        let ids_by_key = unique
+            .iter()
+            .enumerate()
+            .map(|(index, (_, source))| {
+                (
+                    source.spec.key(),
+                    ValueFlowSourceId::try_from_index(index).expect("source ID fits u32"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut source_lists = ValueFlowSourceLists::default();
+        let mut source_specs = Vec::new();
+        for (plan, source) in &unique {
+            let mut spec = source.spec.clone();
+            if let Some(list) = spec.activation_triggers() {
+                let list = source_lists.intern(
+                    plan.source_list(list)
+                        .iter()
+                        .map(|id| ids_by_key[plan.sources[id.index()].spec.key()])
+                        .collect(),
+                );
+                spec = spec.when_sources_reach(list);
+            }
+            source_specs.push(spec);
+        }
+        let mut edge_kills = first.edge_kills.to_vec();
+        for kill in &mut edge_kills {
+            kill.sources = source_lists.intern(
+                first
+                    .source_list(kill.sources)
+                    .iter()
+                    .map(|id| ids_by_key[first.sources[id.index()].spec.key()])
+                    .collect(),
+            );
+        }
+        let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids)?;
         let sources = source_specs
             .into_iter()
-            .zip(source_activation_triggers)
             .enumerate()
-            .map(|(index, (spec, activation_triggers))| {
+            .map(|(index, spec)| {
                 Ok(BoundValueFlowSource {
                     id: ValueFlowSourceId::try_from_index(index)
                         .map_err(|_| ValueFlowPlanError::SourceIdOverflow)?,
                     carrier: *carrier_ids
                         .get(spec.carrier())
                         .ok_or(ValueFlowPlanError::MissingCarrier)?,
-                    activation_triggers,
+                    activation_triggers: spec.activation_triggers(),
                     spec,
                 })
             })
@@ -3848,11 +3937,13 @@ impl ValueFlowPlan {
             fallback_profiles: fallback_profiles.into_boxed_slice(),
             fallback_locations,
             summary_location_bindings: summary_location_bindings.into_boxed_slice(),
+            source_key_order: source_key_order(&sources),
             sources: sources.into_boxed_slice(),
             source_index,
             sinks: sinks.into_boxed_slice(),
             sink_index,
-            edge_kills: first.edge_kills.clone(),
+            source_lists: source_lists.into_lists(),
+            edge_kills: edge_kills.into_boxed_slice(),
             edge_kill_index,
             infeasible_points: first.infeasible_points.clone(),
             snapshot_procedures: first.snapshot_procedures.clone(),
@@ -4962,7 +5053,11 @@ impl ValueFlowPlan {
                     carrier: self.carrier_keys[source.carrier.index()].clone(),
                     proof: source.spec.proof().clone(),
                     completeness: source.spec.completeness().clone(),
-                    triggers: triggers.to_vec().into_boxed_slice(),
+                    triggers: self
+                        .source_list_keys(triggers)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
                 });
         }
         for kill in &self.edge_kills {
@@ -4980,7 +5075,11 @@ impl ValueFlowPlan {
                     target: kill.target,
                     kind: kill.kind,
                     carrier: self.carrier_keys[carrier.index()].clone(),
-                    sources: kill.sources.clone().into_boxed_slice(),
+                    sources: self
+                        .source_list_keys(kill.sources)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
                 });
         }
         builders
@@ -5704,6 +5803,20 @@ impl ValueFlowPlan {
             .flatten()
             .filter(move |_| feasible)
             .map(move |index| &self.local_rules[*index])
+    }
+
+    pub(crate) fn source_list(&self, id: ValueFlowSourceListId) -> &[ValueFlowSourceId] {
+        &self.source_lists[id.index()]
+    }
+
+    fn source_list_keys(&self, id: ValueFlowSourceListId) -> Vec<&ValueFlowEventKey> {
+        let mut keys = self
+            .source_list(id)
+            .iter()
+            .map(|id| self.sources[id.index()].spec.key())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
     }
 
     pub(crate) fn edge_kills(
@@ -8522,17 +8635,82 @@ fn same_summary_location_bindings(left: &ValueFlowPlan, right: &ValueFlowPlan) -
 }
 
 fn same_conditional_source_specs(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
-    let left_sources = left
-        .sources
+    let a = left
+        .source_key_order
         .iter()
-        .filter(|source| source.spec.activation_triggers().is_some())
-        .map(|source| &source.spec);
-    let right_sources = right
-        .sources
+        .map(|id| &left.sources[id.index()])
+        .filter(|source| source.activation_triggers.is_some())
+        .collect::<Vec<_>>();
+    let b = right
+        .source_key_order
         .iter()
-        .filter(|source| source.spec.activation_triggers().is_some())
-        .map(|source| &source.spec);
-    left_sources.eq(right_sources)
+        .map(|id| &right.sources[id.index()])
+        .filter(|source| source.activation_triggers.is_some())
+        .collect::<Vec<_>>();
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| same_source_spec(left, &a.spec, right, &b.spec))
+}
+
+// Full plan equality must preserve source coordinates: retained solver facts
+// name insertion IDs. Propagation compatibility separately compares keys.
+fn same_source_specs(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
+    left.sources.len() == right.sources.len()
+        && left.sources.iter().zip(&right.sources).all(|(a, b)| {
+            a.id == b.id
+                && a.carrier == b.carrier
+                && same_source_spec(left, &a.spec, right, &b.spec)
+        })
+}
+
+fn same_keyed_source_specs(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
+    left.sources.len() == right.sources.len()
+        && left
+            .source_key_order
+            .iter()
+            .zip(&right.source_key_order)
+            .all(|(a, b)| {
+                let a = &left.sources[a.index()];
+                let b = &right.sources[b.index()];
+                a.carrier == b.carrier && same_source_spec(left, &a.spec, right, &b.spec)
+            })
+}
+
+fn same_source_spec(
+    left: &ValueFlowPlan,
+    a: &ValueFlowSourceSpec,
+    right: &ValueFlowPlan,
+    b: &ValueFlowSourceSpec,
+) -> bool {
+    a.key() == b.key()
+        && a.point() == b.point()
+        && a.phase() == b.phase()
+        && a.carrier() == b.carrier()
+        && a.proof() == b.proof()
+        && a.completeness() == b.completeness()
+        && a.dispatch_obligations() == b.dispatch_obligations()
+        && a.activation_triggers()
+            .map(|list| left.source_list_keys(list))
+            == b.activation_triggers()
+                .map(|list| right.source_list_keys(list))
+}
+
+fn hash_source_spec<H: std::hash::Hasher>(
+    plan: &ValueFlowPlan,
+    spec: &ValueFlowSourceSpec,
+    state: &mut H,
+) {
+    spec.key().hash(state);
+    spec.point().hash(state);
+    spec.phase().hash(state);
+    spec.carrier().hash(state);
+    spec.proof().hash(state);
+    spec.completeness().hash(state);
+    spec.activation_triggers()
+        .map(|list| plan.source_list_keys(list))
+        .hash(state);
+    spec.dispatch_obligations().hash(state);
 }
 
 fn relation_kind_rank(kind: ValueFlowRelationKind) -> u8 {
@@ -8597,7 +8775,12 @@ fn call_rule_rank(kind: CallFlowRuleKind) -> u8 {
     }
 }
 
-fn compare_edge_kills(left: &ValueFlowEdgeKillSpec, right: &ValueFlowEdgeKillSpec) -> Ordering {
+fn compare_edge_kills(
+    left: &ValueFlowEdgeKillSpec,
+    right: &ValueFlowEdgeKillSpec,
+    sources: &[ValueFlowSourceSpec],
+    lists: &ValueFlowSourceLists,
+) -> Ordering {
     compare_points(&left.point, &right.point)
         .then_with(|| left.target.cmp(&right.target))
         .then_with(|| left.kind.label().cmp(right.kind.label()))
@@ -8607,7 +8790,18 @@ fn compare_edge_kills(left: &ValueFlowEdgeKillSpec, right: &ValueFlowEdgeKillSpe
                 .ok()
                 .cmp(&right.carrier.stable_key().ok())
         })
-        .then_with(|| left.sources.cmp(&right.sources))
+        .then_with(|| {
+            let keys = |list| {
+                let mut keys = lists
+                    .get(list)
+                    .iter()
+                    .map(|id| sources[id.index()].key())
+                    .collect::<Vec<_>>();
+                keys.sort_unstable();
+                keys
+            };
+            keys(left.sources).cmp(&keys(right.sources))
+        })
 }
 
 fn normalize_summary_edge_kills(
@@ -8647,97 +8841,49 @@ fn normalize_summary_conditional_sources(
     rows.into_boxed_slice()
 }
 
-// Source IDs follow the validated, sorted source-key order. Share this borrowed
-// index across activation and edge-kill binding, then drop it before moving specs.
-struct SourceKeyIndex<'a> {
-    sources: &'a [ValueFlowSourceSpec],
-    ids: std::cell::OnceCell<HashMap<&'a ValueFlowEventKey, ValueFlowSourceId>>,
+fn source_key_order(sources: &[BoundValueFlowSource]) -> Box<[ValueFlowSourceId]> {
+    let mut ids = sources.iter().map(|source| source.id).collect::<Vec<_>>();
+    ids.sort_unstable_by_key(|id| sources[id.index()].spec.key());
+    ids.into_boxed_slice()
 }
 
-impl<'a> SourceKeyIndex<'a> {
-    fn new(sources: &'a [ValueFlowSourceSpec]) -> Self {
-        Self {
-            sources,
-            ids: std::cell::OnceCell::new(),
+fn duplicate_source_keys(sources: &[ValueFlowSourceSpec]) -> bool {
+    let mut keys = HashSet::default();
+    sources.iter().any(|source| !keys.insert(source.key()))
+}
+
+fn validate_source_lists(
+    sources: &[ValueFlowSourceSpec],
+    kills: &[ValueFlowEdgeKillSpec],
+    lists: &ValueFlowSourceLists,
+) -> Result<(), ValueFlowPlanError> {
+    let valid = |list| {
+        let ids = lists.get(list);
+        !ids.is_empty() && ids.iter().all(|id| id.index() < sources.len())
+    };
+    for source in sources {
+        if source
+            .activation_triggers()
+            .is_some_and(|list| !valid(list))
+        {
+            return Err(ValueFlowPlanError::InvalidSourceActivation);
         }
     }
-
-    fn sort_keys(&self, keys: &mut [ValueFlowEventKey]) {
-        // IDs have the same order as the complete keys. Cache one lookup per
-        // key instead of comparing full locators throughout the sort. Missing
-        // keys remain rejected by the subsequent structured kill validation.
-        keys.sort_by_cached_key(|key| self.get(key));
+    if kills.iter().any(|kill| !valid(kill.sources)) {
+        return Err(ValueFlowPlanError::InvalidEdgeKill);
     }
-
-    fn get(&self, key: &ValueFlowEventKey) -> Option<ValueFlowSourceId> {
-        self.ids
-            .get_or_init(|| {
-                self.sources
-                    .iter()
-                    .enumerate()
-                    .map(|(index, source)| {
-                        (
-                            source.key(),
-                            ValueFlowSourceId::try_from_index(index)
-                                .expect("validated source count fits the source ID domain"),
-                        )
-                    })
-                    .collect()
-            })
-            .get(key)
-            .copied()
-    }
-}
-
-fn bind_source_activation_triggers(
-    sources: &[ValueFlowSourceSpec],
-    source_ids: &SourceKeyIndex<'_>,
-) -> Result<Vec<Option<Box<[ValueFlowSourceId]>>>, ValueFlowPlanError> {
-    sources
-        .iter()
-        .map(|source| {
-            let Some(triggers) = source.activation_triggers() else {
-                return Ok(None);
-            };
-            if triggers.is_empty() {
-                return Err(ValueFlowPlanError::InvalidSourceActivation);
-            }
-            let mut previous = None;
-            let bound = triggers
-                .iter()
-                .map(|trigger| {
-                    let id = source_ids
-                        .get(trigger)
-                        .ok_or(ValueFlowPlanError::InvalidSourceActivation)?;
-                    // IDs preserve the checked source-key ordering, so this also
-                    // rejects duplicate or out-of-order trigger keys.
-                    if previous.is_some_and(|previous| previous >= id) {
-                        return Err(ValueFlowPlanError::InvalidSourceActivation);
-                    }
-                    previous = Some(id);
-                    Ok(id)
-                })
-                .collect::<Result<Box<[_]>, _>>()?;
-            Ok(Some(bound))
-        })
-        .collect()
+    Ok(())
 }
 
 fn build_edge_kill_index(
     specs: &[ValueFlowEdgeKillSpec],
     carrier_ids: &HashMap<ValueFlowCarrier, ValueFlowCarrierId>,
-    sources: &SourceKeyIndex<'_>,
 ) -> Result<EdgeKillIndex, ValueFlowPlanError> {
     let mut by_edge = HashMap::<EdgeKillKey, Vec<BoundValueFlowEdgeKill>>::default();
     for spec in specs {
         let carrier = *carrier_ids
             .get(&spec.carrier)
             .ok_or(ValueFlowPlanError::MissingCarrier)?;
-        let source_ids = spec
-            .sources
-            .iter()
-            .map(|key| sources.get(key).ok_or(ValueFlowPlanError::InvalidEdgeKill))
-            .collect::<Result<Box<[_]>, _>>()?;
         by_edge
             .entry(EdgeKillKey {
                 point: spec.point.clone(),
@@ -8747,7 +8893,7 @@ fn build_edge_kill_index(
             .or_default()
             .push(BoundValueFlowEdgeKill {
                 carrier,
-                sources: source_ids,
+                sources: spec.sources,
             });
     }
     Ok(EdgeKillIndex {
@@ -8778,9 +8924,11 @@ mod activation_properties {
     use crate::analyzer::{AnalyzerConfig, Language};
     use crate::inline_project::InlineTestProject;
     use crate::value_flow::ValueFlowEventKind;
+    use brokk_bifrost_test_macros::hardwon;
     use proptest::prelude::*;
 
     #[test]
+    #[hardwon("#5113: guard plans replicated full source keys in every kill and trigger list")]
     fn source_binding_round_trips_keys_and_rejects_missing_sources() {
         // Materialize once; generated cases only exercise immutable event keys.
         let project = InlineTestProject::with_language(Language::Go)
@@ -8837,50 +8985,46 @@ mod activation_properties {
             count in 1u32..65,
             ordinals in prop::collection::vec(0u32..128, 1..33),
         )| {
-            let mut sources = (0..count).map(&source).collect::<Vec<_>>();
-            let triggers = ordinals.iter().map(|ordinal| {
-                sources[(ordinal % count) as usize].key().clone()
-            }).collect();
-            sources.push(source(count).when_sources_reach(triggers));
-            sources.sort_by(|left, right| left.key().cmp(right.key()));
-            let index = SourceKeyIndex::new(&sources);
-            let bound = bind_source_activation_triggers(&sources, &index).expect("all triggers exist");
-            let carrier_id = ValueFlowCarrierId::try_from_index(0).expect("first carrier");
-            let carriers = [(carrier.clone(), carrier_id)].into_iter().collect();
-            let mut kill = ValueFlowEdgeKillSpec {
-                point: entry.clone(), target: entry.id(), kind: ControlEdgeKind::Normal,
-                carrier: carrier.clone(),
-                sources: ordinals.iter().map(|ordinal| sources[(ordinal % count) as usize].key().clone()).collect(),
+            let mut sources = ValueFlowSources::from((0..count).rev().map(&source).collect::<Vec<_>>());
+            let ids = ordinals.iter().map(|ordinal| ValueFlowSourceId::new(ordinal % count)).collect::<Vec<_>>();
+            let list = sources.intern_list(ids.clone());
+            let mut repeated = ids.clone(); repeated.reverse(); repeated.extend(ids);
+            prop_assert_eq!(list, sources.intern_list(repeated));
+            sources.push(source(count).when_sources_reach(list));
+            prop_assert!(validate_source_lists(&sources.specs, &[], &sources.lists).is_ok());
+            let mut expected = ordinals.iter().map(|ordinal| source(count - 1 - ordinal % count).key().clone()).collect::<Vec<_>>();
+            expected.sort_unstable(); expected.dedup();
+            let mut restored = sources.lists.get(list).iter().map(|id| sources.specs[id.index()].key().clone()).collect::<Vec<_>>();
+            restored.sort_unstable();
+            prop_assert_eq!(restored, expected);
+            let mut reordered = ValueFlowSources::from(sources.specs.iter().rev().cloned().collect::<Vec<_>>());
+            // A different list-allocation order must not alter input identity.
+            reordered.intern_list(Vec::new());
+            let reordered_triggers = sources.lists.get(list).iter().map(|id|
+                reordered.id_for_key(sources.specs[id.index()].key()).expect("source key is retained")
+            ).collect();
+            let reordered_list = reordered.intern_list(reordered_triggers);
+            reordered.specs[0] = reordered.specs[0].clone().when_sources_reach(reordered_list);
+            let first = ValueFlowPlan::try_new(root.clone(), Vec::new(), Vec::new(), sources.clone(), Vec::new()).expect("conditional plan");
+            let second = ValueFlowPlan::try_new(root.clone(), Vec::new(), Vec::new(), reordered, Vec::new()).expect("reordered conditional plan");
+            prop_assert!(first.has_same_inputs(&second));
+            prop_assert_ne!(&first, &second);
+            let hash = |plan: &ValueFlowPlan| {
+                let mut state = std::collections::hash_map::DefaultHasher::new();
+                plan.hash(&mut state);
+                std::hash::Hasher::finish(&state)
             };
-            let mut expected = kill.sources.clone();
-            expected.sort();
-            expected.dedup();
-            index.sort_keys(&mut kill.sources);
-            kill.sources.dedup();
-            prop_assert_eq!(&kill.sources, &expected);
-            let kills = build_edge_kill_index(std::slice::from_ref(&kill), &carriers, &index).expect("valid kill");
-            let bound_kill = &kills.by_edge.values().next().expect("one edge")[0];
-            prop_assert_eq!(bound_kill.carrier, carrier_id);
-            prop_assert_eq!(bound_kill.sources.iter().map(|id| sources[id.get() as usize].key()).collect::<Vec<_>>(), kill.sources.iter().collect::<Vec<_>>());
-            kill.sources.push(source(count + 1).key().clone());
-            prop_assert!(matches!(build_edge_kill_index(&[kill], &carriers, &index), Err(ValueFlowPlanError::InvalidEdgeKill)));
-            drop(index);
-            prop_assert_eq!(bound.len(), sources.len());
-            for (spec, ids) in sources.iter().zip(&bound) {
-                match (spec.activation_triggers(), ids) {
-                    (None, None) => {}
-                    (Some(keys), Some(ids)) => {
-                        let restored = ids.iter().map(|id| sources[id.get() as usize].key())
-                            .collect::<Vec<_>>();
-                        prop_assert_eq!(restored, keys.iter().collect::<Vec<_>>());
-                    }
-                    _ => prop_assert!(false, "conditionality changed"),
-                }
-            }
-            let missing = source(count + 1).key().clone();
-            sources[count as usize] = source(count).when_sources_reach(vec![missing]);
-            prop_assert!(matches!(bind_source_activation_triggers(&sources, &SourceKeyIndex::new(&sources)),
-                Err(ValueFlowPlanError::InvalidSourceActivation)));
+            prop_assert_eq!(hash(&first), hash(&second));
+            let invalid = sources.intern_list(vec![ValueFlowSourceId::new(count + 1)]);
+            sources.specs[count as usize] = source(count).when_sources_reach(invalid);
+            prop_assert!(matches!(validate_source_lists(&sources.specs, &[], &sources.lists), Err(ValueFlowPlanError::InvalidSourceActivation)));
+            sources.specs[count as usize] = source(count).when_sources_reach(list);
+            let kill = ValueFlowEdgeKillSpec {
+                point: entry.clone(), target: entry.id(), kind: ControlEdgeKind::Normal,
+                carrier: carrier.clone(), sources: invalid,
+            };
+            prop_assert!(matches!(validate_source_lists(&sources.specs, &[kill], &sources.lists), Err(ValueFlowPlanError::InvalidEdgeKill)));
+
         });
     }
 }

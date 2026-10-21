@@ -444,7 +444,7 @@ jobs:
             --field qualification_manifest_sha256="$QUALIFICATION_MANIFEST_SHA256" \
             --field dispatch_nonce="$DISPATCH_NONCE"
           expected_title="Publish npm ${RELEASE_TAG} [${DISPATCH_NONCE}]"
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             gh run list --repo "$GITHUB_REPOSITORY" --workflow publish-npm.yml \
               --event workflow_dispatch --branch master --limit 10 \
               --json databaseId,displayTitle > "$RUNNER_TEMP/npm-runs.json"
@@ -801,7 +801,7 @@ jobs:
 
   publish-crate-rql:
     name: publish RQL crate
-    needs: [release-context, promote-qualification, publish-crate-flow]
+    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-cpp-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -815,15 +815,191 @@ jobs:
       qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
     permissions: { contents: read, actions: read, id-token: write }
 
-  publish-crate-analysis:
-    name: publish analysis crate
+  publish-crate-semantic:
+    name: publish semantic crate
     needs: [release-context, promote-qualification, publish-crate-core, publish-crate-go, publish-crate-cpp, publish-crate-js-ts, publish-crate-jvm, publish-crate-csharp, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-semantic
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-analysis:
+    name: publish analysis crate
+    needs: [release-context, promote-qualification, publish-crate-core, publish-crate-go, publish-crate-cpp, publish-crate-js-ts, publish-crate-jvm, publish-crate-csharp, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust, publish-crate-semantic, publish-crate-store]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-store:
+    name: publish store crate
+    needs: [release-context, promote-qualification, publish-crate-core, publish-crate-semantic]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-store
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-cpp-analysis:
+    name: publish C++ analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-cpp-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-csharp-analysis:
+    name: publish C# analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-csharp-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-php-analysis:
+    name: publish PHP analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-php-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-python-analysis:
+    name: publish Python analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-python-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-ruby-analysis:
+    name: publish Ruby analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-ruby-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-js-ts-analysis:
+    name: publish JavaScript and TypeScript analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-js-ts-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-go-analysis:
+    name: publish Go analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-go-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-rust-analysis:
+    name: publish Rust analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-rust-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+  publish-crate-tools:
+    name: publish tools crate
+    needs: [release-context, promote-qualification, publish-crate-ruby-analysis, publish-crate-cpp-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-tools
       qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
       qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
       qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
@@ -849,7 +1025,7 @@ jobs:
 
   publish-crate-policy:
     name: publish policy crate
-    needs: [release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs]
+    needs: [release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs, publish-crate-tools, publish-crate-rust-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -881,7 +1057,7 @@ jobs:
 
   publish-crate-semantic-packs:
     name: publish semantic packs crate
-    needs: [release-context, promote-qualification, publish-crate-flow]
+    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -897,7 +1073,7 @@ jobs:
 
   publish-crate-mcp:
     name: publish MCP crate
-    needs: [release-context, promote-qualification, publish-crate-runtime]
+    needs: [release-context, promote-qualification, publish-crate-runtime, publish-crate-tools]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -913,7 +1089,7 @@ jobs:
 
   publish-crate-facade:
     name: publish facade crate
-    needs: [release-context, promote-qualification, publish-crate-mcp]
+    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

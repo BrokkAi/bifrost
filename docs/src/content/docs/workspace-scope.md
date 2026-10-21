@@ -60,7 +60,8 @@ Bifrost builds the workspace file inventory this way:
 Some files stay in the inventory but are never parsed, so they get no code
 intelligence even when no ignore rule matches them:
 
-- Binary files: a file that contains a NUL byte.
+- Binary files: a file that contains a NUL byte, unless
+  `BIFROST_ADMIT_NUL_BYTES=1` is set.
 - Files with overlong structural lines, such as minified JavaScript bundles.
   The default limit is 16000 bytes. Set `BIFROST_MAX_LINE_LENGTH` to apply a
   strict physical-line limit, or to `0` to turn the line limit off. See

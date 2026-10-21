@@ -33,8 +33,8 @@ use crate::analyzer::semantic::{
     SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticCallSite, SemanticCapability,
     SemanticEffect, SemanticEvent, SemanticExecutionBudget, SemanticExecutionBudgetSnapshot,
     SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticRole, SemanticValue,
-    SemanticWork, SourceMapping, SourceMappingKind, StructuralNodeIdentity, ValueAtPoint,
-    ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind, ValueHandle, ValueId,
+    SemanticWork, SourceMapping, SourceMappingKind, SourceSpan, StructuralNodeIdentity,
+    ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind, ValueHandle, ValueId,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledConcurrencyEffect, CompiledSummaryInput, Completeness,
@@ -130,6 +130,44 @@ impl SemanticQueryQuality {
         }
         Some(reasons.join("; "))
     }
+}
+
+/// A query result address; it never retains the addressed executable artifact.
+#[derive(Debug, Clone)]
+pub(super) struct SemanticProcedureReferenceValue {
+    pub(super) file: ProjectFile,
+    pub(super) key: crate::analyzer::semantic::SemanticArtifactKey,
+    pub(super) locator: SemanticLocator,
+    pub(super) source_range_holes: Box<[SourceSpan]>,
+    pub(super) public: CodeQueryProcedure,
+    pub(super) byte_span: std::ops::Range<usize>,
+}
+
+impl SemanticProcedureReferenceValue {
+    pub(super) fn public_ref(&self) -> super::CodeQueryResultRef {
+        super::CodeQueryResultRef::Procedure {
+            id: self.public.id.clone(),
+            path: self.public.path.clone(),
+            procedure_kind: self.public.procedure_kind,
+            range: self.public.range,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SemanticProgramPointReferenceValue {
+    pub(super) procedure: SemanticProcedureReferenceValue,
+    pub(super) id: ProgramPointId,
+    pub(super) public: CodeQueryProgramPoint,
+    pub(super) byte_span: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SemanticControlEdgeReferenceValue {
+    pub(super) procedure: SemanticProcedureReferenceValue,
+    pub(super) id: ControlEdgeId,
+    pub(super) public: CodeQueryControlEdge,
+    pub(super) byte_span: std::ops::Range<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,7 +335,6 @@ pub(super) struct SemanticQueryContext<'a> {
     artifact_window_file: Option<ProjectFile>,
     initial_artifact_lease_error: Option<crate::analyzer::semantic::SemanticArtifactLeaseError>,
     promote_artifact_windows: bool,
-    execution_budget_exhausted: bool,
     materialized_files: HashSet<ProjectFile>,
     cache_hits: usize,
     active_retained_bytes: usize,
@@ -635,7 +672,6 @@ impl<'a> SemanticQueryContext<'a> {
             artifact_window_file: None,
             initial_artifact_lease_error,
             promote_artifact_windows,
-            execution_budget_exhausted: false,
             materialized_files: HashSet::default(),
             cache_hits: 0,
             active_retained_bytes: 0,
@@ -994,6 +1030,7 @@ impl<'a> SemanticQueryContext<'a> {
         let mut arms = Vec::new();
         let mut call_contexts = Vec::with_capacity(result.observations().len());
         let mut unnamed_boundaries = Vec::new();
+        let mut coverage_reasons = Vec::new();
         for observation in result.observations() {
             let call = observation.call();
             let semantic_call = call
@@ -1020,6 +1057,15 @@ impl<'a> SemanticQueryContext<'a> {
                     .collect(),
             });
             for candidate in observation.dispatch().candidates() {
+                if candidate.proof().label() != "proven"
+                    || candidate.completeness().label() != "complete"
+                {
+                    coverage_reasons.push(format!(
+                        "candidate: proof={:?}, completeness={:?}",
+                        candidate.proof(),
+                        candidate.completeness()
+                    ));
+                }
                 let target = candidate.target();
                 let locator = target.semantics().locator();
                 arms.push(DispatchArm {
@@ -1047,6 +1093,12 @@ impl<'a> SemanticQueryContext<'a> {
                 });
             }
             for boundary in observation.dispatch().boundaries() {
+                coverage_reasons.push(format!(
+                    "{} boundary: proof={:?}, completeness={:?}",
+                    boundary.kind.label(),
+                    boundary.proof,
+                    boundary.completeness
+                ));
                 // An unresolved or truncated residual arm names no target. It
                 // is already reflected in the site's coverage; inventing a row
                 // for it would claim a target that does not exist. It is
@@ -1087,6 +1139,7 @@ impl<'a> SemanticQueryContext<'a> {
         DispatchSiteAnswer {
             outcome: label,
             coverage,
+            coverage_reasons,
             call_site_count: result.observations().len(),
             semantic_unsupported,
             exceeded_limit,
@@ -1358,37 +1411,13 @@ impl<'a> SemanticQueryContext<'a> {
                 return None;
             }
             self.traversal_steps = self.traversal_steps.saturating_add(1);
-            if self.traversal_steps > self.limits.max_traversal_steps {
-                self.exhaust_traversal_budget(file, "call-shape-to-result lookup");
-                drop(candidates);
-                if let Err(error) = self.retain_source_call_index_entry(
-                    file,
-                    None,
-                    live_reservation,
-                    reservation_bytes,
-                ) {
-                    self.reject_retained_bytes_error(file, error);
-                }
-                return None;
-            }
+
             let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
                 continue;
             };
             for call in procedure.call_sites() {
                 self.traversal_steps = self.traversal_steps.saturating_add(1);
-                if self.traversal_steps > self.limits.max_traversal_steps {
-                    self.exhaust_traversal_budget(file, "call-shape-to-result lookup");
-                    drop(candidates);
-                    if let Err(error) = self.retain_source_call_index_entry(
-                        file,
-                        None,
-                        live_reservation,
-                        reservation_bytes,
-                    ) {
-                        self.reject_retained_bytes_error(file, error);
-                    }
-                    return None;
-                }
+
                 let mapping = procedure
                     .source_mapping(call.source)
                     .expect("validated semantic call has a source mapping");
@@ -1744,9 +1773,7 @@ impl<'a> SemanticQueryContext<'a> {
         let lookup = procedures_for_source_ranges(
             &artifact,
             &ranges,
-            self.limits
-                .max_traversal_steps
-                .saturating_sub(self.traversal_steps),
+            usize::MAX,
             self.cancellation.unwrap_or(&self.uncancelled),
         );
         self.traversal_steps = self.traversal_steps.saturating_add(lookup.examined);
@@ -1951,6 +1978,172 @@ impl<'a> SemanticQueryContext<'a> {
         false
     }
 
+    /// Inventory references are the complete result of this producing step.
+    /// Python reuses its adapter inventory; other adapters retain the existing
+    /// path until they expose the same pre-lowering inventory hook.
+    pub(super) fn procedure_references(
+        &mut self,
+        file: &ProjectFile,
+    ) -> Vec<SemanticProcedureReferenceValue> {
+        let Some(provider) = self.workspace.program_semantics_provider_for_file(file) else {
+            return Vec::new();
+        };
+        let snapshot = match provider.current_artifact_source(file, self.limits.max_source_bytes) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.exhaust_traversal_budget(file, "procedure inventory source bytes");
+                return Vec::new();
+            }
+            Err(error) => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    &error.to_string(),
+                );
+                return Vec::new();
+            }
+        };
+        let key = snapshot.key().clone();
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        let outcome = provider.procedure_inventory(file, &mut request);
+        let outcome = match outcome {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return Vec::new(),
+            Err(error) => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    &error.to_string(),
+                );
+                return Vec::new();
+            }
+        };
+        if !outcome.is_complete() {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "procedure identity inventory did not complete",
+            );
+        }
+        let Some(identities) = outcome.available_value() else {
+            return Vec::new();
+        };
+        let Some(source) = self.workspace.analyzer().indexed_source(file) else {
+            return Vec::new();
+        };
+        if ContentIdentity::hash_bytes(source.as_bytes()) != key.revision().content() {
+            self.push_source_generation_changed(file);
+            return Vec::new();
+        }
+        let source = SemanticSourceSnapshot::new(source);
+        identities
+            .iter()
+            .map(|entry| {
+                let locator = &entry.locator;
+                let kind = entry.kind;
+                let wire_id =
+                    crate::analyzer::semantic::SemanticProcedureReference::public_digest_for(
+                        &key, locator,
+                    )
+                    .to_string();
+                let span = locator.anchor().span();
+                let range = super::render::range_for_offsets(
+                    &source.source,
+                    &source.line_starts,
+                    span.start_byte() as usize,
+                    span.end_byte() as usize,
+                );
+                SemanticProcedureReferenceValue {
+                    file: file.clone(),
+                    key: key.clone(),
+                    locator: locator.clone(),
+                    source_range_holes: entry.source_range_holes.clone().into_boxed_slice(),
+                    byte_span: span.start_byte() as usize..span.end_byte() as usize,
+                    public: CodeQueryProcedure {
+                        id: wire_id,
+                        artifact_id: key.public_fingerprint().to_string(),
+                        path: crate::path_utils::rel_path_string(file),
+                        language: crate::analyzer::common::language_for_file(file).config_label(),
+                        dialect: key.language().stable_label(),
+                        procedure_kind: kind.label(),
+                        range,
+                        evidence: CodeQuerySemanticEvidence::new(
+                            CodeQuerySemanticProof::Proven,
+                            CodeQuerySemanticCompleteness::Complete,
+                            None,
+                        ),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Producer identity checks contain no executable rows and need not
+    /// prevent the next consuming step from opening its first file window.
+    pub(super) fn finish_reference_inventory(&mut self) {
+        if self.cache.is_empty() {
+            self.indexed_source_identities.clear();
+        }
+    }
+
+    pub(super) fn resolve_point_reference(
+        &mut self,
+        reference: &SemanticProgramPointReferenceValue,
+    ) -> Option<SemanticProgramPointValue> {
+        let procedure = self.resolve_procedure_reference(&reference.procedure)?;
+        let point = procedure.point_value(reference.id)?;
+        if point.public().id != reference.public.id || point.byte_span() != reference.byte_span {
+            self.push_source_generation_changed(&reference.procedure.file);
+            return None;
+        }
+        Some(point)
+    }
+
+    pub(super) fn resolve_edge_reference(
+        &mut self,
+        reference: &SemanticControlEdgeReferenceValue,
+    ) -> Option<SemanticControlEdgeValue> {
+        let procedure = self.resolve_procedure_reference(&reference.procedure)?;
+        let edge = procedure.edge_value(reference.id)?;
+        if edge.public().id != reference.public.id || edge.byte_span() != reference.byte_span {
+            self.push_source_generation_changed(&reference.procedure.file);
+            return None;
+        }
+        Some(edge)
+    }
+
+    pub(super) fn resolve_procedure_reference(
+        &mut self,
+        reference: &SemanticProcedureReferenceValue,
+    ) -> Option<SemanticProcedureValue> {
+        let (artifact, source, quality) = self.materialize(&reference.file)?;
+        if artifact.key() != &reference.key {
+            self.push_source_generation_changed(&reference.file);
+            return None;
+        }
+        let Some(id) = artifact.procedure_id(&reference.locator) else {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::NoEnclosingProcedure,
+                CodeQueryDiagnosticImpact::Incomplete,
+                &reference.file,
+                "referenced procedure is unavailable in this materialization",
+            );
+            return None;
+        };
+        Some(SemanticProcedureValue {
+            handle: artifact
+                .procedure_handle(id)
+                .expect("indexed procedure exists"),
+            file: reference.file.clone(),
+            source,
+            quality,
+        })
+    }
+
     fn procedure_of_declaration(
         &mut self,
         declaration: &DeclarationValue,
@@ -1968,9 +2161,7 @@ impl<'a> SemanticQueryContext<'a> {
             self.workspace.analyzer(),
             &declaration.unit,
             &artifact,
-            self.limits
-                .max_traversal_steps
-                .saturating_sub(self.traversal_steps),
+            usize::MAX,
             self.cancellation.unwrap_or(&self.uncancelled),
         );
         self.traversal_steps = self.traversal_steps.saturating_add(lookup.examined);
@@ -2013,12 +2204,9 @@ impl<'a> SemanticQueryContext<'a> {
         if !self.charge_consumer_traversal(file, 0, OPERATION) {
             return None;
         }
-        let available = self
-            .limits
-            .max_traversal_steps
-            .saturating_sub(self.traversal_steps);
+        let available = usize::MAX;
         let mut remaining = available;
-        let result = crate::analyzer::usages::get_definition::java_expression_lambda_result_use(
+        let result = crate::analyzer::usages::get_definition::java::lambda::java_expression_lambda_result_use(
             analyzer,
             self.active_semantic_model_snapshot.as_deref(),
             file,
@@ -2037,9 +2225,9 @@ impl<'a> SemanticQueryContext<'a> {
             .flatten()
     }
 
-    /// Charge a bounded consumer walk over rows in an already retained
-    /// artifact. Materialization pays for the rows themselves; this ledger is
-    /// the independent per-query bound on how many of them consumers inspect.
+    /// Record visits to rows in an already retained artifact. Visits are
+    /// non-refusing telemetry; resident refusal and cancellation still stop
+    /// consumers of unavailable or interrupted input.
     pub(super) fn charge_consumer_traversal(
         &mut self,
         file: &ProjectFile,
@@ -2061,15 +2249,7 @@ impl<'a> SemanticQueryContext<'a> {
             );
             return false;
         }
-        if steps
-            > self
-                .limits
-                .max_traversal_steps
-                .saturating_sub(self.traversal_steps)
-        {
-            self.exhaust_traversal_budget(file, operation);
-            return false;
-        }
+
         self.traversal_steps = self.traversal_steps.saturating_add(steps);
         true
     }
@@ -2187,6 +2367,13 @@ impl<'a> SemanticQueryContext<'a> {
             control_edges: saturating_u64(used.control_edges),
             nested_entries: saturating_u64(used.nested_entries),
             retained_bytes: saturating_u64(self.peak_retained_bytes),
+            cumulative: used,
+            resident_peaks: self.budget.resident_peak(),
+            root_work_peaks: self.budget.root_work_peak(),
+            resident_nested_entries_peak: saturating_u64(
+                self.budget.resident_peak().nested_entries,
+            ),
+            resident_retained_bytes_peak: saturating_u64(self.peak_retained_bytes),
             traversal_steps: saturating_u64(self.traversal_steps),
             budget_exhausted: self.budget_exhausted
                 || self.typestate.semantic_budget_exhausted()
@@ -3054,6 +3241,15 @@ impl<'a> SemanticQueryContext<'a> {
         }
     }
 
+    pub(super) fn report_no_enclosing_procedure(&mut self, file: &ProjectFile) {
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::NoEnclosingProcedure,
+            CodeQueryDiagnosticImpact::Advisory,
+            file,
+            "no source-backed executable procedure encloses the query input",
+        );
+    }
+
     fn finish_procedure_lookup(
         &mut self,
         file: &ProjectFile,
@@ -3107,12 +3303,7 @@ impl<'a> SemanticQueryContext<'a> {
                 reason.as_ref(),
             );
         } else if candidates.is_empty() && quality.is_complete() {
-            self.push_diagnostic(
-                CodeQueryDiagnosticCode::NoEnclosingProcedure,
-                CodeQueryDiagnosticImpact::Advisory,
-                file,
-                "no source-backed executable procedure encloses the query input",
-            );
+            self.report_no_enclosing_procedure(file);
         }
         candidates
             .into_iter()
@@ -3170,10 +3361,7 @@ impl<'a> SemanticQueryContext<'a> {
         max_outputs: usize,
     ) -> Vec<SemanticControlEdgeValue> {
         let edge_count = edges.len();
-        let remaining_traversal = self
-            .limits
-            .max_traversal_steps
-            .saturating_sub(self.traversal_steps);
+        let remaining_traversal = usize::MAX;
         let admitted = edge_count.min(max_outputs).min(remaining_traversal);
         let mut output = Vec::with_capacity(admitted);
         let procedure = point.handle.procedure();
@@ -3415,7 +3603,6 @@ impl<'a> SemanticQueryContext<'a> {
         };
         if !admitted {
             self.budget_exhausted = true;
-            self.execution_budget_exhausted = true;
             self.cache.insert(
                 file.clone(),
                 CachedSemanticMaterialization::FileBudgetExhausted,
@@ -3610,11 +3797,16 @@ impl<'a> SemanticQueryContext<'a> {
     /// charge. Callers must ensure no emitted pipeline value or trace owns a
     /// handle into these artifacts.
     pub(super) fn release_artifact_window(&mut self) {
+        self.type_flow.release_file_window();
+        self.typestate.release_file_window();
+        self.value_flow.release_file_window();
         self.evict_prepared_source_dispatch();
         if let Some(window) = self.artifact_window.take() {
             window.discard();
         }
         self.cache.clear();
+        self.budget
+            .release_unleased_artifacts(&self.artifact_leases);
         self.indexed_source_identities.clear();
         drop(std::mem::take(&mut self.source_call_indexes));
         self.active_retained_bytes = 0;
@@ -3636,12 +3828,7 @@ impl<'a> SemanticQueryContext<'a> {
             execution_child.charge_traversal(self.traversal_steps),
             "RQL traversal delta must fit the forked execution budget"
         );
-        if self.execution_budget_exhausted && !execution_child.work().exhausted {
-            assert!(
-                !execution_child.charge_traversal(1),
-                "a traversal refusal must leave the forked execution budget exhausted"
-            );
-        }
+
         let execution_charge = execution_child
             .charge_since(&execution_before)
             .expect("a forked execution child extends its exact starting state");
@@ -3819,14 +4006,13 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     fn exhaust_traversal_budget(&mut self, file: &ProjectFile, operation: &str) {
-        self.traversal_steps = self.limits.max_traversal_steps;
+        // An unbounded semantic walk cannot exhaust a work allowance.
         self.budget_exhausted = true;
-        self.execution_budget_exhausted = true;
         self.push_diagnostic(
             CodeQueryDiagnosticCode::SemanticBudgetExhausted,
             CodeQueryDiagnosticImpact::Incomplete,
             file,
-            &format!("semantic traversal-step budget exhausted during {operation}"),
+            &format!("semantic input capacity exhausted during {operation}"),
         );
     }
 
@@ -4102,6 +4288,17 @@ impl CfgQueryAdapter<'_, '_> {
 }
 
 impl SemanticProcedureValue {
+    pub(super) fn reference(&self) -> SemanticProcedureReferenceValue {
+        SemanticProcedureReferenceValue {
+            file: self.file.clone(),
+            key: self.handle.artifact().key().clone(),
+            locator: self.handle.semantics().locator().clone(),
+            source_range_holes: self.handle.semantics().source_range_holes().into(),
+            public: self.public(),
+            byte_span: self.byte_span(),
+        }
+    }
+
     /// Why this procedure cannot support a complete exact downstream
     /// selection, if materialization or enclosing-procedure discovery was
     /// partial. Local row families may still expose proven facts, but must not
@@ -4204,6 +4401,21 @@ impl SemanticProcedureValue {
 }
 
 impl SemanticProgramPointValue {
+    pub(super) fn reference(&self) -> SemanticProgramPointReferenceValue {
+        let procedure = SemanticProcedureValue {
+            handle: self.handle.procedure().clone(),
+            file: self.file.clone(),
+            source: self.source.clone(),
+            quality: self.quality.clone(),
+        };
+        SemanticProgramPointReferenceValue {
+            procedure: procedure.reference(),
+            id: self.handle.id(),
+            public: self.public(),
+            byte_span: self.byte_span(),
+        }
+    }
+
     pub(super) fn exact_selection_incomplete_reason(&self) -> Option<String> {
         self.quality.exact_selection_incomplete_reason()
     }
@@ -4296,6 +4508,21 @@ fn program_point_result_ref(point: CodeQueryProgramPointRef) -> super::CodeQuery
 }
 
 impl SemanticControlEdgeValue {
+    pub(super) fn reference(&self) -> SemanticControlEdgeReferenceValue {
+        let procedure = SemanticProcedureValue {
+            handle: self.handle.procedure().clone(),
+            file: self.file.clone(),
+            source: self.source.clone(),
+            quality: self.quality.clone(),
+        };
+        SemanticControlEdgeReferenceValue {
+            procedure: procedure.reference(),
+            id: self.handle.id(),
+            public: self.public(),
+            byte_span: self.byte_span(),
+        }
+    }
+
     pub(super) fn public(&self) -> CodeQueryControlEdge {
         let procedure = self.handle.procedure();
         let edge = procedure
@@ -4979,8 +5206,8 @@ mod tests {
         leases: &SemanticArtifactLeaseSet,
     ) -> SemanticQueryContext<'a> {
         let parent_scope = parent_semantic.scope_snapshot();
-        let (execution_before, execution_child) = parent_execution
-            .fork_with_additional_limits(limits.max_materialized_files, limits.max_traversal_steps);
+        let (execution_before, execution_child) =
+            parent_execution.fork_with_materialized_file_limit(limits.max_materialized_files);
         SemanticQueryContext::new_with_parent_scope(
             workspace,
             None,
@@ -5061,10 +5288,8 @@ mod tests {
         // test. Keep full semantic authority while independently narrowing the
         // child lease window, as production continuations do.
         let parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(
-            CodeQuerySemanticLimits::default().max_materialized_files,
-            CodeQuerySemanticLimits::default().max_traversal_steps,
-        );
+        let parent_execution =
+            SemanticExecutionBudget::new(CodeQuerySemanticLimits::default().max_materialized_files);
 
         let fitting_limits = CodeQuerySemanticLimits {
             max_retained_bytes: mandatory_bytes + prepared_bytes,
@@ -5241,10 +5466,8 @@ mod tests {
         // standalone-context heuristic derive smaller semantic work lanes from
         // that same number and confound target resolution with lease admission.
         let parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(
-            CodeQuerySemanticLimits::default().max_materialized_files,
-            CodeQuerySemanticLimits::default().max_traversal_steps,
-        );
+        let parent_execution =
+            SemanticExecutionBudget::new(CodeQuerySemanticLimits::default().max_materialized_files);
         let fitting_limits = CodeQuerySemanticLimits {
             max_retained_bytes: fitting_cap,
             ..CodeQuerySemanticLimits::default()
@@ -5377,10 +5600,8 @@ mod tests {
         calibration.release_artifact_window();
 
         let parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(
-            CodeQuerySemanticLimits::default().max_materialized_files,
-            CodeQuerySemanticLimits::default().max_traversal_steps,
-        );
+        let parent_execution =
+            SemanticExecutionBudget::new(CodeQuerySemanticLimits::default().max_materialized_files);
 
         let fitting_limits = CodeQuerySemanticLimits {
             max_retained_bytes: artifact_and_source_bytes + reservation_bytes,
@@ -5446,49 +5667,6 @@ mod tests {
         }));
         drop(artifact);
         refusing.release_artifact_window();
-
-        let mut interrupted = continuation_context(
-            &workspace,
-            &parent_semantic,
-            &parent_execution,
-            CodeQuerySemanticLimits::default(),
-        );
-        interrupted.start_artifact_window(file.clone());
-        let (artifact, _, _) = interrupted
-            .materialize(&file)
-            .expect("the interrupted index materializes its artifact first");
-        let artifact_and_source_bytes = interrupted.physical_retained_bytes();
-        interrupted.limits.max_traversal_steps = interrupted.traversal_steps.saturating_add(1);
-        assert!(interrupted.source_call_index(&file, &artifact).is_none());
-        assert_eq!(
-            interrupted.physical_retained_bytes(),
-            artifact_and_source_bytes
-                + SemanticSourceCallIndex::absent_entry_retained_bytes()
-                    .expect("fixture absent-entry byte arithmetic fits"),
-            "an interrupted build drops candidate storage before retaining its absent entry"
-        );
-        assert_eq!(
-            interrupted.work().retained_bytes,
-            saturating_u64(
-                artifact_and_source_bytes
-                    + SemanticSourceCallIndex::candidate_storage_retained_bytes(
-                        artifact.work().call_sites,
-                    )
-                    .expect("fixture candidate byte arithmetic fits")
-            ),
-            "the high-water mark includes candidate scratch that was genuinely allocated"
-        );
-        let retained_after_interruption = interrupted.physical_retained_bytes();
-        assert!(interrupted.source_call_index(&file, &artifact).is_none());
-        assert_eq!(
-            interrupted.physical_retained_bytes(),
-            retained_after_interruption,
-            "an absent entry prevents rebuilding and recharging the interrupted index"
-        );
-        drop(artifact);
-        interrupted.release_artifact_window();
-        assert_eq!(interrupted.source_call_indexes.capacity(), 0);
-        assert_eq!(interrupted.active_retained_bytes, 0);
     }
 
     #[test]
@@ -5496,7 +5674,7 @@ mod tests {
         let (project, workspace) = receipt_workspace();
         let file = project.file("subject.go");
         let parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(1, 16);
+        let parent_execution = SemanticExecutionBudget::new(1);
         let parent_leases =
             SemanticArtifactLeaseSet::new(CodeQuerySemanticLimits::default().max_retained_bytes);
         let limits = CodeQuerySemanticLimits {
@@ -5534,7 +5712,7 @@ mod tests {
         let (project, workspace) = receipt_workspace();
         let file = project.file("subject.go");
         let mut parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(1, 16);
+        let parent_execution = SemanticExecutionBudget::new(1);
         let mut parent_leases =
             SemanticArtifactLeaseSet::new(CodeQuerySemanticLimits::default().max_retained_bytes);
 
@@ -5634,7 +5812,7 @@ mod tests {
         let first = project.file("first.unsupported");
         let second = project.file("second.unsupported");
         let mut parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(1, 16);
+        let parent_execution = SemanticExecutionBudget::new(1);
 
         let mut first_context = continuation_context(
             &workspace,
@@ -5688,7 +5866,7 @@ mod tests {
         let (project, workspace) = receipt_workspace();
         let file = project.file("subject.go");
         let mut parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(1, 16);
+        let parent_execution = SemanticExecutionBudget::new(1);
         let retained_rejecting_limits = CodeQuerySemanticLimits {
             max_retained_bytes: 1,
             ..CodeQuerySemanticLimits::default()
@@ -5741,7 +5919,7 @@ mod tests {
         let (project, workspace) = receipt_workspace();
         let file = project.file("subject.go");
         let mut parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(1, 16);
+        let parent_execution = SemanticExecutionBudget::new(1);
 
         let calibration_leases =
             SemanticArtifactLeaseSet::new(CodeQuerySemanticLimits::default().max_retained_bytes);
@@ -5861,27 +6039,21 @@ mod tests {
     }
 
     #[test]
-    fn traversal_refusal_replays_the_full_delta_and_exhaustion() {
-        let (project, workspace) = receipt_workspace();
-        let file = project.file("subject.go");
-        let mut parent_semantic = SemanticBudget::default();
-        let parent_execution = SemanticExecutionBudget::new(1, 3);
-        assert!(parent_execution.charge_traversal(1));
-        let limits = CodeQuerySemanticLimits {
-            max_materialized_files: 0,
-            max_traversal_steps: 1,
-            ..CodeQuerySemanticLimits::default()
-        };
-        let mut context =
-            continuation_context(&workspace, &parent_semantic, &parent_execution, limits);
-
-        context.exhaust_traversal_budget(&file, "receipt regression");
-        assert_eq!(context.work().traversal_steps, 1);
-        assert!(context.work().budget_exhausted);
+    fn traversal_telemetry_replays_without_refusal() {
+        let (_project, workspace) = receipt_workspace();
+        let mut parent_semantic = SemanticBudget::uniform(1).unwrap();
+        let parent_execution = SemanticExecutionBudget::new(1);
+        let mut context = continuation_context(
+            &workspace,
+            &parent_semantic,
+            &parent_execution,
+            CodeQuerySemanticLimits::default(),
+        );
+        context.traversal_steps = 2_000_000;
         import_context_charge(&mut parent_semantic, &parent_execution, context);
-
-        assert_eq!(parent_execution.work().traversal_steps, 2);
-        assert!(parent_execution.work().exhausted);
+        assert_eq!(parent_execution.work().traversal_steps, 2_000_000);
+        assert!(!parent_execution.work().exhausted);
+        assert!(parent_semantic.first_refusal().is_none());
     }
 
     fn parallel_edge_artifact(reverse_edges: bool) -> Arc<SemanticArtifact> {

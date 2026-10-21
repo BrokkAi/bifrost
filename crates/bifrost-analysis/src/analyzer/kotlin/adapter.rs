@@ -14,7 +14,8 @@ use brokk_bifrost_jvm::queries::KOTLIN_QUERY_DIRECTORY;
 use tree_sitter::Tree;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct KotlinAdapter;
+#[doc(hidden)]
+pub struct KotlinAdapter;
 
 impl LanguageAdapter for KotlinAdapter {
     fn language(&self) -> Language {

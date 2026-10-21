@@ -383,8 +383,8 @@ To cut a release:
 
    Do not improvise this step. Follow the numbered handoff under
    [Readiness handoff and recovery](#readiness-handoff-and-recovery),
-   which is the authoritative sequence: project, wait for public CI, dispatch
-   `Release readiness` against the exact public commit, inspect the retained
+   which is the authoritative sequence: project, dispatch `Release
+   readiness` against the exact public commit while public CI runs, inspect the retained
    qualification bundle, confirm ancestry with
    `scripts/check-build-ancestry.sh`, and only then create the public tag.
 
@@ -499,9 +499,11 @@ the dependency graph: `brokk-bifrost-core`, then the language crates
 `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
 `brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
 `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (which may
-run in parallel), then `brokk-bifrost-analysis`, then `brokk-bifrost-flow`, then
-`brokk-bifrost-rql` and
-`brokk-bifrost-semantic-packs` in parallel, then `brokk-bifrost-policy`, then
+run in parallel), then `brokk-bifrost-semantic`, then `brokk-bifrost-store`,
+then `brokk-bifrost-analysis`,
+then `brokk-bifrost-go-analysis`, `brokk-bifrost-cpp-analysis`, `brokk-bifrost-csharp-analysis`, `brokk-bifrost-php-analysis`, `brokk-bifrost-python-analysis`, `brokk-bifrost-ruby-analysis`, `brokk-bifrost-rust-analysis`, `brokk-bifrost-js-ts-analysis` and `brokk-bifrost-flow` in parallel, then
+`brokk-bifrost-tools` and `brokk-bifrost-semantic-packs` in parallel, then
+`brokk-bifrost-rql`, then `brokk-bifrost-policy`, then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
 stable `brokk-bifrost` facade last. Each publication waits for crates.io to
 expose the exact version and archive checksum before its dependents proceed.
@@ -522,14 +524,25 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-python` | `crates/bifrost-python/Cargo.toml` | 2 |
 | `brokk-bifrost-ruby` | `crates/bifrost-ruby/Cargo.toml` | 2 |
 | `brokk-bifrost-rust` | `crates/bifrost-rust/Cargo.toml` | 2 |
-| `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 3 |
-| `brokk-bifrost-flow` | `crates/bifrost-flow/Cargo.toml` | 4 |
-| `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 5 |
-| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 5 |
-| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 6 |
-| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 7 |
-| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 8 |
-| `brokk-bifrost` | `Cargo.toml` | 9 |
+| `brokk-bifrost-semantic` | `crates/bifrost-semantic/Cargo.toml` | 3 |
+| `brokk-bifrost-store` | `crates/bifrost-store/Cargo.toml` | 1 |
+| `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 4 |
+| `brokk-bifrost-go-analysis` | `crates/bifrost-go-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-csharp-analysis` | `crates/bifrost-csharp-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-php-analysis` | `crates/bifrost-php-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-cpp-analysis` | `crates/bifrost-cpp-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-python-analysis` | `crates/bifrost-python-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-ruby-analysis` | `crates/bifrost-ruby-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-js-ts-analysis` | `crates/bifrost-js-ts-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-rust-analysis` | `crates/bifrost-rust-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-tools` | `crates/bifrost-tools/Cargo.toml` | 6 |
+| `brokk-bifrost-flow` | `crates/bifrost-flow/Cargo.toml` | 5 |
+| `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 7 |
+| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 7 |
+| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 8 |
+| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 9 |
+| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 10 |
+| `brokk-bifrost` | `Cargo.toml` | 11 |
 
 Before each release, compare this table with the root workspace members and
 package names. Confirm these items for each package:
@@ -605,12 +618,18 @@ Use one explicit handoff from source projection to release publication:
    with a green `Release gate` run, add the one metadata commit, and qualify
    the exact RC head before proceeding. Keep that branch as the release line
    throughout the handoff while master development continues. Land the
-   metadata commit on master through the queue. Public projection has no
-   schedule and runs only when explicitly dispatched for an RC.
-1. Project the release branch's commit to public `master`, then wait for
-   public CI to validate that projection.
+   version and changelog on master through the queue before cutting, so the
+   RC needs no metadata commit of its own: the launcher checksum correction
+   in step 4 is a metadata commit, and an RC may carry only one. Public
+   projection has no schedule and runs only when explicitly dispatched for
+   an RC.
+1. Project the release branch's commit to public `master`.
 2. Dispatch `Release readiness` from the public repository with the exact
-   public commit, release version, and independently observed public head.
+   public commit, release version, and independently observed public head,
+   right away: do not wait for the public CI run the projection started.
+   Readiness builds while CI tests, and its final bundle job waits for that
+   CI run and refuses to assemble a bundle unless it is green. When CI fails
+   on a flake, rerun its failed jobs and then readiness's failed job.
    Select the run whose inputs and `preflight` output match those values; do
    not use the latest run merely because it is latest.
 3. Inspect the retained `release-qualification.json` manifest and its recorded
@@ -623,12 +642,18 @@ Use one explicit handoff from source projection to release publication:
    and tracked source still records the previous release's. Dispatch
    `Sync qualified release metadata` (private repository) with the release
    tag, the qualification run, artifact, digest, the private source commit, and
-   the release branch that commit is the tip of. It reads the sidecars from the
+   the release branch that commit is the tip of, with `dispatch_projection`
+   left on. It reads the sidecars from the
    qualification bundle rather than from published release assets, because at
    this point the tag does not exist yet and the release publishes its assets
    out of that same bundle. It corrects the three tracked checksum projections,
-   commits them to the release branch, projects them to public `master`, and
-   adopts that projection's conclusion, so a failure here means the corrected
+   commits them to the release branch, waits for that commit's CI run, projects
+   them to public `master`, and adopts that projection's conclusion. The
+   correction's CI runs in `checksum` mode (quick policy and the plugin legs,
+   a few minutes), its gate push skips the platform legs, and the verifier
+   takes the gate and full CI evidence from the parent RC head. Do not
+   dispatch it with `dispatch_projection` off to wait for a full RC CI run;
+   none will come, and none is needed. A failure here means the corrected
    digests are not public and the tag must wait. The commit is pushed
    fast-forward only, so a release branch that moved under the run fails the
    operation rather than silently rebasing the correction onto a different
@@ -636,7 +661,10 @@ Use one explicit handoff from source projection to release publication:
    plugins whose committed checksums described the previous release, so a
    fresh marketplace install failed closed with `checksum_mismatch`.
 5. Re-qualify the corrected commit. Dispatch `Release readiness` again against
-   the new public head with `requalify_from_run` set to the run from step 2.
+   the new public head with `requalify_from_run` set to the run from step 2,
+   without waiting for the public CI run the re-projection started: the
+   correction is checksum-only and the source run already required green
+   public CI for the built commit.
    Nothing is rebuilt: it verifies the correction touches only those three
    paths and re-labels the existing bundle for the corrected commit. That is
    sound because the build identity names the last commit that touched a
@@ -682,9 +710,9 @@ themselves while the existing qualification remains valid. Its contract:
 2. Land the repair on private `master`, then dispatch **Prepare open-core
    projection** with `workflow_recovery` set to true and the exact current
    public head. The projection proves, byte for byte, that the candidate
-   differs from that public head only under `.github/workflows/` and then
-   skips the projected Rust build gate. If anything else changed, the proof
-   step fails and a full projection is required.
+   differs from that public head only under `.github/workflows/`. If
+   anything else changed, the proof step fails and a full projection is
+   required.
 3. A workflow-only recovery does not require a new readiness run or a public
    CI wait before retrying. The prior immutable qualification (tag commit,
    readiness run, artifact ID, digest, manifest SHA-256) remains the release

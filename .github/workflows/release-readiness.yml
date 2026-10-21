@@ -137,7 +137,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
 
       # Reuse dependency compilation across public candidates. rust-cache's
       # generated key remains bound to the toolchain and Cargo.lock, while
@@ -196,7 +196,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
 
       # Keep package preparation isolated to this exact public commit.
       - name: Cache Cargo dependencies for crate packages
@@ -237,7 +237,7 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
           targets: x86_64-unknown-linux-gnu
       - name: Download Rust notice report
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -332,7 +332,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
           targets: x86_64-unknown-linux-gnu
       - name: Cache Cargo dependencies for binary build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -446,7 +446,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
       # This cache is shared only inside the public repository. Cargo validates
       # fingerprints and rebuilds workspace members from the exact candidate;
       # no cache crosses the private/public repository boundary.
@@ -582,9 +582,15 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             kind: linux
+          # The x86 macOS wheel cross-compiles on Apple silicon, as the
+          # universal binary already does, and its smoke runs an x64 Python
+          # under Rosetta so the installed x86_64 artifact is what executes.
+          # The Intel pool took about twice as long (1h28m against 46m-1h08m
+          # for the native arm64 wheels in the v0.13.1 readiness run).
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: macos-latest
             kind: macos
+            python_architecture: x64
           - target: aarch64-apple-darwin
             runner: macos-latest
             kind: macos
@@ -605,7 +611,7 @@ jobs:
       - name: Install Rust toolchain for wheel cache
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
       - name: Cache Cargo dependencies for Python wheel
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -620,11 +626,12 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
           args: --release --locked --out dist
-          rust-toolchain: '1.97.1'
+          rust-toolchain: '1.99.1'
       - name: Set up Python for staged wheel smoke
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
+          architecture: ${{ matrix.python_architecture }}
       - name: Install and exercise exact Python wheel
         shell: bash
         env:
@@ -654,12 +661,20 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             kind: linux
+          # The x86 macOS wheel cross-compiles on Apple silicon, as the
+          # universal binary already does, and its smoke runs an x64 Python
+          # under Rosetta so the installed x86_64 artifact is what executes.
+          # The Intel pool took about twice as long (1h28m against 46m-1h08m
+          # for the native arm64 wheels in the v0.13.1 readiness run).
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: macos-latest
             kind: macos
+            python_architecture: x64
+            macho_arch: x86_64
           - target: aarch64-apple-darwin
             runner: macos-latest
             kind: macos
+            macho_arch: arm64
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             kind: windows
@@ -677,7 +692,7 @@ jobs:
       - name: Install Rust toolchain for wheel cache
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
       - name: Cache Cargo dependencies for uv wheel
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -694,12 +709,13 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
           args: --release --locked --out dist
-          rust-toolchain: '1.97.1'
+          rust-toolchain: '1.99.1'
           working-directory: packaging/bifrost-cli
       - name: Set up Python for staged CLI wheel smoke
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
+          architecture: ${{ matrix.python_architecture }}
       - name: Set up Node for staged CLI wheel protocol probe
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -710,6 +726,27 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: python scripts/public/verify-python-wheel.py --wheel-directory packaging/bifrost-cli/dist --kind cli --version "$RELEASE_VERSION"
+      # Under Rosetta an arm64 executable would also run, so the smoke alone
+      # does not prove that the packaged macOS binary has the wheel's
+      # architecture. pip's platform tag check covers the tag, this the file.
+      - name: Verify packaged macOS CLI architecture
+        if: matrix.kind == 'macos'
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.macho_arch }}
+        run: |
+          unpacked="$(mktemp -d)"
+          wheels=(packaging/bifrost-cli/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          unzip -q "${wheels[0]}" -d "$unpacked"
+          binaries=("$unpacked"/*.data/scripts/bifrost)
+          test "${#binaries[@]}" -eq 1
+          test -f "${binaries[0]}"
+          archs="$(lipo -archs "${binaries[0]}")"
+          if [ "$archs" != "$EXPECTED_ARCH" ]; then
+            echo "::error::packaged bifrost has architectures '$archs', expected '$EXPECTED_ARCH'"
+            exit 1
+          fi
       - name: Upload exact uv CLI wheel
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -1284,11 +1321,46 @@ jobs:
       - pi-package
       - npm-package
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
       actions: read
     steps:
+      # Readiness is dispatched as soon as the projection lands, while public
+      # CI for the same commit is still running, instead of after it: the two
+      # share no inputs, and serializing them cost about an hour per release.
+      # The bundle is still only assembled for a commit whose latest public CI
+      # run is green. CI usually finishes long before the build matrix; when
+      # it fails, rerun its failed jobs and then this job.
+      - name: Require green public CI for the qualified commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_COMMIT: ${{ needs.preflight.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 90 * 60))
+          while :; do
+            run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${PUBLIC_COMMIT}&event=push&per_page=1" \
+              --jq '.workflow_runs[0] // empty | {id, run_attempt, status, conclusion, html_url}')"
+            if [[ -z "$run" ]]; then
+              echo "No public CI run for ${PUBLIC_COMMIT} yet."
+            elif [[ "$(jq -r .status <<<"$run")" == "completed" ]]; then
+              echo "Public CI: $run"
+              if [[ "$(jq -r .conclusion <<<"$run")" != "success" ]]; then
+                echo "::error::public CI $(jq -r .html_url <<<"$run") concluded $(jq -r .conclusion <<<"$run")"
+                exit 1
+              fi
+              break
+            else
+              echo "Public CI $(jq -r .html_url <<<"$run") is $(jq -r .status <<<"$run")."
+            fi
+            if (( SECONDS > deadline )); then
+              echo "::error::public CI for ${PUBLIC_COMMIT} did not finish within 90 minutes of the build matrix"
+              exit 1
+            fi
+            sleep 60
+          done
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:

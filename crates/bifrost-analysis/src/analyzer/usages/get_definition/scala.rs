@@ -1,4 +1,69 @@
 use super::*;
+use crate::analyzer::ScalaAnalyzer;
+use crate::analyzer::usages::scala_graph::package_name_of as scala_package_name_of;
+use brokk_bifrost_jvm::scala::graph::syntax::ScalaPackageContextIndex;
+
+#[derive(Clone)]
+pub(super) struct ScalaDefinitionContext {
+    pub(super) file: ProjectFile,
+    pub(super) package: Arc<str>,
+    pub(super) imports: Arc<Vec<ImportInfo>>,
+}
+
+#[derive(Default)]
+pub(super) struct ScalaDefinitionState {
+    scala_contexts: HashMap<ProjectFile, ScalaDefinitionContext>,
+    scala_package_contexts: HashMap<ProjectFile, ScalaPackageContextIndex>,
+    pub(super) scala_lookup_cache: ScalaLookupCache,
+}
+
+impl ScalaDefinitionState {
+    pub(super) fn scala_context(
+        &mut self,
+        token: QueryToken<'_>,
+        scala: &ScalaAnalyzer,
+        file: &ProjectFile,
+    ) -> ScalaDefinitionContext {
+        self.scala_contexts
+            .entry(file.clone())
+            .or_insert_with(|| ScalaDefinitionContext {
+                file: file.clone(),
+                package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
+                imports: Arc::new(scala.import_info_of(token, file)),
+            })
+            .clone()
+    }
+
+    pub(super) fn scala_package_prefixes(
+        &mut self,
+        file: &ProjectFile,
+        root: Node<'_>,
+        source: &str,
+        byte: usize,
+    ) -> Vec<String> {
+        self.scala_package_contexts
+            .entry(file.clone())
+            .or_insert_with(|| ScalaPackageContextIndex::new(root, source))
+            .prefixes_at(byte)
+            .to_vec()
+    }
+
+    #[cfg(test)]
+    pub(super) fn scala_lookup_cache_counts(&self) -> (usize, usize) {
+        (
+            self.scala_lookup_cache.direct_children_builds_for_test(),
+            self.scala_lookup_cache.direct_ancestor_builds_for_test(),
+        )
+    }
+}
+
+use crate::analyzer::JavaAnalyzer;
+use crate::analyzer::usages::scala_graph::{
+    import_candidate_fq_names, import_candidate_owner_fq_names, scala_builtin_type_name,
+    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_node_text,
+    scala_normalized_fq_name,
+};
+
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
 use crate::analyzer::scala::{
@@ -1451,9 +1516,13 @@ pub(super) fn resolve_scala(
         );
     };
     let package_prefixes = tree.map(|tree| {
-        context.scala_package_prefixes(file, tree.root_node(), source, site.focus_start_byte)
+        context
+            .language_state::<ScalaDefinitionState>()
+            .scala_package_prefixes(file, tree.root_node(), source, site.focus_start_byte)
     });
-    let batch = context.scala_context(token, scala, file);
+    let batch = context
+        .language_state::<ScalaDefinitionState>()
+        .scala_context(token, scala, file);
     let support = context.bounded_support();
     resolve_scala_with_context(
         analyzer,
@@ -1466,7 +1535,9 @@ pub(super) fn resolve_scala(
         tree,
         site,
         package_prefixes.as_deref(),
-        &context.scala_lookup_cache,
+        &context
+            .language_state_ref::<ScalaDefinitionState>()
+            .scala_lookup_cache,
         None,
     )
 }
@@ -14462,6 +14533,94 @@ fn scala_simple_name(name: &str) -> &str {
         .trim()
 }
 
+use super::call_sites::{
+    CallSignatureContext, is_call_expression_node, scala_constructor_type_node,
+    scala_terminal_callee_leaf,
+};
+
+pub(crate) fn scala_call_reference_candidate(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if is_call_expression_node(parent, Language::Scala)
+            && scala_callee_node_for_call(parent).and_then(scala_terminal_callee_leaf) == Some(node)
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+pub(crate) fn scala_callee_node_for_call(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "call_expression" => node.child_by_field_name("function"),
+        "instance_expression" => scala_constructor_type_node(node),
+        "infix_expression" | "postfix_expression" => {
+            brokk_bifrost_jvm::scala::structural::scala_call_function_node(node)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn scala_call_signature_context_for_node(
+    node: Node<'_>,
+    byte_offset: usize,
+) -> Option<CallSignatureContext> {
+    match node.kind() {
+        "infix_expression" => {
+            let operator = node.child_by_field_name("operator")?;
+            let right = node.child_by_field_name("right")?;
+            if byte_offset < right.start_byte() || byte_offset > right.end_byte() {
+                return None;
+            }
+            Some(CallSignatureContext {
+                callee_range: node_range(operator),
+                active_parameter: 0,
+            })
+        }
+        "postfix_expression" => {
+            let method = scala_postfix_method_node(node)?;
+            if byte_offset < method.start_byte() || byte_offset > method.end_byte() {
+                return None;
+            }
+            Some(CallSignatureContext {
+                callee_range: node_range(method),
+                active_parameter: 0,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_definition_dispatch<'a>(
+    analyzer: &'a dyn crate::analyzer::IAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    context: &mut crate::analyzer::usages::get_definition::DefinitionBatchContext<'a, '_>,
+    request: &crate::analyzer::usages::get_definition::DefinitionLookupRequest,
+    source: &std::sync::Arc<str>,
+    tree: &Option<tree_sitter::Tree>,
+    site: &crate::analyzer::usages::get_definition::ResolvedReferenceSite,
+    _operation: Option<crate::navigation::NavigationOperation>,
+    _cancellation: Option<&crate::cancellation::CancellationToken>,
+    _go_session: Option<&crate::analyzer::usages::get_definition::ResolutionSession>,
+) -> std::ops::ControlFlow<
+    crate::analyzer::usages::get_definition::DefinitionResolution,
+    crate::analyzer::usages::get_definition::DefinitionResolution,
+> {
+    let evidence = CallEvidence::default();
+    let outcome = scala::resolve_scala(
+        analyzer,
+        token,
+        context,
+        &request.file,
+        source,
+        tree.as_ref(),
+        site,
+    );
+    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+}
+
 #[cfg(test)]
 mod bounded_ast_tests {
     use super::*;
@@ -15029,6 +15188,53 @@ object JdbcCalls {
                     && definition.source().language() == Language::Java
             }),
             "Scala member lookup must retain the exact Java declaration: {value:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_context_tests {
+    use super::*;
+    use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon(
+        "04c089199ae3: Scala named-argument fixture verifies direct-child lookup state is reused without changing parameter resolution"
+    )]
+    fn scala_batch_context_reuses_direct_children_for_named_arguments() {
+        // Asserts an incumbent-only cache counter; the native trial answers before that cache, so this moves or dies at the Scala flip.
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
+            return;
+        }
+        let source = "package demo\nobject Main {\n  class Widget(val alpha: Boolean, val beta: Boolean)\n  val widget = new Widget(alpha = true, beta = false)\n}\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Scala, &[("main.scala", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.scala");
+        let analyzer = fixture.analyzer.analyzer();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
+        let requests = ["alpha", "beta"]
+            .into_iter()
+            .map(|needle| {
+                let start_byte = source.rfind(needle).expect("named argument in source");
+                DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + needle.len()),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let _outcomes =
+            resolve_definition_requests(analyzer, token, &mut context, requests, None, None);
+        assert_eq!(
+            context
+                .language_state::<ScalaDefinitionState>()
+                .scala_lookup_cache_counts(),
+            (1, 0)
         );
     }
 }

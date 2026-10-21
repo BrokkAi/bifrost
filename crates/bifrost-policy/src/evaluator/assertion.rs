@@ -1,8 +1,10 @@
+use brokk_bifrost_analysis::analyzer::structural::resolution::BindingKind;
 use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
 use brokk_bifrost_analysis::path_utils::workspace_relative_slash_path;
 use brokk_bifrost_rql::structural::CodeQueryRowScalarRef;
 use brokk_bifrost_rql::structural::edges::EdgeProvenance;
 use brokk_bifrost_rql::structural::search::{DetailedCodeQueryResult, MergedUnitRows};
+use brokk_bifrost_rql::{BindingFilter, BindingSeed};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -194,10 +196,10 @@ impl<'a> AssertRunPlan<'a> {
             matches!(assertion, PolicyAssert::ValueOrigin(_))
         });
         // Both families read the same binding-of rows, keyed by the role each
-        // assert names. The value-origin family also needs assignment-target
+        // assert names. The value-origin family also needs establishment-target
         // roles, `value_reference` and `binder`, but only for a file that
-        // actually has an assignment inside a subject's region. That is
-        // decided per file, after the assignment query runs.
+        // actually has an establishment site inside a subject's region. That is
+        // decided per file, after the establishment probes run.
         let mut binding_row_roles = asserted_roles(spec, |assertion| {
             matches!(
                 assertion,
@@ -1330,58 +1332,55 @@ fn evaluate_assert_file(
     let execution_scope = CodeQueryExecutionScope::for_seed_files(&seed_files, &workspace_files);
     let mut file_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
 
-    // The assignment family runs *before* the other row families, because
-    // its answer decides whether they need the `value_reference` role at
-    // all. Only an assignment written inside a region some value-origin
-    // assert compares against can exempt anything, so a file with none --
-    // which is most files -- never pays for reaching a binding from every
-    // plain value position in it. The verdict is unchanged either way:
-    // with no in-region assignment the exemption is false for every
-    // subject, which is exactly what the skipped rows would have said.
-    let mut assignment_outcome = None;
+    // Establishment probes precede correlated row queries: retain each actual
+    // target occurrence before binding-of can select a different canonical
+    // binder. Only sites inside a compared region need that later join.
+    let mut establishment_outcomes = Vec::new();
     if !plan.value_origin_roles.is_empty() {
-        let query = match assertion_assignment_query(&file_paths, budget) {
-            Ok(query) => query,
-            Err(message) => {
-                return Err(Box::new(AssertFileFailure::QueryPlan(message)));
-            }
-        };
-        let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
-            context.analyzer,
-            &query,
-            budget.query_limits(),
-            context.cancellation,
-            &mut row_family_session,
-            execution_scope.clone(),
-        );
-        file_incomplete.extend(incomplete_reasons(
-            &outcome.result.completion(),
-            outcome.result.truncated,
-        ));
-        file_failures.extend(failure_reasons(&outcome.result.completion()));
-        file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
-        file_work = file_work.saturating_add(outcome.work);
-        row_completions.push(outcome.result.completion());
-        assignment_outcome = Some(outcome);
+        for query in [
+            assertion_assignment_query(&file_paths, budget),
+            assertion_iteration_binding_query(&file_paths, budget),
+        ] {
+            let query = query.map_err(|message| Box::new(AssertFileFailure::QueryPlan(message)))?;
+            let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
+                context.analyzer,
+                &query,
+                budget.query_limits(),
+                context.cancellation,
+                &mut row_family_session,
+                execution_scope.clone(),
+            );
+            file_incomplete.extend(incomplete_reasons(
+                &outcome.result.completion(),
+                outcome.result.truncated,
+            ));
+            file_failures.extend(failure_reasons(&outcome.result.completion()));
+            file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+            file_work = file_work.saturating_add(outcome.work);
+            row_completions.push(outcome.result.completion());
+            establishment_outcomes.push(outcome);
+        }
     }
     let value_origin_regions = value_origin_regions(plan.spec, file_subjects);
-    let assignments_in_region = assignment_outcome.as_ref().is_some_and(|outcome| {
-        assigned_left_operands(&outcome.result.results)
-            .any(|(_, range)| region_contains_any(&value_origin_regions, range))
-    });
+    let mut establishment_positions = Vec::new();
+    for outcome in &establishment_outcomes {
+        establishment_positions.extend(establishment_sites(
+            &outcome.result.results,
+            &value_origin_regions,
+            &mut file_incomplete,
+        ));
+    }
     let mut joined_ast_ids: Vec<String> = file_subjects
         .iter()
         .flat_map(|subject| subject.captures.values())
         .flatten()
         .filter_map(|capture| capture.ast_id.clone())
         .collect();
-    if let Some(outcome) = &assignment_outcome {
-        joined_ast_ids.extend(
-            assigned_left_operands(&outcome.result.results)
-                .filter(|(_, range)| region_contains_any(&value_origin_regions, *range))
-                .map(|(ast_id, _)| ast_id.to_owned()),
-        );
-    }
+    joined_ast_ids.extend(
+        establishment_positions
+            .iter()
+            .map(|(ast_id, _)| (*ast_id).to_owned()),
+    );
     row_family_session = if plan.origin_shape_asserts.is_empty() {
         CodeQueryRowFamilySession::for_ast_ids(joined_ast_ids)
     } else {
@@ -1392,7 +1391,7 @@ fn evaluate_assert_file(
         CodeQueryRowFamilySession::default()
     };
     let mut binding_row_roles = plan.binding_row_roles.clone();
-    if assignments_in_region {
+    if !establishment_positions.is_empty() {
         binding_row_roles.extend([OccurrenceRole::ValueReference, OccurrenceRole::Binder]);
         binding_row_roles.sort();
         binding_row_roles.dedup();
@@ -1588,20 +1587,6 @@ fn evaluate_assert_file(
     let mut bindings_by_occurrence: HashMap<(&str, &str), Vec<&CodeQueryBinding>> = HashMap::new();
     let mut scopes_by_index: HashMap<(&str, u32), &CodeQueryLexicalScope> = HashMap::new();
     let mut sites_by_ast_id: HashMap<&str, Vec<&CodeQueryGenerationSite>> = HashMap::new();
-    // Every assignment in this file whose left operand is a named value
-    // *and* is written inside a region some value-origin assert compares
-    // against, as (left-operand AST id, left-operand region). Filtering
-    // here rather than at each subject keeps the per-subject scan to the
-    // assignments that can possibly exempt anything, and it is the same
-    // predicate the assert applies.
-    let assigned_positions: Vec<(&str, CodeQueryRange)> = assignment_outcome
-        .as_ref()
-        .map(|outcome| {
-            assigned_left_operands(&outcome.result.results)
-                .filter(|(_, range)| region_contains_any(&value_origin_regions, *range))
-                .collect()
-        })
-        .unwrap_or_default();
     for query in &executed {
         for item in &query.result.results {
             match &item.value {
@@ -1700,7 +1685,7 @@ fn evaluate_assert_file(
     for query in &executed {
         capability_diagnostics.extend(query.result.diagnostics.iter().cloned());
     }
-    if let Some(outcome) = assignment_outcome.as_ref() {
+    for outcome in &establishment_outcomes {
         capability_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
     }
     let capability = assertion_capabilities(&capability_diagnostics);
@@ -1904,7 +1889,7 @@ fn evaluate_assert_file(
                             &ast_ids,
                             &bindings_by_occurrence,
                             &scopes_by_index,
-                            &assigned_positions,
+                            &establishment_positions,
                             &mut late_incomplete,
                         ),
                         None => {
@@ -4826,11 +4811,12 @@ const ORIGIN_LITERAL_CAPTURE_PREFIX: &str = "__bifrost_origin_literal_";
 ///
 /// - the declaring scope of the binding in effect at the reference, which is
 ///   the question [`evaluate_binding_scope_assert`] asks on its own; and
-/// - any assignment whose left operand reaches that same binding, which is how
-///   a value declared once outside a loop but overwritten on every pass is
+/// - an explicit assignment target or classified loop-target site that reaches
+///   that same binding, which is how a value declared once outside a loop but
+///   overwritten on every pass is
 ///   distinguished from one that is genuinely re-used unchanged.
 ///
-/// The join to an assignment is binding identity, never the spelled name: an
+/// The join from a target is binding identity, never the spelled name: an
 /// assignment to a different `values` in a nested scope writes a different
 /// value and must not exempt this one.
 fn evaluate_value_origin_assert<'rows>(
@@ -4839,7 +4825,7 @@ fn evaluate_value_origin_assert<'rows>(
     ast_ids: &[&str],
     bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
     scopes_by_index: &HashMap<(&str, u32), &'rows CodeQueryLexicalScope>,
-    assigned_positions: &[(&str, CodeQueryRange)],
+    establishment_positions: &[(&str, CodeQueryRange)],
     late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
     let (binding, scope, related) = binding_origin_for_capture(
@@ -4852,17 +4838,32 @@ fn evaluate_value_origin_assert<'rows>(
     )?;
 
     let declared_inside = region_contains(related, scope.range);
-    let assigned_inside = assigned_positions.iter().any(|(ast_id, range)| {
-        region_contains(related, *range)
-            && bindings_by_occurrence
-                .get(&(subject.path.as_str(), *ast_id))
-                .is_some_and(|rows| {
-                    rows.iter()
-                        .filter(|row| !row.shadowed)
-                        .any(|row| same_binding(row, binding))
-                })
-    });
-    let established_inside = declared_inside || assigned_inside;
+    let mut established_at_site = false;
+    for (ast_id, range) in establishment_positions {
+        if !region_contains(related, *range) {
+            continue;
+        }
+        let mut winners = bindings_by_occurrence
+            .get(&(subject.path.as_str(), *ast_id))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|row| !row.shadowed);
+        let Some(winner) = winners.next() else {
+            // The retained event ledger distinguishes a missing join from no
+            // event. Subject-side complete NoBinding remains a separate case.
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            return None;
+        };
+        if winners.any(|other| !same_binding(other, winner)) {
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            return None;
+        }
+        // Do not stop at a match: a later relevant event can still have a
+        // missing or ambiguous answer that prevents this file's verdict.
+        established_at_site |= same_binding(winner, binding);
+    }
+    let established_inside = declared_inside || established_at_site;
     if assertion.containment.satisfied_by(established_inside) {
         return None;
     }
@@ -4875,16 +4876,16 @@ fn evaluate_value_origin_assert<'rows>(
             "binding `{}` is established inside capture `{}`: {}",
             binding.name,
             assertion.relative_to,
-            match (declared_inside, assigned_inside) {
-                (true, true) => "declared there, and assigned there",
+            match (declared_inside, established_at_site) {
+                (true, true) => "declared there, and established at a target there",
                 (true, false) => "declared there",
-                (false, true) => "assigned there",
+                (false, true) => "established at a target there",
                 (false, false) => unreachable!("an established origin is one of the two"),
             }
         )
     } else {
         format!(
-            "binding `{}` is declared outside capture `{}`, and no assignment inside it reaches that binding",
+            "binding `{}` is declared outside capture `{}`, and no supported establishment site inside it reaches that binding",
             binding.name, assertion.relative_to
         )
     };
@@ -4897,11 +4898,8 @@ fn evaluate_value_origin_assert<'rows>(
 }
 
 /// The regions every value-origin assert of this policy compares against, for
-/// the subjects of one file.
-///
-/// An assignment outside all of them cannot exempt any subject in the file, so
-/// this is what makes "does this file need the value-reference row family?" a
-/// question the assignment rows alone can answer.
+/// the subjects of one file. Establishment sites outside all of them cannot
+/// exempt any subject, so only in-region occurrences need binding-of queries.
 fn value_origin_regions(
     spec: &AssertionPolicySpec,
     file_subjects: &[&AssertionSubject],
@@ -4925,23 +4923,44 @@ fn region_contains_any(regions: &[CodeQueryRange], inner: CodeQueryRange) -> boo
     regions.iter().any(|outer| region_contains(*outer, inner))
 }
 
-/// The captured left operands of one assignment-query outcome, as
-/// (AST id, region). A capture without both is unjoinable and is skipped;
-/// the row families that need identity report their own gaps.
-fn assigned_left_operands(
-    results: &[CodeQueryResultItem],
-) -> impl Iterator<Item = (&str, CodeQueryRange)> {
-    results.iter().flat_map(|item| {
-        let captures = match &item.value {
-            CodeQueryResultValue::StructuralMatch { value } => value.captures.as_slice(),
-            _ => &[],
+/// Original establishment tokens, before their binding-of answers select the
+/// canonical identity. Assignment captures and raw loop-variable binding rows
+/// retain a discovered site even when the later occurrence join produces no row.
+fn establishment_sites<'rows>(
+    results: &'rows [CodeQueryResultItem],
+    regions: &[CodeQueryRange],
+    incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Vec<(&'rows str, CodeQueryRange)> {
+    let mut sites = Vec::new();
+    let mut retain = |ast_id: Option<&'rows str>, range: Option<CodeQueryRange>| {
+        let Some(range) = range else {
+            incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            return;
         };
-        captures.iter().filter_map(|capture| {
-            (capture.name == ASSIGNED_VALUE_CAPTURE)
-                .then(|| capture.ast_id.as_deref().zip(capture.range))
-                .flatten()
-        })
-    })
+        if !region_contains_any(regions, range) {
+            return;
+        }
+        match ast_id {
+            Some(ast_id) => sites.push((ast_id, range)),
+            None => incomplete.push(PolicyIncompleteReason::CapabilityIncomplete),
+        }
+    };
+    for item in results {
+        match &item.value {
+            CodeQueryResultValue::StructuralMatch { value } => {
+                for capture in &value.captures {
+                    if capture.name == ASSIGNED_VALUE_CAPTURE {
+                        retain(capture.ast_id.as_deref(), capture.range);
+                    }
+                }
+            }
+            CodeQueryResultValue::Binding { value } => {
+                retain(value.ast_id.as_deref(), Some(value.range));
+            }
+            _ => unreachable!("establishment queries return assignment captures or binding rows"),
+        }
+    }
+    sites
 }
 
 /// Whether two binding-of rows name the same binder. Rows reached from two
@@ -5148,6 +5167,32 @@ fn assertion_assignment_query(
         budget,
         "assertion assignment queries require subject paths",
     )
+}
+
+/// Raw already-classified loop-variable tokens, independent of lexical owning
+/// scope. Retain their identity before a later occurrence projection can drop it. This is supported binding evidence, not every language's iteration
+/// write: existing-variable targets need not introduce a LoopVariable row.
+fn assertion_iteration_binding_query(
+    paths: &[&str],
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    Ok(assertion_code_query(
+        CodeQueryPlan {
+            source: CodeQueryPlanSource::Bindings(Box::new(BindingSeed {
+                where_globs: assertion_where_globs(
+                    paths,
+                    "iteration origins require subject paths",
+                )?,
+                languages: Vec::new(),
+                filter: BindingFilter {
+                    kinds: vec![BindingKind::LoopVariable],
+                    ..BindingFilter::default()
+                },
+            })),
+            steps: Vec::new(),
+        },
+        budget,
+    ))
 }
 
 /// Every for-each loop of the subject file with its iterated expression
@@ -5980,4 +6025,155 @@ fn assertion_capabilities(diagnostics: &[CodeQueryDiagnostic]) -> Vec<PolicyCapa
     capabilities.sort();
     capabilities.dedup();
     capabilities
+}
+
+#[cfg(test)]
+mod value_origin_tests {
+    use super::*;
+    use crate::definition::DeclaredContainment;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#5812: missing or conflicting event joins became complete outside-origin proofs")]
+    fn establishment_event_joins_require_unique_canonical_binding() {
+        let range = |start_line, end_line| CodeQueryRange {
+            start_line,
+            start_column: 1,
+            end_line,
+            end_column: 20,
+        };
+        let binding = |start_byte, shadowed| CodeQueryBinding {
+            id: format!("binding-{start_byte}"),
+            ast_id: Some(format!("canonical-{start_byte}")),
+            path: "origin.py".to_owned(),
+            language: "python",
+            name: "target".to_owned(),
+            kind: "local",
+            hoisting: "scope_wide",
+            namespace: "value",
+            // The selected canonical token is outside the event's region.
+            range: range(30, 30),
+            start_byte,
+            end_byte: start_byte + 1,
+            activation_start_byte: 0,
+            activation_end_byte: 100,
+            declaring_scope_index: 1,
+            source_order: 0,
+            visibility: "unknown",
+            import: None,
+            shadowed,
+            reached_from_ast_id: None,
+        };
+        let receiver = binding(10, false);
+        let mut duplicate = receiver.clone();
+        duplicate.id.push_str("-correlated-copy");
+        let other = binding(20, false);
+        let shadowed = binding(20, true);
+        let scope = CodeQueryLexicalScope {
+            id: "owner".to_owned(),
+            ast_id: Some("owner".to_owned()),
+            path: "origin.py".to_owned(),
+            language: "python",
+            index: 1,
+            kind: Some("function"),
+            range: range(1, 40),
+            start_byte: 0,
+            end_byte: 100,
+            parent_index: None,
+        };
+        let path = WorkspaceRelativePath::new("origin.py").unwrap();
+        let subject = AssertionSubject {
+            location: PolicySourceLocation::artifact(path.clone()),
+            path,
+            captures: HashMap::from([(
+                "region".to_owned(),
+                vec![SubjectCapture {
+                    ast_id: Some("loop".to_owned()),
+                    kind: Some("for_loop".into()),
+                    range: Some(range(5, 20)),
+                }],
+            )]),
+            captures_without_ast_id: Vec::new(),
+        };
+        let assertion = ValueOriginAssert {
+            id: PolicyAssertId::new("origin").unwrap(),
+            at: "receiver".to_owned(),
+            role: OccurrenceRole::ReceiverPosition,
+            containment: DeclaredContainment::Inside,
+            relative_to: "region".to_owned(),
+        };
+        let scopes = HashMap::from([(("origin.py", 1), &scope)]);
+        for (name, event_rows, trailing_event, incomplete_expected, finding_expected) in [
+            ("complete empty", vec![], None, true, false),
+            ("shadowed only", vec![&shadowed], None, true, false),
+            ("unique winner", vec![&receiver], None, false, false),
+            (
+                "duplicate winner",
+                vec![&receiver, &duplicate],
+                None,
+                false,
+                false,
+            ),
+            (
+                "ignore shadowed loser",
+                vec![&receiver, &shadowed],
+                None,
+                false,
+                false,
+            ),
+            (
+                "distinct winners",
+                vec![&receiver, &other],
+                None,
+                true,
+                false,
+            ),
+            ("unique different", vec![&other], None, false, true),
+            (
+                "later missing event",
+                vec![&receiver],
+                Some(range(7, 7)),
+                true,
+                false,
+            ),
+            (
+                "unrelated missing event",
+                vec![&receiver],
+                Some(range(41, 41)),
+                false,
+                false,
+            ),
+        ] {
+            let mut bindings = HashMap::from([
+                (("origin.py", "receiver"), vec![&receiver]),
+                (("origin.py", "event"), event_rows),
+            ]);
+            // Keep an explicit complete-empty relation rather than inventing
+            // source syntax that makes the public producer incomplete.
+            bindings.insert(("origin.py", "missing"), Vec::new());
+            let mut sites = vec![("event", range(6, 6))];
+            if let Some(range) = trailing_event {
+                sites.push(("missing", range));
+            }
+            let mut incomplete = Vec::new();
+            let violation = evaluate_value_origin_assert(
+                &assertion,
+                &subject,
+                &["receiver"],
+                &bindings,
+                &scopes,
+                &sites,
+                &mut incomplete,
+            );
+            assert_eq!(violation.is_some(), finding_expected, "{name}");
+            assert_eq!(!incomplete.is_empty(), incomplete_expected, "{name}");
+            if incomplete_expected {
+                assert_eq!(
+                    incomplete,
+                    vec![PolicyIncompleteReason::CapabilityIncomplete],
+                    "{name}"
+                );
+            }
+        }
+    }
 }

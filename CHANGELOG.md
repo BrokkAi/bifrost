@@ -7,6 +7,216 @@ projection and its commit history does not contain every source commit.
 
 ## Unreleased
 
+### Fixed
+
+- Kotlin structural points-to queries resolve constructor-call arguments instead
+  of reporting their canonical facts as unavailable.
+
+## [0.14.0] - 2026-10-21
+
+### Changed
+
+- The Rust library registers each language through `LanguageSupport` trait
+  objects and one linked language table. Language-specific methods on shared
+  analyzer types are now extension traits, and static language knowledge
+  lives in `brokk-bifrost-core`. Rust library users may need to import those
+  traits; the CLI, MCP and LSP surfaces are unchanged.
+
+- Open rule releases are admitted per policy instead of per release. A policy
+  whose required engine capabilities are not available reports that it did not
+  run and names the missing capabilities; the rest of the release still runs.
+  The engine advertises the capabilities that its tests exercise through
+  released policies, and every policy in the public `rules/v0.3.1` release is
+  now admitted. The advertised names include result obligations for C#,
+  JavaScript, TypeScript, PHP, Ruby, Python and libc, callable signatures for
+  C++, statement, attribute, configuration, literal-value and expression-kind
+  facts, Python import, syntax and call facts, and language-rule, Javadoc and
+  generic-type facts. Admission is not a clean result: a policy whose analysis
+  is incomplete still reports inconclusive (#5951, #5959, #5966, #5967, #6032).
+
+- Java, C# and C++ language rules report a site they cannot decide, such as an
+  unresolved type or an unclassified exception, as incomplete instead of
+  returning a clean result. Java generic-type rules resolve names in Java's
+  scope order and read the finality of workspace classes from their declaring
+  file. C++ header-guard and SAL rules report files whose source is unavailable
+  or does not parse (#6030).
+
+- Native Go analysis is the default for definition, type, call-target, rename,
+  selected inverse-reference and targeted-usage queries. Usage graphs and
+  dead-code analysis keep the previous engine. A declaration's references to
+  itself are no longer counted as external usages, and an owner behind an
+  unavailable imported dependency is reported as incomplete instead of absent
+  (#5989).
+
+- Semantic analysis budgets bound the memory currently held instead of all work
+  performed, so large Python workspaces are no longer refused before any root is
+  solved. Performed work is still reported but never refuses. Explain profiles
+  and policy work reports publish cumulative work, resident peaks and the
+  largest per-root work under `work.semantic` (`cumulative`, `resident_peaks`,
+  `root_work_peaks`, `resident_nested_entries_peak` and
+  `resident_retained_bytes_peak`) and as `query.semantic_*` metrics (#5902,
+  #5934, #5941, #5945, #5985, #5991).
+
+- Incomplete effect-derivation diagnostics name the open callees with their
+  source locations and dispatch or modeling reasons (#6009).
+
+- Rust library code must import the moved tool modules from
+  `brokk-bifrost-tools` and the Ruby, C#, PHP, JavaScript and TypeScript,
+  C and C++, Python, Go and Rust analyzer modules from their new language
+  crates.
+  `brokk-bifrost-analysis` no longer declares or re-exports them. The
+  `brokk-bifrost` crate keeps its top-level re-exports, such as the language
+  analyzers and `summarize_inputs` (#5929, #5996, #6087, #6089, #6093, #6100,
+  #6105, #6135, #6144).
+
+- Native Kotlin analysis is the default for definition and type navigation.
+  A name is reported absent only when every relevant provider has a complete
+  inventory or a stronger binding discharges it; a missing classpath or a
+  compiler-dependent route keeps a named obligation and a partial result.
+  Intrinsic default-import inventories, same-module visibility and dispatch
+  `this` arguments remove obligations the source already settles (#6039).
+
+- Rust import resolution keeps every target the facts determine, ordered by
+  rustc's precedence, instead of whichever row SQLite emitted first. Named
+  imports and declarations shadow globs at every intermediate module, equal
+  precedence glob conflicts report both endpoints, a private glob binding is
+  no longer reachable from outside its module, and named and visibility
+  chains are no longer cut off at 64 steps. Cycles, macro inputs and
+  unindexed external crates stay incomplete with a named reason (#5898,
+  #6074).
+
+- MCP workspace-build progress notifications are sent at most once a second
+  per request; completion, failure and cancellation are still sent at once
+  (#6044).
+
+- Building Bifrost from source requires Rust 1.99; the pinned toolchain is
+  1.99.1 (#5940).
+
+- The engine acquires published rules releases that carry a source snapshot
+  beside their smoke evidence, accepts semantic-pack releases with pinned
+  shard activations, and exposes `bifrost policy-source-identity` for pack
+  producers.
+
+### Added
+
+- Ten new crates are published as `brokk-bifrost-analysis` is split up.
+  `brokk-bifrost-semantic` holds the semantic vocabulary, algorithms and
+  semantic-model contracts that do not need the analysis engine, below
+  `brokk-bifrost-analysis` (#5948). `brokk-bifrost-tools` holds the
+  product-surface modules above the engine, such as `summary`,
+  `searchtools`, `code_quality`, `diff_analysis`, `blast_radius`,
+  `relevance`, `file_tools` and `symbol_rename`, and supplies the linked
+  language table (#5929). `brokk-bifrost-ruby-analysis` (#5996),
+  `brokk-bifrost-csharp-analysis` (#6087), `brokk-bifrost-php-analysis`
+  (#6089), `brokk-bifrost-js-ts-analysis` (#6093),
+  `brokk-bifrost-cpp-analysis` (#6100), `brokk-bifrost-python-analysis`
+  (#6105), `brokk-bifrost-go-analysis` (#6135) and
+  `brokk-bifrost-rust-analysis` (#6144) hold each language's analyzer, usage-graph, definition and type
+  code. `brokk-bifrost-analysis` re-exports the semantic items at their
+  `analyzer::semantic` and `analyzer::semantic_model` paths, so those imports
+  keep resolving; the other moves change import paths, as described under
+  Changed.
+
+- Effect-boundary policies can import the protected declarations from a
+  `declaration-selection-document`, read through
+  `(declaration-selection-file ...)` and `(procedure-effects-of ...)`, so a
+  host runs the released `selected-boundary-no-network-io` policies under
+  their own IDs. A missing, empty or malformed selection fails activation
+  with a named `policy-validation-failed` diagnostic instead of passing
+  vacuously, and the engine advertises the `declaration-selection-imports`
+  capability (#5946).
+
+- `BIFROST_ADMIT_NUL_BYTES=1` parses source files that contain NUL bytes,
+  reading each NUL as a space, for harnesses that analyze real repositories.
+
+### Fixed
+
+- Semantic models accept Kotlin varargs that precede named-only parameters,
+  so the current public packs install.
+- Python class bases are proven through bounded local imports and module-level
+  class-object aliases. Runtime class ancestry no longer treats replaced
+  module bindings as the original class; ambiguous aliases and unsupported
+  mutation effects remain incomplete. Refused Python sources no longer fail
+  field-slot indexing.
+- Go analysis treats a `go.mod` without a `module` directive as an excluded
+  module boundary, follows the `go` command in not treating nested vendor
+  directories as providers in module mode, reports an unavailable build
+  selection instead of a complete graph, matches tool-reported paths on
+  Windows, and lowers index and slice expressions. Native Go analysis resolves
+  package-qualified calls and type conversions without losing their receiver
+  facts (#5732).
+- Java dotted constructor-reference receivers resolve as types. Kotlin
+  companion members are admitted only through type qualifiers. Scala
+  repeated-parameter-list signatures that cannot be represented are withheld
+  instead of misreported, and parenthesized curried calls no longer produce a
+  duplicate callee obligation.
+- Native Kotlin analysis makes primary-constructor parameters visible in
+  property initializers and `init` blocks, preserves source navigation for
+  `when`-subject bindings, and gives overload filtering evidence from class
+  literals, smart casts and conversion return types. JVM annotations such as
+  `@JvmName` are recognized by their bound identity, so `@file:Suppress` no
+  longer removes the file facade (#5889, #5925, #5930).
+- Native Kotlin analysis no longer aborts indexing on a local class with
+  primary-constructor parameters, and a bare constructor call on a
+  pack-modeled JVM type such as `URL(address)` keeps its external type
+  boundary, so Kotlin network-effect policies complete (#6091, #6116).
+- Java lookup of a nested type through a compilation-unit type no longer
+  waits on an unresolved on-demand import (#6043).
+- Native Java find-usages projects Kotlin and Scala callers through their own
+  language instead of failing with a false source-change error (#5905).
+- Scala operator-named case classes keep their declaration and constructor, and
+  method-local and initializer-local companions no longer acquire global JVM
+  aliases (#6021).
+- An unlowered call or unknown JVM facade in an unrelated file no longer makes
+  a correct definition incomplete (#5890).
+- Rust reverse usages name qualified expression macros such as `log::warn!`
+  and `serde_json::json!`, so these macros no longer leave every type target
+  incomplete. Empty `use` groups and `use *;` no longer panic during
+  resolution, and tuple-destructuring `let` bindings establish the
+  initialization of each component (#5887, #5936, #5983).
+- Rust dead-code reports complete on repositories with textual macros
+  invoked inside function bodies, and no longer publish one function with
+  conflicting completion through its re-export (#6069, #6124).
+- Rust usages keep an explicitly imported type alias complete beside an
+  open macro inventory, and a glob import from an external crate root such
+  as `std::sync::atomic::Ordering::*` reports an open external boundary
+  instead of a cyclic expansion (#6142).
+- Resolution reason messages render JSON evidence with sorted keys, so their
+  text and order no longer depend on which `serde_json` features a build
+  unifies (#6122).
+- Python RQL equality selectors give complete results over ordering-only
+  comparison chains such as `a < b < c` that cannot match the requested
+  operator (#5995).
+- C++ parser recovery keeps a `namespace` head, so out-of-line definitions
+  share the owner of their header declarations, and receiver and
+  explicit-global type lookup no longer pool unrelated same-named types. RQL
+  `inside-decl` matches an out-of-line C++ member to its class (#5910, #5942,
+  #6016).
+- TypeScript, JSX and C/C++ class-set surfaces keep their exact source dialect,
+  so a TypeScript class set no longer reports its owner as absent (#6027).
+- PHP source-syntax warnings stay bound to their source entry.
+- Taint analysis lets a proven-empty endpoint side outrank other selector
+  gaps, and policy assertions recognize values established by loop targets.
+- Semantic-pack lease expiry rounds up from the absolute deadline.
+
+### Performance
+
+- JVM import context is prepared once per file, and invariant JVM project
+  proofs and package planning are reused within an operation. Complete
+  retained C++ source facts are reused from the existing cache.
+- Semantic analysis passes file references between query steps instead of
+  holding whole artifacts, which roughly halves peak memory on a large Python
+  policy run. Complete artifacts and prepared dispatch sessions each have a
+  2 GiB cache cap (#5902).
+- Rust import closure indexes its bindings by module, which cut that cold
+  build phase from 528 s to 134 s on a large Rust workspace (#6044). Rust
+  dead-code reports project only the callers whose crates can reach a
+  candidate's crate, which more than halved a large report's run time; an
+  unresolved reference in an unrelated crate no longer makes a candidate
+  inconclusive (#6085).
+- Rust usages read macro tokens only when a query needs them, decoding about
+  84% fewer token rows on a large request (#5886).
+
 ## [0.13.1] - 2026-10-18
 
 ### Added

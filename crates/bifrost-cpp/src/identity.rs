@@ -19,7 +19,10 @@ use crate::declarations::{
     recovered_callable_body_at, recovered_class_body_at,
 };
 use crate::graph::CppGraphSource;
-use crate::graph::resolver::{VisibilityIndex, cpp_include_closure_reaches};
+use crate::graph::resolver::{
+    VisibilityIndex, cpp_include_closure_reaches, cpp_name_component_nodes, declarator_name_node,
+    lexical_component_tiers, qualified_owner_components,
+};
 use crate::graph_support::CppSource;
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
@@ -483,23 +486,33 @@ fn cpp_range_for_inner_declarator(node: Node<'_>) -> Option<Node<'_>> {
 /// the way visibility does, to a unique target or to nothing, so two headers
 /// sharing a basename still relate only to the translation units that
 /// unambiguously name them.
+///
+/// A body can also live in a header: fmt's `format-inl.h` defines
+/// `detail::vformat_to`, declared in `base.h`, and includes `format.h`, which
+/// includes `base.h`. Every translation unit that compiles that body also sees
+/// the body file's include closure, so the same closure proves the pair. For
+/// two headers either closure may reach the other, because a declaring header
+/// can instead include its inline-implementation header at its end (#6138).
+/// Two implementation files still never relate: neither is part of the other's
+/// translation unit.
 pub fn cpp_header_body_files_are_related(
     source: &dyn CppSource,
     token: QueryToken<'_>,
     left: &ProjectFile,
     right: &ProjectFile,
 ) -> bool {
-    let (header, implementation) = if cpp_source_path_is_header(left) {
-        (left, right)
-    } else if cpp_source_path_is_header(right) {
-        (right, left)
-    } else {
-        return false;
-    };
-    if cpp_source_path_is_header(implementation) {
-        return false;
+    match (
+        cpp_source_path_is_header(left),
+        cpp_source_path_is_header(right),
+    ) {
+        (true, false) => cpp_include_closure_reaches(source, token, right, left),
+        (false, true) => cpp_include_closure_reaches(source, token, left, right),
+        (true, true) => {
+            cpp_include_closure_reaches(source, token, left, right)
+                || cpp_include_closure_reaches(source, token, right, left)
+        }
+        (false, false) => false,
     }
-    cpp_include_closure_reaches(source, token, implementation, header)
 }
 
 pub fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
@@ -973,7 +986,7 @@ pub fn cpp_reconcile_group(
             continue;
         }
         let Some(reconciled) =
-            cpp_reconcile_definition_identity(cpp, token, unit, &mut using_by_file)
+            cpp_reconcile_definition_identity(cpp, token, unit, &mut using_by_file, keep_going)
         else {
             continue;
         };
@@ -1041,6 +1054,7 @@ fn cpp_reconcile_definition_identity(
     token: QueryToken<'_>,
     unit: &CodeUnit,
     using_by_file: &mut HashMap<ProjectFile, Arc<Vec<String>>>,
+    keep_going: &dyn Fn() -> bool,
 ) -> Option<ReconciledIdentity> {
     // Read the full source-order qualifier off the definition's *structured*
     // `FqName` -- the namespace (`Package`) segments followed by the
@@ -1073,20 +1087,63 @@ fn cpp_reconcile_definition_identity(
         }
     }
     let member = member?;
-    // Existing multi-segment reconciliation uses the provisional structured
-    // FqName because it preserves template-owner normalization. Read the
-    // declarator only for the previously unsupported one-segment shape, where
-    // extraction can prepend a guessed using namespace.
-    let structured_owner_segments = cpp_structured_out_of_line_owner_segments(cpp, token, unit)
-        .filter(|segments| segments.len() == 1);
-    let owner_segments = structured_owner_segments.as_ref().map_or_else(
+    // Keep multi-owner/template reconciliation on the existing provisional
+    // structured chain. A single written owner needs independent lexical proof
+    // before replacing that chain (which may include a guessed using package).
+    let single_owner = cpp_single_owner_context(cpp, token, unit, keep_going)?;
+    let owner_segments = single_owner.as_ref().map_or_else(
         || provisional_owner_segments,
-        |segments| segments.iter().map(String::as_str).collect(),
+        |context| vec![context.owner.as_str()],
     );
     if owner_segments.is_empty() {
         return None;
     }
 
+    let visible = {
+        let _visible = profiling::scope_with(|| {
+            format!("cpp.reconcile.visible[{}]", rel_path_string(unit.source()))
+        });
+        cpp.visible_type_units(unit.source())
+    };
+    let class_table: Vec<VisibleClass> = visible
+        .iter()
+        .filter(|candidate| candidate.is_class())
+        .map(|candidate| VisibleClass {
+            package: candidate.package_name(),
+            nested_short_name: candidate.short_name(),
+        })
+        .collect();
+
+    if let Some(context) = &single_owner {
+        if context.global {
+            // Leading :: excludes lexical and using-namespace candidates.
+            return keep_going().then(|| {
+                reconcile_out_of_line_member_identity(&owner_segments, member, &[""], &class_table)
+            })?;
+        }
+        // Namespace proof is not a guessed class-owner chain. Keep each
+        // namespace tier separate from the written owner, so a global nested
+        // class cannot win by repartitioning those proven namespace segments.
+        for tier in
+            lexical_component_tiers(&[], false, &context.lexical).take(context.lexical.len())
+        {
+            if !keep_going() {
+                return None;
+            }
+            let namespace = tier.join("::");
+            if let Some(identity) = reconcile_out_of_line_member_identity(
+                &owner_segments,
+                member,
+                &[namespace.as_str()],
+                &class_table,
+            ) {
+                return keep_going().then_some(identity);
+            }
+        }
+    }
+    if !keep_going() {
+        return None;
+    }
     let using = using_by_file
         .entry(unit.source().clone())
         .or_insert_with(|| {
@@ -1107,21 +1164,6 @@ fn cpp_reconcile_definition_identity(
     let mut namespace_candidates: Vec<&str> = vec![""];
     namespace_candidates.extend(using.iter().map(String::as_str));
 
-    let visible = {
-        let _visible = profiling::scope_with(|| {
-            format!("cpp.reconcile.visible[{}]", rel_path_string(unit.source()))
-        });
-        cpp.visible_type_units(unit.source())
-    };
-    let class_table: Vec<VisibleClass> = visible
-        .iter()
-        .filter(|candidate| candidate.is_class())
-        .map(|candidate| VisibleClass {
-            package: candidate.package_name(),
-            nested_short_name: candidate.short_name(),
-        })
-        .collect();
-
     reconcile_out_of_line_member_identity(
         &owner_segments,
         member,
@@ -1130,27 +1172,105 @@ fn cpp_reconcile_definition_identity(
     )
 }
 
-/// Read the owner qualifier from the definition declarator itself.
-///
-/// Per-file extraction can prepend one guessed using namespace to a bare
-/// `Class::member` definition. That provisional package is not source syntax.
-/// Reconciliation must compare the real qualifier against every structured
-/// using target and let the visible class table select the namespace.
-fn cpp_structured_out_of_line_owner_segments(
+#[derive(PartialEq, Eq)]
+struct CppSingleOwnerContext {
+    owner: String,
+    global: bool,
+    lexical: Vec<String>,
+}
+
+/// Exact physical declaration/name anchors prove namespace context, never a
+/// guessed Package or a containing malformed wrapper. All records must agree.
+fn cpp_single_owner_context(
     cpp: &dyn CppSource,
     token: QueryToken<'_>,
     unit: &CodeUnit,
-) -> Option<Vec<String>> {
-    // Reconciliation consumes the provisional physical mount. Asking for the
-    // published unit's merged properties here would re-enter reconciliation.
-    let source = cpp.declaration_source_facts(token, unit.source())?;
-    let mut owners = source
-        .for_unit(unit)
-        .filter(|fact| !fact.written_owner.is_empty());
-    let first = &owners.next()?.written_owner;
-    owners
-        .all(|fact| &fact.written_owner == first)
-        .then(|| first.clone())
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Option<CppSingleOwnerContext>> {
+    let facts = cpp.declaration_source_facts(token, unit.source())?;
+    // Some(None) keeps the legacy multi-owner/template path unchanged. Once
+    // any record supplies a single owner, every applicable record must prove
+    // that same owner/context; missing or conflicting records cannot fall back.
+    let mut has_single = false;
+    for fact in facts.for_unit(unit) {
+        if !keep_going() {
+            return None;
+        }
+        has_single |= fact.written_owner.len() == 1;
+    }
+    if !has_single {
+        return keep_going().then_some(None);
+    }
+    let syntax = cpp.prepared_syntax(token, unit.source())?;
+    if !keep_going() {
+        return None;
+    }
+    let scopes = cpp.orphaned_namespace_scopes(token, unit.source());
+    let root = syntax.tree().root_node();
+    let source = syntax.source();
+    let mut agreed = None;
+    for fact in facts.for_unit(unit) {
+        if !keep_going() {
+            return None;
+        }
+        let declaration = facts.source.declaration(fact.declaration);
+        let occurrence = facts.source.occurrence(declaration.occurrence).range;
+        let name_range = facts.source.occurrence(declaration.name?).range;
+        let mut node =
+            root.descendant_for_byte_range(occurrence.start_byte, occurrence.end_byte)?;
+        // Exact spans can be shared by declarator wrappers. Ascend only along
+        // that span; accepting a larger containing envelope is not proof.
+        let selected = loop {
+            if !keep_going()
+                || node.start_byte() != occurrence.start_byte
+                || node.end_byte() != occurrence.end_byte
+            {
+                return None;
+            }
+            if matches!(
+                node.kind(),
+                "function_definition" | "function_declarator" | "declaration" | "field_declaration"
+            ) {
+                break node;
+            }
+            node = node.parent()?;
+        };
+        let callable = if selected.kind() == "function_declarator" {
+            selected
+        } else {
+            selected
+                .child_by_field_name("declarator")
+                .and_then(extract_function_declarator)?
+        };
+        let name = declarator_name_node(callable)?;
+        let terminal = cpp_name_component_nodes(name)?.pop()?;
+        if name.is_missing()
+            || name.has_error()
+            || terminal.is_missing()
+            || terminal.start_byte() != name_range.start_byte
+            || terminal.end_byte() != name_range.end_byte
+            || node_text(terminal, source) != unit.identifier()
+        {
+            return None;
+        }
+        let qualified = qualified_owner_components(name, source)?;
+        if qualified.names.len() != 1 || qualified.names != fact.written_owner {
+            return None;
+        }
+        let proof = CppSingleOwnerContext {
+            owner: qualified.names.into_iter().next()?,
+            global: qualified.global,
+            lexical: scopes.enclosing_namespace_components(selected, source),
+        };
+        if !keep_going() || agreed.as_ref().is_some_and(|prior| prior != &proof) {
+            return None;
+        }
+        agreed = Some(proof);
+    }
+    if !keep_going() {
+        return None;
+    }
+    Some(Some(agreed?))
 }
 
 #[cfg(test)]

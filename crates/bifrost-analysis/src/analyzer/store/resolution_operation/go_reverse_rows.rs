@@ -18,7 +18,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 use brokk_bifrost_go::declarations::go_identifier_is_exported;
 use rusqlite::{OptionalExtension, params};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static LAST_GO_REVERSE_CONFIRMATION_WORK: std::cell::Cell<(usize, usize, usize)> = const {
         std::cell::Cell::new((0, 0, 0))
@@ -42,7 +42,7 @@ thread_local! {
 
 fn record_go_reverse_fallback(cause: GoReverseFallbackCause) {
     crate::analyzer::resolution::seam_profile::record_go_reverse_fallback(cause);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if matches!(cause, GoReverseFallbackCause::AliasUnresolved) {
         LAST_GO_REVERSE_ALIAS_FALLBACKS.with(|count| count.set(count.get() + 1));
     }
@@ -652,7 +652,8 @@ LEFT JOIN main.resolution_unit_summaries AS alias_child
      AND profile.digest=?9)
 "#;
 
-pub(crate) const GO_REVERSE_INVENTORY_COMPLETE_SQL: &str = r#"
+#[doc(hidden)]
+pub const GO_REVERSE_INVENTORY_COMPLETE_SQL: &str = r#"
 WITH target_packages(package_id,tool_import_path,package_name,for_test,source_role) AS (
   SELECT package.package_id,package.tool_import_path,package.package_name,
          package.for_test,members.source_role
@@ -787,11 +788,15 @@ SELECT NOT EXISTS(
 "#;
 
 #[derive(Clone)]
-pub(crate) struct GoReverseCandidate {
-    pub(crate) locator: SelectedSemanticLocator,
-    pub(crate) source_role: String,
+#[doc(hidden)]
+pub struct GoReverseCandidate {
+    #[doc(hidden)]
+    pub locator: SelectedSemanticLocator,
+    #[doc(hidden)]
+    pub source_role: String,
     pub(crate) unit_key: [u8; 32],
-    pub(crate) package_id: i64,
+    #[doc(hidden)]
+    pub package_id: i64,
     pub(crate) summary_role: String,
     pub(crate) mount_ordinal: u32,
     pub(crate) blob_id: i64,
@@ -815,9 +820,11 @@ struct GoReverseSummaryContext {
     profile: [u8; 32],
 }
 
-pub(crate) struct GoReverseCandidateSet {
+#[doc(hidden)]
+pub struct GoReverseCandidateSet {
     pub(crate) target: SemanticId,
-    pub(crate) family: GoMethodFamily,
+    #[doc(hidden)]
+    pub family: GoMethodFamily,
     target_declarations: Vec<(u32, i64)>,
     target_surfaces: Vec<GoReverseTargetSurface>,
     target_in_standard_package: bool,
@@ -826,21 +833,25 @@ pub(crate) struct GoReverseCandidateSet {
     candidate_inventory_complete: bool,
 }
 
-pub(crate) enum GoReverseMemberConfirmation {
+#[doc(hidden)]
+pub enum GoReverseMemberConfirmation {
     /// The keyed receiver helper found the member declaration directly.
     ReceiverAnchor(SemanticId),
     /// The receiver helper needs the caller file's shared forward demand batch.
     Unknown,
 }
 
-pub(crate) struct GoReverseRenameContext {
-    pub(crate) family: GoMethodFamily,
+#[doc(hidden)]
+pub struct GoReverseRenameContext {
+    #[doc(hidden)]
+    pub family: GoMethodFamily,
     summary_context: GoReverseSummaryContext,
     target_declarations: Vec<(u32, i64)>,
 }
 
 impl GoReverseCandidateSet {
-    pub(crate) fn rename_context(&self) -> GoReverseRenameContext {
+    #[doc(hidden)]
+    pub fn rename_context(&self) -> GoReverseRenameContext {
         GoReverseRenameContext {
             family: self.family.clone(),
             summary_context: self.summary_context.clone(),
@@ -1399,7 +1410,7 @@ fn read_go_reverse_qualified_import(
             binding = Some(next);
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     LAST_GO_REVERSE_QUALIFIED_IMPORTS.with(|seen| {
         seen.borrow_mut().extend(observed_imports);
     });
@@ -1697,21 +1708,28 @@ fn follow_go_reverse_aliases(
     })
 }
 
-pub(crate) enum GoReverseCandidateOutcome {
+#[doc(hidden)]
+pub enum GoReverseCandidateOutcome {
     Ready(GoReverseCandidateSet),
     Unavailable(String),
     Cancelled,
 }
 
-pub(crate) struct GoReverseConfirmedReference {
-    pub(crate) locator: SelectedSemanticLocator,
-    pub(crate) answer: FactResolutionAnswer,
-    pub(crate) owner: Option<CodeUnit>,
-    pub(crate) binding_targets: Vec<GoReverseBindingTarget>,
+#[doc(hidden)]
+pub struct GoReverseConfirmedReference {
+    #[doc(hidden)]
+    pub locator: SelectedSemanticLocator,
+    #[doc(hidden)]
+    pub answer: FactResolutionAnswer,
+    #[doc(hidden)]
+    pub owner: Option<CodeUnit>,
+    #[doc(hidden)]
+    pub binding_targets: Vec<GoReverseBindingTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GoReverseBindingTarget {
+#[doc(hidden)]
+pub enum GoReverseBindingTarget {
     Unit(CodeUnit),
     Lexical {
         source_file: ProjectFile,
@@ -1719,12 +1737,18 @@ pub(crate) enum GoReverseBindingTarget {
     },
 }
 
-pub(crate) struct GoReverseConfirmed {
-    pub(crate) family: GoMethodFamily,
-    pub(crate) target: SemanticId,
-    pub(crate) references: Vec<GoReverseConfirmedReference>,
-    pub(crate) completion: ResolutionCompletion,
-    pub(crate) candidate_inventory_complete: bool,
+#[doc(hidden)]
+pub struct GoReverseConfirmed {
+    #[doc(hidden)]
+    pub family: GoMethodFamily,
+    #[doc(hidden)]
+    pub target: SemanticId,
+    #[doc(hidden)]
+    pub references: Vec<GoReverseConfirmedReference>,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
+    #[doc(hidden)]
+    pub candidate_inventory_complete: bool,
 }
 
 pub(crate) enum GoReverseConfirmationOutcome {
@@ -1738,7 +1762,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Refuse a rename when saved Go bundles show a binding that the new
     /// package name would capture or rebind. All reads are keyed by selected
     /// sites, scope endpoints, summary ids, and lookup identities.
-    pub(crate) fn go_rename_conflict(
+    #[doc(hidden)]
+    pub fn go_rename_conflict(
         &self,
         rename_context: &GoReverseRenameContext,
         target: &CodeUnit,
@@ -1952,7 +1977,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Select all structured same-package and importing-package sites whose
     /// shared lookup identity could name `target`. The caller still has to
     /// resolve each site in its own file-scoped Go context.
-    pub(crate) fn go_reverse_candidate_sites(
+    #[doc(hidden)]
+    pub fn go_reverse_candidate_sites(
         &self,
         target: &CodeUnit,
         context_id: i64,
@@ -2164,7 +2190,7 @@ impl SelectedResolutionOperation<'_, '_> {
             let identity = lookup
                 .shared_name_id()
                 .map(|identity| i64::from(identity.get()));
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(identity) = identity {
                 LAST_GO_REVERSE_CANDIDATE_PLAN.with(|last| {
                     *last.borrow_mut() = explain_go_reverse_candidate_plan(
@@ -2347,7 +2373,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .cmp(&(right.summary_role != right.source_role))
                 })
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         LAST_GO_REVERSE_CANDIDATE_PATHS.with(|last| {
             *last.borrow_mut() = candidates
                 .iter()
@@ -2368,7 +2394,8 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Confirm names with summaries and members with receiver anchors.
     /// Resolve unknown or incomplete cases in per-file forward batches.
-    pub(crate) fn confirm_go_reverse_candidates<F>(
+    #[doc(hidden)]
+    pub fn confirm_go_reverse_candidates<F>(
         &mut self,
         context_id: i64,
         mut candidates: GoReverseCandidateSet,
@@ -2383,7 +2410,7 @@ impl SelectedResolutionOperation<'_, '_> {
             FactReferenceSiteMetadata,
         ) -> Result<BoundedResolution<GoReverseMemberConfirmation>>,
     {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         LAST_GO_REVERSE_CONFIRMATION_WORK.with(|work| work.set((0, 0, 0)));
         let candidate_inventory_complete = candidates.candidate_inventory_complete;
         let target_semantic = candidates.target;
@@ -2536,7 +2563,18 @@ impl SelectedResolutionOperation<'_, '_> {
                         value: GoReverseMemberConfirmation::ReceiverAnchor(member),
                         ..
                     } => {
-                        if *member == target_semantic || candidates.family.contains(*member) {
+                        if *member != target_semantic && candidates.family.contains(*member) {
+                            // The anchor proves a declaration. Following its
+                            // implementations also needs the native call-family
+                            // boundary, which a name-only summary cannot prove.
+                            forward_candidate_count += 1;
+                            let group = (
+                                candidate.locator.relative_path().to_owned(),
+                                candidate.source_role.clone(),
+                            );
+                            member_forward_groups.insert(group.clone());
+                            forward_groups.entry(group).or_default().push(candidate);
+                        } else if *member == target_semantic {
                             confirmed_answers.push((
                                 candidate,
                                 FactResolutionAnswer::from_selected_summary_binding(
@@ -2624,7 +2662,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 ),
             ));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         LAST_GO_REVERSE_CONFIRMATION_WORK.with(|work| {
             work.set((member_confirmations.len(), 0, 0));
         });
@@ -2766,7 +2804,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     crate::analyzer::resolution::seam_profile::record_go_reverse_forward_batch(
                         batch.answers().len(),
                     );
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     LAST_GO_REVERSE_CONFIRMATION_WORK.with(|work| {
                         let (members, batches, answers) = work.get();
                         work.set((members, batches + 1, answers + batch.answers().len()));
@@ -2911,7 +2949,7 @@ impl SelectedResolutionOperation<'_, '_> {
             else {
                 continue;
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 let plan = explain_go_reverse_definition_plan(
                     connection,
@@ -2993,7 +3031,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn explain_go_reverse_candidate_plan(
     connection: &rusqlite::Connection,
     context_id: i64,
@@ -3020,7 +3058,7 @@ pub(crate) fn explain_go_reverse_candidate_plan(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn explain_go_reverse_definition_plan(
     connection: &rusqlite::Connection,
     mount_ordinal: i64,
@@ -3034,23 +3072,27 @@ pub(crate) fn explain_go_reverse_definition_plan(
         .collect()
 }
 
-#[cfg(test)]
-pub(crate) fn last_go_reverse_candidate_plan_for_test() -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn last_go_reverse_candidate_plan_for_test() -> Vec<String> {
     LAST_GO_REVERSE_CANDIDATE_PLAN.with(|last| last.borrow().clone())
 }
 
-#[cfg(test)]
-pub(crate) fn last_go_reverse_candidate_paths_for_test() -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn last_go_reverse_candidate_paths_for_test() -> Vec<String> {
     LAST_GO_REVERSE_CANDIDATE_PATHS.with(|last| last.borrow().clone())
 }
 
-#[cfg(test)]
-pub(crate) fn last_go_reverse_definition_plan_for_test() -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn last_go_reverse_definition_plan_for_test() -> Vec<String> {
     LAST_GO_REVERSE_DEFINITION_PLAN.with(|last| last.borrow().clone())
 }
 
-#[cfg(test)]
-pub(crate) fn last_go_reverse_qualified_imports_for_test() -> Vec<(u32, u32, Option<i64>)> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn last_go_reverse_qualified_imports_for_test() -> Vec<(u32, u32, Option<i64>)> {
     LAST_GO_REVERSE_QUALIFIED_IMPORTS.with(|seen| {
         let mut rows = seen.borrow().clone();
         rows.sort_unstable();
@@ -3059,23 +3101,27 @@ pub(crate) fn last_go_reverse_qualified_imports_for_test() -> Vec<(u32, u32, Opt
     })
 }
 
-#[cfg(test)]
-pub(crate) fn reset_go_reverse_qualified_imports_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_go_reverse_qualified_imports_for_test() {
     LAST_GO_REVERSE_QUALIFIED_IMPORTS.with(|seen| seen.borrow_mut().clear());
 }
 
-#[cfg(test)]
-pub(crate) fn reset_go_reverse_alias_fallbacks_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_go_reverse_alias_fallbacks_for_test() {
     LAST_GO_REVERSE_ALIAS_FALLBACKS.with(|count| count.set(0));
 }
 
-#[cfg(test)]
-pub(crate) fn last_go_reverse_alias_fallbacks_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn last_go_reverse_alias_fallbacks_for_test() -> usize {
     LAST_GO_REVERSE_ALIAS_FALLBACKS.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
-pub(crate) fn mark_go_context_incomplete_for_test(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn mark_go_context_incomplete_for_test(
     store: &super::super::AnalyzerStore,
     context_id: i64,
 ) -> Result<()> {
@@ -3088,8 +3134,9 @@ pub(crate) fn mark_go_context_incomplete_for_test(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn mark_go_package_complete_for_test(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn mark_go_package_complete_for_test(
     store: &super::super::AnalyzerStore,
     context_id: i64,
     import_path: &'static str,
@@ -3105,8 +3152,9 @@ pub(crate) fn mark_go_package_complete_for_test(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn mark_go_import_incomplete_for_test(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn mark_go_import_incomplete_for_test(
     store: &super::super::AnalyzerStore,
     context_id: i64,
     source_spelling: &'static str,
@@ -3119,8 +3167,9 @@ pub(crate) fn mark_go_import_incomplete_for_test(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn mark_go_unit_summary_unavailable_for_test(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn mark_go_unit_summary_unavailable_for_test(
     store: &super::super::AnalyzerStore,
     context_id: i64,
     unit_key: [u8; 32],
@@ -3142,8 +3191,9 @@ pub(crate) fn mark_go_unit_summary_unavailable_for_test(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn seed_go_reverse_plan_decoys_for_test(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn seed_go_reverse_plan_decoys_for_test(
     store: &super::super::AnalyzerStore,
     context_id: i64,
     importer_path: &'static str,
@@ -3174,7 +3224,8 @@ pub(crate) fn seed_go_reverse_plan_decoys_for_test(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn last_go_reverse_confirmation_work_for_test() -> (usize, usize, usize) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn last_go_reverse_confirmation_work_for_test() -> (usize, usize, usize) {
     LAST_GO_REVERSE_CONFIRMATION_WORK.with(std::cell::Cell::get)
 }

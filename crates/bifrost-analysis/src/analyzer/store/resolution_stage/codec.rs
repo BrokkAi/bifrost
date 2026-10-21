@@ -54,7 +54,8 @@ fn local_parts(payload: u64) -> (u32, u32) {
     (ordinal, key)
 }
 
-pub(in crate::analyzer::store) fn encode_semantic(semantic: SemanticId) -> i64 {
+#[doc(hidden)]
+pub fn encode_semantic(semantic: SemanticId) -> i64 {
     let cell = if let Some(shared) = semantic.shared_name_id() {
         assert!(shared.get() > 0, "a signed stage shared name is positive");
         -i64::from(shared.get())
@@ -65,7 +66,8 @@ pub(in crate::analyzer::store) fn encode_semantic(semantic: SemanticId) -> i64 {
     cell
 }
 
-pub(in crate::analyzer::store) fn decode_semantic(cell: i64) -> SemanticId {
+#[doc(hidden)]
+pub fn decode_semantic(cell: i64) -> SemanticId {
     if cell < 0 {
         let shared = u32::try_from(cell.unsigned_abs())
             .expect("a stage shared name fits the request SharedNameId domain");
@@ -88,7 +90,8 @@ pub(in crate::analyzer::store) fn decode_semantic(cell: i64) -> SemanticId {
     }
 }
 
-pub(in crate::analyzer::store) fn encode_node(node: BindingNodeId) -> i64 {
+#[doc(hidden)]
+pub fn encode_node(node: BindingNodeId) -> i64 {
     let cell = i64::try_from(node.get()).expect("a runtime node fits a SQLite integer");
     assert_eq!(decode_node(cell), node);
     cell

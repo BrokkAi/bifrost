@@ -1,0 +1,459 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "resolver",
+      "producer": {
+        "identifier": "https://example.org/python-resolver",
+        "version": "1.0.0"
+      },
+      "generationMethod": "source-analysis",
+      "inputs": [
+        {
+          "role": "target-artifact",
+          "purl": "pkg:pypi/types-beautifulsoup4@4.13.0",
+          "digest": {
+            "algorithm": "sha-256",
+            "coverage": "artifact",
+            "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      ]
+    }
+  ],
+  "defaultProvenance": "resolver",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:pypi/types-beautifulsoup4@4.13.0",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "artifact",
+              "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          ]
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.python",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/python/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": {
+                "model": "self"
+              }
+            },
+            {
+              "kind": "fact-family",
+              "family": "distribution-imports",
+              "scope": {
+                "artifact": "model"
+              }
+            },
+            {
+              "kind": "fact-family",
+              "family": "import-bindings",
+              "scope": {
+                "module": "bs4"
+              }
+            },
+            {
+              "kind": "fact-family",
+              "family": "declaration-correspondence",
+              "scope": {
+                "declarationArtifact": "model",
+                "runtimeArtifact": "pkg:pypi/beautifulsoup4@4.13.0"
+              }
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "bs4",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "bs4"
+            }
+          ]
+        },
+        {
+          "id": "Text",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "bs4"
+            },
+            {
+              "role": "type",
+              "name": "Text"
+            }
+          ]
+        },
+        {
+          "id": "parse",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "bs4"
+            },
+            {
+              "role": "callable",
+              "name": "parse"
+            }
+          ]
+        },
+        {
+          "id": "runtime-bs4",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "bs4"
+            }
+          ],
+          "artifactSelectors": [
+            {
+              "purl": "pkg:pypi/beautifulsoup4@4.13.0",
+              "digests": [
+                {
+                  "algorithm": "sha-256",
+                  "coverage": "artifact",
+                  "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "runtime-Text",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "bs4"
+            },
+            {
+              "role": "type",
+              "name": "Text"
+            }
+          ],
+          "artifactSelectors": [
+            {
+              "purl": "pkg:pypi/beautifulsoup4@4.13.0",
+              "digests": [
+                {
+                  "algorithm": "sha-256",
+                  "coverage": "artifact",
+                  "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "runtime-parse",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "bs4"
+            },
+            {
+              "role": "callable",
+              "name": "parse"
+            }
+          ],
+          "artifactSelectors": [
+            {
+              "purl": "pkg:pypi/beautifulsoup4@4.13.0",
+              "digests": [
+                {
+                  "algorithm": "sha-256",
+                  "coverage": "artifact",
+                  "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "declarations": [
+        {
+          "symbol": "bs4",
+          "category": "namespace"
+        },
+        {
+          "symbol": "Text",
+          "category": "type",
+          "owner": "bs4"
+        },
+        {
+          "symbol": "parse",
+          "category": "callable",
+          "owner": "bs4",
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-or-named",
+                "label": "value",
+                "required": true,
+                "type": {
+                  "kind": "reference",
+                  "symbol": "Text"
+                }
+              }
+            ],
+            "results": [
+              {
+                "position": 0,
+                "type": {
+                  "kind": "reference",
+                  "symbol": "Text"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "symbol": "runtime-bs4",
+          "category": "namespace"
+        },
+        {
+          "symbol": "runtime-Text",
+          "category": "type",
+          "owner": "runtime-bs4"
+        },
+        {
+          "symbol": "runtime-parse",
+          "category": "callable",
+          "owner": "runtime-bs4",
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-or-named",
+                "label": "value",
+                "required": true,
+                "type": {
+                  "kind": "reference",
+                  "symbol": "runtime-Text"
+                }
+              }
+            ],
+            "results": [
+              {
+                "position": 0,
+                "type": {
+                  "kind": "reference",
+                  "symbol": "runtime-Text"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "procedureSummaries": [
+        {
+          "callable": "runtime-parse",
+          "transfers": [
+            {
+              "source": {
+                "root": {
+                  "phase": "input",
+                  "role": "parameter",
+                  "position": 0
+                }
+              },
+              "destination": {
+                "root": {
+                  "phase": "output",
+                  "role": "result",
+                  "position": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "distribution-imports",
+          "scope": {
+            "artifact": "model"
+          },
+          "payload": {
+            "kind": "distribution-imports",
+            "importRoots": [
+              [
+                "bs4"
+              ]
+            ]
+          },
+          "provenance": [
+            "resolver"
+          ]
+        },
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "import-bindings",
+          "scope": {
+            "module": "bs4"
+          },
+          "payload": {
+            "kind": "import-bindings",
+            "bindings": [
+              {
+                "name": "parse",
+                "bindingKind": "definition",
+                "target": "parse"
+              }
+            ]
+          },
+          "provenance": [
+            "resolver"
+          ]
+        },
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "declaration-correspondence",
+          "scope": {
+            "declarationArtifact": "model",
+            "runtimeArtifact": "pkg:pypi/beautifulsoup4@4.13.0"
+          },
+          "payload": {
+            "kind": "declaration-correspondence",
+            "mappings": [
+              {
+                "declaration": "parse",
+                "runtime": "runtime-parse",
+                "relation": "describes",
+                "conditions": {
+                  "python": "3.13.0"
+                }
+              },
+              {
+                "declaration": "Text",
+                "runtime": "runtime-Text",
+                "relation": "augments"
+              }
+            ]
+          },
+          "provenance": [
+            "resolver"
+          ]
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "declaration-records",
+          "scope": {
+            "scheme": "csmi.python",
+            "schemeVersion": "0.1.0"
+          },
+          "status": "partial",
+          "limitations": [
+            {
+              "kind": "coverage-limited"
+            }
+          ]
+        },
+        {
+          "family": "declaration-aspects",
+          "scope": {
+            "symbol": "parse",
+            "aspect": "callable-shape"
+          },
+          "status": "complete"
+        },
+        {
+          "family": "procedure-summaries",
+          "scope": {
+            "callable": "runtime-parse"
+          },
+          "status": "partial",
+          "limitations": [
+            {
+              "kind": "coverage-limited"
+            }
+          ]
+        },
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "distribution-imports",
+          "scope": {
+            "artifact": "model"
+          },
+          "status": "complete",
+          "provenance": [
+            "resolver"
+          ]
+        },
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "import-bindings",
+          "scope": {
+            "module": "bs4"
+          },
+          "status": "complete",
+          "provenance": [
+            "resolver"
+          ]
+        },
+        {
+          "vocabulary": "csmi.python",
+          "version": "0.1.0",
+          "family": "declaration-correspondence",
+          "scope": {
+            "declarationArtifact": "model",
+            "runtimeArtifact": "pkg:pypi/beautifulsoup4@4.13.0"
+          },
+          "status": "partial",
+          "limitations": [
+            {
+              "kind": "coverage-limited"
+            }
+          ],
+          "provenance": [
+            "resolver"
+          ]
+        }
+      ]
+    }
+  ]
+}

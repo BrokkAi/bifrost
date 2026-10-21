@@ -1,16 +1,18 @@
+// Preserve explicit engine visibility when an overlay shadows a public glob.
+#![allow(hidden_glob_reexports)]
+// Boundary-visible child modules keep their qualified paths when short names collide.
+#![allow(ambiguous_glob_reexports)]
+
 //! Language-neutral executable semantics and adapter contracts.
 
-macro_rules! count_idents {
-    ($($value:ident),* $(,)?) => {
-        <[()]>::len(&[$(count_idents!(@unit $value)),*])
-    };
-    (@unit $value:ident) => { () };
-}
-
+pub use brokk_bifrost_semantic::analyzer::semantic::common;
+pub use brokk_bifrost_semantic::analyzer::semantic::*;
 /// Implement the public semantic-provider lifecycle by forwarding to one
 /// stateless language lowerer through the analyzer's shared tree-sitter core.
 /// Keeping this pair together prevents each lifecycle addition from requiring
 /// another copy in every language adapter.
+#[doc(hidden)]
+#[macro_export]
 macro_rules! impl_program_semantics_provider {
     ($analyzer:ty, |$context:ident| $lowerer:expr) => {
         impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
@@ -18,6 +20,34 @@ macro_rules! impl_program_semantics_provider {
                 let $context = self;
                 let lowerer = $lowerer;
                 $crate::analyzer::semantic::service::ProgramSemanticsLowerer::capabilities(&lowerer)
+            }
+
+            fn procedure_inventory(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                Option<$crate::analyzer::semantic::SemanticProcedureInventory>,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                let $context = self;
+                let lowerer = $lowerer;
+                let scope = $crate::analyzer::AnalyzerQueryScope::new(self);
+                let Some(prepared) = self.inner.prepared_syntax(
+                    brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope),
+                    file,
+                ) else {
+                    return Err($crate::analyzer::semantic::SemanticProviderError::internal(
+                        "procedure inventory source is unavailable".to_owned(),
+                    ));
+                };
+                $crate::analyzer::semantic::service::ProgramSemanticsLowerer::procedure_inventory(
+                    &lowerer,
+                    file,
+                    &prepared,
+                    request.budget,
+                    request.cancellation,
+                )
             }
 
             fn current_artifact_source(
@@ -34,6 +64,20 @@ macro_rules! impl_program_semantics_provider {
                     &lowerer,
                     file,
                     max_source_bytes,
+                )
+            }
+
+            fn storage_language_key_for_file(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+            ) -> Option<$crate::analyzer::semantic::StorageLanguageKey> {
+                Some(
+                    $crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                        $crate::analyzer::tree_sitter_analyzer::LanguageAdapter::storage_language_key_for_file(
+                            self.inner.adapter(),
+                            file,
+                        ),
+                    ),
                 )
             }
 
@@ -97,6 +141,20 @@ macro_rules! impl_program_semantics_provider {
                 )
             }
 
+            fn storage_language_key_for_file(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+            ) -> Option<$crate::analyzer::semantic::StorageLanguageKey> {
+                Some(
+                    $crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                        $crate::analyzer::tree_sitter_analyzer::LanguageAdapter::storage_language_key_for_file(
+                            self.inner.adapter(),
+                            file,
+                        ),
+                    ),
+                )
+            }
+
             fn materialize(
                 &self,
                 file: &$crate::analyzer::ProjectFile,
@@ -135,67 +193,31 @@ macro_rules! impl_program_semantics_provider {
     };
 }
 
-pub(crate) use impl_program_semantics_provider;
-
-pub(crate) fn hash_arc_key<T: ?Sized, K: std::hash::Hash, H: std::hash::Hasher>(
-    owner: &std::sync::Arc<T>,
-    key: &K,
-    state: &mut H,
-) {
-    std::hash::Hash::hash(&std::sync::Arc::as_ptr(owner), state);
-    std::hash::Hash::hash(key, state);
-}
-
-pub(crate) fn completeness_reason_bytes(completeness: &EvidenceCompleteness) -> usize {
-    completeness.retained_heap_bytes()
-}
-
-pub(crate) const fn procedure_relays_receiver_capture(kind: ProcedureKind) -> bool {
-    matches!(kind, ProcedureKind::Lambda)
-}
-
-pub mod binding_origins;
-pub mod capabilities;
-pub(crate) mod cfg;
+#[doc(hidden)]
+pub use crate::impl_program_semantics_provider;
 pub mod cfg_algorithms;
 pub mod icfg;
 pub mod ids;
-pub(crate) mod inventory;
 pub mod ir;
 pub mod leases;
-pub(crate) mod lowering;
+#[doc(hidden)]
+pub mod lowering;
 pub mod oracle;
 pub mod partial_flow;
 pub mod property_reaching;
-pub mod provider;
 pub mod render;
 pub mod service;
 pub mod statement_entries;
-pub(crate) mod structural_identity;
+#[doc(hidden)]
+pub mod structural_identity;
 pub mod type_flow;
 pub mod value_type_barriers;
 pub mod workspace_oracle;
-
-#[cfg(test)]
-pub(crate) fn floating_value_for_test(value: f64) -> SemanticValueKind {
-    SemanticValueKind::FloatingPoint {
-        bits: value.to_bits(),
-    }
-}
-
 pub use crate::cancellation::CancellationToken;
-pub use binding_origins::*;
-pub use capabilities::*;
 pub use icfg::*;
-pub use ids::*;
 pub(crate) use inventory::*;
-pub use ir::*;
-pub use leases::*;
 pub(crate) use lowering::*;
 pub use oracle::*;
-pub use property_reaching::*;
-pub use provider::*;
-pub use render::*;
 pub use service::semantic_artifact_retained_bytes;
 #[cfg(any(test, feature = "test-support"))]
 pub use service::{SemanticCacheRevivalCensus, SemanticMaterializationCensus};
@@ -211,6 +233,8 @@ pub use type_flow::{
 };
 pub use value_type_barriers::*;
 pub use workspace_oracle::*;
-
 pub mod local_value_origins;
 pub use local_value_origins::*;
+
+// Keep the oracle module distinct from the workspace implementation overlay.
+pub use oracle::{dispatch, heap};

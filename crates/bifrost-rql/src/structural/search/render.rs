@@ -54,6 +54,22 @@ pub(super) fn merge_pipeline_row(
     if let Some(&index) = indexes.get(&key) {
         let row = &mut rows[index];
         row.value.merge_evidence(incoming.value);
+        if incoming
+            .traces
+            .first()
+            .is_some_and(|trace| trace.window_order.is_some())
+        {
+            row.traces.extend(incoming.traces);
+            row.traces.sort_by_key(|trace| {
+                trace
+                    .window_order
+                    .expect("windowed provenance carries its input order")
+            });
+            row.provenance_truncated |=
+                incoming.provenance_truncated || row.traces.len() > MAX_PROVENANCE_TRACES;
+            row.traces.truncate(MAX_PROVENANCE_TRACES);
+            return;
+        }
         let remaining = MAX_PROVENANCE_TRACES.saturating_sub(row.traces.len());
         if incoming.traces.len() > remaining {
             row.provenance_truncated = true;

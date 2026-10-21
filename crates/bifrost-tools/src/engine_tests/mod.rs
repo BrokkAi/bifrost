@@ -1,0 +1,279 @@
+// Keep the moved Go regression's original ancestor-relative fixture path.
+use brokk_bifrost_go_analysis::persist_live_go_sources_for_test;
+
+mod canonical_workspace_graph;
+mod cpp_bounded;
+mod go_native_graph;
+mod point_latency;
+mod rust_crate_context;
+mod rust_crates;
+mod rust_manifest_update;
+mod rust_native_graph;
+mod rust_selected_shadow;
+mod rust_unit_summaries;
+mod tree_sitter_analyzer;
+
+mod ruby_definition_lookup;
+mod ruby_derived_cache;
+mod ruby_finder;
+mod ruby_overlay;
+mod ruby_source_facts;
+mod ruby_store;
+
+mod language_contract;
+mod ruby_graph_contract;
+
+mod language_table_epoch;
+
+mod language_table_multi_analyzer;
+
+mod ruby_icfg;
+
+mod ruby_dispatch;
+
+mod ruby_materialization_rows;
+
+mod ruby_call_relations;
+
+mod language_table_source_admission;
+
+mod ruby_call_sites;
+
+mod ruby_trace_boundaries;
+
+mod language_table_usage_cache;
+
+mod language_table_workspace_graph;
+
+mod ruby_reference_edges;
+
+mod go_module_overlay;
+
+mod csharp_receiver_query;
+mod csharp_store;
+
+mod csharp_boundary_trace;
+mod csharp_identity_routes;
+mod csharp_workspace;
+mod php_call_relations;
+mod php_derived_cache;
+mod php_finder;
+mod php_lexical_environment;
+mod php_source_facts;
+mod php_store;
+mod php_trace;
+
+mod php_call_sites;
+
+mod cpp_extraction;
+
+mod cpp_semantic;
+mod python_analyzer_jvm_external;
+mod python_analyzer_semantic_icfg;
+mod python_analyzer_semantic_model_overlay;
+mod python_analyzer_semantic_workspace_oracle_dispatch;
+mod python_analyzer_semantic_workspace_oracle_heap;
+mod python_analyzer_semantic_workspace_oracle_value_flow;
+mod python_analyzer_store;
+mod python_analyzer_store_relational_query;
+mod python_analyzer_structural_branch_relations;
+mod python_analyzer_structural_index;
+mod python_analyzer_symbol_lookup;
+mod python_analyzer_usages_call_relations;
+mod python_analyzer_usages_get_type;
+mod python_analyzer_workspace;
+mod python_incoming_batch_properties;
+mod python_source_facts;
+
+mod js_ts_comment_density;
+mod js_ts_direct_callable;
+mod js_ts_read_verification;
+mod js_ts_resolution_selection;
+mod js_ts_semantic_icfg;
+mod js_ts_semantic_service;
+mod js_ts_semantic_workspace_oracle_dispatch;
+mod js_ts_semantic_workspace_oracle_runtime_values;
+mod js_ts_semantic_workspace_oracle_runtime_values_cache_tests;
+mod js_ts_semantic_workspace_oracle_source;
+mod js_ts_source_admission_tests;
+mod js_ts_store;
+mod js_ts_store_resolution_producer_tests;
+mod js_ts_store_source_facts_js_ts_tests;
+mod js_ts_structural_branch_relations;
+mod js_ts_structural_identity_routes;
+mod js_ts_structural_lexical_environment;
+mod js_ts_structural_occurrence_rows;
+mod js_ts_structural_provider;
+mod js_ts_structural_qualified_paths;
+mod js_ts_usages_call_relations;
+mod js_ts_usages_get_definition;
+mod js_ts_usages_receiver_query_tests;
+mod js_ts_workspace;
+mod python_analyzer_structural_identity_routes;
+mod python_analyzer_structural_lexical_environment;
+mod python_analyzer_structural_materialization_rows;
+mod python_analyzer_structural_occurrence_rows;
+mod python_runtime_values;
+mod python_source_admission;
+
+mod rust_analyzer_i_analyzer_read_ledger_scope_tests;
+
+mod rust_analyzer_index_warmer_tests;
+
+mod rust_analyzer_multi_analyzer_tests;
+
+mod rust_analyzer_packs_document_tests;
+
+mod rust_analyzer_semantic_icfg_tests;
+
+mod rust_analyzer_semantic_partial_flow_host_tests;
+
+mod rust_analyzer_semantic_workspace_oracle_dispatch_tests;
+
+mod rust_analyzer_semantic_workspace_oracle_heap_tests;
+
+mod rust_analyzer_semantic_workspace_oracle_value_flow_tests;
+
+mod rust_analyzer_store_gc_tests;
+
+mod rust_analyzer_store_import_graph_tests;
+
+mod rust_analyzer_store_planner_statistics_tests;
+
+mod rust_analyzer_store_resolution_operation_forward_tests;
+
+mod rust_analyzer_store_resolution_operation_imports_tests;
+
+mod rust_analyzer_store_resolution_operation_rust_reverse_rows_tests;
+
+mod rust_analyzer_store_resolution_operation_unit_summary_tests;
+
+mod rust_analyzer_store_resolution_producer_tests;
+
+mod rust_analyzer_store_resolution_publication_tests;
+
+mod rust_analyzer_store_resolution_selection_tests;
+
+mod rust_analyzer_store_resolution_stage_closure_tests;
+
+mod rust_analyzer_store_resolution_stage_lexical_reader_tests;
+
+mod rust_analyzer_store_resolution_stage_projection_tests;
+
+mod rust_analyzer_store_resolution_stage_typed_tests;
+
+mod rust_analyzer_store_resolution_typed_row_evidence_tests;
+
+mod rust_analyzer_store_rust_context_scope_tests;
+
+mod rust_analyzer_store_rust_item_query_plan_tests;
+
+mod rust_analyzer_store_rust_item_source_tests;
+
+mod rust_analyzer_store_rust_macro_context_tests;
+
+mod rust_analyzer_store_rust_module_source_tests;
+
+mod rust_analyzer_store_rust_type_form_tests;
+
+mod rust_analyzer_store_semantic_ir_tests;
+
+mod rust_analyzer_store_source_facts_declaration_visibility_tests;
+
+mod rust_analyzer_store_source_facts_import_read_tests;
+
+mod rust_analyzer_store_source_facts_source_import_path_tests;
+
+mod rust_analyzer_store_tests;
+
+mod rust_analyzer_structural_identity_routes_tests;
+
+mod rust_analyzer_structural_occurrence_rows_tests;
+
+mod rust_analyzer_structural_provider_tests;
+
+mod rust_analyzer_structural_qualified_paths_tests;
+
+mod rust_analyzer_structural_reference_edges_tests;
+
+mod rust_analyzer_tree_sitter_resolution_producer_tests;
+
+mod rust_analyzer_usages_call_relations_tests;
+
+mod rust_analyzer_usages_effects_tests;
+
+mod rust_analyzer_usages_finder_tests;
+
+mod rust_analyzer_usages_get_definition_native_navigation_tests;
+
+mod rust_analyzer_usages_get_definition_tests;
+
+mod rust_analyzer_workspace_tests;
+
+mod rust_path_utils_tests;
+
+mod rust_analyzer_store_native_query_plan_tests_wave2;
+
+mod rust_analyzer_store_resolution_operation_forward_tests_wave2;
+
+mod rust_analyzer_store_resolution_operation_point_latency_wave2;
+
+mod rust_analyzer_store_resolution_operation_privacy_tests_wave2;
+
+mod rust_analyzer_store_resolution_operation_reverse_tests_wave2;
+
+mod rust_analyzer_store_resolution_publication_capsule_authentication_tests_wave2;
+
+mod rust_analyzer_store_resolution_publication_tests_wave2;
+
+mod rust_analyzer_store_resolution_stage_projection_tests_wave2;
+
+mod rust_analyzer_store_resolution_stage_rust_context_tests_wave2;
+
+mod rust_multi_analyzer_support;
+
+mod rust_partial_flow_fixpoint_properties;
+
+mod rust_selection_fixture;
+
+mod go_extraction_extra;
+
+mod go_extraction_global;
+
+mod go_extraction_more;
+
+mod go_fact_resolution;
+
+mod go_publication;
+
+mod go_ruby_scope;
+
+mod go_selection_cache;
+
+mod go_store;
+
+mod go_transfer;
+
+mod rust_analyzer_semantic_workspace_oracle_source_tests_wave3;
+
+mod rust_indirect_file_usage_graph;
+
+mod rust_indirect_semantic_workspace_oracle_dispatch;
+
+mod rust_indirect_store_dependency_file_evidence;
+
+mod rust_indirect_store_gc;
+
+mod rust_indirect_store_planner_statistics;
+
+mod rust_indirect_store_resolution_operation_rust_reverse_rows;
+
+mod rust_indirect_store_rust_crate_binding_index_tests;
+
+mod rust_indirect_store_workspace_inputs;
+
+mod rust_indirect_usages_candidates;
+
+pub mod rust_analyzer_store_resolution_operation_tests;
+
+pub mod go_extraction;

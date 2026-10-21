@@ -1,0 +1,57 @@
+[package]
+name = "brokk-bifrost-cpp-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "C and C++ analyzers and receiver-aware usage resolution for brokk-bifrost"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = true
+readme = "README.md"
+
+[lib]
+name = "brokk_bifrost_cpp_analysis"
+
+[lints]
+workspace = true
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0" }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.0" }
+git2 = { version = "0.20.2", default-features = false }
+moka = { version = "0.12.11", features = ["sync"] }
+rayon = "1.10.0"
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+"hooks",
+"functions",
+] }
+semver = "1.0.28"
+serde_json = "1.0.145"
+tempfile = "3.23.0"
+tree-sitter = "0.25.10"
+tree-sitter-cpp = { package = "brokk-tree-sitter-cpp", version = "=0.24.3" }
+
+[features]
+default = []
+test-support = ["brokk-bifrost-analysis/test-support"]
+randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
+
+[dev-dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.0", features = ["test-support"] }
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+] }

@@ -1487,6 +1487,10 @@ impl RustMacroDefinitionSourceFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustMacroInvocationInputSourceFact {
     pub invocation: SourceOccurrenceId,
+    /// The invocation path as written, when the grammar exposes one. Unlike
+    /// `source_rust_macro_invocations`, this includes qualified expression
+    /// macros such as `log::warn!`, which have no item-macro invocation row.
+    pub macro_name: Option<String>,
     /// Effective source placement, including enclosing cfg_if arm predicates.
     pub cfg_condition: RustCfgCondition,
     /// The exact native frontier withheld for this invocation, when present.

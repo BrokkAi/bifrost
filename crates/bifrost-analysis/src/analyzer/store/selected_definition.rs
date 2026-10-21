@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::CancellationToken;
-use crate::analyzer::lexical_definitions::LexicalDefinition;
+use crate::analyzer::resolution::lexical_definition::LexicalDefinition;
 use crate::analyzer::resolution::{ResolutionLocalKey, SelectedResolutionMountOrdinal};
 use crate::analyzer::{DeclarationKind, Range};
 
@@ -11,7 +11,8 @@ use super::resolution::with_resolution_read_progress_handler;
 use super::resolution_selection::{SELECTED_MOUNT_PAGE_ROWS, SelectedResolutionMountInventory};
 use super::{HydratedCandidateRow, Result, StoreError, hydrate_candidate_rows};
 
-pub(crate) enum SelectedDefinitionUnitReadOutcome {
+#[doc(hidden)]
+pub enum SelectedDefinitionUnitReadOutcome {
     Ready(
         Box<
             [(
@@ -40,14 +41,16 @@ pub(crate) enum SelectedDefinitionSemanticReadOutcome {
 /// row and the native bridge exist for all three, so this reader answers for
 /// all three and the caller decides what each one means to it.
 #[derive(Debug)]
-pub(crate) enum SelectedDeclarationDefinition {
+#[doc(hidden)]
+pub enum SelectedDeclarationDefinition {
     Lexical(LexicalDefinition),
     /// The declaration's own source range. There is no stored identifier and
     /// no lexical kind to report, because the parser published neither.
     WithoutUnit(Range),
 }
 
-pub(crate) enum SelectedLexicalDefinitionReadOutcome {
+#[doc(hidden)]
+pub enum SelectedLexicalDefinitionReadOutcome {
     Ready(
         Vec<(
             SelectedResolutionMountOrdinal,
@@ -118,7 +121,8 @@ const SELECTED_REQUEST_INTERIOR_JOINS: &str =
 
 /// Exact requested definition coordinates drive hydration independently of
 /// unrelated units in the same blob or mounts elsewhere in the selection.
-pub(super) static SELECTED_DEFINITION_UNITS_SQL: std::sync::LazyLock<String> =
+#[doc(hidden)]
+pub static SELECTED_DEFINITION_UNITS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
             "SELECT {SELECTED_UNIT_COLUMNS}, request.mount_ordinal, request.key0
@@ -238,7 +242,7 @@ pub(super) static SELECTED_MACRO_ITEM_UNIT_SQL: std::sync::LazyLock<String> =
         )
     });
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static SELECTED_DEFINITION_UNIT_SQL_WORK: std::cell::Cell<(u64, u64)> = const {
         std::cell::Cell::new((0, 0))
@@ -247,8 +251,9 @@ thread_local! {
 
 /// Executions and VM steps of the unit hydration statements only, excluding
 /// request-table writes and subsequent candidate metadata hydration.
-#[cfg(test)]
-pub(super) fn take_selected_definition_unit_sql_work() -> (u64, u64) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_selected_definition_unit_sql_work() -> (u64, u64) {
     SELECTED_DEFINITION_UNIT_SQL_WORK.with(|work| work.replace((0, 0)))
 }
 
@@ -277,7 +282,8 @@ pub(super) static DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> =
     });
 
 impl SelectedResolutionMountInventory<'_> {
-    pub(crate) fn selected_lexical_definitions(
+    #[doc(hidden)]
+    pub fn selected_lexical_definitions(
         &self,
         definitions: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
         cancellation: &CancellationToken,
@@ -416,7 +422,8 @@ impl SelectedResolutionMountInventory<'_> {
         ))
     }
 
-    pub(crate) fn selected_definition_units(
+    #[doc(hidden)]
+    pub fn selected_definition_units(
         &self,
         definitions: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
         cancellation: &CancellationToken,
@@ -563,7 +570,7 @@ impl SelectedResolutionMountInventory<'_> {
                             ))
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     SELECTED_DEFINITION_UNIT_SQL_WORK.with(|work| {
                         let (executions, steps) = work.get();
                         work.set((

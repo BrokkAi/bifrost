@@ -23,4 +23,4 @@ WHERE (cr_visibility(candidate.visibility)<>'restricted'
   AND candidate.nearest_declaration_boundary = 0
   AND candidate.declaration_kind NOT IN (8, 9, 14)
   AND candidate.activation = 1
-ON CONFLICT(crate_key, module_path, namespace, name) DO NOTHING;
+ON CONFLICT(crate_key, module_path, namespace, name, declaration_blob_id, declaration_site) DO NOTHING;

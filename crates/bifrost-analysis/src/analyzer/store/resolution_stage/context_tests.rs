@@ -4,7 +4,7 @@ use crate::analyzer::resolution::{
     ResolutionCompletion, ResolutionIncompleteReason, SemanticId, SharedNameId, StackPattern,
     StackVariableId, WitnessStep,
 };
-use crate::analyzer::store::resolution_selection::tests::SelectionFixture;
+use crate::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
 
 fn path(reason: u64) -> PartialPath {
     let shared = SemanticId::shared_name(SharedNameId::per_request(19));
@@ -180,4 +180,129 @@ fn context_paths_are_atomic_isolated_and_live_only_for_the_request() {
         .unwrap()
         .unwrap();
     assert_ne!(fresh, first);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#5600: named JVM contexts repeatedly published identical provider cells"
+)]
+fn context_cell_reuse_batches_identical_cells_and_rejects_changed_completion() {
+    let fixture = SelectionFixture::new(2);
+    let selection = fixture.open_ready(&[]);
+    let stage = SelectedResolutionStage::new(&selection);
+    let live = CancellationToken::new();
+    let first = path(23);
+    let changed = path(29);
+    let identity = CandidatePathIdentity::new(
+        BindingFragmentId::at_ordinal(0),
+        PartialPathId::context_local((1 << 53) + 15),
+    );
+    let other = CandidatePathIdentity::new(
+        BindingFragmentId::at_ordinal(0),
+        PartialPathId::context_local((1 << 53) + 16),
+    );
+    let source = stage
+        .publish_context_paths(&live, |writer| {
+            assert!(writer.insert(identity, &first)?);
+            writer.insert(other, &first)
+        })
+        .unwrap()
+        .unwrap();
+    let equal = stage
+        .publish_context_paths(&live, |writer| writer.insert(identity, &first))
+        .unwrap()
+        .unwrap();
+    let different = stage
+        .publish_context_paths(&live, |writer| writer.insert(identity, &changed))
+        .unwrap()
+        .unwrap();
+    let copied = stage
+        .publish_context_paths(&live, |writer| {
+            assert!(writer.reuse(source, identity)?);
+            assert!(writer.reuse(equal, identity)?);
+            assert!(writer.insert(identity, &first)?);
+            writer.reuse(source, other)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(read(&selection, copied, identity), first);
+    assert_eq!(read(&selection, copied, other), first);
+    let coordinates =
+        serde_json::to_string(&[(source.get(), 0, codec::encode_path_id(identity.path()))])
+            .unwrap();
+    for sql in [
+        super::REUSED_CONTEXT_CELL_MEMBERSHIP,
+        super::REUSED_CONTEXT_CELL_COPY,
+    ] {
+        let plan = selection
+            .connection()
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", sql))
+            .unwrap()
+            .query_map(params![coordinates, copied.get()], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for relation in ["source", "target"] {
+            assert!(
+                plan.iter().any(|step| step
+                    .contains(&format!("SEARCH {relation} USING PRIMARY KEY"))
+                    && step.contains("context_id=? AND host_ordinal=? AND path=?")),
+                "{plan:?}"
+            );
+        }
+    }
+    let count = || {
+        selection
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM temp.selected_resolution_contexts",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap()
+    };
+    let before = count();
+    assert!(
+        stage
+            .publish_context_paths(&live, |writer| {
+                assert!(writer.reuse(source, identity)?);
+                writer.reuse(different, identity)
+            })
+            .is_err()
+    );
+    assert_eq!(count(), before);
+    assert!(
+        stage
+            .publish_context_paths(&live, |writer| {
+                assert!(writer.insert(identity, &changed)?);
+                writer.reuse(source, identity)
+            })
+            .is_err()
+    );
+    assert_eq!(count(), before);
+    let missing = CandidatePathIdentity::new(
+        identity.fragment(),
+        PartialPathId::context_local((1 << 53) + 99),
+    );
+    assert!(
+        stage
+            .publish_context_paths(&live, |writer| writer.reuse(source, missing))
+            .is_err()
+    );
+    assert_eq!(count(), before);
+    let cancelled = CancellationToken::new();
+    assert!(
+        stage
+            .publish_context_paths(&cancelled, |writer| {
+                assert!(writer.reuse(source, identity)?);
+                cancelled.cancel();
+                Ok(true)
+            })
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(count(), before);
+    assert!(selection.connection().is_autocommit());
 }

@@ -78,7 +78,7 @@ At the provider boundary, outcomes remain typed:
 | `unknown` | The provider cannot establish the requested relation | Sometimes | No |
 | `unsupported` | The selected capability is unavailable for this input | Sometimes | No |
 | `unproven` | A structured result exists without sufficient proof | Yes | No |
-| `exceeded_budget` | A named work limit stopped the request | Sometimes | No |
+| `exceeded_budget` | A named resource limit stopped the request | Sometimes | No |
 | `cancelled` | Cooperative cancellation stopped the request | Sometimes | No |
 
 Policy and extension surfaces may use wire labels such as `frontier_bounded`,
@@ -110,8 +110,11 @@ schemas and resource limits remain validation errors, including malformed
 qualified identities.
 
 Public semantic budget failures name a coarse lane: `source`, `rows`,
-`retained_bytes`, `steps`, or `files`. The internal ledger can refine its
-accounting without changing this vocabulary. In dispatch outcome rows,
+`retained_bytes`, or `files`. Source, row and retained-byte lanes bound resident
+admissions; `files` bounds discovery. Scans and traversal visits are work telemetry
+and never cause a semantic budget refusal. Solver step limits remain separate.
+The internal ledger can refine its accounting within these coarse lanes. In
+dispatch outcome rows,
 `exceeded_limit` is optional: an unavailable lane does not turn budget exhaustion
 into a complete result. Lane projection preserves the typed outcome, candidate
 coverage, proof, and completeness.

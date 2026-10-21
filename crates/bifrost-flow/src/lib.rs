@@ -1,5 +1,7 @@
 //! Flow-analysis engines and host-owned reusable state for Bifrost.
 
+#[cfg(test)]
+use brokk_bifrost_tools as _;
 use std::sync::Arc;
 
 pub use brokk_bifrost_analysis::analyzer;

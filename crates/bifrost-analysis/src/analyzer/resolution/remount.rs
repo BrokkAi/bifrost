@@ -79,16 +79,22 @@ impl LoweredResolutionFactsWithIdentityCatalog {
         }
     }
 
-    pub(crate) fn instantiate_macro_input(
+    #[doc(hidden)]
+    pub fn instantiate_macro_input(
         mut self,
         invocation_digest: [u8; 32],
         checkpoint: super::local_identity::ResolutionNodeIdentity,
+        checkpoint_scope: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId>,
         module_scope: brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
         let fragment = self.lexical.fragment();
-        self.identities
-            .specialize_macro_input(invocation_digest, checkpoint, module_scope);
+        self.identities.specialize_macro_input(
+            invocation_digest,
+            checkpoint,
+            checkpoint_scope,
+            module_scope,
+        );
         let mut artifact = self.remount(fragment, cancellation)?;
         let module = artifact.identities.register_macro_module_node(module_scope);
         artifact.lexical.attach_macro_module_witnesses(
@@ -128,7 +134,8 @@ impl LoweredResolutionFactsWithIdentityCatalog {
         })
     }
 
-    pub(crate) fn remount(
+    #[doc(hidden)]
+    pub fn remount(
         self,
         fragment: BindingFragmentId,
         cancellation: &CancellationToken,
@@ -868,6 +875,7 @@ fn remount_common(
     cancellation: &CancellationToken,
 ) -> Option<LoweredCommonFacts> {
     let LoweredCommonFacts {
+        root_imports,
         additional_definition_namespaces,
         definition_unit_crosswalks,
         deferred_member_owners,
@@ -1094,6 +1102,7 @@ fn remount_common(
         return None;
     }
     Some(LoweredCommonFacts::new(
+        root_imports,
         remounted_additional,
         remounted_crosswalks,
         remounted_deferred,

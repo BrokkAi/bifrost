@@ -4,8 +4,9 @@
 use super::*;
 use crate::analyzer::resolution::{LoweredPackageMember, LoweredPackageReference};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedPackageBridgeDescriptor {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[doc(hidden)]
+pub struct SelectedPackageBridgeDescriptor {
     pub(super) source_fragment: BindingFragmentId,
     pub(super) target_fragment: BindingFragmentId,
     source_language: Language,
@@ -28,6 +29,19 @@ impl SelectedPackageBridgeDescriptor {
     pub(crate) fn with_candidate_origin_rank(mut self, rank: Option<u32>) -> Self {
         self.candidate_origin_rank = rank;
         self
+    }
+
+    pub(crate) fn completion(&self) -> &ResolutionCompletion {
+        &self.completion
+    }
+
+    /// Other route uncertainties do not erase an enumerated declaration.
+    pub(crate) fn binding_definition(&self) -> Option<BindingNodeId> {
+        self.target_definition
+    }
+
+    pub(crate) fn binding_origin_rank(&self) -> Option<u32> {
+        self.target_definition.and(self.candidate_origin_rank)
     }
 
     pub(super) fn matches_qualified_reference(
@@ -397,6 +411,21 @@ impl SelectedPackageBridgeDescriptor {
             jvm_evidence: evidence,
             completion,
         }
+    }
+
+    pub(crate) fn validate_content_authority(
+        &self,
+        identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<()> {
+        self.digest(
+            b"bifrost-selected-package-path:v1",
+            identities,
+            source,
+            cancellation,
+        )?;
+        Ok(())
     }
 
     fn digest(

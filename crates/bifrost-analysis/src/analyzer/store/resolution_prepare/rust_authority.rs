@@ -107,7 +107,8 @@ pub(crate) fn encode_cfg(condition: &RustCfgCondition) -> String {
     .to_string()
 }
 
-pub(crate) fn decode_cfg(body: &str) -> RustCfgCondition {
+#[doc(hidden)]
+pub fn decode_cfg(body: &str) -> RustCfgCondition {
     let value: Value = serde_json::from_str(body).expect("stored cfg is JSON");
     let cells = value.as_array().expect("stored cfg is an array");
     let tag = cells

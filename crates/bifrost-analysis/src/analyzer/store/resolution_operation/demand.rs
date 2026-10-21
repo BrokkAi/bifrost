@@ -10,7 +10,7 @@ use super::*;
 use crate::analyzer::resolution::{
     BatchCandidateCompletionOutcome, BatchCandidateMatch, BatchCandidateOutcome,
     BatchCandidateRequest, BatchDefinitionNode, BatchEndpointClassification,
-    DemandClosureDischarges, DemandMemberSelection, DemandMemberSelectionRequest,
+    DemandClosureDischarges, DemandMemberSelection, DemandMemberSelectionOutcome,
     DemandRootDiscovery as RootDiscovery, DemandRootPlan as RootPlan,
     DemandRootProvider as RootProvider, DemandRootUnavailableReason as RootUnavailableReason,
     DemandSelectedOverlayBlueprint, EndpointSignature, FactResolutionAnswer, PartialPath,
@@ -18,6 +18,7 @@ use crate::analyzer::resolution::{
     ResolutionQuery, ReverseReferenceSeedRequest, SelectedContextPathSource, SemanticId,
     TypeTransferRule,
 };
+use crate::analyzer::resolution::{CALLER_ENVIRONMENT, DemandReferenceKey, DemandRelationKey};
 use std::hash::Hash;
 
 /// A root question selected by one language adapter. The generic provider
@@ -51,14 +52,17 @@ pub(crate) enum LanguageContextPreparation<D> {
 /// root question. A language may answer a prefix inside its context and return
 /// no scheduler inputs, retaining that answer on `RootQuestion` instead.
 pub(crate) struct LanguagePrefixInputs {
-    pub(crate) references: Vec<SemanticId>,
+    pub(crate) references: Vec<DemandReferenceKey>,
     pub(crate) completion: ResolutionCompletion,
 }
 
 /// Completion and any placeholder reasons discharged by one closed root.
-pub(crate) struct LanguageClosure {
-    pub(crate) completion: ResolutionCompletion,
-    pub(crate) closed: bool,
+#[doc(hidden)]
+pub struct LanguageClosure {
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
+    #[doc(hidden)]
+    pub closed: bool,
     pub(crate) discharges: Option<DemandClosureDischarges>,
 }
 
@@ -108,8 +112,22 @@ pub(crate) trait DemandLanguage {
         endpoint: &EndpointSignature,
         question: &Self::RootQuestion,
         context: Option<&Self::ContextData>,
-        inputs: &[(SemanticId, &FactResolutionAnswer)],
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
     ) -> Result<LanguageClosure>;
+
+    /// Include a ready member reader's evidence before publication and memoization.
+    fn close_root_with_member_completion(
+        &mut self,
+        endpoint: &EndpointSignature,
+        question: &Self::RootQuestion,
+        context: Option<&Self::ContextData>,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        member_completion: &ResolutionCompletion,
+    ) -> Result<LanguageClosure> {
+        let mut closure = self.close_root(endpoint, question, context, inputs)?;
+        closure.completion = closure.completion.combine(member_completion);
+        Ok(closure)
+    }
 
     /// Select the declaring owners of a requested member after the receiver
     /// references resolve. The scheduler owns all hierarchy dependencies.
@@ -117,9 +135,12 @@ pub(crate) trait DemandLanguage {
         &mut self,
         _question: &Self::RootQuestion,
         _context: Option<&Self::ContextData>,
-        _inputs: &[(SemanticId, &FactResolutionAnswer)],
-    ) -> Result<Option<DemandMemberSelectionRequest>> {
-        Ok(None)
+        _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+    ) -> Result<DemandMemberSelectionOutcome> {
+        Ok(DemandMemberSelectionOutcome::Ready {
+            request: None,
+            completion: ResolutionCompletion::Complete,
+        })
     }
 
     fn close_selected_members(
@@ -127,7 +148,7 @@ pub(crate) trait DemandLanguage {
         _endpoint: &EndpointSignature,
         _question: &Self::RootQuestion,
         _context: Option<&Self::ContextData>,
-        _inputs: &[(SemanticId, &FactResolutionAnswer)],
+        _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         _selection: &DemandMemberSelection,
     ) -> Result<LanguageClosure> {
         unreachable!("a language requesting member selection installs its result")
@@ -151,7 +172,7 @@ struct PreparedContext<D> {
 struct PendingRoot<Q, K> {
     question: Q,
     context_key: Option<K>,
-    prefixes: Vec<SemanticId>,
+    prefixes: Vec<DemandReferenceKey>,
     completion: ResolutionCompletion,
     closed: bool,
     closed_completion: Option<ResolutionCompletion>,
@@ -162,8 +183,8 @@ struct PendingRoot<Q, K> {
 pub(crate) struct DemandProvider<L: DemandLanguage> {
     language: L,
     contexts: HashMap<L::ContextKey, PreparedContext<L::ContextData>>,
-    pending: HashMap<EndpointSignature, PendingRoot<L::RootQuestion, L::ContextKey>>,
-    discharges: HashMap<EndpointSignature, DemandClosureDischarges>,
+    pending: HashMap<DemandRelationKey, PendingRoot<L::RootQuestion, L::ContextKey>>,
+    discharges: HashMap<DemandRelationKey, DemandClosureDischarges>,
 }
 
 impl<L: DemandLanguage> DemandProvider<L> {
@@ -178,7 +199,7 @@ impl<L: DemandLanguage> DemandProvider<L> {
 
     fn finish_closure(
         &mut self,
-        endpoint: &EndpointSignature,
+        endpoint: &DemandRelationKey,
         closure: LanguageClosure,
     ) -> ResolutionCompletion {
         let root = self
@@ -208,14 +229,22 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         self.language.supports_batched_root_discoveries()
     }
 
-    fn discover_many(&mut self, endpoints: &[EndpointSignature]) -> Result<Vec<RootDiscovery>> {
+    fn discover_many(&mut self, endpoints: &[DemandRelationKey]) -> Result<Vec<RootDiscovery>> {
         let mut missing = Vec::new();
         let mut seen = HashSet::default();
         for endpoint in endpoints {
+            assert_eq!(
+                endpoint.environment, CALLER_ENVIRONMENT,
+                "language providers still execute in the caller environment"
+            );
             if !self.pending.contains_key(endpoint) && seen.insert(endpoint.clone()) {
                 missing.push(endpoint.clone());
             }
         }
+        let missing = missing
+            .iter()
+            .map(|key| key.endpoint.clone())
+            .collect::<Vec<_>>();
         self.language.prepare_root_discoveries(&missing)?;
         endpoints
             .iter()
@@ -225,16 +254,39 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
 
     fn reverse_dependencies(
         &mut self,
-        endpoint: &EndpointSignature,
-    ) -> Result<Vec<EndpointSignature>> {
-        self.language.reverse_dependencies(endpoint)
+        endpoint: &DemandRelationKey,
+    ) -> Result<Vec<DemandRelationKey>> {
+        assert_eq!(
+            endpoint.environment, CALLER_ENVIRONMENT,
+            "language providers still execute in the caller environment"
+        );
+        let endpoint_environment = endpoint.environment;
+        self.language
+            .reverse_dependencies(endpoint)
+            .map(|endpoints| {
+                endpoints
+                    .into_iter()
+                    .map(|endpoint| DemandRelationKey {
+                        endpoint,
+                        environment: endpoint_environment,
+                    })
+                    .collect()
+            })
     }
 
-    fn close_reverse(&mut self, endpoint: &EndpointSignature) {
+    fn close_reverse(&mut self, endpoint: &DemandRelationKey) {
+        assert_eq!(
+            endpoint.environment, CALLER_ENVIRONMENT,
+            "language providers still execute in the caller environment"
+        );
         self.language.close_reverse(endpoint);
     }
 
-    fn discover(&mut self, endpoint: &EndpointSignature) -> Result<RootDiscovery> {
+    fn discover(&mut self, endpoint: &DemandRelationKey) -> Result<RootDiscovery> {
+        assert_eq!(
+            endpoint.environment, CALLER_ENVIRONMENT,
+            "language providers still execute in the caller environment"
+        );
         if let Some(root) = self.pending.get(endpoint) {
             return Ok(if root.closed {
                 RootDiscovery::AlreadyReady {
@@ -311,8 +363,17 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
 
     fn close(
         &mut self,
-        endpoint: &EndpointSignature,
-        inputs: &[(SemanticId, &FactResolutionAnswer)],
+        endpoint: &DemandRelationKey,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+    ) -> Result<ResolutionCompletion> {
+        self.close_with_member_completion(endpoint, inputs, &ResolutionCompletion::Complete)
+    }
+
+    fn close_with_member_completion(
+        &mut self,
+        endpoint: &DemandRelationKey,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        member_completion: &ResolutionCompletion,
     ) -> Result<ResolutionCompletion> {
         let root = self
             .pending
@@ -323,17 +384,21 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
             .as_ref()
             .and_then(|key| self.contexts.get(key))
             .map(|context| &context.data);
-        let closure = self
-            .language
-            .close_root(endpoint, &root.question, context, inputs)?;
+        let closure = self.language.close_root_with_member_completion(
+            endpoint,
+            &root.question,
+            context,
+            inputs,
+            member_completion,
+        )?;
         Ok(self.finish_closure(endpoint, closure))
     }
 
     fn member_selection(
         &mut self,
-        endpoint: &EndpointSignature,
-        inputs: &[(SemanticId, &FactResolutionAnswer)],
-    ) -> Result<Option<DemandMemberSelectionRequest>> {
+        endpoint: &DemandRelationKey,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+    ) -> Result<DemandMemberSelectionOutcome> {
         let root = self
             .pending
             .get(endpoint)
@@ -349,8 +414,8 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
 
     fn close_selected_members(
         &mut self,
-        endpoint: &EndpointSignature,
-        inputs: &[(SemanticId, &FactResolutionAnswer)],
+        endpoint: &DemandRelationKey,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         selection: &DemandMemberSelection,
     ) -> Result<ResolutionCompletion> {
         let root = self
@@ -374,7 +439,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
 
     fn resolved_closure_discharges(
         &self,
-        endpoint: &EndpointSignature,
+        endpoint: &DemandRelationKey,
     ) -> Option<DemandClosureDischarges> {
         self.discharges.get(endpoint).cloned()
     }
@@ -438,7 +503,7 @@ mod tests {
             _endpoint: &EndpointSignature,
             _question: &Self::RootQuestion,
             _context: Option<&Self::ContextData>,
-            _inputs: &[(SemanticId, &FactResolutionAnswer)],
+            _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         ) -> Result<LanguageClosure> {
             Ok(LanguageClosure {
                 completion: self.closure_completion.clone(),
@@ -446,6 +511,45 @@ mod tests {
                 discharges: Some(DemandClosureDischarges::exact([self.discharged])),
             })
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5658: owner review found Ready(None,incomplete) lost its reason on positive memo reuse"
+    )]
+    fn member_reader_completion_is_memoized_before_rediscovery() {
+        let gap =
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                SemanticId::for_test("member-none-gap"),
+            )]);
+        let endpoint = DemandRelationKey::caller(EndpointSignature::new(
+            BindingNodeId::universal_root(),
+            StackPattern::closed([SemanticId::for_test("member-none-root")]),
+            StackPattern::closed(Vec::<BindingNodeId>::new()),
+        ));
+        let discoveries = Rc::new(Cell::new(0));
+        let mut provider = DemandProvider::new(RepeatedRootLanguage {
+            discoveries: Rc::clone(&discoveries),
+            discovery_completion: ResolutionCompletion::Complete,
+            closure_completion: ResolutionCompletion::Complete,
+            discharged: SemanticId::for_test("memo-discharged"),
+        });
+        assert!(matches!(
+            provider.discover(&endpoint).unwrap(),
+            RootDiscovery::Ready(_)
+        ));
+        assert_eq!(
+            provider
+                .close_with_member_completion(&endpoint, &[], &gap)
+                .unwrap(),
+            gap
+        );
+        let RootDiscovery::AlreadyReady { completion } = provider.discover(&endpoint).unwrap()
+        else {
+            panic!("positive memo")
+        };
+        assert_eq!(completion, gap);
+        assert_eq!(discoveries.get(), 1);
     }
 
     #[test]
@@ -459,6 +563,7 @@ mod tests {
             StackPattern::closed([SemanticId::for_test("demand-root")]),
             StackPattern::closed(Vec::<BindingNodeId>::new()),
         );
+        let endpoint = DemandRelationKey::caller(endpoint);
         let mut provider = DemandProvider::new(RepeatedRootLanguage {
             discoveries: Rc::clone(&discoveries),
             discovery_completion: ResolutionCompletion::incomplete([
@@ -499,24 +604,35 @@ mod tests {
 }
 
 #[derive(Default)]
-pub(crate) struct ClosedRelations {
-    /// Rust retains additional context and generated-base facts beside the
-    /// shared overlay. Other adapters use only the fields below.
-    pub(crate) rust: super::rust_demand::relations::RustDemandRelationState,
-    pub(crate) endpoints: HashMap<EndpointSignature, DemandSelectedOverlayBlueprint>,
+#[doc(hidden)]
+pub struct ClosedRelations {
+    #[doc(hidden)]
+    pub registrations:
+        HashMap<DemandRelationKey, super::demand_closure::ClosedEndpointRegistration>,
+    #[doc(hidden)]
+    pub continuations: super::demand_closure::ContinuationRelations,
+    #[doc(hidden)]
+    pub endpoints: HashMap<DemandRelationKey, DemandSelectedOverlayBlueprint>,
     /// Endpoint-local obligations returned by a demanded root closure. These
     /// must remain branch completion when the selected fact source reads the
     /// caller's already-published paths for that exact root.
-    pub(crate) endpoint_completions: HashMap<EndpointSignature, ResolutionCompletion>,
-    pub(crate) paths: HashMap<CandidatePathIdentity, PartialPath>,
+    pub(crate) endpoint_completions: HashMap<DemandRelationKey, ResolutionCompletion>,
+    #[doc(hidden)]
+    pub paths: HashMap<CandidatePathIdentity, PartialPath>,
     /// Equal cells can belong to several endpoint relations. Reverse reads
     /// emit the cell only through the first relation that published it.
-    path_owners: HashMap<CandidatePathIdentity, EndpointSignature>,
-    pub(crate) base_ready: HashSet<EndpointSignature>,
+    path_owners: HashMap<
+        (
+            CandidatePathIdentity,
+            crate::analyzer::resolution::EnvironmentId,
+        ),
+        DemandRelationKey,
+    >,
+    pub(crate) base_ready: HashSet<DemandRelationKey>,
     /// Closed roots whose selected relation excludes provisional base routes.
     /// With no additions this is an empty domain, as used by Rust's negative
     /// closures. Scala uses it after proving a lexical import qualifier.
-    pub(crate) excluded_base: HashSet<EndpointSignature>,
+    pub(crate) excluded_base: HashSet<DemandRelationKey>,
     pub(crate) unconditional: Option<ResolutionCompletion>,
     /// Reverse candidate coverage is a different relation from forward
     /// candidate coverage: it carries the reverse inventory's own gaps, which
@@ -527,7 +643,7 @@ pub(crate) struct ClosedRelations {
     /// forward-validated. A reverse candidate read before any of them is a
     /// read the demand relations do not justify.
     pub(crate) reverse_targets: HashSet<SemanticId>,
-    pub(crate) reverse_endpoints: HashSet<EndpointSignature>,
+    pub(crate) reverse_endpoints: HashSet<DemandRelationKey>,
     #[cfg(test)]
     pub(crate) reads: Vec<EndpointSignature>,
 }
@@ -535,7 +651,7 @@ pub(crate) struct ClosedRelations {
 impl ClosedRelations {
     pub(crate) fn publish(
         &mut self,
-        endpoint: EndpointSignature,
+        endpoint: DemandRelationKey,
         relation: DemandSelectedOverlayBlueprint,
         paths: Vec<(CandidatePathIdentity, PartialPath)>,
     ) {
@@ -555,7 +671,7 @@ impl ClosedRelations {
         for (id, path) in &paths {
             self.paths.entry(*id).or_insert_with(|| path.clone());
             self.path_owners
-                .entry(*id)
+                .entry((*id, endpoint.environment))
                 .or_insert_with(|| endpoint.clone());
         }
         self.endpoints.insert(endpoint, relation);
@@ -563,7 +679,7 @@ impl ClosedRelations {
 
     pub(crate) fn publish_without_base(
         &mut self,
-        endpoint: EndpointSignature,
+        endpoint: DemandRelationKey,
         relation: DemandSelectedOverlayBlueprint,
         paths: Vec<(CandidatePathIdentity, PartialPath)>,
         completion: ResolutionCompletion,
@@ -604,10 +720,20 @@ impl ClosedRelations {
     }
 }
 
+struct PackageInventoryRows<'a> {
+    complete: &'a RefCell<Option<bool>>,
+    fragments: &'a RefCell<HashMap<BindingFragmentId, bool>>,
+}
+
 pub(crate) struct ClosedForwardSource<'a> {
+    environment: crate::analyzer::resolution::EnvironmentId,
     pub(crate) base: &'a dyn BatchResolutionFragmentSource,
     pub(crate) paths: &'a dyn SelectedContextPathSource,
     pub(crate) arena: &'a RefCell<ClosedRelations>,
+    /// Rows supplied by the language hook for this request. Local bindings
+    /// inside a reached file can finish without asking the root provider for
+    /// another context, so proof reads must also see those hook publications.
+    package_inventory: Option<PackageInventoryRows<'a>>,
     pub(crate) session: &'a ResolutionSession,
 }
 
@@ -617,17 +743,39 @@ impl<'a> ClosedForwardSource<'a> {
         paths: &'a dyn SelectedContextPathSource,
         arena: &'a RefCell<ClosedRelations>,
         session: &'a ResolutionSession,
+        environment: crate::analyzer::resolution::EnvironmentId,
     ) -> Self {
         Self {
+            environment,
             base,
             paths,
             arena,
             session,
+            package_inventory: None,
         }
+    }
+
+    pub(crate) fn with_package_inventory_rows(
+        mut self,
+        complete: &'a RefCell<Option<bool>>,
+        fragments: &'a RefCell<HashMap<BindingFragmentId, bool>>,
+    ) -> Self {
+        self.package_inventory = Some(PackageInventoryRows {
+            complete,
+            fragments,
+        });
+        self
     }
 }
 
 impl ClosedForwardSource<'_> {
+    fn relation_key(&self, endpoint: &EndpointSignature) -> DemandRelationKey {
+        DemandRelationKey {
+            endpoint: endpoint.clone(),
+            environment: self.environment,
+        }
+    }
+
     /// Reverse mirror of `visit_forward_candidate_match_pages_limited`.
     ///
     /// The reverse readiness law is not the forward one. A forward read names
@@ -658,7 +806,7 @@ impl ClosedForwardSource<'_> {
                     .arena
                     .borrow()
                     .reverse_endpoints
-                    .contains(request.endpoint())
+                    .contains(&self.relation_key(request.endpoint()))
             })
         {
             return Err(StoreError::new(
@@ -681,7 +829,7 @@ impl ClosedForwardSource<'_> {
                             .into_iter()
                             .collect::<Vec<_>>();
                         let mut excluded = BTreeSet::new();
-                        if arena.endpoints.keys().any(|endpoint| arena.excluded_base.contains(endpoint)) {
+                        if arena.endpoints.keys().any(|endpoint| endpoint.environment == self.environment && arena.excluded_base.contains(endpoint)) {
                             let hydrated = self.base.hydrate_candidate_paths(&candidates, cancellation)?;
                             if cancellation.is_cancelled() {
                                 cancellation_observed = true;
@@ -694,13 +842,15 @@ impl ClosedForwardSource<'_> {
                                 return Err(StoreError::new(format!("closed reverse base candidates lack cells: requested={requested:?}, returned={returned:?}")));
                             }
                             excluded.extend(hydrated.into_iter().filter_map(|(id, path)| {
-                                arena.excluded_base.contains(path.start()).then_some(id)
+                                arena.excluded_base.contains(&self.relation_key(path.start())).then_some(id)
                             }));
                         }
                         for (endpoint, relation) in &arena.endpoints {
+                            if endpoint.environment != self.environment { continue; }
                             if arena.excluded_base.contains(endpoint) { continue; }
                             if !relation.check_base_candidates(
                                 self.paths,
+                                self.base,
                                 &candidates,
                                 cancellation,
                             )? {
@@ -757,6 +907,9 @@ impl ClosedForwardSource<'_> {
         'requests: for (ordinal, request) in requests.iter().enumerate() {
             let arena = self.arena.borrow();
             for (endpoint, relation) in &arena.endpoints {
+                if endpoint.environment != self.environment {
+                    continue;
+                }
                 let local = [BatchCandidateRequest::new(0, request.endpoint().clone())];
                 let local_coverage = BatchCandidateCompletionOutcome::new(
                     1,
@@ -774,7 +927,9 @@ impl ClosedForwardSource<'_> {
                         assert!(!stopped, "overlay emitted after its visitor stopped");
                         let remapped = page
                             .iter()
-                            .filter(|row| &arena.path_owners[&row.candidate()] == endpoint)
+                            .filter(|row| {
+                                &arena.path_owners[&(row.candidate(), self.environment)] == endpoint
+                            })
                             .map(|row| BatchCandidateMatch::new(row.candidate(), ordinal))
                             .collect::<Vec<_>>();
                         if !remapped.is_empty() {
@@ -877,12 +1032,21 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
     }
 
     fn go_package_inventory_complete(&self) -> Option<bool> {
-        self.base.go_package_inventory_complete()
+        self.package_inventory
+            .as_ref()
+            .and_then(|rows| *rows.complete.borrow())
+            .map(|complete| complete || self.base.go_package_inventory_complete() == Some(true))
+            .or_else(|| self.base.go_package_inventory_complete())
     }
 
     fn go_package_inventory_complete_for_fragment(&self, fragment: BindingFragmentId) -> bool {
-        self.base
-            .go_package_inventory_complete_for_fragment(fragment)
+        self.package_inventory
+            .as_ref()
+            .and_then(|rows| rows.fragments.borrow().get(&fragment).copied())
+            .unwrap_or_else(|| {
+                self.base
+                    .go_package_inventory_complete_for_fragment(fragment)
+            })
     }
 
     fn reference_seed(
@@ -948,6 +1112,16 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
     ) -> Result<Vec<BatchEndpointClassification>> {
         self.base.classify_endpoint_nodes(nodes, cancellation)
     }
+    fn classify_endpoint_nodes_with_member_owners(
+        &self,
+        nodes: &[BindingNodeId],
+        cancellation: &CancellationToken,
+        member_owners: &mut crate::analyzer::resolution::ClassificationMemberOwnerReader<'_>,
+    ) -> Result<Option<Vec<BatchEndpointClassification>>> {
+        self.base
+            .classify_endpoint_nodes_with_member_owners(nodes, cancellation, member_owners)
+    }
+
     fn match_forward_candidates(
         &self,
         requests: &[BatchCandidateRequest],
@@ -996,9 +1170,15 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
             assert_eq!(request.request_ordinal(), ordinal);
             if request.endpoint().node() == BindingNodeId::universal_root() && {
                 let arena = self.arena.borrow();
-                !arena.endpoints.contains_key(request.endpoint())
-                    && !arena.base_ready.contains(request.endpoint())
-                    && !arena.excluded_base.contains(request.endpoint())
+                !arena
+                    .endpoints
+                    .contains_key(&self.relation_key(request.endpoint()))
+                    && !arena
+                        .base_ready
+                        .contains(&self.relation_key(request.endpoint()))
+                    && !arena
+                        .excluded_base
+                        .contains(&self.relation_key(request.endpoint()))
             } {
                 return Err(StoreError::new(format!(
                     "selected root relation read before closure: {:?}",
@@ -1021,10 +1201,15 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                 {
                     let arena = self.arena.borrow();
                     for (ordinal, request) in requests.iter().enumerate() {
-                        if arena.excluded_base.contains(request.endpoint()) {
+                        if arena
+                            .excluded_base
+                            .contains(&self.relation_key(request.endpoint()))
+                        {
                             continue;
                         }
-                        let Some(relation) = arena.endpoints.get(request.endpoint()) else {
+                        let Some(relation) =
+                            arena.endpoints.get(&self.relation_key(request.endpoint()))
+                        else {
                             continue;
                         };
                         let candidates = page
@@ -1037,6 +1222,7 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                         if !candidates.is_empty()
                             && !relation.check_base_candidates(
                                 self.paths,
+                                self.base,
                                 &candidates,
                                 cancellation,
                             )?
@@ -1048,7 +1234,10 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                     }
                     for row in page {
                         let request = &requests[row.request_ordinal()];
-                        let keep = if arena.excluded_base.contains(request.endpoint()) {
+                        let keep = if arena
+                            .excluded_base
+                            .contains(&self.relation_key(request.endpoint()))
+                        {
                             if cancellation.is_cancelled()
                                 || !session.unwrap_or(self.session).scope_step()
                             {
@@ -1058,7 +1247,7 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                             }
                             false
                         } else {
-                            match arena.endpoints.get(request.endpoint()) {
+                            match arena.endpoints.get(&self.relation_key(request.endpoint())) {
                                 Some(_) => {
                                     // Match the canonical overlay's pre-filter
                                     // row charge, without mutating the caller token.
@@ -1122,12 +1311,16 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                 .map(|(ordinal, request)| {
                     arena
                         .endpoint_completions
-                        .get(request.endpoint())
+                        .get(&self.relation_key(request.endpoint()))
                         .map_or_else(
                             || coverage.branch_completions()[ordinal].clone(),
                             |completion| {
-                                if arena.excluded_base.contains(request.endpoint())
-                                    && arena.endpoints.contains_key(request.endpoint())
+                                if arena
+                                    .excluded_base
+                                    .contains(&self.relation_key(request.endpoint()))
+                                    && arena
+                                        .endpoints
+                                        .contains_key(&self.relation_key(request.endpoint()))
                                 {
                                     completion.clone()
                                 } else {
@@ -1142,7 +1335,7 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
             // The callback below never visits the base source. It reuses the
             // canonical overlay cursor against exactly this immutable key.
             let arena = self.arena.borrow();
-            let Some(relation) = arena.endpoints.get(request.endpoint()) else {
+            let Some(relation) = arena.endpoints.get(&self.relation_key(request.endpoint())) else {
                 continue;
             };
             let local = [BatchCandidateRequest::new(0, request.endpoint().clone())];

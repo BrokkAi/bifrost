@@ -663,6 +663,15 @@ impl PolicySelectedCallBinding {
     }
 }
 
+/// A taint endpoint selector whose discovery did not finish. The path says
+/// which endpoint role the gap belongs to, so the compiler can tell a gap
+/// that could hide a flow from one that cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct IncompleteTaintSelector {
+    pub(super) path: crate::definition::PolicySelectorPath,
+    pub(super) message: String,
+}
+
 pub(super) struct PolicySelectorSession<'a> {
     workspace: &'a WorkspaceAnalyzer,
     analysis: &'static str,
@@ -702,6 +711,7 @@ pub(super) struct PolicySelectorSession<'a> {
     // per-region charges still totals distinct materializations, not duplicates.
     retired_program_points: usize,
     retired_source_bytes: usize,
+    retired_semantic: SemanticWork,
     retired_materialized_files: usize,
     retired_traversal_steps: usize,
     // The largest single-region charge each per-region lane saw.  The lane
@@ -710,6 +720,10 @@ pub(super) struct PolicySelectorSession<'a> {
     // one region reaches, not the sum the retired counters above accumulate.
     // These are the calibration inputs the derived-lane model never had (#1936).
     peak_row_dimension: usize,
+    resident_peak: SemanticWork,
+    root_work_peak: SemanticWork,
+    work_peak_row_dimension: usize,
+    work_peak_retained_bytes: usize,
     peak_retained_bytes: usize,
     peak_traversal_steps: usize,
     live_selector_retained_peak: usize,
@@ -741,7 +755,7 @@ pub(super) struct PolicySelectorSession<'a> {
     // guard/use projection remained incomplete. Typestate carries this query-
     // level fact into its final completion even when no row can seed a subject.
     retained_incomplete_result_contract_selectors: usize,
-    incomplete_taint_selectors: Vec<String>,
+    incomplete_taint_selectors: Vec<IncompleteTaintSelector>,
     /// Complete identity-only occurrence and environment rows shared across
     /// selectors in this policy compilation. The session is dropped with the
     /// compiler and keys every product by the workspace snapshot, role set
@@ -789,12 +803,9 @@ impl<'a> PolicySelectorSession<'a> {
             execution_scope,
             call_target_outcomes,
             units: None,
-            semantic_budget: SemanticBudget::new(semantic_work_limits(query_limits.semantic))
+            semantic_budget: SemanticBudget::new(semantic_resident_limits(query_limits.semantic))
                 .expect("validated CodeQuery semantic limits are positive"),
-            semantic_execution_budget: SemanticExecutionBudget::new(
-                materialized_files_limit,
-                query_limits.semantic.max_traversal_steps,
-            ),
+            semantic_execution_budget: SemanticExecutionBudget::new(materialized_files_limit),
             query_work: CodeQueryExecutionWork::default(),
             artifacts: HashMap::new(),
             artifact_leases: SemanticArtifactLeaseSet::new(
@@ -803,9 +814,14 @@ impl<'a> PolicySelectorSession<'a> {
             materialized_files_limit,
             retired_program_points: 0,
             retired_source_bytes: 0,
+            retired_semantic: SemanticWork::default(),
             retired_materialized_files: 0,
             retired_traversal_steps: 0,
             peak_row_dimension: 0,
+            resident_peak: SemanticWork::default(),
+            root_work_peak: SemanticWork::default(),
+            work_peak_row_dimension: 0,
+            work_peak_retained_bytes: 0,
             peak_retained_bytes: 0,
             peak_traversal_steps: 0,
             live_selector_retained_peak: 0,
@@ -851,10 +867,15 @@ impl<'a> PolicySelectorSession<'a> {
         // Retire the finishing region's consumed work before the counters are
         // discarded, so the compile-wide work report stays a running total.
         let used = self.semantic_budget.used();
+        self.retired_semantic = self.retired_semantic.conservative_add(used);
         self.retired_program_points = self
             .retired_program_points
             .saturating_add(used.program_points);
-        self.retired_source_bytes = self.retired_source_bytes.saturating_add(used.source_bytes);
+        // The legacy source-byte lane reports performed reads and parses, not
+        // the resident holds a later region re-admits (see #5920).
+        self.retired_source_bytes = self
+            .retired_source_bytes
+            .saturating_add(self.semantic_budget.performed().source_bytes);
         let execution = self.semantic_execution_budget.work();
         self.retired_materialized_files = self
             .retired_materialized_files
@@ -862,8 +883,17 @@ impl<'a> PolicySelectorSession<'a> {
         self.retired_traversal_steps = self
             .retired_traversal_steps
             .saturating_add(execution.traversal_steps);
+        let (row_work_peak, retained_work_peak, _) = self.region_peaks(used);
+        self.work_peak_row_dimension = self.work_peak_row_dimension.max(row_work_peak);
+        self.work_peak_retained_bytes = self.work_peak_retained_bytes.max(retained_work_peak);
         let (row_peak, retained_peak, traversal_peak) = self.live_region_peaks();
         self.peak_row_dimension = self.peak_row_dimension.max(row_peak);
+        self.root_work_peak = self
+            .root_work_peak
+            .component_max(self.semantic_budget.root_work_peak());
+        self.resident_peak = self
+            .resident_peak
+            .component_max(self.semantic_budget.resident_peak());
         self.peak_retained_bytes = self.peak_retained_bytes.max(retained_peak);
         self.peak_traversal_steps = self.peak_traversal_steps.max(traversal_peak);
 
@@ -871,12 +901,12 @@ impl<'a> PolicySelectorSession<'a> {
         // compile already paid stay paid: a shared artifact is charged once per
         // compile, and a later region pays only the repeat lookup.
         let census = self.semantic_budget.scope_snapshot();
-        self.semantic_budget =
-            SemanticBudget::new_child(semantic_work_limits(self.query_limits.semantic), &census);
-        self.semantic_execution_budget = SemanticExecutionBudget::new(
-            self.materialized_files_limit,
-            self.query_limits.semantic.max_traversal_steps,
+        self.semantic_budget = SemanticBudget::new_child(
+            semantic_resident_limits(self.query_limits.semantic),
+            &census,
         );
+        self.semantic_execution_budget =
+            SemanticExecutionBudget::new(self.materialized_files_limit);
         self.live_selector_retained_peak = 0;
     }
 
@@ -1074,10 +1104,14 @@ impl<'a> PolicySelectorSession<'a> {
                 .iter()
                 .map(|diagnostic| format!("{}: {diagnostic:?}", diagnostic.code.as_str()))
                 .collect::<Vec<_>>();
-            self.incomplete_taint_selectors.push(format!(
-                "selector `{}` discovery is {:?}; only individually usable rows were retained: {:?}",
-                selector.path, completion, diagnostics
-            ));
+            self.incomplete_taint_selectors
+                .push(IncompleteTaintSelector {
+                    path: selector.path.clone(),
+                    message: format!(
+                        "selector `{}` discovery is {:?}; only individually usable rows were retained: {:?}",
+                        selector.path, completion, diagnostics
+                    ),
+                });
             detailed.retained_incomplete_taint_rows = true;
         }
         let (selected, artifact_charge) = self.selected_sites(selector, detailed)?;
@@ -1092,12 +1126,15 @@ impl<'a> PolicySelectorSession<'a> {
         selector: &ResolvedPolicySelector,
         error: &crate::source::PolicySourceError,
     ) {
-        let message = format!(
-            "selector `{}` could not be applied: {}: {}",
-            selector.path, error.diagnostic.code, error.diagnostic.message,
-        );
-        if !self.incomplete_taint_selectors.contains(&message) {
-            self.incomplete_taint_selectors.push(message);
+        let gap = IncompleteTaintSelector {
+            path: selector.path.clone(),
+            message: format!(
+                "selector `{}` could not be applied: {}: {}",
+                selector.path, error.diagnostic.code, error.diagnostic.message,
+            ),
+        };
+        if !self.incomplete_taint_selectors.contains(&gap) {
+            self.incomplete_taint_selectors.push(gap);
         }
     }
 
@@ -1124,7 +1161,7 @@ impl<'a> PolicySelectorSession<'a> {
         Ok(())
     }
 
-    pub(super) fn take_incomplete_taint_selectors(&mut self) -> Vec<String> {
+    pub(super) fn take_incomplete_taint_selectors(&mut self) -> Vec<IncompleteTaintSelector> {
         std::mem::take(&mut self.incomplete_taint_selectors)
     }
 
@@ -1136,8 +1173,8 @@ impl<'a> PolicySelectorSession<'a> {
 
     /// Put back messages taken with `take_incomplete_taint_selectors`, after
     /// the ones recorded since.
-    pub(super) fn extend_incomplete_taint_selectors(&mut self, messages: Vec<String>) {
-        self.incomplete_taint_selectors.extend(messages);
+    pub(super) fn extend_incomplete_taint_selectors(&mut self, gaps: Vec<IncompleteTaintSelector>) {
+        self.incomplete_taint_selectors.extend(gaps);
     }
 
     /// Compile this session's selectors one seed file at a time, reusing what
@@ -1285,7 +1322,7 @@ impl<'a> PolicySelectorSession<'a> {
     ) -> Result<ExecutedSelectorUnit, PolicySelectorSessionError> {
         let query_limits = self.remaining_query_limits()?;
         let artifact_leases = self.artifact_leases.snapshot();
-        let semantic_before = self.semantic_budget.used();
+        let semantic_before = self.semantic_budget.replay_snapshot();
         let execution_before = self.semantic_execution_budget.work();
         let (executed, reads) = recompute_unit(self.workspace.analyzer(), || {
             execute_code_query_selector_unit(
@@ -1346,7 +1383,7 @@ impl<'a> PolicySelectorSession<'a> {
                 .result_contract_artifact_leases
                 .saturating_add(self.artifact_leases.len().saturating_sub(retained_before));
         }
-        let semantic = self.semantic_budget.used().saturating_sub(semantic_before);
+        let semantic = self.semantic_budget.replay_since(&semantic_before);
         let execution_after = self.semantic_execution_budget.work();
         Ok(ExecutedSelectorUnit {
             reads,
@@ -1382,7 +1419,10 @@ impl<'a> PolicySelectorSession<'a> {
         &mut self,
         product: &SelectorProduct,
     ) -> Result<(), PolicySelectorSessionError> {
-        if self.semantic_budget.charge(product.semantic).is_err()
+        if self
+            .semantic_budget
+            .replay_product(product.semantic)
+            .is_err()
             || !self.semantic_execution_budget.charge_external_query_work(
                 usize::try_from(product.materialized_files).unwrap_or(usize::MAX),
                 usize::try_from(product.traversal_steps).unwrap_or(usize::MAX),
@@ -2164,6 +2204,16 @@ impl<'a> PolicySelectorSession<'a> {
         self.semantic_budget.used()
     }
 
+    pub(super) fn semantic_resident_peak(&self) -> SemanticWork {
+        self.resident_peak
+            .component_max(self.semantic_budget.resident_peak())
+    }
+
+    pub(super) fn semantic_root_work_peak(&self) -> SemanticWork {
+        self.root_work_peak
+            .component_max(self.semantic_budget.root_work_peak())
+    }
+
     pub(super) fn semantic_remaining(&self) -> SemanticWork {
         self.semantic_budget.remaining()
     }
@@ -2272,20 +2322,6 @@ impl<'a> PolicySelectorSession<'a> {
         Ok(artifact)
     }
 
-    pub(super) fn remaining_semantic_traversal_steps(
-        &self,
-    ) -> Result<usize, PolicySelectorSessionError> {
-        let remaining = self.semantic_execution_budget.remaining_traversal_steps();
-        if remaining == 0 {
-            Err(semantic_budget_error(format!(
-                "{} semantic lookup exhausted the shared traversal budget",
-                self.analysis
-            )))
-        } else {
-            Ok(remaining)
-        }
-    }
-
     pub(super) fn require_execution_budget(
         &self,
         operation: &str,
@@ -2310,7 +2346,8 @@ impl<'a> PolicySelectorSession<'a> {
         let semantic = self.semantic_budget.used();
         let execution = self.semantic_execution_budget.work();
         let semantic_peaks = self.semantic_peaks();
-        let metrics = [
+        let (row_work_peak, retained_work_peak, _) = self.region_peaks(semantic);
+        let mut metrics: Vec<PolicyWorkMetric> = [
             (
                 "semantic_materialized_files",
                 PolicyWorkUnit::Count,
@@ -2327,7 +2364,7 @@ impl<'a> PolicySelectorSession<'a> {
                 "semantic_source_bytes",
                 PolicyWorkUnit::Bytes,
                 self.retired_source_bytes
-                    .saturating_add(semantic.source_bytes),
+                    .saturating_add(self.semantic_budget.performed().source_bytes),
             ),
             (
                 "semantic_program_points",
@@ -2344,20 +2381,32 @@ impl<'a> PolicySelectorSession<'a> {
                 PolicyWorkUnit::Count,
                 usize::try_from(self.selector_scans).unwrap_or(usize::MAX),
             ),
-            // The three per-region lane peaks.  The retired counters above are
-            // sums across regions, which is the compile's total cost but not
-            // what any lane has to admit: the lanes reset per region, so a lane
-            // has to exceed the largest single region's charge.  These are the
-            // numbers the derived-lane model must be calibrated against (#1936).
+            // Preserve the historical work-counter high-water marks across
+            // regions. Resident refunds do not reduce these counters. The new
+            // metrics below report residency; cache grants use semantic_peaks.
             (
                 "semantic_peak_row_dimension",
                 PolicyWorkUnit::Rows,
-                semantic_peaks.row_dimension,
+                self.work_peak_row_dimension.max(row_work_peak),
             ),
             (
                 "semantic_peak_retained_bytes",
                 PolicyWorkUnit::Bytes,
-                semantic_peaks.retained_bytes,
+                self.work_peak_retained_bytes.max(retained_work_peak),
+            ),
+            (
+                "semantic_resident_peak_nested_entries",
+                PolicyWorkUnit::Rows,
+                self.resident_peak
+                    .nested_entries
+                    .max(self.semantic_budget.resident_peak().nested_entries),
+            ),
+            (
+                "semantic_resident_peak_retained_bytes",
+                PolicyWorkUnit::Bytes,
+                self.resident_peak
+                    .owned_text_bytes
+                    .max(self.semantic_budget.resident_peak().owned_text_bytes),
             ),
             (
                 "semantic_peak_traversal_steps",
@@ -2405,6 +2454,19 @@ impl<'a> PolicySelectorSession<'a> {
             .ok()
         })
         .collect();
+        let resident = self
+            .resident_peak
+            .component_max(self.semantic_budget.resident_peak());
+        let root_work = self
+            .root_work_peak
+            .component_max(self.semantic_budget.root_work_peak());
+        super::finding::append_semantic_budget_metrics(
+            &mut metrics,
+            analysis,
+            self.retired_semantic.conservative_add(semantic),
+            resident,
+            root_work,
+        );
         PolicyWorkReport::try_new(
             self.query_work.scanned_files,
             self.query_work.scanned_source_bytes,
@@ -2439,7 +2501,14 @@ impl<'a> PolicySelectorSession<'a> {
     /// being calibrated here is still the uniform grant those remainders
     /// start from.
     fn live_region_peaks(&self) -> (usize, usize, usize) {
-        let used = self.semantic_budget.used();
+        let peak = self
+            .semantic_budget
+            .resident_peak()
+            .component_max(self.semantic_budget.root_work_peak());
+        self.region_peaks(peak)
+    }
+
+    fn region_peaks(&self, used: SemanticWork) -> (usize, usize, usize) {
         let row_peak = CodeQuerySemanticRowLimits::ROW_DIMENSIONS
             .into_iter()
             .map(|dimension| used.get(dimension))
@@ -2491,7 +2560,7 @@ impl<'a> PolicySelectorSession<'a> {
             // receives the region's full cap; the forked provider budget is
             // independently bounded by `semantic_remaining.owned_text_bytes`.
             max_retained_bytes: self.query_limits.semantic.max_retained_bytes,
-            max_traversal_steps: self.semantic_execution_budget.remaining_traversal_steps(),
+
             rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
                 semantic_remaining.get(dimension)
             })),
@@ -2872,7 +2941,7 @@ impl<'a> SelectorUnits<'a> {
         };
         self.reuse.publish(
             self.current[index].clone(),
-            PolicyUnitProduct::Selector(executed.product.clone()),
+            PolicyUnitProduct::Selector(Box::new(executed.product.clone())),
             reads,
         );
     }
@@ -2968,7 +3037,7 @@ pub(super) fn semantic_outcome_failure<T>(
     }
 }
 
-pub(super) fn semantic_work_limits(limits: CodeQuerySemanticLimits) -> SemanticWork {
+pub(super) fn semantic_resident_limits(limits: CodeQuerySemanticLimits) -> SemanticWork {
     use SemanticBudgetDimension as Dimension;
     SemanticWork {
         source_bytes: limits.max_source_bytes,
@@ -4188,7 +4257,6 @@ mod tests {
         mut limits: CodeQueryExecutionLimits,
         census: SemanticWork,
         retained_peak: usize,
-        traversal_per_selector: usize,
         repeats: usize,
     ) -> CodeQueryExecutionLimits {
         let row_limit = |dimension| {
@@ -4201,9 +4269,6 @@ mod tests {
             max_source_bytes: census.source_bytes.max(1),
             max_rows_per_dimension: 1,
             max_retained_bytes: retained_peak.max(census.owned_text_bytes).max(1),
-            max_traversal_steps: traversal_per_selector
-                .max(1)
-                .saturating_mul(repeats.saturating_add(1)),
             rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(row_limit)),
         };
         limits
@@ -4446,7 +4511,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
 
         session
             .semantic_budget
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 nested_entries: rows - 1,
                 procedures: 1,
                 ..SemanticWork::default()
@@ -4501,12 +4566,11 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         assert_eq!(calibrated.len(), 1);
         let census = calibration.semantic_used();
         let retained_peak = calibration.live_selector_retained_peak;
-        let traversal = calibration.execution_budget().work().traversal_steps;
         assert!(retained_peak > 0);
         assert!(retained_peak >= census.owned_text_bytes);
 
         let tight_limits =
-            limits_for_one_census_and_repeats(default_limits, census, retained_peak, traversal, 1);
+            limits_for_one_census_and_repeats(default_limits, census, retained_peak, 1);
         let mut session = PolicySelectorSession::new(
             &workspace,
             "test",
@@ -4542,8 +4606,8 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
 
     /// Sequential RQL windows have a physical high-water limit, while the
     /// provider's exact owned-text and row work remains additive. A paid file
-    /// can therefore be revisited with zero new-file and zero owned-text
-    /// allowance, but the next real repeat still exhausts its exact row lane.
+    /// can therefore be revisited with zero new-file and no additive
+    /// owned-text allowance. Its revisits are non-refusing repeat lookups.
     #[test]
     #[hardwon(
         "9b6029ba83b9: overlapping selectors must share paid identity and a truthful retention high-water mark"
@@ -4573,11 +4637,10 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         );
         let census = calibration.semantic_used();
         let retained_peak = calibration.live_selector_retained_peak;
-        let traversal = calibration.execution_budget().work().traversal_steps;
         assert!(retained_peak >= census.owned_text_bytes);
 
         let tight_limits =
-            limits_for_one_census_and_repeats(default_limits, census, retained_peak, traversal, 1);
+            limits_for_one_census_and_repeats(default_limits, census, retained_peak, 1);
         assert_eq!(tight_limits.semantic.max_retained_bytes, retained_peak);
         let mut session = PolicySelectorSession::new(
             &workspace,
@@ -4596,15 +4659,28 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         );
         assert_eq!(session.execution_budget().work().materialized_files, 1);
 
-        let owned_remaining = session.semantic_remaining().owned_text_bytes;
+        // Drain the additive provider-owned lane. Residency is separate: the
+        // live windows have already released their own admissions, so the
+        // physical cap still has room for the paid revisit's live census.
+        let owned_remaining = tight_limits
+            .semantic
+            .max_retained_bytes
+            .saturating_sub(session.semantic_used().owned_text_bytes);
         session
             .semantic_budget
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 owned_text_bytes: owned_remaining,
                 ..SemanticWork::default()
             })
             .expect("the test fills only the additive provider-owned lane");
-        assert_eq!(session.semantic_remaining().owned_text_bytes, 0);
+        assert_eq!(
+            tight_limits
+                .semantic
+                .max_retained_bytes
+                .saturating_sub(session.semantic_used().owned_text_bytes),
+            0,
+            "the additive provider-owned lane is drained"
+        );
         assert_eq!(
             session
                 .remaining_query_limits()
@@ -4623,10 +4699,15 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             1
         );
         let after_second = session.semantic_used();
+        // `procedure_of` and `cfg_entry` are independent semantic windows.
+        // Each resolves the same paid artifact through the complete-artifact
+        // cache and closes it before the next, so the overlapping selector
+        // performs one repeat lookup per window and never the census again.
+        const REPEAT_LOOKUPS: usize = 2;
         for dimension in SemanticBudgetDimension::ALL {
-            let expected = before_second.get(dimension).saturating_add(usize::from(
-                dimension == SemanticBudgetDimension::NestedEntries,
-            ));
+            let expected = before_second.get(dimension).saturating_add(
+                usize::from(dimension == SemanticBudgetDimension::NestedEntries) * REPEAT_LOOKUPS,
+            );
             assert_eq!(after_second.get(dimension), expected, "{dimension:?}");
         }
         assert_eq!(session.execution_budget().work().materialized_files, 1);
@@ -4642,20 +4723,25 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             u64::try_from(retained_peak).expect("fixture retained peak fits u64")
         );
 
-        let error = match session.select(&third) {
-            Ok(_) => panic!("the next actual repeat must exceed the exact additive lane"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(
-                error,
-                PolicySelectorSessionError::Incomplete {
-                    completion: CodeQueryCompletion::Incomplete { ref codes },
-                    ..
-                } if codes.contains(&CodeQueryDiagnosticCode::SemanticBudgetExhausted)
-            ),
-            "{error:?}"
+        // Repeat lookups are non-refusing work (#5113): a third visit pays
+        // the same two lookups and re-admits only its live census. It never
+        // recharges the artifact census into the work counters, and it cannot
+        // be refused by an additive lane the scope already spent.
+        let before_third = session.semantic_used();
+        assert_eq!(
+            session
+                .select(&third)
+                .expect("repeat lookups are non-refusing work")
+                .len(),
+            1
         );
+        let after_third = session.semantic_used();
+        for dimension in SemanticBudgetDimension::ALL {
+            let expected = before_third.get(dimension).saturating_add(
+                usize::from(dimension == SemanticBudgetDimension::NestedEntries) * REPEAT_LOOKUPS,
+            );
+            assert_eq!(after_third.get(dimension), expected, "{dimension:?}");
+        }
     }
 
     #[test]
@@ -4714,7 +4800,7 @@ func caller() { target() }
 
         session
             .semantic_budget
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 procedures: rows,
                 blocks: rows,
                 program_points: rows,

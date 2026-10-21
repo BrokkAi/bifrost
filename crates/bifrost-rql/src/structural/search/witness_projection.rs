@@ -46,6 +46,63 @@ pub(super) fn retain_prefix_by_bytes<T>(
     (retained, retained_bytes, 0)
 }
 
+/// Source/identity snapshots of a reconstructed path. Projecting while the
+/// solve is live lets later witnesses apply narrower limits without pinning IR.
+#[derive(Debug, Clone)]
+pub(super) struct ProjectedSummaryWitness {
+    steps: Vec<super::CodeQueryFlowWitnessStep>,
+    quality: PathQuality,
+    truncated: bool,
+    omitted_steps_lower_bound: usize,
+    alternatives_truncated: bool,
+    retention_truncated: bool,
+}
+
+impl ProjectedSummaryWitness {
+    pub(super) fn new(
+        workspace: &WorkspaceAnalyzer,
+        witness: &SummaryWitness,
+        max_steps: usize,
+        max_bytes: usize,
+    ) -> Self {
+        let (steps, _, omitted) = retain_prefix_by_bytes(
+            witness
+                .steps()
+                .iter()
+                .map(|step| public_witness_step(workspace, step)),
+            max_steps,
+            max_bytes,
+            serialized_json_len,
+        );
+        Self {
+            steps,
+            quality: witness.quality(),
+            truncated: witness.truncated() || omitted > 0,
+            omitted_steps_lower_bound: witness.omitted_steps_lower_bound().saturating_add(omitted),
+            alternatives_truncated: witness.alternatives_truncated(),
+            retention_truncated: witness.retention_truncated(),
+        }
+    }
+    pub(super) fn steps(&self) -> &[super::CodeQueryFlowWitnessStep] {
+        &self.steps
+    }
+    fn quality(&self) -> PathQuality {
+        self.quality
+    }
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+    fn omitted_steps_lower_bound(&self) -> usize {
+        self.omitted_steps_lower_bound
+    }
+    fn alternatives_truncated(&self) -> bool {
+        self.alternatives_truncated
+    }
+    fn retention_truncated(&self) -> bool {
+        self.retention_truncated
+    }
+}
+
 /// Project the evidence already retained by the class-set solve. Zero payload
 /// budgets still retain a bounded metadata row; they cannot manufacture a
 /// complete empty path or turn a reconstruction error into retention exhaustion.
@@ -99,10 +156,7 @@ pub(super) fn public_absent_member_witness(
         }
         Ok(witness) => {
             let (steps, retained_bytes, omitted) = retain_prefix_by_bytes(
-                witness
-                    .steps()
-                    .iter()
-                    .map(|step| public_witness_step(workspace, step)),
+                witness.steps.iter().cloned(),
                 max_steps,
                 max_bytes,
                 serialized_json_len,

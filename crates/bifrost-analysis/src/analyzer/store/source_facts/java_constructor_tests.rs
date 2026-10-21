@@ -1,9 +1,10 @@
+use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 use brokk_bifrost_core::analyzer::model::{CallableArity, JavaTypeConstructorShape};
 use brokk_bifrost_core::hash::HashMap;
 use rusqlite::params;
 
 use crate::analyzer::java::JavaAdapter;
-use crate::analyzer::store::tests::{oid_for, parse_state};
+use crate::analyzer::store::test_support::{oid_for, parse_state};
 use crate::analyzer::store::{AnalyzerStore, StoreError};
 use crate::analyzer::{Language, SignatureMetadata};
 use crate::inline_project::InlineTestProject;

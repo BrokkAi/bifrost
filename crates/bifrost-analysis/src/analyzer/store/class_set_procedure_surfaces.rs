@@ -29,6 +29,7 @@ pub const MAX_CLASS_SET_SURFACE_READS: usize = 100_000;
 pub struct ClassSetProcedureSurfaceKey {
     pub procedure_lineage: ClassSetSummaryDigest,
     pub owner_rel_path: String,
+    pub owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey,
     pub language: Language,
     pub schema_version: u32,
     pub local_structure_digest: ClassSetSummaryDigest,
@@ -467,11 +468,11 @@ impl SurfaceDigest {
 
 pub(crate) static CLASS_SET_PROCEDURE_SURFACE_FAMILY_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "{} ORDER BY surfaces.surface_digest LIMIT ?7",
+        "{} ORDER BY surfaces.surface_digest LIMIT ?8",
         surface_select_sql(
             "surfaces.procedure_lineage=?1 AND surfaces.owner_rel_path=?2 AND surfaces.lang=?3
-         AND surfaces.schema_version=?4 AND surfaces.local_structure_digest=?5
-         AND surfaces.behavior_read_digest=?6",
+         AND blobs.lang=?4 AND surfaces.schema_version=?5
+         AND surfaces.local_structure_digest=?6 AND surfaces.behavior_read_digest=?7",
             true,
         )
     )
@@ -493,7 +494,7 @@ fn surface_select_sql(predicate: &str, require_complete: bool) -> String {
     };
     format!(
         "SELECT surfaces.surface_id, surfaces.surface_digest, surfaces.procedure_lineage,
-                surfaces.owner_rel_path, blobs.blob_oid, surfaces.lang,
+                surfaces.owner_rel_path, blobs.blob_oid, blobs.lang, surfaces.lang,
                 surfaces.artifact_public_identity, surfaces.artifact_content_identity,
                 surfaces.schema_version, surfaces.local_structure_digest,
                 surfaces.behavior_read_digest, surfaces.exact_behavior_digest,
@@ -503,7 +504,7 @@ fn surface_select_sql(predicate: &str, require_complete: bool) -> String {
                 surfaces.lexical_child_count,
                 surfaces.read_count
          FROM class_set_procedure_surfaces AS surfaces
-         JOIN blobs ON blobs.id=surfaces.owner_blob_id AND blobs.lang=surfaces.lang
+         JOIN blobs ON blobs.id=surfaces.owner_blob_id
          {meta_join}
          WHERE {predicate}{completion}"
     )
@@ -596,6 +597,7 @@ impl AnalyzerStore {
                     key.procedure_lineage.as_slice(),
                     &key.owner_rel_path,
                     key.language.config_label(),
+                    key.owner_storage_language_key.as_str(),
                     key.schema_version,
                     key.local_structure_digest.as_slice(),
                     key.behavior_read_digest.as_slice(),
@@ -636,6 +638,7 @@ fn surface_candidate(raw: RawSurface) -> Result<ClassSetProcedureSurfaceCandidat
         lineage,
         rel_path,
         blob_oid,
+        storage_lang,
         lang,
         artifact_public,
         artifact_content,
@@ -665,6 +668,9 @@ fn surface_candidate(raw: RawSurface) -> Result<ClassSetProcedureSurfaceCandidat
         header: surface_header(SurfaceHeaderFields {
             procedure_lineage: digest(lineage, "procedure lineage")?,
             owner_rel_path: rel_path,
+            owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_store(
+                storage_lang,
+            ),
             language: decode_language(&lang)?,
             schema_version: schema,
             local_structure_digest: local_structure,
@@ -716,7 +722,7 @@ fn live_owner_blob_id(
     super::live_class_set_owner_blob_id(
         conn,
         &surface.header.owner_blob_oid,
-        key.language.config_label(),
+        &key.owner_storage_language_key,
     )?
     .ok_or_else(|| StoreError::new("class-set procedure surface owner blob is absent"))
 }
@@ -759,6 +765,7 @@ type RawSurface = (
     String,
     String,
     String,
+    String,
     Vec<u8>,
     Vec<u8>,
     u32,
@@ -778,6 +785,7 @@ type RawSurface = (
 struct SurfaceHeaderFields {
     procedure_lineage: [u8; 32],
     owner_rel_path: String,
+    owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey,
     language: Language,
     schema_version: u32,
     local_structure_digest: Vec<u8>,
@@ -795,6 +803,7 @@ fn surface_header(fields: SurfaceHeaderFields) -> Result<ClassSetProcedureSurfac
         key: ClassSetProcedureSurfaceKey {
             procedure_lineage: fields.procedure_lineage,
             owner_rel_path: fields.owner_rel_path,
+            owner_storage_language_key: fields.owner_storage_language_key,
             language: fields.language,
             schema_version: fields.schema_version,
             local_structure_digest: digest(
@@ -853,6 +862,7 @@ fn raw_surface_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSurface>
         row.get(17)?,
         row.get(18)?,
         row.get(19)?,
+        row.get(20)?,
     ))
 }
 
@@ -866,6 +876,7 @@ fn load_surface(
         lineage,
         rel_path,
         blob_oid,
+        storage_lang,
         lang,
         artifact_public,
         artifact_content,
@@ -958,6 +969,9 @@ fn load_surface(
         surface_header(SurfaceHeaderFields {
             procedure_lineage: digest(lineage, "procedure lineage")?,
             owner_rel_path: rel_path,
+            owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_store(
+                storage_lang,
+            ),
             language,
             schema_version: schema,
             local_structure_digest: local_structure,
@@ -1540,6 +1554,54 @@ mod tests {
         ephemeral_store_with_complete_python_blob(BLOB_A, 0)
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5141: TypeScript class-set publication looked up the semantic label instead of the stored dialect"
+    )]
+    fn typescript_class_set_surface_publishes_under_its_storage_dialect() {
+        let store = store();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'typescript:ts', 0)",
+                params![BLOB_A],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blob_meta(
+                   blob_id, lang, contains_tests, content_package, stored_unit_count,
+                   range_count, signature_count, signature_metadata_count, supertype_count,
+                   child_count, import_statement_count, type_identifier_count, is_complete
+                 ) SELECT id, lang, 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1
+                 FROM blobs WHERE blob_oid=?1 AND lang='typescript:ts'",
+                params![BLOB_A],
+            )
+            .unwrap();
+        }
+        let original = surface(16);
+        let mut header = original.header;
+        header.key.language = Language::TypeScript;
+        header.key.owner_storage_language_key =
+            crate::analyzer::semantic::StorageLanguageKey::from_adapter("typescript:ts");
+        header.key.owner_rel_path = "src/app.ts".to_owned();
+        let expected = ClassSetProcedureSurfaceRow::try_new(
+            header,
+            original.calls,
+            original.lexical_children,
+            original.reads,
+        )
+        .unwrap();
+        store
+            .publish_class_set_procedure_surface(expected.clone(), &CancellationToken::new())
+            .expect("a complete TypeScript dialect blob owns its class-set surface");
+        assert_eq!(
+            store
+                .class_set_procedure_surface_for_digest(*expected.surface_digest())
+                .unwrap(),
+            Some(expected)
+        );
+    }
+
     fn cascade_rows(store: &AnalyzerStore, oid: &str) -> usize {
         stored_blob_cascade_costs(store, oid).0
     }
@@ -1561,6 +1623,8 @@ mod tests {
                 key: ClassSetProcedureSurfaceKey {
                     procedure_lineage: bytes(1),
                     owner_rel_path: "src/app.py".to_string(),
+                    owner_storage_language_key:
+                        crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
                     language: Language::Python,
                     schema_version: 1,
                     local_structure_digest: bytes(2),

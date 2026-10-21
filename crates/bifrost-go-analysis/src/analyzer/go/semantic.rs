@@ -1,0 +1,21572 @@
+//! Go lowering into the language-neutral executable-semantics IR.
+//!
+//! This module deliberately interprets tree-sitter nodes and fields directly.
+//! Graph construction, abrupt-completion routing, cleanup specialization, and
+//! physical adjacency storage remain owned by the shared semantic substrate.
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::ShortCircuitKind;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::completion_label;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::field_matches;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::schedule_sequential_work;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::*;
+use brokk_bifrost_core::analyzer::tree_walk::children_by_field_name;
+use brokk_bifrost_semantic::analyzer::semantic::inventory::*;
+use brokk_bifrost_semantic::analyzer::semantic::lowering::schedule_short_circuit_condition;
+use tree_sitter::Node;
+
+use brokk_bifrost_go::declarations::{
+    GoCallableResultSyntax, go_callable_result_syntax, is_predeclared_go_type,
+};
+use brokk_bifrost_go::graph::ast::{clause_statement_list, is_clause};
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::semantic::cfg::{
+    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
+    ScopeBinding, ScopeFrameId,
+};
+
+use brokk_bifrost_semantic::analyzer::semantic::service::ProgramSemanticsLowerer;
+
+use brokk_bifrost_semantic::analyzer::semantic::service::SemanticAdapterIdentity;
+
+use brokk_bifrost_analysis::analyzer::semantic::*;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceOrigin;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+
+use brokk_bifrost_core::analyzer::tree_walk::WalkControl;
+
+use brokk_bifrost_core::analyzer::tree_walk::try_walk_named_tree_preorder;
+
+use crate::analyzer::GoAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
+use brokk_bifrost_core::analyzer::model::LanguageDialect;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::hash::HashMap;
+
+use brokk_bifrost_core::hash::HashSet;
+
+use brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression_with;
+use brokk_bifrost_core::text_utils::compute_line_starts;
+use std::sync::Arc;
+
+#[path = "callable_materialization.rs"]
+mod callable_materialization;
+
+pub(crate) use crate::analyzer::go::semantic::callable_materialization::GoCallableMaterialization;
+
+pub use crate::analyzer::go::semantic::callable_materialization::GoCallableCaptureBindingError;
+
+pub use crate::analyzer::go::semantic::callable_materialization::GoCaptureSlot;
+
+pub use crate::analyzer::go::semantic::callable_materialization::GoCaptureSlotPlan;
+
+pub use crate::analyzer::go::semantic::callable_materialization::GoMaterializedAnonymousCallable;
+
+pub use crate::analyzer::go::semantic::callable_materialization::materialize_go_anonymous_callable;
+
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v93";
+
+impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
+
+struct GoSemanticLowerer;
+
+impl ProgramSemanticsLowerer for GoSemanticLowerer {
+    fn identity(&self) -> SemanticAdapterIdentity {
+        SemanticAdapterIdentity::for_adapter(
+            "go",
+            ADAPTER_VERSION,
+            b"go-intrafile-execution-defaults-v1",
+            DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        )
+    }
+
+    fn capabilities(&self) -> SemanticCapabilities {
+        go_capabilities()
+    }
+
+    fn lower(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        budget: &SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
+        let (
+            specs,
+            package_shadowing,
+            package_values,
+            package_value_locators,
+            direct_struct_fields,
+            named_type_definitions,
+            method_inventory,
+            indirect_callable_targets,
+            initial_work,
+        ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
+            ProcedureEnumeration::Complete {
+                value,
+                initial_work,
+                ..
+            } => (
+                value.specs,
+                value.package_shadowing,
+                value.package_values,
+                value.package_value_locators,
+                value.direct_struct_fields,
+                value.named_type_definitions,
+                value.method_inventory,
+                value.indirect_callable_targets,
+                initial_work,
+            ),
+            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            ProcedureEnumeration::Cancelled { work } => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+        };
+
+        let import_bindings = go_import_bindings(prepared.tree().root_node(), prepared.source());
+        let mut package_functions = HashMap::<Box<str>, Option<(ProcedureId, Node<'_>)>>::default();
+        for spec in specs.iter().filter(|spec| {
+            spec.lexical_parent.is_none() && spec.callable.kind() == "function_declaration"
+        }) {
+            if let Some(name) = spec
+                .callable
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(prepared.source(), name))
+            {
+                package_functions
+                    .entry(name.into())
+                    .and_modify(|target| *target = None)
+                    .or_insert(Some((spec.id, spec.callable)));
+            }
+        }
+        let procedure_targets = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.callable.id(),
+                    GoProcedureTarget {
+                        id: spec.id,
+                        captures: spec
+                            .captures
+                            .iter()
+                            .map(|capture| GoTargetCapture {
+                                name: capture.name.clone(),
+                                binding: capture.binding,
+                                storage: capture.storage,
+                            })
+                            .collect(),
+                        omitted_capture_names: spec.omitted_capture_names.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let struct_field_anchors = go_struct_field_anchors(prepared);
+
+        lower_procedure_batch(
+            &specs,
+            initial_work,
+            budget,
+            cancellation,
+            |spec, staged_budget, cancellation| {
+                lower_procedure(
+                    prepared,
+                    &struct_field_anchors,
+                    spec,
+                    package_shadowing,
+                    &package_values,
+                    &package_value_locators,
+                    &direct_struct_fields,
+                    &named_type_definitions,
+                    &import_bindings,
+                    &package_functions,
+                    &method_inventory,
+                    &procedure_targets,
+                    &indirect_callable_targets,
+                    staged_budget,
+                    cancellation,
+                )
+            },
+        )
+    }
+}
+
+/// Lower one caller-supplied exact Go source file through the ordinary Go
+/// lowerer. The source is never read from the workspace, and the resulting
+/// artifact is intentionally request-local rather than entering a cache.
+pub(crate) fn lower_exact_go_file(
+    file: &ProjectFile,
+    mounted_workspace: WorkspaceMountId,
+    source: &str,
+    artifact: &ExactArtifact,
+    package: &super::GoPinnedPackage,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
+    if WorkspaceMountId::from_root(file.root()) != mounted_workspace {
+        return Err(SemanticProviderError::invalid_identity(
+            "exact Go source file belongs to a different workspace mount",
+        ));
+    }
+    let started_work = request.budget.used();
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: SemanticWork::default(),
+        });
+    }
+    let source_work = SemanticWork {
+        source_bytes: source.len(),
+        ..SemanticWork::default()
+    };
+    let mut staged_budget = request.budget.clone();
+    if let Err(exceeded) = staged_budget.admit(source_work) {
+        return Ok(SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work: source_work,
+        });
+    }
+    let result = (|| {
+        let Some(tree) =
+            brokk_bifrost_go::parse::parse_go_with_cancellation(source, Some(request.cancellation))
+        else {
+            return Ok(if request.cancellation.is_cancelled() {
+                SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: source_work,
+                }
+            } else {
+                SemanticOutcome::Unknown {
+                    partial: None,
+                    work: source_work,
+                }
+            });
+        };
+        if tree.root_node().has_error() {
+            return Ok(SemanticOutcome::Unknown {
+                partial: None,
+                work: source_work,
+            });
+        }
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::for_path(Language::Go, file.rel_path()),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let lowerer = GoSemanticLowerer;
+        let identity = exact_go_semantic_identity(&lowerer, artifact, package);
+        let path = WorkspaceRelativePath::try_from_path(file.rel_path())
+            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
+        let key = SemanticArtifactKey::new(
+            mounted_workspace,
+            path,
+            LanguageDialect::for_path(Language::Go, file.rel_path()),
+            SourceRevision::Disk {
+                content: ContentIdentity::hash_bytes(source.as_bytes()),
+            },
+            identity.adapter,
+            SemanticIrVersion::current(),
+            identity.configuration,
+            identity.dependencies,
+        );
+        staged_budget.start_lowering_work();
+        let lowered = lowerer.lower(file, &prepared, &staged_budget, request.cancellation);
+        staged_budget.finish_lowering_work();
+        let lowered = lowered?;
+        let observed_work = source_work.component_max(lowered.work());
+        match lowered {
+            SemanticOutcome::Complete { value, .. } => {
+                let mut publication_budget = staged_budget.clone();
+                let artifact = match SemanticArtifact::try_new_with_budget(
+                    key,
+                    lowerer.capabilities(),
+                    value,
+                    &mut publication_budget,
+                ) {
+                    Ok(artifact) => Arc::new(artifact.with_query_source(Arc::from(source))),
+                    Err(SemanticArtifactBuildError::Invalid(error)) => {
+                        return Err(SemanticProviderError::InvalidArtifact(error));
+                    }
+                    Err(SemanticArtifactBuildError::ExceededBudget(exceeded)) => {
+                        return Ok(SemanticOutcome::ExceededBudget {
+                            partial: None,
+                            exceeded,
+                            work: observed_work,
+                        });
+                    }
+                };
+                publication_budget.track_resident_artifact(&artifact);
+                let total_work = observed_work.component_max(artifact.work());
+                reconcile_exact_go_work(&mut publication_budget, started_work, total_work);
+                if request.cancellation.is_cancelled() {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work: total_work,
+                    });
+                }
+                *request.budget = publication_budget;
+                Ok(SemanticOutcome::Complete {
+                    value: artifact,
+                    work: total_work,
+                })
+            }
+            SemanticOutcome::ExceededBudget { exceeded, work, .. } => {
+                Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work: source_work.component_max(work),
+                })
+            }
+            SemanticOutcome::Cancelled { work, .. } => Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: source_work.component_max(work),
+            }),
+            SemanticOutcome::Ambiguous { work, .. }
+            | SemanticOutcome::Unknown { work, .. }
+            | SemanticOutcome::Unsupported { work, .. }
+            | SemanticOutcome::Unproven { work, .. } => {
+                let total_work = source_work.component_max(work);
+                reconcile_exact_go_work(&mut staged_budget, started_work, total_work);
+                if request.cancellation.is_cancelled() {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work: total_work,
+                    });
+                }
+                *request.budget = staged_budget.clone();
+                Ok(SemanticOutcome::Unknown {
+                    partial: None,
+                    work: total_work,
+                })
+            }
+        }
+    })();
+    request.budget.retain_performed_work(&staged_budget);
+    result
+}
+
+fn exact_go_semantic_identity(
+    lowerer: &GoSemanticLowerer,
+    artifact: &ExactArtifact,
+    package: &super::GoPinnedPackage,
+) -> SemanticAdapterIdentity {
+    let base = lowerer.identity();
+    let mut configuration = LengthDelimitedDigest::new(b"go-exact-callable-configuration-v1");
+    configuration.push(base.configuration.as_bytes());
+    configuration.push(artifact.sha256().as_bytes());
+    configuration.push(package.import_path.as_bytes());
+    for file in &package.files {
+        configuration.push(file.as_bytes());
+    }
+    let mut dependencies = LengthDelimitedDigest::new(b"go-exact-callable-dependencies-v1");
+    dependencies.push(base.dependencies.as_bytes());
+    dependencies.push(artifact.sha256().as_bytes());
+    dependencies.push(package.import_path.as_bytes());
+    for file in &package.files {
+        dependencies.push(file.as_bytes());
+    }
+    SemanticAdapterIdentity {
+        adapter: base.adapter,
+        configuration: ConfigurationFingerprint::from_digest(configuration.finish()),
+        dependencies: DependencyFingerprint::from_digest(dependencies.finish()),
+    }
+}
+
+fn reconcile_exact_go_work(
+    budget: &mut SemanticBudget,
+    started_work: SemanticWork,
+    observed_work: SemanticWork,
+) {
+    let charged_work = budget.used().saturating_sub(started_work);
+    budget.charge_work(observed_work.saturating_sub(charged_work));
+}
+
+fn go_capabilities() -> SemanticCapabilities {
+    let mut builder = SemanticCapabilities::builder();
+    for capability in [
+        SemanticCapability::Procedures,
+        SemanticCapability::EntryBoundary,
+        SemanticCapability::NormalExitBoundary,
+        SemanticCapability::ExceptionalExitBoundary,
+        SemanticCapability::BasicBlocks,
+        SemanticCapability::ProgramPoints,
+        SemanticCapability::NormalCallContinuation,
+        SemanticCapability::ExceptionalCallContinuation,
+        SemanticCapability::SwitchFacts,
+    ] {
+        builder = builder.complete(capability);
+    }
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
+        SemanticCapability::CallableReferences,
+        SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::ReturnFlow,
+        // Partial: field, index, and pointer-dereference stores are represented
+        // as memory rows. Dynamic indices and assignment targets whose address
+        // cannot be identified still publish their own gaps.
+        SemanticCapability::FieldMemory,
+        SemanticCapability::IndexMemory,
+        SemanticCapability::StaticMemory,
+        SemanticCapability::Captures,
+        SemanticCapability::DeferredExecution,
+        SemanticCapability::ConcurrentSpawn,
+        SemanticCapability::Synchronization,
+        SemanticCapability::NonLocalControl,
+        // Every decision the Go lowerer represents publishes a guard row.
+        // Constants, nil comparisons, and constant equality are normalized;
+        // other structured conditions remain explicit opaque facts.
+        SemanticCapability::GuardFacts,
+    ] {
+        builder = builder.partial(capability);
+    }
+    builder.build()
+}
+
+/// Which Go predeclared identifiers a program rebinds.
+///
+/// These are ordinary predeclared identifiers rather than keywords, so a
+/// program may give any of them another meaning. Lowering may read the builtin
+/// meaning only where it has not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PredeclaredShadowing {
+    new: bool,
+    make: bool,
+    append: bool,
+    copy: bool,
+    panic: bool,
+    recover: bool,
+    close: bool,
+    boolean_true: bool,
+    boolean_false: bool,
+    nil: bool,
+    iota: bool,
+}
+
+impl PredeclaredShadowing {
+    fn observe(&mut self, name: &str) {
+        match name {
+            "new" => self.new = true,
+            "make" => self.make = true,
+            "append" => self.append = true,
+            "copy" => self.copy = true,
+            "panic" => self.panic = true,
+            "recover" => self.recover = true,
+            "close" => self.close = true,
+            "true" => self.boolean_true = true,
+            "false" => self.boolean_false = true,
+            "nil" => self.nil = true,
+            "iota" => self.iota = true,
+            _ => {}
+        }
+    }
+
+    fn merged(self, other: Self) -> Self {
+        Self {
+            new: self.new || other.new,
+            make: self.make || other.make,
+            append: self.append || other.append,
+            copy: self.copy || other.copy,
+            panic: self.panic || other.panic,
+            recover: self.recover || other.recover,
+            close: self.close || other.close,
+            boolean_true: self.boolean_true || other.boolean_true,
+            boolean_false: self.boolean_false || other.boolean_false,
+            nil: self.nil || other.nil,
+            iota: self.iota || other.iota,
+        }
+    }
+
+    fn shadows(self, name: &str) -> bool {
+        match name {
+            "new" => self.new,
+            "make" => self.make,
+            "append" => self.append,
+            "copy" => self.copy,
+            "panic" => self.panic,
+            "recover" => self.recover,
+            "close" => self.close,
+            "true" => self.boolean_true,
+            "false" => self.boolean_false,
+            "nil" => self.nil,
+            "iota" => self.iota,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProcedureSpec<'tree> {
+    id: ProcedureId,
+    callable: Node<'tree>,
+    body: Node<'tree>,
+    locator: SemanticLocator,
+    lexical_parent: Option<ProcedureId>,
+    kind: ProcedureKind,
+    properties: ProcedureProperties,
+    result_shadowing: PredeclaredShadowing,
+    captures: Box<[GoCaptureSpec<'tree>]>,
+    shared_bindings: Box<[GoSharedBindingSpec]>,
+    omitted_capture_names: Box<[Box<str>]>,
+    call_exposure_origins: Box<[GoCallExposureOrigin]>,
+    identity_preserving_assertions: HashSet<usize>,
+    reference_identity_preserving_assertions: HashSet<usize>,
+    /// Direct interface-method selectors whose stable pointer payload and
+    /// exact same-file implementation were proved together.
+    interface_dispatches: HashMap<usize, GoInterfaceDispatchProof>,
+    /// Concrete initializer expressions that introduce the reference payload
+    /// used by one of this procedure's exact interface dispatches.
+    reference_boxing_initializers: HashSet<usize>,
+}
+
+#[derive(Clone)]
+struct GoCaptureSpec<'tree> {
+    name: Box<str>,
+    reference: Node<'tree>,
+    binding: GoResolvedBinding,
+    storage: GoCaptureStorage,
+    value_storage: Option<GoStorageKind>,
+    value_type: Option<GoTypeIdentity>,
+    index_value_copy: MemoryValueCopy,
+    index_value_type: Option<GoTypeIdentity>,
+    channel_payload_copy: Option<SynchronizationPayloadCopy>,
+    channel_payload_type: Option<GoTypeIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoCaptureStorage {
+    Value,
+    MutableCell,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoSharedBindingSpec {
+    name: Box<str>,
+    binding: GoResolvedBinding,
+}
+
+#[derive(Clone)]
+struct GoProcedureTarget {
+    id: ProcedureId,
+    captures: Box<[GoTargetCapture]>,
+    omitted_capture_names: Box<[Box<str>]>,
+}
+
+#[derive(Debug, Clone)]
+struct GoTargetCapture {
+    name: Box<str>,
+    binding: GoResolvedBinding,
+    storage: GoCaptureStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoCallExposureOrigin {
+    name: Box<str>,
+    binding: GoResolvedBinding,
+}
+
+struct GoProcedureInventory<'tree> {
+    specs: Vec<ProcedureSpec<'tree>>,
+    package_shadowing: PredeclaredShadowing,
+    package_values: HashSet<Box<str>>,
+    package_value_locators: HashMap<Box<str>, SemanticLocator>,
+    direct_struct_fields: DirectStructFields,
+    named_type_definitions: GoNamedTypeDefinitions<'tree>,
+    method_inventory: GoMethodInventory,
+    /// Callee AST node -> the callable it provably denotes, for calls made
+    /// through a stable function-valued binding.
+    indirect_callable_targets: HashMap<usize, GoIndirectCallableTarget>,
+}
+
+/// What a call through a stable function-valued binding provably denotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoIndirectCallableTarget {
+    /// The function literal the binding was exactly initialized with.
+    Literal(usize),
+    /// The method declaration a method-value selection on the binding's
+    /// initializer names, which the call reaches bound to that selection's
+    /// evaluated receiver.
+    Method(ProcedureId),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GoNamedTypeDefinition<'tree> {
+    declaration: usize,
+    underlying: Node<'tree>,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+}
+
+type GoNamedTypeDefinitions<'tree> = HashMap<Box<str>, Vec<GoNamedTypeDefinition<'tree>>>;
+type DirectStructFields = HashMap<usize, HashSet<Box<str>>>;
+type GoMethodInventory = HashMap<(usize, Box<str>), GoMethodTarget>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GoMethodTarget {
+    pointer_receiver: bool,
+    procedure: ProcedureId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoInterfaceDispatchProof {
+    receiver_type: GoTypeIdentity,
+    target: ProcedureId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GoInterfacePayloadProof<'tree> {
+    r#type: GoAssertionType<'tree>,
+    boxing_procedure: ProcedureId,
+    boxing_initializer: Node<'tree>,
+}
+
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<GoProcedureInventory<'tree>>;
+
+/// Positive dynamic-type evidence for an assertion. Static type information
+/// may cross mutable bindings, but an interface's initializer describes its
+/// payload only while the interface binding cannot be replaced or exposed.
+struct GoAssertionProofContext<'a, 'tree, 'file> {
+    specs: &'a [ProcedureSpec<'tree>],
+    bindings: &'a [GoCallableLexicalBindings],
+    mutated: &'a HashSet<GoResolvedBinding>,
+    source: &'a str,
+    named_types: &'a GoNamedTypeDefinitions<'tree>,
+    package_shadowing: PredeclaredShadowing,
+    inventory: &'a mut ProcedureInventoryBuilder<'file>,
+    cancellation: &'a CancellationToken,
+}
+
+impl<'tree> GoAssertionProofContext<'_, 'tree, '_> {
+    fn binding(
+        &mut self,
+        procedure: usize,
+        node: Node<'tree>,
+    ) -> Result<Option<GoResolvedBinding>, GoInventoryPrepassStop> {
+        let Some(name) = node_text(self.source, node) else {
+            return Ok(None);
+        };
+        resolve_go_binding(
+            self.specs,
+            self.bindings,
+            procedure,
+            name,
+            node.start_byte(),
+            self.inventory,
+            self.cancellation,
+        )
+    }
+
+    fn binding_type_source(
+        &self,
+        binding: GoResolvedBinding,
+    ) -> (Option<Node<'tree>>, Option<Node<'tree>>) {
+        let identity = match binding {
+            GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => identity,
+        };
+        let callable = self.specs[identity.procedure.index()].callable;
+        let name = callable
+            .named_descendant_for_byte_range(
+                identity.declaration_start,
+                identity.declaration_start + 1,
+            )
+            .expect("a binding declaration belongs to its callable");
+        assert_eq!(name.id(), identity.declaration, "exact binding declaration");
+        let mut declaration = name.parent().expect("binding has a declaration");
+        if declaration.kind() == "expression_list" {
+            declaration = declaration.parent().expect("binding list has an owner");
+        }
+        let (names, values) = match declaration.kind() {
+            "short_var_declaration" => (
+                declaration
+                    .child_by_field_name("left")
+                    .map(expression_sequence)
+                    .unwrap_or_default(),
+                declaration
+                    .child_by_field_name("right")
+                    .map(expression_sequence)
+                    .unwrap_or_default(),
+            ),
+            "var_spec"
+            | "const_spec"
+            | "parameter_declaration"
+            | "variadic_parameter_declaration" => (
+                children_by_field_name(declaration, "name"),
+                declaration
+                    .child_by_field_name("value")
+                    .map(expression_sequence)
+                    .unwrap_or_default(),
+            ),
+            _ => return (None, None),
+        };
+        let initializer = names
+            .iter()
+            .position(|candidate| candidate.id() == name.id())
+            .and_then(|index| go_declaration_value_for_index(names.len(), &values, index));
+        (declaration.child_by_field_name("type"), initializer)
+    }
+
+    fn static_type(
+        &mut self,
+        mut procedure: usize,
+        mut node: Node<'tree>,
+    ) -> Result<Option<GoAssertionType<'tree>>, GoInventoryPrepassStop> {
+        let mut pointer_depth = 0usize;
+        let mut visited = HashSet::default();
+        loop {
+            charge_go_inventory_prepass(self.inventory, self.cancellation)?;
+            let mut ancestor = Some(procedure);
+            while let Some(index) = ancestor {
+                charge_go_inventory_prepass(self.inventory, self.cancellation)?;
+                let spec = &self.specs[index];
+                if spec
+                    .callable
+                    .child_by_field_name("type_parameters")
+                    .is_some()
+                    || go_receiver_uses_generic_type(spec.callable)
+                {
+                    return Ok(None);
+                }
+                ancestor = spec.lexical_parent.map(ProcedureId::index);
+            }
+            match node.kind() {
+                "parenthesized_expression" | "literal_element" => {
+                    let Some(child) = transparent_runtime_wrapper_child(node) else {
+                        return Ok(None);
+                    };
+                    node = child;
+                }
+                "unary_expression" if unary_operator_kind(node) == Some("&") => {
+                    let Some(operand) = node.child_by_field_name("operand") else {
+                        return Ok(None);
+                    };
+                    pointer_depth += 1;
+                    node = operand;
+                }
+                "composite_literal" | "type_assertion_expression" => {
+                    return Ok(node
+                        .child_by_field_name("type")
+                        .map(|node| GoAssertionType {
+                            node,
+                            pointer_depth,
+                        }));
+                }
+                "identifier" | "true" | "false" | "nil" | "iota" => {
+                    let Some(binding) = self.binding(procedure, node)? else {
+                        return Ok(None);
+                    };
+                    if !visited.insert(binding) {
+                        return Ok(None);
+                    }
+                    let (declared, initializer) = self.binding_type_source(binding);
+                    if let Some(node) = declared {
+                        return Ok(Some(GoAssertionType {
+                            node,
+                            pointer_depth,
+                        }));
+                    }
+                    let Some(initializer) = initializer else {
+                        return Ok(None);
+                    };
+                    procedure = resolved_binding_procedure(binding).index();
+                    node = initializer;
+                }
+                "call_expression" => {
+                    let Some(function) = node.child_by_field_name("function") else {
+                        return Ok(None);
+                    };
+                    let Some(name @ ("make" | "new")) = node_text(self.source, function) else {
+                        return Ok(None);
+                    };
+                    if function.kind() != "identifier"
+                        || self.package_shadowing.shadows(name)
+                        || self.specs[procedure].result_shadowing.shadows(name)
+                        || self.binding(procedure, function)?.is_some()
+                        || visible_go_named_type(self.named_types, name, function.start_byte())
+                            .is_some()
+                    {
+                        return Ok(None);
+                    }
+                    let arguments = all_call_arguments(node);
+                    let Some(kind) = arguments.first().copied() else {
+                        return Ok(None);
+                    };
+                    if name == "new" && arguments.len() == 1 && is_go_type_syntax(kind.kind()) {
+                        return Ok(Some(GoAssertionType {
+                            node: kind,
+                            pointer_depth: pointer_depth + 1,
+                        }));
+                    }
+                    if name == "make"
+                        && matches!(
+                            (kind.kind(), arguments.len()),
+                            ("slice_type", 2 | 3) | ("map_type" | "channel_type", 1 | 2)
+                        )
+                    {
+                        return Ok(Some(GoAssertionType {
+                            node: kind,
+                            pointer_depth,
+                        }));
+                    }
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    fn payload_type(
+        &mut self,
+        procedure: usize,
+        node: Node<'tree>,
+    ) -> Result<Option<GoAssertionType<'tree>>, GoInventoryPrepassStop> {
+        Ok(self
+            .interface_payload(procedure, node)?
+            .map(|proof| proof.r#type))
+    }
+
+    fn interface_payload(
+        &mut self,
+        mut procedure: usize,
+        mut node: Node<'tree>,
+    ) -> Result<Option<GoInterfacePayloadProof<'tree>>, GoInventoryPrepassStop> {
+        let mut visited = HashSet::default();
+        loop {
+            charge_go_inventory_prepass(self.inventory, self.cancellation)?;
+            node = transparent_parenthesized_expression(node);
+            let Some(kind) = self.static_type(procedure, node)? else {
+                return Ok(None);
+            };
+            let underlying = go_file_underlying_type(
+                kind.node,
+                self.source,
+                self.named_types,
+                kind.node.start_byte(),
+            );
+            let interface = kind.pointer_depth == 0
+                && underlying.is_some_and(|underlying| {
+                    underlying.kind() == "interface_type"
+                        || (underlying.kind() == "type_identifier"
+                            && node_text(self.source, underlying) == Some("any")
+                            && visible_go_named_type(
+                                self.named_types,
+                                "any",
+                                underlying.start_byte(),
+                            )
+                            .is_none())
+                });
+            if !interface {
+                return Ok(Some(GoInterfacePayloadProof {
+                    r#type: kind,
+                    boxing_procedure: self.specs[procedure].id,
+                    boxing_initializer: node,
+                }));
+            }
+            if !is_go_binding_reference_kind(node.kind()) {
+                return Ok(None);
+            }
+            let Some(binding) = self.binding(procedure, node)? else {
+                return Ok(None);
+            };
+            if !visited.insert(binding) || self.mutated.contains(&binding) {
+                return Ok(None);
+            }
+            let (_, initializer) = self.binding_type_source(binding);
+            let Some(initializer) = initializer else {
+                return Ok(None);
+            };
+            node = initializer;
+            procedure = resolved_binding_procedure(binding).index();
+        }
+    }
+
+    fn interface_dispatch(
+        &mut self,
+        procedure: usize,
+        selector: Node<'tree>,
+        methods: &GoMethodInventory,
+    ) -> Result<Option<(GoInterfaceDispatchProof, ProcedureId, usize)>, GoInventoryPrepassStop>
+    {
+        let Some(operand) = selector.child_by_field_name("operand") else {
+            return Ok(None);
+        };
+        let Some(selected_name) = selector
+            .child_by_field_name("field")
+            .and_then(|field| nonempty_node_text(self.source, field))
+        else {
+            return Ok(None);
+        };
+        let Some(static_type) = self.static_type(procedure, operand)? else {
+            return Ok(None);
+        };
+        if static_type.pointer_depth != 0 {
+            return Ok(None);
+        }
+        let Some(interface) = go_file_underlying_type(
+            static_type.node,
+            self.source,
+            self.named_types,
+            static_type.node.start_byte(),
+        )
+        .filter(|underlying| underlying.kind() == "interface_type") else {
+            return Ok(None);
+        };
+        let required_methods = named_children(interface);
+        if required_methods.is_empty()
+            || required_methods
+                .iter()
+                .any(|method| method.kind() != "method_elem")
+        {
+            // Embedded interfaces and type terms require a complete promoted
+            // method set. The local proof deliberately covers direct method
+            // elements only.
+            return Ok(None);
+        }
+
+        let Some(payload) = self.interface_payload(procedure, operand)? else {
+            return Ok(None);
+        };
+        let Some(receiver_type) =
+            go_assertion_type_identity(payload.r#type, self.source, self.named_types)
+        else {
+            return Ok(None);
+        };
+        let Some(receiver_declaration) = receiver_type.declaration else {
+            return Ok(None);
+        };
+        if receiver_type.pointer_depth != 1 {
+            // A value stored in an interface is copied into the wrapper. It
+            // cannot be treated as the source object's storage, and deeper
+            // pointer shapes have no direct named method set here.
+            return Ok(None);
+        }
+
+        let mut selected = None;
+        for required in required_methods {
+            charge_go_inventory_prepass(self.inventory, self.cancellation)?;
+            let Some(name) = required
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(self.source, name))
+            else {
+                return Ok(None);
+            };
+            let Some(candidate) = methods.get(&(receiver_declaration, name.into())).copied() else {
+                return Ok(None);
+            };
+            let candidate_callable = self.specs[candidate.procedure.index()].callable;
+            if !go_method_signatures_match(
+                candidate_callable,
+                required,
+                self.source,
+                self.named_types,
+                self.inventory,
+                self.cancellation,
+            )? {
+                return Ok(None);
+            }
+            if name == selected_name {
+                selected = Some(candidate);
+            }
+        }
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        Ok(Some((
+            GoInterfaceDispatchProof {
+                receiver_type,
+                target: selected.procedure,
+            },
+            payload.boxing_procedure,
+            payload.boxing_initializer.id(),
+        )))
+    }
+}
+
+use brokk_bifrost_analysis::analyzer::semantic::inventory::ProcedureInventoryPrepassStop as GoInventoryPrepassStop;
+
+fn charge_go_inventory_prepass(
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<(), GoInventoryPrepassStop> {
+    brokk_bifrost_analysis::analyzer::semantic::inventory::charge_prepass(inventory, cancellation)
+}
+
+struct ProcedureEnumerationFrame<'tree> {
+    node: Node<'tree>,
+    lexical_parent: Option<ProcedureId>,
+    declaration_path: usize,
+    package_binding_context: bool,
+    file_type_context: bool,
+    direct_struct_owner: Option<Node<'tree>>,
+    named_result_owner: Option<ProcedureId>,
+    entry_precharged: bool,
+}
+
+/// Query assertion compatibility against the workspace's exact current source.
+/// Source acquisition and semantic work are charged to `request` here.
+pub fn workspace_reference_assertion_accepts_payload(
+    workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    assertion: &ValueHandle,
+    payload: &ValueHandle,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SemanticOutcome<bool>, SemanticProviderError> {
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome;
+
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+
+    let unknown = || SemanticOutcome::Unknown {
+        partial: None,
+        work: SemanticWork::default(),
+    };
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: SemanticWork::default(),
+        });
+    }
+    if assertion.procedure().artifact().key() != payload.procedure().artifact().key() {
+        return Ok(unknown());
+    }
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()) else {
+        return Ok(unknown());
+    };
+    let span = |handle: &ValueHandle| {
+        let semantics = handle.procedure().semantics();
+        let value = semantics
+            .value(handle.id())
+            .expect("validated value handle");
+        let mapping = semantics.source_mapping(value.source)?;
+        let span = mapping.locator.anchor().span();
+        Some(span.start_byte() as usize..span.end_byte() as usize)
+    };
+    let (Some(assertion_span), Some(payload_span)) = (span(assertion), span(payload)) else {
+        return Ok(unknown());
+    };
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let limit = request.budget.limits().source_bytes;
+    let Some((file, source)) =
+        brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_source_for_procedure(
+            workspace,
+            assertion.procedure(),
+            limit,
+        )?
+    else {
+        let work = SemanticWork {
+            source_bytes: limit.saturating_add(1),
+            ..SemanticWork::default()
+        };
+        let exceeded = request
+            .budget
+            .check_admission(work)
+            .expect_err("source limit exceeded");
+        return Ok(SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work,
+        });
+    };
+    let source_work = SemanticWork {
+        source_bytes: source.len(),
+        ..SemanticWork::default()
+    };
+    request.budget.charge_work(source_work);
+    let prepared = match go.inner.prepared_syntax_limited_cancellable(
+        scope.token(),
+        &file,
+        source.len(),
+        Some(request.cancellation),
+    ) {
+        PreparedSyntaxLimitedOutcome::Available(_, prepared)
+            if prepared.source() == source.as_ref() =>
+        {
+            prepared
+        }
+        PreparedSyntaxLimitedOutcome::Cancelled => {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: source_work,
+            });
+        }
+        // A changed or unavailable snapshot supplies no type certificate.
+        _ => {
+            return Ok(SemanticOutcome::Unknown {
+                partial: None,
+                work: source_work,
+            });
+        }
+    };
+    let mut outcome = reference_assertion_payload_type_is_exact(
+        &file,
+        &prepared,
+        assertion_span,
+        payload_span,
+        request.budget,
+        request.cancellation,
+    )?;
+    request.budget.charge_work(outcome.work());
+    let work = match &mut outcome {
+        SemanticOutcome::Complete { work, .. }
+        | SemanticOutcome::Ambiguous { work, .. }
+        | SemanticOutcome::Unknown { work, .. }
+        | SemanticOutcome::Unsupported { work, .. }
+        | SemanticOutcome::Unproven { work, .. }
+        | SemanticOutcome::ExceededBudget { work, .. }
+        | SemanticOutcome::Cancelled { work, .. } => work,
+    };
+    *work = source_work.conservative_add(*work);
+    Ok(outcome)
+}
+
+/// Positive same-source type evidence for an invocation-proven boxed payload.
+/// The caller separately proves that `payload` is the stable value in the box.
+/// False means no certificate, not a proof that the assertion must fail.
+/// Parsing belongs to the caller; all inventory and type-comparison work is
+/// reported against its semantic budget. No interface initializer is assumed.
+pub fn reference_assertion_payload_type_is_exact(
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    assertion: std::ops::Range<usize>,
+    payload: std::ops::Range<usize>,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<SemanticOutcome<bool>, SemanticProviderError> {
+    let (facts, previous_work) = match enumerate_procedures(file, prepared, budget, cancellation)? {
+        ProcedureEnumeration::Complete {
+            value,
+            inventory_work,
+            ..
+        } => (value, inventory_work),
+        ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            });
+        }
+        ProcedureEnumeration::Cancelled { work } => {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            });
+        }
+    };
+    let root = prepared.tree().root_node();
+    let mut inventory = ProcedureInventoryBuilder::new(
+        file,
+        prepared.dialect(),
+        root,
+        "go-assertion-payload",
+        budget,
+    )?;
+    let proof = (|| -> Result<bool, GoInventoryPrepassStop> {
+        inventory
+            .observe_additional_work(previous_work)
+            .map_err(GoInventoryPrepassStop::Budget)?;
+        let exact_node = |range: &std::ops::Range<usize>| {
+            root.named_descendant_for_byte_range(range.start, range.end)
+                .filter(|node| node.start_byte() == range.start && node.end_byte() == range.end)
+        };
+        let Some(assertion) =
+            exact_node(&assertion).filter(|node| node.kind() == "type_assertion_expression")
+        else {
+            return Ok(false);
+        };
+        let Some(payload) = exact_node(&payload) else {
+            return Ok(false);
+        };
+        let Some(asserted) = assertion.child_by_field_name("type") else {
+            return Ok(false);
+        };
+        let Some((owner, _)) = facts
+            .specs
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| {
+                spec.body.start_byte() <= payload.start_byte()
+                    && payload.end_byte() <= spec.body.end_byte()
+            })
+            .min_by_key(|(_, spec)| spec.body.end_byte() - spec.body.start_byte())
+        else {
+            return Ok(false);
+        };
+        if !go_type_is_reference(
+            asserted,
+            prepared.source(),
+            &facts.named_type_definitions,
+            asserted.start_byte(),
+        ) {
+            return Ok(false);
+        }
+        let mut bindings = Vec::with_capacity(facts.specs.len());
+        for spec in &facts.specs {
+            bindings.push(go_callable_lexical_bindings(
+                spec,
+                prepared.source(),
+                &facts.direct_struct_fields,
+                &facts.named_type_definitions,
+                &facts.method_inventory,
+                &mut inventory,
+                cancellation,
+            )?);
+        }
+        let mut context = GoAssertionProofContext {
+            specs: &facts.specs,
+            bindings: &bindings,
+            mutated: &HashSet::default(),
+            source: prepared.source(),
+            named_types: &facts.named_type_definitions,
+            package_shadowing: facts.package_shadowing,
+            inventory: &mut inventory,
+            cancellation,
+        };
+        let Some(payload_type) = context.static_type(owner, payload)? else {
+            return Ok(false);
+        };
+        go_assertion_types_match(
+            payload_type,
+            asserted,
+            prepared.source(),
+            &facts.named_type_definitions,
+            &mut inventory,
+            cancellation,
+        )
+    })();
+    match proof {
+        Ok(value) => Ok(SemanticOutcome::Complete {
+            value,
+            work: inventory.observed_work(),
+        }),
+        Err(GoInventoryPrepassStop::Cancelled) => Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: inventory.observed_work(),
+        }),
+        Err(GoInventoryPrepassStop::Budget(stop)) => {
+            let ProcedureInventoryOutcome::ExceededBudget { exceeded, work } =
+                stop.into_outcome::<bool>()
+            else {
+                unreachable!("budget stop has one outcome");
+            };
+            Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            })
+        }
+    }
+}
+
+fn enumerate_procedures<'tree>(
+    file: &ProjectFile,
+    prepared: &'tree PreparedSyntaxTree,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
+    let root = prepared.tree().root_node();
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "go-source", budget)?;
+    let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
+    let mut package_shadowing = PredeclaredShadowing::default();
+    let mut package_values = HashSet::default();
+    let mut package_value_locators = HashMap::default();
+    let mut direct_struct_fields = DirectStructFields::default();
+    let mut named_type_definitions = HashMap::default();
+    let mut stack = vec![ProcedureEnumerationFrame {
+        node: root,
+        lexical_parent: None,
+        declaration_path: inventory.root_path(),
+        package_binding_context: false,
+        file_type_context: false,
+        direct_struct_owner: None,
+        named_result_owner: None,
+        entry_precharged: false,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if !frame.entry_precharged
+            && let Err(stop) = inventory.charge_traversal_entry()
+        {
+            return Ok(stop.into_outcome());
+        }
+
+        if frame.package_binding_context
+            && let Some(name) = go_package_binding_name(frame.node, prepared.source())
+        {
+            package_shadowing.observe(name);
+        }
+        if matches!(frame.node.kind(), "type_spec" | "type_alias")
+            && let Some(name_node) = frame.node.child_by_field_name("name")
+            && let Some(name) = nonempty_node_text(prepared.source(), name_node)
+            && let Some(underlying) = frame.node.child_by_field_name("type")
+        {
+            let local_scope = go_local_scope(frame.node);
+            let (scope_start, scope_end) =
+                local_scope.unwrap_or_else(|| (root.start_byte(), root.end_byte()));
+            named_type_definitions
+                .entry(name.into())
+                .or_insert_with(Vec::new)
+                .push(GoNamedTypeDefinition {
+                    declaration: frame.node.id(),
+                    underlying,
+                    visible_from: local_scope
+                        .map(|_| name_node.start_byte())
+                        .unwrap_or(root.start_byte()),
+                    scope_start,
+                    scope_end,
+                });
+            if underlying.kind() == "struct_type" {
+                record_direct_struct_fields(
+                    &mut direct_struct_fields,
+                    frame.node.id(),
+                    underlying,
+                    prepared.source(),
+                );
+            }
+        }
+        let prescanned_children = if matches!(frame.node.kind(), "var_spec" | "const_spec") {
+            let mut children = Vec::new();
+            for child_index in 0..frame.node.child_count() {
+                if cancellation.is_cancelled() {
+                    return Ok(inventory.cancelled());
+                }
+                let Some(child) = frame
+                    .node
+                    .child(child_index)
+                    .filter(|child| child.is_named())
+                else {
+                    continue;
+                };
+                if let Err(stop) = inventory.charge_traversal_entry() {
+                    return Ok(stop.into_outcome());
+                }
+                if frame.node.field_name_for_child(child_index as u32) == Some("name") {
+                    if frame.package_binding_context
+                        && let Some(name) = node_text(prepared.source(), child)
+                    {
+                        package_shadowing.observe(name);
+                        if name != "_" {
+                            package_values.insert(name.into());
+                            if frame.node.kind() == "var_spec" {
+                                let anchor = source_anchor(child, 0)
+                                    .map_err(SemanticProviderError::invalid_identity)?;
+                                package_value_locators.insert(
+                                    name.into(),
+                                    inventory.locator(
+                                        frame.declaration_path,
+                                        SemanticRole::MemoryLocation,
+                                        anchor,
+                                    )?,
+                                );
+                            }
+                        }
+                    }
+                } else if child.kind() != "comment" {
+                    children.push(child);
+                }
+            }
+            Some(children)
+        } else {
+            None
+        };
+        if let Some(owner) = frame.named_result_owner
+            && is_go_binding_reference_kind(frame.node.kind())
+            && let Some(name) = node_text(prepared.source(), frame.node)
+            && let Some(spec) = specs.get_mut(owner.index())
+        {
+            spec.result_shadowing.observe(name);
+        }
+        let child_path = frame.declaration_path;
+
+        let mut callable_body_scope = None;
+        let mut callable_result_scope = None;
+        if let Some((kind, segment_kind, body, properties)) =
+            callable_shape(frame.node, frame.lexical_parent)
+        {
+            let name = callable_name(prepared.source(), frame.node);
+            let anchor =
+                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            let identity = match inventory.allocate_procedure(
+                child_path,
+                segment_kind,
+                name.as_deref(),
+                anchor,
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
+            specs.push(ProcedureSpec {
+                id: identity.id,
+                callable: frame.node,
+                body,
+                locator: identity.locator,
+                lexical_parent: frame.lexical_parent,
+                kind,
+                properties,
+                result_shadowing: PredeclaredShadowing::default(),
+                captures: Box::new([]),
+                shared_bindings: Box::new([]),
+                omitted_capture_names: Box::new([]),
+                call_exposure_origins: Box::new([]),
+                identity_preserving_assertions: HashSet::default(),
+                reference_identity_preserving_assertions: HashSet::default(),
+                interface_dispatches: HashMap::default(),
+                reference_boxing_initializers: HashSet::default(),
+            });
+            callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
+            callable_result_scope = frame
+                .node
+                .child_by_field_name("result")
+                .filter(|result| result.kind() == "parameter_list")
+                .map(|result| (result.id(), identity.id));
+        }
+
+        let children = if let Some(children) = prescanned_children {
+            children
+                .into_iter()
+                .map(|child| (child, false, true))
+                .collect::<Vec<_>>()
+        } else {
+            let mut children = Vec::new();
+            for child_index in 0..frame.node.child_count() {
+                if cancellation.is_cancelled() {
+                    return Ok(inventory.cancelled());
+                }
+                let Some(child) = frame
+                    .node
+                    .child(child_index)
+                    .filter(|child| child.is_named())
+                else {
+                    continue;
+                };
+                if let Err(stop) = inventory.charge_traversal_entry() {
+                    return Ok(stop.into_outcome());
+                }
+                let package_binding_context = match frame.node.kind() {
+                    "source_file" => true,
+                    "import_declaration" | "import_spec_list" | "type_declaration"
+                    | "var_declaration" | "const_declaration" => frame.package_binding_context,
+                    _ => false,
+                };
+                children.push((child, package_binding_context, true));
+            }
+            children
+        };
+        for (child, package_binding_context, entry_precharged) in children.into_iter().rev() {
+            let (lexical_parent, declaration_path) = callable_body_scope
+                .filter(|(body_id, _, _)| *body_id == child.id())
+                .map(|(_, procedure, path)| (Some(procedure), path))
+                .unwrap_or((frame.lexical_parent, child_path));
+            let named_result_owner = callable_result_scope
+                .filter(|(result_id, _)| *result_id == child.id())
+                .map(|(_, procedure)| procedure)
+                .or(frame.named_result_owner);
+            let file_type_context = match frame.node.kind() {
+                "source_file" => child.kind() == "type_declaration",
+                "type_declaration" if frame.file_type_context => {
+                    matches!(child.kind(), "type_spec" | "type_alias" | "type_spec_list")
+                }
+                "type_spec_list" if frame.file_type_context => {
+                    matches!(child.kind(), "type_spec" | "type_alias")
+                }
+                _ => false,
+            };
+            let direct_struct_owner = match frame.node.kind() {
+                "type_spec"
+                    if frame.file_type_context
+                        && child.kind() == "struct_type"
+                        && field_matches(frame.node, "type", child) =>
+                {
+                    frame.node.child_by_field_name("name")
+                }
+                "struct_type"
+                    if frame.direct_struct_owner.is_some()
+                        && child.kind() == "field_declaration_list" =>
+                {
+                    frame.direct_struct_owner
+                }
+                "field_declaration_list"
+                    if frame.direct_struct_owner.is_some()
+                        && child.kind() == "field_declaration" =>
+                {
+                    frame.direct_struct_owner
+                }
+                _ => None,
+            };
+            stack.push(ProcedureEnumerationFrame {
+                node: child,
+                lexical_parent,
+                declaration_path,
+                package_binding_context,
+                file_type_context,
+                direct_struct_owner,
+                named_result_owner,
+                entry_precharged,
+            });
+        }
+    }
+
+    // A defined type's fields are its underlying struct's fields: `type D S`
+    // selects the same members as `S`. The chain can only be followed once
+    // every type declaration in the file is known, so this runs after the
+    // traversal rather than inside it.
+    let defined_type_structures = named_type_definitions
+        .values()
+        .flatten()
+        .filter(|definition| !direct_struct_fields.contains_key(&definition.declaration))
+        .filter_map(|definition| {
+            let underlying = go_file_underlying_type(
+                definition.underlying,
+                prepared.source(),
+                &named_type_definitions,
+                definition.underlying.start_byte(),
+            )?;
+            (underlying.kind() == "struct_type").then_some((definition.declaration, underlying))
+        })
+        .collect::<Vec<_>>();
+    for (declaration, structure) in defined_type_structures {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
+        }
+        record_direct_struct_fields(
+            &mut direct_struct_fields,
+            declaration,
+            structure,
+            prepared.source(),
+        );
+    }
+
+    let method_inventory = match go_same_file_method_inventory(
+        &specs,
+        &named_type_definitions,
+        root,
+        prepared.source(),
+        &mut inventory,
+        cancellation,
+    ) {
+        Ok(methods) => methods,
+        Err(GoInventoryPrepassStop::Budget(stop)) => return Ok(stop.into_outcome()),
+        Err(GoInventoryPrepassStop::Cancelled) => return Ok(inventory.cancelled()),
+    };
+    let indirect_callable_targets = match populate_capture_specs(
+        &mut specs,
+        prepared.source(),
+        &direct_struct_fields,
+        &named_type_definitions,
+        &method_inventory,
+        package_shadowing,
+        &mut inventory,
+        cancellation,
+    ) {
+        Ok(targets) => targets,
+        Err(stop) => {
+            return Ok(match stop {
+                GoInventoryPrepassStop::Budget(stop) => stop.into_outcome(),
+                GoInventoryPrepassStop::Cancelled => inventory.cancelled(),
+            });
+        }
+    };
+    Ok(inventory.complete(GoProcedureInventory {
+        specs,
+        package_shadowing,
+        package_values,
+        package_value_locators,
+        direct_struct_fields,
+        named_type_definitions,
+        method_inventory,
+        indirect_callable_targets,
+    }))
+}
+
+fn record_direct_struct_fields(
+    inventory: &mut DirectStructFields,
+    declaration: usize,
+    structure: Node<'_>,
+    source: &str,
+) {
+    let mut names = Vec::new();
+    for list in named_children(structure)
+        .into_iter()
+        .filter(|child| child.kind() == "field_declaration_list")
+    {
+        for field in named_children(list)
+            .into_iter()
+            .filter(|child| child.kind() == "field_declaration")
+        {
+            let mut field_names = named_children(field)
+                .into_iter()
+                .filter(|child| child.kind() == "field_identifier")
+                .filter_map(|child| nonempty_node_text(source, child))
+                .filter(|name| *name != "_")
+                .map(Box::<str>::from)
+                .collect::<Vec<_>>();
+            if field_names.is_empty()
+                && let Some((name, _)) =
+                    brokk_bifrost_go::declarations::go_embedded_struct_field(field, source)
+                && name != "_"
+            {
+                field_names.push(name.into_boxed_str());
+            }
+            names.extend(field_names);
+        }
+    }
+    if !names.is_empty() {
+        inventory.entry(declaration).or_default().extend(names);
+    }
+}
+
+fn go_same_file_method_inventory(
+    specs: &[ProcedureSpec<'_>],
+    named_types: &GoNamedTypeDefinitions<'_>,
+    root: Node<'_>,
+    source: &str,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<GoMethodInventory, GoInventoryPrepassStop> {
+    let mut methods = GoMethodInventory::default();
+    for spec in specs {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        if spec.callable.kind() != "method_declaration" {
+            continue;
+        }
+        let Some((receiver, pointer_receiver, _)) =
+            crate::analyzer::go::artifact::method_receiver(spec.callable, source)
+        else {
+            continue;
+        };
+        let Some(definition) = named_types.get(receiver.as_str()).and_then(|definitions| {
+            visible_go_binding(definitions, root.start_byte(), |definition| {
+                (
+                    definition.visible_from,
+                    definition.scope_start,
+                    definition.scope_end,
+                )
+            })
+        }) else {
+            continue;
+        };
+        let Some(name) = spec
+            .callable
+            .child_by_field_name("name")
+            .and_then(|name| nonempty_node_text(source, name))
+        else {
+            continue;
+        };
+        let target = GoMethodTarget {
+            pointer_receiver,
+            procedure: spec.id,
+        };
+        let previous = methods.insert((definition.declaration, name.into()), target);
+        debug_assert!(
+            previous.is_none_or(|previous| previous == target),
+            "one Go receiver type cannot declare the same method twice"
+        );
+    }
+    Ok(methods)
+}
+
+fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    brokk_bifrost_semantic::analyzer::semantic::lowering::callable_name_with_binding(
+        source,
+        node,
+        || enclosing_binding_name(source, node),
+    )
+}
+
+/// Resolve every lexical capture to its exact declaring binding. Stable
+/// short-declared locals may remain value snapshots; all other captures relay
+/// one shared cell through every intervening closure.
+#[allow(clippy::too_many_arguments)]
+fn populate_capture_specs<'tree>(
+    specs: &mut [ProcedureSpec<'tree>],
+    source: &str,
+    direct_struct_fields: &DirectStructFields,
+    named_type_definitions: &GoNamedTypeDefinitions<'tree>,
+    method_inventory: &GoMethodInventory,
+    package_shadowing: PredeclaredShadowing,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<HashMap<usize, GoIndirectCallableTarget>, GoInventoryPrepassStop> {
+    charge_go_inventory_prepass(inventory, cancellation)?;
+    let mut lexical_bindings = Vec::with_capacity(specs.len());
+    for spec in specs.iter() {
+        lexical_bindings.push(go_callable_lexical_bindings(
+            spec,
+            source,
+            direct_struct_fields,
+            named_type_definitions,
+            method_inventory,
+            inventory,
+            cancellation,
+        )?);
+    }
+    let (call_exposure_origins, capture_mutable_bindings) = collect_call_exposure_origins(
+        specs,
+        &lexical_bindings,
+        source,
+        direct_struct_fields,
+        named_type_definitions,
+        method_inventory,
+        inventory,
+        cancellation,
+    )?;
+    let mut assertion_context = GoAssertionProofContext {
+        specs,
+        bindings: &lexical_bindings,
+        mutated: &capture_mutable_bindings,
+        source,
+        named_types: named_type_definitions,
+        package_shadowing,
+        inventory,
+        cancellation,
+    };
+    let mut assertion_proofs = Vec::with_capacity(specs.len());
+    let mut reference_assertion_proofs = Vec::with_capacity(specs.len());
+    let mut interface_dispatch_proofs = Vec::with_capacity(specs.len());
+    let mut reference_boxing_initializers = vec![HashSet::<usize>::default(); specs.len()];
+    for (index, spec) in specs.iter().enumerate() {
+        let mut proven = HashSet::default();
+        let mut proven_reference = HashSet::default();
+        let mut dispatches = HashMap::default();
+        try_walk_named_tree_preorder(spec.body, true, |node| {
+            charge_go_inventory_prepass(assertion_context.inventory, cancellation)?;
+            if node != spec.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "type_assertion_expression"
+                && let Some(operand) = node.child_by_field_name("operand")
+                && let Some(asserted) = node.child_by_field_name("type")
+                && let Some(payload) = assertion_context.payload_type(index, operand)?
+                && go_assertion_types_match(
+                    payload,
+                    asserted,
+                    source,
+                    named_type_definitions,
+                    assertion_context.inventory,
+                    cancellation,
+                )?
+            {
+                proven.insert(node.id());
+                if go_type_is_reference(
+                    asserted,
+                    source,
+                    named_type_definitions,
+                    asserted.start_byte(),
+                ) {
+                    proven_reference.insert(node.id());
+                }
+            }
+            if node.kind() == "selector_expression"
+                && node.parent().is_some_and(|parent| {
+                    parent.kind() == "call_expression" && field_matches(parent, "function", node)
+                })
+                && let Some((proof, boxing_procedure, boxing_initializer)) =
+                    assertion_context.interface_dispatch(index, node, method_inventory)?
+            {
+                dispatches.insert(node.id(), proof);
+                reference_boxing_initializers[boxing_procedure.index()].insert(boxing_initializer);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        assertion_proofs.push(proven);
+        reference_assertion_proofs.push(proven_reference);
+        interface_dispatch_proofs.push(dispatches);
+    }
+    for ((((spec, proofs), reference_proofs), dispatches), boxing_initializers) in specs
+        .iter_mut()
+        .zip(assertion_proofs)
+        .zip(reference_assertion_proofs)
+        .zip(interface_dispatch_proofs)
+        .zip(reference_boxing_initializers)
+    {
+        spec.identity_preserving_assertions = proofs;
+        spec.reference_identity_preserving_assertions = reference_proofs;
+        spec.interface_dispatches = dispatches;
+        spec.reference_boxing_initializers = boxing_initializers;
+    }
+    let mut captures = vec![Vec::<GoCaptureSpec<'tree>>::new(); specs.len()];
+    let omitted_capture_names = vec![Vec::<Box<str>>::new(); specs.len()];
+    for child in specs.iter() {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        let Some(parent_id) = child.lexical_parent else {
+            continue;
+        };
+        let Some(parent) = specs.get(parent_id.index()) else {
+            continue;
+        };
+        if !go_callable_creation_is_lowered(child.callable, parent.body, inventory, cancellation)? {
+            continue;
+        }
+        let child_bindings = &lexical_bindings[child.id.index()];
+        let mut references: HashMap<Box<str>, Node<'tree>> = HashMap::default();
+        try_walk_named_tree_preorder(child.body, true, |node| {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if node != child.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if is_go_binding_reference_kind(node.kind())
+                && let Some(name) = node_text(source, node)
+                && name != "_"
+                && !child_bindings.declaration_targets.contains_key(&node.id())
+                && child_bindings.binding_at(name, node.start_byte()).is_none()
+            {
+                references
+                    .entry(name.into())
+                    .and_modify(|first| {
+                        if node.start_byte() < first.start_byte() {
+                            *first = node;
+                        }
+                    })
+                    .or_insert(node);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        let mut captured = Vec::new();
+        for (name, reference) in references {
+            if let Some(binding) = resolve_go_binding(
+                specs,
+                &lexical_bindings,
+                parent.id.index(),
+                &name,
+                child.callable.start_byte(),
+                inventory,
+                cancellation,
+            )? {
+                let immutable = immutable_captured_binding(
+                    &lexical_bindings,
+                    binding,
+                    &capture_mutable_bindings,
+                );
+                // Only a binding resolved through an enclosing callable is a
+                // capture. Package imports and package-level declarations are
+                // intentionally absent so they remain available to their own
+                // structured resolution paths inside the child.
+                captured.push(GoCaptureSpec {
+                    name,
+                    reference,
+                    binding,
+                    storage: if immutable {
+                        GoCaptureStorage::Value
+                    } else {
+                        GoCaptureStorage::MutableCell
+                    },
+                    value_storage: lexical_bindings[resolved_binding_procedure(binding).index()]
+                        .storage_kind(binding),
+                    index_value_copy: lexical_bindings[resolved_binding_procedure(binding).index()]
+                        .index_value_copy(binding)
+                        .unwrap_or(MemoryValueCopy::Unknown),
+                    index_value_type: lexical_bindings[resolved_binding_procedure(binding).index()]
+                        .index_value_type(binding),
+                    channel_payload_copy: lexical_bindings
+                        [resolved_binding_procedure(binding).index()]
+                    .channel_payload_copy(binding),
+                    channel_payload_type: lexical_bindings
+                        [resolved_binding_procedure(binding).index()]
+                    .channel_payload_type(binding),
+                    value_type: match binding {
+                        GoResolvedBinding::Local(identity)
+                        | GoResolvedBinding::Formal(identity) => lexical_bindings
+                            [identity.procedure.index()]
+                        .receiver_types
+                        .get(&identity)
+                        .cloned(),
+                    },
+                });
+            }
+        }
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        captures[child.id.index()] = captured;
+    }
+
+    // A closure can refer directly to a grandparent binding. Closure
+    // conversion still has to carry that binding through each intermediate
+    // environment, even when the intermediate body never spells its name.
+    for child_index in 0..specs.len() {
+        let direct = captures[child_index].clone();
+        for capture in direct {
+            let owner = resolved_binding_procedure(capture.binding);
+            let mut relay = specs[child_index].lexical_parent;
+            while let Some(relay_id) = relay {
+                if relay_id == owner {
+                    break;
+                }
+                charge_go_inventory_prepass(inventory, cancellation)?;
+                if !captures[relay_id.index()]
+                    .iter()
+                    .any(|existing| existing.binding == capture.binding)
+                {
+                    captures[relay_id.index()].push(capture.clone());
+                }
+                relay = specs[relay_id.index()].lexical_parent;
+            }
+            debug_assert_eq!(
+                relay,
+                Some(owner),
+                "a resolved capture binding must be in the lexical ancestor chain"
+            );
+        }
+    }
+
+    let mut shared_bindings = vec![Vec::<GoSharedBindingSpec>::new(); specs.len()];
+    // Taking a binding's address exposes its storage even without a closure.
+    // Resolve the exact lexical owner before allocating the cell; package
+    // globals and addresses of members retain their existing open boundaries.
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        try_walk_named_tree_preorder(spec.body, true, |node| {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if node != spec.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "unary_expression"
+                && unary_operator_kind(node) == Some("&")
+                && let Some(operand) = node.child_by_field_name("operand")
+                && let operand = transparent_parenthesized_expression(operand)
+                && is_go_binding_reference_kind(operand.kind())
+                && let Some(name) = node_text(source, operand).filter(|name| *name != "_")
+                && let Some(binding) = resolve_go_binding(
+                    specs,
+                    &lexical_bindings,
+                    procedure_index,
+                    name,
+                    operand.start_byte(),
+                    inventory,
+                    cancellation,
+                )?
+            {
+                shared_bindings[resolved_binding_procedure(binding).index()].push(
+                    GoSharedBindingSpec {
+                        name: name.into(),
+                        binding,
+                    },
+                );
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    for captured in &mut captures {
+        captured.sort_by(|left, right| {
+            resolved_binding_sort_key(left.binding)
+                .cmp(&resolved_binding_sort_key(right.binding))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        captured.dedup_by_key(|capture| capture.binding);
+        for capture in captured.iter() {
+            if capture.storage == GoCaptureStorage::MutableCell {
+                shared_bindings[resolved_binding_procedure(capture.binding).index()].push(
+                    GoSharedBindingSpec {
+                        name: capture.name.clone(),
+                        binding: capture.binding,
+                    },
+                );
+            }
+        }
+    }
+    for bindings in &mut shared_bindings {
+        bindings.sort_by_key(|binding| resolved_binding_sort_key(binding.binding));
+        bindings.dedup_by_key(|binding| binding.binding);
+    }
+    for ((((spec, captured), shared), omitted), exposures) in specs
+        .iter_mut()
+        .zip(captures)
+        .zip(shared_bindings)
+        .zip(omitted_capture_names)
+        .zip(call_exposure_origins)
+    {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        spec.captures = captured.into_boxed_slice();
+        spec.shared_bindings = shared.into_boxed_slice();
+        spec.omitted_capture_names = omitted.into_boxed_slice();
+        spec.call_exposure_origins = exposures.into_boxed_slice();
+    }
+    // After the mutable-binding set is complete, so a binding assigned later
+    // in the same body cannot be read as stable here.
+    collect_indirect_callable_targets(
+        specs,
+        &lexical_bindings,
+        &capture_mutable_bindings,
+        source,
+        inventory,
+        cancellation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_call_exposure_origins(
+    specs: &[ProcedureSpec<'_>],
+    lexical_bindings: &[GoCallableLexicalBindings],
+    source: &str,
+    direct_struct_fields: &DirectStructFields,
+    named_type_definitions: &GoNamedTypeDefinitions<'_>,
+    method_inventory: &GoMethodInventory,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<Vec<GoCallExposureOrigin>>, HashSet<GoResolvedBinding>), GoInventoryPrepassStop> {
+    let mut by_owner = (0..specs.len())
+        .map(|_| HashSet::<(Box<str>, GoResolvedBinding)>::default())
+        .collect::<Vec<_>>();
+    let mut capture_mutable_bindings = HashSet::default();
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        try_walk_named_tree_preorder(spec.body, true, |node| {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if node != spec.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+
+            for target in go_mutation_targets(node) {
+                let target = transparent_parenthesized_expression(target);
+                if !is_go_binding_reference_kind(target.kind())
+                    && !matches!(target.kind(), "selector_expression" | "index_expression")
+                {
+                    continue;
+                }
+                let Some(root) = go_place_root_identifier(target) else {
+                    continue;
+                };
+                let Some(name) = node_text(source, root).filter(|name| *name != "_") else {
+                    continue;
+                };
+                let resolved = if is_go_binding_reference_kind(target.kind())
+                    && matches!(
+                        node.kind(),
+                        "short_var_declaration" | "range_clause" | "receive_statement"
+                    )
+                    && direct_child_kind(node, ":=")
+                {
+                    lexical_bindings[procedure_index]
+                        .declaration_targets
+                        .get(&target.id())
+                        .copied()
+                } else {
+                    resolve_go_binding(
+                        specs,
+                        lexical_bindings,
+                        procedure_index,
+                        name,
+                        root.start_byte(),
+                        inventory,
+                        cancellation,
+                    )?
+                };
+                if let Some(binding) = resolved {
+                    let declares_binding = is_go_binding_reference_kind(target.kind())
+                        && matches!(
+                            binding,
+                            GoResolvedBinding::Local(identity)
+                                if identity.declaration == target.id()
+                        );
+                    let mutates_only_backing_store = target.kind() == "index_expression"
+                        && matches!(
+                            lexical_bindings[resolved_binding_procedure(binding).index()]
+                                .storage_kind(binding),
+                            Some(GoStorageKind::Slice | GoStorageKind::Map)
+                        );
+                    if !declares_binding && !mutates_only_backing_store {
+                        // An exact value capture is sound only while the
+                        // original variable's complete value is stable. An
+                        // array index or field write changes that value. A
+                        // slice or map index write instead changes the backing
+                        // store named by a stable descriptor, so the exact
+                        // descriptor value remains a sound capture.
+                        capture_mutable_bindings.insert(binding);
+                    }
+                    if resolved_binding_procedure(binding) != spec.id {
+                        by_owner[resolved_binding_procedure(binding).index()]
+                            .insert((name.into(), binding));
+                    }
+                }
+            }
+
+            if node.kind() == "selector_expression"
+                && let Some(operand) = node.child_by_field_name("operand")
+                && let Some(root) = go_place_root_identifier(operand)
+                && let Some(name) = node_text(source, root).filter(|name| *name != "_")
+                && let Some(field_name) = node
+                    .child_by_field_name("field")
+                    .and_then(|field| nonempty_node_text(source, field))
+                && let Some(binding) = resolve_go_binding(
+                    specs,
+                    lexical_bindings,
+                    procedure_index,
+                    name,
+                    root.start_byte(),
+                    inventory,
+                    cancellation,
+                )?
+            {
+                let direct_receiver = transparent_parenthesized_expression(operand);
+                let receiver_type = (is_go_binding_reference_kind(direct_receiver.kind())
+                    && direct_receiver.id() == root.id())
+                .then(|| match binding {
+                    GoResolvedBinding::Local(identity) => lexical_bindings
+                        .get(identity.procedure.index())?
+                        .receiver_types
+                        .get(&identity),
+                    GoResolvedBinding::Formal(_) => None,
+                })
+                .flatten();
+                match go_same_file_selector_resolution(
+                    receiver_type.and_then(|identity| identity.declaration),
+                    Some(field_name),
+                    direct_struct_fields,
+                    method_inventory,
+                ) {
+                    GoSelectorResolution::Method {
+                        pointer_receiver: true,
+                        ..
+                    } if receiver_type.is_some_and(|identity| identity.pointer_depth == 0) => {
+                        // A method value saves the implicit address even when
+                        // its eventual invocation is outside this procedure.
+                        capture_mutable_bindings.insert(binding);
+                        by_owner[resolved_binding_procedure(binding).index()]
+                            .insert((name.into(), binding));
+                    }
+                    GoSelectorResolution::Unknown => {
+                        let receiver_is_interface = receiver_type
+                            .and_then(|identity| identity.declaration)
+                            .and_then(|declaration| {
+                                named_type_definitions
+                                    .values()
+                                    .flatten()
+                                    .find(|definition| definition.declaration == declaration)
+                            })
+                            .and_then(|definition| {
+                                go_file_underlying_type(
+                                    definition.underlying,
+                                    source,
+                                    named_type_definitions,
+                                    node.start_byte(),
+                                )
+                            })
+                            .is_some_and(|underlying| underlying.kind() == "interface_type");
+                        if receiver_is_interface {
+                            return Ok(WalkControl::Continue);
+                        }
+                        // An unresolved selector might still be a pointer
+                        // method. Refuse the exact capture claim, and when the
+                        // reference comes from a descendant callable retain
+                        // the original binding's possible call exposure. The
+                        // current type proof deliberately covers only exact
+                        // same-file local types, so unsupported types and
+                        // formals must remain conservative here.
+                        capture_mutable_bindings.insert(binding);
+                        if resolved_binding_procedure(binding) != spec.id {
+                            by_owner[resolved_binding_procedure(binding).index()]
+                                .insert((name.into(), binding));
+                        }
+                    }
+                    GoSelectorResolution::Package
+                    | GoSelectorResolution::Field
+                    | GoSelectorResolution::Method { .. }
+                    | GoSelectorResolution::InterfaceMethod { .. } => {}
+                }
+            }
+
+            if node.kind() == "unary_expression"
+                && unary_operator_kind(node) == Some("&")
+                && let Some(operand) = node.child_by_field_name("operand")
+                && let Some(root) = go_place_root_identifier(operand)
+                && let Some(name) = node_text(source, root).filter(|name| *name != "_")
+                && let Some(binding) = resolve_go_binding(
+                    specs,
+                    lexical_bindings,
+                    procedure_index,
+                    name,
+                    root.start_byte(),
+                    inventory,
+                    cancellation,
+                )?
+            {
+                // The escaped address can update the original cell even
+                // when this file contains no direct assignment to it.
+                capture_mutable_bindings.insert(binding);
+                by_owner[resolved_binding_procedure(binding).index()]
+                    .insert((name.into(), binding));
+            }
+
+            if node.kind() == "slice_expression"
+                && let Some(root) = go_place_root_identifier(node)
+                && let Some(name) = node_text(source, root).filter(|name| *name != "_")
+                && let Some(binding) = resolve_go_binding(
+                    specs,
+                    lexical_bindings,
+                    procedure_index,
+                    name,
+                    root.start_byte(),
+                    inventory,
+                    cancellation,
+                )?
+            {
+                // Slicing an array or pointer-to-array can publish an alias to
+                // its storage. Without a structured aggregate-kind proof, a
+                // later update through that slice can change the original
+                // variable's complete value, including through an otherwise
+                // unrelated call that receives the derived slice.
+                capture_mutable_bindings.insert(binding);
+                by_owner[resolved_binding_procedure(binding).index()]
+                    .insert((name.into(), binding));
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    let mut ordered_by_owner = Vec::with_capacity(by_owner.len());
+    for origins in by_owner {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        let mut origins = origins
+            .into_iter()
+            .map(|(name, binding)| GoCallExposureOrigin { name, binding })
+            .collect::<Vec<_>>();
+        origins.sort_by(|left, right| {
+            left.name.cmp(&right.name).then_with(|| {
+                resolved_binding_sort_key(left.binding)
+                    .cmp(&resolved_binding_sort_key(right.binding))
+            })
+        });
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        ordered_by_owner.push(origins);
+    }
+    Ok((ordered_by_owner, capture_mutable_bindings))
+}
+
+fn go_place_root_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "parenthesized_expression" | "literal_element" => {
+                node = transparent_runtime_wrapper_child(node)?;
+            }
+            "selector_expression" | "index_expression" | "slice_expression" => {
+                node = node.child_by_field_name("operand")?;
+            }
+            "identifier" | "true" | "false" | "nil" | "iota" => return Some(node),
+            _ => return None,
+        }
+    }
+}
+
+fn go_has_ancestor_kind_before(mut node: Node<'_>, root: Node<'_>, kind: &str) -> bool {
+    while let Some(ancestor) = node.parent() {
+        if ancestor.id() == root.id() {
+            return false;
+        }
+        if ancestor.kind() == kind {
+            return true;
+        }
+        node = ancestor;
+    }
+    false
+}
+
+fn resolved_binding_procedure(binding: GoResolvedBinding) -> ProcedureId {
+    match binding {
+        GoResolvedBinding::Local(identity) => identity.procedure,
+        GoResolvedBinding::Formal(identity) => identity.procedure,
+    }
+}
+
+fn resolved_binding_sort_key(binding: GoResolvedBinding) -> (usize, usize, usize) {
+    match binding {
+        GoResolvedBinding::Formal(identity) => {
+            (identity.procedure.index(), 0, identity.declaration_start)
+        }
+        GoResolvedBinding::Local(identity) => {
+            (identity.procedure.index(), 1, identity.declaration_start)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GoBindingIdentity {
+    procedure: ProcedureId,
+    /// Tree-sitter's node ID remains the exact same-tree lookup identity.
+    /// Source order is separate because a fresh tree may assign different node
+    /// IDs to unchanged declarations.
+    declaration: usize,
+    declaration_start: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GoResolvedBinding {
+    Local(GoBindingIdentity),
+    Formal(GoBindingIdentity),
+}
+
+impl GoResolvedBinding {
+    fn identity(self) -> GoBindingIdentity {
+        match self {
+            Self::Local(identity) | Self::Formal(identity) => identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GoScopedLocalBinding {
+    identity: GoBindingIdentity,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    exact_value_candidate: bool,
+}
+
+/// Reference and mutation classification must use the binding visible at the
+/// individual AST site. Go local scope begins after the declaration and a
+/// later declaration may shadow only part of a child callable; a whole-body
+/// name set would therefore erase an earlier outer reference. These transient
+/// inventories share their scope selectors with lowering-time `LocalBinding`.
+struct GoCallableLexicalBindings {
+    formals: HashMap<Box<str>, GoBindingIdentity>,
+    locals: HashMap<Box<str>, Vec<GoScopedLocalBinding>>,
+    receiver_types: HashMap<GoBindingIdentity, GoTypeIdentity>,
+    storage_kinds: HashMap<GoBindingIdentity, GoStorageKind>,
+    index_value_copies: HashMap<GoBindingIdentity, MemoryValueCopy>,
+    index_value_types: HashMap<GoBindingIdentity, GoTypeIdentity>,
+    channel_payload_copies: HashMap<GoBindingIdentity, SynchronizationPayloadCopy>,
+    channel_payload_types: HashMap<GoBindingIdentity, GoTypeIdentity>,
+    declaration_targets: HashMap<usize, GoResolvedBinding>,
+    /// The function literal a binding is exactly initialized with, for the
+    /// bindings that have one. Keyed by the literal's AST node so the caller
+    /// can reach the same `GoProcedureTarget` a direct literal call reaches.
+    callable_literals: HashMap<GoBindingIdentity, usize>,
+    /// The method declaration a binding is exactly initialized with a
+    /// method-value selection of, for the bindings that have one.
+    callable_methods: HashMap<GoBindingIdentity, ProcedureId>,
+}
+
+fn visible_go_binding<T>(
+    bindings: &[T],
+    byte: usize,
+    bounds: impl Fn(&T) -> (usize, usize, usize),
+) -> Option<&T> {
+    brokk_bifrost_analysis::analyzer::common::visible_local_binding(
+        bindings,
+        byte,
+        bounds,
+        |_, bounds| {
+            let (visible_from, scope_start, scope_end) = bounds;
+            (scope_end - scope_start, std::cmp::Reverse(visible_from))
+        },
+    )
+}
+
+fn visible_go_named_type<'tree>(
+    named_types: &GoNamedTypeDefinitions<'tree>,
+    name: &str,
+    byte: usize,
+) -> Option<GoNamedTypeDefinition<'tree>> {
+    visible_go_binding(named_types.get(name)?, byte, |definition| {
+        (
+            definition.visible_from,
+            definition.scope_start,
+            definition.scope_end,
+        )
+    })
+    .copied()
+}
+
+fn go_binding_in_exact_scope<T>(
+    bindings: &[T],
+    byte: usize,
+    scope_start: usize,
+    scope_end: usize,
+    bounds: impl Fn(&T) -> (usize, usize, usize),
+) -> Option<&T> {
+    bindings.iter().find(|binding| {
+        let (visible_from, candidate_start, candidate_end) = bounds(binding);
+        visible_from <= byte && candidate_start == scope_start && candidate_end == scope_end
+    })
+}
+
+impl GoCallableLexicalBindings {
+    fn binding_at(&self, name: &str, byte: usize) -> Option<GoResolvedBinding> {
+        self.local_at(name, byte)
+            .map(|binding| GoResolvedBinding::Local(binding.identity))
+            .or_else(|| {
+                self.formals
+                    .get(name)
+                    .copied()
+                    .map(GoResolvedBinding::Formal)
+            })
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<GoScopedLocalBinding> {
+        visible_go_binding(self.locals.get(name)?, byte, |binding| {
+            (binding.visible_from, binding.scope_start, binding.scope_end)
+        })
+        .copied()
+    }
+
+    fn local_in_exact_scope(
+        &self,
+        name: &str,
+        byte: usize,
+        scope_start: usize,
+        scope_end: usize,
+    ) -> Option<GoScopedLocalBinding> {
+        go_binding_in_exact_scope(
+            self.locals.get(name)?,
+            byte,
+            scope_start,
+            scope_end,
+            |binding| (binding.visible_from, binding.scope_start, binding.scope_end),
+        )
+        .copied()
+    }
+
+    fn storage_kind(&self, binding: GoResolvedBinding) -> Option<GoStorageKind> {
+        let identity = match binding {
+            GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => identity,
+        };
+        self.storage_kinds.get(&identity).copied()
+    }
+
+    fn index_value_copy(&self, binding: GoResolvedBinding) -> Option<MemoryValueCopy> {
+        self.index_value_copies.get(&binding.identity()).copied()
+    }
+
+    fn index_value_type(&self, binding: GoResolvedBinding) -> Option<GoTypeIdentity> {
+        self.index_value_types.get(&binding.identity()).cloned()
+    }
+
+    fn channel_payload_copy(
+        &self,
+        binding: GoResolvedBinding,
+    ) -> Option<SynchronizationPayloadCopy> {
+        self.channel_payload_copies
+            .get(&binding.identity())
+            .copied()
+    }
+
+    fn channel_payload_type(&self, binding: GoResolvedBinding) -> Option<GoTypeIdentity> {
+        self.channel_payload_types.get(&binding.identity()).cloned()
+    }
+}
+
+fn go_receiver_type_proof_from_type(
+    node: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+) -> Option<GoTypeIdentity> {
+    let identity = go_type_identity(node, source)?;
+    let identity = go_type_identity_with_visible_declaration(identity, named_types, byte);
+    identity.declaration?;
+    Some(identity)
+}
+
+fn go_type_identity_with_visible_declaration(
+    mut identity: GoTypeIdentity,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+) -> GoTypeIdentity {
+    identity.declaration = visible_go_named_type(named_types, identity.name.as_ref(), byte)
+        .map(|definition| definition.declaration);
+    identity
+}
+
+fn go_prepass_expression_receiver_type(
+    mut node: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<Option<GoTypeIdentity>, GoInventoryPrepassStop> {
+    let mut address_depth = 0usize;
+    let mut dereference_depth = 0usize;
+    let base = loop {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        match node.kind() {
+            "parenthesized_expression" | "literal_element" => {
+                let Some(child) = transparent_runtime_wrapper_child(node) else {
+                    break None;
+                };
+                node = child;
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("&") => {
+                let Some(depth) = address_depth.checked_add(1) else {
+                    break None;
+                };
+                let Some(operand) = node.child_by_field_name("operand") else {
+                    break None;
+                };
+                address_depth = depth;
+                node = operand;
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("*") => {
+                let Some(depth) = dereference_depth.checked_add(1) else {
+                    break None;
+                };
+                let Some(operand) = node.child_by_field_name("operand") else {
+                    break None;
+                };
+                dereference_depth = depth;
+                node = operand;
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("<-") => {
+                break node.child_by_field_name("operand").and_then(|channel| {
+                    go_prepass_channel_payload_type(channel, bindings, source, named_types, byte)
+                });
+            }
+            "composite_literal" | "type_assertion_expression" => {
+                break node.child_by_field_name("type").and_then(|type_node| {
+                    go_receiver_type_proof_from_type(type_node, source, named_types, byte)
+                });
+            }
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                let Some(name) = node_text(source, node) else {
+                    break None;
+                };
+                break bindings
+                    .local_at(name, byte)
+                    .and_then(|binding| bindings.receiver_types.get(&binding.identity).cloned());
+            }
+            _ => break None,
+        }
+    };
+    Ok(base.and_then(|mut proof| {
+        proof.pointer_depth = proof
+            .pointer_depth
+            .checked_add(address_depth)?
+            .checked_sub(dereference_depth)?;
+        Some(proof)
+    }))
+}
+
+/// The method declaration a method-value selection in value position denotes,
+/// when the selection's operand is a direct binding reference whose proved
+/// type resolves to exactly one workspace method declaration.
+///
+/// `f := c.serve` stores the very callable the call form `c.serve()` invokes,
+/// so a later `go f()` runs that bound method on the receiver the selection
+/// evaluated. Proving it here lets the call site name the same declaration
+/// instead of leaving the spawn unresolved. An operand whose type is not
+/// exactly one workspace type (an interface, or a promoted or embedded
+/// method) resolves to no single declaration and records nothing.
+#[allow(clippy::too_many_arguments)]
+fn go_prepass_method_value_target(
+    selector: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    direct_struct_fields: &DirectStructFields,
+    method_inventory: &GoMethodInventory,
+    byte: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<Option<ProcedureId>, GoInventoryPrepassStop> {
+    let Some(operand) = selector
+        .child_by_field_name("operand")
+        .map(transparent_parenthesized_expression)
+    else {
+        return Ok(None);
+    };
+    if !is_go_binding_reference_kind(operand.kind()) {
+        return Ok(None);
+    }
+    let receiver_type = go_prepass_expression_receiver_type(
+        operand,
+        bindings,
+        source,
+        named_types,
+        byte,
+        inventory,
+        cancellation,
+    )?;
+    let field_name = selector
+        .child_by_field_name("field")
+        .and_then(|field| nonempty_node_text(source, field));
+    Ok(
+        match go_same_file_selector_resolution(
+            receiver_type.and_then(|identity| identity.declaration),
+            field_name,
+            direct_struct_fields,
+            method_inventory,
+        ) {
+            GoSelectorResolution::Method { target, .. } => Some(target),
+            GoSelectorResolution::Package
+            | GoSelectorResolution::Field
+            | GoSelectorResolution::InterfaceMethod { .. }
+            | GoSelectorResolution::Unknown => None,
+        },
+    )
+}
+
+fn go_file_underlying_type<'tree>(
+    mut kind: Node<'tree>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'tree>,
+    mut use_byte: usize,
+) -> Option<Node<'tree>> {
+    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    for _ in 0..=definition_count {
+        match kind.kind() {
+            "parenthesized_type" => kind = first_named_child(kind)?,
+            "generic_type" => {
+                let name = kind.child_by_field_name("type")?;
+                let name = node_text(source, name)?;
+                let underlying = visible_go_named_type(named_types, name, use_byte)?.underlying;
+                use_byte = underlying.start_byte();
+                kind = underlying;
+            }
+            "type_identifier" => {
+                let name = node_text(source, kind)?;
+                let Some(definition) = visible_go_named_type(named_types, name, use_byte) else {
+                    return Some(kind);
+                };
+                use_byte = definition.underlying.start_byte();
+                kind = definition.underlying;
+            }
+            _ => return Some(kind),
+        }
+    }
+    None
+}
+
+fn go_type_uses_generic<'tree>(
+    mut kind: Node<'tree>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'tree>,
+    mut use_byte: usize,
+) -> bool {
+    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    for _ in 0..=definition_count {
+        match kind.kind() {
+            "generic_type" | "type_parameter_list" | "type_parameter_declaration" => {
+                return true;
+            }
+            "parenthesized_type" => {
+                let Some(child) = first_named_child(kind) else {
+                    return false;
+                };
+                kind = child;
+            }
+            "type_identifier" => {
+                let Some(name) = node_text(source, kind) else {
+                    return false;
+                };
+                let Some(definition) = visible_go_named_type(named_types, name, use_byte) else {
+                    return false;
+                };
+                if definition
+                    .underlying
+                    .parent()
+                    .is_some_and(|parent| parent.child_by_field_name("type_parameters").is_some())
+                {
+                    return true;
+                }
+                use_byte = definition.underlying.start_byte();
+                kind = definition.underlying;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GoAssertionType<'tree> {
+    node: Node<'tree>,
+    pointer_depth: usize,
+}
+
+fn go_assertion_type_identity(
+    r#type: GoAssertionType<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+) -> Option<GoTypeIdentity> {
+    let mut identity = go_type_identity(r#type.node, source)?;
+    identity.pointer_depth = identity.pointer_depth.checked_add(r#type.pointer_depth)?;
+    Some(go_type_identity_with_visible_declaration(
+        identity,
+        named_types,
+        r#type.node.start_byte(),
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GoMethodParameterType<'tree> {
+    node: Node<'tree>,
+    variadic: bool,
+}
+
+fn go_method_parameter_types(parameters: Node<'_>) -> Option<Vec<GoMethodParameterType<'_>>> {
+    let mut result = Vec::new();
+    for declaration in named_children(parameters) {
+        let variadic = match declaration.kind() {
+            "parameter_declaration" => false,
+            "variadic_parameter_declaration" => true,
+            _ => return None,
+        };
+        let r#type = declaration.child_by_field_name("type")?;
+        let count = children_by_field_name(declaration, "name").len().max(1);
+        result.extend(std::iter::repeat_n(
+            GoMethodParameterType {
+                node: r#type,
+                variadic,
+            },
+            count,
+        ));
+    }
+    Some(result)
+}
+
+fn go_callable_result_types(callable: Node<'_>) -> Option<Vec<Node<'_>>> {
+    match go_callable_result_syntax(callable) {
+        GoCallableResultSyntax::None => Some(Vec::new()),
+        GoCallableResultSyntax::Parameters(results) => go_method_parameter_types(results)
+            .map(|results| results.into_iter().map(|result| result.node).collect()),
+        GoCallableResultSyntax::Type(result) => Some(vec![result]),
+    }
+}
+
+fn go_method_signatures_match<'tree>(
+    candidate: Node<'tree>,
+    required: Node<'tree>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'tree>,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, GoInventoryPrepassStop> {
+    if candidate.child_by_field_name("type_parameters").is_some()
+        || required.child_by_field_name("type_parameters").is_some()
+    {
+        return Ok(false);
+    }
+    let (Some(candidate_parameters), Some(required_parameters)) = (
+        candidate
+            .child_by_field_name("parameters")
+            .and_then(go_method_parameter_types),
+        required
+            .child_by_field_name("parameters")
+            .and_then(go_method_parameter_types),
+    ) else {
+        return Ok(false);
+    };
+    if candidate_parameters.len() != required_parameters.len()
+        || candidate_parameters
+            .iter()
+            .zip(&required_parameters)
+            .any(|(candidate, required)| candidate.variadic != required.variadic)
+    {
+        return Ok(false);
+    }
+    for (candidate, required) in candidate_parameters.iter().zip(&required_parameters) {
+        if !go_assertion_types_match(
+            GoAssertionType {
+                node: candidate.node,
+                pointer_depth: 0,
+            },
+            required.node,
+            source,
+            named_types,
+            inventory,
+            cancellation,
+        )? {
+            return Ok(false);
+        }
+    }
+
+    let (Some(candidate_results), Some(required_results)) = (
+        go_callable_result_types(candidate),
+        go_callable_result_types(required),
+    ) else {
+        return Ok(false);
+    };
+    if candidate_results.len() != required_results.len() {
+        return Ok(false);
+    }
+    for (candidate, required) in candidate_results.into_iter().zip(required_results) {
+        if !go_assertion_types_match(
+            GoAssertionType {
+                node: candidate,
+                pointer_depth: 0,
+            },
+            required,
+            source,
+            named_types,
+            inventory,
+            cancellation,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether a statically known interface payload can satisfy an assertion.
+///
+/// This intentionally proves only exact named identity, scalar predeclared
+/// atoms, and recursive slice, map, or bidirectional-channel shapes. A
+/// distinct named type does not become equal merely because it has the same
+/// underlying representation, and unsupported syntax remains open to the
+/// caller.
+fn go_assertion_types_match<'tree>(
+    payload: GoAssertionType<'tree>,
+    asserted: Node<'tree>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'tree>,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, GoInventoryPrepassStop> {
+    let alias_limit = named_types
+        .values()
+        .map(Vec::len)
+        .sum::<usize>()
+        .saturating_add(1);
+    let mut pending = vec![(
+        payload,
+        payload.node.start_byte(),
+        0usize,
+        GoAssertionType {
+            node: asserted,
+            pointer_depth: 0,
+        },
+        asserted.start_byte(),
+        0usize,
+    )];
+
+    while let Some((
+        mut left,
+        mut left_byte,
+        mut left_aliases,
+        mut right,
+        mut right_byte,
+        mut right_aliases,
+    )) = pending.pop()
+    {
+        loop {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if left.node.kind() == "parenthesized_type" {
+                let Some(child) = first_named_child(left.node) else {
+                    return Ok(false);
+                };
+                left.node = child;
+                continue;
+            }
+            if right.node.kind() == "parenthesized_type" {
+                let Some(child) = first_named_child(right.node) else {
+                    return Ok(false);
+                };
+                right.node = child;
+                continue;
+            }
+            if left.node.kind() == "pointer_type" {
+                let Some(child) = first_named_child(left.node) else {
+                    return Ok(false);
+                };
+                left.pointer_depth = match left.pointer_depth.checked_add(1) {
+                    Some(depth) => depth,
+                    None => return Ok(false),
+                };
+                left.node = child;
+                continue;
+            }
+            if right.node.kind() == "pointer_type" {
+                let Some(child) = first_named_child(right.node) else {
+                    return Ok(false);
+                };
+                right.pointer_depth = match right.pointer_depth.checked_add(1) {
+                    Some(depth) => depth,
+                    None => return Ok(false),
+                };
+                right.node = child;
+                continue;
+            }
+
+            let left_definition = if left.node.kind() == "type_identifier" {
+                let Some(name) = nonempty_node_text(source, left.node) else {
+                    return Ok(false);
+                };
+                visible_go_named_type(named_types, name, left_byte)
+            } else {
+                None
+            };
+            let right_definition = if right.node.kind() == "type_identifier" {
+                let Some(name) = nonempty_node_text(source, right.node) else {
+                    return Ok(false);
+                };
+                visible_go_named_type(named_types, name, right_byte)
+            } else {
+                None
+            };
+            if let (Some(left_definition), Some(right_definition)) =
+                (left_definition, right_definition)
+                && left_definition.declaration == right_definition.declaration
+                && left.pointer_depth == right.pointer_depth
+            {
+                break;
+            }
+
+            if let Some(definition) = left_definition
+                && definition
+                    .underlying
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "type_alias")
+            {
+                if left_aliases >= alias_limit {
+                    return Ok(false);
+                }
+                left_aliases += 1;
+                left.node = definition.underlying;
+                left_byte = left.node.start_byte();
+                continue;
+            }
+            if let Some(definition) = right_definition
+                && definition
+                    .underlying
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "type_alias")
+            {
+                if right_aliases >= alias_limit {
+                    return Ok(false);
+                }
+                right_aliases += 1;
+                right.node = definition.underlying;
+                right_byte = right.node.start_byte();
+                continue;
+            }
+
+            if left.pointer_depth != right.pointer_depth {
+                return Ok(false);
+            }
+            match (left.node.kind(), right.node.kind()) {
+                ("slice_type", "slice_type") => {
+                    let (Some(left_element), Some(right_element)) = (
+                        left.node.child_by_field_name("element"),
+                        right.node.child_by_field_name("element"),
+                    ) else {
+                        return Ok(false);
+                    };
+                    pending.push((
+                        GoAssertionType {
+                            node: left_element,
+                            pointer_depth: 0,
+                        },
+                        left_byte,
+                        left_aliases,
+                        GoAssertionType {
+                            node: right_element,
+                            pointer_depth: 0,
+                        },
+                        right_byte,
+                        right_aliases,
+                    ));
+                    break;
+                }
+                ("map_type", "map_type") => {
+                    let (Some(left_key), Some(right_key), Some(left_value), Some(right_value)) = (
+                        left.node.child_by_field_name("key"),
+                        right.node.child_by_field_name("key"),
+                        left.node.child_by_field_name("value"),
+                        right.node.child_by_field_name("value"),
+                    ) else {
+                        return Ok(false);
+                    };
+                    pending.push((
+                        GoAssertionType {
+                            node: left_value,
+                            pointer_depth: 0,
+                        },
+                        left_byte,
+                        left_aliases,
+                        GoAssertionType {
+                            node: right_value,
+                            pointer_depth: 0,
+                        },
+                        right_byte,
+                        right_aliases,
+                    ));
+                    pending.push((
+                        GoAssertionType {
+                            node: left_key,
+                            pointer_depth: 0,
+                        },
+                        left_byte,
+                        left_aliases,
+                        GoAssertionType {
+                            node: right_key,
+                            pointer_depth: 0,
+                        },
+                        right_byte,
+                        right_aliases,
+                    ));
+                    break;
+                }
+                ("channel_type", "channel_type") => {
+                    // Channel direction is part of the channel type. The
+                    // grammar exposes directional channels separately; keep
+                    // this proof limited to the bidirectional form until a
+                    // structured direction comparison is available.
+                    if left.node.child_by_field_name("direction").is_some()
+                        || right.node.child_by_field_name("direction").is_some()
+                    {
+                        return Ok(false);
+                    }
+                    let (Some(left_value), Some(right_value)) = (
+                        left.node.child_by_field_name("value"),
+                        right.node.child_by_field_name("value"),
+                    ) else {
+                        return Ok(false);
+                    };
+                    pending.push((
+                        GoAssertionType {
+                            node: left_value,
+                            pointer_depth: 0,
+                        },
+                        left_byte,
+                        left_aliases,
+                        GoAssertionType {
+                            node: right_value,
+                            pointer_depth: 0,
+                        },
+                        right_byte,
+                        right_aliases,
+                    ));
+                    break;
+                }
+                ("type_identifier", "type_identifier") => {
+                    let (Some(left_name), Some(right_name)) = (
+                        nonempty_node_text(source, left.node),
+                        nonempty_node_text(source, right.node),
+                    ) else {
+                        return Ok(false);
+                    };
+                    let left_predeclared = is_predeclared_go_type(left_name)
+                        && !matches!(left_name, "any" | "comparable" | "error")
+                        && left_definition.is_none();
+                    let right_predeclared = is_predeclared_go_type(right_name)
+                        && !matches!(right_name, "any" | "comparable" | "error")
+                        && right_definition.is_none();
+                    if !(left_predeclared && right_predeclared && left_name == right_name) {
+                        return Ok(false);
+                    }
+                    break;
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn go_storage_kind_from_type(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> Option<GoStorageKind> {
+    go_storage_kind_of_underlying(go_file_underlying_type(
+        kind,
+        source,
+        named_types,
+        use_byte,
+    )?)
+}
+
+/// The storage a value of an already-resolved underlying type holds.
+fn go_storage_kind_of_underlying(underlying: Node<'_>) -> Option<GoStorageKind> {
+    match underlying.kind() {
+        "array_type" | "implicit_length_array_type" => Some(GoStorageKind::Array),
+        "struct_type" => Some(GoStorageKind::Struct),
+        "slice_type" => Some(GoStorageKind::Slice),
+        "map_type" => Some(GoStorageKind::Map),
+        "channel_type" => Some(GoStorageKind::Channel),
+        _ => None,
+    }
+}
+
+/// Whether a type is one of the Go values whose representation carries a
+/// reference to a runtime object. This deliberately follows only the
+/// structured type inventory; interfaces, structs, and arrays are not
+/// reference payloads here.
+fn go_type_is_reference(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> bool {
+    let Some(underlying) = go_file_underlying_type(kind, source, named_types, use_byte) else {
+        return false;
+    };
+    matches!(
+        underlying.kind(),
+        "pointer_type" | "slice_type" | "map_type" | "channel_type"
+    )
+}
+
+/// The interface type node a type denotes, resolving parentheses and named
+/// type declarations. The predeclared `any` alias denotes the empty interface
+/// but has no `interface_type` node, so its identifier is returned instead.
+fn go_type_interface_node<'tree>(
+    mut kind: Node<'tree>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'tree>,
+    mut use_byte: usize,
+) -> Option<Node<'tree>> {
+    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    for _ in 0..=definition_count {
+        match kind.kind() {
+            "parenthesized_type" => kind = first_named_child(kind)?,
+            "type_identifier" => {
+                let name = node_text(source, kind)?;
+                if name == "any" {
+                    return visible_go_named_type(named_types, "any", kind.start_byte())
+                        .is_none()
+                        .then_some(kind);
+                }
+                let definition = visible_go_named_type(named_types, name, use_byte)?;
+                use_byte = definition.underlying.start_byte();
+                kind = definition.underlying;
+            }
+            "interface_type" => return Some(kind),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn go_type_is_interface(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> bool {
+    go_type_interface_node(kind, source, named_types, use_byte).is_some()
+}
+
+fn go_type_is_empty_interface(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> bool {
+    go_type_interface_node(kind, source, named_types, use_byte)
+        .is_some_and(|node| node.kind() != "interface_type" || named_children(node).is_empty())
+}
+
+fn go_channel_payload_copy_from_type(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> Option<SynchronizationPayloadCopy> {
+    let channel = go_file_underlying_type(kind, source, named_types, use_byte)?;
+    let element = go_channel_payload_type_node(channel)?;
+    let element = go_file_underlying_type(element, source, named_types, use_byte)?;
+    match element.kind() {
+        "pointer_type" | "channel_type" => Some(SynchronizationPayloadCopy::Reference),
+        "slice_type" => Some(SynchronizationPayloadCopy::BackingStore {
+            identity: IndexedLocationIdentity::Element,
+        }),
+        "map_type" => Some(SynchronizationPayloadCopy::BackingStore {
+            identity: IndexedLocationIdentity::Aggregate,
+        }),
+        // An interface element boxes one reference payload. The sent
+        // reference keeps its object identity inside the wrapper, exactly as
+        // a direct `pointer_type` element does; the operand check
+        // (`expression_supports_channel_payload_copy`) keeps a boxed
+        // non-reference payload, such as a slice or map header, unnamed.
+        _ if go_type_is_interface(element, source, named_types, use_byte) => {
+            Some(SynchronizationPayloadCopy::Reference)
+        }
+        _ => None,
+    }
+}
+
+fn go_memory_value_copy_from_type(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> MemoryValueCopy {
+    let Some(underlying) = go_file_underlying_type(kind, source, named_types, use_byte) else {
+        return MemoryValueCopy::Unknown;
+    };
+    match underlying.kind() {
+        "pointer_type" | "channel_type" | "function_type" => MemoryValueCopy::Reference,
+        "slice_type" => MemoryValueCopy::BackingStore {
+            identity: IndexedLocationIdentity::Element,
+        },
+        "map_type" => MemoryValueCopy::BackingStore {
+            identity: IndexedLocationIdentity::Aggregate,
+        },
+        "array_type" | "implicit_length_array_type" | "struct_type" => MemoryValueCopy::Value,
+        "type_identifier"
+            if nonempty_node_text(source, underlying).is_some_and(|name| {
+                is_predeclared_go_type(name)
+                    && !matches!(name, "any" | "comparable" | "error")
+                    && visible_go_named_type(named_types, name, use_byte).is_none()
+            }) =>
+        {
+            MemoryValueCopy::Value
+        }
+        _ => MemoryValueCopy::Unknown,
+    }
+}
+
+fn go_index_value_copy_from_type(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> MemoryValueCopy {
+    let Some(container) = go_file_underlying_type(kind, source, named_types, use_byte) else {
+        return MemoryValueCopy::Unknown;
+    };
+    go_index_value_type_node(container).map_or(MemoryValueCopy::Unknown, |element| {
+        go_memory_value_copy_from_type(element, source, named_types, use_byte)
+    })
+}
+
+fn go_index_value_type_from_type(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> Option<GoTypeIdentity> {
+    let container = go_file_underlying_type(kind, source, named_types, use_byte)?;
+    let element = go_index_value_type_node(container)?;
+    go_receiver_type_proof_from_type(element, source, named_types, use_byte)
+}
+
+fn go_index_value_type_node(container: Node<'_>) -> Option<Node<'_>> {
+    match container.kind() {
+        "array_type" | "implicit_length_array_type" | "slice_type" => {
+            container.child_by_field_name("element")
+        }
+        "map_type" => container.child_by_field_name("value"),
+        _ => None,
+    }
+}
+
+fn go_channel_payload_type_node(channel: Node<'_>) -> Option<Node<'_>> {
+    (channel.kind() == "channel_type")
+        .then(|| channel.child_by_field_name("value"))
+        .flatten()
+}
+
+fn go_channel_payload_storage_kind(copy: SynchronizationPayloadCopy) -> Option<GoStorageKind> {
+    match copy {
+        SynchronizationPayloadCopy::Unknown | SynchronizationPayloadCopy::Reference => None,
+        SynchronizationPayloadCopy::BackingStore {
+            identity: IndexedLocationIdentity::Element,
+        } => Some(GoStorageKind::Slice),
+        SynchronizationPayloadCopy::BackingStore {
+            identity: IndexedLocationIdentity::Aggregate,
+        } => Some(GoStorageKind::Map),
+    }
+}
+
+fn go_channel_payload_type_from_type(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> Option<GoTypeIdentity> {
+    let channel = go_file_underlying_type(kind, source, named_types, use_byte)?;
+    let element = go_channel_payload_type_node(channel)?;
+    go_receiver_type_proof_from_type(element, source, named_types, use_byte)
+}
+
+enum GoChannelPayloadSource<'tree, T> {
+    Binding(T),
+    Type(Node<'tree>),
+}
+
+enum GoIndexValueExpressionSource<'tree, T> {
+    Binding(T),
+    Type(Node<'tree>),
+    Forward(Node<'tree>),
+}
+
+fn go_index_value_expression_source<'tree, T>(
+    mut node: Node<'tree>,
+    mut unwrap: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+    mut binding: impl FnMut(Node<'tree>) -> Option<T>,
+    mut make_type: impl FnMut(Node<'tree>, usize) -> Option<Node<'tree>>,
+    mut append_source: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<GoIndexValueExpressionSource<'tree, T>> {
+    while let Some(child) = unwrap(node) {
+        node = child;
+    }
+    match node.kind() {
+        "identifier" | "true" | "false" | "nil" | "iota" => {
+            Some(GoIndexValueExpressionSource::Binding(binding(node)?))
+        }
+        "composite_literal" | "type_assertion_expression" => Some(
+            GoIndexValueExpressionSource::Type(node.child_by_field_name("type")?),
+        ),
+        "slice_expression" => Some(GoIndexValueExpressionSource::Forward(
+            node.child_by_field_name("operand")?,
+        )),
+        "call_expression" => make_type(node, node.start_byte())
+            .map(GoIndexValueExpressionSource::Type)
+            .or_else(|| append_source(node).map(GoIndexValueExpressionSource::Forward)),
+        _ => None,
+    }
+}
+
+fn go_prepass_make_type_argument<'tree>(
+    call: Node<'tree>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    byte: usize,
+) -> Option<Node<'tree>> {
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "identifier"
+        || node_text(source, function) != Some("make")
+        || bindings.binding_at("make", byte).is_some()
+    {
+        return None;
+    }
+    all_call_arguments(call).first().copied()
+}
+
+fn go_channel_payload_source<'tree, T>(
+    mut node: Node<'tree>,
+    source: &str,
+    mut unwrap: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+    mut binding_at: impl FnMut(&str, usize) -> Option<T>,
+    mut make_channel_type: impl FnMut(Node<'tree>, usize) -> Option<Node<'tree>>,
+) -> Option<GoChannelPayloadSource<'tree, T>> {
+    while let Some(child) = unwrap(node) {
+        node = child;
+    }
+    match node.kind() {
+        "identifier" | "true" | "false" | "nil" | "iota" => {
+            let name = node_text(source, node)?;
+            Some(GoChannelPayloadSource::Binding(binding_at(
+                name,
+                node.start_byte(),
+            )?))
+        }
+        "call_expression" => Some(GoChannelPayloadSource::Type(make_channel_type(
+            node,
+            node.start_byte(),
+        )?)),
+        _ => None,
+    }
+}
+
+fn go_prepass_channel_payload_copy(
+    node: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+) -> Option<SynchronizationPayloadCopy> {
+    match go_channel_payload_source(
+        node,
+        source,
+        |node| {
+            matches!(node.kind(), "parenthesized_expression" | "literal_element")
+                .then(|| transparent_runtime_wrapper_child(node))
+                .flatten()
+        },
+        |name, _use_byte| bindings.binding_at(name, byte),
+        |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
+    )? {
+        GoChannelPayloadSource::Binding(binding) => bindings.channel_payload_copy(binding),
+        GoChannelPayloadSource::Type(channel) => {
+            go_channel_payload_copy_from_type(channel, source, named_types, byte)
+        }
+    }
+}
+
+fn go_prepass_channel_payload_type(
+    node: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+) -> Option<GoTypeIdentity> {
+    match go_channel_payload_source(
+        node,
+        source,
+        |node| {
+            matches!(node.kind(), "parenthesized_expression" | "literal_element")
+                .then(|| transparent_runtime_wrapper_child(node))
+                .flatten()
+        },
+        |name, _use_byte| bindings.binding_at(name, byte),
+        |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
+    )? {
+        GoChannelPayloadSource::Binding(binding) => bindings.channel_payload_type(binding),
+        GoChannelPayloadSource::Type(channel) => {
+            go_channel_payload_type_from_type(channel, source, named_types, byte)
+        }
+    }
+}
+
+fn go_prepass_index_value_copy(
+    mut node: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+) -> MemoryValueCopy {
+    loop {
+        let source_node = go_index_value_expression_source(
+            node,
+            |node| {
+                matches!(node.kind(), "parenthesized_expression" | "literal_element")
+                    .then(|| transparent_runtime_wrapper_child(node))
+                    .flatten()
+            },
+            |node| node_text(source, node).and_then(|name| bindings.binding_at(name, byte)),
+            |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
+            |_| None,
+        );
+        match source_node {
+            Some(GoIndexValueExpressionSource::Binding(binding)) => {
+                return bindings
+                    .index_value_copy(binding)
+                    .unwrap_or(MemoryValueCopy::Unknown);
+            }
+            Some(GoIndexValueExpressionSource::Type(kind)) => {
+                return go_index_value_copy_from_type(kind, source, named_types, byte);
+            }
+            Some(GoIndexValueExpressionSource::Forward(next)) => node = next,
+            None => return MemoryValueCopy::Unknown,
+        }
+    }
+}
+
+fn go_prepass_index_value_type(
+    mut node: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+) -> Option<GoTypeIdentity> {
+    loop {
+        let source_node = go_index_value_expression_source(
+            node,
+            |node| {
+                matches!(node.kind(), "parenthesized_expression" | "literal_element")
+                    .then(|| transparent_runtime_wrapper_child(node))
+                    .flatten()
+            },
+            |node| node_text(source, node).and_then(|name| bindings.binding_at(name, byte)),
+            |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
+            |_| None,
+        )?;
+        match source_node {
+            GoIndexValueExpressionSource::Binding(binding) => {
+                return bindings.index_value_type(binding);
+            }
+            GoIndexValueExpressionSource::Type(kind) => {
+                return go_index_value_type_from_type(kind, source, named_types, byte);
+            }
+            GoIndexValueExpressionSource::Forward(next) => node = next,
+        }
+    }
+}
+
+fn go_prepass_expression_storage_kind(
+    mut node: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    byte: usize,
+) -> Option<GoStorageKind> {
+    let mut sliced = false;
+    loop {
+        let storage = match node.kind() {
+            "parenthesized_expression" | "literal_element" => {
+                node = transparent_runtime_wrapper_child(node)?;
+                continue;
+            }
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                let name = node_text(source, node)?;
+                bindings
+                    .binding_at(name, byte)
+                    .and_then(|binding| bindings.storage_kind(binding))
+            }
+            "composite_literal" => go_storage_kind_from_type(
+                node.child_by_field_name("type")?,
+                source,
+                named_types,
+                byte,
+            ),
+            "type_assertion_expression" => go_storage_kind_from_type(
+                node.child_by_field_name("type")?,
+                source,
+                named_types,
+                byte,
+            ),
+            "slice_expression" => {
+                sliced = true;
+                node = node.child_by_field_name("operand")?;
+                continue;
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("<-") => {
+                let channel = node.child_by_field_name("operand")?;
+                go_prepass_channel_payload_copy(channel, bindings, source, named_types, byte)
+                    .and_then(go_channel_payload_storage_kind)
+            }
+            "call_expression" => {
+                let function = node.child_by_field_name("function")?;
+                if function.kind() != "identifier"
+                    || node_text(source, function) != Some("make")
+                    || bindings.binding_at("make", byte).is_some()
+                {
+                    return None;
+                }
+                let arguments = all_call_arguments(node);
+                let kind = *arguments.first()?;
+                match arguments.as_slice() {
+                    [_, _] | [_, _, _] if kind.kind() == "slice_type" => Some(GoStorageKind::Slice),
+                    [_] | [_, _] if kind.kind() == "channel_type" => Some(GoStorageKind::Channel),
+                    [_] | [_, _] if kind.kind() == "map_type" => Some(GoStorageKind::Map),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        return if sliced {
+            matches!(storage, Some(GoStorageKind::Array | GoStorageKind::Slice))
+                .then_some(GoStorageKind::Slice)
+        } else {
+            storage
+        };
+    }
+}
+
+fn go_callable_lexical_bindings(
+    spec: &ProcedureSpec<'_>,
+    source: &str,
+    direct_struct_fields: &DirectStructFields,
+    named_type_definitions: &GoNamedTypeDefinitions<'_>,
+    method_inventory: &GoMethodInventory,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<GoCallableLexicalBindings, GoInventoryPrepassStop> {
+    charge_go_inventory_prepass(inventory, cancellation)?;
+    let mut bindings = GoCallableLexicalBindings {
+        formals: HashMap::default(),
+        locals: HashMap::default(),
+        receiver_types: HashMap::default(),
+        storage_kinds: HashMap::default(),
+        index_value_copies: HashMap::default(),
+        index_value_types: HashMap::default(),
+        channel_payload_copies: HashMap::default(),
+        channel_payload_types: HashMap::default(),
+        declaration_targets: HashMap::default(),
+        callable_literals: HashMap::default(),
+        callable_methods: HashMap::default(),
+    };
+    if let Some(layout) = formal_parameter_slots_for_owner(Language::Go, spec.callable, source) {
+        for slot in layout.slots {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            let declaration = spec
+                .callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(spec.callable);
+            let storage = declaration.child_by_field_name("type").and_then(|kind| {
+                go_storage_kind_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            let index_value_copy =
+                declaration
+                    .child_by_field_name("type")
+                    .map_or(MemoryValueCopy::Unknown, |kind| {
+                        go_index_value_copy_from_type(
+                            kind,
+                            source,
+                            named_type_definitions,
+                            declaration.start_byte(),
+                        )
+                    });
+            let index_value_type = declaration.child_by_field_name("type").and_then(|kind| {
+                go_index_value_type_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            let channel_payload_copy = declaration.child_by_field_name("type").and_then(|kind| {
+                go_channel_payload_copy_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            let channel_payload_type = declaration.child_by_field_name("type").and_then(|kind| {
+                go_channel_payload_type_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            let value_type = declaration.child_by_field_name("type").and_then(|kind| {
+                go_receiver_type_proof_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            for name in slot.names {
+                charge_go_inventory_prepass(inventory, cancellation)?;
+                if name == "_" {
+                    continue;
+                }
+                let declaration_node = children_by_field_name(declaration, "name")
+                    .into_iter()
+                    .find(|name_node| node_text(source, *name_node) == Some(name.as_str()))
+                    .unwrap_or(declaration);
+                let identity = GoBindingIdentity {
+                    procedure: spec.id,
+                    declaration: declaration_node.id(),
+                    declaration_start: declaration_node.start_byte(),
+                };
+                bindings.formals.insert(name.into_boxed_str(), identity);
+                if let Some(value_type) = &value_type {
+                    bindings.receiver_types.insert(identity, value_type.clone());
+                }
+
+                if let Some(storage) = storage {
+                    bindings.storage_kinds.insert(identity, storage);
+                }
+                if index_value_copy != MemoryValueCopy::Unknown {
+                    bindings
+                        .index_value_copies
+                        .insert(identity, index_value_copy);
+                }
+                if let Some(index_value_type) = index_value_type.clone() {
+                    bindings
+                        .index_value_types
+                        .insert(identity, index_value_type);
+                }
+                if let Some(copy) = channel_payload_copy {
+                    bindings.channel_payload_copies.insert(identity, copy);
+                }
+                if let Some(payload_type) = channel_payload_type.clone() {
+                    bindings
+                        .channel_payload_types
+                        .insert(identity, payload_type);
+                }
+            }
+        }
+    }
+    if let Some(results) = spec
+        .callable
+        .child_by_field_name("result")
+        .filter(|result| result.kind() == "parameter_list")
+    {
+        for declaration in named_children(results)
+            .into_iter()
+            .filter(|node| node.kind() == "parameter_declaration")
+        {
+            let storage = declaration.child_by_field_name("type").and_then(|kind| {
+                go_storage_kind_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            let index_value_copy =
+                declaration
+                    .child_by_field_name("type")
+                    .map_or(MemoryValueCopy::Unknown, |kind| {
+                        go_index_value_copy_from_type(
+                            kind,
+                            source,
+                            named_type_definitions,
+                            declaration.start_byte(),
+                        )
+                    });
+            let index_value_type = declaration.child_by_field_name("type").and_then(|kind| {
+                go_index_value_type_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            let channel_payload_copy = declaration.child_by_field_name("type").and_then(|kind| {
+                go_channel_payload_copy_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            let channel_payload_type = declaration.child_by_field_name("type").and_then(|kind| {
+                go_channel_payload_type_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            for name_node in children_by_field_name(declaration, "name") {
+                charge_go_inventory_prepass(inventory, cancellation)?;
+                if let Some(name) = node_text(source, name_node)
+                    && name != "_"
+                {
+                    let identity = GoBindingIdentity {
+                        procedure: spec.id,
+                        declaration: name_node.id(),
+                        declaration_start: name_node.start_byte(),
+                    };
+                    bindings.formals.insert(name.into(), identity);
+                    if let Some(storage) = storage {
+                        bindings.storage_kinds.insert(identity, storage);
+                    }
+                    if index_value_copy != MemoryValueCopy::Unknown {
+                        bindings
+                            .index_value_copies
+                            .insert(identity, index_value_copy);
+                    }
+                    if let Some(index_value_type) = index_value_type.clone() {
+                        bindings
+                            .index_value_types
+                            .insert(identity, index_value_type);
+                    }
+                    if let Some(copy) = channel_payload_copy {
+                        bindings.channel_payload_copies.insert(identity, copy);
+                    }
+                    if let Some(payload_type) = channel_payload_type.clone() {
+                        bindings
+                            .channel_payload_types
+                            .insert(identity, payload_type);
+                    }
+                }
+            }
+        }
+    }
+    try_walk_named_tree_preorder(spec.body, true, |node| {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        if node != spec.body && is_go_callable_kind(node.kind()) {
+            return Ok(WalkControl::SkipChildren);
+        }
+        let (name_nodes, exact_value_candidate, value_nodes) = match node.kind() {
+            "var_spec" | "const_spec" => {
+                let names = children_by_field_name(node, "name");
+                let values = node
+                    .child_by_field_name("value")
+                    .map(expression_sequence)
+                    .unwrap_or_default();
+                (names, node.kind() == "const_spec", values)
+            }
+            "short_var_declaration" => {
+                let left = node.child_by_field_name("left");
+                let right = node.child_by_field_name("right");
+                let name_nodes = left.map(expression_sequence).unwrap_or_default();
+                let value_nodes = right.map(expression_sequence).unwrap_or_default();
+                (name_nodes, true, value_nodes)
+            }
+            "receive_statement" if direct_child_kind(node, ":=") => (
+                node.child_by_field_name("left")
+                    .map(expression_sequence)
+                    .unwrap_or_default(),
+                false,
+                Vec::new(),
+            ),
+            "range_clause" if direct_child_kind(node, ":=") => (
+                node.child_by_field_name("left")
+                    .map(expression_sequence)
+                    .unwrap_or_default(),
+                false,
+                Vec::new(),
+            ),
+            _ => return Ok(WalkControl::Continue),
+        };
+        let Some((scope_start, scope_end)) = go_local_scope(node) else {
+            return Ok(WalkControl::Continue);
+        };
+        let name_count = name_nodes.len();
+        for (index, name_node) in name_nodes.into_iter().enumerate() {
+            let declared_value = go_declaration_value_for_index(name_count, &value_nodes, index);
+            if !is_go_binding_reference_kind(name_node.kind()) {
+                continue;
+            }
+            let Some(name) = node_text(source, name_node) else {
+                continue;
+            };
+            if name == "_" {
+                continue;
+            }
+            let existing = (node.kind() == "short_var_declaration")
+                .then(|| {
+                    bindings.local_in_exact_scope(name, node.start_byte(), scope_start, scope_end)
+                })
+                .flatten();
+            let resolved = existing
+                .map(|binding| GoResolvedBinding::Local(binding.identity))
+                .or_else(|| {
+                    (node.kind() == "short_var_declaration"
+                        && bindings.formals.contains_key(name)
+                        && scope_start == spec.body.start_byte()
+                        && scope_end == spec.body.end_byte())
+                    .then(|| {
+                        GoResolvedBinding::Formal(
+                            *bindings
+                                .formals
+                                .get(name)
+                                .expect("formal membership was checked"),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| {
+                    GoResolvedBinding::Local(GoBindingIdentity {
+                        procedure: spec.id,
+                        declaration: name_node.id(),
+                        declaration_start: name_node.start_byte(),
+                    })
+                });
+            if let GoResolvedBinding::Local(identity) = resolved
+                && existing.is_none()
+            {
+                let receiver_type = if node.kind() == "receive_statement" {
+                    node.child_by_field_name("right")
+                        .filter(|receive| {
+                            receive.kind() == "unary_expression"
+                                && unary_operator_kind(*receive) == Some("<-")
+                        })
+                        .and_then(|receive| receive.child_by_field_name("operand"))
+                        .and_then(|channel| {
+                            go_prepass_channel_payload_type(
+                                channel,
+                                &bindings,
+                                source,
+                                named_type_definitions,
+                                node.start_byte(),
+                            )
+                        })
+                } else if let Some(kind) = node.child_by_field_name("type") {
+                    go_receiver_type_proof_from_type(
+                        kind,
+                        source,
+                        named_type_definitions,
+                        node.start_byte(),
+                    )
+                } else {
+                    match declared_value {
+                        Some(value) => go_prepass_expression_receiver_type(
+                            value,
+                            &bindings,
+                            source,
+                            named_type_definitions,
+                            node.start_byte(),
+                            inventory,
+                            cancellation,
+                        )?,
+                        None => None,
+                    }
+                };
+                bindings
+                    .locals
+                    .entry(name.into())
+                    .or_default()
+                    .push(GoScopedLocalBinding {
+                        identity,
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        exact_value_candidate,
+                    });
+                if let Some(receiver_type) = receiver_type {
+                    bindings.receiver_types.insert(identity, receiver_type);
+                }
+                if exact_value_candidate
+                    && let Some(literal) = declared_value
+                        .map(transparent_parenthesized_expression)
+                        .filter(|value| value.kind() == "func_literal")
+                {
+                    bindings.callable_literals.insert(identity, literal.id());
+                }
+                if exact_value_candidate
+                    && let Some(selector) = declared_value
+                        .map(transparent_parenthesized_expression)
+                        .filter(|value| value.kind() == "selector_expression")
+                    && let Some(method) = go_prepass_method_value_target(
+                        selector,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        direct_struct_fields,
+                        method_inventory,
+                        node.start_byte(),
+                        inventory,
+                        cancellation,
+                    )?
+                {
+                    bindings.callable_methods.insert(identity, method);
+                }
+            }
+            let storage = if let Some(kind) = node.child_by_field_name("type") {
+                go_storage_kind_from_type(kind, source, named_type_definitions, node.start_byte())
+            } else {
+                declared_value.and_then(|value| {
+                    go_prepass_expression_storage_kind(
+                        value,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        node.start_byte(),
+                    )
+                })
+            };
+            let index_value_copy = if let Some(kind) = node.child_by_field_name("type") {
+                go_index_value_copy_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    node.start_byte(),
+                )
+            } else {
+                declared_value.map_or(MemoryValueCopy::Unknown, |value| {
+                    go_prepass_index_value_copy(
+                        value,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        node.start_byte(),
+                    )
+                })
+            };
+            let index_value_type = if let Some(kind) = node.child_by_field_name("type") {
+                go_index_value_type_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    node.start_byte(),
+                )
+            } else {
+                declared_value.and_then(|value| {
+                    go_prepass_index_value_type(
+                        value,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        node.start_byte(),
+                    )
+                })
+            };
+            let channel_payload_copy = if let Some(kind) = node.child_by_field_name("type") {
+                go_channel_payload_copy_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    node.start_byte(),
+                )
+            } else {
+                declared_value.and_then(|value| {
+                    go_prepass_channel_payload_copy(
+                        value,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        node.start_byte(),
+                    )
+                })
+            };
+            let channel_payload_type = if let Some(kind) = node.child_by_field_name("type") {
+                go_channel_payload_type_from_type(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    node.start_byte(),
+                )
+            } else {
+                declared_value.and_then(|value| {
+                    go_prepass_channel_payload_type(
+                        value,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        node.start_byte(),
+                    )
+                })
+            };
+            if let Some(storage) = storage {
+                let identity = match resolved {
+                    GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => {
+                        identity
+                    }
+                };
+                bindings.storage_kinds.insert(identity, storage);
+            }
+            if index_value_copy != MemoryValueCopy::Unknown {
+                let identity = match resolved {
+                    GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => {
+                        identity
+                    }
+                };
+                bindings
+                    .index_value_copies
+                    .insert(identity, index_value_copy);
+            }
+            if let Some(index_value_type) = index_value_type {
+                let identity = match resolved {
+                    GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => {
+                        identity
+                    }
+                };
+                bindings
+                    .index_value_types
+                    .insert(identity, index_value_type);
+            }
+            if let Some(copy) = channel_payload_copy {
+                let identity = match resolved {
+                    GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => {
+                        identity
+                    }
+                };
+                bindings.channel_payload_copies.insert(identity, copy);
+            }
+            if let Some(payload_type) = channel_payload_type {
+                let identity = match resolved {
+                    GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => {
+                        identity
+                    }
+                };
+                bindings
+                    .channel_payload_types
+                    .insert(identity, payload_type);
+            }
+            bindings
+                .declaration_targets
+                .insert(name_node.id(), resolved);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(bindings)
+}
+
+/// Exact capture identity is useful only when the parent CFG also lowers the
+/// function-literal expression and can publish its capture bindings.
+/// Expression-switch and select case bodies are retained, while type-switch
+/// clauses still stop where their parent construct publishes an explicit gap.
+fn go_callable_creation_is_lowered(
+    callable: Node<'_>,
+    parent_body: Node<'_>,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, GoInventoryPrepassStop> {
+    let mut current = callable;
+    while current.id() != parent_body.id() {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        let Some(parent) = current.parent() else {
+            return Ok(false);
+        };
+        if is_clause(parent) {
+            let lowered_clause = parent.parent().is_some_and(|owner| {
+                matches!(
+                    owner.kind(),
+                    "expression_switch_statement" | "select_statement"
+                )
+            });
+            if !lowered_clause {
+                return Ok(false);
+            }
+        }
+        current = parent;
+    }
+    Ok(true)
+}
+
+fn immutable_captured_binding(
+    lexical_bindings: &[GoCallableLexicalBindings],
+    binding: GoResolvedBinding,
+    capture_mutable_bindings: &HashSet<GoResolvedBinding>,
+) -> bool {
+    let GoResolvedBinding::Local(identity) = binding else {
+        return false;
+    };
+    lexical_bindings[identity.procedure.index()]
+        .locals
+        .values()
+        .flatten()
+        .any(|candidate| candidate.identity == identity && candidate.exact_value_candidate)
+        && !capture_mutable_bindings.contains(&binding)
+}
+
+/// Prove the local callable a call denotes when its callee is a stable
+/// function-valued binding.
+///
+/// A call whose callee is written as a literal is already proven where it is
+/// lowered. Go just as routinely calls through a binding, and
+/// `check := func() { ... }; go check()` is the shape bbolt's own published
+/// `TestTx_Check_ReadOnly` reproducer uses. Leaving that unresolved hides the
+/// entire spawned body from every consumer of `declared_targets`, which for
+/// the concurrency solver means no task slice and therefore no comparison at
+/// all rather than a narrower one.
+///
+/// The claim is made only for a binding this prepass already proved stable:
+/// one short or const declaration whose value is a function literal, with no
+/// later assignment, no address escape, and no implicit pointer-method
+/// address. That is the same predicate exact value captures use, so a
+/// reassigned binding stays unresolved instead of naming its first value.
+///
+/// A binding exactly initialized with a method-value selection is stable in
+/// the same sense and denotes that method: `f := c.serve; go f()` reaches the
+/// same bound method `go c.serve()` does. The selection's evaluated receiver
+/// stays in the callable the binding holds, so the call site names the method
+/// and the spawn's receiver travels through the callable's own flow.
+fn collect_indirect_callable_targets(
+    specs: &[ProcedureSpec<'_>],
+    lexical_bindings: &[GoCallableLexicalBindings],
+    capture_mutable_bindings: &HashSet<GoResolvedBinding>,
+    source: &str,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<HashMap<usize, GoIndirectCallableTarget>, GoInventoryPrepassStop> {
+    let mut targets = HashMap::default();
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        try_walk_named_tree_preorder(spec.body, true, |node| {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if node != spec.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() != "call_expression" {
+                return Ok(WalkControl::Continue);
+            }
+            let Some(callee) = node
+                .child_by_field_name("function")
+                .map(transparent_parenthesized_expression)
+                .filter(|callee| is_go_binding_reference_kind(callee.kind()))
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(name) = node_text(source, callee).filter(|name| *name != "_") else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(binding) = resolve_go_binding(
+                specs,
+                lexical_bindings,
+                procedure_index,
+                name,
+                callee.start_byte(),
+                inventory,
+                cancellation,
+            )?
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            if !immutable_captured_binding(lexical_bindings, binding, capture_mutable_bindings) {
+                return Ok(WalkControl::Continue);
+            }
+            let GoResolvedBinding::Local(identity) = binding else {
+                return Ok(WalkControl::Continue);
+            };
+            let callable = lexical_bindings[identity.procedure.index()]
+                .callable_literals
+                .get(&identity)
+                .copied()
+                .map(GoIndirectCallableTarget::Literal)
+                .or_else(|| {
+                    lexical_bindings[identity.procedure.index()]
+                        .callable_methods
+                        .get(&identity)
+                        .copied()
+                        .map(GoIndirectCallableTarget::Method)
+                });
+            if let Some(callable) = callable {
+                targets.insert(callee.id(), callable);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(targets)
+}
+
+fn resolve_go_binding(
+    specs: &[ProcedureSpec<'_>],
+    lexical_bindings: &[GoCallableLexicalBindings],
+    mut procedure_index: usize,
+    name: &str,
+    byte: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<Option<GoResolvedBinding>, GoInventoryPrepassStop> {
+    loop {
+        charge_go_inventory_prepass(inventory, cancellation)?;
+        if let Some(binding) = lexical_bindings[procedure_index].binding_at(name, byte) {
+            return Ok(Some(binding));
+        }
+        let Some(parent) = specs[procedure_index].lexical_parent else {
+            return Ok(None);
+        };
+        procedure_index = parent.index();
+    }
+}
+
+fn go_mutation_targets(node: Node<'_>) -> Vec<Node<'_>> {
+    match node.kind() {
+        "assignment_statement" | "short_var_declaration" | "range_clause" | "receive_statement" => {
+            node.child_by_field_name("left")
+                .map(expression_sequence)
+                .unwrap_or_default()
+        }
+        "inc_statement" | "dec_statement" => runtime_expression_children(node),
+        _ => Vec::new(),
+    }
+}
+
+fn enclosing_binding_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    let mut value = node;
+    loop {
+        let parent = value.parent()?;
+        match parent.kind() {
+            "parenthesized_expression" | "expression_list" => value = parent,
+            "assignment_statement" | "short_var_declaration"
+                if field_matches(parent, "right", value) =>
+            {
+                return parent
+                    .child_by_field_name("left")
+                    .and_then(single_binding_node)
+                    .and_then(|name| nonempty_node_text(source, name))
+                    .map(Box::<str>::from);
+            }
+            "var_spec" if field_matches(parent, "value", value) => {
+                let names = children_by_field_name(parent, "name");
+                return (names.len() == 1)
+                    .then(|| names[0])
+                    .and_then(|name| nonempty_node_text(source, name))
+                    .map(Box::<str>::from);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn single_binding_node(node: Node<'_>) -> Option<Node<'_>> {
+    if is_go_binding_reference_kind(node.kind()) || node.kind() == "field_identifier" {
+        return Some(node);
+    }
+    let children = named_children(node);
+    (children.len() == 1
+        && (is_go_binding_reference_kind(children[0].kind())
+            || children[0].kind() == "field_identifier"))
+        .then(|| children[0])
+}
+
+fn callable_shape<'tree>(
+    node: Node<'tree>,
+    lexical_parent: Option<ProcedureId>,
+) -> Option<(
+    ProcedureKind,
+    DeclarationSegmentKind,
+    Node<'tree>,
+    ProcedureProperties,
+)> {
+    let (kind, segment_kind, body) = match node.kind() {
+        "function_declaration" => (
+            if lexical_parent.is_some() {
+                ProcedureKind::LocalFunction
+            } else {
+                ProcedureKind::Function
+            },
+            if lexical_parent.is_some() {
+                DeclarationSegmentKind::LocalFunction
+            } else {
+                DeclarationSegmentKind::Function
+            },
+            callable_body(node)?,
+        ),
+        "method_declaration" => (
+            ProcedureKind::Method,
+            DeclarationSegmentKind::Method,
+            callable_body(node)?,
+        ),
+        "func_literal" => (
+            ProcedureKind::Lambda,
+            DeclarationSegmentKind::Lambda,
+            callable_body(node)?,
+        ),
+        _ => return None,
+    };
+    Some((
+        kind,
+        segment_kind,
+        body,
+        ProcedureProperties {
+            is_async: false,
+            is_generator: false,
+            is_static: false,
+            is_synthetic: false,
+            invocation: ProcedureInvocationKind::Immediate,
+            ..ProcedureProperties::default()
+        },
+    ))
+}
+
+fn callable_body(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("body")
+}
+
+type GoLoweringError = ProcedureLoweringError;
+
+type EdgeTarget = ControlTarget;
+
+type MemoryPlaceLocation = (MemoryAccessKind, MemoryLocationId, Option<(ValueId, bool)>);
+
+#[derive(Debug, Clone, Copy)]
+enum Work<'tree> {
+    Statement {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: StatementNext,
+        scope: ScopeFrameId,
+        label: Option<Node<'tree>>,
+    },
+    Expression {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    Condition {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    DeferredCall {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    RetainContinuations {
+        cursor: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StatementContinuationId(u32);
+
+impl StatementContinuationId {
+    fn try_from_index(index: usize) -> Result<Self, GoLoweringError> {
+        Ok(Self(u32::try_from(index).map_err(|_| {
+            GoLoweringError::Invalid("too many Go statement continuations".into())
+        })?))
+    }
+
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StatementNext {
+    Target(EdgeTarget),
+    Continuation(StatementContinuationId),
+    FunctionReturn,
+}
+
+impl From<EdgeTarget> for StatementNext {
+    fn from(target: EdgeTarget) -> Self {
+        Self::Target(target)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatementContinuation<'tree> {
+    node: Node<'tree>,
+    next: StatementNext,
+    retention_scope: ScopeFrameId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupRegion<'tree> {
+    id: CleanupRegionId,
+    call: Node<'tree>,
+    outer_scope: ScopeFrameId,
+}
+
+#[derive(Debug, Clone)]
+struct DeferredCapture {
+    receiver: Option<DeferredCaptureValue>,
+    arguments: Box<[DeferredCaptureValue]>,
+}
+
+/// The registration-time value retained for a supported `defer` call.
+///
+/// A deferred call always gets a distinct capture slot. The flow kind records
+/// the narrower cases where the captured value still denotes an existing
+/// runtime identity: a pointer receiver/reference, or a slice/map backing
+/// store. Value receivers and by-value arguments stay language-defined because
+/// their outer value is copied. In particular, the `go.defer_capture` marker
+/// alone is never enough to claim aliasing.
+#[derive(Debug, Clone, Copy)]
+struct DeferredCaptureValue {
+    source: ValueId,
+    target: ValueId,
+    flow_kind: ValueFlowKind,
+}
+
+struct LoweredCallOperands {
+    callee: ValueId,
+    receiver: Option<ValueId>,
+    arguments: Box<[SemanticCallArgument]>,
+    resolution: CallableTargetResolution,
+    selector_resolution: Option<GoSelectorResolution>,
+}
+
+struct GoCallResolutionGapContext<'a> {
+    callee: ValueId,
+    receiver: Option<ValueId>,
+    resolution: &'a CallableTargetResolution,
+    selector_resolution: Option<GoSelectorResolution>,
+}
+
+struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
+    procedure_id: ProcedureId,
+    prepared: &'tree PreparedSyntaxTree,
+    direct_struct_fields: &'facts DirectStructFields,
+    named_type_definitions: &'facts GoNamedTypeDefinitions<'tree>,
+    identity_preserving_assertions: &'procedure HashSet<usize>,
+    reference_identity_preserving_assertions: &'procedure HashSet<usize>,
+    interface_dispatches: &'procedure HashMap<usize, GoInterfaceDispatchProof>,
+    reference_boxing_initializers: &'procedure HashSet<usize>,
+    session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    multi_result_values: HashMap<usize, Box<[ValueId]>>,
+    parameters: HashMap<Box<str>, ValueId>,
+    captured_values: HashMap<Box<str>, ValueId>,
+    captured_bindings: HashMap<GoResolvedBinding, ValueId>,
+    shared_binding_locations: HashMap<ValueId, (MemoryLocationId, MemoryAccessKind)>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    call_exposed_bindings: HashSet<ValueId>,
+    value_types: HashMap<ValueId, GoTypeIdentity>,
+    /// The structured declared type syntax for bindings whose identity is not
+    /// represented by `GoTypeIdentity`, especially interface destinations.
+    value_type_nodes: HashMap<ValueId, Node<'tree>>,
+    /// Exact local aggregate storage semantics retained from structured Go
+    /// syntax. Arrays copy their elements on assignment; slices copy a view of
+    /// one backing store.
+    value_storage_kinds: HashMap<ValueId, GoStorageKind>,
+    /// How indexing one exact local container copies the selected value.
+    /// This remains absent when the element type is unavailable or when an
+    /// assignment loses the producer-authored type relation.
+    index_value_copies: HashMap<ValueId, MemoryValueCopy>,
+    /// Exact named pointer type selected by indexing a local container. This
+    /// is kept separately from the container's own type so a memory store can
+    /// distinguish identity-preserving assignment from an opaque conversion.
+    index_value_types: HashMap<ValueId, GoTypeIdentity>,
+    /// How one element copied through a proven channel type preserves object
+    /// identity. Interfaces, arrays, structs, and unknown element types are
+    /// deliberately absent.
+    channel_payload_copies: HashMap<ValueId, SynchronizationPayloadCopy>,
+    /// Declared pointer element type for channels whose receive result can
+    /// retain a structured Go object type. Kept separate from identity.
+    channel_payload_types: HashMap<ValueId, GoTypeIdentity>,
+    /// Slice lengths and capacities proven directly by structured literals or
+    /// builtin `make` arguments, retained only through exact slice operations.
+    exact_slice_shapes: HashMap<ValueId, ExactSliceShape>,
+    /// Fresh aggregate or converted values whose first binding consumes the
+    /// completed construction rather than copying an already-owned value.
+    fresh_binding_values: HashSet<ValueId>,
+    /// Every `(struct type, field)` declaration this file states, shared by
+    /// every procedure lowered from it.
+    struct_field_anchors: &'tree HashMap<(usize, Box<str>), SourceAnchor>,
+    /// The fallback memory-location identity for a field whose declaration
+    /// this file does not state, interned once per name per procedure so a
+    /// store and a load of the same name still meet.
+    field_locators: HashMap<Box<str>, SemanticLocator>,
+    /// Builtin names this file's lowering treated as predeclared. Package
+    /// scope can extend into sibling files, so workspace queries discharge
+    /// these structured assumptions against the package declaration index.
+    predeclared_builtin_assumptions: HashSet<GoBuiltinCall>,
+    static_locations: HashMap<Box<str>, MemoryLocationId>,
+    /// One occurrence identity per imported package value, interned by its
+    /// qualified spelling.
+    ///
+    /// This adapter declares `no-intrafile-dependencies`, so it must not read
+    /// the declaring file and cannot state the declaration's own identity. The
+    /// occurrence therefore carries a gap, and a workspace-aware consumer
+    /// resolves it; see `add_imported_package_value_gap`.
+    imported_static_locators: HashMap<Box<str>, SemanticLocator>,
+    /// One value per integer-literal magnitude. Go accepts several spellings
+    /// for the same integer, so the cache is keyed by parsed value rather than
+    /// source text.
+    constant_index_values: HashMap<u128, ValueId>,
+    receiver: Option<ValueId>,
+    root_body: Node<'tree>,
+    statement_continuations: Vec<StatementContinuation<'tree>>,
+    continuation_entries: HashMap<(StatementContinuationId, ScopeFrameId), ProgramPointId>,
+    materialized_continuations: HashSet<StatementContinuationId>,
+    return_entries: HashMap<ScopeFrameId, ProgramPointId>,
+    deferred_captures: HashMap<usize, DeferredCapture>,
+    cleanups: Vec<CleanupRegion<'tree>>,
+    named_results: Vec<ValueId>,
+    declared_result_arity: Option<usize>,
+    return_shape_supported: bool,
+    omitted_capture_names: &'procedure [Box<str>],
+    call_exposure_origins: &'procedure [GoCallExposureOrigin],
+    import_bindings: &'imports HashMap<Box<str>, Box<str>>,
+    package_functions: &'imports HashMap<Box<str>, Option<(ProcedureId, Node<'tree>)>>,
+    package_values: &'imports HashSet<Box<str>>,
+    package_value_locators: &'imports HashMap<Box<str>, SemanticLocator>,
+    method_inventory: &'imports GoMethodInventory,
+    procedure_targets: &'imports HashMap<usize, GoProcedureTarget>,
+    /// Callee AST node -> the function literal it provably denotes, proven by
+    /// the prepass for calls through a stable function-valued binding.
+    indirect_callable_targets: &'imports HashMap<usize, GoIndirectCallableTarget>,
+    package_shadowing: PredeclaredShadowing,
+    predeclared_shadowed: PredeclaredShadowing,
+}
+
+#[derive(Debug, Clone)]
+struct LocalBinding {
+    declaration: usize,
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoTypeIdentity {
+    pointer_depth: usize,
+    name: Box<str>,
+    declaration: Option<usize>,
+}
+
+struct GoInferredLocalMetadata {
+    type_identity: Option<GoTypeIdentity>,
+    storage_kind: Option<GoStorageKind>,
+    index_value_copy: MemoryValueCopy,
+    index_value_type: Option<GoTypeIdentity>,
+    channel_payload_copy: Option<SynchronizationPayloadCopy>,
+    channel_payload_type: Option<GoTypeIdentity>,
+}
+
+impl GoInferredLocalMetadata {
+    fn empty() -> Self {
+        Self {
+            type_identity: None,
+            storage_kind: None,
+            index_value_copy: MemoryValueCopy::Unknown,
+            index_value_type: None,
+            channel_payload_copy: None,
+            channel_payload_type: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoStorageKind {
+    Array,
+    /// A struct value holds its fields inline, so assigning one duplicates the
+    /// whole aggregate into independent field storage, exactly like an array.
+    Struct,
+    Slice,
+    Map,
+    /// A channel descriptor is copied by value while retaining the channel
+    /// object it refers to, like a slice or map descriptor.
+    Channel,
+}
+
+impl GoStorageKind {
+    /// Whether a value of this storage holds its contents inline, so that
+    /// assigning, passing, returning, or converting it duplicates the whole
+    /// aggregate instead of sharing a runtime object.
+    const fn is_value_aggregate(self) -> bool {
+        matches!(self, Self::Array | Self::Struct)
+    }
+}
+
+/// The value flow one exact Go by-value aggregate duplication publishes.
+///
+/// Go copies the whole aggregate bitwise, so the destination receives the
+/// source's value in its own storage and no distinct operation runs.
+const GO_AGGREGATE_COPY_FLOW: ValueFlowKind = ValueFlowKind::Transfer(ValueTransfer {
+    kind: TransferKind::AggregateCopy,
+    operation: TransferOperation::None,
+});
+
+/// One structured Go conversion expression.
+///
+/// Go writes a conversion two ways and tree-sitter keeps them apart: an
+/// explicit `type_conversion_expression` carries `type` and `operand` fields,
+/// while a conversion whose target is a plain type name parses as a
+/// `call_expression`. `target` is the conversion's type syntax exactly as
+/// written, including any pointer wrapper, so a pointer conversion cannot be
+/// mistaken for a value-aggregate duplication.
+#[derive(Debug, Clone, Copy)]
+struct GoTypeConversion<'tree> {
+    target: Node<'tree>,
+    operand: Node<'tree>,
+}
+
+type GoBuiltinCall = GoPredeclaredBuiltin;
+
+struct GoBuiltinCallSite<'tree> {
+    node: Node<'tree>,
+    result: ValueId,
+    entry: ProgramPointId,
+    next: EdgeTarget,
+    scope: ScopeFrameId,
+    builtin: GoBuiltinCall,
+}
+
+/// One field an exact struct copy duplicates into the destination's storage.
+#[derive(Debug, Clone)]
+struct GoCopiedField {
+    name: Box<str>,
+    anchor: SourceAnchor,
+    storage: GoCompositeFieldStorage,
+}
+
+/// What this file can state about the contents one by-value copy duplicates.
+#[derive(Debug)]
+enum GoAggregateContents {
+    /// Every field of the copied struct, with its proven storage kind.
+    Struct(Vec<GoCopiedField>),
+    /// An array copy, whose element identity the indexed memory model already
+    /// carries and whose element snapshot belongs to issue #2831.
+    ArrayElements,
+    /// The aggregate's layout is not proven here, for this exact reason.
+    Unproven(Box<str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactSliceShape {
+    length: u128,
+    capacity: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactAppendBacking {
+    Retained {
+        source: ValueId,
+        append_start: u128,
+        result_shape: ExactSliceShape,
+    },
+    Replaced {
+        append_start: u128,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GoEvaluationTraits {
+    runtime_read: bool,
+    call_or_receive: bool,
+    may_abort: bool,
+    ordered_completion: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoSelectorResolution {
+    Package,
+    Field,
+    Method {
+        pointer_receiver: bool,
+        target: ProcedureId,
+    },
+    InterfaceMethod {
+        pointer_receiver: bool,
+        target: ProcedureId,
+    },
+    Unknown,
+}
+
+fn go_same_file_selector_resolution(
+    receiver_declaration: Option<usize>,
+    field_name: Option<&str>,
+    direct_struct_fields: &DirectStructFields,
+    method_inventory: &GoMethodInventory,
+) -> GoSelectorResolution {
+    let (Some(declaration), Some(name)) = (receiver_declaration, field_name) else {
+        return GoSelectorResolution::Unknown;
+    };
+    if direct_struct_fields
+        .get(&declaration)
+        .is_some_and(|fields| fields.contains(name))
+    {
+        return GoSelectorResolution::Field;
+    }
+    method_inventory
+        .get(&(declaration, name.into()))
+        .map(|method| GoSelectorResolution::Method {
+            pointer_receiver: method.pointer_receiver,
+            target: method.procedure,
+        })
+        .unwrap_or(GoSelectorResolution::Unknown)
+}
+
+impl GoEvaluationTraits {
+    fn merge(&mut self, other: Self) {
+        self.runtime_read |= other.runtime_read;
+        self.call_or_receive |= other.call_or_receive;
+        self.may_abort |= other.may_abort;
+        self.ordered_completion = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GoLiteralNestingStep {
+    Element,
+    Key,
+    Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoLiteralAggregateKind {
+    Map,
+    NonMap,
+    Unknown,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_procedure<'tree>(
+    prepared: &'tree PreparedSyntaxTree,
+    struct_field_anchors: &'tree HashMap<(usize, Box<str>), SourceAnchor>,
+    spec: &ProcedureSpec<'tree>,
+    package_shadowing: PredeclaredShadowing,
+    package_values: &HashSet<Box<str>>,
+    package_value_locators: &HashMap<Box<str>, SemanticLocator>,
+    direct_struct_fields: &DirectStructFields,
+    named_type_definitions: &GoNamedTypeDefinitions<'tree>,
+    import_bindings: &HashMap<Box<str>, Box<str>>,
+    package_functions: &HashMap<Box<str>, Option<(ProcedureId, Node<'tree>)>>,
+    method_inventory: &GoMethodInventory,
+    procedure_targets: &HashMap<usize, GoProcedureTarget>,
+    indirect_callable_targets: &HashMap<usize, GoIndirectCallableTarget>,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<(ProcedureSemanticsParts, SemanticWork), GoLoweringError> {
+    debug_assert!(
+        spec.omitted_capture_names
+            .windows(2)
+            .all(|names| names[0] <= names[1]),
+        "Go omitted capture names are kept in lexical-name order"
+    );
+    let mut parts = ProcedureSemanticsParts::new(
+        spec.id,
+        spec.locator.clone(),
+        spec.kind,
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
+    );
+    parts.lexical_parent = spec.lexical_parent;
+    parts.properties = spec.properties;
+    let ProcedureLoweringStart {
+        mut builder,
+        session,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        function_scope,
+    } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
+    let mut context = LoweringContext {
+        identity_preserving_assertions: &spec.identity_preserving_assertions,
+        reference_identity_preserving_assertions: &spec.reference_identity_preserving_assertions,
+        interface_dispatches: &spec.interface_dispatches,
+        reference_boxing_initializers: &spec.reference_boxing_initializers,
+        procedure_id: spec.id,
+        prepared,
+        direct_struct_fields,
+        named_type_definitions,
+        session,
+        expression_values: HashMap::default(),
+        multi_result_values: HashMap::default(),
+        parameters: HashMap::default(),
+        captured_values: HashMap::default(),
+        captured_bindings: HashMap::default(),
+        shared_binding_locations: HashMap::default(),
+        locals: HashMap::default(),
+        call_exposed_bindings: HashSet::default(),
+        value_types: HashMap::default(),
+        value_type_nodes: HashMap::default(),
+        value_storage_kinds: HashMap::default(),
+        index_value_copies: HashMap::default(),
+        index_value_types: HashMap::default(),
+        channel_payload_copies: HashMap::default(),
+        channel_payload_types: HashMap::default(),
+        exact_slice_shapes: HashMap::default(),
+        fresh_binding_values: HashSet::default(),
+        struct_field_anchors,
+        field_locators: HashMap::default(),
+        predeclared_builtin_assumptions: HashSet::default(),
+        static_locations: HashMap::default(),
+        imported_static_locators: HashMap::default(),
+        constant_index_values: HashMap::default(),
+        receiver: None,
+        root_body: spec.body,
+        statement_continuations: Vec::new(),
+        continuation_entries: HashMap::default(),
+        materialized_continuations: HashSet::default(),
+        return_entries: HashMap::default(),
+        deferred_captures: HashMap::default(),
+        cleanups: Vec::new(),
+        named_results: Vec::new(),
+        declared_result_arity: go_callable_result_types(spec.callable).map(|results| results.len()),
+        return_shape_supported: spec
+            .callable
+            .child_by_field_name("result")
+            .is_some_and(|result| result.kind() != "parameter_list"),
+        omitted_capture_names: &spec.omitted_capture_names,
+        call_exposure_origins: &spec.call_exposure_origins,
+        import_bindings,
+        package_functions,
+        package_values,
+        package_value_locators,
+        method_inventory,
+        procedure_targets,
+        indirect_callable_targets,
+        package_shadowing,
+        // Exact and omitted capture inventories below distinguish the
+        // enclosing bindings a nested literal actually sees. Keep package and
+        // named-result shadowing here; treating every predeclared name as
+        // shadowed would discard valid builtin constants in every closure.
+        predeclared_shadowed: package_shadowing.merged(spec.result_shadowing),
+    };
+    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    context.emit_capture_inputs(&mut builder, entry, spec)?;
+    context.emit_named_result_bindings(&mut builder, spec.callable, spec.body)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
+    context.emit_shared_binding_cells(&mut builder, entry, spec)?;
+    context.collect_call_exposed_bindings(&builder)?;
+
+    if spec.lexical_parent.is_some()
+        && spec.captures.is_empty()
+        && !spec.omitted_capture_names.is_empty()
+    {
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "required lexical captures are absent from the Go function literal's binding inventory",
+        )?;
+    }
+    if spec
+        .callable
+        .child_by_field_name("type_parameters")
+        .is_some()
+        || go_receiver_uses_generic_type(spec.callable)
+    {
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Values,
+            SemanticGapKind::Unsupported,
+            "generic Go callable and receiver type substitutions are not yet represented",
+        )?;
+    }
+
+    let body_entry = context
+        .session
+        .add_node_point(&mut builder, spec.body, Vec::new())?;
+    let body_work = Work::Statement {
+        node: spec.body,
+        entry: body_entry,
+        next: StatementNext::FunctionReturn,
+        scope: function_scope,
+        label: None,
+    };
+    let mut pending = vec![Work::RetainContinuations { cursor: 0 }, body_work];
+    context
+        .session
+        .add_target_edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+
+    let (mut parts, mut work) = drive_and_finish_procedure(
+        builder,
+        pending.drain(..).rev(),
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| context.step(builder, work, stack),
+    )?;
+    let pointer_rows = add_go_pointer_facts(&mut parts);
+    work = work.conservative_add(SemanticWork {
+        nested_entries: pointer_rows,
+        ..SemanticWork::default()
+    });
+    parts.go_predeclared_builtin_assumptions = context
+        .predeclared_builtin_assumptions
+        .into_iter()
+        .collect();
+    parts
+        .go_predeclared_builtin_assumptions
+        .sort_unstable_by_key(|builtin| builtin.name());
+    Ok((parts, work))
+}
+
+/// Project Go's already-structured address creation and dereference events
+/// into the common pointer provenance contract.
+fn add_go_pointer_facts(parts: &mut ProcedureSemanticsParts) -> usize {
+    let initial_origin_count = parts.pointer_origins.len();
+    let values = parts
+        .values
+        .iter()
+        .map(|value| (value.id, value))
+        .collect::<HashMap<_, _>>();
+    let mut origins_by_place = HashMap::<SemanticPlace, PointerOriginId>::default();
+    let mut rows = 0usize;
+
+    for point in &parts.points {
+        for event in &point.events {
+            let SemanticEffect::Assignment { target, value } = event.effect else {
+                continue;
+            };
+            if !matches!(
+                values.get(&target).map(|value| &value.kind),
+                Some(SemanticValueKind::Address)
+            ) {
+                continue;
+            }
+            if !matches!(
+                values.get(&value).map(|value| &value.kind),
+                Some(
+                    SemanticValueKind::Local
+                        | SemanticValueKind::Parameter { .. }
+                        | SemanticValueKind::Receiver { .. }
+                )
+            ) {
+                continue;
+            }
+            let binding = values[&value];
+            let binding_locator = &parts.source_mappings[binding.source.index()].locator;
+            let place = SemanticPlace::LocalBinding(SemanticLocator::new(
+                binding_locator.mount(),
+                binding_locator.path().clone(),
+                binding_locator.language(),
+                binding_locator.declaration().clone(),
+                SemanticRole::Value,
+                binding_locator.anchor(),
+            ));
+            let origin = *origins_by_place.entry(place.clone()).or_insert_with(|| {
+                let id = PointerOriginId::try_from_index(parts.pointer_origins.len())
+                    .expect("pointer origin IDs fit the validated dense-ID domain");
+                parts.pointer_origins.push(PointerOrigin {
+                    id,
+                    point: point.id,
+                    kind: PointerOriginKind::StackPlace { place },
+                    byte_extent: None,
+                    source: event.source,
+                    evidence: event.evidence,
+                });
+                id
+            });
+            parts.pointer_aliases.push(PointerAlias {
+                point: point.id,
+                pointer: target,
+                origin,
+                byte_offset: PointerByteOffset::Exact(0),
+                strength: PointerRelationStrength::Must,
+                source: event.source,
+                evidence: event.evidence,
+            });
+            rows = rows.saturating_add(1);
+        }
+    }
+
+    for point in &parts.points {
+        for event in &point.events {
+            let (location, pointer_access_kind) = match event.effect {
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Dereference,
+                    location,
+                    ..
+                } => (location, PointerAccessKind::Read),
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Dereference,
+                    location,
+                    ..
+                } => (location, PointerAccessKind::Write),
+                _ => continue,
+            };
+            let Some(MemoryLocationKind::Dereference { address }) = parts
+                .memory_locations
+                .get(location.index())
+                .map(|row| &row.kind)
+            else {
+                unreachable!("Go dereference effects name dereference locations")
+            };
+            parts.pointer_accesses.push(PointerAccess {
+                point: point.id,
+                pointer: *address,
+                kind: pointer_access_kind,
+                width: PointerAccessWidth::Unknown,
+                source: event.source,
+                evidence: event.evidence,
+            });
+            rows = rows.saturating_add(1);
+        }
+    }
+    rows.saturating_add(
+        parts
+            .pointer_origins
+            .len()
+            .saturating_sub(initial_origin_count),
+    )
+}
+
+impl<'tree, 'facts, 'targets, 'imports, 'procedure>
+    LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure>
+{
+    fn emit_capture_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(lexical_parent) = spec.lexical_parent else {
+            return Ok(());
+        };
+        for (index, capture) in spec.captures.iter().enumerate() {
+            let metadata = self.session.add_value_mapping(builder, capture.reference)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            let location = self.session.add_memory_location(
+                builder,
+                entry,
+                MemoryLocationKind::Capture {
+                    lexical_parent,
+                    binding: Some(value),
+                },
+            )?;
+            let expected = MemoryLocationId::new(
+                u32::try_from(index)
+                    .map_err(|_| GoLoweringError::Invalid("too many Go captures".into()))?,
+            );
+            if location != expected {
+                return Err(GoLoweringError::Invalid(format!(
+                    "Go capture destination must be {expected}, allocated {location}"
+                )));
+            }
+            if capture.storage == GoCaptureStorage::Value {
+                self.append_effect(
+                    builder,
+                    entry,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Capture,
+                        location,
+                        result: value,
+                    },
+                )?;
+            } else {
+                self.shared_binding_locations
+                    .insert(value, (location, MemoryAccessKind::Capture));
+                // This cell belongs to an enclosing invocation. Calls can
+                // observe writes from its owner or another capturing closure,
+                // so its read order is not private to this procedure.
+                self.call_exposed_bindings.insert(value);
+            }
+            if let Some(storage) = capture.value_storage {
+                self.value_storage_kinds.insert(value, storage);
+            }
+            if capture.index_value_copy != MemoryValueCopy::Unknown {
+                self.index_value_copies
+                    .insert(value, capture.index_value_copy);
+            }
+            if let Some(identity) = &capture.index_value_type {
+                self.index_value_types.insert(value, identity.clone());
+            }
+            if let Some(copy) = capture.channel_payload_copy {
+                self.channel_payload_copies.insert(value, copy);
+            }
+            if let Some(payload_type) = &capture.channel_payload_type {
+                self.channel_payload_types
+                    .insert(value, payload_type.clone());
+            }
+            if let Some(identity) = &capture.value_type {
+                // A capture retains its binding's static type even when its
+                // value lives in a mutable cell. Identity still comes from
+                // the capture/assignment facts, not from this type alone.
+                self.value_types.insert(value, identity.clone());
+            }
+            self.captured_values.insert(capture.name.clone(), value);
+            self.captured_bindings.insert(capture.binding, value);
+        }
+        Ok(())
+    }
+
+    fn emit_shared_binding_cells(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        for shared in &spec.shared_bindings {
+            let value = self
+                .owned_binding_value(shared.name.as_ref(), shared.binding)
+                .ok_or_else(|| {
+                    GoLoweringError::Invalid(format!(
+                        "shared Go binding `{}` has no owner-local value",
+                        shared.name
+                    ))
+                })?;
+            let location = self.session.add_memory_location(
+                builder,
+                entry,
+                MemoryLocationKind::LexicalCell { binding: value },
+            )?;
+            let previous = self
+                .shared_binding_locations
+                .insert(value, (location, MemoryAccessKind::LexicalCell));
+            debug_assert!(previous.is_none(), "one Go binding has one shared cell");
+            // Captured procedure inputs already have a value on entry. Their
+            // shared cell must receive that value before the body can read it.
+            if self
+                .parameters
+                .values()
+                .any(|parameter| *parameter == value)
+                || self.receiver == Some(value)
+            {
+                self.append_effect(
+                    builder,
+                    entry,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::LexicalCell,
+                        location,
+                        value,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let layout =
+            formal_parameter_slots_for_owner(Language::Go, callable, self.prepared.source())
+                .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(GoLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let declaration = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let mapping_node = slot
+                .names
+                .first()
+                .and_then(|slot_name| {
+                    children_by_field_name(declaration, "name")
+                        .into_iter()
+                        .find(|name| node_text(self.prepared.source(), *name) == Some(slot_name))
+                })
+                .unwrap_or(declaration);
+            let metadata = self.session.add_value_mapping(builder, mapping_node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver { dispatch: true },
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                        name: parameter_name,
+                        passing_mode,
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    GoLoweringError::Invalid("too many Go formal parameters".into())
+                })?;
+                value
+            };
+            if let Some(type_node) = declaration.child_by_field_name("type") {
+                self.value_type_nodes.insert(value, type_node);
+                if let Some(identity) = self.type_identity(type_node, declaration.start_byte()) {
+                    self.value_types.insert(value, identity);
+                }
+                if let Some(storage) = self.type_storage_kind(type_node, declaration.start_byte()) {
+                    self.value_storage_kinds.insert(value, storage);
+                }
+                let index_value_copy = go_index_value_copy_from_type(
+                    type_node,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    declaration.start_byte(),
+                );
+                if index_value_copy != MemoryValueCopy::Unknown {
+                    self.index_value_copies.insert(value, index_value_copy);
+                }
+                if let Some(identity) =
+                    self.index_value_type_from_type(type_node, declaration.start_byte())
+                {
+                    self.index_value_types.insert(value, identity);
+                }
+                if let Some(copy) = go_channel_payload_copy_from_type(
+                    type_node,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    declaration.start_byte(),
+                ) {
+                    self.channel_payload_copies.insert(value, copy);
+                }
+                if let Some(payload_type) =
+                    self.channel_payload_type_from_type(type_node, declaration.start_byte())
+                {
+                    self.channel_payload_types.insert(value, payload_type);
+                }
+            }
+            for name in slot.names {
+                if name != "_" {
+                    self.parameters.insert(name.into_boxed_str(), value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(GoLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node != body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            match node.kind() {
+                "var_spec" | "const_spec" => self.preindex_value_spec(builder, node)?,
+                "short_var_declaration" => self.preindex_short_declaration(builder, node)?,
+                "range_clause" if direct_child_kind(node, ":=") => {
+                    self.preindex_range_declaration(builder, node)?;
+                }
+                "receive_statement" if direct_child_kind(node, ":=") => {
+                    self.preindex_receive_declaration(builder, node)?;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn emit_named_result_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+        body: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(results) = callable
+            .child_by_field_name("result")
+            .filter(|result| result.kind() == "parameter_list")
+        else {
+            return Ok(());
+        };
+        for declaration in named_children(results)
+            .into_iter()
+            .filter(|node| node.kind() == "parameter_declaration")
+        {
+            let identity = declaration
+                .child_by_field_name("type")
+                .and_then(|node| self.type_identity(node, declaration.start_byte()));
+            let storage = declaration
+                .child_by_field_name("type")
+                .and_then(|node| self.type_storage_kind(node, declaration.start_byte()));
+            let index_value_copy =
+                declaration
+                    .child_by_field_name("type")
+                    .map_or(MemoryValueCopy::Unknown, |node| {
+                        go_index_value_copy_from_type(
+                            node,
+                            self.prepared.source(),
+                            self.named_type_definitions,
+                            declaration.start_byte(),
+                        )
+                    });
+            let index_value_type = declaration
+                .child_by_field_name("type")
+                .and_then(|node| self.index_value_type_from_type(node, declaration.start_byte()));
+            let channel_payload_copy = declaration.child_by_field_name("type").and_then(|node| {
+                self.channel_payload_copy_from_type(node, declaration.start_byte())
+            });
+            let channel_payload_type = declaration.child_by_field_name("type").and_then(|node| {
+                self.channel_payload_type_from_type(node, declaration.start_byte())
+            });
+            for name_node in children_by_field_name(declaration, "name") {
+                let Some(name) = node_text(self.prepared.source(), name_node) else {
+                    continue;
+                };
+                if name == "_" {
+                    continue;
+                }
+                let metadata = self.session.add_value_mapping(builder, name_node)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                if let Some(type_node) = declaration.child_by_field_name("type") {
+                    self.value_type_nodes.insert(value, type_node);
+                }
+                if let Some(identity) = identity.clone() {
+                    self.value_types.insert(value, identity);
+                }
+                if let Some(storage) = storage {
+                    self.value_storage_kinds.insert(value, storage);
+                }
+                if index_value_copy != MemoryValueCopy::Unknown {
+                    self.index_value_copies.insert(value, index_value_copy);
+                }
+                if let Some(identity) = index_value_type.clone() {
+                    self.index_value_types.insert(value, identity);
+                }
+                if let Some(copy) = channel_payload_copy {
+                    self.channel_payload_copies.insert(value, copy);
+                }
+                if let Some(payload_type) = channel_payload_type.clone() {
+                    self.channel_payload_types.insert(value, payload_type);
+                }
+                self.named_results.push(value);
+                self.locals
+                    .entry(name.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration: name_node.id(),
+                        declaration_start: name_node.start_byte(),
+                        visible_from: body.start_byte(),
+                        scope_start: body.start_byte(),
+                        scope_end: body.end_byte(),
+                        value,
+                    });
+            }
+        }
+        Ok(())
+    }
+
+    fn inferred_local_metadata(
+        &self,
+        value: Option<Node<'tree>>,
+        byte: usize,
+    ) -> GoInferredLocalMetadata {
+        let Some(value) = value else {
+            return GoInferredLocalMetadata::empty();
+        };
+        GoInferredLocalMetadata {
+            type_identity: self.expression_type_identity(value, byte),
+            storage_kind: self.expression_storage_kind(value, byte),
+            index_value_copy: self.expression_index_value_copy(value, byte),
+            index_value_type: self.expression_index_value_type(value, byte),
+            channel_payload_copy: self.expression_channel_payload_copy(value, byte),
+            channel_payload_type: self.expression_channel_payload_type(value, byte),
+        }
+    }
+
+    fn preindex_value_spec(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        spec: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let names = children_by_field_name(spec, "name");
+        if names.is_empty() {
+            return Ok(());
+        }
+        let values = spec
+            .child_by_field_name("value")
+            .map(expression_sequence)
+            .unwrap_or_default();
+        let declared_type_node = spec.child_by_field_name("type");
+        let declared_type =
+            declared_type_node.and_then(|node| self.type_identity(node, spec.start_byte()));
+        let declared_storage =
+            declared_type_node.and_then(|node| self.type_storage_kind(node, spec.start_byte()));
+        let declared_index_value_copy =
+            declared_type_node.map_or(MemoryValueCopy::Unknown, |node| {
+                go_index_value_copy_from_type(
+                    node,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    spec.start_byte(),
+                )
+            });
+        let declared_index_value_type = declared_type_node
+            .and_then(|node| self.index_value_type_from_type(node, spec.start_byte()));
+        let declared_channel_payload_copy = declared_type_node
+            .and_then(|node| self.channel_payload_copy_from_type(node, spec.start_byte()));
+        let declared_channel_payload_type = declared_type_node
+            .and_then(|node| self.channel_payload_type_from_type(node, spec.start_byte()));
+        let infer_from_initializer = declared_type_node.is_none();
+        let name_count = names.len();
+        let single_shared_value =
+            values.len() == 1 && !go_declaration_is_comma_ok_assertion(name_count, &values);
+        for (index, name) in names.into_iter().enumerate() {
+            let declared_value = go_declaration_value_for_index(name_count, &values, index);
+            let inferred = if infer_from_initializer {
+                self.inferred_local_metadata(declared_value, spec.start_byte())
+            } else {
+                GoInferredLocalMetadata::empty()
+            };
+            let inferred_type = if single_shared_value && infer_from_initializer {
+                self.expression_type_identity(values[0], spec.start_byte())
+            } else {
+                inferred.type_identity.clone()
+            };
+            self.preindex_local(
+                builder,
+                name,
+                spec,
+                declared_type.clone().or(inferred_type),
+                declared_storage.or(inferred.storage_kind),
+                if declared_index_value_copy != MemoryValueCopy::Unknown {
+                    declared_index_value_copy
+                } else {
+                    inferred.index_value_copy
+                },
+                declared_index_value_type
+                    .clone()
+                    .or(inferred.index_value_type),
+                declared_channel_payload_copy.or(inferred.channel_payload_copy),
+                declared_channel_payload_type
+                    .clone()
+                    .or(inferred.channel_payload_type),
+            )?;
+            if infer_from_initializer {
+                self.record_inferred_function_value_type(name, spec.start_byte(), declared_value);
+            }
+        }
+        Ok(())
+    }
+
+    fn preindex_short_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(left) = declaration.child_by_field_name("left") else {
+            return Ok(());
+        };
+        let Some(right) = declaration.child_by_field_name("right") else {
+            return Ok(());
+        };
+        let names = expression_sequence(left);
+        let values = expression_sequence(right);
+        let name_count = names.len();
+        for (index, name) in names.into_iter().enumerate() {
+            if !is_go_binding_reference_kind(name.kind()) {
+                continue;
+            }
+            let declared_value = go_declaration_value_for_index(name_count, &values, index);
+            let inferred = self.inferred_local_metadata(declared_value, declaration.start_byte());
+            self.preindex_local(
+                builder,
+                name,
+                declaration,
+                inferred.type_identity,
+                inferred.storage_kind,
+                inferred.index_value_copy,
+                inferred.index_value_type,
+                inferred.channel_payload_copy,
+                inferred.channel_payload_type,
+            )?;
+            self.record_inferred_function_value_type(
+                name,
+                declaration.start_byte(),
+                declared_value,
+            );
+            if let Some(source) = declared_value
+                && let Some(shape) = self.expression_slice_shape(source, declaration.start_byte())
+                && let Some(target) = self.local_declaration_value(
+                    node_text(self.prepared.source(), name).unwrap_or_default(),
+                    name.start_byte(),
+                )
+            {
+                self.exact_slice_shapes.insert(target, shape);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_inferred_function_value_type(
+        &mut self,
+        name_node: Node<'tree>,
+        declaration_start: usize,
+        source: Option<Node<'tree>>,
+    ) {
+        let Some(source) =
+            source.filter(|source| matches!(source.kind(), "identifier" | "selector_expression"))
+        else {
+            return;
+        };
+        let Some(name) = node_text(self.prepared.source(), name_node).filter(|name| *name != "_")
+        else {
+            return;
+        };
+        let Some(type_node) = self
+            .expression_type_node(source, source.start_byte())
+            .filter(|type_node| {
+                self.file_underlying_type(*type_node, declaration_start)
+                    .is_some_and(|underlying| underlying.kind() == "function_type")
+            })
+        else {
+            return;
+        };
+        if let Some(value) = self.local_declaration_value(name, declaration_start) {
+            self.value_type_nodes.insert(value, type_node);
+        }
+    }
+
+    fn preindex_range_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        self.preindex_local_declaration_bindings(builder, declaration, None)
+    }
+
+    fn preindex_receive_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        let payload_type = declaration
+            .child_by_field_name("right")
+            .filter(|receive| {
+                receive.kind() == "unary_expression" && unary_operator_kind(*receive) == Some("<-")
+            })
+            .and_then(|receive| receive.child_by_field_name("operand"))
+            .and_then(|channel| {
+                self.expression_channel_payload_type(channel, declaration.start_byte())
+            });
+        self.preindex_local_declaration_bindings(builder, declaration, payload_type)
+    }
+
+    fn preindex_local_declaration_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        declaration: Node<'tree>,
+        first_binding_type: Option<GoTypeIdentity>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(left) = declaration.child_by_field_name("left") else {
+            return Ok(());
+        };
+        for (index, name) in expression_sequence(left).into_iter().enumerate() {
+            if is_go_binding_reference_kind(name.kind()) {
+                self.preindex_local(
+                    builder,
+                    name,
+                    declaration,
+                    (index == 0).then(|| first_binding_type.clone()).flatten(),
+                    None,
+                    MemoryValueCopy::Unknown,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preindex_local(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        name_node: Node<'tree>,
+        declaration: Node<'tree>,
+        identity: Option<GoTypeIdentity>,
+        storage: Option<GoStorageKind>,
+        index_value_copy: MemoryValueCopy,
+        index_value_type: Option<GoTypeIdentity>,
+        channel_payload_copy: Option<SynchronizationPayloadCopy>,
+        channel_payload_type: Option<GoTypeIdentity>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), name_node) else {
+            return Ok(());
+        };
+        if name == "_" {
+            return Ok(());
+        }
+        let Some((scope_start, scope_end)) = go_local_scope(declaration) else {
+            return Ok(());
+        };
+        if declaration.kind() == "short_var_declaration"
+            && (self
+                .local_in_exact_scope(name, declaration.start_byte(), scope_start, scope_end)
+                .is_some()
+                || (self.parameters.contains_key(name)
+                    && scope_start == self.root_body.start_byte()
+                    && scope_end == self.root_body.end_byte()))
+        {
+            return Ok(());
+        }
+        let metadata = self.session.add_value_mapping(builder, name_node)?;
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        if let Some(type_node) = declaration.child_by_field_name("type") {
+            self.value_type_nodes.insert(value, type_node);
+        }
+        if let Some(identity) = identity {
+            self.value_types.insert(value, identity);
+        }
+        if let Some(storage) = storage {
+            self.value_storage_kinds.insert(value, storage);
+        }
+        if index_value_copy != MemoryValueCopy::Unknown {
+            self.index_value_copies.insert(value, index_value_copy);
+        }
+        if let Some(identity) = index_value_type {
+            self.index_value_types.insert(value, identity);
+        }
+        if let Some(copy) = channel_payload_copy {
+            self.channel_payload_copies.insert(value, copy);
+        }
+        if let Some(payload_type) = channel_payload_type {
+            self.channel_payload_types.insert(value, payload_type);
+        }
+        self.locals
+            .entry(name.into())
+            .or_default()
+            .push(LocalBinding {
+                declaration: name_node.id(),
+                declaration_start: name_node.start_byte(),
+                visible_from: declaration.end_byte(),
+                scope_start,
+                scope_end,
+                value,
+            });
+        Ok(())
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        visible_go_binding(self.locals.get(name)?, byte, |binding| {
+            (binding.visible_from, binding.scope_start, binding.scope_end)
+        })
+        .map(|binding| binding.value)
+    }
+
+    fn local_in_exact_scope(
+        &self,
+        name: &str,
+        byte: usize,
+        scope_start: usize,
+        scope_end: usize,
+    ) -> Option<ValueId> {
+        go_binding_in_exact_scope(
+            self.locals.get(name)?,
+            byte,
+            scope_start,
+            scope_end,
+            |binding| (binding.visible_from, binding.scope_start, binding.scope_end),
+        )
+        .map(|binding| binding.value)
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        brokk_bifrost_analysis::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            declaration_start,
+        )
+    }
+
+    fn local_identity_value(&self, name: &str, declaration: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .find_map(|binding| (binding.declaration == declaration).then_some(binding.value))
+    }
+
+    fn binding_value(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.local_at(name, byte)
+            .or_else(|| self.captured_values.get(name).copied())
+            .or_else(|| self.parameters.get(name).copied())
+    }
+
+    fn owned_binding_value(&self, name: &str, binding: GoResolvedBinding) -> Option<ValueId> {
+        match binding {
+            GoResolvedBinding::Local(identity) if identity.procedure == self.procedure_id => {
+                self.local_identity_value(name, identity.declaration)
+            }
+            GoResolvedBinding::Formal(identity) if identity.procedure == self.procedure_id => self
+                .local_identity_value(name, identity.declaration)
+                .or_else(|| self.parameters.get(name).copied()),
+            GoResolvedBinding::Local(_) | GoResolvedBinding::Formal(_) => None,
+        }
+    }
+
+    fn captured_or_owned_binding_value(
+        &self,
+        name: &str,
+        binding: GoResolvedBinding,
+    ) -> Option<ValueId> {
+        self.owned_binding_value(name, binding)
+            .or_else(|| self.captured_bindings.get(&binding).copied())
+    }
+
+    fn binding_value_for_origin(&self, origin: &GoCallExposureOrigin) -> Option<ValueId> {
+        self.captured_or_owned_binding_value(origin.name.as_ref(), origin.binding)
+    }
+
+    /// Bindings whose stored value an otherwise unrelated call can observe or
+    /// change. An exact local, parameter, or value capture is private until
+    /// its address escapes, a descendant closure actually writes it, or Go
+    /// implicitly takes its address for a pointer-receiver method value.
+    /// Package values remain shared because this procedure does not own their
+    /// storage.
+    fn collect_call_exposed_bindings(
+        &mut self,
+        builder: &ProcedureCfgBuilder,
+    ) -> Result<(), GoLoweringError> {
+        if self.session.cancellation().is_cancelled() {
+            return Err(GoLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let exposed = self
+            .call_exposure_origins
+            .iter()
+            .filter_map(|origin| self.binding_value_for_origin(origin))
+            .collect::<Vec<_>>();
+        self.call_exposed_bindings.extend(exposed);
+
+        let mut stack = vec![self.root_body];
+        while let Some(node) = stack.pop() {
+            if self.session.cancellation().is_cancelled() {
+                return Err(GoLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node != self.root_body && is_go_callable_kind(node.kind()) {
+                continue;
+            }
+
+            if node.kind() == "unary_expression"
+                && unary_operator_kind(node) == Some("&")
+                && let Some(operand) = node.child_by_field_name("operand")
+                && let Some(binding) = self.place_root_binding(operand)
+            {
+                self.call_exposed_bindings.insert(binding);
+            }
+            if node.kind() == "selector_expression"
+                && let Some(operand) = node.child_by_field_name("operand")
+            {
+                match self.selector_resolution(node) {
+                    GoSelectorResolution::Method {
+                        pointer_receiver: true,
+                        ..
+                    } if self
+                        .expression_type_identity(operand, node.start_byte())
+                        .is_some_and(|identity| identity.pointer_depth == 0) =>
+                    {
+                        if let Some(binding) = self.place_root_binding(operand) {
+                            // Selecting a pointer-receiver method from an
+                            // addressable value saves `&value`, including when
+                            // the method value is stored and called later.
+                            self.call_exposed_bindings.insert(binding);
+                        }
+                    }
+                    GoSelectorResolution::Unknown
+                        if node.parent().is_some_and(|parent| {
+                            parent.kind() == "call_expression"
+                                && field_matches(parent, "function", node)
+                        }) =>
+                    {
+                        if let Some(binding) = self.place_root_binding(operand) {
+                            // An unresolved direct method call may still use a
+                            // pointer receiver. Keep only that unknown case
+                            // conservative; exact fields and value methods do
+                            // not expose the receiver cell.
+                            self.call_exposed_bindings.insert(binding);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            stack.extend(named_children(node).into_iter().rev());
+        }
+        Ok(())
+    }
+
+    fn place_root_binding(&self, node: Node<'tree>) -> Option<ValueId> {
+        let root = go_place_root_identifier(node)?;
+        let name = node_text(self.prepared.source(), root)?;
+        self.binding_value(name, root.start_byte())
+    }
+
+    fn selector_resolution(&self, selector: Node<'tree>) -> GoSelectorResolution {
+        if self.is_import_qualified_selector(selector) {
+            return GoSelectorResolution::Package;
+        }
+        if let Some(proof) = self.interface_dispatches.get(&selector.id()) {
+            return GoSelectorResolution::InterfaceMethod {
+                pointer_receiver: proof.receiver_type.pointer_depth > 0,
+                target: proof.target,
+            };
+        }
+        let receiver_declaration = selector
+            .child_by_field_name("operand")
+            .and_then(|operand| self.expression_type_identity(operand, selector.start_byte()))
+            .and_then(|identity| identity.declaration);
+        let field_name = selector
+            .child_by_field_name("field")
+            .and_then(|field| nonempty_node_text(self.prepared.source(), field));
+        go_same_file_selector_resolution(
+            receiver_declaration,
+            field_name,
+            self.direct_struct_fields,
+            self.method_inventory,
+        )
+    }
+
+    fn package_function_target(&self, node: Node<'tree>) -> Option<ProcedureId> {
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), node)?;
+        if self.predeclared_shadowed.shadows(name)
+            || self.package_shadowing.shadows(name)
+            || self.binding_value(name, node.start_byte()).is_some()
+            || self
+                .omitted_capture_names
+                .iter()
+                .any(|captured| captured.as_ref() == name)
+            || self.package_values.contains(name)
+            || self.import_bindings.contains_key(name)
+            || visible_go_named_type(self.named_type_definitions, name, node.start_byte()).is_some()
+        {
+            return None;
+        }
+        self.package_functions
+            .get(name)
+            .copied()
+            .flatten()
+            .map(|(id, _)| id)
+    }
+
+    fn identifier_is_shared_or_call_exposed(&self, node: Node<'tree>) -> bool {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return true;
+        };
+        self.binding_value(name, node.start_byte()).map_or_else(
+            || !self.package_functions.contains_key(name),
+            |binding| self.call_exposed_bindings.contains(&binding),
+        )
+    }
+
+    fn assignment_target_evaluation_nodes(&self, target: Node<'tree>) -> Vec<Node<'tree>> {
+        let mut result = Vec::new();
+        let mut stack = vec![target];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "selector_expression" => {
+                    if let Some(operand) = node.child_by_field_name("operand") {
+                        result.push(operand);
+                    }
+                }
+                "index_expression" => {
+                    result.extend(runtime_expression_children(node));
+                }
+                "unary_expression" if unary_operator_kind(node) == Some("*") => {
+                    if let Some(operand) = node.child_by_field_name("operand") {
+                        result.push(operand);
+                    }
+                }
+                "identifier" | "true" | "false" | "nil" | "iota" | "field_identifier" => {}
+                _ => {
+                    let children = named_children(node);
+                    for child in children.into_iter().rev() {
+                        if !is_go_type_syntax(child.kind()) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn assignment_target_order_nodes(&self, target: Node<'tree>) -> Vec<Node<'tree>> {
+        let mut result = Vec::new();
+        let mut stack = vec![target];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "selector_expression" if self.is_direct_value_field(node) => {
+                    // The selector itself performs no implicit dereference,
+                    // but an explicitly dereferenced or otherwise structured
+                    // operand can still make order observable. Descend without
+                    // treating the field place as a value load.
+                    if let Some(operand) = node.child_by_field_name("operand") {
+                        stack.push(operand);
+                    }
+                }
+                "index_expression" if self.is_private_constant_array_index(node) => {}
+                "selector_expression" | "index_expression" => result.push(node),
+                "unary_expression" if unary_operator_kind(node) == Some("*") => {
+                    result.push(node);
+                }
+                "identifier" | "true" | "false" | "nil" | "iota" | "field_identifier" => {}
+                _ => {
+                    let children = named_children(node);
+                    for child in children.into_iter().rev() {
+                        if !is_go_type_syntax(child.kind()) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Whether evaluating an indexed assignment place beside an RHS call has
+    /// no observable ordering choice. The array binding is local to this
+    /// procedure, has not escaped to a call or closure, and the index is a Go
+    /// constant; evaluating either place operand is therefore inert. Slices,
+    /// dynamic indices, foreign bindings, and escaped arrays fail closed.
+    fn is_private_constant_array_index(&self, node: Node<'tree>) -> bool {
+        let Some(operand) = node.child_by_field_name("operand") else {
+            return false;
+        };
+        let Some(index) = node.child_by_field_name("index") else {
+            return false;
+        };
+        self.expression_storage_kind(operand, node.start_byte()) == Some(GoStorageKind::Array)
+            && self
+                .place_root_binding(operand)
+                .is_some_and(|binding| !self.call_exposed_bindings.contains(&binding))
+            && self.is_go_constant_evaluation(index)
+    }
+
+    fn binding_requires_runtime_protocol(&self, binding: Node<'tree>) -> bool {
+        !self.assignment_target_order_nodes(binding).is_empty()
+    }
+
+    fn assignment_evaluation_nodes(&self, node: Node<'tree>) -> Vec<Node<'tree>> {
+        let mut result = Vec::new();
+        if node.kind() == "assignment_statement"
+            && let Some(left) = node.child_by_field_name("left")
+        {
+            result.extend(self.assignment_target_evaluation_nodes(left));
+        }
+        if let Some(right) = node.child_by_field_name("right") {
+            result.extend(expression_sequence(right));
+        }
+        result
+    }
+
+    fn assignment_order_evaluation_nodes(&self, node: Node<'tree>) -> Vec<Node<'tree>> {
+        let mut result = Vec::new();
+        if node.kind() == "assignment_statement"
+            && let Some(left) = node.child_by_field_name("left")
+        {
+            result.extend(self.assignment_target_order_nodes(left));
+        }
+        if let Some(right) = node.child_by_field_name("right") {
+            result.extend(expression_sequence(right));
+        }
+        result
+    }
+
+    /// The flow kind for a write into an already-resolved name binding.
+    ///
+    /// Shared by the three statements that write one: simple assignment,
+    /// compound assignment, and increment or decrement.
+    fn binding_flow_kind(&self, name: &str, target: ValueId, byte: usize) -> ValueFlowKind {
+        let is_local = self.local_at(name, byte) == Some(target)
+            || self.captured_values.get(name).copied() == Some(target);
+        brokk_bifrost_semantic::analyzer::semantic::lowering::binding_flow_kind(
+            target,
+            self.receiver,
+            is_local.then_some(target),
+        )
+    }
+
+    /// The flow kind for a destination that holds the source's own value
+    /// without copying it.
+    ///
+    /// Go's parenthesized expression is a spelling rather than an operation,
+    /// so the wrapper names the operand's value: the same object, and the
+    /// same indexed backing store for a slice or map header, which is the
+    /// relation a binding copy of that header already states.
+    fn source_alias_flow_kind(&self, value: ValueId) -> ValueFlowKind {
+        match self.value_storage_kinds.get(&value) {
+            Some(GoStorageKind::Slice | GoStorageKind::Map) => ValueFlowKind::BackingStore {
+                offset: BackingStoreOffset::Zero,
+            },
+            _ => ValueFlowKind::Local,
+        }
+    }
+
+    fn append_binding_assignment(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        target: ValueId,
+        value: ValueId,
+        kind: ValueFlowKind,
+    ) -> Result<(), GoLoweringError> {
+        if let Some(identity) = self.value_types.get(&target).cloned() {
+            self.value_types.insert(value, identity);
+        }
+        let storage = self.value_storage_kinds.get(&value).copied();
+        if let Some(storage) = storage {
+            self.value_storage_kinds.insert(target, storage);
+        } else {
+            self.value_storage_kinds.remove(&target);
+        }
+        if let Some(copy) = self.index_value_copies.get(&value).copied() {
+            self.index_value_copies.insert(target, copy);
+        } else {
+            self.index_value_copies.remove(&target);
+        }
+        if let Some(identity) = self.index_value_types.get(&value).cloned() {
+            self.index_value_types.insert(target, identity);
+        } else {
+            self.index_value_types.remove(&target);
+        }
+        if let Some(copy) = self.channel_payload_copies.get(&value).copied() {
+            self.channel_payload_copies.insert(target, copy);
+        } else {
+            self.channel_payload_copies.remove(&target);
+        }
+        if let Some(payload_type) = self.channel_payload_types.get(&value).cloned() {
+            self.channel_payload_types.insert(target, payload_type);
+        } else {
+            self.channel_payload_types.remove(&target);
+        }
+        if let Some(shape) = self.exact_slice_shapes.get(&value).copied() {
+            self.exact_slice_shapes.insert(target, shape);
+        } else {
+            self.exact_slice_shapes.remove(&target);
+        }
+        // Go duplicates a whole array or struct value into independent
+        // aggregate storage; no distinct operation runs. A fresh literal or
+        // zero value is the destination's own storage, not a copy of an
+        // already-owned aggregate, so it keeps the plain local flow.
+        let aggregate_copy = kind == ValueFlowKind::Local
+            && storage.is_some_and(GoStorageKind::is_value_aggregate)
+            && !self.fresh_binding_values.contains(&value);
+        if !aggregate_copy {
+            self.append_effect(builder, point, SemanticEffect::Assignment { target, value })?;
+        }
+        let kind = if kind == ValueFlowKind::Local {
+            match storage {
+                Some(GoStorageKind::Slice | GoStorageKind::Map) => ValueFlowKind::BackingStore {
+                    offset: BackingStoreOffset::Zero,
+                },
+                // A proven inline aggregate duplicates the whole value
+                // bitwise; no distinct operation runs. The structural storage
+                // kind proves this for a named struct, an inline struct type,
+                // and an array alike.
+                _ if aggregate_copy => GO_AGGREGATE_COPY_FLOW,
+                None if !self.fresh_binding_values.contains(&value)
+                    && self.value_types.get(&value).is_some_and(|identity| {
+                        identity.pointer_depth == 0
+                            && (identity.declaration.is_some()
+                                || !is_predeclared_go_type(&identity.name))
+                    }) =>
+                {
+                    let identity = &self.value_types[&value];
+                    let definition = identity.declaration.and_then(|declaration| {
+                        self.named_type_definitions
+                            .get(&identity.name)?
+                            .iter()
+                            .find(|definition| definition.declaration == declaration)
+                    });
+                    let interface = definition.is_some_and(|definition| {
+                        go_file_underlying_type(
+                            definition.underlying,
+                            self.prepared.source(),
+                            self.named_type_definitions,
+                            definition.visible_from,
+                        )
+                        .is_some_and(|underlying| underlying.kind() == "interface_type")
+                    });
+                    let copy = definition.map_or(MemoryValueCopy::Unknown, |definition| {
+                        go_memory_value_copy_from_type(
+                            definition.underlying,
+                            self.prepared.source(),
+                            self.named_type_definitions,
+                            definition.visible_from,
+                        )
+                    });
+                    match copy {
+                        // Copying an interface descriptor preserves its boxed
+                        // payload relation. The wrapper remains separate from
+                        // the pointee through the explicit boxing edge.
+                        MemoryValueCopy::Unknown if interface => kind,
+                        MemoryValueCopy::Reference => kind,
+                        MemoryValueCopy::BackingStore { .. } => ValueFlowKind::BackingStore {
+                            offset: BackingStoreOffset::Zero,
+                        },
+                        MemoryValueCopy::Value | MemoryValueCopy::Unknown => {
+                            // A nominal binding copy is not an object alias.
+                            // Unknown representation preserves dependence and
+                            // runtime class, but cannot certify inline storage.
+                            ValueFlowKind::Transfer(ValueTransfer {
+                                kind: if copy == MemoryValueCopy::Value {
+                                    TransferKind::AggregateCopy
+                                } else {
+                                    TransferKind::Copy
+                                },
+                                operation: TransferOperation::None,
+                            })
+                        }
+                    }
+                }
+                Some(GoStorageKind::Array | GoStorageKind::Struct | GoStorageKind::Channel)
+                | None => kind,
+            }
+        } else {
+            kind
+        };
+        if aggregate_copy {
+            self.append_aggregate_copy_effects(builder, point, value, target)?;
+        } else {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source: value,
+                    target,
+                },
+            )?;
+        }
+        if let Some(storage) = storage.filter(|_| aggregate_copy) {
+            self.append_aggregate_copy_contents(builder, point, storage, value, target)?;
+        }
+        // The cell receives the post-transfer value. Storing the original
+        // source would bypass the copy's identity boundary through captures.
+        let stored_value = if matches!(kind, ValueFlowKind::Transfer(_)) {
+            target
+        } else {
+            value
+        };
+        if let Some((location, kind)) = self.shared_binding_locations.get(&target).copied() {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryStore {
+                    kind,
+                    location,
+                    value: stored_value,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn append_aggregate_copy_effects(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), GoLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: GO_AGGREGATE_COPY_FLOW,
+                source,
+                target,
+            },
+        )
+    }
+
+    /// Copy the proven contents of one by-value aggregate into the
+    /// destination's own storage.
+    ///
+    /// Go's assignment, argument passing, return, and defined-type conversion
+    /// all duplicate a struct's fields into independent storage while a
+    /// reference-typed field goes on naming the same runtime object. The copy
+    /// is therefore a field-by-field load and store, not a deep copy: a pointer
+    /// field's copied value is the pointer. A nested aggregate field is itself
+    /// a by-value copy and receives its own transfer barrier, and the contents
+    /// behind that barrier stay explicitly incomplete.
+    ///
+    /// Array elements are left exactly as the existing array transfer leaves
+    /// them: their indexed identity is already carried across the copy, and
+    /// the element snapshot is #2831's. A struct copy this method cannot model
+    /// publishes a typed field-memory gap naming the exact reason rather than
+    /// leaving the destination silently covered.
+    fn append_aggregate_copy_contents(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        storage: GoStorageKind,
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), GoLoweringError> {
+        let fields = match self.aggregate_copy_contents(storage, source, target) {
+            GoAggregateContents::Struct(fields) => fields,
+            // An array copy's elements are already carried by the indexed
+            // memory model the array transfer has always used, so this ticket
+            // neither restates that coverage nor declares it absent; the
+            // element snapshot itself is #2831's.
+            GoAggregateContents::ArrayElements => return Ok(()),
+            GoAggregateContents::Unproven(reason) => {
+                return self.session.record_gap(
+                    builder,
+                    point,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::FieldMemory,
+                    SemanticGapKind::Unsupported,
+                    &format!(
+                        "Go aggregate copy separates storage identity, but the copied field contents are not modeled: {reason}"
+                    ),
+                );
+            }
+        };
+        let mut nested_aggregates = Vec::new();
+        for field in fields {
+            let member = self.member_locator(field.anchor);
+            let loaded_from = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Field {
+                    base: source,
+                    member: member.clone(),
+                },
+            )?;
+            let loaded = self.value(builder, point, SemanticValueKind::Temporary)?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
+                    location: loaded_from,
+                    result: loaded,
+                },
+            )?;
+            let stored = if field.storage == GoCompositeFieldStorage::InlineAggregate {
+                nested_aggregates.push(field.name);
+                let copied = self.value(builder, point, SemanticValueKind::Temporary)?;
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::Assignment {
+                        target: copied,
+                        value: loaded,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::ValueFlow {
+                        kind: GO_AGGREGATE_COPY_FLOW,
+                        source: loaded,
+                        target: copied,
+                    },
+                )?;
+                copied
+            } else {
+                loaded
+            };
+            // Copying a reference-typed member duplicates the reference, not
+            // the object it names, so the destination member names the same
+            // runtime object as the source member. Stating that here is what
+            // lets a read through the copied member reach that object.
+            let stored_into = self.session.add_memory_location_with_value_copy(
+                builder,
+                point,
+                MemoryLocationKind::Field {
+                    base: target,
+                    member,
+                },
+                match field.storage {
+                    GoCompositeFieldStorage::Reference => MemoryValueCopy::Reference,
+                    GoCompositeFieldStorage::InlineAggregate
+                    | GoCompositeFieldStorage::InlineScalar => MemoryValueCopy::Value,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location: stored_into,
+                    value: stored,
+                },
+            )?;
+        }
+        if !nested_aggregates.is_empty() {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::Value(target),
+                SemanticCapability::FieldMemory,
+                SemanticGapKind::Unsupported,
+                &format!(
+                    "Go aggregate copy duplicates these nested aggregate fields into independent storage, but their own copied contents are not modeled: {nested_aggregates:?}"
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Duplicate a by-value aggregate into fresh storage and answer with the
+    /// value that now holds the copy.
+    ///
+    /// Go copies an aggregate when it crosses a call boundary in either
+    /// direction: an argument is copied into the callee's parameter and a
+    /// result is copied into the caller's storage. A value whose storage this
+    /// procedure just established is already that independent storage and is
+    /// transported directly rather than copied twice.
+    fn append_transferred_aggregate(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+    ) -> Result<ValueId, GoLoweringError> {
+        let Some(storage) = self
+            .value_storage_kinds
+            .get(&source)
+            .copied()
+            .filter(|storage| storage.is_value_aggregate())
+        else {
+            return Ok(source);
+        };
+        if self.fresh_binding_values.contains(&source) {
+            return Ok(source);
+        }
+        let copied =
+            self.session
+                .add_node_value(builder, source_node, SemanticValueKind::Temporary)?;
+        if let Some(identity) = self.value_types.get(&source).cloned() {
+            self.value_types.insert(copied, identity);
+        }
+        if let Some(type_node) = self.value_type_nodes.get(&source).copied() {
+            self.value_type_nodes.insert(copied, type_node);
+        }
+        self.value_storage_kinds.insert(copied, storage);
+        self.fresh_binding_values.insert(copied);
+        self.append_aggregate_copy_effects(builder, point, source, copied)?;
+        // No snapshot stores here on purpose. This temporary exists only to be
+        // consumed by the boundary that created it, an argument position or a
+        // return, so nothing in this procedure ever loads its members. The
+        // boundary carries the copied contents through the transfer itself;
+        // restating them as stores would publish caller-side member accesses
+        // that stand for no source-level load of the copy.
+        Ok(copied)
+    }
+
+    /// A returned copy publishes the members that cross the return port.
+    /// Argument temporaries are consumed by the actual/formal binder; return
+    /// temporaries need their own contents for the callee's exit snapshot.
+    fn append_returned_aggregate(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+    ) -> Result<ValueId, GoLoweringError> {
+        let copied = self.append_transferred_aggregate(builder, point, source_node, source)?;
+        if copied != source {
+            let storage = self.value_storage_kinds[&copied];
+            self.append_aggregate_copy_contents(builder, point, storage, source, copied)?;
+        }
+        Ok(copied)
+    }
+
+    /// What this file can state about the contents an exact by-value copy of
+    /// `source` duplicates. `target` supplies the declared type when the copied
+    /// expression carries none of its own.
+    fn aggregate_copy_contents(
+        &self,
+        storage: GoStorageKind,
+        source: ValueId,
+        target: ValueId,
+    ) -> GoAggregateContents {
+        if storage == GoStorageKind::Array {
+            return GoAggregateContents::ArrayElements;
+        }
+        let Some(underlying) = self
+            .value_underlying_type(source)
+            .or_else(|| self.value_underlying_type(target))
+        else {
+            return GoAggregateContents::Unproven(
+                "the copied value has no resolved structured type".into(),
+            );
+        };
+        if underlying.kind() != "struct_type" {
+            return GoAggregateContents::Unproven(
+                "the copied value's underlying type is not a struct".into(),
+            );
+        }
+        let Some(fields) = go_struct_literal_fields(underlying, self.prepared.source()) else {
+            return GoAggregateContents::Unproven("the struct field layout is ambiguous".into());
+        };
+        let mut copied = Vec::with_capacity(fields.len());
+        for field in fields {
+            let Some(type_node) = field.type_node else {
+                return GoAggregateContents::Unproven(
+                    format!(
+                        "embedded field {:?} declares no direct field storage",
+                        field.name
+                    )
+                    .into(),
+                );
+            };
+            let Some(storage) = self.composite_field_storage(type_node) else {
+                return GoAggregateContents::Unproven(
+                    format!("field {:?} has no resolved storage kind", field.name).into(),
+                );
+            };
+            copied.push(GoCopiedField {
+                name: field.name,
+                anchor: field.anchor,
+                storage,
+            });
+        }
+        GoAggregateContents::Struct(copied)
+    }
+
+    /// The underlying type a value's proven declared type resolves to, whether
+    /// that type was named or written inline.
+    fn value_underlying_type(&self, value: ValueId) -> Option<Node<'tree>> {
+        if let Some(identity) = self.value_types.get(&value)
+            && identity.pointer_depth == 0
+            && let Some(declaration) = identity.declaration
+            && let Some(definition) = self.named_type_definition_for_declaration(declaration)
+        {
+            return self
+                .file_underlying_type(definition.underlying, definition.underlying.start_byte());
+        }
+        let type_node = self.value_type_nodes.get(&value).copied()?;
+        self.file_underlying_type(type_node, type_node.start_byte())
+    }
+
+    /// One memory-location identity for a member declared at `anchor`.
+    fn member_locator(&self, anchor: SourceAnchor) -> SemanticLocator {
+        let procedure = self.session.locator();
+        procedure.memory_location_at(anchor)
+    }
+
+    fn assignment_conversion_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+    ) -> Result<ValueId, GoLoweringError> {
+        let converted = self.session.add_node_value(
+            builder,
+            source_node,
+            SemanticValueKind::LanguageDefined("go.assignment_conversion".into()),
+        )?;
+        self.session
+            .append_language_defined_value_flows(builder, point, [source], converted)?;
+        self.fresh_binding_values.insert(converted);
+        Ok(converted)
+    }
+
+    /// Make the explicit value-flow witness for storing a proven reference
+    /// payload in an interface destination. The wrapper value remains a
+    /// separate semantic value; only this edge carries the payload relation
+    /// for consumers that understand it.
+    fn reference_boxing_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+    ) -> Result<ValueId, GoLoweringError> {
+        let boxed = self.session.add_node_value(
+            builder,
+            source_node,
+            SemanticValueKind::LanguageDefined("go.reference_boxing".into()),
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::ReferenceBoxing,
+                source,
+                target: boxed,
+            },
+        )?;
+        self.fresh_binding_values.insert(boxed);
+        Ok(boxed)
+    }
+
+    fn append_reference_aware_binding_assignment(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+        target: ValueId,
+        kind: ValueFlowKind,
+    ) -> Result<(), GoLoweringError> {
+        let interface_destination =
+            self.value_type_nodes
+                .get(&target)
+                .copied()
+                .is_some_and(|type_node| {
+                    self.type_is_empty_interface(type_node, type_node.start_byte())
+                });
+        let exact_interface_reference = interface_destination
+            || self
+                .reference_boxing_initializers
+                .contains(&source_node.id());
+        let converted =
+            if exact_interface_reference && self.expression_is_reference_value(source_node) {
+                self.reference_boxing_value(builder, point, source_node, source)?
+            } else {
+                self.assignment_conversion_value(builder, point, source_node, source)?
+            };
+        self.append_binding_assignment(builder, point, target, converted, kind)
+    }
+
+    fn expression_is_reference_value(&self, node: Node<'tree>) -> bool {
+        let node = transparent_parenthesized_expression(node);
+        self.expression_type_identity(node, node.start_byte())
+            .is_some_and(|identity| identity.pointer_depth > 0)
+            || node.kind() == "func_literal"
+            || self
+                .expression_type_node(node, node.start_byte())
+                .and_then(|type_node| self.file_underlying_type(type_node, node.start_byte()))
+                .is_some_and(|underlying| underlying.kind() == "function_type")
+            || matches!(
+                self.expression_storage_kind(node, node.start_byte()),
+                Some(GoStorageKind::Slice | GoStorageKind::Map | GoStorageKind::Channel)
+            )
+            || node.child_by_field_name("type").is_some_and(|type_node| {
+                matches!(
+                    node.kind(),
+                    "composite_literal" | "type_assertion_expression"
+                ) && go_type_is_reference(
+                    type_node,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    node.start_byte(),
+                )
+            })
+    }
+
+    fn expression_supports_channel_payload_copy(
+        &self,
+        node: Node<'tree>,
+        copy: SynchronizationPayloadCopy,
+    ) -> bool {
+        match copy {
+            SynchronizationPayloadCopy::Unknown => false,
+            SynchronizationPayloadCopy::Reference => {
+                self.expression_type_identity(node, node.start_byte())
+                    .is_some_and(|identity| identity.pointer_depth > 0)
+                    || self.expression_storage_kind(node, node.start_byte())
+                        == Some(GoStorageKind::Channel)
+            }
+            SynchronizationPayloadCopy::BackingStore { identity } => {
+                self.expression_storage_kind(node, node.start_byte())
+                    == go_channel_payload_storage_kind(SynchronizationPayloadCopy::BackingStore {
+                        identity,
+                    })
+            }
+        }
+    }
+
+    /// Return the declared type of a direct struct field selector. The
+    /// declaration is recovered from the same structured type inventory that
+    /// anchors the field's memory locator; an unresolved field has no type
+    /// witness and therefore remains behind the ordinary conversion edge.
+    fn selector_field_type(&self, selector: Node<'tree>) -> Option<Node<'tree>> {
+        if selector.kind() != "selector_expression" {
+            return None;
+        }
+        let operand = selector.child_by_field_name("operand")?;
+        let field = selector.child_by_field_name("field")?;
+        let field_name = nonempty_node_text(self.prepared.source(), field)?;
+        let identity = self.expression_type_identity(operand, operand.start_byte())?;
+        let definition = self.named_type_definition_for_declaration(identity.declaration?)?;
+        let structure = self.file_underlying_type(definition.underlying, selector.start_byte())?;
+        named_children(structure)
+            .into_iter()
+            .filter(|child| child.kind() == "field_declaration_list")
+            .flat_map(named_children)
+            .filter(|declaration| declaration.kind() == "field_declaration")
+            .find(|declaration| {
+                children_by_field_name(*declaration, "name")
+                    .into_iter()
+                    .any(|name| {
+                        nonempty_node_text(self.prepared.source(), name) == Some(field_name)
+                    })
+            })
+            .and_then(|declaration| declaration.child_by_field_name("type"))
+    }
+
+    fn place_has_exact_reference_type(&self, place: Node<'tree>, source_node: Node<'tree>) -> bool {
+        let target_identity = match place.kind() {
+            "selector_expression" => self
+                .selector_field_type(place)
+                .and_then(|target_type| self.type_identity(target_type, target_type.start_byte())),
+            "index_expression" => place
+                .child_by_field_name("operand")
+                .and_then(|operand| self.expression_index_value_type(operand, place.start_byte())),
+            _ => None,
+        };
+        let Some(target_identity) = target_identity else {
+            return false;
+        };
+        target_identity.pointer_depth > 0
+            && self
+                .expression_type_identity(source_node, source_node.start_byte())
+                .is_some_and(|source_identity| source_identity == target_identity)
+    }
+
+    fn append_converted_binding_assignment(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+        target: ValueId,
+        kind: ValueFlowKind,
+    ) -> Result<(), GoLoweringError> {
+        let converted = self.assignment_conversion_value(builder, point, source_node, source)?;
+        self.append_binding_assignment(builder, point, target, converted, kind)
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, GoLoweringError> {
+        let value = self.session.cached_node_value(
+            builder,
+            &mut self.expression_values,
+            node,
+            kind,
+            |session, builder, node| session.add_value_mapping(builder, node),
+        )?;
+        self.record_expression_value_facts(node, value);
+        Ok(value)
+    }
+    /// Record the structured type, storage, and copy facts one expression
+    /// states for its result value.
+    ///
+    /// Both the cached expression value and every result a multi-result
+    /// expression materializes separately must carry these facts. Without
+    /// them a later member read cannot resolve its declaration, which is how
+    /// a comma-ok assertion result previously lost its field identities.
+    fn record_expression_value_facts(&mut self, node: Node<'tree>, value: ValueId) {
+        if let Some(identity) = self.expression_type_identity(node, node.start_byte()) {
+            self.value_types.insert(value, identity);
+        }
+        if let Some(type_node) = self.expression_type_node(node, node.start_byte()) {
+            self.value_type_nodes.insert(value, type_node);
+        }
+        if let Some(storage) = self.expression_storage_kind(node, node.start_byte()) {
+            self.value_storage_kinds.insert(value, storage);
+        }
+        if self.establishes_fresh_binding(node) {
+            self.fresh_binding_values.insert(value);
+        }
+        let index_value_copy = self.expression_index_value_copy(node, node.start_byte());
+        if index_value_copy != MemoryValueCopy::Unknown {
+            self.index_value_copies.insert(value, index_value_copy);
+        }
+        if let Some(identity) = self.expression_index_value_type(node, node.start_byte()) {
+            self.index_value_types.insert(value, identity);
+        }
+        if let Some(copy) = self.expression_channel_payload_copy(node, node.start_byte()) {
+            self.channel_payload_copies.insert(value, copy);
+        }
+        if let Some(payload_type) = self.expression_channel_payload_type(node, node.start_byte()) {
+            self.channel_payload_types.insert(value, payload_type);
+        }
+        if let Some(shape) = self.expression_slice_shape(node, node.start_byte()) {
+            self.exact_slice_shapes.insert(value, shape);
+        }
+    }
+
+    /// A same-file, unshadowed, nongeneric function states its single result
+    /// type in the declaration. Keep that type on the call result so a later
+    /// member read uses the declaration's field identity.
+    fn call_result_type_node(&self, call: Node<'tree>) -> Option<Node<'tree>> {
+        let function = transparent_parenthesized_expression(call.child_by_field_name("function")?);
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), function)?;
+        if self.binding_value(name, function.start_byte()).is_some() {
+            return None;
+        }
+        let (_, declaration) = self.package_functions.get(name).copied().flatten()?;
+        if declaration.child_by_field_name("type_parameters").is_some() {
+            return None;
+        }
+        let results = go_callable_result_types(declaration)?;
+        match results.as_slice() {
+            [result] => Some(*result),
+            _ => None,
+        }
+    }
+
+    /// The declared type syntax this expression's value carries.
+    ///
+    /// Only a declared or written type counts: a binding's own declaration, a
+    /// literal's type, or an assertion's type. This is what lets an inline
+    /// struct type, which has no name to resolve, still state its layout.
+    fn expression_type_node(&self, node: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
+        let node = transparent_parenthesized_expression(node);
+        match node.kind() {
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                let name = node_text(self.prepared.source(), node)?;
+                let value = self.binding_value(name, byte)?;
+                self.value_type_nodes.get(&value).copied()
+            }
+            "composite_literal" | "type_assertion_expression" => node.child_by_field_name("type"),
+            "selector_expression" => self.selector_field_type(node),
+            "call_expression" => self.call_result_type_node(node),
+            _ => None,
+        }
+    }
+
+    /// Whether this expression establishes its own storage instead of reading a
+    /// value another binding already owns.
+    ///
+    /// A composite literal and an exact value-aggregate conversion both
+    /// materialize a completed value, so binding one is not a second
+    /// duplication of an already-owned value.
+    fn establishes_fresh_binding(&self, node: Node<'tree>) -> bool {
+        let node = transparent_parenthesized_expression(node);
+        node.kind() == "composite_literal"
+            || self.type_conversion(node).is_some_and(|conversion| {
+                self.exact_value_aggregate_conversion(conversion, node.start_byte())
+                    .is_some()
+            })
+    }
+
+    fn multi_result_values(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: Node<'tree>,
+        count: usize,
+    ) -> Result<Box<[ValueId]>, GoLoweringError> {
+        if let Some(values) = self.multi_result_values.get(&call.id()) {
+            assert_eq!(values.len(), count, "one Go call has one result arity");
+            return Ok(values.clone());
+        }
+        let mut values = Vec::with_capacity(count);
+        for index in 0..count {
+            // The comma-ok assertion is a two-result expression like a call:
+            // result zero is the asserted value and result one is the presence
+            // Boolean the continuation branches on.
+            let assertion_result = call.kind() == "type_assertion_expression" && index == 0;
+            let kind = if call.kind() == "type_assertion_expression" {
+                match index {
+                    0 => SemanticValueKind::LanguageDefined("go.assertion_result".into()),
+                    _ => SemanticValueKind::LanguageDefined("go.assertion_presence".into()),
+                }
+            } else {
+                SemanticValueKind::LanguageDefined(format!("go.normal_result.{index}").into())
+            };
+            let value = self.session.add_node_value(builder, call, kind)?;
+            if assertion_result {
+                // The asserted type is the result's static type. Every later
+                // member read through the narrowed value needs that type to
+                // resolve its field declaration.
+                self.record_expression_value_facts(call, value);
+            }
+            values.push(value);
+        }
+        let values = values.into_boxed_slice();
+        self.multi_result_values.insert(call.id(), values.clone());
+        Ok(values)
+    }
+
+    fn visible_named_type_definition(
+        &self,
+        name: &str,
+        byte: usize,
+    ) -> Option<GoNamedTypeDefinition<'tree>> {
+        visible_go_named_type(self.named_type_definitions, name, byte)
+    }
+
+    /// The declaration whose declared type is literally the struct a named type
+    /// resolves to.
+    ///
+    /// A defined type's fields are its underlying struct's fields, so `D` in
+    /// `type D S` must name the same field memory locations as `S`. Without
+    /// this, every field of a defined type fell back to an occurrence identity
+    /// and a store through one spelling could not meet a load through the other.
+    fn struct_declaration_for_declaration(&self, declaration: usize) -> Option<usize> {
+        let definition = self.named_type_definition_for_declaration(declaration)?;
+        let underlying =
+            self.file_underlying_type(definition.underlying, definition.underlying.start_byte())?;
+        if underlying.kind() != "struct_type" {
+            return None;
+        }
+        underlying
+            .parent()
+            .filter(|parent| parent.kind() == "type_spec")
+            .map(|parent| parent.id())
+    }
+
+    /// The named-type definition one resolved declaration identity names.
+    ///
+    /// A `GoTypeIdentity` already carries the declaration a name resolved to,
+    /// so consumers recover the definition from that identity instead of
+    /// resolving the spelling a second time in a possibly different scope.
+    fn named_type_definition_for_declaration(
+        &self,
+        declaration: usize,
+    ) -> Option<GoNamedTypeDefinition<'tree>> {
+        self.named_type_definitions
+            .values()
+            .flatten()
+            .find(|definition| definition.declaration == declaration)
+            .copied()
+    }
+
+    fn type_identity(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
+        let mut identity = go_type_identity(node, self.prepared.source())?;
+        if let Some((package, name)) = go_qualified_type_parts(node, self.prepared.source())
+            && let Some(import_path) = self.import_bindings.get(package)
+        {
+            identity.name = format!("{import_path}.{name}").into();
+        }
+        identity.declaration = self
+            .visible_named_type_definition(identity.name.as_ref(), byte)
+            .map(|definition| definition.declaration);
+        Some(identity)
+    }
+
+    fn type_storage_kind(&self, node: Node<'tree>, byte: usize) -> Option<GoStorageKind> {
+        go_storage_kind_from_type(
+            node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            byte,
+        )
+    }
+
+    fn index_value_type_from_type(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
+        let container = self.file_underlying_type(node, byte)?;
+        let element = go_index_value_type_node(container)?;
+        self.type_identity(element, byte)
+    }
+
+    fn channel_payload_copy_from_type(
+        &self,
+        node: Node<'tree>,
+        byte: usize,
+    ) -> Option<SynchronizationPayloadCopy> {
+        go_channel_payload_copy_from_type(
+            node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            byte,
+        )
+    }
+
+    fn channel_payload_type_from_type(
+        &self,
+        node: Node<'tree>,
+        byte: usize,
+    ) -> Option<GoTypeIdentity> {
+        go_channel_payload_type_from_type(
+            node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            byte,
+        )
+    }
+
+    fn type_is_empty_interface(&self, node: Node<'tree>, byte: usize) -> bool {
+        go_type_is_empty_interface(
+            node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            byte,
+        )
+    }
+
+    fn expression_type_identity(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
+        match node.kind() {
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                let name = node_text(self.prepared.source(), node)?;
+                let value = self.binding_value(name, byte)?;
+                self.value_types.get(&value).cloned()
+            }
+            "parenthesized_expression" => first_runtime_named_child(node)
+                .and_then(|child| self.expression_type_identity(child, byte)),
+            "type_assertion_expression" => {
+                self.type_identity(node.child_by_field_name("type")?, byte)
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("&") => {
+                let operand = node.child_by_field_name("operand")?;
+                let mut identity = self.expression_type_identity(operand, byte)?;
+                identity.pointer_depth = identity.pointer_depth.checked_add(1)?;
+                Some(identity)
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("<-") => {
+                let operand = node.child_by_field_name("operand")?;
+                self.expression_channel_payload_type(operand, byte)
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("*") => {
+                let operand = node.child_by_field_name("operand")?;
+                let mut identity = self.expression_type_identity(operand, byte)?;
+                identity.pointer_depth = identity.pointer_depth.checked_sub(1)?;
+                Some(identity)
+            }
+            "index_expression"
+                if node
+                    .child_by_field_name("index")
+                    .is_some_and(|index| !is_go_type_syntax(index.kind())) =>
+            {
+                self.expression_index_value_type(node.child_by_field_name("operand")?, byte)
+            }
+            "composite_literal" => self.type_identity(node.child_by_field_name("type")?, byte),
+            "type_conversion_expression" | "call_expression"
+                if self.type_conversion(node).is_some() =>
+            {
+                // A conversion names its result type exactly. Reading it is the
+                // structured answer, not an inference from the operand.
+                let conversion = self.type_conversion(node)?;
+                self.conversion_target_identity(conversion.target, byte)
+            }
+            "call_expression" if self.is_builtin_new_call(node) => {
+                let argument = all_call_arguments(node).into_iter().next()?;
+                let mut identity = self.type_identity(argument, byte)?;
+                identity.pointer_depth = identity.pointer_depth.checked_add(1)?;
+                Some(identity)
+            }
+            "selector_expression" => self
+                .expression_field_type_node(node, byte)
+                .and_then(|kind| self.type_identity(kind, byte)),
+            "call_expression" => {
+                let result = self.call_result_type_node(node)?;
+                self.type_identity(result, result.start_byte())
+            }
+            _ => None,
+        }
+    }
+
+    fn expression_field_type_node(
+        &self,
+        selector: Node<'tree>,
+        byte: usize,
+    ) -> Option<Node<'tree>> {
+        let operand = selector.child_by_field_name("operand")?;
+        let field_name = selector
+            .child_by_field_name("field")
+            .and_then(|field| nonempty_node_text(self.prepared.source(), field))?;
+        let declaration = self.expression_type_identity(operand, byte)?.declaration?;
+        let definition = self.named_type_definition_for_declaration(declaration)?;
+        let structure = self.file_underlying_type(definition.underlying, byte)?;
+        go_struct_literal_fields(structure, self.prepared.source())?
+            .into_iter()
+            .find(|field| field.name.as_ref() == field_name)?
+            .type_node
+    }
+
+    fn expression_storage_kind(&self, node: Node<'tree>, byte: usize) -> Option<GoStorageKind> {
+        let node = transparent_parenthesized_expression(node);
+        match node.kind() {
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                let name = node_text(self.prepared.source(), node)?;
+                let value = self.binding_value(name, byte)?;
+                self.value_storage_kinds.get(&value).copied()
+            }
+            "composite_literal" => self.type_storage_kind(node.child_by_field_name("type")?, byte),
+            "type_assertion_expression" => {
+                self.type_storage_kind(node.child_by_field_name("type")?, byte)
+            }
+            "type_conversion_expression" | "call_expression"
+                if self.type_conversion(node).is_some() =>
+            {
+                let conversion = self.type_conversion(node)?;
+                go_storage_kind_of_underlying(self.conversion_target_underlying(conversion.target)?)
+            }
+            "selector_expression" => self
+                .expression_field_type_node(node, byte)
+                .and_then(|kind| self.type_storage_kind(kind, byte)),
+            "slice_expression" => {
+                let operand = node.child_by_field_name("operand")?;
+                matches!(
+                    self.expression_storage_kind(operand, byte),
+                    Some(GoStorageKind::Array | GoStorageKind::Slice)
+                )
+                .then_some(GoStorageKind::Slice)
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("<-") => {
+                let channel = node.child_by_field_name("operand")?;
+                self.expression_channel_payload_copy(channel, byte)
+                    .and_then(go_channel_payload_storage_kind)
+            }
+            "call_expression"
+                if self.builtin_make_allocation_kind(node) == Some(AllocationKind::Slice) =>
+            {
+                Some(GoStorageKind::Slice)
+            }
+            "call_expression"
+                if matches!(
+                    self.builtin_make_allocation_kind(node),
+                    Some(AllocationKind::LanguageDefined(name))
+                        if name.as_ref() == "go-channel"
+                ) =>
+            {
+                Some(GoStorageKind::Channel)
+            }
+            "call_expression"
+                if self.builtin_make_allocation_kind(node) == Some(AllocationKind::Array) =>
+            {
+                Some(GoStorageKind::Map)
+            }
+            "call_expression" if self.builtin_append_source(node).is_some() => {
+                Some(GoStorageKind::Slice)
+            }
+            "call_expression" => {
+                let result = self.call_result_type_node(node)?;
+                self.type_storage_kind(result, result.start_byte())
+            }
+            _ => None,
+        }
+    }
+
+    fn expression_index_value_copy(&self, node: Node<'tree>, byte: usize) -> MemoryValueCopy {
+        let mut node = node;
+        loop {
+            let source_node = go_index_value_expression_source(
+                node,
+                |node| {
+                    let unwrapped = transparent_parenthesized_expression(node);
+                    (unwrapped.id() != node.id()).then_some(unwrapped)
+                },
+                |node| {
+                    node_text(self.prepared.source(), node)
+                        .and_then(|name| self.binding_value(name, byte))
+                },
+                |call, _use_byte| {
+                    matches!(
+                        self.builtin_make_allocation_kind(call),
+                        Some(AllocationKind::Slice | AllocationKind::Array)
+                    )
+                    .then(|| all_call_arguments(call).first().copied())
+                    .flatten()
+                },
+                |call| self.builtin_append_source(call),
+            );
+            match source_node {
+                Some(GoIndexValueExpressionSource::Binding(value)) => {
+                    if let Some(copy) = self.index_value_copies.get(&value).copied() {
+                        return copy;
+                    }
+                    let Some(type_node) = self.value_type_nodes.get(&value).copied() else {
+                        return MemoryValueCopy::Unknown;
+                    };
+                    return go_index_value_copy_from_type(
+                        type_node,
+                        self.prepared.source(),
+                        self.named_type_definitions,
+                        byte,
+                    );
+                }
+                Some(GoIndexValueExpressionSource::Type(type_node)) => {
+                    return go_index_value_copy_from_type(
+                        type_node,
+                        self.prepared.source(),
+                        self.named_type_definitions,
+                        byte,
+                    );
+                }
+                Some(GoIndexValueExpressionSource::Forward(next)) => node = next,
+                None => return MemoryValueCopy::Unknown,
+            }
+        }
+    }
+
+    fn expression_index_value_type(
+        &self,
+        node: Node<'tree>,
+        byte: usize,
+    ) -> Option<GoTypeIdentity> {
+        let mut node = node;
+        loop {
+            let source_node = go_index_value_expression_source(
+                node,
+                |node| {
+                    let unwrapped = transparent_parenthesized_expression(node);
+                    (unwrapped.id() != node.id()).then_some(unwrapped)
+                },
+                |node| {
+                    node_text(self.prepared.source(), node)
+                        .and_then(|name| self.binding_value(name, byte))
+                },
+                |call, _use_byte| {
+                    matches!(
+                        self.builtin_make_allocation_kind(call),
+                        Some(AllocationKind::Slice | AllocationKind::Array)
+                    )
+                    .then(|| all_call_arguments(call).first().copied())
+                    .flatten()
+                },
+                |call| self.builtin_append_source(call),
+            )?;
+            match source_node {
+                GoIndexValueExpressionSource::Binding(value) => {
+                    if let Some(identity) = self.index_value_types.get(&value).cloned() {
+                        return Some(identity);
+                    }
+                    let type_node = self.value_type_nodes.get(&value).copied()?;
+                    return self.index_value_type_from_type(type_node, byte);
+                }
+                GoIndexValueExpressionSource::Type(type_node) => {
+                    return self.index_value_type_from_type(type_node, byte);
+                }
+                GoIndexValueExpressionSource::Forward(next) => node = next,
+            }
+        }
+    }
+
+    fn expression_channel_payload_copy(
+        &self,
+        node: Node<'tree>,
+        byte: usize,
+    ) -> Option<SynchronizationPayloadCopy> {
+        match go_channel_payload_source(
+            node,
+            self.prepared.source(),
+            |node| {
+                let unwrapped = transparent_parenthesized_expression(node);
+                (unwrapped.id() != node.id()).then_some(unwrapped)
+            },
+            |name, _use_byte| self.binding_value(name, byte),
+            |call, _use_byte| {
+                matches!(
+                    self.builtin_make_allocation_kind(call),
+                    Some(AllocationKind::LanguageDefined(name)) if name.as_ref() == "go-channel"
+                )
+                .then(|| all_call_arguments(call).first().copied())
+                .flatten()
+            },
+        )? {
+            GoChannelPayloadSource::Binding(value) => {
+                self.channel_payload_copies.get(&value).copied()
+            }
+            GoChannelPayloadSource::Type(channel) => {
+                self.channel_payload_copy_from_type(channel, byte)
+            }
+        }
+    }
+
+    fn expression_channel_payload_type(
+        &self,
+        node: Node<'tree>,
+        byte: usize,
+    ) -> Option<GoTypeIdentity> {
+        match go_channel_payload_source(
+            node,
+            self.prepared.source(),
+            |node| {
+                let unwrapped = transparent_parenthesized_expression(node);
+                (unwrapped.id() != node.id()).then_some(unwrapped)
+            },
+            |name, _use_byte| self.binding_value(name, byte),
+            |call, _use_byte| {
+                matches!(
+                    self.builtin_make_allocation_kind(call),
+                    Some(AllocationKind::LanguageDefined(name)) if name.as_ref() == "go-channel"
+                )
+                .then(|| all_call_arguments(call).first().copied())
+                .flatten()
+            },
+        )? {
+            GoChannelPayloadSource::Binding(value) => {
+                self.channel_payload_types.get(&value).cloned()
+            }
+            GoChannelPayloadSource::Type(channel) => {
+                self.channel_payload_type_from_type(channel, byte)
+            }
+        }
+    }
+
+    fn expression_slice_shape(&self, node: Node<'tree>, byte: usize) -> Option<ExactSliceShape> {
+        let node = transparent_parenthesized_expression(node);
+        match node.kind() {
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                let name = node_text(self.prepared.source(), node)?;
+                let value = self.binding_value(name, byte)?;
+                self.exact_slice_shapes.get(&value).copied()
+            }
+            "composite_literal" if node.child_by_field_name("type")?.kind() == "slice_type" => {
+                let body = node.child_by_field_name("body")?;
+                let elements = named_children(body)
+                    .into_iter()
+                    .filter(|child| child.kind() != "comment")
+                    .collect::<Vec<_>>();
+                if elements
+                    .iter()
+                    .any(|element| element.kind() == "keyed_element")
+                {
+                    return None;
+                }
+                let length = elements.len() as u128;
+                Some(ExactSliceShape {
+                    length,
+                    capacity: length,
+                })
+            }
+            "call_expression"
+                if self.builtin_make_allocation_kind(node) == Some(AllocationKind::Slice) =>
+            {
+                let arguments = all_call_arguments(node);
+                let length = go_integer_literal_value(self.prepared.source(), arguments[1])?;
+                let capacity = match arguments.get(2) {
+                    Some(capacity) => go_integer_literal_value(self.prepared.source(), *capacity)?,
+                    None => length,
+                };
+                (length <= capacity).then_some(ExactSliceShape { length, capacity })
+            }
+            "slice_expression" => {
+                let source = node.child_by_field_name("operand")?;
+                let source_shape = self.expression_slice_shape(source, byte)?;
+                let start = node
+                    .child_by_field_name("start")
+                    .map(|start| go_integer_literal_value(self.prepared.source(), start))
+                    .unwrap_or(Some(0))?;
+                let end = node
+                    .child_by_field_name("end")
+                    .map(|end| go_integer_literal_value(self.prepared.source(), end))
+                    .unwrap_or(Some(source_shape.length))?;
+                let length = end.checked_sub(start)?;
+                let capacity = match node.child_by_field_name("capacity") {
+                    Some(max) => {
+                        let max = go_integer_literal_value(self.prepared.source(), max)?;
+                        if end > max || max > source_shape.capacity {
+                            return None;
+                        }
+                        max.checked_sub(start)?
+                    }
+                    None => source_shape.capacity.checked_sub(start)?,
+                };
+                (end <= source_shape.capacity).then_some(ExactSliceShape { length, capacity })
+            }
+            "call_expression" => match self.exact_append_backing(node)? {
+                ExactAppendBacking::Retained { result_shape, .. } => Some(result_shape),
+                ExactAppendBacking::Replaced { .. } => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn exact_append_backing(&self, node: Node<'tree>) -> Option<ExactAppendBacking> {
+        let source_node = self.builtin_append_source(node)?;
+        let source_name = node_text(self.prepared.source(), source_node)?;
+        let source = self.binding_value(source_name, node.start_byte())?;
+        let shape = self.exact_slice_shapes.get(&source).copied()?;
+        let arguments = all_call_arguments(node);
+        if !arguments[1..]
+            .iter()
+            .all(|argument| self.is_go_constant_evaluation(*argument))
+        {
+            return None;
+        }
+        let added = u128::try_from(arguments.len().checked_sub(1)?).ok()?;
+        let length = shape.length.checked_add(added)?;
+        if length <= shape.capacity {
+            Some(ExactAppendBacking::Retained {
+                source,
+                append_start: shape.length,
+                result_shape: ExactSliceShape {
+                    length,
+                    capacity: shape.capacity,
+                },
+            })
+        } else {
+            Some(ExactAppendBacking::Replaced {
+                append_start: shape.length,
+            })
+        }
+    }
+
+    fn expression_has_boolean_domain(&self, node: Node<'tree>) -> bool {
+        let node = transparent_parenthesized_expression(node);
+        if matches!(node.kind(), "true" | "false")
+            && self.predeclared_constant_has_builtin_meaning(node)
+        {
+            return true;
+        }
+        self.expression_type_identity(node, node.start_byte())
+            .is_some_and(|identity| {
+                identity.name.as_ref() == "bool"
+                    && identity.pointer_depth == 0
+                    && identity.declaration.is_none()
+            })
+    }
+
+    fn is_direct_value_field(&self, selector: Node<'tree>) -> bool {
+        // Reading a depth-zero field from a proven nonpointer value requires
+        // no implicit dereference. Keep every selector outside this exact
+        // same-file type and declaration proof conservatively unknown.
+        let Some(operand) = selector.child_by_field_name("operand") else {
+            return false;
+        };
+        let Some(identity) = self.expression_type_identity(operand, selector.start_byte()) else {
+            return false;
+        };
+        if identity.pointer_depth != 0 {
+            return false;
+        }
+
+        let Some(field_name) = selector
+            .child_by_field_name("field")
+            .and_then(|field| nonempty_node_text(self.prepared.source(), field))
+        else {
+            return false;
+        };
+        identity
+            .declaration
+            .and_then(|declaration| self.direct_struct_fields.get(&declaration))
+            .is_some_and(|fields| fields.contains(field_name))
+    }
+
+    /// The memory-location identity of `operand.field`, and whether it is the
+    /// field's own declaration.
+    ///
+    /// Go auto-dereferences a pointer to a struct, so `holder.Value` and
+    /// `pointer.Value` name the same field of the same struct type; the
+    /// operand's pointer depth is deliberately ignored. When the file does not
+    /// state the declaration -- an unresolved operand type, an imported struct,
+    /// a name two structs share -- the locator falls back to one interned
+    /// per field name per procedure. That fallback still lets a store and a
+    /// load of one name meet, which anchoring each occurrence separately would
+    /// silently prevent, and the caller publishes a field-identity gap for it.
+    fn memory_member_locator(
+        &mut self,
+        operand: Node<'tree>,
+        field: Node<'tree>,
+    ) -> Result<(SemanticLocator, bool), GoLoweringError> {
+        let name = node_text(self.prepared.source(), field);
+        let declaration_anchor = name.and_then(|name| {
+            let identity = self.expression_type_identity(operand, operand.start_byte())?;
+            let declaration = identity.declaration?;
+            self.struct_field_anchors
+                .get(&(declaration, name.into()))
+                .or_else(|| {
+                    let declaring = self.struct_declaration_for_declaration(declaration)?;
+                    self.struct_field_anchors.get(&(declaring, name.into()))
+                })
+                .copied()
+        });
+        if let Some(name) = name
+            && declaration_anchor.is_none()
+            && let Some(locator) = self.field_locators.get(name)
+        {
+            return Ok((locator.clone(), false));
+        }
+        let resolved = declaration_anchor.is_some();
+        let anchor = match declaration_anchor {
+            Some(anchor) => anchor,
+            None => source_anchor(field, 0).map_err(GoLoweringError::Invalid)?,
+        };
+        let locator = self.member_locator(anchor);
+        if !resolved && let Some(name) = name {
+            self.field_locators.insert(name.into(), locator.clone());
+        }
+        Ok((locator, resolved))
+    }
+
+    /// The occurrence identity of one imported package value, anchored at the
+    /// use so a workspace-aware consumer can resolve it back to a declaration.
+    fn imported_package_value_locator(
+        &mut self,
+        place: Node<'tree>,
+        field: Node<'tree>,
+    ) -> Result<SemanticLocator, GoLoweringError> {
+        let qualified = node_text(self.prepared.source(), place).map(Box::<str>::from);
+        if let Some(qualified) = qualified.as_deref()
+            && let Some(locator) = self.imported_static_locators.get(qualified)
+        {
+            return Ok(locator.clone());
+        }
+        let anchor = source_anchor(field, 0).map_err(GoLoweringError::Invalid)?;
+        let locator = self.member_locator(anchor);
+        if let Some(qualified) = qualified {
+            self.imported_static_locators
+                .insert(qualified, locator.clone());
+        }
+        Ok(locator)
+    }
+
+    /// Record that an imported package value's declaring package is not
+    /// resolved here, so the occurrence identity above is a use site rather
+    /// than a declaration.
+    ///
+    /// A consumer that read it as a declaration would conclude that two files
+    /// naming one variable name different storage, which is how a real
+    /// cross-package race came back as a clean, complete run.
+    fn add_imported_package_value_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), GoLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::StaticMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            "Go imported package value occurrence is structured, but its declaring package is resolved outside this file",
+        )?;
+        Ok(())
+    }
+
+    /// The storage one package-level name denotes.
+    ///
+    /// `package_value_locators` is filled by walking this file, so a variable
+    /// declared in another file of the same package is absent from it.
+    /// Returning nothing for those recorded no access at all, which made a
+    /// race on such a variable vanish with nothing reported open. Go requires
+    /// every identifier to resolve, and a local binding, an import qualifier
+    /// and a predeclared constant have each been excluded before this point,
+    /// so what remains is a package-level declaration this file does not
+    /// state. Give it an occurrence identity and mark that identity
+    /// unresolved, exactly as an imported value is treated; the concurrency
+    /// provider resolves both to the same declaration.
+    fn package_static_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        node: Node<'tree>,
+        name: &str,
+    ) -> Result<Option<MemoryLocationId>, GoLoweringError> {
+        if let Some(location) = self.static_locations.get(name).copied() {
+            return Ok(Some(location));
+        }
+        let declared = self.package_value_locators.get(name).cloned();
+        let resolved = declared.is_some();
+        let member = match declared {
+            Some(member) => member,
+            None => {
+                // A name this file does declare, yet has no locator for, is a
+                // package constant: `package_value_locators` records only
+                // `var_spec` names on purpose, because a constant is not
+                // mutable storage. Keep returning nothing for those, and for
+                // anything that is not storage at all.
+                if self.package_values.contains(name)
+                    || self.import_bindings.contains_key(name)
+                    || self.package_functions.contains_key(name)
+                    || is_go_predeclared_constant_kind(node.kind())
+                {
+                    return Ok(None);
+                }
+                let anchor = source_anchor(node, 0).map_err(GoLoweringError::Invalid)?;
+                self.member_locator(anchor)
+            }
+        };
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Static { member },
+        )?;
+        // Deliberately no gap here, unlike the imported-selector case. A gap is
+        // a general semantic signal that every consumer reads, and marking
+        // these made an unrelated value-flow plan report this as its blocking
+        // cause. The concurrency provider resolves an occurrence of a package
+        // variable to its declaration on both sides without needing the marker,
+        // and where it cannot the identity simply stays this file's, which is
+        // the behavior that already existed.
+        let _ = resolved;
+        self.static_locations.insert(name.into(), location);
+        Ok(Some(location))
+    }
+
+    /// Materialize the structured location named by one selector, index, or
+    /// dereference place without claiming that the place is accessed.
+    /// Address-of, loads, stores, compound updates, range bindings, and
+    /// multi-result assignments share this interpretation so the same
+    /// source-level place never acquires incompatible location identities.
+    fn memory_place_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        place: Node<'tree>,
+    ) -> Result<Option<MemoryPlaceLocation>, GoLoweringError> {
+        let place = transparent_parenthesized_expression(place);
+        match place.kind() {
+            "selector_expression"
+                if matches!(
+                    self.selector_resolution(place),
+                    GoSelectorResolution::Package
+                ) =>
+            {
+                let field = required_field(place, "field")?;
+                let member = self.imported_package_value_locator(place, field)?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Static { member },
+                )?;
+                self.add_imported_package_value_gap(builder, point, location)?;
+                Ok(Some((MemoryAccessKind::Static, location, None)))
+            }
+            "selector_expression" if !self.selector_denotes_no_location(place) => {
+                let operand =
+                    transparent_parenthesized_expression(required_field(place, "operand")?);
+                let field = required_field(place, "field")?;
+                let base =
+                    self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+                let (member, resolved) = self.memory_member_locator(operand, field)?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Field { base, member },
+                )?;
+                if !resolved {
+                    self.add_field_identity_gap(builder, point, location)?;
+                }
+                Ok(Some((MemoryAccessKind::Field, location, None)))
+            }
+            "index_expression"
+                if place
+                    .child_by_field_name("index")
+                    .is_some_and(|index| !is_go_type_syntax(index.kind())) =>
+            {
+                let operand = required_field(place, "operand")?;
+                let index_node = required_field(place, "index")?;
+                let base =
+                    self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+                let constant_index = self.canonical_integer_index_value(builder, index_node)?;
+                let index = match constant_index {
+                    Some((value, _)) => value,
+                    None => self.expression_value(
+                        builder,
+                        index_node,
+                        self.expression_value_kind(index_node),
+                    )?,
+                };
+                let value_copy = self.expression_index_value_copy(operand, operand.start_byte());
+                let location = self.session.add_memory_location_with_value_copy(
+                    builder,
+                    point,
+                    MemoryLocationKind::Index {
+                        base,
+                        index: Some(index),
+                        constant_index: constant_index.map(|(_, magnitude)| magnitude),
+                        identity: if self.expression_storage_kind(operand, operand.start_byte())
+                            == Some(GoStorageKind::Map)
+                        {
+                            brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Aggregate
+                        } else {
+                            brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element
+                        },
+                    },
+                    value_copy,
+                )?;
+                Ok(Some((
+                    MemoryAccessKind::Index,
+                    location,
+                    Some((index, constant_index.is_some())),
+                )))
+            }
+            "unary_expression" if unary_operator_kind(place) == Some("*") => {
+                let operand = required_field(place, "operand")?;
+                let address =
+                    self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Dereference { address },
+                )?;
+                Ok(Some((MemoryAccessKind::Dereference, location, None)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Materialize a place that is actually loaded or stored and publish the
+    /// remaining flow-state limitation for indexed memory. Merely taking a
+    /// place's address must use `memory_place_location` directly: an address
+    /// does not discharge an index identity through a fabricated access.
+    fn memory_access_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        place: Node<'tree>,
+    ) -> Result<Option<(MemoryAccessKind, MemoryLocationId)>, GoLoweringError> {
+        let Some((kind, location, index)) = self.memory_place_location(builder, point, place)?
+        else {
+            return Ok(None);
+        };
+        if kind == MemoryAccessKind::Index {
+            // Flow-state does not yet project indexed properties. Keep that
+            // omission explicit even when the IR can prove a literal index
+            // identity for value-flow consumers.
+            self.add_unprojected_index_gap(
+                builder,
+                point,
+                location,
+                index.is_some_and(|(_, exact)| exact),
+            )?;
+        }
+        Ok(Some((kind, location)))
+    }
+
+    /// Reuse one procedure-local value for each structured integer-literal
+    /// magnitude. A dynamic expression, including a local rebound to a
+    /// constant, deliberately remains unknown until constant propagation can
+    /// prove its value.
+    fn canonical_integer_index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(ValueId, u128)>, GoLoweringError> {
+        let Some(index) = go_integer_literal_value(self.prepared.source(), node) else {
+            return Ok(None);
+        };
+        if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
+            &self.constant_index_values,
+            &mut self.expression_values,
+            index,
+            node.id(),
+        ) {
+            return Ok(Some((value, index)));
+        }
+        let value =
+            self.expression_value(builder, node, SemanticValueKind::UnsignedInteger(index))?;
+        self.constant_index_values.insert(index, value);
+        Ok(Some((value, index)))
+    }
+
+    fn add_field_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), GoLoweringError> {
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::FieldMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            SemanticGapDischarge::ExactFieldLayout,
+            "Go field occurrence is structured, but its struct declaration identity is not yet resolved",
+        )?;
+        Ok(())
+    }
+
+    fn add_unprojected_index_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+        exact_index: bool,
+    ) -> Result<(), GoLoweringError> {
+        let discharge = if exact_index {
+            // Canonical literal magnitude is the cross-occurrence identity
+            // value-flow needs; this marker deliberately says nothing about
+            // flow-state indexed-property projection. A dynamic structured
+            // index remains available for scalar refinement without claiming
+            // that discharge.
+            SemanticGapDischarge::CanonicalIndexIdentity
+        } else {
+            SemanticGapDischarge::None
+        };
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::IndexMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unsupported,
+            discharge,
+            "Go index identity is deliberately unprojected from flow state",
+        )?;
+        Ok(())
+    }
+
+    /// Whether a selector denotes no runtime memory location.
+    ///
+    /// Two shapes read like a field access but are not one: a call's callee
+    /// (`pkg.Func(...)`, `receiver.Method(...)`, whose selection the call site
+    /// already models), and a package qualifier, whose root identifier names
+    /// no value this procedure binds and carries no value type. Minting a
+    /// `Field` location for either would publish an undischargeable
+    /// field-memory gap on syntax that holds nothing.
+    fn selector_denotes_no_location(&self, node: Node<'tree>) -> bool {
+        match self.selector_resolution(node) {
+            // `pkg.Name` names storage this file does not declare. Treating it
+            // as no location made every cross-package race vanish: no access
+            // was recorded, so no pair was compared, and the run still called
+            // itself complete.
+            GoSelectorResolution::Package => return false,
+            GoSelectorResolution::Method { .. } | GoSelectorResolution::InterfaceMethod { .. } => {
+                return true;
+            }
+            GoSelectorResolution::Field => return false,
+            GoSelectorResolution::Unknown => {}
+        }
+        let Some(operand) = node.child_by_field_name("operand") else {
+            return true;
+        };
+        if !is_go_binding_reference_kind(operand.kind()) {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), operand) else {
+            return true;
+        };
+        self.binding_value(name, operand.start_byte()).is_none()
+            && self
+                .expression_type_identity(operand, operand.start_byte())
+                .is_none()
+    }
+
+    fn builtin_call_kind(&self, node: Node<'tree>) -> Option<GoBuiltinCall> {
+        if node.kind() != "call_expression" {
+            return None;
+        }
+        let function = transparent_parenthesized_expression(node.child_by_field_name("function")?);
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), function)?;
+        let builtin = GoBuiltinCall::from_name(name)?;
+        let byte = function.start_byte();
+        let name_is_declared = self.package_shadowing.shadows(name)
+            || self.binding_value(name, byte).is_some()
+            || self
+                .omitted_capture_names
+                .iter()
+                .any(|capture| capture.as_ref() == name)
+            || self.package_functions.contains_key(name)
+            || self.package_values.contains(name)
+            || self.import_bindings.contains_key(name)
+            || visible_go_named_type(self.named_type_definitions, name, byte).is_some();
+        (!name_is_declared).then_some(builtin)
+    }
+
+    fn note_predeclared_builtin_assumption(&mut self, builtin: GoBuiltinCall) {
+        self.predeclared_builtin_assumptions.insert(builtin);
+    }
+
+    fn is_builtin_new_call(&self, node: Node<'tree>) -> bool {
+        if self.builtin_call_kind(node) != Some(GoBuiltinCall::New) {
+            return false;
+        }
+        let arguments = all_call_arguments(node);
+        let [argument] = arguments.as_slice() else {
+            return false;
+        };
+        is_go_type_syntax(argument.kind())
+    }
+
+    /// Return the runtime operand when call-shaped Go syntax is exactly a
+    /// conversion to a visible type. Tree-sitter gives named scalar
+    /// conversions such as `error(nil)` the same shape as an invocation, so
+    /// the adapter must consult structured binding and type inventories before
+    /// publishing a call site. An imported `pkg.Name(value)` selector stays a
+    /// call when its declaration kind is unavailable: the same syntax can name
+    /// an imported function, and guessing would hide a real unresolved call.
+    fn call_shaped_type_conversion_operand(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        if node.kind() != "call_expression" {
+            return None;
+        }
+        let arguments = all_call_arguments(node);
+        let [operand] = arguments.as_slice() else {
+            return None;
+        };
+        let mut function = node.child_by_field_name("function")?;
+        loop {
+            match function.kind() {
+                "parenthesized_expression" => function = first_named_child(function)?,
+                "unary_expression" if unary_operator_kind(function) == Some("*") => {
+                    function = required_field(function, "operand").ok()?;
+                }
+                _ => break,
+            }
+        }
+        if is_go_type_syntax(function.kind()) || self.unsafe_pointer_type(function) {
+            return Some(*operand);
+        }
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), function)?;
+        let byte = function.start_byte();
+        let value_shadowed = self.binding_value(name, byte).is_some()
+            || self
+                .omitted_capture_names
+                .iter()
+                .any(|capture| capture.as_ref() == name)
+            || self.package_functions.contains_key(name)
+            || self.package_values.contains(name)
+            || self.import_bindings.contains_key(name);
+        (!value_shadowed
+            && (is_predeclared_go_type(name)
+                || visible_go_named_type(self.named_type_definitions, name, byte).is_some()))
+        .then_some(*operand)
+    }
+
+    /// The structured conversion this expression performs, in either spelling.
+    fn type_conversion(&self, node: Node<'tree>) -> Option<GoTypeConversion<'tree>> {
+        if node.kind() == "type_conversion_expression" {
+            return Some(GoTypeConversion {
+                target: node.child_by_field_name("type")?,
+                operand: node.child_by_field_name("operand")?,
+            });
+        }
+        let operand = self.call_shaped_type_conversion_operand(node)?;
+        let mut target = node.child_by_field_name("function")?;
+        while target.kind() == "parenthesized_expression" {
+            target = first_named_child(target)?;
+        }
+        Some(GoTypeConversion { target, operand })
+    }
+
+    /// The underlying type a conversion's target syntax names.
+    ///
+    /// A conversion whose target is a plain type name parses as a call, so
+    /// tree-sitter labels that name `identifier` rather than `type_identifier`.
+    /// Resolving it through the file's named-type inventory is the structured
+    /// answer; the rest of the type syntax resolves as written.
+    fn conversion_target_underlying(&self, target: Node<'tree>) -> Option<Node<'tree>> {
+        let Some(definition) = self.conversion_target_definition(target) else {
+            return self.file_underlying_type(target, target.start_byte());
+        };
+        self.file_underlying_type(definition.underlying, definition.underlying.start_byte())
+    }
+
+    /// The named-type definition a call-shaped conversion target names.
+    fn conversion_target_definition(
+        &self,
+        target: Node<'tree>,
+    ) -> Option<GoNamedTypeDefinition<'tree>> {
+        if target.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), target)?;
+        self.visible_named_type_definition(name, target.start_byte())
+    }
+
+    /// The type identity a conversion establishes for its result.
+    fn conversion_target_identity(
+        &self,
+        target: Node<'tree>,
+        byte: usize,
+    ) -> Option<GoTypeIdentity> {
+        if target.kind() != "identifier" {
+            return self.type_identity(target, byte);
+        }
+        let name = nonempty_node_text(self.prepared.source(), target)?;
+        Some(GoTypeIdentity {
+            pointer_depth: 0,
+            name: name.into(),
+            declaration: self
+                .conversion_target_definition(target)
+                .map(|definition| definition.declaration),
+        })
+    }
+
+    /// The underlying aggregate an exact by-value conversion produces.
+    ///
+    /// Go converts between two types when their underlying types are
+    /// identical, and the conversion of a value aggregate duplicates the whole
+    /// value. Identity is proved by reaching one underlying type node from both
+    /// sides through the file's named-type inventory, never by comparing
+    /// rendered spellings, so two separately written but structurally equal
+    /// struct literals stay unproven here.
+    fn exact_value_aggregate_conversion(
+        &self,
+        conversion: GoTypeConversion<'tree>,
+        byte: usize,
+    ) -> Option<Node<'tree>> {
+        let target = self.conversion_target_underlying(conversion.target)?;
+        if !matches!(
+            target.kind(),
+            "struct_type" | "array_type" | "implicit_length_array_type"
+        ) {
+            return None;
+        }
+        let operand = transparent_parenthesized_expression(conversion.operand);
+        (self.expression_underlying_type(operand, byte)?.id() == target.id()).then_some(target)
+    }
+
+    /// The underlying type this expression's proven type resolves to.
+    fn expression_underlying_type(&self, node: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
+        let node = transparent_parenthesized_expression(node);
+        if let Some(conversion) = self.type_conversion(node) {
+            return self.conversion_target_underlying(conversion.target);
+        }
+        if matches!(
+            node.kind(),
+            "composite_literal" | "type_assertion_expression"
+        ) && let Some(type_node) = node.child_by_field_name("type")
+        {
+            return self.file_underlying_type(type_node, byte);
+        }
+        let identity = self.expression_type_identity(node, byte)?;
+        if identity.pointer_depth != 0 {
+            return None;
+        }
+        let definition = self.named_type_definition_for_declaration(identity.declaration?)?;
+        self.file_underlying_type(definition.underlying, definition.underlying.start_byte())
+    }
+
+    fn builtin_make_allocation_kind(&self, node: Node<'tree>) -> Option<AllocationKind> {
+        if self.builtin_call_kind(node) != Some(GoBuiltinCall::Make) {
+            return None;
+        }
+        let arguments = all_call_arguments(node);
+        let kind = self.file_underlying_type(*arguments.first()?, node.start_byte())?;
+        match kind.kind() {
+            "slice_type" => Some(AllocationKind::Slice),
+            "map_type" => Some(AllocationKind::Array),
+            "channel_type" => Some(AllocationKind::LanguageDefined("go-channel".into())),
+            _ => None,
+        }
+    }
+
+    fn builtin_append_source(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        if self.builtin_call_kind(node) != Some(GoBuiltinCall::Append) {
+            return None;
+        }
+        let arguments = all_call_arguments(node);
+        (arguments.len() >= 2).then(|| arguments[0])
+    }
+
+    fn exact_builtin_copy(&self, node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>, u128)> {
+        if self.builtin_call_kind(node) != Some(GoBuiltinCall::Copy) {
+            return None;
+        }
+        let arguments = all_call_arguments(node);
+        let [destination, source] = arguments.as_slice() else {
+            return None;
+        };
+        let destination_shape = self.expression_slice_shape(*destination, node.start_byte())?;
+        let source_shape = self.expression_slice_shape(*source, node.start_byte())?;
+        Some((
+            *destination,
+            *source,
+            destination_shape.length.min(source_shape.length),
+        ))
+    }
+
+    fn is_import_qualifier(&self, node: Node<'tree>) -> bool {
+        if node.kind() != "identifier" {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return false;
+        };
+        self.import_bindings.contains_key(name)
+            && self
+                .omitted_capture_names
+                .binary_search_by(|capture| capture.as_ref().cmp(name))
+                .is_err()
+            && self.binding_value(name, node.start_byte()).is_none()
+    }
+
+    /// The single runtime argument of a `panic(v)` that still carries the
+    /// predeclared builtin meaning.
+    ///
+    /// `panic` is an ordinary predeclared identifier, so a program that
+    /// declares its own `panic` keeps the ordinary call lowering, exactly as
+    /// `new`, `true`, and `false` do.
+    fn builtin_panic_argument(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        if self.builtin_call_kind(node) != Some(GoBuiltinCall::Panic) {
+            return None;
+        }
+        let [argument] = call_arguments(node)[..] else {
+            return None;
+        };
+        // A spread `panic(vs...)` is not legal Go, so a variadic argument here
+        // is not a builtin panic.
+        (argument.kind() != "variadic_argument").then_some(argument)
+    }
+
+    /// The channel argument of an unshadowed predeclared `close(ch)` call.
+    fn builtin_close_argument(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        if self.builtin_call_kind(node) != Some(GoBuiltinCall::Close) {
+            return None;
+        }
+        let [argument] = call_arguments(node)[..] else {
+            return None;
+        };
+        (argument.kind() != "variadic_argument").then_some(argument)
+    }
+
+    fn unsafe_pointer_type(&self, node: Node<'tree>) -> bool {
+        node.kind() == "selector_expression"
+            && node
+                .child_by_field_name("operand")
+                .and_then(|operand| node_text(self.prepared.source(), operand))
+                .and_then(|package| self.import_bindings.get(package))
+                .is_some_and(|path| path.as_ref() == "unsafe")
+            && node
+                .child_by_field_name("field")
+                .and_then(|field| {
+                    node_text(self.prepared.source(), field).map(|field| field == "Pointer")
+                })
+                .unwrap_or(false)
+    }
+
+    fn builtin_memory_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        name: &'static str,
+    ) -> Result<ValueId, GoLoweringError> {
+        self.value(
+            builder,
+            point,
+            SemanticValueKind::LanguageDefined(name.into()),
+        )
+    }
+
+    fn lower_non_call_builtin(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: GoBuiltinCallSite<'tree>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let GoBuiltinCallSite {
+            node,
+            result,
+            entry,
+            next,
+            scope,
+            builtin,
+        } = call;
+        let arguments = call_arguments(node)
+            .into_iter()
+            .map(go_call_argument_value_node)
+            .collect::<Vec<_>>();
+        if matches!(
+            builtin,
+            GoBuiltinCall::Delete | GoBuiltinCall::Clear | GoBuiltinCall::Copy
+        ) && ((builtin == GoBuiltinCall::Delete && arguments.len() == 2)
+            || (builtin == GoBuiltinCall::Clear && arguments.len() == 1)
+            || (builtin == GoBuiltinCall::Copy && arguments.len() == 2))
+        {
+            let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+            let base = self.expression_value(
+                builder,
+                arguments[0],
+                self.expression_value_kind(arguments[0]),
+            )?;
+            let index = if builtin == GoBuiltinCall::Delete {
+                Some(self.expression_value(
+                    builder,
+                    arguments[1],
+                    self.expression_value_kind(arguments[1]),
+                )?)
+            } else {
+                None
+            };
+            if builtin == GoBuiltinCall::Copy {
+                let source = self.expression_value(
+                    builder,
+                    arguments[1],
+                    self.expression_value_kind(arguments[1]),
+                )?;
+                let source_location = self.session.add_memory_location(
+                    builder,
+                    boundary,
+                    MemoryLocationKind::Index {
+                        base: source,
+                        index: None,
+                        constant_index: None,
+                        identity: IndexedLocationIdentity::Element,
+                    },
+                )?;
+                let copied = self.value(builder, boundary, SemanticValueKind::Temporary)?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Index,
+                        location: source_location,
+                        result: copied,
+                    },
+                )?;
+                let destination_location = self.session.add_memory_location(
+                    builder,
+                    boundary,
+                    MemoryLocationKind::Index {
+                        base,
+                        index: None,
+                        constant_index: None,
+                        identity: IndexedLocationIdentity::Element,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location: destination_location,
+                        value: copied,
+                    },
+                )?;
+            } else {
+                let location = self.session.add_memory_location(
+                    builder,
+                    boundary,
+                    MemoryLocationKind::Index {
+                        base,
+                        index,
+                        constant_index: None,
+                        identity: IndexedLocationIdentity::Element,
+                    },
+                )?;
+                let marker = self.builtin_memory_value(
+                    builder,
+                    boundary,
+                    if builtin == GoBuiltinCall::Delete {
+                        "go.map.deleted_value"
+                    } else {
+                        "go.clear.zero_value"
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        value: marker,
+                    },
+                )?;
+            }
+            self.session.add_target_edge(builder, boundary, next)?;
+            self.note_deterministic_evaluation_order(builder, entry, node, &arguments)?;
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &arguments,
+                EdgeTarget::normal(boundary),
+                scope,
+                stack,
+            );
+        }
+
+        if builtin == GoBuiltinCall::Make {
+            self.session
+                .add_allocation(builder, entry, result, AllocationKind::Object)?;
+            self.session.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Allocations,
+                SemanticGapKind::Unsupported,
+                "Go make allocation kind is not resolved by the intrafile type declarations",
+            )?;
+        }
+        self.note_deterministic_evaluation_order(builder, entry, node, &arguments)?;
+        self.schedule_expressions(builder, entry, &arguments, next, scope, stack)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), GoLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let Some(source) = self.binding_value(name, node.start_byte()) else {
+            if let Some(location) = self.package_static_location(builder, point, node, name)? {
+                let metadata = self.session.add_value_mapping(builder, node)?;
+                self.session.append_effect_with_metadata(
+                    builder,
+                    point,
+                    metadata,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Static,
+                        location,
+                        result: target,
+                    },
+                )?;
+            }
+            return Ok(());
+        };
+        if let Some((location, kind)) = self.shared_binding_locations.get(&source).copied() {
+            let metadata = self.session.add_value_mapping(builder, node)?;
+            self.session.append_effect_with_metadata(
+                builder,
+                point,
+                metadata,
+                SemanticEffect::MemoryLoad {
+                    kind,
+                    location,
+                    result: target,
+                },
+            )?;
+            return Ok(());
+        }
+        let kind = if Some(source) == self.receiver {
+            ValueFlowKind::Receiver
+        } else if self.local_at(name, node.start_byte()) == Some(source)
+            || self.captured_values.get(name).copied() == Some(source)
+        {
+            ValueFlowKind::Local
+        } else {
+            ValueFlowKind::Parameter
+        };
+        if source != target {
+            // `point` is the entry selected by the enclosing evaluation and
+            // may be wider than this identifier (for example `(value)`). The
+            // lexical read event is spelled by the identifier itself, so keep
+            // its exact mapping instead of inheriting the wrapper's metadata.
+            let metadata = self.session.add_value_mapping(builder, node)?;
+            self.session.append_effect_with_metadata(
+                builder,
+                point,
+                metadata,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn step(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        work: Work<'tree>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        if self.session.cancellation().is_cancelled() {
+            return Err(GoLoweringError::Cancelled(Box::default()));
+        }
+        match work {
+            Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+                label,
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, label, stack)
+            }
+            Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+            } => self.expression(builder, node, entry, next, scope, stack),
+            Work::Condition {
+                node,
+                entry,
+                when_true,
+                when_false,
+                scope,
+            } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
+            Work::DeferredCall {
+                node,
+                entry,
+                next,
+                scope,
+            } => self.deferred_call_expression(builder, node, entry, next, scope, stack),
+            Work::RetainContinuations { mut cursor } => {
+                while cursor < self.statement_continuations.len() {
+                    let continuation = StatementContinuationId::try_from_index(cursor)?;
+                    cursor += 1;
+                    if self.materialized_continuations.contains(&continuation) {
+                        continue;
+                    }
+                    let scope = self.statement_continuations[continuation.index()].retention_scope;
+                    stack.push(Work::RetainContinuations { cursor });
+                    self.materialize_statement_next(
+                        builder,
+                        StatementNext::Continuation(continuation),
+                        scope,
+                        stack,
+                    )?;
+                    break;
+                }
+                Ok(())
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        // A folded literal keeps exactly one arm. Recording the guard is what
+        // keeps the fold legible: nothing else in the frozen artifact says the
+        // branch was constant (#2443).
+        if let Some(value) = self.folded_boolean_constant(node) {
+            let taken = if value { when_true } else { when_false };
+            self.session.add_target_edge(builder, entry, taken)?;
+            return self.record_guard(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(when_true),
+                (!value).then_some(when_false),
+            );
+        }
+        let normalized_unary =
+            if node.kind() == "unary_expression" && unary_operator_kind(node) == Some("!") {
+                let (operand, negated) = self.peel_condition_wrappers(node)?;
+                let normalized = self.normalize_peeled_condition(builder, operand, negated)?;
+                if normalized.is_none() {
+                    // With no normalized outer predicate, negation changes the
+                    // operand's outcome, not its identity. Peel the whole wrapper
+                    // chain once, keep the terminal decision, and carry the net
+                    // polarity into its continuations.
+                    let (when_true, when_false) = if negated {
+                        (when_false, when_true)
+                    } else {
+                        (when_true, when_false)
+                    };
+                    stack.push(Work::Condition {
+                        node: operand,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
+                    });
+                    return Ok(());
+                }
+                normalized
+            } else {
+                None
+            };
+        if let Some(value) =
+            normalized_unary
+                .as_ref()
+                .and_then(|(predicate, subject)| match (predicate, subject) {
+                    (GuardPredicate::ConstantBoolean { value }, None) => Some(*value),
+                    _ => None,
+                })
+        {
+            let taken = if value { when_true } else { when_false };
+            self.session.add_target_edge(builder, entry, taken)?;
+            return self.record_guard(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(when_true),
+                (!value).then_some(when_false),
+            );
+        }
+        match (node.kind(), go_boolean_operator_kind(node)) {
+            ("binary_expression", Some(operator @ ("&&" | "||"))) => {
+                let left = required_field(node, "left")?;
+                let right = required_field(node, "right")?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" => ShortCircuitKind::And,
+                    "||" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects Go boolean operators"),
+                };
+                schedule_short_circuit_condition(
+                    stack,
+                    kind,
+                    (left, entry),
+                    (right, right_entry),
+                    when_true,
+                    when_false,
+                    scope,
+                    |node, entry, when_true, when_false, scope| Work::Condition {
+                        node,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
+                    },
+                );
+                Ok(())
+            }
+            ("parenthesized_expression", _) => {
+                let value =
+                    first_runtime_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
+                stack.push(Work::Condition {
+                    node: value,
+                    entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                Ok(())
+            }
+            _ => {
+                let decision = self.session.add_node_point(builder, node, Vec::new())?;
+                self.session.add_target_edge(builder, decision, when_true)?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
+                let normalized = match normalized_unary {
+                    Some(normalized) => Some(normalized),
+                    None => self.normalize_condition(builder, node)?,
+                };
+                let (predicate, subject) = match normalized {
+                    Some(normalized) => normalized,
+                    None => {
+                        // A Go condition tests this expression's Boolean value.
+                        // Unknown expression semantics remain unknown in value
+                        // flow, without discarding the decision's exact subject.
+                        let value =
+                            self.expression_value(builder, node, self.expression_value_kind(node))?;
+                        (GuardPredicate::Truthy { value }, Some(value))
+                    }
+                };
+                self.record_guard(
+                    builder,
+                    decision,
+                    predicate,
+                    subject,
+                    Some(when_true),
+                    Some(when_false),
+                )?;
+                stack.push(Work::Expression {
+                    node,
+                    entry,
+                    next: EdgeTarget::normal(decision),
+                    scope,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn predeclared_constant_has_builtin_meaning(&self, node: Node<'tree>) -> bool {
+        let name = node.kind();
+        is_go_predeclared_constant_kind(name)
+            && !self.predeclared_shadowed.shadows(name)
+            && !self.package_shadowing.shadows(name)
+            && self.binding_value(name, node.start_byte()).is_none()
+            && !self
+                .omitted_capture_names
+                .iter()
+                .any(|captured| captured.as_ref() == name)
+    }
+
+    fn is_go_constant_value(&self, node: Node<'tree>) -> bool {
+        is_go_constant_value_kind(node.kind())
+            && (!is_go_predeclared_constant_kind(node.kind())
+                || self.predeclared_constant_has_builtin_meaning(node))
+    }
+
+    fn expression_value_kind(&self, node: Node<'tree>) -> SemanticValueKind {
+        if self.is_context_done_on_formal(node) {
+            SemanticValueKind::LanguageDefined("go.context_done_formal_channel".into())
+        } else if self.package_function_target(node).is_some()
+            || node.kind() == "func_literal"
+            || node.parent().is_some_and(|parent| {
+                parent.kind() == "call_expression"
+                    && field_matches(parent, "function", node)
+                    && parent
+                        .parent()
+                        .is_some_and(|statement| statement.kind() == "defer_statement")
+            })
+            || (node.kind() == "selector_expression"
+                && (matches!(
+                    self.selector_resolution(node),
+                    GoSelectorResolution::Method { .. }
+                        | GoSelectorResolution::InterfaceMethod { .. }
+                ) || node.parent().is_some_and(|parent| {
+                    parent.kind() == "call_expression" && field_matches(parent, "function", node)
+                })))
+        {
+            SemanticValueKind::Callable
+        } else if node.kind() == "unary_expression" && unary_operator_kind(node) == Some("&") {
+            SemanticValueKind::Address
+        } else if node.kind() == "nil" && self.predeclared_constant_has_builtin_meaning(node) {
+            SemanticValueKind::Null
+        } else if let Some(value) = self.folded_boolean_constant(node) {
+            SemanticValueKind::Boolean(value)
+        } else if let Some(value) = go_integer_literal_value(self.prepared.source(), node) {
+            SemanticValueKind::UnsignedInteger(value)
+        } else if let Some(text) = go_string_literal_text(self.prepared.source(), node) {
+            SemanticValueKind::ConstantString(text.into())
+        } else if self.is_go_constant_value(node) {
+            SemanticValueKind::Constant
+        } else {
+            SemanticValueKind::Temporary
+        }
+    }
+
+    fn is_context_done_on_formal(&self, node: Node<'tree>) -> bool {
+        if node.kind() != "call_expression" {
+            return false;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return false;
+        };
+        if function.kind() != "selector_expression"
+            || function
+                .child_by_field_name("field")
+                .and_then(|field| node_text(self.prepared.source(), field))
+                != Some("Done")
+        {
+            return false;
+        }
+        let Some(operand) = function.child_by_field_name("operand") else {
+            return false;
+        };
+        let operand = transparent_parenthesized_expression(operand);
+        if self
+            .expression_type_identity(operand, operand.start_byte())
+            .is_none_or(|identity| {
+                identity.pointer_depth != 0 || identity.name.as_ref() != "context.Context"
+            })
+        {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), operand) else {
+            return false;
+        };
+        let Some(value) = self.binding_value(name, operand.start_byte()) else {
+            return false;
+        };
+        self.parameters
+            .values()
+            .any(|parameter| *parameter == value)
+            || self.receiver == Some(value)
+    }
+
+    /// The compile-time boolean a condition names, when `true` and `false`
+    /// still carry the meaning Go predeclares for them.
+    ///
+    /// Both are ordinary predeclared identifiers, so a program may rebind
+    /// either one. A rebound spelling folds nothing and falls through to the
+    /// opaque decision arm, where the decision is still recorded.
+    fn folded_boolean_constant(&self, node: Node<'tree>) -> Option<bool> {
+        let value = match node.kind() {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        let name = if value { "true" } else { "false" };
+        (node.kind() == name && self.predeclared_constant_has_builtin_meaning(node))
+            .then_some(value)
+    }
+
+    /// Publish one guard fact for a decision this lowerer just made.
+    ///
+    /// Arms must already have been added as edges; the IR validator enforces
+    /// that.
+    #[allow(clippy::too_many_arguments)]
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), GoLoweringError> {
+        self.session
+            .add_guard_for_targets(builder, point, predicate, subject, when_true, when_false)?;
+        Ok(())
+    }
+
+    /// Peel transparent condition wrappers once. Parentheses and logical
+    /// negation change no value identity; only negation changes polarity.
+    fn peel_condition_wrappers(
+        &self,
+        condition: Node<'tree>,
+    ) -> Result<(Node<'tree>, bool), GoLoweringError> {
+        let mut cursor = condition;
+        let mut negated = false;
+        loop {
+            match cursor.kind() {
+                "parenthesized_expression" => {
+                    cursor = first_runtime_named_child(cursor)
+                        .ok_or_else(|| missing_field(cursor, "value"))?;
+                }
+                "unary_expression" if unary_operator_kind(cursor) == Some("!") => {
+                    let operand = required_field(cursor, "operand")?;
+                    negated = !negated;
+                    cursor = operand;
+                }
+                _ => break,
+            }
+        }
+        Ok((cursor, negated))
+    }
+
+    /// Normalize only condition shapes established by Go's tree-sitter fields.
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        condition: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, GoLoweringError> {
+        let (condition, negated) = self.peel_condition_wrappers(condition)?;
+        self.normalize_peeled_condition(builder, condition, negated)
+    }
+
+    fn normalize_peeled_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        condition: Node<'tree>,
+        negated: bool,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, GoLoweringError> {
+        let cursor = condition;
+
+        match cursor.kind() {
+            "true" | "false" => {
+                let Some(value) = self.folded_boolean_constant(cursor) else {
+                    return Ok(None);
+                };
+                return Ok(Some((
+                    GuardPredicate::ConstantBoolean {
+                        value: value ^ negated,
+                    },
+                    None,
+                )));
+            }
+            "binary_expression" => {}
+            _ => return Ok(None),
+        }
+
+        let Some(operator) = cursor.child_by_field_name("operator") else {
+            return Ok(None);
+        };
+        let (Some(left), Some(right)) = (
+            cursor.child_by_field_name("left"),
+            cursor.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+
+        let ordered_relation = match operator.kind() {
+            "<" => Some(IntegerComparison::LessThan),
+            "<=" => Some(IntegerComparison::LessThanOrEqual),
+            ">" => Some(IntegerComparison::GreaterThan),
+            ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+            _ => None,
+        };
+        if let Some(relation) = ordered_relation {
+            let left_integer = go_integer_literal_value(self.prepared.source(), left).is_some();
+            let right_integer = go_integer_literal_value(self.prepared.source(), right).is_some();
+            let (subject, constant, relation) = match (left_integer, right_integer) {
+                (true, false) => (right, left, relation.reverse()),
+                (false, true) => (left, right, relation),
+                (true, true) | (false, false) => return Ok(None),
+            };
+            let constant =
+                self.expression_value(builder, constant, self.expression_value_kind(constant))?;
+            let subject =
+                self.expression_value(builder, subject, self.expression_value_kind(subject))?;
+            return Ok(Some((
+                GuardPredicate::OrderedIntegerComparison {
+                    relation: if negated { relation.negate() } else { relation },
+                    constant,
+                },
+                Some(subject),
+            )));
+        }
+
+        let equal_on_true = match operator.kind() {
+            "==" => !negated,
+            "!=" => negated,
+            _ => return Ok(None),
+        };
+
+        let nil_subject = match (
+            left.kind() == "nil" && self.is_go_constant_value(left),
+            right.kind() == "nil" && self.is_go_constant_value(right),
+        ) {
+            (true, false) => Some(right),
+            (false, true) => Some(left),
+            (true, true) | (false, false) => None,
+        };
+        if let Some(subject) = nil_subject {
+            let subject =
+                self.expression_value(builder, subject, self.expression_value_kind(subject))?;
+            return Ok(Some((
+                GuardPredicate::NullComparison {
+                    null_on_true: equal_on_true,
+                },
+                Some(subject),
+            )));
+        }
+
+        let left_constant = self.is_go_constant_value(left);
+        let right_constant = self.is_go_constant_value(right);
+        let (subject, constant) = match (left_constant, right_constant) {
+            (true, false) => (right, left),
+            (false, true) => (left, right),
+            (true, true) | (false, false) => return Ok(None),
+        };
+        let constant =
+            self.expression_value(builder, constant, self.expression_value_kind(constant))?;
+        let subject =
+            self.expression_value(builder, subject, self.expression_value_kind(subject))?;
+        Ok(Some((
+            GuardPredicate::ConstantEquality {
+                negated: !equal_on_true,
+                constant,
+            },
+            Some(subject),
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: StatementNext,
+        scope: ScopeFrameId,
+        attached_label: Option<Node<'tree>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        match node.kind() {
+            "block" => {
+                let children = named_children(node);
+                self.schedule_statements(builder, entry, &children, next, scope, stack)
+            }
+            "statement_list" => {
+                let children = named_children(node);
+                self.schedule_statements(builder, entry, &children, next, scope, stack)
+            }
+            "expression_statement" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                let expressions = named_children(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &expressions)?;
+                self.schedule_expressions(builder, entry, &expressions, next, scope, stack)
+            }
+            "return_statement" => self.return_statement(builder, node, entry, scope, stack),
+            "break_statement" | "continue_statement" => {
+                let completion = if node.kind() == "break_statement" {
+                    CompletionKind::Break
+                } else {
+                    CompletionKind::Continue
+                };
+                let label_node = control_label_node(node);
+                let label = label_node.and_then(|label| node_text(self.prepared.source(), label));
+                self.abrupt(builder, entry, scope, completion, label, stack)
+            }
+            "labeled_statement" => {
+                let label = required_field(node, "label")?;
+                let statement = named_children(node)
+                    .into_iter()
+                    .find(|child| child.id() != label.id())
+                    .ok_or_else(|| missing_field(node, "statement"))?;
+                stack.push(Work::Statement {
+                    node: statement,
+                    entry,
+                    next,
+                    scope,
+                    label: Some(label),
+                });
+                Ok(())
+            }
+            "if_statement" => self.if_statement(builder, node, entry, next, scope, stack),
+            "for_statement" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.for_statement(builder, node, entry, next, scope, attached_label, stack)
+            }
+            "expression_switch_statement" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.expression_switch_statement(
+                    builder,
+                    node,
+                    entry,
+                    next,
+                    scope,
+                    attached_label,
+                    stack,
+                )
+            }
+            "type_switch_statement" => {
+                self.type_switch_boundary(builder, node, entry, scope, stack)
+            }
+            "select_statement" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.select_boundary(builder, node, entry, next, scope, stack)
+            }
+            "defer_statement" | "go_statement" => {
+                self.deferred_or_spawned_call(builder, node, entry, next, scope, stack)
+            }
+            "goto_statement" | "fallthrough_statement" => self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unsupported,
+                if node.kind() == "goto_statement" {
+                    "goto label resolution and transfer are not lowered"
+                } else {
+                    "fallthrough outside a terminal switch-case position is invalid or not lowered"
+                },
+            ),
+            "send_statement" | "receive_statement" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.communication_statement(builder, node, entry, next, scope, stack)
+            }
+            "assignment_statement" | "short_var_declaration" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.assignment_statement(builder, node, entry, next, scope, stack)
+            }
+            "inc_statement" | "dec_statement" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.increment_statement(builder, node, entry, next, scope, stack)
+            }
+            "var_declaration" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.var_declaration(builder, node, entry, next, scope, stack)
+            }
+            "const_declaration"
+            | "type_declaration"
+            | "function_declaration"
+            | "method_declaration"
+            | "empty_statement" => {
+                let next = self.materialize_statement_next(builder, next, scope, stack)?;
+                self.session.add_target_edge(builder, entry, next)
+            }
+            _ => self.unhandled_control_syntax(builder, node, entry),
+        }
+    }
+
+    fn return_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let values = runtime_expression_children(node);
+        let terminal = if values.is_empty() {
+            entry
+        } else {
+            self.session.add_node_point(builder, node, Vec::new())?
+        };
+        let direct_multi_results = if let [source_node] = values.as_slice()
+            && source_node.kind() == "call_expression"
+            && let Some(result_arity) = self.declared_result_arity.filter(|arity| *arity > 1)
+        {
+            Some(self.multi_result_values(builder, *source_node, result_arity)?)
+        } else {
+            None
+        };
+        let value = (values.len() == 1 && direct_multi_results.is_none())
+            .then(|| self.value(builder, terminal, SemanticValueKind::Return))
+            .transpose()?;
+        if let Some(sources) = &direct_multi_results {
+            for (ordinal, source) in sources.iter().copied().enumerate() {
+                let target = self.value(builder, terminal, SemanticValueKind::Return)?;
+                let identity_preserving = self.named_results.is_empty();
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: if identity_preserving {
+                            ValueFlowKind::IndexedReturn {
+                                ordinal: ordinal as u32,
+                            }
+                        } else {
+                            ValueFlowKind::LanguageDefined
+                        },
+                        source,
+                        target,
+                    },
+                )?;
+                if !identity_preserving {
+                    self.session.record_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::ReturnFlow,
+                        SemanticGapKind::Unsupported,
+                        "Go named result identity after deferred execution is not propagated",
+                    )?;
+                }
+            }
+        } else if let ([source_node], Some(target)) = (values.as_slice(), value) {
+            let source = self.expression_value(
+                builder,
+                *source_node,
+                self.expression_value_kind(*source_node),
+            )?;
+            let identity_preserving =
+                self.return_shape_supported && source_node.kind() != "type_conversion_expression";
+            if identity_preserving {
+                let source =
+                    self.append_returned_aggregate(builder, terminal, *source_node, source)?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source,
+                        target,
+                    },
+                )?;
+            } else {
+                // Retain the returned operand's value dependence even when
+                // its result-binding identity is unsupported. Publication
+                // consumers must not see a disconnected return boundary.
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source,
+                        target,
+                    },
+                )?;
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::ReturnFlow,
+                    if self.return_shape_supported {
+                        SemanticGapKind::Unknown
+                    } else {
+                        SemanticGapKind::Unsupported
+                    },
+                    if self.return_shape_supported {
+                        "explicit Go return conversion result identity is intentionally not propagated"
+                    } else {
+                        "Go named, tuple, and multi-result return flow is not yet lowered"
+                    },
+                )?;
+            }
+        } else if values.len() > 1 {
+            for (ordinal, source_node) in values.iter().copied().enumerate() {
+                let target = self.value(builder, terminal, SemanticValueKind::Return)?;
+                if source_node.kind() == "type_conversion_expression" {
+                    self.session.record_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::ReturnFlow,
+                        SemanticGapKind::Unknown,
+                        "explicit Go return conversion result identity is intentionally not propagated",
+                    )?;
+                    continue;
+                }
+                let source = self.expression_value(
+                    builder,
+                    source_node,
+                    self.expression_value_kind(source_node),
+                )?;
+                let identity_preserving = self.named_results.is_empty();
+                let source = if identity_preserving {
+                    self.append_returned_aggregate(builder, terminal, source_node, source)?
+                } else {
+                    source
+                };
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: if identity_preserving {
+                            ValueFlowKind::IndexedReturn {
+                                ordinal: ordinal as u32,
+                            }
+                        } else {
+                            ValueFlowKind::LanguageDefined
+                        },
+                        source,
+                        target,
+                    },
+                )?;
+                if !identity_preserving {
+                    self.session.record_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::ReturnFlow,
+                        SemanticGapKind::Unsupported,
+                        "Go named result identity after deferred execution is not propagated",
+                    )?;
+                }
+            }
+        }
+        if !values.is_empty() && !self.named_results.is_empty() {
+            let assigned = if let Some(results) = &direct_multi_results {
+                results.to_vec()
+            } else if values.len() == self.named_results.len() {
+                values
+                    .iter()
+                    .copied()
+                    .map(|source| {
+                        self.expression_value(builder, source, self.expression_value_kind(source))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else if values.len() == 1 && values[0].kind() == "call_expression" {
+                self.multi_result_values(builder, values[0], self.named_results.len())?
+                    .into_vec()
+            } else {
+                Vec::new()
+            };
+            if assigned.len() == self.named_results.len() {
+                for (target, value) in self.named_results.clone().into_iter().zip(assigned) {
+                    self.append_binding_assignment(
+                        builder,
+                        terminal,
+                        target,
+                        value,
+                        ValueFlowKind::Local,
+                    )?;
+                }
+            } else {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ReturnFlow,
+                    SemanticGapKind::Unsupported,
+                    "Go explicit return values cannot be related to their named result bindings",
+                )?;
+            }
+        }
+        if values.is_empty() {
+            for source in self.named_results.clone() {
+                let target = self.value(builder, terminal, SemanticValueKind::Return)?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source,
+                        target,
+                    },
+                )?;
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::ReturnFlow,
+                    SemanticGapKind::Unsupported,
+                    "Go bare named-result binding identity is not yet lowered",
+                )?;
+            }
+        }
+        self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
+        self.abrupt(
+            builder,
+            terminal,
+            scope,
+            CompletionKind::Return,
+            None,
+            stack,
+        )?;
+        if values.is_empty() {
+            Ok(())
+        } else {
+            self.schedule_expressions(
+                builder,
+                entry,
+                &values,
+                EdgeTarget::normal(terminal),
+                scope,
+                stack,
+            )
+        }
+    }
+
+    /// Lower `x++` and `x--`.
+    ///
+    /// Go's increment is a statement, not an expression, and it is exactly a
+    /// compound assignment: it reads the operand, computes a value of the
+    /// operand's own type, and writes it back. Modelling it that way is what
+    /// lets a loop-carried value survive an induction step.
+    #[allow(clippy::too_many_arguments)]
+    fn increment_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let expressions = runtime_expression_children(node);
+        let operand = first_runtime_named_child(node)
+            .ok_or_else(|| missing_field(node, "incremented operand"))?;
+        let operand = transparent_parenthesized_expression(operand);
+        let binding = is_go_binding_reference_kind(operand.kind())
+            .then(|| node_text(self.prepared.source(), operand))
+            .flatten()
+            .and_then(|name| Some((name, self.binding_value(name, node.start_byte())?)));
+
+        let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+        let computed = self
+            .session
+            .add_node_value(builder, node, SemanticValueKind::Temporary)?;
+        // `x++` and `x--` change a numeric value by exactly one, which the
+        // syntax states without any type reasoning. Publishing that step as a
+        // structured offset instead of an opaque flow is what lets a bounded
+        // scalar consumer follow a loop induction variable across its update
+        // (issue #2903); an opaque flow ends the value's history there.
+        self.append_effect(
+            builder,
+            boundary,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset {
+                    offset: SignedIntegerMagnitude::new(node.kind() == "dec_statement", 1),
+                },
+                source: old,
+                target: computed,
+            },
+        )?;
+        if let Some((name, target)) = binding {
+            let kind = self.binding_flow_kind(name, target, node.end_byte());
+            self.append_binding_assignment(builder, boundary, target, computed, kind)?;
+        } else if is_go_binding_reference_kind(operand.kind())
+            && let Some(name) = node_text(self.prepared.source(), operand)
+            && let Some(location) =
+                self.package_static_location(builder, boundary, operand, name)?
+        {
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Static,
+                    location,
+                    value: computed,
+                },
+            )?;
+        } else if let Some((kind, location)) =
+            self.memory_access_location(builder, boundary, operand)?
+        {
+            // Scheduling the operand below emits the matching MemoryLoad;
+            // this boundary stores the language-defined incremented value.
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::MemoryStore {
+                    kind,
+                    location,
+                    value: computed,
+                },
+            )?;
+        } else if is_go_binding_reference_kind(operand.kind()) {
+            self.session.record_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Value(old),
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "Go increment target is not a lowered binding",
+            )?;
+        } else {
+            let impacts = SemanticGapImpacts::single(SemanticGapImpact::HeapWrite);
+            let impacts = if operand.kind() == "unary_expression"
+                && unary_operator_kind(operand) == Some("*")
+            {
+                impacts.with(SemanticGapImpact::HeapRead)
+            } else {
+                impacts
+            };
+            self.session.add_gap_with_impacts(
+                builder,
+                boundary,
+                SemanticGapSubject::Value(old),
+                SemanticCapability::Assignments,
+                impacts,
+                SemanticGapKind::Unsupported,
+                "Go increment target write is not a lowered field or index place",
+            )?;
+        }
+        self.session.add_target_edge(builder, boundary, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &expressions,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assignment_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let mut evaluations = self.assignment_evaluation_nodes(node);
+        let mut order_evaluations = self.assignment_order_evaluation_nodes(node);
+        let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        let operator_is_simple = node.kind() == "short_var_declaration"
+            || node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "=");
+        let left = node.child_by_field_name("left");
+        let right = node.child_by_field_name("right");
+        let left_items = left.map(expression_sequence).unwrap_or_default();
+        let right_items = right.map(expression_sequence).unwrap_or_default();
+        let simple_pair = operator_is_simple
+            && left_items.len() == 1
+            && right_items.len() == 1
+            && is_go_binding_reference_kind(left_items[0].kind());
+        let multi_result_call = operator_is_simple
+            && left_items.len() > 1
+            && right_items.len() == 1
+            && matches!(
+                right_items[0].kind(),
+                "call_expression" | "type_assertion_expression"
+            );
+        let multi_result_values = multi_result_call
+            .then(|| self.multi_result_values(builder, right_items[0], left_items.len()))
+            .transpose()?;
+        let tuple_has_memory_target = operator_is_simple
+            && left_items.len() > 1
+            && left_items.len() == right_items.len()
+            && left_items.iter().any(|target| {
+                matches!(
+                    transparent_parenthesized_expression(*target).kind(),
+                    "selector_expression" | "index_expression" | "unary_expression"
+                )
+            });
+        let compound_target = (!operator_is_simple
+            && node.kind() == "assignment_statement"
+            && left_items.len() == 1
+            && right_items.len() == 1
+            && is_go_binding_reference_kind(left_items[0].kind()))
+        .then(|| {
+            let name = node_text(self.prepared.source(), left_items[0])?;
+            Some((name, self.binding_value(name, node.start_byte())?))
+        })
+        .flatten();
+        let compound_static_target = if !operator_is_simple
+            && node.kind() == "assignment_statement"
+            && left_items.len() == 1
+            && right_items.len() == 1
+            && is_go_binding_reference_kind(left_items[0].kind())
+        {
+            let name = node_text(self.prepared.source(), left_items[0]);
+            match name {
+                Some(name) if self.binding_value(name, node.start_byte()).is_none() => self
+                    .package_static_location(builder, boundary, left_items[0], name)?
+                    .map(|location| (name, location)),
+                Some(_) | None => None,
+            }
+        } else {
+            None
+        };
+        // The single memory place this statement writes, when it writes one:
+        // `holder.field = v`, `values[0] = v`, or `*pointer = v`, with any
+        // redundant parentheses removed. Simple and compound updates share
+        // this place identity; tuple assignments are handled independently.
+        let single_target = (node.kind() == "assignment_statement"
+            && left_items.len() == 1
+            && right_items.len() == 1)
+            .then(|| transparent_parenthesized_expression(left_items[0]));
+        let memory_target = single_target.filter(|target| {
+            target.child_by_field_name("operand").is_some()
+                && match target.kind() {
+                    "selector_expression" => !self.selector_denotes_no_location(*target),
+                    "index_expression" => target
+                        .child_by_field_name("index")
+                        .is_some_and(|index| !is_go_type_syntax(index.kind())),
+                    "unary_expression" => unary_operator_kind(*target) == Some("*"),
+                    _ => false,
+                }
+        });
+        let place_target = operator_is_simple.then_some(memory_target).flatten();
+        let compound_place_target = (!operator_is_simple).then_some(memory_target).flatten();
+        let deref_target = single_target.is_some_and(|target| {
+            target.kind() == "unary_expression" && unary_operator_kind(target) == Some("*")
+        });
+
+        if simple_pair {
+            let name_node = left_items[0];
+            let source_node = right_items[0];
+            let name = node_text(self.prepared.source(), name_node).ok_or_else(|| {
+                GoLoweringError::Invalid("Go assignment has invalid identifier range".into())
+            })?;
+            if name != "_" {
+                let target = if node.kind() == "short_var_declaration" {
+                    self.local_declaration_value(name, name_node.start_byte())
+                        .or_else(|| self.binding_value(name, node.start_byte()))
+                } else {
+                    self.binding_value(name, node.start_byte())
+                };
+                if let Some(target) = target {
+                    let value = self.expression_value(
+                        builder,
+                        source_node,
+                        self.expression_value_kind(source_node),
+                    )?;
+                    let identity_preserving = node.kind() == "short_var_declaration"
+                        && self.local_declaration_value(name, name_node.start_byte())
+                            == Some(target)
+                        || self
+                            .exact_append_backing(source_node)
+                            .and_then(|_| self.builtin_append_source(source_node))
+                            .and_then(|source| node_text(self.prepared.source(), source))
+                            .and_then(|source| {
+                                self.binding_value(source, source_node.start_byte())
+                            })
+                            == Some(target)
+                        || self.value_types.get(&target).is_some_and(|target_type| {
+                            self.expression_type_identity(source_node, node.start_byte())
+                                .is_some_and(|source_type| source_type == *target_type)
+                        });
+                    let kind = self.binding_flow_kind(name, target, node.end_byte());
+                    if identity_preserving {
+                        self.append_binding_assignment(builder, boundary, target, value, kind)?;
+                    } else {
+                        // Go still overwrites the target binding when an implicit
+                        // conversion occurs or the source type is unresolved. Keep
+                        // the conversion opaque without dropping that definite write.
+                        self.append_reference_aware_binding_assignment(
+                            builder,
+                            boundary,
+                            source_node,
+                            value,
+                            target,
+                            kind,
+                        )?;
+                    }
+                } else if let Some(location) =
+                    self.package_static_location(builder, boundary, name_node, name)?
+                {
+                    let value = self.expression_value(
+                        builder,
+                        source_node,
+                        self.expression_value_kind(source_node),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Static,
+                            location,
+                            value,
+                        },
+                    )?;
+                } else {
+                    self.session.record_gap(
+                        builder,
+                        boundary,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Assignments,
+                        SemanticGapKind::Unsupported,
+                        "Go identifier assignment target is not a lowered local, parameter, receiver, or capture binding",
+                    )?;
+                }
+            }
+        } else if let Some(values) = multi_result_values {
+            let mut unresolved_identifier_values = Vec::new();
+            for (name_node, value) in left_items.iter().zip(values.iter().copied()) {
+                match name_node.kind() {
+                    "identifier" | "true" | "false" | "nil" | "iota" => {
+                        let name =
+                            node_text(self.prepared.source(), *name_node).ok_or_else(|| {
+                                GoLoweringError::Invalid(
+                                    "Go multi-result assignment has invalid identifier range"
+                                        .into(),
+                                )
+                            })?;
+                        if name == "_" {
+                            continue;
+                        }
+                        let target = if node.kind() == "short_var_declaration" {
+                            self.local_declaration_value(name, name_node.start_byte())
+                                .or_else(|| self.binding_value(name, node.start_byte()))
+                        } else {
+                            self.binding_value(name, node.start_byte())
+                        };
+                        let Some(target) = target else {
+                            unresolved_identifier_values.push(value);
+                            continue;
+                        };
+                        let newly_declared = node.kind() == "short_var_declaration"
+                            && self.local_declaration_value(name, name_node.start_byte())
+                                == Some(target);
+                        let kind = self.binding_flow_kind(name, target, node.end_byte());
+                        if newly_declared {
+                            self.append_binding_assignment(builder, boundary, target, value, kind)?;
+                        } else {
+                            // The intrafile call row does not publish the type of
+                            // each result ordinal. Reusing an existing binding can
+                            // therefore perform an assignment conversion even when
+                            // the target's own type is known. Preserve the definite
+                            // write, but keep its value identity behind the same
+                            // explicit conversion boundary as a scalar assignment.
+                            self.append_converted_binding_assignment(
+                                builder,
+                                boundary,
+                                right_items[0],
+                                value,
+                                target,
+                                kind,
+                            )?;
+                        }
+                    }
+                    "selector_expression" | "index_expression" | "unary_expression" => {
+                        if let Some((kind, location)) =
+                            self.memory_access_location(builder, boundary, *name_node)?
+                        {
+                            let stored = self.assignment_conversion_value(
+                                builder,
+                                boundary,
+                                right_items[0],
+                                value,
+                            )?;
+                            self.append_effect(
+                                builder,
+                                boundary,
+                                SemanticEffect::MemoryStore {
+                                    kind,
+                                    location,
+                                    value: stored,
+                                },
+                            )?;
+                        } else {
+                            self.session.add_gap_with_impacts(
+                                builder,
+                                boundary,
+                                SemanticGapSubject::Value(value),
+                                SemanticCapability::Assignments,
+                                SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+                                SemanticGapKind::Unsupported,
+                                "Go multi-result memory target is not a lowered field, index, or dereference place",
+                            )?;
+                        }
+                    }
+                    _ => {
+                        self.session.add_gap_with_impacts(
+                            builder,
+                            boundary,
+                            SemanticGapSubject::Value(value),
+                            SemanticCapability::Assignments,
+                            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+                            SemanticGapKind::Unsupported,
+                            "Go multi-result assignment target write is not lowered",
+                        )?;
+                    }
+                }
+            }
+            for value in unresolved_identifier_values {
+                self.session.record_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    "Go multi-result value has an identifier assignment target that is not a lowered local, parameter, receiver, or capture binding",
+                )?;
+            }
+        } else if tuple_has_memory_target {
+            // Assignment places are evaluated before the RHS. Materialize
+            // every supported destination while visiting the LHS targets in
+            // order, then read every RHS value before appending any stores.
+            let target_locations = left_items
+                .iter()
+                .map(|target| {
+                    let target = transparent_parenthesized_expression(*target);
+                    matches!(
+                        target.kind(),
+                        "selector_expression" | "index_expression" | "unary_expression"
+                    )
+                    .then(|| self.memory_access_location(builder, boundary, target))
+                    .transpose()
+                    .map(Option::flatten)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let right_values = right_items
+                .iter()
+                .map(|source| {
+                    self.expression_value(builder, *source, self.expression_value_kind(*source))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut unsupported_memory_targets = Vec::new();
+            let mut unsupported_assignment_targets = Vec::new();
+            for (((target_node, source_node), value), target_location) in left_items
+                .iter()
+                .zip(right_items.iter())
+                .zip(right_values.iter().copied())
+                .zip(target_locations)
+            {
+                let target_node = transparent_parenthesized_expression(*target_node);
+                match target_node.kind() {
+                    "identifier" | "true" | "false" | "nil" | "iota" => {
+                        let name =
+                            node_text(self.prepared.source(), target_node).ok_or_else(|| {
+                                GoLoweringError::Invalid(
+                                    "Go tuple assignment has invalid identifier range".into(),
+                                )
+                            })?;
+                        if name == "_" {
+                            continue;
+                        }
+                        let target = if node.kind() == "short_var_declaration" {
+                            self.local_declaration_value(name, target_node.start_byte())
+                                .or_else(|| self.binding_value(name, node.start_byte()))
+                        } else {
+                            self.binding_value(name, node.start_byte())
+                        };
+                        let Some(target) = target else {
+                            unsupported_assignment_targets.push(name.to_owned());
+                            continue;
+                        };
+                        // Keep the existing conservative local-target lowering
+                        // for general tuples. Heap targets use their positional
+                        // RHS value below.
+                        let opaque_source = self.session.add_node_value(
+                            builder,
+                            target_node,
+                            SemanticValueKind::Temporary,
+                        )?;
+                        let kind = self.binding_flow_kind(name, target, node.end_byte());
+                        self.append_converted_binding_assignment(
+                            builder,
+                            boundary,
+                            target_node,
+                            opaque_source,
+                            target,
+                            kind,
+                        )?;
+                    }
+                    "selector_expression" | "index_expression" | "unary_expression" => {
+                        let Some((kind, location)) = target_location else {
+                            unsupported_memory_targets.push(
+                                node_text(self.prepared.source(), target_node)
+                                    .expect("Go assignment target has source text")
+                                    .to_owned(),
+                            );
+                            continue;
+                        };
+                        let stored =
+                            if self.place_has_exact_reference_type(target_node, *source_node) {
+                                value
+                            } else {
+                                self.assignment_conversion_value(
+                                    builder,
+                                    boundary,
+                                    *source_node,
+                                    value,
+                                )?
+                            };
+                        self.append_effect(
+                            builder,
+                            boundary,
+                            SemanticEffect::MemoryStore {
+                                kind,
+                                location,
+                                value: stored,
+                            },
+                        )?;
+                    }
+                    _ => unsupported_assignment_targets.push(
+                        node_text(self.prepared.source(), target_node)
+                            .expect("Go assignment target has source text")
+                            .to_owned(),
+                    ),
+                }
+            }
+            if !unsupported_memory_targets.is_empty() {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapImpacts::single(SemanticGapImpact::ValueFlow)
+                        .with(SemanticGapImpact::HeapWrite)
+                        .with(SemanticGapImpact::Aliasing),
+                    SemanticGapKind::Unsupported,
+                    format!(
+                        "Go tuple assignment memory targets are not lowered: {unsupported_memory_targets:?}"
+                    ),
+                )?;
+            }
+            if !unsupported_assignment_targets.is_empty() {
+                self.session.record_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    &format!(
+                        "Go tuple assignment targets are not lowered: {unsupported_assignment_targets:?}"
+                    ),
+                )?;
+            }
+        } else if let Some((name, target)) = compound_target {
+            // A compound `x op= y` reads both operands, computes a value of the
+            // target's own type, and writes it back into the target binding.
+            let name_node = left_items[0];
+            let source_node = right_items[0];
+            evaluations.insert(0, name_node);
+            order_evaluations.insert(0, name_node);
+            let left_value =
+                self.expression_value(builder, name_node, self.expression_value_kind(name_node))?;
+            let right_value = self.expression_value(
+                builder,
+                source_node,
+                self.expression_value_kind(source_node),
+            )?;
+            let computed =
+                self.session
+                    .add_node_value(builder, node, SemanticValueKind::Temporary)?;
+            if let Some(identity) = self.value_types.get(&target).cloned() {
+                self.value_types.insert(computed, identity);
+            }
+            // `x += n` and `x -= n` over an exact integer literal apply the
+            // same structured step as `x++`, so they publish the same offset
+            // relation. Every other operator, and any right operand that is
+            // not a represented integer literal, keeps the opaque flow.
+            match go_update_integer_offset(self.prepared.source(), node, source_node) {
+                Some(offset) => self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IntegerOffset { offset },
+                        source: left_value,
+                        target: computed,
+                    },
+                )?,
+                None => self.session.append_language_defined_value_flows(
+                    builder,
+                    boundary,
+                    [left_value, right_value],
+                    computed,
+                )?,
+            }
+            let kind = self.binding_flow_kind(name, target, node.end_byte());
+            self.append_binding_assignment(builder, boundary, target, computed, kind)?;
+        } else if let Some((_, location)) = compound_static_target {
+            let name_node = left_items[0];
+            let source_node = right_items[0];
+            evaluations.insert(0, name_node);
+            order_evaluations.insert(0, name_node);
+            let left_value =
+                self.expression_value(builder, name_node, self.expression_value_kind(name_node))?;
+            let right_value = self.expression_value(
+                builder,
+                source_node,
+                self.expression_value_kind(source_node),
+            )?;
+            let computed =
+                self.session
+                    .add_node_value(builder, node, SemanticValueKind::Temporary)?;
+            self.session.append_language_defined_value_flows(
+                builder,
+                boundary,
+                [left_value, right_value],
+                computed,
+            )?;
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Static,
+                    location,
+                    value: computed,
+                },
+            )?;
+        } else if let Some(place) = compound_place_target {
+            // A compound field or index update reads the old place value and
+            // writes the computed value back after every operand is evaluated.
+            // Assignment-target expressions are not scheduled as loads, so
+            // publish both memory effects explicitly at this boundary.
+            let source_node = right_items[0];
+            let left_value =
+                self.expression_value(builder, place, self.expression_value_kind(place))?;
+            let right_value = self.expression_value(
+                builder,
+                source_node,
+                self.expression_value_kind(source_node),
+            )?;
+            let computed =
+                self.session
+                    .add_node_value(builder, node, SemanticValueKind::Temporary)?;
+            self.session.append_language_defined_value_flows(
+                builder,
+                boundary,
+                [left_value, right_value],
+                computed,
+            )?;
+            let Some((kind, location)) = self.memory_access_location(builder, boundary, place)?
+            else {
+                unreachable!("compound_place_target contains only memory places");
+            };
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::MemoryLoad {
+                    kind,
+                    location,
+                    result: left_value,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::MemoryStore {
+                    kind,
+                    location,
+                    value: computed,
+                },
+            )?;
+            order_evaluations = vec![place, source_node];
+        } else if let Some(place) = place_target {
+            // A single selector, index, or dereference target is a real store into memory.
+            // The target's own operand is still evaluated, but the target node
+            // itself must not be scheduled as an expression: reading it would
+            // publish a load of the location this statement writes.
+            let source_node = right_items[0];
+            let value = self.expression_value(
+                builder,
+                source_node,
+                self.expression_value_kind(source_node),
+            )?;
+            let operand = required_field(place, "operand")?;
+            let Some((kind, location)) = self.memory_access_location(builder, boundary, place)?
+            else {
+                unreachable!("place_target contains only memory places");
+            };
+            let stored = if self.place_has_exact_reference_type(place, source_node) {
+                value
+            } else {
+                self.assignment_conversion_value(builder, boundary, source_node, value)?
+            };
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::MemoryStore {
+                    kind,
+                    location,
+                    value: stored,
+                },
+            )?;
+            evaluations = vec![operand];
+            if let Some(index) = place.child_by_field_name("index") {
+                evaluations.push(index);
+            }
+            evaluations.push(source_node);
+        } else if !left_items.is_empty() || !right_items.is_empty() {
+            // A type assertion or another unsupported RHS can still have a
+            // definite overwrite for identifier destinations. Preserve that
+            // update with a fresh opaque conversion so the old parameter/local
+            // identity cannot survive, while the statement-level gap below
+            // continues to describe the unresolved multi-target relation.
+            for target_node in &left_items {
+                if target_node.kind() != "identifier" {
+                    continue;
+                }
+                let Some(name) = node_text(self.prepared.source(), *target_node) else {
+                    continue;
+                };
+                if name == "_" {
+                    continue;
+                }
+                let target = if node.kind() == "short_var_declaration" {
+                    self.local_declaration_value(name, target_node.start_byte())
+                        .or_else(|| self.binding_value(name, node.start_byte()))
+                } else {
+                    self.binding_value(name, node.start_byte())
+                };
+                let Some(target) = target else {
+                    continue;
+                };
+                // The unsupported RHS has no trustworthy source value. Use a
+                // fresh temporary, then pass it through the existing Go
+                // assignment-conversion boundary. This preserves the
+                // definite overwrite without allowing identity consumers to
+                // treat the opaque replacement as a local copy of the old
+                // binding.
+                let opaque_source = self.session.add_node_value(
+                    builder,
+                    *target_node,
+                    SemanticValueKind::Temporary,
+                )?;
+                let kind = self.binding_flow_kind(name, target, node.end_byte());
+                self.append_converted_binding_assignment(
+                    builder,
+                    boundary,
+                    *target_node,
+                    opaque_source,
+                    target,
+                    kind,
+                )?;
+            }
+            let detail = if !operator_is_simple {
+                "Go compound assignment flow is not yet lowered"
+            } else if deref_target {
+                "Go assignment through a pointer dereference target is not yet lowered"
+            } else if single_target.is_some_and(|target| target.kind() == "selector_expression") {
+                "Go assignment to a selector target whose operand names no value this procedure binds is not yet lowered"
+            } else {
+                "Go tuple, multi-result, and multi-target assignment flow is not yet lowered"
+            };
+            let may_write_memory = left_items.iter().any(|target| {
+                matches!(
+                    transparent_parenthesized_expression(*target).kind(),
+                    "selector_expression" | "index_expression" | "unary_expression"
+                )
+            });
+            if may_write_memory {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapImpacts::single(SemanticGapImpact::ValueFlow)
+                        .with(SemanticGapImpact::HeapWrite)
+                        .with(SemanticGapImpact::Aliasing),
+                    SemanticGapKind::Unsupported,
+                    detail,
+                )?;
+            } else {
+                self.session.record_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    detail,
+                )?;
+            }
+        }
+        if node.kind() == "assignment_statement"
+            && node
+                .child_by_field_name("left")
+                .is_some_and(|left| self.binding_requires_runtime_protocol(left))
+        {
+            if memory_target.is_none() {
+                // A target this adapter does not lower still hides whatever
+                // the update protocol would do, including a call.
+                self.session.record_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unknown,
+                    "assignment through indexing or indirection requires runtime refinement",
+                )?;
+            }
+            // The abort edge a nil operand or an out-of-range index would
+            // take is not lowered. Preserve the Go proof that such a panic
+            // cannot rejoin this function's body, including when a defer
+            // recovers it.
+            self.add_non_rejoining_exceptional_exit_gap(
+                builder,
+                scope,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticGapKind::Unsupported,
+                "assignment target evaluation and update panics are not lowered",
+            )?;
+        }
+        self.session.add_target_edge(builder, boundary, next)?;
+        self.note_deterministic_evaluation_order(builder, boundary, node, &order_evaluations)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn var_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let specs = go_var_specs(node);
+        if specs.is_empty() {
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let mut entries = Vec::with_capacity(specs.len());
+        entries.push(entry);
+        for spec in specs.iter().copied().skip(1) {
+            entries.push(self.session.add_node_point(builder, spec, Vec::new())?);
+        }
+        for (index, spec) in specs.iter().copied().enumerate() {
+            let spec_entry = entries[index];
+            let spec_next = entries
+                .get(index + 1)
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(next);
+            let boundary = self.session.add_node_point(builder, spec, Vec::new())?;
+            let names = children_by_field_name(spec, "name");
+            let values = spec
+                .child_by_field_name("value")
+                .map(expression_sequence)
+                .unwrap_or_default();
+            let mut lowered_any = false;
+            let mut unsupported = false;
+            let mut saw_nonblank_target = false;
+            let mut unresolved_any = false;
+            if values.is_empty() {
+                for name_node in &names {
+                    let Some(name) = node_text(self.prepared.source(), *name_node) else {
+                        continue;
+                    };
+                    if name == "_" {
+                        continue;
+                    }
+                    saw_nonblank_target = true;
+                    let Some(target) = self.local_declaration_value(name, name_node.start_byte())
+                    else {
+                        self.session.record_gap(
+                            builder,
+                            boundary,
+                            SemanticGapSubject::Point,
+                            SemanticCapability::Assignments,
+                            SemanticGapKind::Unsupported,
+                            "typed Go zero-value declaration has no lowered local binding",
+                        )?;
+                        unresolved_any = true;
+                        continue;
+                    };
+                    if !self.value_types.contains_key(&target)
+                        && !self
+                            .value_storage_kinds
+                            .get(&target)
+                            .is_some_and(|storage| storage.is_value_aggregate())
+                    {
+                        self.session.record_gap(
+                            builder,
+                            boundary,
+                            SemanticGapSubject::Value(target),
+                            SemanticCapability::Values,
+                            SemanticGapKind::Unsupported,
+                            "Go zero value for an unresolved declared type is not lowered",
+                        )?;
+                        unresolved_any = true;
+                        continue;
+                    }
+                    let zero_kind = if self
+                        .value_types
+                        .get(&target)
+                        .is_some_and(|identity| identity.pointer_depth > 0)
+                    {
+                        SemanticValueKind::Null
+                    } else {
+                        SemanticValueKind::LanguageDefined("go.zero_value".into())
+                    };
+                    let zero = self
+                        .session
+                        .add_node_value(builder, *name_node, zero_kind)?;
+                    // A zero-valued declaration establishes its own storage,
+                    // even when an external type's representation is unknown.
+                    self.fresh_binding_values.insert(zero);
+                    if let Some(storage) = self.value_storage_kinds.get(&target).copied() {
+                        self.value_storage_kinds.insert(zero, storage);
+                    }
+                    if let Some(copy) = self.index_value_copies.get(&target).copied() {
+                        self.index_value_copies.insert(zero, copy);
+                    }
+                    if let Some(identity) = self.index_value_types.get(&target).cloned() {
+                        self.index_value_types.insert(zero, identity);
+                    }
+                    if let Some(copy) = self.channel_payload_copies.get(&target).copied() {
+                        self.channel_payload_copies.insert(zero, copy);
+                    }
+                    if let Some(identity) = self.channel_payload_types.get(&target).cloned() {
+                        self.channel_payload_types.insert(zero, identity);
+                    }
+                    self.append_binding_assignment(
+                        builder,
+                        boundary,
+                        target,
+                        zero,
+                        ValueFlowKind::Local,
+                    )?;
+                    lowered_any = true;
+                }
+            } else {
+                saw_nonblank_target |= names.iter().any(|name_node| {
+                    node_text(self.prepared.source(), *name_node).is_some_and(|name| name != "_")
+                });
+                if names.len() > 1
+                    && values.len() == 1
+                    && values[0].kind() == "call_expression"
+                    && spec.child_by_field_name("type").is_none()
+                {
+                    let results = self.multi_result_values(builder, values[0], names.len())?;
+                    for (name_node, value) in names.iter().zip(results.iter().copied()) {
+                        let Some(name) = node_text(self.prepared.source(), *name_node) else {
+                            continue;
+                        };
+                        if name == "_" {
+                            continue;
+                        }
+                        let Some(target) =
+                            self.local_declaration_value(name, name_node.start_byte())
+                        else {
+                            self.session.record_gap(
+                                builder,
+                                boundary,
+                                SemanticGapSubject::Value(value),
+                                SemanticCapability::Assignments,
+                                SemanticGapKind::Unsupported,
+                                "Go multi-result var value has an identifier target without a lowered local binding",
+                            )?;
+                            continue;
+                        };
+                        self.append_binding_assignment(
+                            builder,
+                            boundary,
+                            target,
+                            value,
+                            ValueFlowKind::Local,
+                        )?;
+                    }
+                    lowered_any = true;
+                } else if names.len() == 1 && values.len() == 1 {
+                    let name_node = names[0];
+                    let value_node = values[0];
+                    if let Some(name) = node_text(self.prepared.source(), name_node)
+                        && name != "_"
+                        && let Some(target) =
+                            self.local_declaration_value(name, name_node.start_byte())
+                    {
+                        let value = self.expression_value(
+                            builder,
+                            value_node,
+                            self.expression_value_kind(value_node),
+                        )?;
+                        let inferred = spec.child_by_field_name("type").is_none();
+                        let identity_preserving = inferred
+                            || self.value_types.get(&target).is_some_and(|target_type| {
+                                self.expression_type_identity(value_node, spec.start_byte())
+                                    .is_some_and(|source_type| source_type == *target_type)
+                            });
+                        // As in assignment: an explicitly typed initialization still
+                        // writes the value, and the structural type check only decides
+                        // whether the local keeps the initializer's identity or derives
+                        // from it through an implicit conversion.
+                        if identity_preserving {
+                            self.append_binding_assignment(
+                                builder,
+                                boundary,
+                                target,
+                                value,
+                                ValueFlowKind::Local,
+                            )?;
+                        } else {
+                            self.append_reference_aware_binding_assignment(
+                                builder,
+                                boundary,
+                                value_node,
+                                value,
+                                target,
+                                ValueFlowKind::Local,
+                            )?;
+                        }
+                        lowered_any = true;
+                    }
+                } else {
+                    unsupported = true;
+                }
+            }
+            if unsupported {
+                self.session.record_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    "Go multi-name, tuple, and multi-result var initialization flow is not yet lowered",
+                )?;
+            }
+            if saw_nonblank_target && !lowered_any && !unsupported && !unresolved_any {
+                self.session.record_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "Go var initialization bound no analyzable local target",
+                )?;
+            }
+            self.session.add_target_edge(builder, boundary, spec_next)?;
+            self.note_deterministic_evaluation_order(builder, spec_entry, spec, &values)?;
+            self.schedule_expressions(
+                builder,
+                spec_entry,
+                &values,
+                EdgeTarget::normal(boundary),
+                scope,
+                stack,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn communication_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let evaluations = communication_evaluations(node);
+        let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        let (operation, channel) = communication_operation_and_channel(node)
+            .ok_or_else(|| missing_field(node, "channel communication"))?;
+        let subject =
+            self.expression_value(builder, channel, self.expression_value_kind(channel))?;
+        let payload = match operation {
+            SynchronizationOperation::ChannelSend => {
+                let value_node = node
+                    .child_by_field_name("value")
+                    .ok_or_else(|| missing_field(node, "value"))?;
+                let copy = self
+                    .expression_channel_payload_copy(channel, channel.start_byte())
+                    .filter(|copy| self.expression_supports_channel_payload_copy(value_node, *copy))
+                    .unwrap_or(SynchronizationPayloadCopy::Unknown);
+                let value = self.expression_value(
+                    builder,
+                    value_node,
+                    self.expression_value_kind(value_node),
+                )?;
+                Some(SynchronizationPayload::Send { value, copy })
+            }
+            SynchronizationOperation::ChannelReceive => {
+                let receive = node
+                    .child_by_field_name("right")
+                    .ok_or_else(|| missing_field(node, "right"))?;
+                let result =
+                    self.expression_value(builder, receive, self.expression_value_kind(receive))?;
+                if let Some(payload_type) =
+                    self.expression_channel_payload_type(channel, channel.start_byte())
+                {
+                    self.value_types.insert(result, payload_type);
+                }
+                if let Some(storage) = self
+                    .expression_channel_payload_copy(channel, channel.start_byte())
+                    .and_then(go_channel_payload_storage_kind)
+                {
+                    self.value_storage_kinds.insert(result, storage);
+                }
+                Some(SynchronizationPayload::Receive { result })
+            }
+            SynchronizationOperation::ChannelClose => None,
+        };
+        self.append_effect(
+            builder,
+            boundary,
+            SemanticEffect::Synchronization {
+                operation,
+                subject,
+                payload,
+            },
+        )?;
+        if let Some(SynchronizationPayload::Receive { result }) = payload
+            && let Some(left) = node.child_by_field_name("left")
+        {
+            let targets = expression_sequence(left);
+            if let [target_node] = targets.as_slice()
+                && is_go_binding_reference_kind(target_node.kind())
+                && let Some(name) = node_text(self.prepared.source(), *target_node)
+                && name != "_"
+            {
+                let target = if direct_child_kind(node, ":=") {
+                    self.local_declaration_value(name, target_node.start_byte())
+                        .or_else(|| self.binding_value(name, node.start_byte()))
+                } else {
+                    self.binding_value(name, node.start_byte())
+                };
+                if let Some(target) = target {
+                    if direct_child_kind(node, ":=")
+                        && self.local_declaration_value(name, target_node.start_byte())
+                            == Some(target)
+                        && let Some(identity) = self.value_types.get(&result).cloned()
+                    {
+                        self.value_types.insert(target, identity);
+                    }
+                    let kind = self.binding_flow_kind(name, target, node.end_byte());
+                    self.append_binding_assignment(builder, boundary, target, result, kind)?;
+                }
+            }
+        }
+        self.add_retained_control_topology_gap(
+            builder,
+            boundary,
+            "channel communication may block and requires scheduler refinement",
+        )?;
+        self.add_non_rejoining_exceptional_exit_gap(
+            builder,
+            scope,
+            boundary,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Unknown,
+            "send on a closed channel and communication-related panics are not lowered",
+        )?;
+        self.session.add_target_edge(builder, boundary, next)?;
+        // The communication boundary already owns the scheduler-dependent
+        // normal-control gap. Evaluation order is a separate fact that occurs
+        // before either operand is evaluated, so attach it to the statement
+        // entry rather than duplicating the boundary's scoped gap.
+        self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deferred_or_spawned_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: StatementNext,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let operand = first_runtime_named_child(node)
+            .ok_or_else(|| missing_field(node, "call expression"))?;
+        let defer_call = supported_defer_call(node, self.procedure_targets);
+        let inside_loop = node.kind() == "defer_statement" && self.defer_is_inside_loop(node);
+        let inside_switch =
+            node.kind() == "defer_statement" && self.defer_is_inside_expression_switch(node);
+        let supported_defer = !inside_loop
+            && !inside_switch
+            && defer_call.is_some()
+            && self.has_stable_deferred_callable(
+                defer_call.expect("a present defer call was checked above"),
+            )?;
+        let evaluations = if operand.kind() == "call_expression" {
+            self.call_operand_evaluations(operand, !supported_defer)?
+        } else {
+            vec![operand]
+        };
+        let continuation_scope = if supported_defer {
+            if !self.deferred_captures.contains_key(&operand.id()) {
+                let capture = self.prepare_deferred_capture(builder, operand)?;
+                self.deferred_captures.insert(operand.id(), capture);
+            }
+            let id = CleanupRegionId::new(u32::try_from(self.cleanups.len()).map_err(|_| {
+                GoLoweringError::Invalid("too many Go defer cleanup regions".into())
+            })?);
+            self.cleanups.push(CleanupRegion {
+                id,
+                call: operand,
+                outer_scope: scope,
+            });
+            builder.push_scope(Some(scope), ScopeBinding::Cleanup { region: id })
+        } else {
+            scope
+        };
+        let next = self.materialize_statement_next(builder, next, continuation_scope, stack)?;
+        if node.kind() == "go_statement" && operand.kind() == "call_expression" {
+            let invoke = self.spawned_call_expression(builder, operand, next)?;
+            self.session.add_gap_with_impacts_and_discharge(
+                builder,
+                invoke,
+                SemanticGapSubject::Point,
+                SemanticCapability::ConcurrentSpawn,
+                SemanticGapImpacts::NONE,
+                SemanticGapKind::Unsupported,
+                SemanticGapDischarge::RetainedControlTopology,
+                "goroutine scheduling, lifetime, and join behavior are not lowered",
+            )?;
+            self.note_deterministic_evaluation_order(builder, invoke, node, &evaluations)?;
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &evaluations,
+                EdgeTarget::normal(invoke),
+                scope,
+                stack,
+            );
+        }
+        let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        if node.kind() == "go_statement" {
+            for (capability, detail) in [
+                (
+                    SemanticCapability::ConcurrentSpawn,
+                    "goroutine creation, scheduling, lifetime, and join behavior are not lowered",
+                ),
+                (
+                    SemanticCapability::Calls,
+                    "the spawned operand is not an exact call expression",
+                ),
+            ] {
+                let discharge = if capability == SemanticCapability::ConcurrentSpawn {
+                    SemanticGapDischarge::RetainedControlTopology
+                } else {
+                    SemanticGapDischarge::None
+                };
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    capability,
+                    SemanticGapImpacts::NONE,
+                    SemanticGapKind::Unsupported,
+                    discharge,
+                    detail,
+                )?;
+            }
+        } else if !supported_defer {
+            for (capability, kind, detail) in [
+                (
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapKind::Unsupported,
+                    if inside_loop {
+                        "defer registration inside a loop has unbounded per-iteration captures and is not lowered"
+                    } else if inside_switch {
+                        "defer registration inside an expression switch has branch-specific continuation state and is not lowered"
+                    } else {
+                        "deferred invocation timing and LIFO execution are not lowered"
+                    },
+                ),
+                (
+                    SemanticCapability::CleanupControlFlow,
+                    SemanticGapKind::Unsupported,
+                    if inside_loop {
+                        "per-iteration deferred calls cannot be stitched into bounded cleanup control flow"
+                    } else if inside_switch {
+                        "branch-specific deferred calls cannot be stitched through the shared post-switch continuation"
+                    } else {
+                        "deferred calls on return and panic paths are not stitched into control flow"
+                    },
+                ),
+                (
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unsupported,
+                    "the deferred outer call is intentionally not emitted as an immediate invocation",
+                ),
+            ] {
+                let discharge = if matches!(
+                    capability,
+                    SemanticCapability::DeferredExecution | SemanticCapability::CleanupControlFlow
+                ) {
+                    SemanticGapDischarge::ExitOnlyProcedureCompletion
+                } else {
+                    SemanticGapDischarge::None
+                };
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    capability,
+                    SemanticGapImpacts::NONE,
+                    kind,
+                    discharge,
+                    detail,
+                )?;
+            }
+            self.add_non_rejoining_exceptional_exit_gap(
+                builder,
+                scope,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticGapKind::Unknown,
+                "deferred invocation panic propagation is not lowered",
+            )?;
+        } else {
+            let capture = self
+                .deferred_captures
+                .get(&operand.id())
+                .cloned()
+                .ok_or_else(|| {
+                    GoLoweringError::Invalid("supported Go defer has no captured operands".into())
+                })?;
+            for captured in capture.receiver.into_iter().chain(capture.arguments) {
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: captured.flow_kind,
+                        source: captured.source,
+                        target: captured.target,
+                    },
+                )?;
+            }
+        }
+        self.session.add_target_edge(builder, boundary, next)?;
+        self.note_deterministic_evaluation_order(builder, boundary, node, &evaluations)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expression_switch_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        attached_label: Option<Node<'tree>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        let clauses = named_children(node)
+            .into_iter()
+            .filter(|child| is_clause(*child))
+            .collect::<Vec<_>>();
+        let label = attached_label
+            .and_then(|label| node_text(self.prepared.source(), label))
+            .map(Box::<str>::from);
+        let switch_scope = builder.push_scope(
+            Some(scope),
+            ScopeBinding::Breakable {
+                label,
+                accepts_unlabeled: true,
+                break_target: next.point,
+                break_edge_kind: next.kind,
+            },
+        );
+        let clause_entries = clauses
+            .iter()
+            .map(|clause| self.session.add_node_point(builder, *clause, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, clause) in clauses.iter().copied().enumerate() {
+            let clause_entry = clause_entries[index];
+            let statements = clause_statement_list(clause)
+                .map(named_children)
+                .unwrap_or_default();
+            let terminal_fallthrough = statements
+                .last()
+                .copied()
+                .filter(|statement| statement.kind() == "fallthrough_statement")
+                .zip(clause_entries.get(index + 1).copied());
+            if let Some((fallthrough, fallthrough_target)) = terminal_fallthrough {
+                let fallthrough_entry =
+                    self.session
+                        .add_node_point(builder, fallthrough, Vec::new())?;
+                self.session.add_target_edge(
+                    builder,
+                    fallthrough_entry,
+                    EdgeTarget::normal(fallthrough_target),
+                )?;
+                self.schedule_statements(
+                    builder,
+                    clause_entry,
+                    &statements[..statements.len() - 1],
+                    EdgeTarget::normal(fallthrough_entry).into(),
+                    switch_scope,
+                    stack,
+                )?;
+            } else {
+                self.schedule_statements(
+                    builder,
+                    clause_entry,
+                    &statements,
+                    next.into(),
+                    switch_scope,
+                    stack,
+                )?;
+            }
+        }
+
+        let tagged = node.child_by_field_name("value").is_some();
+        let mut tests = Vec::new();
+        for (clause_index, clause) in clauses.iter().copied().enumerate() {
+            if clause.kind() != "expression_case" {
+                continue;
+            }
+            let case_values = required_field(clause, "value")?;
+            for case_value in expression_sequence(case_values) {
+                let test_entry = self
+                    .session
+                    .add_node_point(builder, case_value, Vec::new())?;
+                let comparison = tagged
+                    .then(|| self.session.add_node_point(builder, case_value, Vec::new()))
+                    .transpose()?;
+                tests.push((case_value, test_entry, comparison, clause_index));
+            }
+        }
+        let no_match_target = clauses
+            .iter()
+            .position(|clause| clause.kind() == "default_case")
+            .map(|index| clause_entries[index])
+            .unwrap_or(next.point);
+        for (index, (case_value, test_entry, comparison, clause_index)) in
+            tests.iter().copied().enumerate()
+        {
+            let when_true = EdgeTarget {
+                point: clause_entries[clause_index],
+                kind: ControlEdgeKind::SwitchCase,
+            };
+            let when_false = EdgeTarget {
+                point: tests
+                    .get(index + 1)
+                    .map(|(_, entry, _, _)| *entry)
+                    .unwrap_or(no_match_target),
+                kind: ControlEdgeKind::ConditionalFalse,
+            };
+            if let Some(comparison) = comparison {
+                self.session
+                    .add_target_edge(builder, comparison, when_true)?;
+                self.session
+                    .add_target_edge(builder, comparison, when_false)?;
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    switch_scope,
+                    comparison,
+                    SemanticGapSubject::Point,
+                    SemanticGapKind::Unknown,
+                    "tagged switch equality may panic when an interface operand contains a dynamically incomparable value",
+                )?;
+                stack.push(Work::Expression {
+                    node: case_value,
+                    entry: test_entry,
+                    next: EdgeTarget::normal(comparison),
+                    scope: switch_scope,
+                });
+            } else {
+                stack.push(Work::Condition {
+                    node: case_value,
+                    entry: test_entry,
+                    when_true,
+                    when_false,
+                    scope: switch_scope,
+                });
+            }
+        }
+        if let Some((_, first_test, _, _)) = tests.first() {
+            self.session
+                .add_target_edge(builder, boundary, EdgeTarget::normal(*first_test))?;
+        } else if let Some(default_index) = clauses
+            .iter()
+            .position(|clause| clause.kind() == "default_case")
+        {
+            self.session.add_target_edge(
+                builder,
+                boundary,
+                EdgeTarget {
+                    point: clause_entries[default_index],
+                    kind: ControlEdgeKind::SwitchCase,
+                },
+            )?;
+        } else {
+            self.session.add_target_edge(builder, boundary, next)?;
+        }
+
+        let selector_node = node.child_by_field_name("value");
+        let selector = selector_node
+            .map(|selector| {
+                self.expression_value(builder, selector, self.expression_value_kind(selector))
+            })
+            .transpose()?;
+        let default_index = clauses
+            .iter()
+            .position(|clause| clause.kind() == "default_case");
+        let (kind, selector_domain, cases, default_edge) =
+            if let Some(selector_node) = selector_node {
+                let cases = tests
+                    .iter()
+                    .map(|(case_value, _, comparison, clause_index)| {
+                        Ok(SwitchCaseFactParts {
+                            value: self.expression_value(
+                                builder,
+                                *case_value,
+                                self.expression_value_kind(*case_value),
+                            )?,
+                            edge: SwitchEdgeParts {
+                                source_point: comparison
+                                    .expect("tagged switch tests have comparison points"),
+                                arm: GuardArm {
+                                    target_point: clause_entries[*clause_index],
+                                    kind: ControlEdgeKind::SwitchCase,
+                                },
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>, GoLoweringError>>()?;
+                let default_edge = default_index.map(|default_index| {
+                    tests.last().map_or(
+                        SwitchEdgeParts {
+                            source_point: boundary,
+                            arm: GuardArm {
+                                target_point: clause_entries[default_index],
+                                kind: ControlEdgeKind::SwitchCase,
+                            },
+                        },
+                        |(_, _, comparison, _)| SwitchEdgeParts {
+                            source_point: comparison
+                                .expect("tagged switch tests have comparison points"),
+                            arm: GuardArm {
+                                target_point: clause_entries[default_index],
+                                kind: ControlEdgeKind::ConditionalFalse,
+                            },
+                        },
+                    )
+                });
+                (
+                    SwitchFactKind::Expression,
+                    if self.expression_has_boolean_domain(selector_node) {
+                        SwitchSelectorDomain::Boolean
+                    } else {
+                        SwitchSelectorDomain::Open
+                    },
+                    cases,
+                    default_edge,
+                )
+            } else {
+                (
+                    SwitchFactKind::Expressionless,
+                    SwitchSelectorDomain::Open,
+                    Vec::new(),
+                    None,
+                )
+            };
+        self.session.add_switch_fact(
+            builder,
+            SwitchFactScaffold {
+                point: boundary,
+                kind,
+                selector,
+                selector_domain,
+                cases,
+                default_edge,
+                default_present: default_index.is_some(),
+            },
+        )?;
+
+        let initializer = node.child_by_field_name("initializer");
+        let value = node.child_by_field_name("value");
+        match (initializer, value) {
+            (Some(initializer), Some(value)) => {
+                let value_entry = self.session.add_node_point(builder, value, Vec::new())?;
+                stack.push(Work::Expression {
+                    node: value,
+                    entry: value_entry,
+                    next: EdgeTarget::normal(boundary),
+                    scope,
+                });
+                stack.push(Work::Statement {
+                    node: initializer,
+                    entry,
+                    next: EdgeTarget::normal(value_entry).into(),
+                    scope,
+                    label: None,
+                });
+                Ok(())
+            }
+            (Some(initializer), None) => {
+                stack.push(Work::Statement {
+                    node: initializer,
+                    entry,
+                    next: EdgeTarget::normal(boundary).into(),
+                    scope,
+                    label: None,
+                });
+                Ok(())
+            }
+            (None, Some(value)) => {
+                stack.push(Work::Expression {
+                    node: value,
+                    entry,
+                    next: EdgeTarget::normal(boundary),
+                    scope,
+                });
+                Ok(())
+            }
+            (None, None) => {
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(boundary))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_switch_boundary(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        self.session.add_switch_fact(
+            builder,
+            SwitchFactScaffold {
+                point: boundary,
+                kind: SwitchFactKind::Type,
+                selector: None,
+                selector_domain: SwitchSelectorDomain::Open,
+                cases: Vec::new(),
+                default_edge: None,
+                default_present: named_children(node)
+                    .into_iter()
+                    .any(|child| child.kind() == "default_case"),
+            },
+        )?;
+        self.session.record_gap(
+            builder,
+            boundary,
+            SemanticGapSubject::Point,
+            SemanticCapability::NormalControlFlow,
+            SemanticGapKind::Unsupported,
+            "type-switch matching, per-case bindings, case bodies, and post-switch continuation are not lowered",
+        )?;
+        self.session.record_gap(
+            builder,
+            boundary,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "calls in selected type-switch case bodies are not lowered",
+        )?;
+        self.add_non_rejoining_exceptional_exit_gap(
+            builder,
+            scope,
+            boundary,
+            SemanticGapSubject::Point,
+            SemanticGapKind::Unknown,
+            "type-switch header evaluation panics are not fully lowered",
+        )?;
+
+        let initializer = node.child_by_field_name("initializer");
+        let value = node.child_by_field_name("value");
+        match (initializer, value) {
+            (Some(initializer), Some(value)) => {
+                let value_entry = self.session.add_node_point(builder, value, Vec::new())?;
+                stack.push(Work::Expression {
+                    node: value,
+                    entry: value_entry,
+                    next: EdgeTarget::normal(boundary),
+                    scope,
+                });
+                stack.push(Work::Statement {
+                    node: initializer,
+                    entry,
+                    next: EdgeTarget::normal(value_entry).into(),
+                    scope,
+                    label: None,
+                });
+                Ok(())
+            }
+            (Some(initializer), None) => {
+                stack.push(Work::Statement {
+                    node: initializer,
+                    entry,
+                    next: EdgeTarget::normal(boundary).into(),
+                    scope,
+                    label: None,
+                });
+                Ok(())
+            }
+            (None, Some(value)) => {
+                stack.push(Work::Expression {
+                    node: value,
+                    entry,
+                    next: EdgeTarget::normal(boundary),
+                    scope,
+                });
+                Ok(())
+            }
+            (None, None) => {
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(boundary))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_boundary(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let eager = select_eager_expressions(node);
+        let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        let clauses = named_children(node)
+            .into_iter()
+            .filter(|child| matches!(child.kind(), "communication_case" | "default_case"))
+            .collect::<Vec<_>>();
+        let select_scope = builder.push_scope(
+            Some(scope),
+            ScopeBinding::Breakable {
+                label: None,
+                accepts_unlabeled: true,
+                break_target: next.point,
+                break_edge_kind: next.kind,
+            },
+        );
+        let has_default = clauses.iter().any(|clause| clause.kind() == "default_case");
+        // With no alternatives the boundary has no successor: select {} blocks
+        // forever. Readiness is uncertain only when communication can proceed.
+        if !has_default && !clauses.is_empty() {
+            self.add_retained_control_topology_gap(
+                builder,
+                boundary,
+                "select may block while every structured communication alternative remains retained",
+            )?;
+        }
+        for clause in clauses {
+            let clause_entry = self.session.add_node_point(builder, clause, Vec::new())?;
+            self.session.add_target_edge(
+                builder,
+                boundary,
+                EdgeTarget {
+                    point: clause_entry,
+                    kind: ControlEdgeKind::SwitchCase,
+                },
+            )?;
+            let body = clause_statement_list(clause);
+            let body_entry = body
+                .map(|body| self.session.add_node_point(builder, body, Vec::new()))
+                .transpose()?;
+            self.session.add_target_edge(
+                builder,
+                clause_entry,
+                body_entry.map(EdgeTarget::normal).unwrap_or(next),
+            )?;
+            if let Some(body) = body {
+                stack.push(Work::Statement {
+                    node: body,
+                    entry: body_entry.expect("select body entry was allocated"),
+                    next: next.into(),
+                    scope: select_scope,
+                    label: None,
+                });
+            }
+            let Some(communication) = clause.child_by_field_name("communication") else {
+                continue;
+            };
+            let (operation, channel) = communication_operation_and_channel(communication)
+                .ok_or_else(|| missing_field(communication, "channel communication"))?;
+            let subject =
+                self.expression_value(builder, channel, self.expression_value_kind(channel))?;
+            let payload = if operation == SynchronizationOperation::ChannelSend {
+                let value_node = communication
+                    .child_by_field_name("value")
+                    .ok_or_else(|| missing_field(communication, "value"))?;
+                let value = self.expression_value(
+                    builder,
+                    value_node,
+                    self.expression_value_kind(value_node),
+                )?;
+                // Preserve the selected send's escape endpoint without proving
+                // a unique send/receive pairing across alternative clauses.
+                Some(SynchronizationPayload::Send {
+                    value,
+                    copy: SynchronizationPayloadCopy::Unknown,
+                })
+            } else {
+                None
+            };
+            self.append_effect(
+                builder,
+                clause_entry,
+                SemanticEffect::Synchronization {
+                    operation,
+                    subject,
+                    payload,
+                },
+            )?;
+            if communication.kind() == "receive_statement"
+                && let Some(left) = communication.child_by_field_name("left")
+            {
+                let mut rebound_bindings = Vec::new();
+                let targets = expression_sequence(left);
+                for target_node in &targets {
+                    if !is_go_binding_reference_kind(target_node.kind()) {
+                        continue;
+                    }
+                    let Some(name) = node_text(self.prepared.source(), *target_node) else {
+                        continue;
+                    };
+                    if name == "_" {
+                        continue;
+                    }
+                    let target = if direct_child_kind(communication, ":=") {
+                        self.local_declaration_value(name, target_node.start_byte())
+                            .or_else(|| self.binding_value(name, communication.start_byte()))
+                    } else {
+                        self.binding_value(name, communication.start_byte())
+                    };
+                    let Some(target) = target else {
+                        continue;
+                    };
+                    // The selected receive has no exact payload relation yet,
+                    // but it still definitely overwrites this binding when its
+                    // case executes. Preserve that update through the ordinary
+                    // opaque assignment-conversion boundary so an older local
+                    // identity cannot survive the rebind.
+                    let opaque_source = self.session.add_node_value(
+                        builder,
+                        *target_node,
+                        SemanticValueKind::Temporary,
+                    )?;
+                    let kind = self.binding_flow_kind(name, target, communication.end_byte());
+                    self.append_converted_binding_assignment(
+                        builder,
+                        clause_entry,
+                        *target_node,
+                        opaque_source,
+                        target,
+                        kind,
+                    )?;
+                    rebound_bindings.push(target);
+                }
+                if rebound_bindings.is_empty() {
+                    let impacts = if targets.iter().any(|target| {
+                        matches!(
+                            transparent_parenthesized_expression(*target).kind(),
+                            "selector_expression" | "index_expression" | "unary_expression"
+                        )
+                    }) {
+                        SemanticGapImpacts::single(SemanticGapImpact::ValueFlow)
+                            .with(SemanticGapImpact::HeapWrite)
+                            .with(SemanticGapImpact::Aliasing)
+                    } else {
+                        SemanticGapImpacts::for_gap(
+                            SemanticCapability::Assignments,
+                            SemanticGapSubject::Point,
+                        )
+                    };
+                    self.session.add_gap_with_impacts(
+                        builder,
+                        clause_entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Assignments,
+                        impacts,
+                        SemanticGapKind::Unsupported,
+                        "selected receive assignment values are not yet related to their exact target bindings",
+                    )?;
+                } else {
+                    for target in rebound_bindings {
+                        self.session.record_gap(
+                            builder,
+                            clause_entry,
+                            SemanticGapSubject::Value(target),
+                            SemanticCapability::Assignments,
+                            SemanticGapKind::Unsupported,
+                            "selected receive assignment value is not yet related to its exact payload",
+                        )?;
+                    }
+                }
+            }
+            if operation == SynchronizationOperation::ChannelSend {
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    select_scope,
+                    clause_entry,
+                    SemanticGapSubject::Point,
+                    SemanticGapKind::Unknown,
+                    "selected send on a closed channel may panic",
+                )?;
+            }
+        }
+        self.schedule_expressions(
+            builder,
+            entry,
+            &eager,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn if_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: StatementNext,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let condition = required_field(node, "condition")?;
+        let consequence = required_field(node, "consequence")?;
+        let alternative = node.child_by_field_name("alternative");
+        let condition_entry = self
+            .session
+            .add_node_point(builder, condition, Vec::new())?;
+        let consequence_entry = self
+            .session
+            .add_node_point(builder, consequence, Vec::new())?;
+        let alternative_entry = alternative
+            .map(|alternative| {
+                self.session
+                    .add_node_point(builder, alternative, Vec::new())
+            })
+            .transpose()?;
+        let false_target = if alternative_entry.is_none() {
+            Some(self.materialize_statement_next(builder, next, scope, stack)?)
+        } else {
+            None
+        };
+
+        if let (Some(alternative), Some(alternative_entry)) = (alternative, alternative_entry) {
+            stack.push(Work::Statement {
+                node: alternative,
+                entry: alternative_entry,
+                next,
+                scope,
+                label: None,
+            });
+        }
+        stack.push(Work::Statement {
+            node: consequence,
+            entry: consequence_entry,
+            next,
+            scope,
+            label: None,
+        });
+        stack.push(Work::Condition {
+            node: condition,
+            entry: condition_entry,
+            when_true: EdgeTarget {
+                point: consequence_entry,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            when_false: EdgeTarget {
+                point: alternative_entry
+                    .or_else(|| false_target.map(|target| target.point))
+                    .expect("an if statement has an alternative or a continuation"),
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+            scope,
+        });
+        if let Some(initializer) = node.child_by_field_name("initializer") {
+            stack.push(Work::Statement {
+                node: initializer,
+                entry,
+                next: EdgeTarget::normal(condition_entry).into(),
+                scope,
+                label: None,
+            });
+            Ok(())
+        } else {
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        attached_label: Option<Node<'tree>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let body = required_field(node, "body")?;
+        let control = named_children(node)
+            .into_iter()
+            .find(|child| child.id() != body.id());
+        let label = attached_label
+            .and_then(|label| node_text(self.prepared.source(), label))
+            .map(Box::<str>::from);
+        match control {
+            None => self.infinite_loop(builder, body, entry, next, scope, label, stack),
+            Some(control) if control.kind() == "for_clause" => {
+                self.for_clause_loop(builder, control, body, entry, next, scope, label, stack)
+            }
+            Some(control) if control.kind() == "range_clause" => {
+                self.range_loop(builder, control, body, entry, next, scope, label, stack)
+            }
+            Some(condition) => {
+                self.condition_loop(builder, condition, body, entry, next, scope, label, stack)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infinite_loop(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        label: Option<Box<str>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        // An infinite loop re-enters its body.
+        self.session.record_loop_site(
+            builder,
+            body.parent().expect("a for body has its for statement"),
+            body_entry,
+            body_entry,
+        )?;
+        let loop_scope = builder.push_scope(
+            Some(scope),
+            ScopeBinding::Loop {
+                label,
+                break_target: next.point,
+                break_edge_kind: next.kind,
+                continue_target: body_entry,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: body_entry,
+                kind: ControlEdgeKind::LoopBack,
+            }
+            .into(),
+            scope: loop_scope,
+            label: None,
+        });
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn condition_loop(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        condition: Node<'tree>,
+        body: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        label: Option<Box<str>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let condition_entry = self
+            .session
+            .add_node_point(builder, condition, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        self.session.record_loop_site(
+            builder,
+            body.parent().expect("a for body has its for statement"),
+            condition_entry,
+            body_entry,
+        )?;
+        schedule_loop_flow(
+            builder,
+            &self.session,
+            entry,
+            next,
+            scope,
+            label,
+            &[],
+            Some((condition, condition_entry)),
+            condition_entry,
+            EdgeTarget::normal(condition_entry),
+            (body, body_entry),
+            &[],
+            stack,
+            |node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+            },
+            |node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+            },
+            |node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next: next.into(),
+                scope,
+                label: None,
+            },
+            |node, entry, when_true, when_false, scope| Work::Condition {
+                node,
+                entry,
+                when_true,
+                when_false,
+                scope,
+            },
+        )
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_clause_loop(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        clause: Node<'tree>,
+        body: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        label: Option<Box<str>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let initializer = clause.child_by_field_name("initializer");
+        let condition = clause.child_by_field_name("condition");
+        let update = clause.child_by_field_name("update");
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        let condition_entry = condition
+            .map(|condition| self.session.add_node_point(builder, condition, Vec::new()))
+            .transpose()?;
+        let update_entry = update
+            .map(|update| self.session.add_node_point(builder, update, Vec::new()))
+            .transpose()?;
+        let loop_head = condition_entry.unwrap_or(body_entry);
+        // The post statement runs before the condition, which (or, without
+        // one, the body) starts every iteration.
+        self.session.record_loop_site(
+            builder,
+            body.parent().expect("a for body has its for statement"),
+            loop_head,
+            body_entry,
+        )?;
+        let initial_target = if go_for_clause_has_first_iteration(
+            self.prepared.source(),
+            initializer,
+            condition,
+            update,
+        ) {
+            EdgeTarget::normal(body_entry)
+        } else {
+            EdgeTarget::normal(loop_head)
+        };
+        let continue_target = update_entry.unwrap_or(loop_head);
+        let loop_scope = builder.push_scope(
+            Some(scope),
+            ScopeBinding::Loop {
+                label,
+                break_target: next.point,
+                break_edge_kind: next.kind,
+                continue_target,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+
+        if let (Some(update), Some(update_entry)) = (update, update_entry) {
+            stack.push(Work::Statement {
+                node: update,
+                entry: update_entry,
+                next: EdgeTarget {
+                    point: loop_head,
+                    kind: ControlEdgeKind::LoopBack,
+                }
+                .into(),
+                scope: loop_scope,
+                label: None,
+            });
+        }
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: update_entry
+                .map(EdgeTarget::normal)
+                .unwrap_or(EdgeTarget {
+                    point: loop_head,
+                    kind: ControlEdgeKind::LoopBack,
+                })
+                .into(),
+            scope: loop_scope,
+            label: None,
+        });
+        if let (Some(condition), Some(condition_entry)) = (condition, condition_entry) {
+            stack.push(Work::Condition {
+                node: condition,
+                entry: condition_entry,
+                when_true: EdgeTarget {
+                    point: body_entry,
+                    kind: ControlEdgeKind::ConditionalTrue,
+                },
+                when_false: EdgeTarget {
+                    point: next.point,
+                    kind: ControlEdgeKind::ConditionalFalse,
+                },
+                scope: loop_scope,
+            });
+        }
+        if let Some(initializer) = initializer {
+            stack.push(Work::Statement {
+                node: initializer,
+                entry,
+                next: initial_target.into(),
+                scope: loop_scope,
+                label: None,
+            });
+            Ok(())
+        } else {
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(loop_head))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn range_loop(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        clause: Node<'tree>,
+        body: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        label: Option<Box<str>>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let right = required_field(clause, "right")?;
+        let left = clause.child_by_field_name("left");
+        let test = self.session.add_node_point(builder, clause, Vec::new())?;
+        let iterable = self.expression_value(builder, right, self.expression_value_kind(right))?;
+        let iterable_storage = self.expression_storage_kind(right, right.start_byte());
+        if iterable_storage == Some(GoStorageKind::Map) {
+            let value_copy = self.expression_index_value_copy(right, right.start_byte());
+            let location = self.session.add_memory_location_with_value_copy(
+                builder,
+                test,
+                MemoryLocationKind::Index {
+                    base: iterable,
+                    index: None,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Aggregate,
+                },
+                value_copy,
+            )?;
+            let result =
+                self.session
+                    .add_node_value(builder, clause, SemanticValueKind::Temporary)?;
+            self.append_effect(
+                builder,
+                test,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result,
+                },
+            )?;
+            self.add_unprojected_index_gap(builder, test, location, false)?;
+        }
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        let binding_entry = left
+            .map(|left| self.session.add_node_point(builder, left, Vec::new()))
+            .transpose()?;
+        let binding_boundary = left
+            .map(|left| self.session.add_node_point(builder, left, Vec::new()))
+            .transpose()?;
+        let loop_scope = builder.push_scope(
+            Some(scope),
+            ScopeBinding::Loop {
+                label,
+                break_target: next.point,
+                break_edge_kind: next.kind,
+                continue_target: test,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+        if iterable_storage != Some(GoStorageKind::Map) {
+            self.session.record_gap(
+                builder,
+                test,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "range-over-function invocation and type-specific range mechanics require refinement",
+            )?;
+            self.add_retained_control_topology_gap(
+                builder,
+                test,
+                "type-specific range progress may block or diverge, but source-local branch and loop-back topology is retained",
+            )?;
+        }
+        self.session.add_target_edge(
+            builder,
+            test,
+            EdgeTarget {
+                point: binding_entry.unwrap_or(body_entry),
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+        )?;
+        self.session.add_target_edge(
+            builder,
+            test,
+            EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+        )?;
+
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: test,
+                kind: ControlEdgeKind::LoopBack,
+            }
+            .into(),
+            scope: loop_scope,
+            label: None,
+        });
+        if let (Some(left), Some(binding_entry), Some(binding_boundary)) =
+            (left, binding_entry, binding_boundary)
+        {
+            let binding_evaluations = if direct_child_kind(clause, "=") {
+                self.assignment_target_evaluation_nodes(left)
+            } else {
+                Vec::new()
+            };
+            let binding_order = if direct_child_kind(clause, "=") {
+                self.assignment_target_order_nodes(left)
+            } else {
+                Vec::new()
+            };
+            if self.binding_requires_runtime_protocol(left) {
+                self.session.record_gap(
+                    builder,
+                    binding_boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unknown,
+                    "range target unpacking, indexing, or indirection requires runtime refinement",
+                )?;
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    loop_scope,
+                    binding_boundary,
+                    SemanticGapSubject::Point,
+                    SemanticGapKind::Unsupported,
+                    "range target evaluation and assignment panics are not lowered",
+                )?;
+            }
+            // Each target is written a fresh element derived from the iterable
+            // on every iteration. The element value depends on the iterable's
+            // value, so a `for x := range x` binder relates to the outer `x`
+            // read as same-evaluation rather than serving it.
+            let declares = direct_child_kind(clause, ":=");
+            for name_node in expression_sequence(left) {
+                let element = self.session.add_node_value(
+                    builder,
+                    name_node,
+                    SemanticValueKind::Temporary,
+                )?;
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    binding_boundary,
+                    [iterable],
+                    element,
+                )?;
+                match name_node.kind() {
+                    "identifier" | "true" | "false" | "nil" | "iota" => {
+                        let Some(name) = node_text(self.prepared.source(), name_node) else {
+                            continue;
+                        };
+                        if name == "_" {
+                            continue;
+                        }
+                        let target = if declares {
+                            self.local_declaration_value(name, name_node.start_byte())
+                        } else {
+                            self.binding_value(name, clause.start_byte())
+                        };
+                        let Some(target) = target else {
+                            continue;
+                        };
+                        let kind = self.binding_flow_kind(name, target, body.start_byte());
+                        if declares {
+                            self.append_binding_assignment(
+                                builder,
+                                binding_boundary,
+                                target,
+                                element,
+                                kind,
+                            )?;
+                        } else {
+                            self.append_converted_binding_assignment(
+                                builder,
+                                binding_boundary,
+                                name_node,
+                                element,
+                                target,
+                                kind,
+                            )?;
+                        }
+                    }
+                    "selector_expression" | "index_expression" => {
+                        if let Some((kind, location)) =
+                            self.memory_access_location(builder, binding_boundary, name_node)?
+                        {
+                            let stored = if declares {
+                                element
+                            } else {
+                                self.assignment_conversion_value(
+                                    builder,
+                                    binding_boundary,
+                                    name_node,
+                                    element,
+                                )?
+                            };
+                            self.append_effect(
+                                builder,
+                                binding_boundary,
+                                SemanticEffect::MemoryStore {
+                                    kind,
+                                    location,
+                                    value: stored,
+                                },
+                            )?;
+                        } else {
+                            self.session.add_gap_with_impacts(
+                                builder,
+                                binding_boundary,
+                                SemanticGapSubject::Value(element),
+                                SemanticCapability::Assignments,
+                                SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+                                SemanticGapKind::Unsupported,
+                                "Go range memory target is not a lowered field or index place",
+                            )?;
+                        }
+                    }
+                    _ => {
+                        self.session.add_gap_with_impacts(
+                            builder,
+                            binding_boundary,
+                            SemanticGapSubject::Point,
+                            SemanticCapability::Assignments,
+                            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+                            SemanticGapKind::Unsupported,
+                            "Go range assignment target write is not yet lowered",
+                        )?;
+                    }
+                }
+            }
+            self.session.add_target_edge(
+                builder,
+                binding_boundary,
+                EdgeTarget::normal(body_entry),
+            )?;
+            self.note_deterministic_evaluation_order(
+                builder,
+                binding_boundary,
+                clause,
+                &binding_order,
+            )?;
+            self.schedule_expressions(
+                builder,
+                binding_entry,
+                &binding_evaluations,
+                EdgeTarget::normal(binding_boundary),
+                loop_scope,
+                stack,
+            )?;
+        }
+        stack.push(Work::Expression {
+            node: right,
+            entry,
+            next: EdgeTarget::normal(test),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        if node.kind() == "call_expression"
+            && let Some(builtin) = self.builtin_call_kind(node)
+        {
+            self.note_predeclared_builtin_assumption(builtin);
+        }
+        let result = self
+            .multi_result_values
+            .get(&node.id())
+            .and_then(|values| values.first().copied())
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.expression_value(builder, node, self.expression_value_kind(node))
+            })?;
+        if is_go_binding_reference_kind(node.kind()) && !self.is_go_constant_value(node) {
+            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
+        if let Some(target) = self.package_function_target(node) {
+            let metadata = self.metadata(entry)?;
+            self.append_effect(
+                builder,
+                entry,
+                SemanticEffect::CallableReference {
+                    result,
+                    callable: CallableValue {
+                        kind: CallableReferenceKind::Function,
+                        targets: CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                        target_evidence: metadata.evidence,
+                        bound_receiver: None,
+                        environment: None,
+                    },
+                },
+            )?;
+        }
+        match node.kind() {
+            "type_conversion_expression" | "call_expression"
+                if self.type_conversion(node).is_some_and(|conversion| {
+                    self.exact_value_aggregate_conversion(conversion, node.start_byte())
+                        .is_some()
+                }) =>
+            {
+                // Go converts between two types whose underlying types are
+                // identical, and converting a value aggregate duplicates the
+                // whole value into the result's own storage. Only the type
+                // name changes, so no distinct operation runs.
+                let conversion = self
+                    .type_conversion(node)
+                    .expect("guard proves one structured conversion");
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                let source = self.expression_value(
+                    builder,
+                    conversion.operand,
+                    self.expression_value_kind(conversion.operand),
+                )?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value: source,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: GO_AGGREGATE_COPY_FLOW,
+                        source,
+                        target: result,
+                    },
+                )?;
+                let storage = self
+                    .exact_value_aggregate_conversion(conversion, node.start_byte())
+                    .and_then(go_storage_kind_of_underlying)
+                    .expect("guard proves one exact value-aggregate conversion");
+                self.append_aggregate_copy_contents(builder, boundary, storage, source, result)?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                let children = if node.kind() == "type_conversion_expression" {
+                    runtime_expression_children(node)
+                } else {
+                    vec![conversion.operand]
+                };
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "call_expression" if self.call_shaped_type_conversion_operand(node).is_some() => {
+                let operand = self
+                    .call_shaped_type_conversion_operand(node)
+                    .expect("guard proves one structured conversion operand");
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go conversion result identity is intentionally not propagated",
+                )?;
+                stack.push(Work::Expression {
+                    node: operand,
+                    entry,
+                    next,
+                    scope,
+                });
+                Ok(())
+            }
+            "call_expression" if self.is_builtin_new_call(node) => {
+                self.session
+                    .add_allocation(builder, entry, result, AllocationKind::Object)?;
+                self.session.add_target_edge(builder, entry, next)
+            }
+            "call_expression" if self.builtin_make_allocation_kind(node).is_some() => {
+                let kind = self
+                    .builtin_make_allocation_kind(node)
+                    .expect("guard proves a structured builtin make allocation");
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                if kind == AllocationKind::Slice {
+                    self.value_storage_kinds
+                        .insert(result, GoStorageKind::Slice);
+                } else if kind == AllocationKind::Array {
+                    self.value_storage_kinds.insert(result, GoStorageKind::Map);
+                } else if matches!(
+                    &kind,
+                    AllocationKind::LanguageDefined(name) if name.as_ref() == "go-channel"
+                ) {
+                    self.value_storage_kinds
+                        .insert(result, GoStorageKind::Channel);
+                }
+                self.session
+                    .add_allocation(builder, boundary, result, kind)?;
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    scope,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticGapKind::Unknown,
+                    "builtin make may panic when its structured size arguments are invalid",
+                )?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                let evaluations = all_call_arguments(node)
+                    .into_iter()
+                    .skip(1)
+                    .collect::<Vec<_>>();
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &evaluations,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "call_expression" if self.builtin_panic_argument(node).is_some() => {
+                // `panic(v)` never returns normally, so it is a throw rather
+                // than a call: no callee, no unresolved-target gap, and no
+                // normal continuation. `next` is deliberately unused, the
+                // same shape `return` uses.
+                //
+                // Go has no intraprocedural handler, so the routed completion
+                // carries the panic value to the procedure's exceptional exit
+                // and stops there. `recover()` inside a deferred call is a
+                // separate channel this adapter does not yet model.
+                let argument = self
+                    .builtin_panic_argument(node)
+                    .expect("guard already matched a builtin panic argument");
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let source =
+                    self.expression_value(builder, argument, self.expression_value_kind(argument))?;
+                let value = self.value(builder, terminal, SemanticValueKind::Exception)?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target: value,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Throw { value: Some(value) },
+                )?;
+                self.abrupt(builder, terminal, scope, CompletionKind::Throw, None, stack)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[argument],
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "call_expression" if self.builtin_close_argument(node).is_some() => {
+                let argument = self
+                    .builtin_close_argument(node)
+                    .expect("guard already matched a builtin close argument");
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                let subject =
+                    self.expression_value(builder, argument, self.expression_value_kind(argument))?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::Synchronization {
+                        operation: SynchronizationOperation::ChannelClose,
+                        subject,
+                        payload: None,
+                    },
+                )?;
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    scope,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticGapKind::Unknown,
+                    "close of a closed channel or send-only invalid channel may panic",
+                )?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                stack.push(Work::Expression {
+                    node: argument,
+                    entry,
+                    next: EdgeTarget::normal(boundary),
+                    scope,
+                });
+                Ok(())
+            }
+            "call_expression" if self.exact_builtin_copy(node).is_some() => {
+                let (destination_node, source_node, count) = self
+                    .exact_builtin_copy(node)
+                    .expect("guard proves an exact builtin copy");
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                let destination = self.expression_value(
+                    builder,
+                    destination_node,
+                    self.expression_value_kind(destination_node),
+                )?;
+                let source = self.expression_value(
+                    builder,
+                    source_node,
+                    self.expression_value_kind(source_node),
+                )?;
+                let source_value_copy =
+                    self.expression_index_value_copy(source_node, node.start_byte());
+                let destination_value_copy =
+                    self.expression_index_value_copy(destination_node, node.start_byte());
+                let mut copied = Vec::new();
+                for index in 0..count {
+                    let index_value =
+                        self.value(builder, boundary, SemanticValueKind::UnsignedInteger(index))?;
+                    let source_location = self.session.add_memory_location_with_value_copy(
+                        builder,
+                        boundary,
+                        MemoryLocationKind::Index {
+                            base: source,
+                            index: Some(index_value),
+                            constant_index: Some(index),
+                            identity: IndexedLocationIdentity::Element,
+                        },
+                        source_value_copy,
+                    )?;
+                    let value = self.value(builder, boundary, SemanticValueKind::Local)?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::MemoryLoad {
+                            kind: MemoryAccessKind::Index,
+                            location: source_location,
+                            result: value,
+                        },
+                    )?;
+                    copied.push((index, index_value, value));
+                }
+                for (index, index_value, value) in copied {
+                    let destination_location = self.session.add_memory_location_with_value_copy(
+                        builder,
+                        boundary,
+                        MemoryLocationKind::Index {
+                            base: destination,
+                            index: Some(index_value),
+                            constant_index: Some(index),
+                            identity: IndexedLocationIdentity::Element,
+                        },
+                        destination_value_copy,
+                    )?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            location: destination_location,
+                            value,
+                        },
+                    )?;
+                }
+                let count_value =
+                    self.value(builder, boundary, SemanticValueKind::UnsignedInteger(count))?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: count_value,
+                        target: result,
+                    },
+                )?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                let evaluations = [destination_node, source_node];
+                self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &evaluations,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "call_expression" if self.exact_append_backing(node).is_some() => {
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                let backing = self
+                    .exact_append_backing(node)
+                    .expect("guard proves an exact append backing outcome");
+                let append_start = match backing {
+                    ExactAppendBacking::Retained {
+                        source,
+                        append_start,
+                        result_shape,
+                    } => {
+                        self.exact_slice_shapes.insert(result, result_shape);
+                        self.append_effect(
+                            builder,
+                            boundary,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::BackingStore {
+                                    offset: BackingStoreOffset::Zero,
+                                },
+                                source,
+                                target: result,
+                            },
+                        )?;
+                        append_start
+                    }
+                    ExactAppendBacking::Replaced { append_start } => {
+                        self.session.add_allocation(
+                            builder,
+                            boundary,
+                            result,
+                            AllocationKind::Slice,
+                        )?;
+                        self.session.add_partitioned_gap(
+                            builder,
+                            boundary,
+                            SemanticGapSubject::Value(result),
+                            SemanticCapability::IndexMemory,
+                            SemanticGapImpacts::single(SemanticGapImpact::HeapRead),
+                            SemanticGapKind::Unsupported,
+                            "Go append proves a replacement allocation, but copying prior elements into the new backing store is not yet lowered",
+                        )?;
+                        append_start
+                    }
+                };
+                let value_copy = self.expression_index_value_copy(node, node.start_byte());
+                for (offset, argument) in all_call_arguments(node)[1..].iter().enumerate() {
+                    let index = append_start
+                        .checked_add(
+                            u128::try_from(offset).expect("append argument count fits u128"),
+                        )
+                        .expect("exact append length arithmetic was already checked");
+                    let index_value =
+                        self.value(builder, boundary, SemanticValueKind::UnsignedInteger(index))?;
+                    let location = self.session.add_memory_location_with_value_copy(
+                        builder,
+                        boundary,
+                        MemoryLocationKind::Index {
+                            base: result,
+                            index: Some(index_value),
+                            constant_index: Some(index),
+                            identity: IndexedLocationIdentity::Element,
+                        },
+                        value_copy,
+                    )?;
+                    let value = self.expression_value(
+                        builder,
+                        go_call_argument_value_node(*argument),
+                        self.expression_value_kind(go_call_argument_value_node(*argument)),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            value,
+                        },
+                    )?;
+                }
+                self.session.add_target_edge(builder, boundary, next)?;
+                let evaluations = all_call_arguments(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &evaluations,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "call_expression" if self.builtin_append_source(node).is_some() => {
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                let source_node = self
+                    .builtin_append_source(node)
+                    .expect("guard proves a builtin append source");
+                let source = self.expression_value(
+                    builder,
+                    source_node,
+                    self.expression_value_kind(source_node),
+                )?;
+                let fresh = self.value(
+                    builder,
+                    boundary,
+                    SemanticValueKind::LanguageDefined("go.append.fresh_backing".into()),
+                )?;
+                self.value_storage_kinds.insert(fresh, GoStorageKind::Slice);
+                let allocation =
+                    self.session
+                        .add_allocation(builder, boundary, fresh, AllocationKind::Slice)?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStoreAlternative {
+                            offset: BackingStoreOffset::Zero,
+                            allocation,
+                        },
+                        source,
+                        target: result,
+                    },
+                )?;
+                for argument in all_call_arguments(node)[1..].iter().copied() {
+                    let argument = go_call_argument_value_node(argument);
+                    let location = self.session.add_memory_location(
+                        builder,
+                        boundary,
+                        MemoryLocationKind::Index {
+                            base: result,
+                            index: None,
+                            constant_index: None,
+                            identity: IndexedLocationIdentity::Element,
+                        },
+                    )?;
+                    let value = self.expression_value(
+                        builder,
+                        argument,
+                        self.expression_value_kind(argument),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            value,
+                        },
+                    )?;
+                }
+                self.session.add_target_edge(builder, boundary, next)?;
+                let evaluations = all_call_arguments(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &evaluations,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "call_expression" if let Some(builtin) = self.builtin_call_kind(node) => self
+                .lower_non_call_builtin(
+                    builder,
+                    GoBuiltinCallSite {
+                        node,
+                        result,
+                        entry,
+                        next,
+                        scope,
+                        builtin,
+                    },
+                    stack,
+                ),
+            "call_expression" => self.call_expression(builder, node, entry, next, scope, stack),
+            "func_literal" => self.callable_expression(builder, node, entry, next),
+            "binary_expression" if go_boolean_operator_kind(node).is_some() => {
+                let merge = self.session.add_node_point(builder, node, Vec::new())?;
+                // Both arms of the short circuit reconvene here, and the
+                // boolean this expression produces derives from whichever
+                // operands were evaluated to reach it.
+                let operands = runtime_expression_children(node)
+                    .into_iter()
+                    .map(|child| {
+                        self.expression_value(builder, child, self.expression_value_kind(child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, merge, operands, result)?;
+                self.session.add_target_edge(builder, merge, next)?;
+                stack.push(Work::Condition {
+                    node,
+                    entry,
+                    when_true: EdgeTarget {
+                        point: merge,
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    },
+                    when_false: EdgeTarget {
+                        point: merge,
+                        kind: ControlEdgeKind::ConditionalFalse,
+                    },
+                    scope,
+                });
+                Ok(())
+            }
+            "parenthesized_expression" => {
+                if let Some(value) = first_runtime_named_child(node) {
+                    if parenthesized_call_receiver(node) {
+                        // The call site and deferred-capture producer both
+                        // name the transparent inner receiver. Do not emit a
+                        // second wrapper assignment whose unused temporary
+                        // would look like another possible value transfer.
+                        stack.push(Work::Expression {
+                            node: value,
+                            entry,
+                            next,
+                            scope,
+                        });
+                        return Ok(());
+                    }
+                    let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                    let source =
+                        self.expression_value(builder, value, self.expression_value_kind(value))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: source,
+                        },
+                    )?;
+                    // Parentheses are a spelling, not an operation: the
+                    // wrapper denotes the operand's own value, so a consumer
+                    // that reads it reads the same object. Stating the
+                    // relation is what lets an assertion on the wrapper see
+                    // the identity the operand carried, including a reference
+                    // that arrived as a channel payload (issue #3405).
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: self.source_alias_flow_kind(source),
+                            source,
+                            target: result,
+                        },
+                    )?;
+                    self.session.add_target_edge(builder, terminal, next)?;
+                    stack.push(Work::Expression {
+                        node: value,
+                        entry,
+                        next: EdgeTarget::normal(terminal),
+                        scope,
+                    });
+                    Ok(())
+                } else {
+                    self.session.add_target_edge(builder, entry, next)
+                }
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("<-") => {
+                let operand = required_field(node, "operand")?;
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                let subject =
+                    self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+                if let Some(payload_type) =
+                    self.expression_channel_payload_type(operand, operand.start_byte())
+                {
+                    self.value_types.insert(result, payload_type);
+                }
+                if let Some(storage) = self
+                    .expression_channel_payload_copy(operand, operand.start_byte())
+                    .and_then(go_channel_payload_storage_kind)
+                {
+                    self.value_storage_kinds.insert(result, storage);
+                }
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::Synchronization {
+                        operation: SynchronizationOperation::ChannelReceive,
+                        subject,
+                        payload: Some(SynchronizationPayload::Receive { result }),
+                    },
+                )?;
+                self.add_retained_control_topology_gap(
+                    builder,
+                    boundary,
+                    "channel receive may block and requires scheduler refinement",
+                )?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                stack.push(Work::Expression {
+                    node: operand,
+                    entry,
+                    next: EdgeTarget::normal(boundary),
+                    scope,
+                });
+                Ok(())
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("&") => {
+                let operand = required_field(node, "operand")?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let referenced = transparent_parenthesized_expression(operand);
+                if matches!(
+                    referenced.kind(),
+                    "selector_expression" | "index_expression"
+                ) {
+                    let impacts = SemanticGapImpacts::single(SemanticGapImpact::Aliasing)
+                        .with(SemanticGapImpact::HeapRead)
+                        .with(SemanticGapImpact::HeapWrite);
+                    if let Some((_kind, location, _index)) =
+                        self.memory_place_location(builder, terminal, referenced)?
+                    {
+                        self.session.add_gap_with_impacts(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::MemoryLocation(location),
+                            SemanticCapability::Assignments,
+                            impacts,
+                            SemanticGapKind::Unsupported,
+                            "Go address-of memory location is not related to the produced address value",
+                        )?;
+                    } else {
+                        self.session.add_gap_with_impacts(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::Value(result),
+                            SemanticCapability::Assignments,
+                            impacts,
+                            SemanticGapKind::Unsupported,
+                            "Go address-of selector or index has no materializable memory location",
+                        )?;
+                    }
+                    self.session.add_target_edge(builder, terminal, next)?;
+                    let evaluations = self.assignment_target_evaluation_nodes(referenced);
+                    return self.schedule_expressions(
+                        builder,
+                        entry,
+                        &evaluations,
+                        EdgeTarget::normal(terminal),
+                        scope,
+                        stack,
+                    );
+                }
+                let exact_binding = if is_go_binding_reference_kind(referenced.kind()) {
+                    node_text(self.prepared.source(), referenced)
+                        .and_then(|name| self.binding_value(name, referenced.start_byte()))
+                } else {
+                    None
+                };
+                let source = if let Some(binding) = exact_binding {
+                    binding
+                } else {
+                    self.expression_value(
+                        builder,
+                        referenced,
+                        self.expression_value_kind(referenced),
+                    )?
+                };
+                if is_go_binding_reference_kind(referenced.kind()) && exact_binding.is_none() {
+                    self.session.record_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(source),
+                        SemanticCapability::Assignments,
+                        SemanticGapKind::Unsupported,
+                        "Go address-of identifier is not a lowered local, parameter, receiver, or exact value capture binding",
+                    )?;
+                }
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value: source,
+                    },
+                )?;
+                self.session.add_target_edge(builder, terminal, next)?;
+                if exact_binding.is_some() {
+                    return self.session.add_target_edge(
+                        builder,
+                        entry,
+                        EdgeTarget::normal(terminal),
+                    );
+                }
+                stack.push(Work::Expression {
+                    node: operand,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
+            "selector_expression"
+                if matches!(
+                    self.selector_resolution(node),
+                    GoSelectorResolution::Method { .. }
+                        | GoSelectorResolution::InterfaceMethod { .. }
+                ) && !is_assignment_target(node) =>
+            {
+                let operand = required_field(node, "operand")?;
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                // A method-value selection in value position denotes the same
+                // bound-method callable a call on the selector produces: the
+                // receiver type resolved to exactly one method declaration, so
+                // the selection publishes that declaration as a proven local
+                // target and the evaluated operand as its bound receiver. The
+                // receiver is the evaluated operand, not a copy the producer
+                // mints here; whether it aliases the caller's object is the
+                // consumer's declared pointer-versus-value receiver rule.
+                if let GoSelectorResolution::Method {
+                    pointer_receiver,
+                    target,
+                } = self.selector_resolution(node)
+                {
+                    let receiver = self.expression_value(
+                        builder,
+                        operand,
+                        self.expression_value_kind(operand),
+                    )?;
+                    let metadata = self.metadata(boundary)?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::CallableReference {
+                            result,
+                            callable: CallableValue {
+                                kind: CallableReferenceKind::BoundMethod,
+                                targets: CallableTargetResolution::Proven(CallableTarget::Local(
+                                    target,
+                                )),
+                                target_evidence: metadata.evidence,
+                                bound_receiver: Some(receiver),
+                                environment: None,
+                            },
+                        },
+                    )?;
+                    // Selection is the only evaluation step that can abort
+                    // here, and only one shape reaches the pointee: a
+                    // value-receiver method selected through a pointer
+                    // operand dereferences it. A value operand is copied, and
+                    // a pointer-receiver method selected through an
+                    // addressable value saves that value's address; neither
+                    // aborts.
+                    let operand_is_pointer = self
+                        .expression_type_identity(operand, node.start_byte())
+                        .is_some_and(|identity| identity.pointer_depth > 0);
+                    if !pointer_receiver && operand_is_pointer {
+                        self.add_non_rejoining_exceptional_exit_gap(
+                            builder,
+                            scope,
+                            boundary,
+                            SemanticGapSubject::Value(result),
+                            SemanticGapKind::Unknown,
+                            "a value-receiver method value selected through a pointer operand may require an implicit dereference",
+                        )?;
+                    }
+                } else {
+                    // An interface operand's dynamic type is not exact, so the
+                    // callable stays unpublished and the selection keeps its
+                    // reviewed open boundary.
+                    self.session.record_gap(
+                        builder,
+                        boundary,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::CallableReferences,
+                        SemanticGapKind::Unknown,
+                        "Go method-value selection is structured but its callable target is not yet published",
+                    )?;
+                    self.add_non_rejoining_exceptional_exit_gap(
+                        builder,
+                        scope,
+                        boundary,
+                        SemanticGapSubject::Value(result),
+                        SemanticGapKind::Unknown,
+                        "method-value selection may require an implicit dereference",
+                    )?;
+                }
+                self.session.record_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::DynamicDispatch,
+                    SemanticGapKind::Unknown,
+                    "Go method-value dispatch requires complete method-set refinement",
+                )?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[operand],
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            // An imported package's value is a place, but its qualifier names a
+            // package rather than a value: there is no operand to evaluate and
+            // no nil operand to panic on.
+            "selector_expression"
+                if !is_assignment_target(node)
+                    && matches!(
+                        self.selector_resolution(node),
+                        GoSelectorResolution::Package
+                    ) =>
+            {
+                let access = self.session.add_node_point(builder, node, Vec::new())?;
+                let Some((kind, location)) = self.memory_access_location(builder, access, node)?
+                else {
+                    unreachable!("an imported package value is a memory place");
+                };
+                debug_assert_eq!(kind, MemoryAccessKind::Static);
+                self.append_effect(
+                    builder,
+                    access,
+                    SemanticEffect::MemoryLoad {
+                        kind,
+                        location,
+                        result,
+                    },
+                )?;
+                self.session.add_target_edge(builder, access, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[],
+                    EdgeTarget::normal(access),
+                    scope,
+                    stack,
+                )
+            }
+            "selector_expression"
+                if !self.selector_denotes_no_location(node) && !is_assignment_target(node) =>
+            {
+                let operand = required_field(node, "operand")?;
+                let access = self.session.add_node_point(builder, node, Vec::new())?;
+                let Some((kind, location)) = self.memory_access_location(builder, access, node)?
+                else {
+                    unreachable!("the selector load guard proves a memory place");
+                };
+                debug_assert_eq!(kind, MemoryAccessKind::Field);
+                self.append_effect(
+                    builder,
+                    access,
+                    SemanticEffect::MemoryLoad {
+                        kind,
+                        location,
+                        result,
+                    },
+                )?;
+                if self.selector_resolution(node) == GoSelectorResolution::Unknown
+                    && !is_direct_call_function(node)
+                {
+                    self.session.record_gap(
+                        builder,
+                        access,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::CallableReferences,
+                        SemanticGapKind::Unknown,
+                        "Go selector load may denote a method value, but its callable interpretation is unresolved",
+                    )?;
+                }
+                if !self.is_direct_value_field(node) {
+                    self.add_non_rejoining_exceptional_exit_gap(
+                        builder,
+                        scope,
+                        access,
+                        SemanticGapSubject::Value(result),
+                        SemanticGapKind::Unsupported,
+                        "selection may panic on a nil operand",
+                    )?;
+                }
+                self.session.add_target_edge(builder, access, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[operand],
+                    EdgeTarget::normal(access),
+                    scope,
+                    stack,
+                )
+            }
+            "index_expression"
+                if !is_assignment_target(node)
+                    && node
+                        .child_by_field_name("index")
+                        .is_some_and(|index| !is_go_type_syntax(index.kind())) =>
+            {
+                let operand = required_field(node, "operand")?;
+                let index_node = required_field(node, "index")?;
+                let access = self.session.add_node_point(builder, node, Vec::new())?;
+                let Some((kind, location)) = self.memory_access_location(builder, access, node)?
+                else {
+                    unreachable!("the index load guard proves a memory place");
+                };
+                debug_assert_eq!(kind, MemoryAccessKind::Index);
+                self.append_effect(
+                    builder,
+                    access,
+                    SemanticEffect::MemoryLoad {
+                        kind,
+                        location,
+                        result,
+                    },
+                )?;
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    scope,
+                    access,
+                    SemanticGapSubject::Value(result),
+                    SemanticGapKind::Unsupported,
+                    "indexing may panic on a nil operand or an out-of-range index",
+                )?;
+                self.session.add_target_edge(builder, access, next)?;
+                let children = [operand, index_node];
+                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(access),
+                    scope,
+                    stack,
+                )
+            }
+            "slice_expression" => {
+                let operand = required_field(node, "operand")?;
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                let source =
+                    self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+                let offset = match node.child_by_field_name("start") {
+                    None => BackingStoreOffset::Zero,
+                    Some(start) => match go_integer_literal_value(self.prepared.source(), start) {
+                        Some(offset) => BackingStoreOffset::Constant(offset),
+                        None => BackingStoreOffset::Value(self.expression_value(
+                            builder,
+                            start,
+                            self.expression_value_kind(start),
+                        )?),
+                    },
+                };
+                if matches!(
+                    self.value_storage_kinds.get(&source),
+                    Some(GoStorageKind::Array | GoStorageKind::Slice)
+                ) {
+                    self.value_storage_kinds
+                        .insert(result, GoStorageKind::Slice);
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::BackingStore { offset },
+                            source,
+                            target: result,
+                        },
+                    )?;
+                } else {
+                    self.session.add_gap_with_impacts(
+                        builder,
+                        boundary,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::IndexMemory,
+                        SemanticGapImpacts::single(SemanticGapImpact::Aliasing)
+                            .with(SemanticGapImpact::HeapRead)
+                            .with(SemanticGapImpact::HeapWrite),
+                        SemanticGapKind::Unknown,
+                        "Go slice expression has no exact local backing store",
+                    )?;
+                }
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    scope,
+                    boundary,
+                    SemanticGapSubject::Value(result),
+                    SemanticGapKind::Unsupported,
+                    "slicing may panic on an invalid bound",
+                )?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                let children = runtime_expression_children(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("*") => {
+                // A dereference reads the pointee. Its value is the pointee's
+                // own, not a value derived from the pointer, which is the same
+                // identity claim the `&` arm above makes in the other
+                // direction.
+                let operand = required_field(node, "operand")?;
+                let consumed = transparent_parenthesized_expression(operand);
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let source =
+                    self.expression_value(builder, consumed, self.expression_value_kind(consumed))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueUse {
+                        kind: ValueUseKind::Dereference,
+                        value: source,
+                    },
+                )?;
+                let Some((kind, location)) =
+                    self.memory_access_location(builder, terminal, node)?
+                else {
+                    unreachable!("a pointer dereference has a dereference memory location");
+                };
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::MemoryLoad {
+                        kind,
+                        location,
+                        result,
+                    },
+                )?;
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    scope,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticGapKind::Unknown,
+                    "operator evaluation may panic",
+                )?;
+                self.session.add_target_edge(builder, terminal, next)?;
+                stack.push(Work::Expression {
+                    node: operand,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
+            "type_assertion_expression" => {
+                // Preserve dataflow through every assertion (#2662), but
+                // object identity requires a compatible stable payload. A
+                // failed assertion does not reinterpret the stored object.
+                //
+                // The single-result form continues only when the assertion
+                // succeeded, so a compatible stable reference payload keeps
+                // its identity on this normal continuation. The two-result
+                // form `v, ok := x.(T)` reaches the same lowering through
+                // assignment lowering, which binds result zero to this value
+                // and result one to the presence Boolean; the failure
+                // continuation assigns the zero value and carries no payload
+                // identity because a compatible assertion cannot fail.
+                let two_result = self
+                    .multi_result_values
+                    .get(&node.id())
+                    .is_some_and(|values| values.len() > 1);
+                let operand = required_field(node, "operand")?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let source =
+                    self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+                let kind = if self
+                    .reference_identity_preserving_assertions
+                    .contains(&node.id())
+                {
+                    ValueFlowKind::ReferenceUnboxing
+                } else if self.identity_preserving_assertions.contains(&node.id()) {
+                    ValueFlowKind::Local
+                } else {
+                    ValueFlowKind::Transfer(ValueTransfer {
+                        kind: TransferKind::Unboxing,
+                        operation: TransferOperation::None,
+                    })
+                };
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value: source,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source,
+                        target: result,
+                    },
+                )?;
+                if !two_result {
+                    self.add_non_rejoining_exceptional_exit_gap(
+                        builder,
+                        scope,
+                        terminal,
+                        SemanticGapSubject::Value(result),
+                        SemanticGapKind::Unsupported,
+                        "single-result type assertion may panic on a failed assertion",
+                    )?;
+                }
+                self.session.add_target_edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[operand],
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "selector_expression" if self.is_import_qualified_selector(node) => {
+                // A package name is not an evaluated receiver, and the
+                // selector does not name struct-field memory.
+                self.session.add_target_edge(builder, entry, next)
+            }
+            "selector_expression" | "index_expression" => {
+                let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+                self.add_non_rejoining_exceptional_exit_gap(
+                    builder,
+                    scope,
+                    boundary,
+                    SemanticGapSubject::Value(result),
+                    SemanticGapKind::Unsupported,
+                    "selection, indexing, or slicing may panic",
+                )?;
+                self.session.add_target_edge(builder, boundary, next)?;
+                let children = runtime_expression_children(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "binary_expression" | "unary_expression" => {
+                // The operator result derives from every operand. Without this
+                // flow an arithmetic step silently ended the value's history.
+                let children = runtime_expression_children(node);
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let operands = children
+                    .iter()
+                    .map(|child| {
+                        self.expression_value(builder, *child, self.expression_value_kind(*child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let integer_offset = if node.kind() == "binary_expression" {
+                    let operator = node
+                        .child_by_field_name("operator")
+                        .map(|value| value.kind());
+                    let left = node.child_by_field_name("left");
+                    let right = node.child_by_field_name("right");
+                    match (operator, left, right) {
+                        (Some("+"), Some(left), Some(right)) => {
+                            match (
+                                go_integer_literal_value(self.prepared.source(), left),
+                                go_integer_literal_value(self.prepared.source(), right),
+                            ) {
+                                (Some(magnitude), None) => Some((right, false, magnitude)),
+                                (None, Some(magnitude)) => Some((left, false, magnitude)),
+                                _ => None,
+                            }
+                        }
+                        (Some("-"), Some(left), Some(right)) => {
+                            go_integer_literal_value(self.prepared.source(), right)
+                                .filter(|_| {
+                                    go_integer_literal_value(self.prepared.source(), left).is_none()
+                                })
+                                .map(|magnitude| (left, true, magnitude))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((source, negative, magnitude)) = integer_offset {
+                    let source =
+                        self.expression_value(builder, source, self.expression_value_kind(source))?;
+                    self.session.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::IntegerOffset {
+                                offset: SignedIntegerMagnitude::new(negative, magnitude),
+                            },
+                            source,
+                            target: result,
+                        },
+                    )?;
+                } else {
+                    self.session
+                        .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                }
+                if go_operation_can_panic(node) {
+                    self.add_non_rejoining_exceptional_exit_gap(
+                        builder,
+                        scope,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticGapKind::Unknown,
+                        "operator evaluation may panic",
+                    )?;
+                }
+                self.session.add_target_edge(builder, terminal, next)?;
+                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "type_conversion_expression" => {
+                let children = runtime_expression_children(node);
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let operands = children
+                    .iter()
+                    .map(|child| {
+                        self.expression_value(builder, *child, self.expression_value_kind(*child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Retain operand dependence without claiming identity across
+                // an unproved conversion. Otherwise an address can disappear
+                // at this boundary and later escape unseen by heap consumers.
+                self.session
+                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go conversion result identity is intentionally not propagated",
+                )?;
+                self.session.add_target_edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "composite_literal" => {
+                let kind = match node.child_by_field_name("type").map(|node| node.kind()) {
+                    Some("slice_type") => AllocationKind::Slice,
+                    Some("array_type" | "implicit_length_array_type" | "map_type") => {
+                        AllocationKind::Array
+                    }
+                    _ => AllocationKind::Object,
+                };
+                self.session.add_allocation(builder, entry, result, kind)?;
+                let children = runtime_expression_children(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+                let index_stores =
+                    self.composite_literal_index_stores(builder, entry, node, result)?;
+                let field_stores = if index_stores.is_none() {
+                    self.composite_literal_field_stores(builder, entry, node, result)?
+                } else {
+                    None
+                };
+                let aggregate_initializers = if index_stores.is_none() && field_stores.is_none() {
+                    self.composite_literal_aggregate_initializers(builder, node)?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if index_stores.as_ref().is_none_or(Vec::is_empty)
+                    && field_stores.as_ref().is_none_or(Vec::is_empty)
+                    && aggregate_initializers.is_empty()
+                {
+                    return self
+                        .schedule_expressions(builder, entry, &children, next, scope, stack);
+                }
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                if let Some(stores) = index_stores {
+                    let value_copy = self.expression_index_value_copy(node, node.start_byte());
+                    for (constant_index, value) in stores {
+                        let index = self.value(
+                            builder,
+                            terminal,
+                            SemanticValueKind::UnsignedInteger(constant_index),
+                        )?;
+                        let location = self.session.add_memory_location_with_value_copy(
+                            builder,
+                            terminal,
+                            MemoryLocationKind::Index {
+                                base: result,
+                                index: Some(index),
+                                constant_index: Some(constant_index),
+                                identity: IndexedLocationIdentity::Element,
+                            },
+                            value_copy,
+                        )?;
+                        self.add_unprojected_index_gap(builder, terminal, location, true)?;
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::MemoryStore {
+                                kind: MemoryAccessKind::Index,
+                                location,
+                                value,
+                            },
+                        )?;
+                    }
+                }
+                if let Some(stores) = field_stores {
+                    for store in stores {
+                        let value = if store.aggregate_copy {
+                            let copied = self.session.add_node_value(
+                                builder,
+                                store.source_node,
+                                SemanticValueKind::Temporary,
+                            )?;
+                            self.append_effect(
+                                builder,
+                                terminal,
+                                SemanticEffect::Assignment {
+                                    target: copied,
+                                    value: store.value,
+                                },
+                            )?;
+                            self.append_effect(
+                                builder,
+                                terminal,
+                                SemanticEffect::ValueFlow {
+                                    kind: ValueFlowKind::Transfer(ValueTransfer {
+                                        kind: TransferKind::AggregateCopy,
+                                        operation: TransferOperation::None,
+                                    }),
+                                    source: store.value,
+                                    target: copied,
+                                },
+                            )?;
+                            copied
+                        } else {
+                            store.value
+                        };
+                        let location = self.session.add_memory_location(
+                            builder,
+                            terminal,
+                            MemoryLocationKind::Field {
+                                base: result,
+                                member: store.member,
+                            },
+                        )?;
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::MemoryStore {
+                                kind: MemoryAccessKind::Field,
+                                location,
+                                value,
+                            },
+                        )?;
+                    }
+                }
+                for initializer in aggregate_initializers {
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::AggregateInitializer {
+                            aggregate: result,
+                            selector: initializer.selector,
+                            value: initializer.value,
+                        },
+                    )?;
+                }
+                self.session.add_target_edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "literal_value" | "literal_element" | "keyed_element" | "expression_list"
+            | "argument_list" | "variadic_argument" => {
+                let children = runtime_expression_children(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "type_instantiation_expression" => self.session.add_target_edge(builder, entry, next),
+            kind if is_runtime_leaf(kind) => self.session.add_target_edge(builder, entry, next),
+            _ => self.unhandled_control_syntax(builder, node, entry),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let invoke = self.emit_call_expression(builder, node, next, scope, false, stack)?;
+        let evaluations = self.call_operand_evaluations(node, false)?;
+        self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(invoke),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deferred_call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        if let Some(builtin) = self.builtin_call_kind(node) {
+            self.note_predeclared_builtin_assumption(builtin);
+        }
+        if self.builtin_close_argument(node).is_some() {
+            let capture = self.deferred_captures.get(&node.id()).ok_or_else(|| {
+                GoLoweringError::Invalid("supported deferred close has no captured operand".into())
+            })?;
+            let [captured] = capture.arguments.as_ref() else {
+                return Err(GoLoweringError::Invalid(
+                    "builtin close must have one captured operand".into(),
+                ));
+            };
+            let subject = captured.target;
+            let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::Synchronization {
+                    operation: SynchronizationOperation::ChannelClose,
+                    subject,
+                    payload: None,
+                },
+            )?;
+            self.add_non_rejoining_exceptional_exit_gap(
+                builder,
+                scope,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticGapKind::Unknown,
+                "deferred close of a closed channel or send-only invalid channel may panic",
+            )?;
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(boundary))?;
+            return self.session.add_target_edge(builder, boundary, next);
+        }
+        let invoke = self.emit_call_expression(builder, node, next, scope, true, stack)?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(invoke))
+    }
+
+    fn call_resolution_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        call_site: CallSiteId,
+        call: GoCallResolutionGapContext<'_>,
+    ) -> Result<(), GoLoweringError> {
+        if call.selector_resolution == Some(GoSelectorResolution::Package) {
+            self.imported_package_member_resolution_gaps(
+                builder,
+                invoke,
+                call.callee,
+                call_site,
+                call.resolution,
+            )?;
+        } else {
+            self.session.add_dispatch_resolution_gaps(
+                builder,
+                invoke,
+                call.callee,
+                call_site,
+                call.resolution,
+            )?;
+        }
+        if call.selector_resolution == Some(GoSelectorResolution::Unknown)
+            || (call.receiver.is_some()
+                && !matches!(
+                    call.selector_resolution,
+                    Some(GoSelectorResolution::Method { .. })
+                ))
+        {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                if call.selector_resolution == Some(GoSelectorResolution::Unknown) {
+                    "selector callee may be a function-valued field, interface method, or promoted method; receiver type and complete method-set coverage require refinement"
+                } else {
+                    "selector dispatch may target an interface method or promoted method; receiver type and complete method-set coverage require type refinement"
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn spawned_call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        next: EdgeTarget,
+    ) -> Result<ProgramPointId, GoLoweringError> {
+        if let Some(builtin) = self.builtin_call_kind(node) {
+            self.note_predeclared_builtin_assumption(builtin);
+        }
+        let invoke = self.session.add_node_point(builder, node, Vec::new())?;
+        let normal = self.session.add_node_point(builder, node, Vec::new())?;
+        let operands = self.lower_call_operands(builder, node, invoke, None)?;
+        let call_site = self.session.add_spawned_call_site(
+            builder,
+            SpawnedCallSiteScaffold {
+                point: invoke,
+                callee: operands.callee,
+                receiver: operands.receiver,
+                arguments: operands.arguments,
+                declared_targets: operands.resolution.clone(),
+                normal_continuation: normal,
+            },
+        )?;
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.call_resolution_gaps(
+            builder,
+            invoke,
+            call_site,
+            GoCallResolutionGapContext {
+                callee: operands.callee,
+                receiver: operands.receiver,
+                resolution: &operands.resolution,
+                selector_resolution: operands.selector_resolution,
+            },
+        )?;
+        Ok(invoke)
+    }
+
+    fn lower_call_operands(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        invoke: ProgramPointId,
+        capture: Option<&DeferredCapture>,
+    ) -> Result<LoweredCallOperands, GoLoweringError> {
+        let function = required_field(node, "function")?;
+        let callee = self.expression_value(builder, function, SemanticValueKind::Callable)?;
+        let direct_function = transparent_parenthesized_expression(function);
+        let selector_resolution =
+            (function.kind() == "selector_expression").then(|| self.selector_resolution(function));
+        let interface_dispatch = self.interface_dispatches.get(&function.id()).cloned();
+        let receiver_node = selector_resolution
+            .and_then(|resolution| match resolution {
+                GoSelectorResolution::Method { .. }
+                | GoSelectorResolution::InterfaceMethod { .. }
+                | GoSelectorResolution::Unknown => function.child_by_field_name("operand"),
+                GoSelectorResolution::Package | GoSelectorResolution::Field => None,
+            })
+            .map(transparent_parenthesized_expression);
+        let evaluated_receiver = if let Some(captured) =
+            capture.and_then(|capture| capture.receiver.map(|captured| captured.target))
+        {
+            Some(captured)
+        } else {
+            receiver_node
+                .map(|receiver| {
+                    self.expression_value(builder, receiver, self.expression_value_kind(receiver))
+                })
+                .transpose()?
+        };
+        let receiver = if let (Some(proof), Some(wrapper), Some(receiver_node)) = (
+            interface_dispatch.as_ref(),
+            evaluated_receiver,
+            receiver_node,
+        ) {
+            let extracted = self.session.add_node_value(
+                builder,
+                receiver_node,
+                SemanticValueKind::LanguageDefined("go.interface_method_receiver".into()),
+            )?;
+            self.value_types
+                .insert(extracted, proof.receiver_type.clone());
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::Assignment {
+                    target: extracted,
+                    value: wrapper,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::ReferenceUnboxing,
+                    source: wrapper,
+                    target: extracted,
+                },
+            )?;
+            Some(extracted)
+        } else {
+            evaluated_receiver
+        };
+        let callable_kind = if receiver.is_some() {
+            CallableReferenceKind::BoundMethod
+        } else {
+            CallableReferenceKind::Function
+        };
+        // A call denotes a local procedure either by immediate literal syntax
+        // or through a binding the prepass proved stable and function-valued.
+        // Both reach the same `GoProcedureTarget`, so the two spellings of one
+        // call cannot disagree about what it denotes.
+        let callable = if direct_function.kind() == "func_literal" {
+            Some(GoIndirectCallableTarget::Literal(direct_function.id()))
+        } else {
+            self.indirect_callable_targets
+                .get(&direct_function.id())
+                .copied()
+        };
+        let resolution = interface_dispatch
+            .as_ref()
+            .map(|proof| CallableTargetResolution::Proven(CallableTarget::Local(proof.target)))
+            .or_else(|| match callable {
+                Some(GoIndirectCallableTarget::Literal(literal)) => {
+                    self.procedure_targets.get(&literal).map(|target| {
+                        CallableTargetResolution::Proven(CallableTarget::Local(target.id))
+                    })
+                }
+                Some(GoIndirectCallableTarget::Method(target)) => Some(
+                    CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                ),
+                None => None,
+            })
+            .or(match selector_resolution {
+                Some(GoSelectorResolution::Method { target, .. }) => Some(
+                    CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                ),
+                _ => None,
+            })
+            .or_else(|| {
+                self.package_function_target(direct_function)
+                    .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target)))
+            })
+            .unwrap_or_else(|| {
+                let is_function_value_binding = match direct_function.kind() {
+                    "identifier" => {
+                        node_text(self.prepared.source(), direct_function).is_some_and(|name| {
+                            self.binding_value(name, direct_function.start_byte())
+                                .is_some()
+                        })
+                    }
+                    "selector_expression" => self.selector_field_type(direct_function).is_some(),
+                    _ => false,
+                };
+                let is_function_typed = is_function_value_binding
+                    && self
+                        .expression_type_node(direct_function, direct_function.start_byte())
+                        .and_then(|type_node| {
+                            self.file_underlying_type(type_node, direct_function.start_byte())
+                        })
+                        .is_some_and(|type_node| type_node.kind() == "function_type");
+                if is_function_typed {
+                    // The Go adapter has identified a function-valued
+                    // expression, but its target set is assembled later by
+                    // invocation-local value flow. Keep this distinct from a
+                    // direct unresolved name without claiming an unproven
+                    // candidate set at this semantic point.
+                    CallableTargetResolution::Unsupported
+                } else {
+                    CallableTargetResolution::Unknown
+                }
+            });
+        let metadata = self.metadata(invoke)?;
+        if selector_resolution == Some(GoSelectorResolution::Unknown) {
+            // The selector can still denote a function-valued field. Retain
+            // that alternative beside the bound-method interpretation so the
+            // call row carries the receiver candidate without certifying that
+            // one receiver binding exists.
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::CallableReference {
+                    result: callee,
+                    callable: CallableValue {
+                        kind: CallableReferenceKind::Function,
+                        targets: resolution.clone(),
+                        target_evidence: metadata.evidence,
+                        bound_receiver: None,
+                        environment: None,
+                    },
+                },
+            )?;
+        }
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: receiver,
+                    environment: None,
+                },
+            },
+        )?;
+
+        let arguments = call_arguments(node);
+        let argument_values = arguments
+            .iter()
+            .enumerate()
+            .map(
+                |(index, argument)| -> Result<SemanticCallArgument, GoLoweringError> {
+                    let value_node = go_call_argument_value_node(*argument);
+                    let value = if let Some(captured) = capture
+                        .and_then(|capture| capture.arguments.get(index))
+                        .map(|captured| captured.target)
+                    {
+                        // A deferred call already captured its operand at
+                        // registration time and owns that copy's semantics.
+                        captured
+                    } else {
+                        let value = self.expression_value(
+                            builder,
+                            value_node,
+                            self.expression_value_kind(value_node),
+                        )?;
+                        // Go passes every argument by value. An inline aggregate
+                        // actual therefore reaches the callee as the callee's
+                        // own storage holding the caller's members: the callee
+                        // observes those members, and a write to its parameter
+                        // is not observable here.
+                        self.append_transferred_aggregate(builder, invoke, value_node, value)?
+                    };
+                    Ok(if argument.kind() == "variadic_argument" {
+                        SemanticCallArgument {
+                            value,
+                            expansion: CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+                            keyword: None,
+                        }
+                    } else {
+                        SemanticCallArgument::direct(value, ArgumentDomain::Positional)
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LoweredCallOperands {
+            callee,
+            receiver,
+            arguments: argument_values.into_boxed_slice(),
+            resolution,
+            selector_resolution,
+        })
+    }
+
+    fn emit_call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        deferred: bool,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, GoLoweringError> {
+        let invoke = self.session.add_node_point(builder, node, Vec::new())?;
+        let normal = self.session.add_node_point(builder, node, Vec::new())?;
+        let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
+        let function = required_field(node, "function")?;
+        let normal_results = self.multi_result_values.get(&node.id()).cloned();
+        let result = if normal_results.is_none() {
+            Some(if deferred {
+                self.session
+                    .add_node_value(builder, node, SemanticValueKind::Temporary)?
+            } else {
+                self.expression_value(builder, node, SemanticValueKind::Temporary)?
+            })
+        } else {
+            None
+        };
+        let thrown =
+            self.session
+                .add_node_value(builder, function, SemanticValueKind::Exception)?;
+        let capture = deferred
+            .then(|| self.deferred_captures.get(&node.id()).cloned())
+            .flatten();
+        let operands = self.lower_call_operands(builder, node, invoke, capture.as_ref())?;
+        let scaffold = CallSiteScaffold {
+            point: invoke,
+            callee: operands.callee,
+            receiver: operands.receiver,
+            arguments: operands.arguments,
+            normal_results: normal_results.unwrap_or_default(),
+            result,
+            thrown: Some(thrown),
+            declared_targets: operands.resolution.clone(),
+            normal_continuation: normal,
+            exceptional_continuation: exceptional,
+        };
+        let call_site = if deferred {
+            self.session.add_deferred_call_site(builder, scaffold)?
+        } else {
+            self.session.add_call_site(builder, scaffold)?
+        };
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.abrupt(
+            builder,
+            exceptional,
+            scope,
+            CompletionKind::Throw,
+            None,
+            stack,
+        )?;
+        self.call_resolution_gaps(
+            builder,
+            invoke,
+            call_site,
+            GoCallResolutionGapContext {
+                callee: operands.callee,
+                receiver: operands.receiver,
+                resolution: &operands.resolution,
+                selector_resolution: operands.selector_resolution,
+            },
+        )?;
+
+        Ok(invoke)
+    }
+
+    fn callable_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), GoLoweringError> {
+        let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
+        let target = self.procedure_targets.get(&node.id()).cloned();
+        let resolution = target
+            .as_ref()
+            .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
+            .unwrap_or(CallableTargetResolution::Unknown);
+        let metadata = self.metadata(entry)?;
+        let kind = CallableReferenceKind::Lambda;
+        let environment = if target
+            .as_ref()
+            .is_some_and(|target| !target.captures.is_empty())
+        {
+            Some(self.session.add_allocation(
+                builder,
+                entry,
+                result,
+                AllocationKind::ClosureEnvironment,
+            )?)
+        } else {
+            None
+        };
+        let callable = CallableValue {
+            kind,
+            targets: resolution.clone(),
+            target_evidence: metadata.evidence,
+            bound_receiver: None,
+            environment,
+        };
+        self.append_effect(
+            builder,
+            entry,
+            SemanticEffect::CallableCreation { result, callable },
+        )?;
+        if let (Some(target), Some(environment)) = (target.as_ref(), environment) {
+            for (index, capture) in target.captures.iter().enumerate() {
+                let source = self
+                    .captured_or_owned_binding_value(capture.name.as_ref(), capture.binding)
+                    .ok_or_else(|| {
+                        GoLoweringError::Invalid(format!(
+                            "precomputed Go capture `{}` has no parent binding",
+                            capture.name
+                        ))
+                    })?;
+                let destination = MemoryLocationId::new(u32::try_from(index).map_err(|_| {
+                    GoLoweringError::Invalid("too many Go capture destinations".into())
+                })?);
+                let (captured, mode) = match capture.storage {
+                    GoCaptureStorage::Value => (CaptureSource::Value(source), CaptureMode::Value),
+                    GoCaptureStorage::MutableCell => {
+                        let (location, _) = self
+                            .shared_binding_locations
+                            .get(&source)
+                            .copied()
+                            .ok_or_else(|| {
+                                GoLoweringError::Invalid(format!(
+                                    "shared Go capture `{}` has no parent cell",
+                                    capture.name
+                                ))
+                            })?;
+                        (CaptureSource::Location(location), CaptureMode::MutableCell)
+                    }
+                };
+                self.session.add_capture(
+                    builder,
+                    entry,
+                    result,
+                    target.id,
+                    environment,
+                    captured,
+                    destination,
+                    mode,
+                )?;
+            }
+        }
+        if let Some(target) = target.as_ref() {
+            for name in &target.omitted_capture_names {
+                let Some(source) = self.binding_value(name, node.start_byte()) else {
+                    continue;
+                };
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(source),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unsupported,
+                    "Go closure captures this parent binding by reference, whose value identity is not modeled",
+                )?;
+            }
+        }
+        if resolution == CallableTargetResolution::Unknown {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::CallableReferences,
+                SemanticGapKind::Unknown,
+                "function-literal target mapping requires location-first dispatch refinement",
+            )?;
+        }
+        self.session.add_target_edge(builder, entry, next)
+    }
+
+    fn unhandled_control_syntax(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+    ) -> Result<(), GoLoweringError> {
+        self.session
+            .add_unhandled_control_syntax_gap(builder, entry, node.kind())
+            .map(|_| ())
+    }
+
+    fn note_deterministic_evaluation_order(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        node: Node<'tree>,
+        evaluations: &[Node<'tree>],
+    ) -> Result<(), GoLoweringError> {
+        let Some(detail) = self.go_evaluation_order_gap_detail(node, evaluations) else {
+            return Ok(());
+        };
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::NormalControlFlow,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unknown,
+            SemanticGapDischarge::RetainedEvaluationOrder,
+            detail,
+        )?;
+        Ok(())
+    }
+
+    fn go_evaluation_order_gap_detail(
+        &self,
+        node: Node<'tree>,
+        evaluations: &[Node<'tree>],
+    ) -> Option<&'static str> {
+        let unspecified = match node.kind() {
+            "composite_literal" => self.composite_literal_has_unspecified_order(node),
+            "literal_value" => {
+                node.parent()
+                    .is_none_or(|parent| parent.kind() != "composite_literal")
+                    && self.literal_value_has_unspecified_order(node)
+            }
+            // The containing literal_value or composite_literal owns this gap
+            // so selectors have one precise source-backed boundary rather
+            // than one duplicate per keyed element.
+            "keyed_element" => false,
+            _ => self.evaluation_units_have_unspecified_order(evaluations),
+        };
+        unspecified.then_some(
+            if matches!(node.kind(), "composite_literal" | "literal_value") {
+                "Go does not fully specify composite-literal operand and element evaluation order; deterministic CFG topology uses source order while preserving the specified lexical order of calls, receives, and logical operations"
+            } else {
+                "Go specifies lexical left-to-right order for calls, method calls, receives, and logical operations, but not all other operand evaluations; deterministic CFG topology uses source order for the unspecified remainder"
+            },
+        )
+    }
+
+    fn composite_literal_has_unspecified_order(&self, node: Node<'tree>) -> bool {
+        let Some(body) = node.child_by_field_name("body") else {
+            return false;
+        };
+        self.literal_value_has_unspecified_order(body)
+    }
+
+    fn literal_value_has_unspecified_order(&self, node: Node<'tree>) -> bool {
+        let elements = named_children(node);
+        let aggregate_kind = self.literal_value_aggregate_kind(node);
+        let element_traits = elements
+            .iter()
+            .map(|element| self.literal_element_evaluation_traits(*element, aggregate_kind))
+            .collect::<Vec<_>>();
+        self.evaluation_traits_have_unspecified_order(&element_traits)
+            || elements.iter().any(|element| {
+                let Some(key) = element.child_by_field_name("key") else {
+                    return false;
+                };
+                self.literal_key_is_evaluated(key, aggregate_kind)
+                    && element.child_by_field_name("value").is_some_and(|value| {
+                        self.evaluation_units_have_unspecified_order(&[key, value])
+                    })
+            })
+            || (aggregate_kind != GoLiteralAggregateKind::NonMap
+                && self.map_literal_has_unordered_assignments(node, aggregate_kind))
+    }
+
+    fn literal_element_evaluation_traits(
+        &self,
+        element: Node<'tree>,
+        aggregate_kind: GoLiteralAggregateKind,
+    ) -> GoEvaluationTraits {
+        if element.kind() != "keyed_element" {
+            return self.go_evaluation_traits(element);
+        }
+        let mut traits = element
+            .child_by_field_name("value")
+            .map(|value| self.go_evaluation_traits(value))
+            .unwrap_or_default();
+        if let Some(key) = element.child_by_field_name("key")
+            && self.literal_key_is_evaluated(key, aggregate_kind)
+        {
+            traits.merge(self.go_evaluation_traits(key));
+        }
+        traits
+    }
+
+    fn literal_key_is_evaluated(
+        &self,
+        key: Node<'tree>,
+        aggregate_kind: GoLiteralAggregateKind,
+    ) -> bool {
+        match aggregate_kind {
+            GoLiteralAggregateKind::Map => true,
+            GoLiteralAggregateKind::NonMap => false,
+            GoLiteralAggregateKind::Unknown => self.unknown_literal_key_is_runtime(key),
+        }
+    }
+
+    /// A qualified or otherwise unresolved composite type can be either a map
+    /// or a struct. Preserve a key only when its AST proves a runtime
+    /// expression, or when a bare name resolves to a value this intrafile
+    /// inventory knows. An unresolved bare name remains a possible static
+    /// struct field label, avoiding map-order gaps for imported structs.
+    fn unknown_literal_key_is_runtime(&self, mut key: Node<'tree>) -> bool {
+        while let Some(inner) = transparent_runtime_wrapper_child(key) {
+            key = inner;
+        }
+        if is_go_binding_reference_kind(key.kind()) {
+            let Some(name) = node_text(self.prepared.source(), key) else {
+                return false;
+            };
+            return self.binding_value(name, key.start_byte()).is_some()
+                || self.package_values.contains(name);
+        }
+        key.kind() != "field_identifier"
+    }
+
+    fn evaluation_units_have_unspecified_order(&self, evaluations: &[Node<'tree>]) -> bool {
+        let traits = evaluations
+            .iter()
+            .map(|evaluation| self.go_evaluation_traits(*evaluation))
+            .collect::<Vec<_>>();
+        self.evaluation_traits_have_unspecified_order(&traits)
+    }
+
+    fn evaluation_traits_have_unspecified_order(&self, traits: &[GoEvaluationTraits]) -> bool {
+        for (index, earlier) in traits.iter().enumerate() {
+            if !earlier.runtime_read && !earlier.call_or_receive && !earlier.may_abort {
+                continue;
+            }
+            for later in &traits[index + 1..] {
+                if !later.runtime_read && !later.call_or_receive && !later.may_abort {
+                    continue;
+                }
+                if (earlier.may_abort && later.may_abort)
+                    || (earlier.call_or_receive && (later.runtime_read || later.may_abort))
+                    || ((earlier.runtime_read || earlier.may_abort)
+                        && !earlier.ordered_completion
+                        && later.call_or_receive)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The ways one evaluation unit can make an otherwise unspecified source
+    /// order observable.
+    ///
+    /// A call or receive may mutate or synchronize with an adjacent read, so
+    /// the specification's `[]int{a, f()}` example needs only one such event.
+    /// A panic-only operation beside a plain read does not expose their order,
+    /// but two potentially aborting units do expose which panic wins. The walk
+    /// is iterative and does not descend into a function literal whose body is
+    /// evaluated only when that literal is called.
+    fn go_evaluation_traits(&self, node: Node<'tree>) -> GoEvaluationTraits {
+        let mut traits = GoEvaluationTraits {
+            ordered_completion: go_evaluation_unit_has_ordered_completion(node),
+            ..GoEvaluationTraits::default()
+        };
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            if is_comment_kind(current.kind()) || is_go_type_syntax(current.kind()) {
+                continue;
+            }
+            if current.kind() == "func_literal" || self.is_go_constant_value(current) {
+                continue;
+            }
+            if self.is_import_qualified_selector(current) {
+                // The selected declaration can be a mutable package variable,
+                // but the package qualifier is resolved syntax rather than a
+                // nil-able runtime receiver.
+                traits.runtime_read = true;
+                continue;
+            }
+            match current.kind() {
+                "call_expression" => {
+                    traits.call_or_receive = true;
+                    if let Some(function) = current.child_by_field_name("function") {
+                        match function.kind() {
+                            "identifier" | "true" | "false" | "nil" | "iota" => {
+                                if self.identifier_is_shared_or_call_exposed(function) {
+                                    traits.runtime_read = true;
+                                }
+                            }
+                            "selector_expression" => match self.selector_resolution(function) {
+                                GoSelectorResolution::Package => {}
+                                GoSelectorResolution::Field | GoSelectorResolution::Unknown => {
+                                    stack.push(function)
+                                }
+                                GoSelectorResolution::Method { .. }
+                                | GoSelectorResolution::InterfaceMethod { .. } => {
+                                    if let Some(receiver) = function.child_by_field_name("operand")
+                                    {
+                                        stack.push(receiver);
+                                    }
+                                }
+                            },
+                            _ => stack.push(function),
+                        }
+                    }
+                    stack.extend(call_arguments(current).into_iter().rev());
+                    continue;
+                }
+                "unary_expression" if unary_operator_kind(current) == Some("<-") => {
+                    traits.call_or_receive = true;
+                    if let Some(operand) = current.child_by_field_name("operand") {
+                        stack.push(operand);
+                    }
+                    continue;
+                }
+                "binary_expression" if go_boolean_operator_kind(current).is_some() => {
+                    traits.call_or_receive = true;
+                }
+                "unary_expression" if unary_operator_kind(current) == Some("&") => {
+                    if let Some(operand) = current.child_by_field_name("operand") {
+                        let target = transparent_parenthesized_expression(operand);
+                        if !is_go_binding_reference_kind(target.kind())
+                            && !(target.kind() == "selector_expression"
+                                && self.is_direct_value_field(target))
+                        {
+                            stack.push(target);
+                        }
+                    }
+                    continue;
+                }
+                "index_expression" | "slice_expression" | "type_assertion_expression" => {
+                    traits.runtime_read = true;
+                    traits.may_abort = true;
+                }
+                "selector_expression" => {
+                    let direct_value_field = self.is_direct_value_field(current);
+                    traits.may_abort |= !direct_value_field;
+                    if !direct_value_field
+                        || current
+                            .child_by_field_name("operand")
+                            .and_then(|operand| self.place_root_binding(operand))
+                            .is_some_and(|binding| self.call_exposed_bindings.contains(&binding))
+                    {
+                        traits.runtime_read = true;
+                    }
+                    if let Some(operand) = current.child_by_field_name("operand") {
+                        stack.push(operand);
+                    }
+                    continue;
+                }
+                "identifier" | "true" | "false" | "nil" | "iota" => {
+                    traits.runtime_read |= self.identifier_is_shared_or_call_exposed(current);
+                }
+                "field_identifier" | "package_identifier" => {
+                    traits.runtime_read = true;
+                }
+                _ => {}
+            }
+            if go_operation_can_panic(current) {
+                traits.may_abort = true;
+            }
+            stack.extend(named_children(current));
+        }
+        traits
+    }
+
+    /// Map entries are assignments whose relative order Go leaves
+    /// unspecified. Two entries commute only when their keys are proven
+    /// distinct; valid Go source guarantees that basic constant keys do not
+    /// duplicate, while any runtime key can collide with another entry.
+    fn is_go_constant_evaluation(&self, mut node: Node<'tree>) -> bool {
+        loop {
+            if self.is_go_constant_value(node) {
+                return true;
+            }
+            let Some(only) = transparent_runtime_wrapper_child(node) else {
+                return false;
+            };
+            node = only;
+        }
+    }
+
+    fn map_literal_has_unordered_assignments(
+        &self,
+        body: Node<'tree>,
+        aggregate_kind: GoLiteralAggregateKind,
+    ) -> bool {
+        let entries = named_children(body)
+            .into_iter()
+            .filter(|element| element.kind() == "keyed_element")
+            .collect::<Vec<_>>();
+        entries.len() > 1
+            && entries.into_iter().any(|entry| {
+                entry.child_by_field_name("key").is_some_and(|key| {
+                    self.literal_key_is_evaluated(key, aggregate_kind)
+                        && !self.is_go_constant_evaluation(key)
+                })
+            })
+    }
+
+    fn literal_value_aggregate_kind(&self, body: Node<'tree>) -> GoLiteralAggregateKind {
+        let Some(kind) = self
+            .literal_value_expected_type(body)
+            .and_then(|kind| self.file_underlying_type(kind, body.start_byte()))
+        else {
+            return GoLiteralAggregateKind::Unknown;
+        };
+        match kind.kind() {
+            "map_type" => GoLiteralAggregateKind::Map,
+            "struct_type" | "array_type" | "implicit_length_array_type" | "slice_type" => {
+                GoLiteralAggregateKind::NonMap
+            }
+            _ => GoLiteralAggregateKind::Unknown,
+        }
+    }
+
+    /// Recover the type expected by an explicit or elided literal value using
+    /// only tree-sitter fields and same-file named type declarations.
+    fn literal_value_expected_type(&self, mut body: Node<'tree>) -> Option<Node<'tree>> {
+        let use_byte = body.start_byte();
+        let mut nesting = Vec::new();
+        let mut kind = loop {
+            let parent = body.parent()?;
+            if parent.kind() == "composite_literal" && field_matches(parent, "body", body) {
+                break parent.child_by_field_name("type")?;
+            }
+            if parent.kind() != "literal_element" {
+                return None;
+            }
+            let wrapper = parent;
+            let container = wrapper.parent()?;
+            match container.kind() {
+                "literal_value" => {
+                    nesting.push(GoLiteralNestingStep::Element);
+                    body = container;
+                }
+                "keyed_element" => {
+                    nesting.push(if field_matches(container, "key", wrapper) {
+                        GoLiteralNestingStep::Key
+                    } else if field_matches(container, "value", wrapper) {
+                        GoLiteralNestingStep::Value
+                    } else {
+                        return None;
+                    });
+                    body = container
+                        .parent()
+                        .filter(|parent| parent.kind() == "literal_value")?;
+                }
+                _ => return None,
+            }
+        };
+
+        for step in nesting.into_iter().rev() {
+            kind = self.literal_component_type(kind, step, use_byte)?;
+        }
+        Some(kind)
+    }
+
+    fn literal_component_type(
+        &self,
+        kind: Node<'tree>,
+        step: GoLiteralNestingStep,
+        use_byte: usize,
+    ) -> Option<Node<'tree>> {
+        let kind = self.file_underlying_type(kind, use_byte)?;
+        let component = match (kind.kind(), step) {
+            ("array_type" | "implicit_length_array_type" | "slice_type", _) => {
+                kind.child_by_field_name("element")
+            }
+            ("map_type", GoLiteralNestingStep::Key) => kind.child_by_field_name("key"),
+            ("map_type", GoLiteralNestingStep::Element | GoLiteralNestingStep::Value) => {
+                kind.child_by_field_name("value")
+            }
+            _ => None,
+        }?;
+        if component.kind() == "pointer_type" {
+            first_named_child(component)
+        } else {
+            Some(component)
+        }
+    }
+
+    /// Lower exact array literal operands as stores into the new inline array.
+    /// Positional entries advance from the preceding entry, while an integer
+    /// key sets the position for itself and the following positional entry.
+    /// Unavailable keys, lengths, duplicates, and bounds retain a Values gap
+    /// instead of manufacturing an indexed definition.
+    fn composite_literal_index_stores(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        node: Node<'tree>,
+        result: ValueId,
+    ) -> Result<Option<Vec<(u128, ValueId)>>, GoLoweringError> {
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return Ok(None);
+        };
+        let Some(array_type) = self.file_underlying_type(type_node, node.start_byte()) else {
+            return Ok(None);
+        };
+        if !matches!(
+            array_type.kind(),
+            "array_type" | "implicit_length_array_type"
+        ) {
+            return Ok(None);
+        }
+        let Some(body) = node.child_by_field_name("body") else {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Go array literal body is unavailable",
+            )?;
+            return Ok(Some(Vec::new()));
+        };
+        let elements = named_children(body)
+            .into_iter()
+            .filter(|element| element.kind() != "comment")
+            .collect::<Vec<_>>();
+        if elements.is_empty()
+            && !type_node.has_error()
+            && !type_node.is_missing()
+            && !body.has_error()
+            && !body.is_missing()
+        {
+            return Ok(Some(Vec::new()));
+        }
+        let length = if array_type.kind() == "array_type" {
+            let Some(length) = array_type
+                .child_by_field_name("length")
+                .and_then(|length| go_integer_literal_value(self.prepared.source(), length))
+            else {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go array literal length is not an exact integer literal",
+                )?;
+                return Ok(Some(Vec::new()));
+            };
+            Some(length)
+        } else {
+            None
+        };
+
+        let mut next_index = 0u128;
+        let mut used = HashSet::default();
+        let mut stores = Vec::new();
+        let mut unsupported = None;
+        for element in elements {
+            let (constant_index, value_node) = if element.kind() == "keyed_element" {
+                let Some(key) = element.child_by_field_name("key") else {
+                    unsupported = Some("Go array literal keyed initializer has no index");
+                    break;
+                };
+                let key = transparent_runtime_wrapper_child(key).unwrap_or(key);
+                let Some(index) = go_integer_literal_value(self.prepared.source(), key) else {
+                    unsupported = Some("Go array literal index is not an exact integer literal");
+                    break;
+                };
+                let Some(value) = element.child_by_field_name("value") else {
+                    unsupported = Some("Go array literal keyed initializer has no value");
+                    break;
+                };
+                (index, value)
+            } else if element.kind() == "literal_element" {
+                (next_index, element)
+            } else {
+                unsupported = Some("Go array literal initializer shape is unavailable");
+                break;
+            };
+            if length.is_some_and(|length| constant_index >= length) {
+                unsupported = Some("Go array literal initializer is outside its exact bounds");
+                break;
+            }
+            if !used.insert(constant_index) {
+                unsupported = Some("Go array literal repeats an element initializer");
+                break;
+            }
+            let Some(following) = constant_index.checked_add(1) else {
+                unsupported = Some("Go array literal index exceeds the semantic identity range");
+                break;
+            };
+            next_index = following;
+            let value_node = transparent_runtime_wrapper_child(value_node).unwrap_or(value_node);
+            let value =
+                self.expression_value(builder, value_node, self.expression_value_kind(value_node))?;
+            stores.push((constant_index, value));
+        }
+        if let Some(message) = unsupported {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                message,
+            )?;
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(stores))
+    }
+
+    /// Lower explicit initializers of a struct literal as stores into the
+    /// newly allocated aggregate. The stores are emitted at the caller's
+    /// terminal point, after every initializer has evaluated, so a panic in
+    /// an initializer cannot publish a partially constructed value.
+    fn composite_literal_field_stores(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        node: Node<'tree>,
+        result: ValueId,
+    ) -> Result<Option<Vec<GoCompositeLiteralStore<'tree>>>, GoLoweringError> {
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return Ok(None);
+        };
+        if go_type_uses_generic(
+            type_node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            node.start_byte(),
+        ) {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Go generic struct literal field layout is unavailable",
+            )?;
+            return Ok(Some(Vec::new()));
+        }
+        let body_is_well_formed_empty = node.child_by_field_name("body").is_some_and(|body| {
+            !type_node.has_error()
+                && !type_node.is_missing()
+                && !body.has_error()
+                && !body.is_missing()
+                && named_children(body).is_empty()
+        });
+        if body_is_well_formed_empty {
+            // An empty literal has no keyed or positional operands whose
+            // layout could affect this artifact. Preserve its allocation and
+            // let workspace refinement handle any later field access without
+            // manufacturing a Values gap for an absent initializer.
+            return Ok(Some(Vec::new()));
+        }
+        let Some(structure) = self.file_underlying_type(type_node, node.start_byte()) else {
+            if matches!(
+                type_node.kind(),
+                "type_identifier" | "qualified_type" | "generic_type" | "parenthesized_type"
+            ) {
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapImpacts::for_gap(
+                        SemanticCapability::Values,
+                        SemanticGapSubject::Value(result),
+                    ),
+                    SemanticGapKind::Unsupported,
+                    SemanticGapDischarge::ExactFieldLayout,
+                    "Go struct literal field layout is unavailable",
+                )?;
+            }
+            return Ok(None);
+        };
+        if structure.kind() != "struct_type" {
+            if matches!(
+                structure.kind(),
+                "type_identifier" | "qualified_type" | "generic_type"
+            ) {
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapImpacts::for_gap(
+                        SemanticCapability::Values,
+                        SemanticGapSubject::Value(result),
+                    ),
+                    SemanticGapKind::Unsupported,
+                    SemanticGapDischarge::ExactFieldLayout,
+                    "Go struct literal field layout is unavailable",
+                )?;
+            }
+            return Ok(None);
+        }
+        let Some(fields) = go_struct_literal_fields(structure, self.prepared.source()) else {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Go struct literal field layout is ambiguous",
+            )?;
+            return Ok(Some(Vec::new()));
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return Ok(Some(Vec::new()));
+        };
+        let elements = named_children(body);
+
+        let keyed = elements
+            .iter()
+            .all(|element| element.kind() == "keyed_element");
+        let positional = elements
+            .iter()
+            .all(|element| element.kind() != "keyed_element");
+        if !keyed && !positional {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Go struct literal mixes keyed and positional initializers",
+            )?;
+            return Ok(Some(Vec::new()));
+        }
+        if positional && elements.len() != fields.len() {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Go struct literal positional initializer arity is unavailable",
+            )?;
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut used = HashSet::default();
+        let mut stores = Vec::with_capacity(elements.len());
+        let mut storage_kind_unavailable = false;
+        for (index, element) in elements.into_iter().enumerate() {
+            let field_index = if keyed {
+                let (_key, name) =
+                    match keyed_composite_element_name(element, self.prepared.source()) {
+                        Ok(name) => name,
+                        Err(GoKeyedElementNameError::MissingKey) => {
+                            self.session.record_gap(
+                                builder,
+                                entry,
+                                SemanticGapSubject::Value(result),
+                                SemanticCapability::Values,
+                                SemanticGapKind::Unsupported,
+                                "Go struct literal keyed initializer has no field name",
+                            )?;
+                            return Ok(Some(Vec::new()));
+                        }
+                        Err(GoKeyedElementNameError::InvalidKey) => {
+                            self.session.record_gap(
+                                builder,
+                                entry,
+                                SemanticGapSubject::Value(result),
+                                SemanticCapability::Values,
+                                SemanticGapKind::Unsupported,
+                                "Go struct literal keyed initializer is not a direct field name",
+                            )?;
+                            return Ok(Some(Vec::new()));
+                        }
+                        Err(GoKeyedElementNameError::MissingName) => {
+                            self.session.record_gap(
+                                builder,
+                                entry,
+                                SemanticGapSubject::Value(result),
+                                SemanticCapability::Values,
+                                SemanticGapKind::Unsupported,
+                                "Go struct literal keyed initializer has an unavailable field name",
+                            )?;
+                            return Ok(Some(Vec::new()));
+                        }
+                    };
+                fields.iter().position(|field| field.name.as_ref() == name)
+            } else {
+                Some(index)
+            };
+            let Some(field_index) = field_index.filter(|index| *index < fields.len()) else {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go struct literal initializer does not identify a direct field",
+                )?;
+                return Ok(Some(Vec::new()));
+            };
+            if !used.insert(field_index) {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go struct literal repeats a field initializer",
+                )?;
+                return Ok(Some(Vec::new()));
+            }
+            let Some(value_node) = (element.kind() == "keyed_element")
+                .then(|| element.child_by_field_name("value"))
+                .flatten()
+                .or_else(|| (element.kind() == "literal_element").then_some(element))
+            else {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go struct literal initializer has no value",
+                )?;
+                return Ok(Some(Vec::new()));
+            };
+            let value_node = transparent_runtime_wrapper_child(value_node).unwrap_or(value_node);
+            let value =
+                self.expression_value(builder, value_node, self.expression_value_kind(value_node))?;
+            let field = fields[field_index].clone();
+            let member = self.member_locator(field.anchor);
+            let aggregate_copy = if let Some(field_storage) = field
+                .type_node
+                .and_then(|node| self.composite_field_storage(node))
+            {
+                field_storage == GoCompositeFieldStorage::InlineAggregate
+            } else {
+                // Preserve the exact field/value store for workspace queries.
+                // The memory location keeps Unknown copy identity, and the gap
+                // prevents file-local consumers from inferring aggregate
+                // aliasing without the declaration that classifies the field.
+                storage_kind_unavailable = true;
+                false
+            };
+            stores.push(GoCompositeLiteralStore {
+                member,
+                source_node: value_node,
+                value,
+                aggregate_copy,
+            });
+        }
+        if storage_kind_unavailable {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Go struct literal field storage kind is unavailable",
+            )?;
+        }
+        Ok(Some(stores))
+    }
+
+    /// Preserve keyed operands when this file cannot resolve the aggregate's
+    /// layout. The effect is deliberately weaker than a field store: a
+    /// workspace-aware consumer may learn that the selector is a struct field,
+    /// a map key, or another structured aggregate operand after loading the
+    /// declaring artifact. Generic types, positional elements, mixed keyed and
+    /// positional elements, and non-name keys remain in the existing gap
+    /// because this file cannot establish their structured identity. Known
+    /// same-file layouts use ordinary field stores, including inline aggregate
+    /// copies. The RHS value is recorded before this method returns, while the
+    /// effect itself is appended at the composite literal's terminal point
+    /// after all child expressions have completed.
+    fn composite_literal_aggregate_initializers(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<Vec<GoAggregateInitializer>>, GoLoweringError> {
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return Ok(None);
+        };
+        if go_type_uses_generic(
+            type_node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            node.start_byte(),
+        ) {
+            return Ok(None);
+        }
+        let unresolved_layout = self
+            .file_underlying_type(type_node, node.start_byte())
+            .is_none_or(|structure| {
+                matches!(
+                    structure.kind(),
+                    "type_identifier" | "qualified_type" | "generic_type" | "parenthesized_type"
+                )
+            });
+        if !unresolved_layout {
+            return Ok(None);
+        }
+        let Some(body) = node.child_by_field_name("body") else {
+            return Ok(None);
+        };
+        let elements = named_children(body);
+        if elements.is_empty()
+            || !elements
+                .iter()
+                .all(|element| element.kind() == "keyed_element")
+        {
+            return Ok(None);
+        }
+
+        let procedure = self.session.locator().clone();
+        let mut selectors = HashSet::default();
+        let mut initializers = Vec::with_capacity(elements.len());
+        for element in elements {
+            let Ok((key, name)) = keyed_composite_element_name(element, self.prepared.source())
+            else {
+                return Ok(None);
+            };
+            if !selectors.insert(name) {
+                return Ok(None);
+            }
+            let Some(value_node) = element.child_by_field_name("value") else {
+                return Ok(None);
+            };
+            let value_node = transparent_runtime_wrapper_child(value_node).unwrap_or(value_node);
+            let value =
+                self.expression_value(builder, value_node, self.expression_value_kind(value_node))?;
+            let selector = SemanticLocator::new(
+                procedure.mount(),
+                procedure.path().clone(),
+                procedure.language(),
+                procedure.declaration().clone(),
+                SemanticRole::MemoryLocation,
+                source_anchor(key, 0).map_err(GoLoweringError::Invalid)?,
+            );
+            initializers.push(GoAggregateInitializer { selector, value });
+        }
+        Ok(Some(initializers))
+    }
+
+    fn composite_field_storage(&self, type_node: Node<'tree>) -> Option<GoCompositeFieldStorage> {
+        if go_type_uses_generic(
+            type_node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            type_node.start_byte(),
+        ) {
+            return None;
+        }
+        let kind = self.file_underlying_type(type_node, type_node.start_byte())?;
+        if kind.kind() == "interface_type" {
+            // An interface field stores a two-word descriptor by value. Its
+            // dynamic payload can still name a reference allocation, so keep
+            // the value itself as the field initializer instead of omitting
+            // the store as an unknown storage shape.
+            return Some(GoCompositeFieldStorage::InlineScalar);
+        }
+        match kind.kind() {
+            "struct_type" | "array_type" | "implicit_length_array_type" => {
+                Some(GoCompositeFieldStorage::InlineAggregate)
+            }
+            "pointer_type" | "slice_type" | "map_type" | "channel_type" => {
+                Some(GoCompositeFieldStorage::Reference)
+            }
+            "type_identifier" => {
+                let name = nonempty_node_text(self.prepared.source(), kind)?;
+                (is_predeclared_go_type(name) && !matches!(name, "any" | "comparable" | "error"))
+                    .then_some(GoCompositeFieldStorage::InlineScalar)
+            }
+            _ => None,
+        }
+    }
+
+    fn file_underlying_type(&self, kind: Node<'tree>, use_byte: usize) -> Option<Node<'tree>> {
+        go_file_underlying_type(
+            kind,
+            self.prepared.source(),
+            self.named_type_definitions,
+            use_byte,
+        )
+    }
+
+    fn is_import_qualified_selector(&self, node: Node<'tree>) -> bool {
+        node.kind() == "selector_expression"
+            && node
+                .child_by_field_name("operand")
+                .is_some_and(|operand| self.is_import_qualifier(operand))
+    }
+
+    fn call_operand_evaluations(
+        &self,
+        call: Node<'tree>,
+        include_identifier_function: bool,
+    ) -> Result<Vec<Node<'tree>>, GoLoweringError> {
+        let function = required_field(call, "function")?;
+        let arguments = call_arguments(call);
+        let mut result = Vec::with_capacity(arguments.len() + 1);
+        if function.kind() == "selector_expression" {
+            match self.selector_resolution(function) {
+                GoSelectorResolution::Package => {}
+                GoSelectorResolution::Field | GoSelectorResolution::Unknown => {
+                    result.push(function)
+                }
+                GoSelectorResolution::Method { .. }
+                | GoSelectorResolution::InterfaceMethod { .. } => {
+                    if let Some(receiver) = function.child_by_field_name("operand")
+                        && !is_go_type_syntax(receiver.kind())
+                    {
+                        result.push(receiver);
+                    }
+                }
+            }
+        } else if include_identifier_function
+            // A bound function value carries its closure environment, even
+            // when its target is known. Evaluate it through the ordinary
+            // expression path exactly once before the invocation.
+            || (is_go_binding_reference_kind(function.kind())
+                && node_text(self.prepared.source(), function)
+                    .and_then(|name| self.binding_value(name, function.start_byte()))
+                    .is_some())
+            || !is_go_binding_reference_kind(function.kind())
+            || (is_go_binding_reference_kind(function.kind())
+                && self.identifier_is_shared_or_call_exposed(function))
+        {
+            result.push(function);
+        }
+        result.extend(arguments);
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_statement_next(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        next: StatementNext,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<EdgeTarget, GoLoweringError> {
+        match next {
+            StatementNext::Target(target) => Ok(target),
+            StatementNext::Continuation(continuation) => {
+                let key = (continuation, scope);
+                if let Some(entry) = self.continuation_entries.get(&key).copied() {
+                    return Ok(EdgeTarget::normal(entry));
+                }
+                let descriptor = *self
+                    .statement_continuations
+                    .get(continuation.index())
+                    .ok_or_else(|| {
+                        GoLoweringError::Invalid(format!(
+                            "missing Go statement continuation {}",
+                            continuation.index()
+                        ))
+                    })?;
+                builder.descend_nested_entry();
+                let entry = self
+                    .session
+                    .add_node_point(builder, descriptor.node, Vec::new())?;
+                self.continuation_entries.insert(key, entry);
+                self.materialized_continuations.insert(continuation);
+                stack.push(Work::Statement {
+                    node: descriptor.node,
+                    entry,
+                    next: descriptor.next,
+                    scope,
+                    label: None,
+                });
+                Ok(EdgeTarget::normal(entry))
+            }
+            StatementNext::FunctionReturn => {
+                let route = builder
+                    .resolve_completion(
+                        scope,
+                        &CompletionRequest::new(CompletionKind::Return, None),
+                    )
+                    .ok_or_else(|| {
+                        GoLoweringError::Invalid(
+                            "Go fallthrough has no function return destination".into(),
+                        )
+                    })?;
+                if route.cleanups().is_empty() {
+                    return Ok(EdgeTarget {
+                        point: route.destination().target(),
+                        kind: route.destination().edge_kind(),
+                    });
+                }
+                if let Some(entry) = self.return_entries.get(&scope).copied() {
+                    return Ok(EdgeTarget::normal(entry));
+                }
+                builder.descend_nested_entry();
+                let entry = self
+                    .session
+                    .add_node_point(builder, self.root_body, Vec::new())?;
+                self.return_entries.insert(scope, entry);
+                self.route(builder, entry, &route, stack)?;
+                Ok(EdgeTarget::normal(entry))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_statements(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: StatementNext,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let mut continuation = next;
+        for child in children.iter().copied().rev() {
+            builder.descend_nested_entry();
+            let id = StatementContinuationId::try_from_index(self.statement_continuations.len())?;
+            self.statement_continuations.push(StatementContinuation {
+                node: child,
+                next: continuation,
+                retention_scope: scope,
+            });
+            continuation = StatementNext::Continuation(id);
+        }
+        let continuation = self.materialize_statement_next(builder, continuation, scope, stack)?;
+        self.session.add_target_edge(builder, entry, continuation)
+    }
+
+    fn prepare_deferred_capture(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: Node<'tree>,
+    ) -> Result<DeferredCapture, GoLoweringError> {
+        let function = required_field(call, "function")?;
+        let selector_resolution =
+            (function.kind() == "selector_expression").then(|| self.selector_resolution(function));
+        let receiver_node = selector_resolution
+            .and_then(|resolution| match resolution {
+                GoSelectorResolution::Method { .. }
+                | GoSelectorResolution::InterfaceMethod { .. }
+                | GoSelectorResolution::Unknown => function.child_by_field_name("operand"),
+                GoSelectorResolution::Package | GoSelectorResolution::Field => None,
+            })
+            .map(transparent_parenthesized_expression);
+        let receiver_flow_kind = selector_resolution
+            .map(Self::deferred_receiver_flow_kind)
+            .unwrap_or(ValueFlowKind::LanguageDefined);
+        let receiver = receiver_node
+            .map(|receiver| self.deferred_capture_value(builder, receiver, receiver_flow_kind))
+            .transpose()?;
+        let arguments = call_arguments(call)
+            .into_iter()
+            .map(|argument| {
+                let value = go_call_argument_value_node(argument);
+                let flow_kind = self.deferred_argument_flow_kind(value);
+                self.deferred_capture_value(builder, value, flow_kind)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DeferredCapture {
+            receiver,
+            arguments: arguments.into_boxed_slice(),
+        })
+    }
+
+    /// A method-set witness is exact only for a same-file method that the
+    /// selector resolver classified as a pointer receiver. An unresolved
+    /// selector may still be a pointer method, but the producer has no proof
+    /// that it is one and therefore leaves that route language-defined for a
+    /// consumer/provider witness.
+    fn deferred_receiver_flow_kind(resolution: GoSelectorResolution) -> ValueFlowKind {
+        match resolution {
+            GoSelectorResolution::Method {
+                pointer_receiver: true,
+                ..
+            }
+            | GoSelectorResolution::InterfaceMethod {
+                pointer_receiver: true,
+                ..
+            } => ValueFlowKind::Local,
+            GoSelectorResolution::Package
+            | GoSelectorResolution::Field
+            | GoSelectorResolution::Method {
+                pointer_receiver: false,
+                ..
+            }
+            | GoSelectorResolution::InterfaceMethod {
+                pointer_receiver: false,
+                ..
+            }
+            | GoSelectorResolution::Unknown => ValueFlowKind::LanguageDefined,
+        }
+    }
+
+    /// Go copies a deferred argument value into the cleanup record. Pointer
+    /// values and channel descriptors retain the referenced object; slices and
+    /// maps retain their backing store. Arrays, structs, scalar values, and
+    /// unresolved expressions remain language-defined so no copied outer value
+    /// is mistaken for the source's storage.
+    fn deferred_argument_flow_kind(&self, node: Node<'tree>) -> ValueFlowKind {
+        if self
+            .expression_type_identity(node, node.start_byte())
+            .is_some_and(|identity| identity.pointer_depth > 0)
+        {
+            return ValueFlowKind::Local;
+        }
+        match self.expression_storage_kind(node, node.start_byte()) {
+            Some(GoStorageKind::Slice | GoStorageKind::Map) => ValueFlowKind::BackingStore {
+                offset: BackingStoreOffset::Zero,
+            },
+            Some(GoStorageKind::Channel) => ValueFlowKind::Local,
+            Some(GoStorageKind::Array | GoStorageKind::Struct) | None => {
+                ValueFlowKind::LanguageDefined
+            }
+        }
+    }
+
+    fn has_stable_deferred_callable(&self, call: Node<'tree>) -> Result<bool, GoLoweringError> {
+        let function = required_field(call, "function")?;
+        if function.kind() == "selector_expression" {
+            return Ok(matches!(
+                self.selector_resolution(function),
+                GoSelectorResolution::Package
+                    | GoSelectorResolution::Method { .. }
+                    | GoSelectorResolution::InterfaceMethod { .. }
+                    | GoSelectorResolution::Unknown
+            ));
+        }
+        if !is_go_binding_reference_kind(function.kind()) {
+            return Ok(true);
+        }
+        let Some(name) = node_text(self.prepared.source(), function) else {
+            return Ok(false);
+        };
+        Ok(self.binding_value(name, function.start_byte()).is_none())
+    }
+
+    fn defer_is_inside_loop(&self, node: Node<'tree>) -> bool {
+        go_has_ancestor_kind_before(node, self.root_body, "for_statement")
+    }
+
+    fn defer_is_inside_expression_switch(&self, node: Node<'tree>) -> bool {
+        go_has_ancestor_kind_before(node, self.root_body, "expression_switch_statement")
+    }
+
+    fn deferred_capture_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        flow_kind: ValueFlowKind,
+    ) -> Result<DeferredCaptureValue, GoLoweringError> {
+        let source = self.expression_value(builder, node, self.expression_value_kind(node))?;
+        let target = self.session.add_node_value(
+            builder,
+            node,
+            SemanticValueKind::LanguageDefined("go.defer_capture".into()),
+        )?;
+        if let Some(identity) = self.value_types.get(&source).cloned() {
+            self.value_types.insert(target, identity);
+        }
+        if let Some(storage) = self.value_storage_kinds.get(&source).copied() {
+            self.value_storage_kinds.insert(target, storage);
+        }
+        if let Some(shape) = self.exact_slice_shapes.get(&source).copied() {
+            self.exact_slice_shapes.insert(target, shape);
+        }
+        Ok(DeferredCaptureValue {
+            source,
+            target,
+            flow_kind,
+        })
+    }
+
+    fn schedule_expressions(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        if children.is_empty() {
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let entries = children
+            .iter()
+            .map(|child| self.session.add_node_point(builder, *child, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(())
+    }
+
+    fn abrupt(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        scope: ScopeFrameId,
+        kind: CompletionKind,
+        label: Option<&str>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let Some(route) = builder.resolve_completion(scope, &CompletionRequest::new(kind, label))
+        else {
+            if matches!(kind, CompletionKind::Break | CompletionKind::Continue) {
+                let capability = if label.is_some() {
+                    SemanticCapability::NonLocalControl
+                } else {
+                    SemanticCapability::NormalControlFlow
+                };
+                self.session
+                    .add_unmatched_completion_gap(builder, from, kind, capability)?;
+                return Ok(());
+            }
+            return Err(GoLoweringError::Invalid(format!(
+                "{} completion has no matching structured continuation",
+                completion_label(kind)
+            )));
+        };
+        self.route(builder, from, &route, stack)
+    }
+
+    fn route(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        route: &CompletionRoute,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next_with_lookup(
+            builder,
+            &mut self.session,
+            |id| {
+                self.cleanups
+                    .get(id.index())
+                    .copied()
+                    .filter(|region| region.id == id)
+            },
+            |region| region.call,
+        )? {
+            let call_next = if step.next.kind == ControlEdgeKind::Normal {
+                step.next
+            } else {
+                let relay = self
+                    .session
+                    .add_node_point(builder, step.region.call, Vec::new())?;
+                self.session.add_target_edge(builder, relay, step.next)?;
+                EdgeTarget::normal(relay)
+            };
+            stack.push(Work::DeferredCall {
+                node: step.region.call,
+                entry: step.entry,
+                next: call_next,
+                scope: step.region.outer_scope,
+            });
+        }
+        self.session.add_target_edge(builder, from, plan.target())
+    }
+
+    fn imported_package_member_resolution_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        callee: ValueId,
+        call_site: CallSiteId,
+        resolution: &CallableTargetResolution,
+    ) -> Result<(), GoLoweringError> {
+        self.session.add_callable_resolution_gaps(
+            builder,
+            point,
+            callee,
+            call_site,
+            resolution,
+            "imported Go package member declaration kind is unavailable to intrafile lowering",
+            "imported Go package selector may name a callable or a type conversion; declaration kind is unresolved",
+        )
+    }
+
+    fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, GoLoweringError> {
+        self.session.metadata(point)
+    }
+
+    fn value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, GoLoweringError> {
+        self.session.add_value(builder, point, kind)
+    }
+
+    fn append_effect(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        effect: SemanticEffect,
+    ) -> Result<(), GoLoweringError> {
+        self.session.append_effect(builder, point, effect)
+    }
+
+    /// Preserve the exact source-local normal successors of an evaluation
+    /// whose blocking, progress, or termination remains unknown. Consumers
+    /// may use the retained topology for structured positive proofs, while the
+    /// raw gap continues to keep global control relations incomplete.
+    fn add_retained_control_topology_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        detail: &str,
+    ) -> Result<(), GoLoweringError> {
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::NormalControlFlow,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unknown,
+            SemanticGapDischarge::RetainedControlTopology,
+            detail,
+        )?;
+        Ok(())
+    }
+
+    /// Go panics never resume evaluation after the panicking operation. A
+    /// deferred call may recover the panic, but then the panicking function
+    /// returns after its deferred sequence; its normal body does not rejoin.
+    /// Preserve the stronger `NonRejoiningExceptionalExit` proof when this
+    /// exact evaluation scope has no already-registered deferred call. With an
+    /// active cleanup, preserve only `ExitOnlyProcedureCompletion`: cleanup
+    /// user code may run and observe or transfer values, but it cannot resume
+    /// this function's normal body. A later defer elsewhere in the procedure
+    /// must not weaken the earlier point-local proof. Value-flow, ICFG, and
+    /// generic control consumers keep the active-cleanup marker open; only
+    /// narrow result-specific control proofs may localize it.
+    fn add_non_rejoining_exceptional_exit_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        scope: ScopeFrameId,
+        point: ProgramPointId,
+        subject: SemanticGapSubject,
+        kind: SemanticGapKind,
+        detail: &str,
+    ) -> Result<(), GoLoweringError> {
+        let route = builder
+            .resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+            .expect("a Go evaluation scope must resolve panic completion");
+        let discharge = if route.cleanups().is_empty() {
+            SemanticGapDischarge::NonRejoiningExceptionalExit
+        } else {
+            SemanticGapDischarge::ExitOnlyProcedureCompletion
+        };
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            subject,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapImpacts::NONE,
+            kind,
+            discharge,
+            detail,
+        )?;
+        Ok(())
+    }
+}
+
+fn go_evaluation_unit_has_ordered_completion(mut node: Node<'_>) -> bool {
+    while let Some(inner) = transparent_runtime_wrapper_child(node) {
+        node = inner;
+    }
+    node.kind() == "call_expression"
+        || (node.kind() == "unary_expression" && unary_operator_kind(node) == Some("<-"))
+        || (node.kind() == "binary_expression" && go_boolean_operator_kind(node).is_some())
+}
+
+pub(crate) fn transparent_runtime_wrapper_child(node: Node<'_>) -> Option<Node<'_>> {
+    if !matches!(
+        node.kind(),
+        "parenthesized_expression" | "literal_element" | "variadic_argument"
+    ) {
+        return None;
+    }
+    let mut children = named_children(node)
+        .into_iter()
+        .filter(|child| !is_comment_kind(child.kind()))
+        .filter(|child| !is_go_type_syntax(child.kind()));
+    let only = children.next()?;
+    children.next().is_none().then_some(only)
+}
+
+fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
+    match node.kind() {
+        "return_statement" => {
+            return named_children(node)
+                .into_iter()
+                .flat_map(expression_sequence)
+                .filter(|child| !is_go_type_syntax(child.kind()))
+                .collect();
+        }
+        "expression_statement" | "inc_statement" | "dec_statement" => {
+            return named_children(node)
+                .into_iter()
+                .filter(|child| !is_go_type_syntax(child.kind()))
+                .collect();
+        }
+        "binary_expression" => {
+            let mut result = children_by_field_name(node, "left");
+            result.extend(children_by_field_name(node, "right"));
+            return result;
+        }
+        "unary_expression" => return children_by_field_name(node, "operand"),
+        "selector_expression" => return children_by_field_name(node, "operand"),
+        "index_expression" => {
+            let mut result = children_by_field_name(node, "operand");
+            result.extend(children_by_field_name(node, "index"));
+            return result;
+        }
+        "slice_expression" => {
+            let mut result = children_by_field_name(node, "operand");
+            result.extend(children_by_field_name(node, "start"));
+            result.extend(children_by_field_name(node, "end"));
+            result.extend(children_by_field_name(node, "capacity"));
+            return result;
+        }
+        "type_assertion_expression" => return children_by_field_name(node, "operand"),
+        "type_conversion_expression" => return children_by_field_name(node, "operand"),
+        "parenthesized_expression" => {
+            return first_named_child(node).into_iter().collect();
+        }
+        "keyed_element" => {
+            let mut result = children_by_field_name(node, "key");
+            result.extend(children_by_field_name(node, "value"));
+            return result;
+        }
+        "variadic_argument" => return named_children(node),
+        _ => {}
+    }
+
+    named_children(node)
+        .into_iter()
+        .filter(|child| {
+            !is_go_type_syntax(child.kind())
+                && ![
+                    "name",
+                    "type",
+                    "result",
+                    "receiver",
+                    "parameters",
+                    "type_parameters",
+                    "type_arguments",
+                    "operator",
+                    "label",
+                ]
+                .into_iter()
+                .any(|field| field_matches(node, field, *child))
+        })
+        .collect()
+}
+
+fn communication_evaluations(node: Node<'_>) -> Vec<Node<'_>> {
+    match node.kind() {
+        "send_statement" => {
+            let mut result = children_by_field_name(node, "channel");
+            result.extend(children_by_field_name(node, "value"));
+            result
+        }
+        "receive_statement" => node
+            .child_by_field_name("right")
+            .and_then(|receive| {
+                (receive.kind() == "unary_expression" && unary_operator_kind(receive) == Some("<-"))
+                    .then(|| receive.child_by_field_name("operand"))
+                    .flatten()
+            })
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn communication_operation_and_channel(
+    node: Node<'_>,
+) -> Option<(SynchronizationOperation, Node<'_>)> {
+    match node.kind() {
+        "send_statement" => node
+            .child_by_field_name("channel")
+            .map(|channel| (SynchronizationOperation::ChannelSend, channel)),
+        "receive_statement" => node
+            .child_by_field_name("right")
+            .filter(|receive| {
+                receive.kind() == "unary_expression" && unary_operator_kind(*receive) == Some("<-")
+            })
+            .and_then(|receive| receive.child_by_field_name("operand"))
+            .map(|channel| (SynchronizationOperation::ChannelReceive, channel)),
+        _ => None,
+    }
+}
+
+fn select_eager_expressions(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut result = Vec::new();
+    for case in named_children(node)
+        .into_iter()
+        .filter(|child| child.kind() == "communication_case")
+    {
+        if let Some(communication) = case.child_by_field_name("communication") {
+            result.extend(communication_evaluations(communication));
+        }
+    }
+    result
+}
+
+fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    all_call_arguments(node)
+        .into_iter()
+        .filter(|argument| !is_go_type_syntax(argument.kind()))
+        .collect()
+}
+
+fn go_call_argument_value_node(argument: Node<'_>) -> Node<'_> {
+    if argument.kind() == "variadic_argument" {
+        first_runtime_named_child(argument).unwrap_or(argument)
+    } else {
+        argument
+    }
+}
+
+fn all_call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::named_children_by_field(node, "arguments")
+}
+
+fn supported_defer_call<'tree>(
+    node: Node<'tree>,
+    procedure_targets: &HashMap<usize, GoProcedureTarget>,
+) -> Option<Node<'tree>> {
+    if node.kind() != "defer_statement" {
+        return None;
+    }
+    let call = first_runtime_named_child(node)?;
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if is_go_binding_reference_kind(function.kind()) || function.kind() == "selector_expression" {
+        return Some(call);
+    }
+    let direct_function = transparent_parenthesized_expression(function);
+    (direct_function.kind() == "func_literal"
+        && procedure_targets.contains_key(&direct_function.id()))
+    .then_some(call)
+}
+
+fn expression_sequence(node: Node<'_>) -> Vec<Node<'_>> {
+    if node.kind() == "expression_list" {
+        named_children(node)
+    } else {
+        vec![node]
+    }
+}
+
+fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    runtime_expression_children(node).into_iter().next()
+}
+
+fn transparent_parenthesized_expression(node: Node<'_>) -> Node<'_> {
+    unwrap_parenthesized_expression_with(node, first_runtime_named_child)
+}
+
+fn parenthesized_call_receiver(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent()
+        && parent.kind() == "parenthesized_expression"
+    {
+        node = parent;
+    }
+    let Some(selector) = node.parent().filter(|parent| {
+        parent.kind() == "selector_expression" && field_matches(*parent, "operand", node)
+    }) else {
+        return false;
+    };
+    is_call_function(selector)
+}
+
+fn is_call_function(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|call| {
+        call.kind() == "call_expression" && field_matches(call, "function", node)
+    })
+}
+
+fn control_label_node(node: Node<'_>) -> Option<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == "label_name")
+}
+
+/// Whether this expression is written by the statement that contains it.
+///
+/// A write target is not a read. The lowered single-target store replaces its
+/// evaluation list so the target node is never scheduled, but an unsupported
+/// target or a range clause's assignment form still schedules the place so its
+/// operands are evaluated. Minting a `MemoryLoad` there would publish a read of
+/// the very location the statement overwrites.
+fn is_assignment_target(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "parenthesized_expression" | "expression_list" => current = parent,
+            "assignment_statement" | "short_var_declaration" | "range_clause" => {
+                return field_matches(parent, "left", current);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether this expression is the callable evaluated by a direct call.
+///
+/// Parentheses preserve that role. A selector in any other context may be a
+/// method value rather than a field load when its imported receiver type is
+/// unresolved, so the lowering must retain that ambiguity explicitly.
+fn is_direct_call_function(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "parenthesized_expression" {
+            current = parent;
+            continue;
+        }
+        return is_call_function(current);
+    }
+    false
+}
+
+use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as direct_child_kind;
+
+fn go_boolean_operator_kind(node: Node<'_>) -> Option<&'static str> {
+    match node.child_by_field_name("operator")?.kind() {
+        "&&" => Some("&&"),
+        "||" => Some("||"),
+        _ => None,
+    }
+}
+
+/// Whether a Go `for` clause is known to enter its body before its first
+/// condition check.
+///
+/// This is intentionally limited to the structured form used by the
+/// language's ordinary counted loops. Unknown expressions, multiple bindings,
+/// and all other loop shapes retain the shared zero-trip approximation.
+fn go_for_clause_has_first_iteration(
+    source: &str,
+    initializer: Option<Node<'_>>,
+    condition: Option<Node<'_>>,
+    update: Option<Node<'_>>,
+) -> bool {
+    let (Some(initializer), Some(condition), Some(update)) = (initializer, condition, update)
+    else {
+        return false;
+    };
+    if initializer.kind() != "short_var_declaration"
+        || update.kind() != "inc_statement"
+        || condition.kind() != "binary_expression"
+        || condition
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "<")
+    {
+        return false;
+    }
+    let Some(counter) = initializer
+        .child_by_field_name("left")
+        .and_then(single_expression_node)
+        .filter(|node| node.kind() == "identifier")
+    else {
+        return false;
+    };
+    let Some(start) = initializer
+        .child_by_field_name("right")
+        .and_then(single_expression_node)
+        .and_then(|node| integer_literal_value(source, node))
+    else {
+        return false;
+    };
+    let Some(left) = condition
+        .child_by_field_name("left")
+        .filter(|node| node.kind() == "identifier")
+    else {
+        return false;
+    };
+    let Some(limit) = condition
+        .child_by_field_name("right")
+        .and_then(|node| integer_literal_value(source, node))
+    else {
+        return false;
+    };
+    let Some(incremented) = first_named_child(update).filter(|node| node.kind() == "identifier")
+    else {
+        return false;
+    };
+    node_text(source, counter) == node_text(source, left)
+        && node_text(source, counter) == node_text(source, incremented)
+        && start < limit
+}
+
+fn single_expression_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "expression_list" {
+        let children = named_children(node);
+        (children.len() == 1).then(|| children[0])
+    } else {
+        Some(node)
+    }
+}
+
+fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
+    brokk_bifrost_analysis::analyzer::common::integer_literal_value_with_kind(
+        source,
+        node,
+        "int_literal",
+    )
+}
+
+fn unary_operator_kind(node: Node<'_>) -> Option<&str> {
+    node.child_by_field_name("operator")
+        .map(|operator| operator.kind())
+}
+
+fn go_operation_can_panic(node: Node<'_>) -> bool {
+    match node.kind() {
+        "unary_expression" => unary_operator_kind(node) == Some("*"),
+        "binary_expression" => node
+            .child_by_field_name("operator")
+            .is_some_and(|operator| matches!(operator.kind(), "/" | "%" | "<<" | ">>")),
+        _ => false,
+    }
+}
+
+/// Whether this grammar kind carries type syntax rather than a runtime
+/// operand.
+///
+/// The set is enumerated rather than matched by a `type_` prefix or a `_type`
+/// suffix. Three of the grammar's `type_`-prefixed kinds --
+/// `type_assertion_expression`, `type_conversion_expression`, and
+/// `type_instantiation_expression` -- are expressions whose value the program
+/// computes and can pass on, and a prefix test silently deleted them wherever
+/// this predicate filters operands. `dfb_sink(recovered.(int))` and
+/// `sink(int(x))` then lowered as zero-argument calls, so no taint binding
+/// could name their argument (#2662). Enumerating the kinds makes a future
+/// grammar addition a deliberate decision instead of an accident of spelling.
+fn is_go_type_syntax(kind: &str) -> bool {
+    matches!(
+        kind,
+        // Type expressions.
+        "type_identifier"
+            | "qualified_type"
+            | "generic_type"
+            | "pointer_type"
+            | "parenthesized_type"
+            | "negated_type"
+            | "array_type"
+            | "implicit_length_array_type"
+            | "slice_type"
+            | "map_type"
+            | "channel_type"
+            | "struct_type"
+            | "interface_type"
+            | "function_type"
+            | "type_elem"
+            | "type_constraint"
+            // Type and parameter declaration syntax, which declares rather
+            // than evaluates.
+            | "parameter_list"
+            | "parameter_declaration"
+            | "variadic_parameter_declaration"
+            | "type_arguments"
+            | "type_parameter_list"
+            | "type_parameter_declaration"
+            | "type_declaration"
+            | "type_alias"
+            | "type_spec"
+            | "type_case"
+    )
+}
+
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::named_children_vec(node)
+        .into_iter()
+        .filter(|child| !is_comment_kind(child.kind()))
+        .collect()
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !is_comment_kind(child.kind())
+    })
+}
+
+fn is_comment_kind(kind: &str) -> bool {
+    kind == "comment"
+}
+
+fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, GoLoweringError> {
+    brokk_bifrost_semantic::analyzer::semantic::lowering::required_field_or_else(
+        node,
+        field,
+        missing_field,
+    )
+}
+
+fn is_runtime_leaf(kind: &str) -> bool {
+    is_go_constant_value_kind(kind)
+        || matches!(
+            kind,
+            "identifier"
+                | "field_identifier"
+                | "package_identifier"
+                | "escape_sequence"
+                | "comment"
+        )
+}
+
+fn is_go_literal_value_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "int_literal"
+            | "float_literal"
+            | "imaginary_literal"
+            | "rune_literal"
+            | "interpreted_string_literal"
+            | "raw_string_literal"
+    )
+}
+
+/// The exact source text of one tree-sitter-classified Go string literal.
+///
+/// Interpreted and raw string literals both carry their own spelling, so two
+/// literals with equal text always denote equal string values. A value spelled
+/// with escapes equals its written-out form (`"p"` and `"\x70"`) while their
+/// texts differ, so those constants compare unequal: consumers must treat
+/// unequal payloads as unresolved equality, never as proven difference.
+fn go_string_literal_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
+    if !matches!(
+        node.kind(),
+        "interpreted_string_literal" | "raw_string_literal"
+    ) {
+        return None;
+    }
+    let text = node_text(source, node)?;
+    Some(text)
+}
+
+/// The exact integer step one Go compound assignment applies to its target.
+///
+/// `x += n` and `x -= n` change the target by the literal `n`. Every other
+/// operator, and any right operand that is not a represented integer literal,
+/// has no exact step and keeps the opaque assignment flow. The operator comes
+/// from the statement's own AST field, so no source text is scanned.
+fn go_update_integer_offset(
+    source: &str,
+    statement: Node<'_>,
+    right: Node<'_>,
+) -> Option<SignedIntegerMagnitude> {
+    let negative = match statement.child_by_field_name("operator")?.kind() {
+        "+=" => false,
+        "-=" => true,
+        _ => return None,
+    };
+    let magnitude = go_integer_literal_value(source, right)?;
+    Some(SignedIntegerMagnitude::new(negative, magnitude))
+}
+
+/// The magnitude of one tree-sitter-classified Go integer literal.
+///
+/// Go permits binary, explicit and legacy octal, decimal, and hexadecimal
+/// spellings, with underscores between digits and immediately after a base
+/// prefix. Decoding the already-classified AST token through `u128`
+/// canonicalizes those spellings. Malformed separators and overflowing
+/// magnitudes stay unknown, which is conservative and still covers every
+/// machine-representable Go index.
+fn go_integer_literal_value(source: &str, node: Node<'_>) -> Option<u128> {
+    if node.kind() != "int_literal" {
+        return None;
+    }
+    let text = node_text(source, node)?;
+    let (digits, radix, separator_after_prefix) =
+        if let Some(digits) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+            (digits, 2, true)
+        } else if let Some(digits) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
+            (digits, 8, true)
+        } else if let Some(digits) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            (digits, 16, true)
+        } else if text.len() > 1 && text.starts_with('0') {
+            (text, 8, false)
+        } else {
+            (text, 10, false)
+        };
+    let bytes = digits.as_bytes();
+    let valid_digit = |byte: u8| char::from(byte).is_digit(radix);
+    let mut compact = String::with_capacity(digits.len());
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte == b'_' {
+            let follows_prefix = separator_after_prefix && index == 0;
+            let follows_digit = index > 0 && valid_digit(bytes[index - 1]);
+            let precedes_digit = bytes.get(index + 1).is_some_and(|next| valid_digit(*next));
+            if !(precedes_digit && (follows_prefix || follows_digit)) {
+                return None;
+            }
+            continue;
+        }
+        if !valid_digit(byte) {
+            return None;
+        }
+        compact.push(char::from(byte));
+    }
+    if compact.is_empty() {
+        return None;
+    }
+    u128::from_str_radix(&compact, radix).ok()
+}
+
+fn is_go_predeclared_constant_kind(kind: &str) -> bool {
+    matches!(kind, "true" | "false" | "nil" | "iota")
+}
+
+fn is_go_constant_value_kind(kind: &str) -> bool {
+    is_go_literal_value_kind(kind) || is_go_predeclared_constant_kind(kind)
+}
+
+fn is_go_binding_reference_kind(kind: &str) -> bool {
+    kind == "identifier" || is_go_predeclared_constant_kind(kind)
+}
+
+struct GoCompositeLiteralStore<'tree> {
+    member: SemanticLocator,
+    source_node: Node<'tree>,
+    value: ValueId,
+    aggregate_copy: bool,
+}
+
+enum GoKeyedElementNameError {
+    MissingKey,
+    InvalidKey,
+    MissingName,
+}
+
+fn keyed_composite_element_name<'tree, 'source>(
+    element: Node<'tree>,
+    source: &'source str,
+) -> Result<(Node<'tree>, &'source str), GoKeyedElementNameError> {
+    assert_eq!(element.kind(), "keyed_element");
+    let key = element
+        .child_by_field_name("key")
+        .ok_or(GoKeyedElementNameError::MissingKey)?;
+    let key = transparent_runtime_wrapper_child(key).unwrap_or(key);
+    if !matches!(key.kind(), "identifier" | "field_identifier") {
+        return Err(GoKeyedElementNameError::InvalidKey);
+    }
+    let name = nonempty_node_text(source, key).ok_or(GoKeyedElementNameError::MissingName)?;
+    Ok((key, name))
+}
+
+struct GoAggregateInitializer {
+    selector: SemanticLocator,
+    value: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoCompositeFieldStorage {
+    InlineAggregate,
+    InlineScalar,
+    Reference,
+}
+
+/// One direct field of a proven struct layout. Its declaration anchor is the
+/// identity shared by an initializer store and a later selector access.
+#[derive(Clone)]
+struct GoStructLiteralField<'tree> {
+    name: Box<str>,
+    anchor: SourceAnchor,
+    type_node: Option<Node<'tree>>,
+}
+
+fn go_struct_literal_fields<'tree>(
+    structure: Node<'tree>,
+    source: &str,
+) -> Option<Vec<GoStructLiteralField<'tree>>> {
+    let list = named_children(structure)
+        .into_iter()
+        .find(|child| child.kind() == "field_declaration_list")?;
+    let mut fields = Vec::new();
+    for declaration in named_children(list)
+        .into_iter()
+        .filter(|child| child.kind() == "field_declaration")
+    {
+        let names = children_by_field_name(declaration, "name");
+        if names.is_empty() {
+            // Embedded fields occupy their own direct slot; they do not hide
+            // an explicitly named sibling's initializer. Retain their exact
+            // name for duplicate/arity checks, while leaving explicit stores
+            // into the embedded slot open until its storage type is proven.
+            let (name, embedded) =
+                brokk_bifrost_go::declarations::go_embedded_struct_field(declaration, source)?;
+            if fields
+                .iter()
+                .any(|field: &GoStructLiteralField<'tree>| field.name.as_ref() == name)
+            {
+                return None;
+            }
+            fields.push(GoStructLiteralField {
+                name: name.into_boxed_str(),
+                anchor: source_anchor(embedded, 0).ok()?,
+                type_node: None,
+            });
+            continue;
+        }
+        for name_node in names {
+            let name = nonempty_node_text(source, name_node)?;
+            if fields
+                .iter()
+                .any(|field: &GoStructLiteralField<'tree>| field.name.as_ref() == name)
+            {
+                return None;
+            }
+            let anchor = source_anchor(name_node, 0).ok()?;
+            let type_node = declaration.child_by_field_name("type")?;
+            fields.push(GoStructLiteralField {
+                name: name.into(),
+                anchor,
+                type_node: Some(type_node),
+            });
+        }
+    }
+    Some(fields)
+}
+
+/// Where each `(type declaration, field)` pair of this file is declared.
+///
+/// A field's declaration is the identity a memory location names, so two
+/// occurrences of `holder.Value` in one procedure -- and the store and the load
+/// that must meet on it -- agree only when both anchor on the same declaration.
+/// Declaration identity keeps a local type shadow separate from a package type
+/// with the same spelling. An embedded field declares no `field_identifier`
+/// and is skipped.
+fn go_struct_field_anchors(
+    prepared: &PreparedSyntaxTree,
+) -> HashMap<(usize, Box<str>), SourceAnchor> {
+    let mut anchors = HashMap::default();
+    let mut stack = vec![prepared.tree().root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_spec"
+            && let Some(declared) = node.child_by_field_name("type")
+            && declared.kind() == "struct_type"
+        {
+            // Only this struct's own field list, one level: a field whose type
+            // is itself an anonymous struct declares names that belong to that
+            // inner type, not to `owner`.
+            let mut fields = Vec::new();
+            for list in named_children(declared) {
+                if list.kind() != "field_declaration_list" {
+                    continue;
+                }
+                for declaration in named_children(list) {
+                    if declaration.kind() != "field_declaration" {
+                        continue;
+                    }
+                    fields.extend(
+                        named_children(declaration)
+                            .into_iter()
+                            .filter(|child| child.kind() == "field_identifier"),
+                    );
+                }
+            }
+            for field in fields {
+                let Some(name) = nonempty_node_text(prepared.source(), field) else {
+                    continue;
+                };
+                let Ok(anchor) = source_anchor(field, 0) else {
+                    continue;
+                };
+                anchors.insert((node.id(), name.into()), anchor);
+            }
+        }
+        stack.extend(named_children(node));
+    }
+    anchors
+}
+
+fn go_type_identity(node: Node<'_>, source: &str) -> Option<GoTypeIdentity> {
+    let mut current = node;
+    let mut pointer_depth = 0usize;
+    loop {
+        match current.kind() {
+            "pointer_type" => {
+                pointer_depth = pointer_depth.checked_add(1)?;
+                current = first_named_child(current)?;
+            }
+            "parenthesized_type" => current = first_named_child(current)?,
+            // Substituting a generic type or interface constraint can change
+            // method sets and identity; leave those paths explicitly open.
+            "generic_type"
+            | "interface_type"
+            | "type_parameter_list"
+            | "type_parameter_declaration"
+            | "type_constraint" => return None,
+            "type_identifier" | "qualified_type" => {
+                let name = nonempty_node_text(source, current)?.trim();
+                return (!name.is_empty()).then(|| GoTypeIdentity {
+                    pointer_depth,
+                    name: name.into(),
+                    declaration: None,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_go_callable_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration" | "method_declaration" | "func_literal"
+    )
+}
+
+fn go_receiver_uses_generic_type(callable: Node<'_>) -> bool {
+    let Some(receiver) = callable.child_by_field_name("receiver") else {
+        return false;
+    };
+    let mut stack = vec![receiver];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "generic_type" | "type_arguments") {
+            return true;
+        }
+        let children = named_children(node);
+        stack.extend(children);
+    }
+    false
+}
+
+fn go_local_scope(declaration: Node<'_>) -> Option<(usize, usize)> {
+    let mut child = declaration;
+    let mut parent = declaration.parent();
+    while let Some(node) = parent {
+        let owns_header_declaration = match node.kind() {
+            "for_statement" => node.child_by_field_name("body").is_none_or(|body| {
+                !(body.start_byte() <= child.start_byte() && child.end_byte() <= body.end_byte())
+            }),
+            "if_statement" | "expression_switch_statement" | "type_switch_statement" => node
+                .child_by_field_name("initializer")
+                .is_some_and(|initializer| {
+                    initializer.start_byte() <= declaration.start_byte()
+                        && declaration.end_byte() <= initializer.end_byte()
+                }),
+            _ => false,
+        };
+        let owns_case_clause_scope =
+            node.kind() == "statement_list" && node.parent().is_some_and(is_clause);
+        if owns_header_declaration || owns_case_clause_scope || node.kind() == "block" {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        child = node;
+        parent = node.parent();
+    }
+    None
+}
+
+fn go_var_specs(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut specs = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "var_spec" {
+            specs.push(current);
+            continue;
+        }
+        let children = named_children(current);
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    specs.sort_by_key(Node::start_byte);
+    specs
+}
+
+/// The value expression one declared name receives its facts from.
+///
+/// A comma-ok type assertion `v, ok := x.(T)` is the one shape where two
+/// names share a single written value. The narrowed name receives the
+/// asserted type and the presence name receives no payload fact at all, so
+/// every consumer of a declaration's result types and storage kinds asks
+/// here instead of assuming one written expression per name.
+fn go_declaration_value_for_index<'tree>(
+    names_len: usize,
+    values: &[Node<'tree>],
+    index: usize,
+) -> Option<Node<'tree>> {
+    match values {
+        [value] if go_declaration_is_comma_ok_assertion(names_len, values) => {
+            (index == 0).then_some(*value)
+        }
+        _ if values.len() == names_len => values.get(index).copied(),
+        _ => None,
+    }
+}
+
+/// Whether one written value supplies two declared names through the
+/// comma-ok type assertion `v, ok := x.(T)`.
+fn go_declaration_is_comma_ok_assertion(names_len: usize, values: &[Node<'_>]) -> bool {
+    names_len == 2 && matches!(values, [value] if value.kind() == "type_assertion_expression")
+}
+
+/// The package-level name this declaration node binds, if it binds one.
+fn go_package_binding_name<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    match node.kind() {
+        "identifier" | "true" | "false" | "nil" | "iota" => node_text(source, node),
+        "import_spec" => brokk_bifrost_go::declarations::go_import_spec_binding_name(node, source),
+        "function_declaration" | "type_spec" | "type_alias" => node
+            .child_by_field_name("name")
+            .and_then(|name| node_text(source, name)),
+        _ => None,
+    }
+}
+
+fn go_import_bindings(root: Node<'_>, source: &str) -> HashMap<Box<str>, Box<str>> {
+    crate::analyzer::go::go_import_binding_pairs(root, source, |_| None)
+        .into_iter()
+        .map(|(local, path)| (local.into_boxed_str(), path.into_boxed_str()))
+        .collect()
+}
+
+fn go_qualified_type_parts<'source>(
+    mut node: Node<'_>,
+    source: &'source str,
+) -> Option<(&'source str, &'source str)> {
+    loop {
+        match node.kind() {
+            "pointer_type" | "parenthesized_type" => node = first_named_child(node)?,
+            "qualified_type" => {
+                let package = node.child_by_field_name("package")?;
+                let name = node.child_by_field_name("name")?;
+                return Some((node_text(source, package)?, node_text(source, name)?));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Procedure syntax roles for the Go lowering. `for … range` iterates and is
+/// not a conditional loop; a condition-only `for` is a while loop.
+pub(crate) const PROCEDURE_SYNTAX_ROLES:
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles =
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: go_statement_kind,
+        loop_site: go_loop_site,
+        loop_site_with_source: None,
+        procedure_matches: |_, node| {
+            matches!(
+                node.kind(),
+                "function_declaration" | "method_declaration" | "func_literal"
+            )
+        },
+        nested_procedure: |node| node.kind() == "func_literal",
+    };
+
+fn go_loop_site(
+    node: Node<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax<'_>> {
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopKind;
+
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax;
+    if node.kind() != "for_statement" {
+        return None;
+    }
+    let body = node.child_by_field_name("body");
+    let control = named_children(node)
+        .into_iter()
+        .find(|child| body.is_none_or(|body| child.id() != body.id()));
+    match control {
+        None => Some(LoopSyntax {
+            kind: LoopKind::For,
+            body,
+            condition: None,
+        }),
+        Some(clause) if clause.kind() == "for_clause" => Some(LoopSyntax {
+            kind: LoopKind::For,
+            body,
+            condition: clause.child_by_field_name("condition"),
+        }),
+        Some(clause) if clause.kind() == "range_clause" => None,
+        Some(condition) => Some(LoopSyntax {
+            kind: LoopKind::While,
+            body,
+            condition: Some(condition),
+        }),
+    }
+}
+
+/// Classify an executable Go statement. Constant and type declarations act
+/// at compile time; a `for` header's init and post statements are not
+/// statements of the body.
+fn go_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "for_clause")
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "block" => "block",
+        "expression_statement" | "send_statement" | "inc_statement" | "dec_statement" => {
+            "expression"
+        }
+        "assignment_statement" | "short_var_declaration" | "var_declaration" => "local_declaration",
+        "return_statement" => "return",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "goto_statement" => "goto",
+        "fallthrough_statement" => "fallthrough",
+        "labeled_statement" => "labeled",
+        "if_statement" => "if",
+        "for_statement" => "for",
+        "expression_switch_statement" | "type_switch_statement" | "select_statement" => "switch",
+        "defer_statement" => "defer",
+        "go_statement" => "go",
+        "empty_statement" => "empty",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+#[path = "../../../../../test-support/semantic_source.rs"]
+mod semantic_test_support;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::analyzer::go::semantic::*;
+
+    use brokk_bifrost_core::analyzer::model::LanguageDialect;
+
+    use brokk_bifrost_semantic::analyzer::semantic::service::ProgramSemanticsLowerer;
+
+    use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceOrigin;
+
+    use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
+
+    use brokk_bifrost_core::text_utils::compute_line_starts;
+
+    fn prepared_fixture(source: &str) -> PreparedSyntaxTree {
+        let tree = brokk_bifrost_analysis::test_support::parse_fixture_tree(
+            source,
+            tree_sitter_go::LANGUAGE.into(),
+        );
+        PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::Go),
+            PreparedSourceOrigin::Disk,
+            None,
+        )
+    }
+
+    fn lower_fixture_with_budget(
+        source: &str,
+        budget: &SemanticBudget,
+    ) -> SemanticOutcome<Vec<ProcedureSemanticsParts>> {
+        let prepared = prepared_fixture(source);
+        let file = ProjectFile::new(std::env::temp_dir(), "fixture.go");
+        GoSemanticLowerer
+            .lower(&file, &prepared, budget, &CancellationToken::default())
+            .expect("Go lowering succeeds")
+    }
+
+    fn lower_fixture(source: &str) -> Vec<ProcedureSemanticsParts> {
+        let SemanticOutcome::Complete { value, .. } =
+            lower_fixture_with_budget(source, &SemanticBudget::default())
+        else {
+            panic!("Go fixture lowering must complete");
+        };
+        value
+    }
+
+    fn assert_immutable_value_capture_relay<'a>(
+        procedures: &'a [ProcedureSemanticsParts],
+        outer: &ProcedureSemanticsParts,
+    ) -> (&'a ProcedureSemanticsParts, MemoryLocationId) {
+        let child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(outer.id))
+            .expect("intermediate child procedure");
+        let grandchild = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(child.id))
+            .expect("grandchild procedure");
+        let [outer_capture] = outer.captures.as_slice() else {
+            panic!("one exact ancestor capture: {outer:#?}");
+        };
+        let [child_capture] = child.captures.as_slice() else {
+            panic!("one exact relayed capture: {child:#?}");
+        };
+        assert_eq!(outer_capture.mode, CaptureMode::Value);
+        assert_eq!(child_capture.mode, CaptureMode::Value);
+        assert_eq!(outer_capture.target, child.id);
+        assert_eq!(child_capture.target, grandchild.id);
+        assert!(matches!(outer_capture.captured, CaptureSource::Value(_)));
+        assert!(matches!(child_capture.captured, CaptureSource::Value(_)));
+        (grandchild, child_capture.destination)
+    }
+
+    fn value_source_span(procedure: &ProcedureSemanticsParts, value: ValueId) -> SourceSpan {
+        mapping_source_span(procedure, procedure.values[value.index()].source)
+    }
+
+    fn mapping_source_span(
+        procedure: &ProcedureSemanticsParts,
+        source: SourceMappingId,
+    ) -> SourceSpan {
+        brokk_bifrost_analysis::analyzer::test_support::source_mapping_span(
+            &procedure.source_mappings[source.index()],
+        )
+    }
+
+    fn source_text(source: &str, span: SourceSpan) -> &str {
+        super::semantic_test_support::source_text(source, span.start_byte(), span.end_byte())
+    }
+
+    fn capture_source_value(
+        procedure: &ProcedureSemanticsParts,
+        capture: &CaptureBinding,
+    ) -> ValueId {
+        match capture.captured {
+            CaptureSource::Value(value) => value,
+            CaptureSource::Location(location) => {
+                match procedure.memory_locations[location.index()].kind {
+                    MemoryLocationKind::LexicalCell { binding } => binding,
+                    ref kind => panic!("parent capture source is not a lexical cell: {kind:#?}"),
+                }
+            }
+        }
+    }
+
+    fn named_procedure<'a>(
+        procedures: &'a [ProcedureSemanticsParts],
+        name: &str,
+    ) -> &'a ProcedureSemanticsParts {
+        procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing procedure {name}"))
+    }
+
+    #[test]
+    fn direct_multi_result_returns_preserve_call_result_ordinals() {
+        const SOURCE: &str = r#"package main
+type cell struct{}
+func pair(first, second *cell) (*cell, *cell) { return first, second }
+func forward(first, second *cell) (*cell, *cell) {
+    return pair(first, second)
+}
+func namedForward(first, second *cell) (returnedFirst *cell, returnedSecond *cell) {
+    return pair(first, second)
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        for name in ["forward", "namedForward"] {
+            let forward = named_procedure(&procedures, name);
+            let [call] = forward.call_sites.as_slice() else {
+                panic!("direct forwarding return has one call: {forward:#?}");
+            };
+            assert!(
+                call.result.is_none(),
+                "multi-result call has no tuple result"
+            );
+            let [first, second] = call.normal_results.as_ref() else {
+                panic!("direct forwarding call has two result ports: {call:#?}");
+            };
+            assert_ne!(first, second, "result ordinals have distinct value ports");
+            assert!(
+                forward
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .any(|event| matches!(
+                        event.effect,
+                        SemanticEffect::ProcedureReturn { value: None }
+                    ))
+            );
+        }
+
+        let forward = named_procedure(&procedures, "forward");
+        let [call] = forward.call_sites.as_slice() else {
+            unreachable!("checked above")
+        };
+        let returned = forward
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::IndexedReturn { ordinal },
+                    source,
+                    target,
+                } => Some((ordinal, source, target)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(returned.len(), 2, "one flow per declared result ordinal");
+        assert_eq!((returned[0].0, returned[0].1), (0, call.normal_results[0]));
+        assert_eq!((returned[1].0, returned[1].1), (1, call.normal_results[1]));
+        assert!(returned.iter().all(|(_, _, target)| {
+            forward.values[target.index()].kind == SemanticValueKind::Return
+                && forward.gaps.iter().all(|gap| {
+                    gap.subject != SemanticGapSubject::Value(*target)
+                        || gap.capability != SemanticCapability::ReturnFlow
+                })
+        }));
+
+        let named = named_procedure(&procedures, "namedForward");
+        let [call] = named.call_sites.as_slice() else {
+            unreachable!("checked above")
+        };
+        let returned = named
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if named.values[target.index()].kind == SemanticValueKind::Return => {
+                    Some((source, target))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            returned
+                .iter()
+                .map(|(source, _)| *source)
+                .collect::<HashSet<_>>(),
+            call.normal_results.iter().copied().collect::<HashSet<_>>(),
+            "named results retain both call-result dependencies"
+        );
+        assert!(returned.iter().all(|(_, target)| {
+            named.gaps.iter().any(|gap| {
+                gap.subject == SemanticGapSubject::Value(*target)
+                    && gap.capability == SemanticCapability::ReturnFlow
+            })
+        }));
+    }
+
+    #[test]
+    fn array_literal_initializers_are_exact_index_stores() {
+        const SOURCE: &str = r#"package main
+
+type cell struct{}
+
+func build() {
+    const length = 4
+    c := &cell{}
+    values := [4]*cell{c, 2: c}
+    empty := [length]*cell{}
+    _ = values
+    _ = empty
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "build");
+        let mut stores = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                let location = &procedure.memory_locations[location.index()];
+                let MemoryLocationKind::Index { constant_index, .. } = location.kind else {
+                    unreachable!("index stores use index locations")
+                };
+                Some((constant_index, location.value_copy))
+            })
+            .collect::<Vec<_>>();
+        stores.sort_unstable_by_key(|(index, _)| *index);
+        assert_eq!(
+            stores,
+            vec![
+                (Some(0), MemoryValueCopy::Reference),
+                (Some(2), MemoryValueCopy::Reference),
+            ],
+            "mixed positional and keyed entries retain exact element definitions"
+        );
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Values),
+            "an exact array literal must not retain a Values gap: {procedure:#?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_keyed_aggregate_initializer_retains_rhs_at_terminal() {
+        const SOURCE: &str = r#"package main
+
+import other "example.org/other"
+
+func makeCell() *int { return new(int) }
+
+func build() {
+	value := other.T{Field: makeCell()}
+	_ = value
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "build");
+        let (fact_point, selector, aggregate, value) = procedure
+            .points
+            .iter()
+            .find_map(|point| {
+                point.events.iter().find_map(|event| {
+                    let SemanticEffect::AggregateInitializer {
+                        aggregate,
+                        selector,
+                        value,
+                    } = &event.effect
+                    else {
+                        return None;
+                    };
+                    Some((point.id, selector.clone(), *aggregate, *value))
+                })
+            })
+            .expect("unresolved keyed initializer has one retained operand fact");
+        assert_eq!(source_text(SOURCE, selector.anchor().span()), "Field");
+        assert_eq!(
+            source_text(SOURCE, value_source_span(procedure, value)),
+            "makeCell()"
+        );
+
+        let rhs_point = procedure
+            .points
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::Invoke { .. }))
+            })
+            .map(|point| point.id)
+            .expect("RHS call invoke point");
+        let allocation_point = procedure
+            .points
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::Allocation { .. }))
+            })
+            .map(|point| point.id)
+            .expect("aggregate allocation point");
+        assert_ne!(fact_point, allocation_point);
+        let mut frontier = vec![rhs_point];
+        let mut reached = HashSet::default();
+        while let Some(point) = frontier.pop() {
+            if !reached.insert(point) {
+                continue;
+            }
+            frontier.extend(
+                procedure
+                    .control_edges
+                    .iter()
+                    .filter(|edge| edge.source_point == point)
+                    .map(|edge| edge.target_point),
+            );
+        }
+        assert!(
+            reached.contains(&fact_point),
+            "aggregate fact point must follow RHS evaluation"
+        );
+        assert!(
+            procedure.points[fact_point.index()]
+                .events
+                .iter()
+                .any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::AggregateInitializer {
+                            aggregate: actual_aggregate,
+                            value: actual_value,
+                            ..
+                        } if actual_aggregate == aggregate && actual_value == value
+                    )
+                })
+        );
+    }
+
+    #[test]
+    fn type_assertion_flow_tracks_stable_and_replaced_interface_bindings() {
+        const SOURCE: &str = r#"package main
+func stable() {
+    var boxed any = make([]int, 1)
+    recovered := boxed.([]int)
+    _ = recovered
+}
+func receive(ch chan any) {
+    var boxed any = make([]int, 1)
+    select {
+    case boxed = <-ch:
+    default:
+    }
+    recovered := boxed.([]int)
+    _ = recovered
+}
+func direct() {
+    var boxed any = make([]int, 1)
+    boxed = make([]int, 1)
+    recovered := boxed.([]int)
+    _ = recovered
+}
+"#;
+
+        let procedures = lower_fixture(SOURCE);
+        let assertion_flow = |procedure_name: &str| {
+            let procedure = named_procedure(&procedures, procedure_name);
+            let assertion = procedure
+                .values
+                .iter()
+                .find(|value| {
+                    source_text(SOURCE, value_source_span(procedure, value.id)) == "boxed.([]int)"
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing assertion result in {procedure_name}: {procedure:#?}")
+                })
+                .id;
+            let flows = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter_map(|event| match event.effect {
+                    SemanticEffect::ValueFlow { kind, target, .. } if target == assertion => {
+                        Some(kind)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [kind] = flows.as_slice() else {
+                panic!(
+                    "assertion result has one flow in {procedure_name}, got {flows:#?}: {procedure:#?}"
+                );
+            };
+            *kind
+        };
+        let unboxing = ValueFlowKind::Transfer(ValueTransfer {
+            kind: TransferKind::Unboxing,
+            operation: TransferOperation::None,
+        });
+
+        assert_eq!(
+            assertion_flow("stable"),
+            ValueFlowKind::ReferenceUnboxing,
+            "a stable statically known reference payload publishes an extraction witness"
+        );
+        assert_eq!(
+            assertion_flow("receive"),
+            unboxing,
+            "a selected receive replaces the interface payload"
+        );
+        assert_eq!(
+            assertion_flow("direct"),
+            unboxing,
+            "a direct assignment replaces the interface payload"
+        );
+    }
+
+    #[test]
+    fn comma_ok_assertions_lower_both_results_with_identity() {
+        const SOURCE: &str = r#"package main
+type Cell struct { value int }
+
+func run(source *Cell) {
+    var boxed any = source
+    if narrowed, ok := boxed.(*Cell); ok {
+        _ = narrowed
+        _ = ok
+    }
+}
+
+func runSingle(source *Cell) {
+    var boxed any = source
+    narrowed := boxed.(*Cell)
+    _ = narrowed
+}
+"#;
+
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "run");
+        let assertion = procedure
+            .values
+            .iter()
+            .find(|value| {
+                source_text(SOURCE, value_source_span(procedure, value.id)) == "boxed.(*Cell)"
+            })
+            .map(|value| value.id)
+            .expect("the assertion result is lowered");
+        let flows = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow { kind, target, .. } if target == assertion => Some(kind),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flows,
+            [ValueFlowKind::ReferenceUnboxing],
+            "the comma-ok result keeps the operand payload identity: {procedure:#?}"
+        );
+
+        // Both declared names receive one result each: the narrowed value and
+        // the presence Boolean. The presence result must not turn the
+        // assertion into a single-result panic, so it carries no panic gap.
+        let presence = procedure
+            .values
+            .iter()
+            .find(|value| {
+                matches!(&value.kind, SemanticValueKind::LanguageDefined(kind)
+                    if kind.as_ref() == "go.assertion_presence")
+            })
+            .map(|value| value.id)
+            .expect("the presence result is lowered");
+        let assigned = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } => Some((target, value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assigned.iter().any(|(_, value)| *value == assertion),
+            "the narrowed binding receives the assertion result: {procedure:#?}"
+        );
+        assert!(
+            assigned.iter().any(|(_, value)| *value == presence),
+            "the presence binding receives the presence result: {procedure:#?}"
+        );
+        assert!(
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| !matches!(event.effect, SemanticEffect::Gap { .. })),
+            "the comma-ok form does not panic on a failed assertion: {procedure:#?}"
+        );
+
+        // The single-result form keeps its panic boundary.
+        let single = named_procedure(&procedures, "runSingle");
+        assert!(
+            single
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| matches!(event.effect, SemanticEffect::Gap { .. })),
+            "the single-result form still states its panic boundary: {single:#?}"
+        );
+    }
+
+    #[test]
+    fn external_zero_values_establish_storage_but_initialized_bindings_copy() {
+        let procedures = lower_fixture(
+            r#"package main
+import "example.org/records"
+func run() {
+    var first, second records.Record
+    {
+        var first records.Record
+        _ = first
+    }
+    copied := first
+    _, _ = second, copied
+}
+"#,
+        );
+        let procedure = named_procedure(&procedures, "run");
+        let flows = procedure.points.iter().flat_map(|point| &point.events);
+        let mut zeros = Vec::new();
+        let mut copies = 0;
+        for event in flows {
+            if let SemanticEffect::ValueFlow { source, kind, .. } = event.effect {
+                if matches!(&procedure.values[source.index()].kind,
+                    SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == "go.zero_value")
+                {
+                    assert_eq!(kind, ValueFlowKind::Local, "{event:#?}");
+                    zeros.push(source);
+                } else if matches!(kind, ValueFlowKind::Transfer(_)) {
+                    copies += 1;
+                }
+            }
+        }
+        zeros.sort_unstable();
+        zeros.dedup();
+        assert_eq!(
+            zeros.len(),
+            3,
+            "each declaration owns distinct zero storage"
+        );
+        assert_eq!(copies, 1, "an initialized binding still copies its source");
+    }
+
+    #[test]
+    fn unary_not_condition_guards_the_inner_call_result_with_inverted_polarity() {
+        const SOURCE: &str = r#"package main
+func predicate() bool { return true }
+func negated() bool {
+    if !predicate() { return true }
+    return false
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "negated");
+        let [call] = procedure.call_sites.as_slice() else {
+            panic!("expected one predicate call: {procedure:#?}");
+        };
+        let [guard] = procedure.guard_facts.as_slice() else {
+            panic!("expected one predicate guard: {procedure:#?}");
+        };
+        let result = call.result.expect("predicate call has one result");
+
+        assert_eq!(
+            guard.subject,
+            Some(result),
+            "the guard must test the call result rather than a synthetic unary value"
+        );
+        assert_eq!(
+            source_text(SOURCE, value_source_span(procedure, result)),
+            "predicate()"
+        );
+        assert_eq!(
+            source_text(
+                SOURCE,
+                mapping_source_span(procedure, procedure.points[guard.point.index()].source),
+            ),
+            "predicate()",
+            "the decision point belongs to the grammar-native operand"
+        );
+        assert!(matches!(guard.predicate, GuardPredicate::Truthy { .. }));
+        assert_eq!(
+            guard.true_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalFalse)
+        );
+        assert_eq!(
+            guard.false_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalTrue)
+        );
+    }
+
+    #[test]
+    fn double_unary_not_restores_the_inner_call_guard_polarity() {
+        const SOURCE: &str = r#"package main
+func predicate() bool { return true }
+func doubleNegated() bool {
+    if !!predicate() { return true }
+    return false
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "doubleNegated");
+        let [call] = procedure.call_sites.as_slice() else {
+            panic!("expected one predicate call: {procedure:#?}");
+        };
+        let [guard] = procedure.guard_facts.as_slice() else {
+            panic!("expected one predicate guard: {procedure:#?}");
+        };
+
+        assert_eq!(
+            guard.subject, call.result,
+            "both unary wrappers must peel back to the call result"
+        );
+        assert_eq!(
+            guard.true_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalTrue)
+        );
+        assert_eq!(
+            guard.false_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalFalse)
+        );
+    }
+
+    #[test]
+    fn unary_not_normalizes_comparisons_with_inverted_predicate_polarity() {
+        const SOURCE: &str = r#"package main
+func negatedNil(err error) bool {
+    if !(err != nil) { return true }
+    return false
+}
+func negatedConstant(x int) bool {
+    if !((x == 7)) { return true }
+    return false
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+
+        let nil_procedure = named_procedure(&procedures, "negatedNil");
+        let [nil_guard] = nil_procedure.guard_facts.as_slice() else {
+            panic!("expected one normalized nil guard: {nil_procedure:#?}");
+        };
+        let nil_subject = nil_guard
+            .subject
+            .expect("a nil comparison retains its nonconstant subject");
+        assert_eq!(
+            source_text(SOURCE, value_source_span(nil_procedure, nil_subject)),
+            "err"
+        );
+        assert!(matches!(
+            nil_guard.predicate,
+            GuardPredicate::NullComparison { null_on_true: true }
+        ));
+        assert_eq!(
+            nil_guard.true_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalTrue)
+        );
+        assert_eq!(
+            nil_guard.false_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalFalse)
+        );
+
+        let constant_procedure = named_procedure(&procedures, "negatedConstant");
+        let [constant_guard] = constant_procedure.guard_facts.as_slice() else {
+            panic!("expected one normalized constant guard: {constant_procedure:#?}");
+        };
+        let constant_subject = constant_guard
+            .subject
+            .expect("a constant comparison retains its nonconstant subject");
+        assert_eq!(
+            source_text(
+                SOURCE,
+                value_source_span(constant_procedure, constant_subject),
+            ),
+            "x"
+        );
+        let GuardPredicate::ConstantEquality { negated, constant } = &constant_guard.predicate
+        else {
+            panic!("expected constant equality predicate: {constant_guard:#?}");
+        };
+        assert!(*negated, "negating equality must make inequality true");
+        assert_eq!(
+            source_text(SOURCE, value_source_span(constant_procedure, *constant),),
+            "7"
+        );
+        assert_eq!(
+            constant_guard.true_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalTrue)
+        );
+        assert_eq!(
+            constant_guard.false_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalFalse)
+        );
+    }
+
+    #[test]
+    fn unary_not_composes_with_parentheses_and_short_circuit_conditions() {
+        const SOURCE: &str = r#"package main
+func left() bool { return true }
+func right() bool { return true }
+func negatedAnd() bool {
+    if !(left() && right()) { return true }
+    return false
+}
+func negatedOr() bool {
+    if !(left() || right()) { return true }
+    return false
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+
+        for (name, rightward_arm) in [("negatedAnd", true), ("negatedOr", false)] {
+            let procedure = named_procedure(&procedures, name);
+            assert_eq!(procedure.call_sites.len(), 2, "{procedure:#?}");
+            assert_eq!(procedure.guard_facts.len(), 2, "{procedure:#?}");
+
+            let call_result = |text: &str| {
+                procedure
+                    .call_sites
+                    .iter()
+                    .find_map(|call| {
+                        let result = call.result?;
+                        (source_text(SOURCE, value_source_span(procedure, result)) == text)
+                            .then_some(result)
+                    })
+                    .unwrap_or_else(|| panic!("missing {text} result: {procedure:#?}"))
+            };
+            let left_result = call_result("left()");
+            let right_result = call_result("right()");
+            let guard_for = |result| {
+                procedure
+                    .guard_facts
+                    .iter()
+                    .find(|guard| guard.subject == Some(result))
+                    .unwrap_or_else(|| panic!("missing call-result guard: {procedure:#?}"))
+            };
+            let left_guard = guard_for(left_result);
+            let right_guard = guard_for(right_result);
+
+            let right_entry = if rightward_arm {
+                left_guard.true_arm
+            } else {
+                left_guard.false_arm
+            }
+            .expect("the short-circuit operator reaches its right operand");
+            assert_eq!(
+                source_text(
+                    SOURCE,
+                    mapping_source_span(
+                        procedure,
+                        procedure.points[right_entry.target_point.index()].source,
+                    ),
+                ),
+                "right()"
+            );
+            assert_eq!(
+                right_guard.true_arm.map(|arm| arm.kind),
+                Some(ControlEdgeKind::ConditionalFalse)
+            );
+            assert_eq!(
+                right_guard.false_arm.map(|arm| arm.kind),
+                Some(ControlEdgeKind::ConditionalTrue)
+            );
+        }
+    }
+
+    #[test]
+    fn unary_not_distinguishes_builtin_and_rebound_boolean_literals() {
+        const SOURCE: &str = r#"package main
+func builtin() bool {
+    if !true { return true }
+    return false
+}
+func rebound() bool {
+    true := false
+    if !true { return true }
+    return false
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let builtin = named_procedure(&procedures, "builtin");
+        let [builtin_guard] = builtin.guard_facts.as_slice() else {
+            panic!("expected one builtin literal guard: {builtin:#?}");
+        };
+        assert_eq!(builtin_guard.subject, None);
+        assert_eq!(
+            source_text(SOURCE, mapping_source_span(builtin, builtin_guard.source)),
+            "!true"
+        );
+        assert!(matches!(
+            builtin_guard.predicate,
+            GuardPredicate::ConstantBoolean { value: false }
+        ));
+        assert_eq!(builtin_guard.true_arm, None);
+        assert_eq!(
+            builtin_guard.false_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalFalse)
+        );
+
+        let rebound = named_procedure(&procedures, "rebound");
+        let [rebound_guard] = rebound.guard_facts.as_slice() else {
+            panic!("expected one rebound literal guard: {rebound:#?}");
+        };
+        let subject = rebound_guard
+            .subject
+            .expect("a rebound literal is an ordinary runtime value");
+        assert_eq!(
+            source_text(SOURCE, value_source_span(rebound, subject)),
+            "true"
+        );
+        assert_ne!(
+            rebound.values[subject.index()].kind,
+            SemanticValueKind::Constant
+        );
+        assert!(matches!(
+            rebound_guard.predicate,
+            GuardPredicate::Truthy { .. }
+        ));
+        assert_eq!(
+            rebound_guard.true_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalFalse)
+        );
+        assert_eq!(
+            rebound_guard.false_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::ConditionalTrue)
+        );
+    }
+
+    #[test]
+    fn conditional_defer_specialization_exhausts_the_semantic_budget_typed() {
+        const SOURCE: &str = r#"package main
+func cleanup() {}
+func bounded(a, b, c, d bool) {
+    if a { defer cleanup() }
+    if b { defer cleanup() }
+    if c { defer cleanup() }
+    if d { defer cleanup() }
+    finish()
+}
+"#;
+        let complete = lower_fixture_with_budget(SOURCE, &SemanticBudget::default());
+        let SemanticOutcome::Complete { value, work } = complete else {
+            panic!("default semantic budget must lower the bounded fixture: {complete:#?}");
+        };
+        assert!(work.nested_entries > 1);
+
+        let mut limits = SemanticBudget::default().limits();
+        let retained = value.iter().fold(SemanticWork::default(), |total, parts| {
+            total.conservative_add(
+                brokk_bifrost_semantic::analyzer::semantic::ir::measure_procedure_work(parts),
+            )
+        });
+        let traversal = work.saturating_sub(retained);
+        // Refuse one actual balance; their sum is no longer a resident grant.
+        limits.nested_entries = retained.nested_entries.max(traversal.nested_entries) - 1;
+        let budget = SemanticBudget::new(limits).expect("all semantic limits remain positive");
+        let constrained = lower_fixture_with_budget(SOURCE, &budget);
+        let SemanticOutcome::ExceededBudget { exceeded, .. } = constrained else {
+            panic!("continuation specialization must fail typed: {constrained:#?}");
+        };
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
+    }
+
+    #[test]
+    fn direct_immutable_capture_prepass_exhausts_nested_entry_budget_typed() {
+        const SOURCE: &str = r#"package main
+func outer() {
+    value := acquire()
+    closure := func() { consume(value) }
+    closure()
+}
+"#;
+        let prepared = prepared_fixture(SOURCE);
+        let file = ProjectFile::new(std::env::temp_dir(), "fixture.go");
+        let unconstrained = enumerate_procedures(
+            &file,
+            &prepared,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("unconstrained Go inventory succeeds");
+        let ProcedureInventoryOutcome::Complete {
+            value:
+                GoProcedureInventory {
+                    mut specs,
+                    direct_struct_fields,
+                    named_type_definitions,
+                    method_inventory,
+                    package_shadowing,
+                    ..
+                },
+            ..
+        } = unconstrained
+        else {
+            panic!("unconstrained Go inventory must complete");
+        };
+
+        let mut limits = SemanticBudget::default().limits();
+        limits.nested_entries = 1;
+        let budget = SemanticBudget::new(limits).expect("all semantic limits remain positive");
+        let mut inventory = ProcedureInventoryBuilder::new(
+            &file,
+            prepared.dialect(),
+            prepared.tree().root_node(),
+            "go-source",
+            &budget,
+        )
+        .expect("fresh Go inventory is valid");
+        let stop = populate_capture_specs(
+            &mut specs,
+            prepared.source(),
+            &direct_struct_fields,
+            &named_type_definitions,
+            &method_inventory,
+            package_shadowing,
+            &mut inventory,
+            &CancellationToken::default(),
+        );
+        let Err(GoInventoryPrepassStop::Budget(stop)) = stop else {
+            panic!("capture prepass must stop with a typed budget error");
+        };
+        assert_eq!(
+            stop.exceeded.dimension(),
+            SemanticBudgetDimension::NestedEntries
+        );
+    }
+
+    #[test]
+    fn captured_array_retains_pointer_element_metadata() {
+        const SOURCE: &str = r#"package main
+
+type cell struct { n int }
+
+func outer() {
+    var values [1]*cell
+    go func() { values[0].n = 1 }()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = named_procedure(&procedures, "outer");
+        let child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(parent.id))
+            .expect("function-literal procedure");
+        assert!(
+            parent
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Values),
+            "the structured array zero value must be lowered without an alias gap: {parent:#?}"
+        );
+        let indexed = child
+            .memory_locations
+            .iter()
+            .find(|location| matches!(location.kind, MemoryLocationKind::Index { .. }))
+            .expect("captured array element access");
+        assert_eq!(
+            indexed.value_copy,
+            MemoryValueCopy::Reference,
+            "the captured array keeps its pointer element copy contract: {child:#?}"
+        );
+        let member = child
+            .memory_locations
+            .iter()
+            .find_map(|location| match &location.kind {
+                MemoryLocationKind::Field { member, .. } => Some(member),
+                _ => None,
+            })
+            .expect("pointer element field access");
+        assert_eq!(
+            member.anchor().span().start_byte() as usize,
+            SOURCE.find("n int").expect("cell field declaration"),
+            "the captured element type resolves the selected field declaration"
+        );
+    }
+
+    #[test]
+    fn stable_interface_dispatch_publishes_one_target_and_reference_payload() {
+        const SOURCE: &str = r#"package main
+type cell struct{}
+type bumper interface { bump() }
+func (c *cell) bump() {}
+func run() {
+    c := &cell{}
+    var b bumper = c
+    go b.bump()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let run = named_procedure(&procedures, "run");
+        let bump = named_procedure(&procedures, "bump");
+        let [call] = run.call_sites.as_slice() else {
+            panic!("run has one spawned interface call: {run:#?}");
+        };
+        assert_eq!(
+            call.declared_targets,
+            CallableTargetResolution::Proven(CallableTarget::Local(bump.id))
+        );
+        let receiver = call
+            .receiver
+            .expect("interface call publishes its receiver");
+        let events = run
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::ReferenceBoxing,
+                    source,
+                    ..
+                } if source_text(SOURCE, value_source_span(run, source)) == "c"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::ReferenceUnboxing,
+                    target,
+                    ..
+                } if target == receiver
+            )
+        }));
+        assert!(run.gaps.iter().any(|gap| {
+            gap.subject == SemanticGapSubject::CallSite(call.id)
+                && gap.capability == SemanticCapability::DynamicDispatch
+        }));
+
+        const MISMATCHED: &str = r#"package main
+type cell struct{}
+type bumper interface { bump(int) }
+func (c *cell) bump() {}
+func run() {
+    c := &cell{}
+    var b bumper = c
+    go b.bump(1)
+}
+"#;
+        let procedures = lower_fixture(MISMATCHED);
+        let run = named_procedure(&procedures, "run");
+        let [call] = run.call_sites.as_slice() else {
+            panic!("run has one unresolved spawned interface call: {run:#?}");
+        };
+        assert_eq!(call.declared_targets, CallableTargetResolution::Unknown);
+        assert!(
+            run.points
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| {
+                    !matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
+                            ..
+                        }
+                    )
+                })
+        );
+        assert!(run.gaps.iter().any(|gap| {
+            gap.subject == SemanticGapSubject::CallSite(call.id)
+                && gap.capability == SemanticCapability::DynamicDispatch
+        }));
+
+        const VALUE_RECEIVER: &str = r#"package main
+type cell struct{}
+type bumper interface { bump() }
+func (c cell) bump() {}
+func run() {
+    c := &cell{}
+    var b bumper = c
+    go b.bump()
+}
+"#;
+        let procedures = lower_fixture(VALUE_RECEIVER);
+        let run = named_procedure(&procedures, "run");
+        let bump = named_procedure(&procedures, "bump");
+        let [call] = run.call_sites.as_slice() else {
+            panic!("value-receiver interface call has one target: {run:#?}");
+        };
+        assert_eq!(
+            call.declared_targets,
+            CallableTargetResolution::Proven(CallableTarget::Local(bump.id))
+        );
+        let receiver = call
+            .receiver
+            .expect("the interface payload is still the pointer receiver value");
+        assert!(
+            run.points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::ReferenceUnboxing,
+                            target,
+                            ..
+                        } if target == receiver
+                    )
+                })
+        );
+        assert!(run.gaps.iter().any(|gap| {
+            gap.subject == SemanticGapSubject::CallSite(call.id)
+                && gap.capability == SemanticCapability::DynamicDispatch
+        }));
+    }
+
+    #[test]
+    fn named_function_arguments_retain_exact_callable_identity() {
+        const SOURCE: &str = r#"package main
+func helper() {}
+func consume(f func()) {}
+func direct() { consume(helper) }
+func shadowed(helper func()) { consume(helper) }
+func local() { helper := func() {}; consume(helper) }
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let helper = named_procedure(&procedures, "helper").id;
+        for (name, expected) in [("direct", true), ("shadowed", false), ("local", false)] {
+            let procedure = named_procedure(&procedures, name);
+            let argument = procedure
+                .call_sites
+                .iter()
+                .find(|call| {
+                    source_text(SOURCE, value_source_span(procedure, call.callee)) == "consume"
+                })
+                .expect("consume call")
+                .arguments[0]
+                .value;
+            let references = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter_map(|event| match &event.effect {
+                    SemanticEffect::CallableReference { result, callable }
+                        if *result == argument =>
+                    {
+                        Some(&callable.targets)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                references.contains(&&CallableTargetResolution::Proven(CallableTarget::Local(
+                    helper
+                ))),
+                expected,
+                "{name}: {references:?}"
+            );
+        }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "c51b249c4f34: stable closure calls lost the bound callable value during summary replay"
+    )]
+    #[test]
+    fn stable_callable_calls_retain_the_bound_closure_value() {
+        const SOURCE: &str = r#"package main
+func invoke() {
+    value := 0
+    read := func() int { return value }
+    read()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = named_procedure(&procedures, "invoke");
+        let events = parent
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .collect::<Vec<_>>();
+        let closure = events
+            .iter()
+            .find_map(|event| match event.effect {
+                SemanticEffect::CallableCreation {
+                    result,
+                    ref callable,
+                } if callable.environment.is_some() => Some(result),
+                _ => None,
+            })
+            .expect("the captured function literal has a closure environment");
+        let binding = events
+            .iter()
+            .find_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } if value == closure => Some(target),
+                _ => None,
+            })
+            .expect("the closure is assigned to the local function binding");
+        let call = parent
+            .call_sites
+            .iter()
+            .find(|call| source_text(SOURCE, value_source_span(parent, call.callee)) == "read")
+            .expect("the stable function binding is called");
+        assert_eq!(
+            parent.values[call.callee.index()].kind,
+            SemanticValueKind::Callable
+        );
+        assert!(
+            events.iter().any(|event| matches!(event.effect,
+                SemanticEffect::ValueFlow { kind: ValueFlowKind::Local, source, target }
+                    if source == binding && target == call.callee
+            )),
+            "the callable operand retains the bound closure environment"
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::CallableReference { result, .. } if result == call.callee
+            )
+        }));
+    }
+
+    /// The stability requirement, stated as its own case because it is the
+    /// only thing separating a proven alias from a wrong answer.
+    #[test]
+    fn a_reassigned_callable_binding_does_not_name_its_first_value() {
+        const SOURCE: &str = r#"package main
+func invoke(flag bool) {
+    worker := func() {}
+    if flag {
+        worker = func() {}
+    }
+    worker()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("invoke procedure");
+        let worker = parent
+            .call_sites
+            .iter()
+            .find(|call| source_text(SOURCE, value_source_span(parent, call.callee)) == "worker")
+            .expect("the worker call");
+        assert_eq!(
+            worker.declared_targets,
+            CallableTargetResolution::Unknown,
+            "a rebound callable must not be reported as its first value"
+        );
+    }
+
+    #[test]
+    fn go_spawn_call_has_different_task_timing_and_parent_normal_successor() {
+        let procedures = lower_fixture(
+            r#"package main
+func spawn() {
+    go func() {}()
+    observe()
+}
+func observe() {}
+"#,
+        );
+        let parent = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("spawn")
+            })
+            .expect("spawn procedure");
+        let spawn_gaps = parent
+            .gaps
+            .iter()
+            .filter(|gap| gap.capability == SemanticCapability::ConcurrentSpawn)
+            .collect::<Vec<_>>();
+        let [spawn_gap] = spawn_gaps.as_slice() else {
+            panic!("one concurrent-spawn gap: {spawn_gaps:#?}");
+        };
+        assert_eq!(spawn_gap.subject, SemanticGapSubject::Point);
+        assert_eq!(spawn_gap.kind, SemanticGapKind::Unsupported);
+        assert_eq!(
+            spawn_gap.discharge,
+            SemanticGapDischarge::RetainedControlTopology
+        );
+        assert_eq!(
+            parent
+                .control_edges
+                .iter()
+                .filter(|edge| edge.source_point == spawn_gap.point)
+                .map(|edge| edge.kind)
+                .collect::<Vec<_>>(),
+            vec![ControlEdgeKind::Normal],
+            "the parent continues through its one represented normal successor"
+        );
+        let spawned = parent
+            .call_sites
+            .iter()
+            .find(|call| call.point == spawn_gap.point)
+            .expect("the exact go statement emits its outer call");
+        assert_eq!(spawned.invocation_mode, CallInvocationMode::Detached);
+        assert_eq!(spawned.execution_timing, ExecutionTiming::DifferentTask);
+        assert!(spawned.normal_continuation.target().is_some());
+        assert_eq!(
+            spawned.exceptional_continuation,
+            ControlContinuation::Absent
+        );
+        assert!(spawned.normal_result_values().next().is_none());
+        assert!(spawned.thrown.is_none());
+        assert!(parent.gaps.iter().all(|gap| {
+            gap.point != spawn_gap.point || gap.capability != SemanticCapability::Calls
+        }));
+    }
+
+    #[test]
+    fn malformed_go_operand_retains_control_and_explicit_call_gap() {
+        let procedures = lower_fixture(
+            r#"package main
+func incomplete(callback func()) {
+	go callback
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("incomplete")
+            })
+            .expect("incomplete procedure");
+        assert!(
+            procedure.call_sites.is_empty(),
+            "a non-call operand must not manufacture a spawned call: {:#?}",
+            procedure.call_sites
+        );
+        let spawn_gap = procedure
+            .gaps
+            .iter()
+            .find(|gap| gap.capability == SemanticCapability::ConcurrentSpawn)
+            .expect("unsupported spawn remains explicit");
+        assert!(procedure.gaps.iter().any(|gap| {
+            gap.point == spawn_gap.point && gap.capability == SemanticCapability::Calls
+        }));
+        assert!(procedure.control_edges.iter().any(|edge| {
+            edge.source_point == spawn_gap.point && edge.kind == ControlEdgeKind::Normal
+        }));
+    }
+
+    #[test]
+    fn direct_func_literal_defers_are_bounded_but_callable_values_remain_open() {
+        const SOURCE: &str = r#"package main
+func deferCalls(callback func(), factory func() func()) {
+    defer func() {}()
+    defer (func() {})()
+    alias := func() {}
+    defer alias()
+    defer callback()
+    defer factory()()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("deferCalls procedure");
+        let callee_span = |call: &SemanticCallSite| value_source_span(parent, call.callee);
+        let callee_text = |call: &SemanticCallSite| source_text(SOURCE, callee_span(call));
+
+        for expected in ["func() {}", "(func() {})"] {
+            let call = parent
+                .call_sites
+                .iter()
+                .find(|call| callee_text(call) == expected)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing deferred `{expected}` call: {:#?}",
+                        parent.call_sites
+                    )
+                });
+            assert_eq!(call.execution_timing, ExecutionTiming::SameInvocation);
+            let CallableTargetResolution::Proven(CallableTarget::Local(target)) =
+                call.declared_targets
+            else {
+                panic!("direct deferred literal must have a proven local target: {call:#?}");
+            };
+            let target = procedures
+                .iter()
+                .find(|procedure| procedure.id == target)
+                .expect("deferred literal target names one published procedure");
+            let target_span = target.locator.anchor().span();
+            let call_span = callee_span(call);
+            assert!(
+                call_span.start_byte() <= target_span.start_byte()
+                    && target_span.end_byte() <= call_span.end_byte(),
+                "the deferred target must be the exact literal registered here"
+            );
+        }
+
+        for unsupported in ["alias", "callback", "factory()"] {
+            assert!(
+                parent
+                    .call_sites
+                    .iter()
+                    .all(|call| callee_text(call) != unsupported),
+                "a callable value or producing expression must not fabricate a deferred call target: {:#?}",
+                parent.call_sites
+            );
+        }
+        assert_eq!(
+            parent
+                .gaps
+                .iter()
+                .filter(|gap| {
+                    gap.capability == SemanticCapability::Calls
+                        && gap.detail.as_ref()
+                            == "the deferred outer call is intentionally not emitted as an immediate invocation"
+                })
+                .count(),
+            3,
+            "each alias, parameter, or callable-producing defer remains explicit: {:#?}",
+            parent.gaps
+        );
+    }
+
+    #[test]
+    fn active_defer_marks_later_panics_as_exit_only_procedure_completion() {
+        const SOURCE: &str = r#"package main
+type item struct { value int }
+func cleanup() {}
+func run(input *item) {
+    defer cleanup()
+    _ = input.value
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "run");
+        let gaps = procedure
+            .gaps
+            .iter()
+            .filter(|gap| {
+                gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && source_text(SOURCE, mapping_source_span(procedure, gap.source))
+                        == "input.value"
+            })
+            .collect::<Vec<_>>();
+        let [gap] = gaps.as_slice() else {
+            panic!("the selector owns one exceptional gap: {gaps:#?}");
+        };
+        assert!(matches!(gap.subject, SemanticGapSubject::Value(_)));
+        assert_eq!(gap.kind, SemanticGapKind::Unsupported);
+        assert_eq!(
+            gap.discharge,
+            SemanticGapDischarge::ExitOnlyProcedureCompletion,
+            "active cleanup may run during panic completion but cannot resume the normal body"
+        );
+    }
+
+    #[test]
+    fn mutable_capture_read_retains_operand_order_gap() {
+        for (mutation, expected_gap) in [("n = 2", true), ("", false)] {
+            let source = format!(
+                "package main\nfunc consume(a, b int) {{}}\nfunc outer(cb func() int) {{\n    n := 0\n    read := func() {{ consume(n, cb()) }}\n    {mutation}\n    read()\n}}\n"
+            );
+            let procedures = lower_fixture(&source);
+            let child = procedures
+                .iter()
+                .find(|procedure| procedure.lexical_parent.is_some())
+                .expect("capturing read procedure");
+            assert_eq!(
+                child
+                    .gaps
+                    .iter()
+                    .any(|gap| { gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder }),
+                expected_gap,
+                "mutable cells retain read order uncertainty; stable value captures do not: {:#?}",
+                child.gaps
+            );
+        }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "f35e73bce2e2: evaluation-order gaps must distinguish stable values from effectful calls"
+    )]
+    #[test]
+    fn selector_compared_with_stable_literal_needs_no_evaluation_order_gap() {
+        let procedures = lower_fixture(
+            r#"package main
+type record struct { value string }
+func check(item *record) bool {
+    return item.value != ("")
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("check procedure");
+
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.discharge != SemanticGapDischarge::RetainedEvaluationOrder),
+            "a stable literal contributes no observable evaluation order: {:#?}",
+            procedure.gaps
+        );
+        assert!(
+            procedure.gaps.iter().any(|gap| {
+                gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+                    && gap.detail.as_ref() == "selection may panic on a nil operand"
+            }),
+            "the selector panic stays explicit and records Go's non-rejoining provenance"
+        );
+    }
+
+    #[test]
+    fn private_constant_array_assignment_needs_no_operand_order_gap() {
+        let procedures = lower_fixture(
+            r#"package main
+type record struct { value int }
+func sideEffect() int { return 1 }
+func plain(target record) {
+    target.value = sideEffect()
+}
+func dereferenced(target *record) {
+    (*target).value = sideEffect()
+}
+func privateArray() {
+    values := [2]int{}
+    values[0] = sideEffect()
+}
+func sliceParameter(values []int) {
+    values[0] = sideEffect()
+}
+func dynamicArray(index int) {
+    values := [2]int{}
+    values[index] = sideEffect()
+}
+func escapedArray(consume func(*[2]int)) {
+    values := [2]int{}
+    consume(&values)
+    values[0] = sideEffect()
+}
+"#,
+        );
+        let procedure_named = |name: &str| {
+            procedures
+                .iter()
+                .find(|procedure| {
+                    procedure.lexical_parent.is_none()
+                        && procedure
+                            .locator
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing procedure {name}"))
+        };
+        let has_order_gap = |name: &str| {
+            procedure_named(name)
+                .gaps
+                .iter()
+                .any(|gap| gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder)
+        };
+
+        assert!(
+            !has_order_gap("plain"),
+            "taking the address of a direct field on a local value has no observable read order"
+        );
+        assert!(
+            has_order_gap("dereferenced"),
+            "an explicit dereference can panic before or after the unordered RHS call"
+        );
+        assert!(
+            !has_order_gap("privateArray"),
+            "a private array binding and constant index are inert beside the RHS call"
+        );
+        assert!(
+            has_order_gap("sliceParameter"),
+            "a slice descriptor can share mutable backing storage"
+        );
+        assert!(
+            has_order_gap("dynamicArray"),
+            "a dynamic index retains a runtime operand evaluation"
+        );
+        assert!(
+            has_order_gap("escapedArray"),
+            "a call-exposed array can be changed before the indexed assignment"
+        );
+    }
+
+    #[test]
+    fn package_variable_is_a_nonpanicable_side_effect_free_runtime_leaf() {
+        let procedures = lower_fixture(
+            r#"package main
+import (
+    "fmt"
+    "os"
+)
+func write(message string) {
+    fmt.Fprintln(os.Stderr, message)
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("write procedure");
+
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.discharge != SemanticGapDischarge::RetainedEvaluationOrder),
+            "two side-effect-free runtime reads have no material relative order: {:#?}",
+            procedure.gaps
+        );
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.detail.as_ref() != "selection may panic on a nil operand"),
+            "a proven package qualifier is not a runtime receiver that can panic: {:#?}",
+            procedure.gaps
+        );
+        assert!(
+            procedure
+                .memory_locations
+                .iter()
+                .all(|location| !matches!(location.kind, MemoryLocationKind::Field { .. })),
+            "a package-qualified declaration is not receiver-field memory: {procedure:#?}"
+        );
+    }
+
+    #[test]
+    fn exact_outer_capture_shadow_is_not_a_package_qualifier() {
+        let procedures = lower_fixture(
+            r#"package main
+import "os"
+
+type holder struct { Stderr *os.File }
+
+func shadowed(os *holder) func() {
+    return func() { _ = os.Stderr }
+}
+
+func imported() func() {
+    return func() { _ = os.Stderr }
+}
+"#,
+        );
+        let shadowed_parent = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("shadowed")
+            })
+            .expect("shadowed parent procedure");
+        let imported_parent = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("imported")
+            })
+            .expect("imported parent procedure");
+        let shadowed_child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(shadowed_parent.id))
+            .expect("shadowed function-literal procedure");
+        let imported_child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(imported_parent.id))
+            .expect("imported function-literal procedure");
+
+        let [capture] = shadowed_parent.captures.as_slice() else {
+            panic!("the shadowing parameter is captured exactly: {shadowed_parent:#?}");
+        };
+        assert_eq!(capture.mode, CaptureMode::MutableCell);
+        assert!(imported_parent.gaps.iter().all(|gap| {
+            gap.capability != SemanticCapability::Captures
+                || !matches!(gap.subject, SemanticGapSubject::Value(_))
+        }));
+        assert!(shadowed_child.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::ExceptionalControlFlow
+                && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+        }));
+        assert!(
+            imported_child.gaps.iter().all(|gap| {
+                gap.capability != SemanticCapability::ExceptionalControlFlow
+                    || gap.discharge != SemanticGapDischarge::NonRejoiningExceptionalExit
+            }),
+            "the genuine import remains a nonpanicable package qualifier: {imported_child:#?}"
+        );
+    }
+
+    #[test]
+    fn effectful_wrapped_or_multi_child_operands_retain_evaluation_order_gaps() {
+        let procedures = lower_fixture(
+            r#"package main
+import (
+    "fmt"
+    "os"
+)
+func produce() []any { return nil }
+func fromCall(format string) {
+    fmt.Fprintf(os.Stderr, format, produce()...)
+}
+func fromReceive(format string, values <-chan []any) {
+    fmt.Fprintf(os.Stderr, format, (<-values)...)
+}
+func fromIndex(format string, values []any) {
+    fmt.Fprintln(os.Stderr, values[next()])
+}
+func next() int { return 0 }
+"#,
+        );
+
+        for name in ["fromCall", "fromReceive", "fromIndex"] {
+            let procedure = procedures
+                .iter()
+                .find(|procedure| {
+                    procedure.lexical_parent.is_none()
+                        && procedure
+                            .locator
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} procedure"));
+            assert!(
+                procedure
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder),
+                "wrappers must not hide a call, receive, or multi-child expression whose evaluation order remains material: {procedure:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_variable_paired_with_call_retains_evaluation_order_gap() {
+        let procedures = lower_fixture(
+            r#"package main
+import (
+    "fmt"
+    "os"
+)
+func mutate() any { return os.Stderr }
+func write() {
+    fmt.Fprintln(os.Stderr, mutate())
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("write")
+            })
+            .expect("write procedure");
+
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .any(|gap| gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder),
+            "a call can mutate the package variable before its read, so their relative order remains material: {:#?}",
+            procedure.gaps
+        );
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.detail.as_ref() != "selection may panic on a nil operand"),
+            "the retained order gap must not restore a fabricated package-selector panic: {:#?}",
+            procedure.gaps
+        );
+    }
+
+    #[test]
+    fn uncaptured_address_taken_bindings_have_distinct_storage_cells() {
+        let procedures = lower_fixture(
+            r#"package main
+func consume(value *int) {}
+func owner() {
+    value := 1
+    untouched := 2
+    consume(&value)
+    {
+        value := 3
+        consume(&value)
+    }
+    consume(&((value)))
+    _ = untouched
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .iter()
+                    .any(|segment| segment.name().is_some_and(|name| name == "owner"))
+            })
+            .expect("owner procedure");
+        assert!(procedure.captures.is_empty());
+        let addresses = procedure
+            .values
+            .iter()
+            .filter(|value| value.kind == SemanticValueKind::Address)
+            .map(|value| value.id)
+            .collect::<HashSet<_>>();
+        let addressed = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } if addresses.contains(&target) => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addressed.len(),
+            3,
+            "all address operations retain their binding"
+        );
+        let addressed_bindings = addressed.into_iter().collect::<HashSet<_>>();
+        assert_eq!(
+            addressed_bindings.len(),
+            2,
+            "shadowing names distinct bindings"
+        );
+        let cells = procedure
+            .memory_locations
+            .iter()
+            .filter_map(|location| match location.kind {
+                MemoryLocationKind::LexicalCell { binding } => Some(binding),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), 2, "only the two exposed bindings need cells");
+        assert_eq!(
+            cells.into_iter().collect::<HashSet<_>>(),
+            addressed_bindings
+        );
+    }
+
+    #[test]
+    fn address_of_a_mutable_capture_uses_its_binding_without_reading_the_cell() {
+        let procedures = lower_fixture(
+            r#"package main
+func consume(value *int) {}
+func outer() {
+    value := 0
+    callback := func() { consume(&value) }
+    callback()
+}
+"#,
+        );
+        let child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_some())
+            .expect("callback procedure");
+        let capture = child
+            .memory_locations
+            .iter()
+            .find_map(|location| match location.kind {
+                MemoryLocationKind::Capture {
+                    binding: Some(binding),
+                    ..
+                } => Some((location.id, binding)),
+                _ => None,
+            })
+            .expect("mutable capture retains its target binding");
+        let address = child
+            .values
+            .iter()
+            .find(|value| value.kind == SemanticValueKind::Address)
+            .expect("address-of creates a typed address");
+
+        assert!(
+            child
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::Assignment { target, value }
+                        if target == address.id && value == capture.1
+                ))
+        );
+        assert!(
+            child
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| !matches!(
+                    event.effect,
+                    SemanticEffect::MemoryLoad { location, .. } if location == capture.0
+                ))
+        );
+    }
+
+    #[test]
+    fn unary_address_of_package_global_uses_best_effort_value_without_local_identity() {
+        let procedures = lower_fixture(
+            r#"package main
+var global int
+func consume(value *int) {}
+func observe() { consume(&global) }
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .iter()
+                        .any(|segment| segment.name().is_some_and(|name| name == "observe"))
+            })
+            .expect("observe procedure survives valid package-global address lowering");
+        let address = procedure
+            .values
+            .iter()
+            .find(|value| value.kind == SemanticValueKind::Address)
+            .expect("package-global address value");
+        let source = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } if target == address.id => Some(value),
+                _ => None,
+            })
+            .expect("address creation retains a structured source value");
+        let source_value = procedure
+            .values
+            .iter()
+            .find(|value| value.id == source)
+            .expect("address source value");
+
+        assert_eq!(
+            source_value.kind,
+            SemanticValueKind::Temporary,
+            "package-global identity is best effort, never a fabricated local: {procedure:#?}"
+        );
+        assert!(procedure.gaps.iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Value(source)
+                && gap.capability == SemanticCapability::Assignments
+                && gap.kind == SemanticGapKind::Unsupported
+        }));
+    }
+
+    #[test]
+    fn imported_selector_address_names_static_storage_without_fabricating_an_assignment() {
+        const SOURCE: &str = r#"package main
+import "net/http"
+
+func observe() any { return &http.DefaultClient }
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("observe procedure");
+        let address = procedure
+            .values
+            .iter()
+            .find(|value| {
+                value.kind == SemanticValueKind::Address
+                    && source_text(SOURCE, value_source_span(procedure, value.id))
+                        == "&http.DefaultClient"
+            })
+            .expect("imported selector address value");
+        assert!(
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| {
+                    !matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == address.id)
+                })
+        );
+        // The occurrence now has a structured location instead of nothing, and
+        // the explicit gap moved onto that location. This is what lets a
+        // workspace-aware consumer resolve the declaration; while the
+        // occurrence had no location at all, a race on an imported variable
+        // was silently missed and the run still reported itself complete.
+        let location = procedure
+            .memory_locations
+            .iter()
+            .find(|location| matches!(location.kind, MemoryLocationKind::Static { .. }))
+            .expect("the imported occurrence names static storage");
+        let gap = procedure
+            .gaps
+            .iter()
+            .find(|gap| {
+                gap.subject == SemanticGapSubject::MemoryLocation(location.id)
+                    && gap.capability == SemanticCapability::StaticMemory
+            })
+            .expect("the unresolved imported declaration remains explicit");
+        for impact in [
+            SemanticGapImpact::Aliasing,
+            SemanticGapImpact::HeapRead,
+            SemanticGapImpact::HeapWrite,
+        ] {
+            assert!(gap.impacts.contains(impact));
+        }
+        assert!(
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| !matches!(
+                    event.effect,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Field,
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "f35e73bce2e2: evaluation-order gaps must distinguish stable values from effectful calls"
+    )]
+    #[test]
+    fn identifier_compared_with_call_retains_evaluation_order_gap() {
+        let procedures = lower_fixture(
+            r#"package main
+var observed int
+func mutate() int { observed = 1; return observed }
+func check() bool {
+    return observed == mutate()
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .iter()
+                        .any(|segment| segment.name().is_some_and(|name| name == "check"))
+            })
+            .expect("check procedure");
+
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .any(|gap| gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder),
+            "the call can mutate state observed by the identifier, so their relative order remains material: {:#?}",
+            procedure.gaps
+        );
+    }
+
+    #[test]
+    fn channel_receive_binding_retains_pointer_element_type() {
+        const SOURCE: &str = r#"package main
+type cell struct { n int }
+func transport() {
+    ch := make(chan *cell, 1)
+    c := &cell{}
+    ch <- c
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let stores = procedures
+            .iter()
+            .flat_map(|procedure| {
+                procedure
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .filter_map(|event| match event.effect {
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Field,
+                            location,
+                            ..
+                        } => {
+                            let MemoryLocationKind::Field { member, .. } =
+                                &procedure.memory_locations[location.index()].kind
+                            else {
+                                unreachable!("field store has a field location")
+                            };
+                            Some(member.clone())
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = stores.as_slice() else {
+            panic!("the two goroutines retain their field stores: {stores:#?}");
+        };
+        assert_eq!(
+            first.anchor(),
+            second.anchor(),
+            "both writes resolve the declared cell.n field"
+        );
+        assert!(procedures.iter().all(|procedure| {
+            procedure.gaps.iter().all(|gap| {
+                gap.capability != SemanticCapability::FieldMemory
+                    || !matches!(gap.subject, SemanticGapSubject::MemoryLocation(_))
+            })
+        }));
+    }
+
+    #[test]
+    fn channel_send_payload_copy_follows_the_declared_element_type() {
+        const SOURCE: &str = r#"package main
+type cell struct{}
+func send(
+    pointers chan *cell,
+    slices chan []int,
+    maps chan map[int]int,
+    structs chan cell,
+    interfaces chan any,
+    interfaceSlices chan any,
+    pointer *cell,
+    slice []int,
+    mapping map[int]int,
+    value cell,
+) {
+    pointers <- pointer
+    slices <- slice
+    maps <- mapping
+    structs <- value
+    interfaces <- pointer
+    interfaceSlices <- slice
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let send = named_procedure(&procedures, "send");
+        let payloads = send
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Synchronization {
+                    operation: SynchronizationOperation::ChannelSend,
+                    subject,
+                    payload,
+                } => Some((
+                    source_text(SOURCE, value_source_span(send, subject)),
+                    payload,
+                )),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(matches!(
+            payloads.get("pointers"),
+            Some(Some(SynchronizationPayload::Send {
+                copy: SynchronizationPayloadCopy::Reference,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            payloads.get("slices"),
+            Some(Some(SynchronizationPayload::Send {
+                copy: SynchronizationPayloadCopy::BackingStore {
+                    identity: IndexedLocationIdentity::Element,
+                },
+                ..
+            }))
+        ));
+        assert!(matches!(
+            payloads.get("maps"),
+            Some(Some(SynchronizationPayload::Send {
+                copy: SynchronizationPayloadCopy::BackingStore {
+                    identity: IndexedLocationIdentity::Aggregate,
+                },
+                ..
+            }))
+        ));
+        assert!(matches!(
+            payloads.get("interfaces"),
+            Some(Some(SynchronizationPayload::Send {
+                copy: SynchronizationPayloadCopy::Reference,
+                ..
+            }))
+        ));
+        // An interface element boxes whatever the operand copies. A boxed
+        // slice header names no single transported object here, so its send
+        // endpoint stays unknown rather than claiming the reference rule.
+        for channel in ["structs", "interfaceSlices"] {
+            assert!(
+                matches!(
+                    payloads.get(channel),
+                    Some(Some(SynchronizationPayload::Send {
+                        copy: SynchronizationPayloadCopy::Unknown,
+                        ..
+                    }))
+                ),
+                "the send endpoint survives unknown copy semantics: {payloads:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_retains_each_communication_alternative_and_case_body() {
+        let procedures = lower_fixture(
+            r#"package main
+func observe() {}
+func choose(left chan<- int, right <-chan int) {
+    select {
+    case left <- 1:
+        observe()
+    case <-right:
+        observe()
+    default:
+        observe()
+    }
+    observe()
+}
+"#,
+        );
+        let procedure = named_procedure(&procedures, "choose");
+        let operations = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Synchronization { operation, .. } => Some(operation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            vec![
+                SynchronizationOperation::ChannelSend,
+                SynchronizationOperation::ChannelReceive,
+            ]
+        );
+        assert_eq!(
+            procedure.call_sites.len(),
+            4,
+            "all case bodies and continuation"
+        );
+        assert!(procedure.control_edges.iter().any(|edge| {
+            edge.kind == ControlEdgeKind::SwitchCase
+                && procedure
+                    .control_edges
+                    .iter()
+                    .filter(|candidate| candidate.source_point == edge.source_point)
+                    .filter(|candidate| candidate.kind == ControlEdgeKind::SwitchCase)
+                    .count()
+                    == 3
+        }));
+        assert!(procedure.gaps.iter().all(|gap| {
+            gap.detail.as_ref()
+                != "select readiness, pseudo-random case choice, blocking, and selected case body are not lowered"
+        }));
+    }
+
+    #[test]
+    fn range_forms_retain_all_source_local_normal_successors() {
+        const SOURCE: &str = r#"package main
+
+type sequence func(func(int) bool)
+type collection struct { values map[int]int }
+
+func observe() {}
+func arrayRange(values [2]int) { for range values { observe() } }
+func pointerArrayRange(values *[2]int) { for range values { observe() } }
+func sliceRange(values []int) { for range values { observe() } }
+func mapRange(values map[int]int) { for range values { observe() } }
+func stringRange(values string) { for range values { observe() } }
+func channelRange(values <-chan int) { for range values { observe() } }
+func integerRange(values int) { for range values { observe() } }
+func functionRange(values sequence) { for range values { observe() } }
+func (values *collection) fieldMapRange() { for range values.values { observe() } }
+
+func controls(values []int, skip bool) {
+Loop:
+    for range values {
+        if skip { continue Loop }
+        break Loop
+    }
+    observe()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let named = |name: &str| {
+            procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing procedure {name}"))
+        };
+
+        for name in [
+            "arrayRange",
+            "pointerArrayRange",
+            "sliceRange",
+            "stringRange",
+            "channelRange",
+            "integerRange",
+            "functionRange",
+        ] {
+            let procedure = named(name);
+            let gaps = procedure
+                .gaps
+                .iter()
+                .filter(|gap| gap.discharge == SemanticGapDischarge::RetainedControlTopology)
+                .collect::<Vec<_>>();
+            let [gap] = gaps.as_slice() else {
+                panic!("{name} must own exactly one retained range-topology gap: {gaps:#?}");
+            };
+            assert_eq!(gap.subject, SemanticGapSubject::Point);
+            assert_eq!(gap.capability, SemanticCapability::NormalControlFlow);
+            assert_eq!(gap.kind, SemanticGapKind::Unknown);
+            let outgoing = procedure
+                .control_edges
+                .iter()
+                .filter(|edge| edge.source_point == gap.point)
+                .map(|edge| edge.kind)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outgoing,
+                vec![
+                    ControlEdgeKind::ConditionalTrue,
+                    ControlEdgeKind::ConditionalFalse,
+                ],
+                "{name} range decision successors"
+            );
+            assert!(
+                procedure.control_edges.iter().any(|edge| {
+                    edge.target_point == gap.point && edge.kind == ControlEdgeKind::LoopBack
+                }),
+                "{name} normal body completion must return to the range decision"
+            );
+        }
+
+        let map_range = named("mapRange");
+        assert!(
+            map_range.gaps.iter().all(|gap| {
+                gap.detail.as_ref()
+                    != "range-over-function invocation and type-specific range mechanics require refinement"
+                    && gap.discharge != SemanticGapDischarge::RetainedControlTopology
+            }),
+            "exact map ranges do not need callback or retained-control gaps"
+        );
+        let map_backing_reads = map_range
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                let MemoryLocationKind::Index { identity, .. } =
+                    map_range.memory_locations[location.index()].kind
+                else {
+                    unreachable!("an index load has an index location")
+                };
+                (identity == IndexedLocationIdentity::Aggregate)
+                    .then(|| source_text(SOURCE, mapping_source_span(map_range, event.source)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            map_backing_reads,
+            ["range values"],
+            "iterating a map is an ordinary read of its aggregate backing store"
+        );
+        let function_range = named("functionRange");
+        assert!(function_range.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::Calls
+                && gap.detail.as_ref()
+                    == "range-over-function invocation and type-specific range mechanics require refinement"
+        }));
+        assert!(
+            function_range
+                .gaps
+                .iter()
+                .any(|gap| gap.discharge == SemanticGapDischarge::RetainedControlTopology)
+        );
+        let field_map_range = named("fieldMapRange");
+        assert!(
+            field_map_range.gaps.iter().all(|gap| {
+                gap.detail.as_ref()
+                    != "range-over-function invocation and type-specific range mechanics require refinement"
+                    && gap.discharge != SemanticGapDischarge::RetainedControlTopology
+            }),
+            "exact map fields do not need callback or retained-control gaps"
+        );
+        let field_map_backing_reads = field_map_range
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                matches!(
+                    field_map_range.memory_locations[location.index()].kind,
+                    MemoryLocationKind::Index {
+                        identity: IndexedLocationIdentity::Aggregate,
+                        ..
+                    }
+                )
+                .then(|| source_text(SOURCE, mapping_source_span(field_map_range, event.source)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            field_map_backing_reads,
+            ["range values.values"],
+            "same-file field types retain map backing semantics"
+        );
+        for name in [
+            "arrayRange",
+            "pointerArrayRange",
+            "sliceRange",
+            "stringRange",
+            "channelRange",
+            "integerRange",
+            "functionRange",
+        ] {
+            let procedure = named(name);
+            assert!(
+                procedure
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .all(|event| match event.effect {
+                        SemanticEffect::MemoryLoad {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            ..
+                        } => !matches!(
+                            procedure.memory_locations[location.index()].kind,
+                            MemoryLocationKind::Index {
+                                identity: IndexedLocationIdentity::Aggregate,
+                                ..
+                            }
+                        ),
+                        _ => true,
+                    }),
+                "{name} must not acquire map-backing access semantics"
+            );
+        }
+
+        let controls = named("controls");
+        let range_gap = controls
+            .gaps
+            .iter()
+            .find(|gap| gap.discharge == SemanticGapDischarge::RetainedControlTopology)
+            .expect("the labeled range owns its topology marker");
+        let exit = controls
+            .control_edges
+            .iter()
+            .find(|edge| {
+                edge.source_point == range_gap.point
+                    && edge.kind == ControlEdgeKind::ConditionalFalse
+            })
+            .expect("range exhaustion reaches the post-loop continuation")
+            .target_point;
+        assert!(
+            controls.control_edges.iter().any(|edge| {
+                edge.target_point == range_gap.point && edge.kind == ControlEdgeKind::LoopBack
+            }),
+            "labeled continue returns to the range decision"
+        );
+        assert!(
+            controls
+                .control_edges
+                .iter()
+                .any(|edge| { edge.target_point == exit && edge.kind == ControlEdgeKind::Normal }),
+            "labeled break reaches the same post-loop continuation as exhaustion"
+        );
+    }
+
+    #[test]
+    fn switch_retains_case_bodies_break_fallthrough_and_post_switch_successors() {
+        const SOURCE: &str = r#"package main
+func observe(string) {}
+func caseZero() int { return 0 }
+func caseOne() int { return 1 }
+func caseTwo() int { return 2 }
+func controls(mode int) {
+Switch:
+    switch mode {
+    case caseZero():
+        observe("labeled break")
+        break Switch
+    case caseOne():
+        observe("fallthrough source")
+        fallthrough
+    default:
+        observe("fallthrough target")
+        break
+    case caseTwo():
+        observe("normal completion")
+    }
+    observe("after switch")
+}
+func noDefault(mode int) {
+    switch mode {
+    case caseZero():
+        observe("only case")
+    }
+    observe("after no default")
+}
+func expressionless(first bool, second bool) {
+    switch {
+    case first:
+        observe("first condition")
+    case second:
+        observe("second condition")
+    default:
+        observe("condition default")
+    }
+    observe("after conditions")
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let controls = named_procedure(&procedures, "controls");
+        let no_default = named_procedure(&procedures, "noDefault");
+        let expressionless = named_procedure(&procedures, "expressionless");
+        let point_text = |procedure: &ProcedureSemanticsParts, point: ProgramPointId| {
+            source_text(
+                SOURCE,
+                mapping_source_span(procedure, procedure.points[point.index()].source),
+            )
+        };
+
+        assert!(
+            controls
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::NormalControlFlow),
+            "expression-switch selection and case bodies are fully connected: {:#?}",
+            controls.gaps
+        );
+        let [controls_switch] = controls.switch_facts.as_slice() else {
+            panic!("controls has one switch fact: {controls:#?}")
+        };
+        assert_eq!(controls_switch.kind, SwitchFactKind::Expression);
+        assert!(controls_switch.selector.is_some());
+        assert_eq!(controls_switch.selector_domain, SwitchSelectorDomain::Open);
+        assert_eq!(controls_switch.cases.len(), 3);
+        assert!(controls_switch.default_present);
+        assert!(controls_switch.default_edge.is_some());
+
+        let [no_default_switch] = no_default.switch_facts.as_slice() else {
+            panic!("noDefault has one switch fact: {no_default:#?}")
+        };
+        assert_eq!(no_default_switch.kind, SwitchFactKind::Expression);
+        assert_eq!(no_default_switch.cases.len(), 1);
+        assert!(!no_default_switch.default_present);
+        assert!(no_default_switch.default_edge.is_none());
+
+        let [expressionless_switch] = expressionless.switch_facts.as_slice() else {
+            panic!("expressionless has one switch fact: {expressionless:#?}")
+        };
+        assert_eq!(expressionless_switch.kind, SwitchFactKind::Expressionless);
+        assert!(expressionless_switch.selector.is_none());
+        assert!(expressionless_switch.default_present);
+
+        let comparisons = ["caseZero()", "caseOne()", "caseTwo()"].map(|text| {
+            controls
+                .points
+                .iter()
+                .find(|point| {
+                    point_text(controls, point.id) == text
+                        && controls.control_edges.iter().any(|edge| {
+                            edge.source_point == point.id
+                                && edge.kind == ControlEdgeKind::SwitchCase
+                        })
+                })
+                .map(|point| point.id)
+                .unwrap_or_else(|| panic!("missing tagged switch comparison for {text}"))
+        });
+        for (index, expected_false_target) in ["caseOne()", "caseTwo()", "default:"]
+            .into_iter()
+            .enumerate()
+        {
+            let outgoing = controls
+                .control_edges
+                .iter()
+                .filter(|edge| edge.source_point == comparisons[index])
+                .collect::<Vec<_>>();
+            assert_eq!(outgoing.len(), 2, "{outgoing:#?}");
+            assert!(
+                outgoing
+                    .iter()
+                    .any(|edge| edge.kind == ControlEdgeKind::SwitchCase)
+            );
+            assert!(
+                outgoing.iter().any(|edge| {
+                    edge.kind == ControlEdgeKind::ConditionalFalse
+                        && point_text(controls, edge.target_point)
+                            .starts_with(expected_false_target)
+                }),
+                "case tests remain in source order and default is only the terminal no-match target: {outgoing:#?}"
+            );
+        }
+
+        let call_point = |needle: &str| {
+            controls
+                .call_sites
+                .iter()
+                .find(|call| {
+                    source_text(SOURCE, mapping_source_span(controls, call.source)) == needle
+                })
+                .map(|call| call.point)
+                .unwrap_or_else(|| panic!("missing lowered case-body call {needle}: {controls:#?}"))
+        };
+        for call in [
+            "caseZero()",
+            "caseOne()",
+            "caseTwo()",
+            "observe(\"labeled break\")",
+            "observe(\"fallthrough source\")",
+            "observe(\"fallthrough target\")",
+            "observe(\"normal completion\")",
+            "observe(\"after switch\")",
+        ] {
+            call_point(call);
+        }
+
+        let fallthrough_point = controls
+            .points
+            .iter()
+            .find(|point| point_text(controls, point.id) == "fallthrough")
+            .map(|point| point.id)
+            .expect("terminal fallthrough has a source-backed transfer point");
+        let fallthrough_target = controls
+            .control_edges
+            .iter()
+            .find(|edge| edge.source_point == fallthrough_point)
+            .expect("terminal fallthrough reaches the following clause");
+        assert_eq!(fallthrough_target.kind, ControlEdgeKind::Normal);
+        assert!(
+            point_text(controls, fallthrough_target.target_point).starts_with("default:"),
+            "fallthrough reaches the next source clause: {fallthrough_target:#?}"
+        );
+
+        let after_switch = controls
+            .points
+            .iter()
+            .find(|point| point_text(controls, point.id) == "observe(\"after switch\")")
+            .map(|point| point.id)
+            .expect("post-switch continuation entry");
+        for break_text in ["break Switch", "break"] {
+            let break_point = controls
+                .points
+                .iter()
+                .find(|point| point_text(controls, point.id) == break_text)
+                .map(|point| point.id)
+                .unwrap_or_else(|| panic!("missing {break_text} point"));
+            assert!(
+                controls.control_edges.iter().any(|edge| {
+                    edge.source_point == break_point
+                        && edge.target_point == after_switch
+                        && edge.kind == ControlEdgeKind::Normal
+                }),
+                "{break_text} must resolve through the switch Breakable scope"
+            );
+        }
+
+        let no_default_comparison = no_default
+            .points
+            .iter()
+            .find(|point| {
+                point_text(no_default, point.id) == "caseZero()"
+                    && no_default.control_edges.iter().any(|edge| {
+                        edge.source_point == point.id && edge.kind == ControlEdgeKind::SwitchCase
+                    })
+            })
+            .map(|point| point.id)
+            .expect("no-default tagged comparison");
+        let no_default_successors = no_default
+            .control_edges
+            .iter()
+            .filter(|edge| edge.source_point == no_default_comparison)
+            .collect::<Vec<_>>();
+        assert_eq!(no_default_successors.len(), 2, "{no_default_successors:#?}");
+        assert!(
+            no_default_successors
+                .iter()
+                .any(|edge| edge.kind == ControlEdgeKind::SwitchCase)
+        );
+        assert!(no_default_successors.iter().any(|edge| {
+            edge.kind == ControlEdgeKind::ConditionalFalse
+                && point_text(no_default, edge.target_point) == "observe(\"after no default\")"
+        }));
+
+        let expressionless_guards = expressionless
+            .guard_facts
+            .iter()
+            .filter(|guard| {
+                point_text(expressionless, guard.point) == "first"
+                    || point_text(expressionless, guard.point) == "second"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expressionless_guards.len(), 2, "{expressionless:#?}");
+        let first_guard = expressionless_guards
+            .iter()
+            .find(|guard| point_text(expressionless, guard.point) == "first")
+            .expect("first condition guard");
+        assert_eq!(
+            first_guard.true_arm.map(|arm| arm.kind),
+            Some(ControlEdgeKind::SwitchCase)
+        );
+        assert!(first_guard.false_arm.is_some_and(|arm| {
+            arm.kind == ControlEdgeKind::ConditionalFalse
+                && point_text(expressionless, arm.target_point) == "second"
+        }));
+    }
+
+    #[test]
+    fn switch_case_statement_lists_own_sibling_local_scopes() {
+        const SOURCE: &str = r#"package main
+func acquire() int { return 0 }
+func consume(int) {}
+func scoped(mode int) {
+    value := acquire()
+    switch mode {
+    case 0:
+        value := acquire()
+        consume(value)
+    case 1:
+        value := acquire()
+        consume(value)
+    }
+    consume(value)
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "scoped");
+        let mut consumed = procedure
+            .call_sites
+            .iter()
+            .filter(|call| {
+                source_text(SOURCE, mapping_source_span(procedure, call.source)) == "consume(value)"
+            })
+            .map(|call| {
+                let span = mapping_source_span(procedure, call.source);
+                let argument = call
+                    .arguments
+                    .first()
+                    .map(|argument| argument.value)
+                    .expect("consume has one argument");
+                let binding = procedure
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .find_map(|event| match event.effect {
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target,
+                        } if target == argument => Some(source),
+                        _ => None,
+                    })
+                    .expect("identifier argument has one lexical input binding");
+                (span.start_byte(), binding)
+            })
+            .collect::<Vec<_>>();
+        consumed.sort_unstable_by_key(|(start, _)| *start);
+        assert_eq!(consumed.len(), 3, "{procedure:#?}");
+        assert_ne!(consumed[0].1, consumed[1].1);
+        assert_ne!(consumed[1].1, consumed[2].1);
+        assert_ne!(consumed[0].1, consumed[2].1);
+        assert_eq!(
+            source_text(SOURCE, value_source_span(procedure, consumed[2].1)),
+            "value",
+            "the post-switch read resolves to the outer binding after both implicit clause scopes end"
+        );
+    }
+
+    #[test]
+    fn range_assignment_converts_existing_targets_but_fresh_binders_preserve_identity() {
+        let procedures = lower_fixture(
+            r#"package main
+type record struct{}
+type holder struct { value any }
+func existing(values []*record) {
+    var target any
+    for target = range values { break }
+}
+func field(values []*record, target *holder) {
+    for target.value = range values { break }
+}
+func index(values []*record, target []any) {
+    for target[0] = range values { break }
+}
+func fresh(values []*record) {
+    for target := range values { _ = target; break }
+}
+"#,
+        );
+        let named = |name: &str| {
+            procedures
+                .iter()
+                .find(|procedure| {
+                    procedure.lexical_parent.is_none()
+                        && procedure
+                            .locator
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let conversion_values = |procedure: &ProcedureSemanticsParts| {
+            procedure
+                .values
+                .iter()
+                .filter_map(|value| match &value.kind {
+                    SemanticValueKind::LanguageDefined(kind)
+                        if kind.as_ref() == "go.assignment_conversion" =>
+                    {
+                        Some(value.id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let existing = named("existing");
+        let existing_conversions = conversion_values(existing);
+        let [converted] = existing_conversions.as_slice() else {
+            panic!("one existing-binding conversion: {existing:#?}");
+        };
+        assert!(existing.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::Assignment { value, .. } if value == *converted
+                )
+            })
+        }));
+        assert!(
+            existing
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Values),
+            "the opaque conversion flow preserves structured dependence: {existing:#?}"
+        );
+
+        for (name, expected_kind) in [
+            ("field", MemoryAccessKind::Field),
+            ("index", MemoryAccessKind::Index),
+        ] {
+            let procedure = named(name);
+            let conversions = conversion_values(procedure);
+            let [converted] = conversions.as_slice() else {
+                panic!("one {name} memory conversion: {procedure:#?}");
+            };
+            assert!(procedure.points.iter().any(|point| {
+                point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::MemoryStore { kind, value, .. }
+                            if kind == expected_kind && value == *converted
+                    )
+                })
+            }));
+            assert!(
+                procedure
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.capability != SemanticCapability::Values),
+                "the {name} conversion flow preserves structured dependence: {procedure:#?}"
+            );
+        }
+
+        let fresh = named("fresh");
+        assert!(
+            conversion_values(fresh).is_empty(),
+            "a fresh range binder infers the element identity: {fresh:#?}"
+        );
+        let assignment = fresh
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } => Some((target, value)),
+                _ => None,
+            })
+            .expect("fresh range binder has one assignment");
+        assert!(fresh.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target,
+                    } if source == assignment.1 && target == assignment.0
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn escaped_and_aggregate_mutated_go_cells_are_mutable_captures() {
+        const SOURCE: &str = r#"package main
+
+func mutate(pointer *int) { *pointer = 1 }
+
+func outer() {
+    addressed := 0
+    record := struct{ field int }{}
+    array := [1]int{}
+    stable := acquire()
+    closure := func() {
+        consume(addressed)
+        consume(record.field)
+        consume(array[0])
+        consume(stable)
+    }
+    mutate(&addressed)
+    record.field = 1
+    array[0] = 1
+    closure()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("outer")
+            })
+            .expect("outer procedure");
+
+        let mut captures = parent
+            .captures
+            .iter()
+            .map(|capture| {
+                (
+                    source_text(
+                        SOURCE,
+                        value_source_span(parent, capture_source_value(parent, capture)),
+                    ),
+                    capture.mode.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        captures.sort_unstable_by_key(|(name, _)| *name);
+        assert_eq!(
+            captures,
+            vec![
+                ("addressed", CaptureMode::MutableCell),
+                ("array", CaptureMode::MutableCell),
+                ("record", CaptureMode::MutableCell),
+                ("stable", CaptureMode::Value),
+            ]
+        );
+        assert!(parent.gaps.iter().all(|gap| {
+            gap.capability != SemanticCapability::Captures
+                || !matches!(gap.subject, SemanticGapSubject::Value(_))
+        }));
+    }
+
+    #[test]
+    fn integer_literal_indices_share_canonical_identity_and_keep_typed_gaps() {
+        const SOURCE: &str = r#"package main
+
+func indexes(values []int, dynamic int, iota int) int {
+    return values[0] +
+        values[0x0] +
+        values[0_0] +
+        values[0b0] +
+        values[10] +
+        values[0xa] +
+        values[0x_a] +
+        values[012] +
+        values[0o12] +
+        values[0b1010] +
+        values[1] +
+        values[dynamic] +
+        values[iota]
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("indexes")
+            })
+            .expect("indexes procedure");
+
+        let location_for = |expected: &str| {
+            procedure
+                .points
+                .iter()
+                .find_map(|point| {
+                    let span = procedure.source_mappings[point.source.index()]
+                        .locator
+                        .anchor()
+                        .span();
+                    if source_text(SOURCE, span) != expected {
+                        return None;
+                    }
+                    point.events.iter().find_map(|event| match &event.effect {
+                        SemanticEffect::MemoryLoad {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            ..
+                        } => Some(*location),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing index load for {expected}"))
+        };
+        let index_for =
+            |location: MemoryLocationId| match &procedure.memory_locations[location.index()].kind {
+                MemoryLocationKind::Index { index, .. } => *index,
+                kind => panic!("expected index location, got {kind:?}"),
+            };
+        let constant_for =
+            |location: MemoryLocationId| match &procedure.memory_locations[location.index()].kind {
+                MemoryLocationKind::Index { constant_index, .. } => *constant_index,
+                kind => panic!("expected index location, got {kind:?}"),
+            };
+
+        let zero_location = location_for("values[0]");
+        let zero = index_for(zero_location).expect("literal zero has exact identity");
+        assert_eq!(constant_for(zero_location), Some(0));
+        for spelling in ["values[0x0]", "values[0_0]", "values[0b0]"] {
+            assert_eq!(
+                index_for(location_for(spelling)),
+                Some(zero),
+                "{spelling} must share zero's canonical identity"
+            );
+        }
+
+        let ten = index_for(location_for("values[10]")).expect("literal ten has exact identity");
+        assert_eq!(constant_for(location_for("values[10]")), Some(10));
+        for spelling in [
+            "values[0xa]",
+            "values[0x_a]",
+            "values[012]",
+            "values[0o12]",
+            "values[0b1010]",
+        ] {
+            assert_eq!(
+                index_for(location_for(spelling)),
+                Some(ten),
+                "{spelling} must share ten's canonical identity"
+            );
+        }
+        let one = index_for(location_for("values[1]")).expect("literal one has exact identity");
+        assert_ne!(zero, one);
+        assert_ne!(ten, one);
+
+        let dynamic_location = location_for("values[dynamic]");
+        let rebound_location = location_for("values[iota]");
+        let dynamic = index_for(dynamic_location).expect("dynamic index retains its value");
+        let rebound = index_for(rebound_location).expect("rebound index retains its value");
+        assert_ne!(dynamic, rebound);
+        assert!(!procedure.values[dynamic.index()].kind.is_constant());
+        assert!(!procedure.values[rebound.index()].kind.is_constant());
+        assert_eq!(constant_for(dynamic_location), None);
+        assert_eq!(constant_for(rebound_location), None);
+
+        for (location, expected_discharge) in [
+            (zero_location, SemanticGapDischarge::CanonicalIndexIdentity),
+            (dynamic_location, SemanticGapDischarge::None),
+            (rebound_location, SemanticGapDischarge::None),
+        ] {
+            let gaps = procedure
+                .gaps
+                .iter()
+                .filter(|gap| {
+                    gap.subject == SemanticGapSubject::MemoryLocation(location)
+                        && gap.capability == SemanticCapability::IndexMemory
+                        && gap.kind == SemanticGapKind::Unsupported
+                })
+                .collect::<Vec<_>>();
+            let [gap] = gaps.as_slice() else {
+                panic!("index location {location:?} must retain one typed gap: {gaps:#?}");
+            };
+            assert_eq!(gap.discharge, expected_discharge);
+        }
+    }
+
+    #[test]
+    fn slices_publish_backing_store_relations_but_array_copies_do_not() {
+        const SOURCE: &str = r#"package main
+
+func backing() {
+    array := [2]int{}
+    arrayCopy := array
+    slice := []int{0, 0}
+    alias := slice
+    window := alias[1:]
+    consume(arrayCopy, alias, window)
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "backing");
+        let allocation_kinds = procedure
+            .allocations
+            .iter()
+            .map(|allocation| allocation.kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            allocation_kinds,
+            vec![AllocationKind::Array, AllocationKind::Slice]
+        );
+
+        let mut backing_offsets = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::BackingStore { offset },
+                    ..
+                } => Some(offset),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        backing_offsets.sort_unstable();
+        assert_eq!(
+            backing_offsets,
+            vec![
+                BackingStoreOffset::Zero,
+                BackingStoreOffset::Zero,
+                BackingStoreOffset::Zero,
+                BackingStoreOffset::Constant(1),
+            ]
+        );
+        let binding = |name: &str| {
+            procedure
+                .values
+                .iter()
+                .find(|value| {
+                    value.kind == SemanticValueKind::Local
+                        && source_text(SOURCE, value_source_span(procedure, value.id)) == name
+                })
+                .unwrap_or_else(|| panic!("missing {name} binding"))
+                .id
+        };
+        let flow_into = |target: ValueId| {
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .find_map(|event| match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        target: actual,
+                        ..
+                    } if actual == target => Some(kind),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("binding {target} has no value flow"))
+        };
+        assert_eq!(
+            flow_into(binding("arrayCopy")),
+            ValueFlowKind::Transfer(ValueTransfer {
+                kind: TransferKind::AggregateCopy,
+                operation: TransferOperation::None,
+            }),
+            "array assignment must publish a by-value aggregate-copy transfer"
+        );
+        assert_eq!(
+            flow_into(binding("alias")),
+            ValueFlowKind::BackingStore {
+                offset: BackingStoreOffset::Zero,
+            },
+            "slice assignment must retain exact backing-store identity"
+        );
+        assert_eq!(
+            flow_into(binding("window")),
+            ValueFlowKind::BackingStore {
+                offset: BackingStoreOffset::Zero,
+            },
+            "binding a subslice must preserve its already-shifted backing view"
+        );
+    }
+
+    #[test]
+    fn exact_builtin_copy_retains_bounded_element_effects() {
+        const SOURCE: &str = r#"package main
+
+func exact() int {
+    destination := make([]int, 3)
+    source := []int{1, 2}
+    return copy(destination, source)
+}
+
+type copyCell struct { n int }
+
+func pointers() {
+    destination := make([]*copyCell, 1)
+    source := make([]*copyCell, 1)
+    source[0] = &copyCell{}
+    copy(destination, source)
+}
+
+func unknown(destination, source []int) { copy(destination, source) }
+
+func shadowed(copy func([]int, []int) int) {
+    destination := make([]int, 1)
+    source := []int{1}
+    copy(destination, source)
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let exact = named_procedure(&procedures, "exact");
+        assert!(
+            exact.call_sites.is_empty(),
+            "the exact predeclared copy is a structured memory operation: {exact:#?}"
+        );
+        let effects = exact
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } => Some(("read", location)),
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } => Some(("write", location)),
+                _ => None,
+            })
+            .filter_map(|(mode, location)| {
+                let MemoryLocationKind::Index { constant_index, .. } =
+                    exact.memory_locations[location.index()].kind
+                else {
+                    return None;
+                };
+                Some((mode, constant_index))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effects,
+            [
+                ("read", Some(0)),
+                ("read", Some(1)),
+                ("write", Some(0)),
+                ("write", Some(1)),
+            ],
+            "copy reads all source elements before replacing destination elements"
+        );
+        assert!(
+            exact
+                .values
+                .iter()
+                .any(|value| value.kind == SemanticValueKind::UnsignedInteger(2)),
+            "copy retains its exact result count"
+        );
+        let exact_locations = exact
+            .memory_locations
+            .iter()
+            .filter(|location| matches!(location.kind, MemoryLocationKind::Index { .. }))
+            .collect::<Vec<_>>();
+        assert!(
+            !exact_locations.is_empty()
+                && exact_locations
+                    .iter()
+                    .all(|location| location.value_copy == MemoryValueCopy::Value),
+            "scalar elements carry an explicit value-copy contract"
+        );
+
+        let pointers = named_procedure(&procedures, "pointers");
+        let pointer_locations = pointers
+            .memory_locations
+            .iter()
+            .filter(|location| matches!(location.kind, MemoryLocationKind::Index { .. }))
+            .collect::<Vec<_>>();
+        assert!(
+            !pointer_locations.is_empty()
+                && pointer_locations
+                    .iter()
+                    .all(|location| location.value_copy == MemoryValueCopy::Reference),
+            "pointer elements carry an explicit reference-copy contract"
+        );
+        let stored_pointer = pointers
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value,
+                } if location == MemoryLocationId::new(0) => Some(value),
+                _ => None,
+            })
+            .expect("the explicit source element assignment is retained");
+        assert_eq!(
+            pointers.values[stored_pointer.index()].kind,
+            SemanticValueKind::Address,
+            "an exact pointer-element assignment must not hide identity behind an opaque conversion"
+        );
+
+        let unknown = named_procedure(&procedures, "unknown");
+        assert!(
+            unknown.call_sites.is_empty(),
+            "generic builtin copy keeps memory effects without an unresolved call: {unknown:#?}"
+        );
+        assert!(
+            unknown
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Index,
+                        ..
+                    }
+                ))
+                && unknown
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .any(|event| matches!(
+                        event.effect,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            ..
+                        }
+                    )),
+            "generic copy keeps wildcard source reads and destination writes: {unknown:#?}"
+        );
+        let shadowed = named_procedure(&procedures, "shadowed");
+        assert_eq!(
+            shadowed.call_sites.len(),
+            1,
+            "a function-valued parameter named copy remains an ordinary call: {shadowed:#?}"
+        );
+    }
+
+    #[test]
+    fn predeclared_builtins_keep_memory_effects_without_call_sites() {
+        const SOURCE: &str = r#"package main
+
+type Fields map[int]int
+type Values []int
+
+func namedMake() {
+    _ = make(Fields)
+    _ = make(Values, 2)
+}
+
+func modeled(input, destination, source []int, table map[int]int, key int, channel chan int) {
+    _ = len(input)
+    _ = cap(input)
+    _ = min(1, 2)
+    _ = max(1, 2)
+    _ = complex(1, 2)
+    _ = real(1)
+    _ = imag(1)
+    print(len(input))
+    println(cap(input))
+    copy(destination, source)
+    delete(table, key)
+    clear(table)
+    clear(input)
+    close(channel)
+    recover()
+}
+
+func shadowed(len func([]int) int, delete func(map[int]int, int), min func(int, int) int, T func(int) int, value int) {
+    _ = len(nil)
+    delete(nil, 0)
+    _ = min(1, 2)
+    _ = T(value)
+}
+
+func builtinsAfterLocalShadow(values []int, channel chan int) {
+    _ = make([]int, 1)
+    close(channel)
+}
+
+func shadowedMakeAndClose(make func([]int, int) []int, close func(chan int), values []int, channel chan int) {
+    _ = make(values, 1)
+    close(channel)
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+
+        let named_make = named_procedure(&procedures, "namedMake");
+        assert_eq!(
+            named_make
+                .allocations
+                .iter()
+                .map(|allocation| allocation.kind.clone())
+                .collect::<Vec<_>>(),
+            [AllocationKind::Array, AllocationKind::Slice],
+            "named map and slice types retain their builtin make allocations: {named_make:#?}"
+        );
+        assert!(
+            named_make.call_sites.is_empty(),
+            "builtin make must not publish a call site: {named_make:#?}"
+        );
+
+        let modeled = named_procedure(&procedures, "modeled");
+        assert!(
+            modeled.call_sites.is_empty(),
+            "predeclared builtins have no unresolved invocation: {modeled:#?}"
+        );
+        let index_stores = modeled
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            index_stores, 4,
+            "copy, delete, and clear retain wildcard/index writes: {modeled:#?}"
+        );
+        assert!(
+            modeled
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::Synchronization {
+                            operation: SynchronizationOperation::ChannelClose,
+                            ..
+                        }
+                    )
+                }),
+            "close remains a channel synchronization: {modeled:#?}"
+        );
+
+        let shadowed = named_procedure(&procedures, "shadowed");
+        assert_eq!(
+            shadowed.call_sites.len(),
+            4,
+            "function-valued parameters named after builtins remain calls: {shadowed:#?}"
+        );
+
+        let builtins_after_shadow = named_procedure(&procedures, "builtinsAfterLocalShadow");
+        assert!(
+            builtins_after_shadow.call_sites.is_empty(),
+            "a shadow in another procedure does not disable builtin lowering: {builtins_after_shadow:#?}"
+        );
+        assert_eq!(
+            builtins_after_shadow.allocations.len(),
+            1,
+            "make remains an allocation outside the procedure with a local make binding"
+        );
+        assert!(
+            builtins_after_shadow
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::Synchronization {
+                        operation: SynchronizationOperation::ChannelClose,
+                        ..
+                    }
+                )),
+            "close remains synchronization outside the procedure with a local close binding"
+        );
+
+        let shadowed_make_close = named_procedure(&procedures, "shadowedMakeAndClose");
+        assert_eq!(
+            shadowed_make_close.call_sites.len(),
+            2,
+            "local function values named make and close remain calls: {shadowed_make_close:#?}"
+        );
+    }
+
+    #[test]
+    fn indexed_addresses_retain_places_without_fabricating_memory_accesses() {
+        const SOURCE: &str = r#"package main
+
+func consume(values ...any) {}
+
+func addressAndRead(path, buf []byte, dynamic int) {
+    first := &path[0]
+    second := &buf[0]
+    third := &buf[dynamic]
+    value := path[0x0]
+    path[0b0] = value
+    consume(first, second, third, value)
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "addressAndRead");
+
+        let addressed_locations = procedure
+            .gaps
+            .iter()
+            .filter_map(|gap| {
+                if gap.capability != SemanticCapability::Assignments
+                    || gap.kind != SemanticGapKind::Unsupported
+                    || !gap.impacts.contains(SemanticGapImpact::Aliasing)
+                {
+                    return None;
+                }
+                let SemanticGapSubject::MemoryLocation(location) = gap.subject else {
+                    return None;
+                };
+                Some(location)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(addressed_locations.len(), 3, "{procedure:#?}");
+
+        let indexed_loads = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } => Some(location),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let indexed_stores = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } => Some(location),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [loaded_location] = indexed_loads.as_slice() else {
+            panic!("only path[0x0] performs an indexed load: {procedure:#?}");
+        };
+        let [stored_location] = indexed_stores.as_slice() else {
+            panic!("only path[0b0] performs an indexed store: {procedure:#?}");
+        };
+        assert!(
+            addressed_locations.iter().all(|location| {
+                !indexed_loads.contains(location) && !indexed_stores.contains(location)
+            }),
+            "taking an address must not fabricate a load or store: {procedure:#?}"
+        );
+
+        let index_for = |location: MemoryLocationId| {
+            let MemoryLocationKind::Index { index, .. } =
+                &procedure.memory_locations[location.index()].kind
+            else {
+                panic!("expected an indexed place: {procedure:#?}");
+            };
+            *index
+        };
+        let canonical_zero =
+            index_for(*loaded_location).expect("a literal indexed load retains exact identity");
+        assert_eq!(index_for(*stored_location), Some(canonical_zero));
+        assert_eq!(
+            addressed_locations
+                .iter()
+                .filter(|location| index_for(**location) == Some(canonical_zero))
+                .count(),
+            2,
+            "equivalent literal address spellings must share canonical index identity"
+        );
+        let dynamic_indices = addressed_locations
+            .iter()
+            .filter_map(|location| index_for(*location))
+            .filter(|index| !procedure.values[index.index()].kind.is_constant())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dynamic_indices.len(),
+            1,
+            "a dynamic indexed address retains its structured value without inventing a constant identity"
+        );
+
+        let index_gaps = procedure
+            .gaps
+            .iter()
+            .filter(|gap| gap.capability == SemanticCapability::IndexMemory)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            index_gaps.len(),
+            2,
+            "only the real load and store receive index-memory gaps: {procedure:#?}"
+        );
+        for location in [*loaded_location, *stored_location] {
+            let gaps = index_gaps
+                .iter()
+                .filter(|gap| gap.subject == SemanticGapSubject::MemoryLocation(location))
+                .collect::<Vec<_>>();
+            let [gap] = gaps.as_slice() else {
+                panic!("indexed access {location:?} must retain one typed gap: {gaps:#?}");
+            };
+            assert_eq!(gap.discharge, SemanticGapDischarge::CanonicalIndexIdentity);
+        }
+    }
+
+    #[test]
+    fn direct_concrete_method_calls_publish_the_selected_target() {
+        const SOURCE: &str = r#"package main
+
+type cell struct { value int }
+
+func (c *cell) pointerMethod() {}
+func (c cell) valueMethod() {}
+
+func invokeMethods(pointer *cell, value cell) {
+    pointer.pointerMethod()
+    value.valueMethod()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let caller = named_procedure(&procedures, "invokeMethods");
+        for (callee, target_name) in [
+            ("pointer.pointerMethod", "pointerMethod"),
+            ("value.valueMethod", "valueMethod"),
+        ] {
+            let call = caller
+                .call_sites
+                .iter()
+                .find(|call| source_text(SOURCE, value_source_span(caller, call.callee)) == callee)
+                .unwrap_or_else(|| panic!("missing direct method call {callee}: {caller:#?}"));
+            let target = named_procedure(&procedures, target_name).id;
+            assert_eq!(
+                call.declared_targets,
+                CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                "a uniquely selected concrete method names its declaration: {caller:#?}"
+            );
+            assert!(
+                !caller.gaps.iter().any(|gap| {
+                    gap.capability == SemanticCapability::DynamicDispatch
+                        && gap.subject == SemanticGapSubject::CallSite(call.id)
+                }),
+                "a unique concrete method call is complete: {caller:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_selector_types_keep_field_declaration_identity() {
+        const SOURCE: &str = r#"package main
+
+type leaf struct { count int }
+type middle struct { leaf *leaf }
+type outer struct { middle *middle }
+
+func bump(value *outer) { value.middle.leaf.count++ }
+"#;
+        let prepared = prepared_fixture(SOURCE);
+        let mut declaration_spans = HashSet::default();
+        let mut stack = vec![prepared.tree().root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "field_declaration" {
+                declaration_spans.extend(
+                    children_by_field_name(node, "name")
+                        .into_iter()
+                        .map(|name| (name.start_byte() as u32, name.end_byte() as u32)),
+                );
+            }
+            stack.extend(named_children(node));
+        }
+
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "bump");
+        let field_locations = procedure
+            .memory_locations
+            .iter()
+            .filter_map(|location| match &location.kind {
+                MemoryLocationKind::Field { member, .. } => Some((location, member)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut names = HashSet::default();
+        let mut ids = HashSet::default();
+        for (location, member) in &field_locations {
+            let span = member.anchor().span();
+            assert!(
+                declaration_spans.contains(&(span.start_byte(), span.end_byte())),
+                "nested selector field identity must point to its declaration: {member:?}"
+            );
+            names.insert(source_text(SOURCE, span));
+            ids.insert(location.id);
+        }
+        assert_eq!(names, ["middle", "leaf", "count"].into_iter().collect());
+        assert!(!procedure.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::FieldMemory
+                && matches!(gap.subject, SemanticGapSubject::MemoryLocation(id) if ids.contains(&id))
+        }), "known nested fields do not retain identity gaps: {procedure:#?}");
+    }
+
+    #[test]
+    fn deferred_unknown_selector_captures_receiver_without_losing_field_alternative() {
+        const SOURCE: &str = r#"package main
+import external "example.com/external"
+
+func closeLater(resource *external.Resource) {
+    defer resource.Close()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("closeLater")
+            })
+            .expect("closeLater procedure");
+        let call = procedure
+            .call_sites
+            .iter()
+            .find(|call| {
+                source_text(SOURCE, value_source_span(procedure, call.callee)) == "resource.Close"
+            })
+            .expect("deferred unknown selector call site");
+        assert_eq!(
+            procedure.values[call.callee.index()].kind,
+            SemanticValueKind::Callable,
+            "the registration-time selector value remains a valid deferred callee"
+        );
+        let receiver = call
+            .receiver
+            .expect("deferred unknown selector retains a captured candidate receiver");
+        assert_eq!(
+            procedure.values[receiver.index()].kind,
+            SemanticValueKind::LanguageDefined("go.defer_capture".into())
+        );
+        let callable_alternatives = procedure.points[call.point.index()]
+            .events
+            .iter()
+            .filter_map(|event| match &event.effect {
+                SemanticEffect::CallableReference { result, callable }
+                    if *result == call.callee =>
+                {
+                    Some((callable.kind, callable.bound_receiver))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            callable_alternatives.len(),
+            2,
+            "deferred unknown selector retains exactly two callable interpretations"
+        );
+        assert!(
+            callable_alternatives.contains(&(CallableReferenceKind::Function, None)),
+            "deferred selector retains its function-valued-field interpretation"
+        );
+        assert!(
+            callable_alternatives.contains(&(CallableReferenceKind::BoundMethod, Some(receiver))),
+            "deferred selector retains its bound-method interpretation with the captured receiver"
+        );
+        assert!(procedure.gaps.iter().all(|gap| {
+            !matches!(
+                gap.capability,
+                SemanticCapability::DeferredExecution | SemanticCapability::CleanupControlFlow
+            )
+        }));
+        assert!(procedure.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::DynamicDispatch
+                && gap.subject == SemanticGapSubject::CallSite(call.id)
+        }));
+    }
+
+    #[test]
+    fn deferred_close_of_local_make_channel_preserves_channel_value_flow() {
+        const SOURCE: &str = r#"package main
+
+func run() {
+    done := make(chan struct{})
+    defer close(done)
+    go func() { defer close(done) }()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        assert_eq!(procedures.len(), 2);
+        for procedure in &procedures {
+            let subject = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .find_map(|event| match event.effect {
+                    SemanticEffect::Synchronization {
+                        operation: SynchronizationOperation::ChannelClose,
+                        subject,
+                        ..
+                    } => Some(subject),
+                    _ => None,
+                })
+                .expect("deferred close has one channel subject");
+            let flow = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .find_map(|event| match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source,
+                        target,
+                    } if target == subject => Some((kind, source)),
+                    _ => None,
+                })
+                .expect("deferred close retains the local channel capture");
+            assert_eq!(flow.0, ValueFlowKind::Local);
+            assert_eq!(
+                source_text(SOURCE, value_source_span(procedure, flow.1)),
+                "done"
+            );
+        }
+    }
+
+    #[test]
+    fn parenthesized_method_receivers_keep_direct_and_deferred_source_identity() {
+        const SOURCE: &str = r#"package main
+import external "example.com/external"
+
+func closeBoth(resource *external.Resource) {
+    (resource).Close()
+    defer (resource).Close()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("closeBoth")
+            })
+            .expect("closeBoth procedure");
+        let receiver_calls = procedure
+            .call_sites
+            .iter()
+            .filter_map(|call| {
+                let receiver = call.receiver?;
+                source_text(SOURCE, value_source_span(procedure, call.callee))
+                    .ends_with(".Close")
+                    .then_some((call, receiver))
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = receiver_calls.as_slice() else {
+            panic!("one direct and one deferred receiver call: {procedure:#?}");
+        };
+        let (direct, deferred) = if procedure.values[first.1.index()].kind
+            == SemanticValueKind::LanguageDefined("go.defer_capture".into())
+        {
+            (*second, *first)
+        } else {
+            (*first, *second)
+        };
+        assert_eq!(
+            source_text(SOURCE, value_source_span(procedure, direct.1)),
+            "resource",
+            "transparent parentheses do not mint a direct receiver value"
+        );
+        let direct_read = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local
+                            | ValueFlowKind::Parameter
+                            | ValueFlowKind::Receiver,
+                        target,
+                        ..
+                    } if target == direct.1
+                )
+            })
+            .expect("direct receiver lexical read");
+        assert_eq!(
+            source_text(SOURCE, mapping_source_span(procedure, direct_read.source)),
+            "resource",
+            "the direct receiver read event retains the identifier mapping"
+        );
+        assert_eq!(
+            procedure.values[deferred.1.index()].kind,
+            SemanticValueKind::LanguageDefined("go.defer_capture".into())
+        );
+        assert_eq!(
+            source_text(SOURCE, value_source_span(procedure, deferred.1)),
+            "resource",
+            "the deferred capture retains the transparent receiver source"
+        );
+        let deferred_source = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if target == deferred.1
+                    && source_text(SOURCE, value_source_span(procedure, source)) == "resource" =>
+                {
+                    Some(source)
+                }
+                _ => None,
+            })
+            .expect("deferred receiver capture source");
+        let deferred_read = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local
+                            | ValueFlowKind::Parameter
+                            | ValueFlowKind::Receiver,
+                        target,
+                        ..
+                    } if target == deferred_source
+                )
+            })
+            .expect("deferred receiver lexical read");
+        assert_eq!(
+            source_text(SOURCE, mapping_source_span(procedure, deferred_read.source)),
+            "resource",
+            "the deferred receiver read event retains the identifier mapping"
+        );
+        assert!(
+            procedure.points.iter().all(|point| {
+                point.events.iter().all(|event| {
+                    !matches!(
+                        event.effect,
+                        SemanticEffect::Assignment { target, .. }
+                            if source_text(SOURCE, value_source_span(procedure, target))
+                                == "(resource)"
+                    )
+                })
+            }),
+            "a transparent call receiver must not publish a wrapper transfer"
+        );
+    }
+
+    #[test]
+    fn unresolved_qualified_keyed_literal_retains_possible_map_key_order() {
+        let procedures = lower_fixture(
+            r#"package main
+import external "example.com/external"
+
+var observed int
+func keyCall() int { return observed }
+
+func qualified() { _ = external.NamedMap{keyCall(): observed} }
+func localKey(key int) { _ = external.NamedMap{key: 1, key: 2} }
+func importedStruct() {
+    _ = external.Record{First: keyCall(), Second: keyCall()}
+}
+
+type Record struct { Key int }
+func knownStruct() { _ = Record{Key: observed} }
+"#,
+        );
+        let named = |name: &str| {
+            procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing procedure {name}"))
+        };
+        assert!(
+            named("qualified")
+                .gaps
+                .iter()
+                .any(|gap| { gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder })
+        );
+        assert!(
+            named("localKey")
+                .gaps
+                .iter()
+                .any(|gap| { gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder })
+        );
+        for near_miss in ["importedStruct", "knownStruct"] {
+            assert!(
+                named(near_miss)
+                    .gaps
+                    .iter()
+                    .all(|gap| { gap.discharge != SemanticGapDischarge::RetainedEvaluationOrder })
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_descendant_selector_exposes_the_original_parent_binding() {
+        let procedures = lower_fixture(
+            r#"package main
+type Holder struct { value int }
+func (holder *Holder) mutate() {}
+func consume(values ...any) {}
+
+func outer(holder Holder) {
+    child := func() int { method := holder.mutate; method(); return 0 }
+    consume(holder.value, child())
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("outer")
+            })
+            .expect("outer procedure");
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .any(|gap| { gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder })
+        );
+    }
+
+    #[test]
+    fn reference_before_child_shadow_retains_its_outer_capture_identity() {
+        const SOURCE: &str = r#"package main
+func outer() {
+    leading := acquire()
+    stable := acquire()
+    closure := func() {
+        consume(leading)
+        leading := acquire()
+        consume(leading)
+        consume(stable)
+    }
+    closure()
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("outer")
+            })
+            .expect("outer procedure");
+        let child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(parent.id))
+            .expect("function-literal procedure");
+
+        assert_eq!(
+            parent.captures.len(),
+            2,
+            "both the leading outer read and the unshadowed mixed capture need exact identity: {:#?}",
+            parent.captures
+        );
+        let capture_results = child
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Capture,
+                    result,
+                    ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                Some(result)
+            })
+            .collect::<HashSet<_>>();
+        let mut captured_references = capture_results
+            .iter()
+            .map(|value| {
+                let mapping = &child.source_mappings[child.values[value.index()].source.index()];
+                let span = mapping.locator.anchor().span();
+                (
+                    SOURCE
+                        .get(span.start_byte() as usize..span.end_byte() as usize)
+                        .expect("capture mapping belongs to the fixture"),
+                    span,
+                )
+            })
+            .collect::<Vec<_>>();
+        captured_references.sort_unstable_by_key(|(name, _)| *name);
+        assert_eq!(
+            captured_references
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["leading", "stable"]
+        );
+        let leading_capture = captured_references
+            .iter()
+            .find_map(|(name, span)| (*name == "leading").then_some(*span))
+            .expect("leading capture mapping");
+        let shadow_declaration = child
+            .values
+            .iter()
+            .filter(|value| {
+                value.kind == SemanticValueKind::Local && !capture_results.contains(&value.id)
+            })
+            .find_map(|value| {
+                let mapping = &child.source_mappings[value.source.index()];
+                let span = mapping.locator.anchor().span();
+                (SOURCE.get(span.start_byte() as usize..span.end_byte() as usize)
+                    == Some("leading"))
+                .then_some(span)
+            })
+            .expect("child-local leading declaration mapping");
+        assert!(
+            leading_capture.end_byte() <= shadow_declaration.start_byte(),
+            "the exact capture must come from the pre-shadow reference, not the post-shadow child local"
+        );
+        assert!(parent.gaps.iter().all(|gap| {
+            gap.capability != SemanticCapability::Captures
+                || !matches!(gap.subject, SemanticGapSubject::Value(_))
+        }));
+    }
+
+    #[test]
+    fn binding_assigned_by_nested_func_literal_relays_the_shared_cell() {
+        let procedures = lower_fixture(
+            r#"package main
+func outer() {
+    value := acquire()
+    closure := func() {
+        nested := func() { value = acquire() }
+        nested()
+        consume(value)
+    }
+    closure()
+}
+"#,
+        );
+        let parent = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("outer procedure");
+
+        let child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(parent.id))
+            .expect("intermediate child");
+        let grandchild = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(child.id))
+            .expect("nested child");
+        let [outer_capture] = parent.captures.as_slice() else {
+            panic!("outer-to-child relay: {parent:#?}");
+        };
+        let [nested_capture] = child.captures.as_slice() else {
+            panic!("child-to-grandchild relay: {child:#?}");
+        };
+        assert_eq!(outer_capture.mode, CaptureMode::MutableCell);
+        assert_eq!(nested_capture.mode, CaptureMode::MutableCell);
+        assert_eq!(nested_capture.target, grandchild.id);
+        assert_eq!(
+            nested_capture.captured,
+            CaptureSource::Location(outer_capture.destination)
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "4dfa18943618: nested closures relayed ancestor captures with the wrong storage kind"
+    )]
+    #[test]
+    fn nested_func_literal_relays_an_immutable_ancestor_value() {
+        let procedures = lower_fixture(
+            r#"package main
+func visit(callback func()) { callback() }
+func outer() <-chan int {
+    ch := make(chan int, 1)
+    go func() {
+        visit(func() { ch <- 1 })
+        close(ch)
+    }()
+    return ch
+}
+"#,
+        );
+        let outer = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("outer")
+            })
+            .expect("outer procedure");
+        let _ = assert_immutable_value_capture_relay(&procedures, outer);
+    }
+
+    #[test]
+    fn local_constant_capture_has_an_exact_owner_value() {
+        let procedures = lower_fixture(
+            r#"package main
+func outer() {
+    const label = "ready"
+    callback := func() { consume(label) }
+    callback()
+}
+"#,
+        );
+        let outer = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("outer procedure");
+        let child = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent == Some(outer.id))
+            .expect("function-literal procedure");
+        let [capture] = outer.captures.as_slice() else {
+            panic!("one local constant capture: {outer:#?}");
+        };
+        assert_eq!(capture.target, child.id);
+        assert_eq!(capture.mode, CaptureMode::Value);
+        assert!(matches!(capture.captured, CaptureSource::Value(_)));
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "4dfa18943618: a read-only grandchild capture was relayed as the wrong ancestor cell"
+    )]
+    #[test]
+    fn grandchild_only_read_relays_the_exact_ancestor_value() {
+        let procedures = lower_fixture(
+            r#"package main
+func outer() {
+    value := acquire()
+    child := func() {
+        grandchild := func() { consume(value) }
+        grandchild()
+    }
+    child()
+}
+"#,
+        );
+        let outer = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("outer procedure");
+        let (grandchild, child_capture_destination) =
+            assert_immutable_value_capture_relay(&procedures, outer);
+        assert!(grandchild.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Capture,
+                        location,
+                        ..
+                    } if location == child_capture_destination
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn explicitly_typed_reference_var_initialization_assigns_boxed_value() {
+        const SOURCE: &str = r#"package main
+type record struct{}
+func initialize(source *record) {
+    var target any = source
+    _ = target
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("initialize procedure");
+        let events = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .collect::<Vec<_>>();
+        let (initializer, boxed) = events
+            .iter()
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::ReferenceBoxing,
+                    source,
+                    target,
+                } if matches!(
+                    &procedure.values[target.index()].kind,
+                    SemanticValueKind::LanguageDefined(kind)
+                        if kind.as_ref() == "go.reference_boxing"
+                ) =>
+                {
+                    Some((source, target))
+                }
+                _ => None,
+            })
+            .expect("the initializer has an explicit reference boxing witness");
+
+        assert_eq!(
+            source_text(SOURCE, value_source_span(procedure, initializer)),
+            "source",
+            "boxing retains the exact pointer payload source"
+        );
+
+        let target = events
+            .iter()
+            .find_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } if value == boxed => Some(target),
+                _ => None,
+            })
+            .expect("the boxed value is assigned to the interface wrapper");
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::Assignment { target: assigned, value }
+                    if assigned == target && value == boxed
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source,
+                    target: assigned,
+                } if source == boxed && assigned == target
+            )
+        }));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.effect,
+                SemanticEffect::Assignment { target: assigned, value }
+                    if assigned == target && value == initializer
+            )
+        }));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.effect,
+                SemanticEffect::ValueFlow {
+                    source,
+                    target: assigned,
+                    ..
+                } if source == initializer && assigned == target
+            )
+        }));
+        assert!(procedure.gaps.iter().all(|gap| {
+            gap.subject != SemanticGapSubject::Value(target)
+                || gap.capability != SemanticCapability::Values
+        }));
+    }
+
+    #[test]
+    fn multi_result_assignment_gaps_preserve_call_result_identity() {
+        let procedures = lower_fixture(
+            r#"package main
+type holder struct { first int }
+func pair() (int, error) { return 0, nil }
+func consume(value int) {}
+func fieldAndDiscard(target *holder) {
+    target.first, _ = pair()
+    consume(target.first)
+}
+func outer() {
+    var second error
+    func() {
+        var first int
+        first, second = pair()
+        if second != nil { return }
+        consume(first)
+    }()
+}
+"#,
+        );
+        let field_assignment = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.points.iter().any(|point| {
+                    point
+                        .events
+                        .iter()
+                        .any(|event| matches!(event.effect, SemanticEffect::MemoryStore { .. }))
+                })
+            })
+            .expect("field-assignment procedure");
+        let child = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_some() && !procedure.call_sites.is_empty()
+            })
+            .expect("function-literal procedure");
+
+        let field_call = field_assignment
+            .call_sites
+            .iter()
+            .find(|call| call.normal_results.len() == 2)
+            .expect("one multi-result field-assignment call");
+        let [field_result, discarded_condition] = field_call.normal_results.as_ref() else {
+            panic!("two field-assignment results: {field_call:#?}");
+        };
+        let converted_field_result = field_assignment
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if source == *field_result => Some(target),
+                _ => None,
+            })
+            .expect("the field result has an explicit assignment conversion");
+        assert!(matches!(
+            &field_assignment.values[converted_field_result.index()].kind,
+            SemanticValueKind::LanguageDefined(kind)
+                if kind.as_ref() == "go.assignment_conversion"
+        ));
+        let field_assignment_point = field_assignment
+            .points
+            .iter()
+            .find(|point| {
+                point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::MemoryStore { value, .. }
+                            if value == converted_field_result
+                    )
+                })
+            })
+            .expect("the converted result is stored into the receiver field");
+        let field_store_location = field_assignment_point
+            .events
+            .iter()
+            .find_map(|event| match event.effect {
+                SemanticEffect::MemoryStore {
+                    location, value, ..
+                } if value == converted_field_result => Some(location),
+                _ => None,
+            })
+            .expect("the converted result has one field location");
+        assert!(field_assignment.points.iter().all(|point| {
+            point.events.iter().all(|event| {
+                !matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore { value, .. } if value == *field_result
+                )
+            })
+        }));
+        assert!(field_assignment.gaps.iter().any(|gap| {
+            gap.point == field_assignment_point.id
+                && gap.subject == SemanticGapSubject::Point
+                && gap.capability == SemanticCapability::Calls
+        }));
+        assert!(field_assignment.gaps.iter().all(|gap| {
+            gap.subject != SemanticGapSubject::MemoryLocation(field_store_location)
+                || gap.capability != SemanticCapability::Values
+        }));
+        assert!(!field_assignment.gaps.iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Value(*discarded_condition)
+                && gap.capability == SemanticCapability::Assignments
+        }));
+
+        let captured_call = child
+            .call_sites
+            .iter()
+            .find(|call| call.normal_results.len() == 2)
+            .expect("one multi-result captured-assignment call");
+        let [local_result, captured_condition] = captured_call.normal_results.as_ref() else {
+            panic!("two captured-assignment results: {captured_call:#?}");
+        };
+        let converted_result = child
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if source == *local_result => Some(target),
+                _ => None,
+            })
+            .expect("the reused local receives an explicit assignment conversion");
+        assert!(matches!(
+            &child.values[converted_result.index()].kind,
+            SemanticValueKind::LanguageDefined(kind)
+                if kind.as_ref() == "go.assignment_conversion"
+        ));
+        assert!(child.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::Assignment { value, .. } if value == converted_result
+                )
+            })
+        }));
+        assert!(child.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        ..
+                    } if source == converted_result
+                )
+            })
+        }));
+        assert!(child.points.iter().all(|point| {
+            point.events.iter().all(|event| {
+                !matches!(
+                    event.effect,
+                    SemanticEffect::Assignment { value, .. } if value == *local_result
+                )
+            })
+        }));
+        assert!(
+            child
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Values),
+            "the opaque result conversion preserves structured dependence: {child:#?}"
+        );
+        let captured_conversion = child
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if source == *captured_condition => Some(target),
+                _ => None,
+            })
+            .expect("the captured result receives an assignment conversion");
+        assert!(child.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Capture,
+                        value,
+                        ..
+                    } if value == captured_conversion
+                )
+            })
+        }));
+        assert!(
+            child
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Assignments),
+            "the exact captured cell no longer needs an assignment gap: {child:#?}"
+        );
+    }
+
+    #[test]
+    fn tuple_memory_assignments_store_after_rhs_reads_in_target_order() {
+        const SOURCE: &str = r#"package main
+type pair struct { first int; second int }
+func pairValues() (int, int) { return 1, 2 }
+func mapValue() (int, bool) { return 3, true }
+func assign(target, source *pair) {
+    target.first, target.second = source.second, source.first
+}
+func swap(target *pair) {
+    target.first, target.second = target.second, target.first
+}
+func dereference(target *int, value int) {
+    *target, value = 1, 2
+}
+func localPointerAlias() {
+    value := 0
+    pointer := &value
+    *pointer = 1
+}
+func fieldResults(target *pair) {
+    target.first, target.second = pairValues()
+}
+func mapResult(target map[int]int, ok bool) {
+    target[0], ok = mapValue()
+}
+"#;
+        fn reaches(
+            procedure: &ProcedureSemanticsParts,
+            start: ProgramPointId,
+            target: ProgramPointId,
+        ) -> bool {
+            let mut pending = vec![start];
+            let mut visited = std::collections::HashSet::new();
+            while let Some(point) = pending.pop() {
+                if point == target {
+                    return true;
+                }
+                if !visited.insert(point) {
+                    continue;
+                }
+                pending.extend(
+                    procedure
+                        .control_edges
+                        .iter()
+                        .filter(|edge| edge.source_point == point)
+                        .map(|edge| edge.target_point),
+                );
+            }
+            false
+        }
+
+        fn member_name(location: &MemoryLocation) -> Option<&str> {
+            match &location.kind {
+                MemoryLocationKind::Field { member, .. } => {
+                    Some(source_text(SOURCE, member.anchor().span()))
+                }
+                _ => None,
+            }
+        }
+
+        fn assert_tuple(
+            procedure: &ProcedureSemanticsParts,
+            statement: &str,
+            rhs_reads: &[&str],
+            expected_targets: &[&str],
+        ) {
+            let assignment_point = procedure
+                .points
+                .iter()
+                .find(|point| {
+                    source_text(SOURCE, mapping_source_span(procedure, point.source)) == statement
+                        && point
+                            .events
+                            .iter()
+                            .any(|event| matches!(event.effect, SemanticEffect::MemoryStore { .. }))
+                })
+                .expect("tuple stores share the whole-statement source span");
+            let stored_targets = assignment_point
+                .events
+                .iter()
+                .filter_map(|event| match event.effect {
+                    SemanticEffect::MemoryStore { location, .. } => {
+                        member_name(&procedure.memory_locations[location.index()])
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(stored_targets, expected_targets, "{procedure:#?}");
+
+            let read_points = procedure
+                .points
+                .iter()
+                .filter(|point| {
+                    point
+                        .events
+                        .iter()
+                        .any(|event| matches!(event.effect, SemanticEffect::MemoryLoad { .. }))
+                        && rhs_reads.contains(&source_text(
+                            SOURCE,
+                            mapping_source_span(procedure, point.source),
+                        ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(read_points.len(), rhs_reads.len(), "{procedure:#?}");
+            for read in read_points {
+                assert!(
+                    reaches(procedure, read.id, assignment_point.id),
+                    "every RHS memory read reaches the store point: {procedure:#?}"
+                );
+            }
+        }
+
+        let procedures = lower_fixture(SOURCE);
+        let assign = named_procedure(&procedures, "assign");
+        assert_tuple(
+            assign,
+            "target.first, target.second = source.second, source.first",
+            &["source.second", "source.first"],
+            &["first", "second"],
+        );
+        let swap = named_procedure(&procedures, "swap");
+        assert_tuple(
+            swap,
+            "target.first, target.second = target.second, target.first",
+            &["target.second", "target.first"],
+            &["first", "second"],
+        );
+
+        let dereference = named_procedure(&procedures, "dereference");
+        assert!(dereference.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Dereference,
+                        location,
+                        ..
+                    } if matches!(
+                        dereference.memory_locations[location.index()].kind,
+                        MemoryLocationKind::Dereference { .. }
+                    )
+                )
+            })
+        }));
+        assert!(
+            dereference
+                .pointer_accesses
+                .iter()
+                .any(|access| { access.kind == PointerAccessKind::Write })
+        );
+
+        let local_pointer_alias = named_procedure(&procedures, "localPointerAlias");
+        assert_eq!(local_pointer_alias.pointer_origins.len(), 1);
+        assert!(matches!(
+            &local_pointer_alias.pointer_origins[0].kind,
+            PointerOriginKind::StackPlace {
+                place: SemanticPlace::LocalBinding(_)
+            }
+        ));
+        assert!(local_pointer_alias.pointer_aliases.iter().any(|alias| {
+            alias.origin == local_pointer_alias.pointer_origins[0].id
+                && alias.byte_offset == PointerByteOffset::Exact(0)
+                && alias.strength == PointerRelationStrength::Must
+        }));
+        assert_eq!(local_pointer_alias.pointer_accesses.len(), 1);
+        assert_eq!(
+            local_pointer_alias.pointer_accesses[0].kind,
+            PointerAccessKind::Write
+        );
+
+        let field_results = named_procedure(&procedures, "fieldResults");
+        let result_stores = field_results
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryStore { location, .. } => {
+                    member_name(&field_results.memory_locations[location.index()])
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result_stores, ["first", "second"]);
+        assert!(
+            field_results
+                .gaps
+                .iter()
+                .all(|gap| { gap.capability != SemanticCapability::Assignments })
+        );
+
+        let map_result = named_procedure(&procedures, "mapResult");
+        assert!(map_result.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        ..
+                    }
+                )
+            })
+        }));
+        assert!(
+            map_result
+                .gaps
+                .iter()
+                .all(|gap| { gap.capability != SemanticCapability::Assignments })
+        );
+    }
+
+    #[test]
+    fn comma_ok_assertion_assignments_bind_both_results_without_a_gap() {
+        let procedures = lower_fixture(
+            r#"package main
+type cell struct{}
+func assertion(boxed any, pointer *cell) {
+    var ok bool
+    pointer, ok = boxed.(*cell)
+    _ = ok
+}
+func assertionWithShortDeclaration(boxed any, pointer *cell) {
+    pointer, ok := boxed.(*cell)
+    _ = ok
+}
+func initialized(boxed any) {
+    pointer := &cell{}
+    var ok bool
+    pointer, ok = boxed.(*cell)
+    _ = pointer
+    _ = ok
+}
+"#,
+        );
+        // A reused binding still crosses an assignment-conversion boundary,
+        // while a newly short-declared one keeps the assertion result's flow.
+        for (procedure_name, expected_conversions) in [
+            ("assertion", 2),
+            ("assertionWithShortDeclaration", 1),
+            ("initialized", 2),
+        ] {
+            let procedure = named_procedure(&procedures, procedure_name);
+            let conversions = procedure
+                .values
+                .iter()
+                .filter(|value| {
+                    matches!(&value.kind, SemanticValueKind::LanguageDefined(kind)
+                        if kind.as_ref() == "go.assignment_conversion")
+                })
+                .count();
+            assert_eq!(
+                conversions, expected_conversions,
+                "each reused binding receives one conversion: {procedure:#?}"
+            );
+            assert!(
+                !procedure
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.capability == SemanticCapability::Assignments),
+                "the comma-ok assertion is a lowered multi-target relation: {procedure:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_short_multi_result_converts_only_the_reused_binding() {
+        let procedures = lower_fixture(
+            r#"package main
+type record struct{}
+func pair() (*record, error) { return nil, nil }
+func mixed() {
+    var reused any
+    reused, fresh := pair()
+    _, _ = reused, fresh
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("mixed")
+            })
+            .expect("mixed procedure");
+        let call = procedure
+            .call_sites
+            .iter()
+            .find(|call| call.normal_results.len() == 2)
+            .expect("pair has two results");
+        let [reused_result, fresh_result] = call.normal_results.as_ref() else {
+            panic!("pair has two results: {call:#?}");
+        };
+        let events = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .collect::<Vec<_>>();
+        let converted = events
+            .iter()
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                } if source == *reused_result => Some(target),
+                _ => None,
+            })
+            .expect("the reused interface binding keeps conversion identity open");
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::Assignment { value, .. } if value == converted
+            )
+        }));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.effect,
+                SemanticEffect::Assignment { value, .. } if value == *reused_result
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::Assignment { value, .. } if value == *fresh_result
+            )
+        }));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    ..
+                } if source == *fresh_result
+            )
+        }));
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Values),
+            "the reused binding has an opaque conversion flow, not an uncertainty gap: {procedure:#?}"
+        );
+    }
+
+    #[test]
+    fn if_initializer_shadow_does_not_capture_later_multi_result_assignments() {
+        const SOURCE: &str = r#"package main
+type profiler struct { first, second, third int }
+func create(string) (int, error) { return 0, nil }
+func start(int) error { return nil }
+func profile(receiver *profiler) error {
+    var err error
+    receiver.first, err = create("first")
+    if err != nil { return err }
+    if err := start(receiver.first); err != nil { return err }
+    receiver.second, err = create("second")
+    if err != nil { return err }
+    receiver.third, err = create("third")
+    if err != nil { return err }
+    return nil
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("profile")
+            })
+            .expect("profile procedure");
+        let mut error_locals = procedure
+            .values
+            .iter()
+            .filter(|value| value.kind == SemanticValueKind::Local)
+            .filter_map(|value| {
+                let span = value_source_span(procedure, value.id);
+                (source_text(SOURCE, span) == "err").then_some((span.start_byte(), value.id))
+            })
+            .collect::<Vec<_>>();
+        error_locals.sort_unstable_by_key(|(start, _)| *start);
+        let [(_, outer_error), (_, inner_error)] = error_locals.as_slice() else {
+            panic!("one outer and one if-initializer error binding: {error_locals:#?}");
+        };
+        assert_ne!(outer_error, inner_error);
+
+        let assignment_target = |result: ValueId| {
+            let assigned_value = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .find_map(|event| match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source,
+                        target,
+                    } if source == result => Some(target),
+                    _ => None,
+                })
+                .unwrap_or(result);
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .find_map(|event| match event.effect {
+                    SemanticEffect::Assignment { target, value } if value == assigned_value => {
+                        Some(target)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("call result {result} has one binding assignment"))
+        };
+        let callee_text = |call: &SemanticCallSite| {
+            source_text(SOURCE, value_source_span(procedure, call.callee))
+        };
+        let create_calls = procedure
+            .call_sites
+            .iter()
+            .filter(|call| callee_text(call) == "create")
+            .collect::<Vec<_>>();
+        assert_eq!(create_calls.len(), 3, "{:#?}", procedure.call_sites);
+        for call in create_calls {
+            let [_, error_result] = call.normal_results.as_ref() else {
+                panic!("create has one value and one error result: {call:#?}");
+            };
+            assert_eq!(
+                assignment_target(*error_result),
+                *outer_error,
+                "the if-initializer shadow ends with its if statement: {call:#?}"
+            );
+        }
+
+        let start_call = procedure
+            .call_sites
+            .iter()
+            .find(|call| callee_text(call) == "start")
+            .expect("one scalar start call");
+        assert_eq!(
+            assignment_target(start_call.result.expect("start has one scalar result")),
+            *inner_error,
+            "the initializer and its guard bind the inner error"
+        );
+
+        let after_initializer = SOURCE
+            .find("receiver.second")
+            .expect("fixture contains a statement after the initializer shadow");
+        let later_error_reads = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow { source, target, .. }
+                    if procedure.values[source.index()].kind == SemanticValueKind::Local
+                        && value_source_span(procedure, target).start_byte() as usize
+                            > after_initializer
+                        && source_text(SOURCE, value_source_span(procedure, target)) == "err" =>
+                {
+                    Some(source)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            later_error_reads,
+            std::iter::once(*outer_error).collect::<HashSet<_>>(),
+            "later guards and failure returns read only the restored outer binding"
+        );
+    }
+
+    #[test]
+    fn inferred_multi_result_var_declarations_preserve_result_ordinals() {
+        let procedures = lower_fixture(
+            r#"package main
+func pair() (int, error) { return 0, nil }
+func ints() (int, int) { return 0, 0 }
+func inferred() {
+    var first, second = pair()
+}
+func discarded() {
+    var first, _ = pair()
+}
+func explicitlyTyped() {
+    var first, second int = ints()
+}
+"#,
+        );
+        let inferred = procedures
+            .iter()
+            .filter_map(|procedure| {
+                let call = procedure
+                    .call_sites
+                    .iter()
+                    .find(|call| call.normal_results.len() == 2)?;
+                Some((procedure, call))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inferred.len(), 2, "{inferred:#?}");
+
+        let mut assignment_counts = Vec::new();
+        for (procedure, call) in inferred {
+            let assignment_sources = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter_map(|event| match event.effect {
+                    SemanticEffect::Assignment { value, .. } => Some(value),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let flow_sources = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter_map(|event| match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        ..
+                    } => Some(source),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            assert!(
+                procedure
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.capability != SemanticCapability::Assignments),
+                "{procedure:#?}"
+            );
+            assert!(
+                assignment_sources.contains(&call.normal_results[0])
+                    && flow_sources.contains(&call.normal_results[0]),
+                "{procedure:#?}"
+            );
+            assert_eq!(
+                assignment_sources.contains(&call.normal_results[1]),
+                flow_sources.contains(&call.normal_results[1]),
+                "{procedure:#?}"
+            );
+            assignment_counts.push(assignment_sources.len());
+        }
+        assignment_counts.sort_unstable();
+        assert_eq!(assignment_counts, vec![1, 2]);
+
+        let explicitly_typed = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.gaps.iter().any(|gap| {
+                    gap.subject == SemanticGapSubject::Point
+                        && gap.capability == SemanticCapability::Assignments
+                        && gap.detail.as_ref()
+                            == "Go multi-name, tuple, and multi-result var initialization flow is not yet lowered"
+                })
+            })
+            .expect("explicitly typed multi-result var stays conservative");
+        assert!(
+            explicitly_typed
+                .call_sites
+                .iter()
+                .all(|call| call.normal_results.is_empty()),
+            "{explicitly_typed:#?}"
+        );
+    }
+    #[test]
+    fn full_slice_capacity_controls_exact_append_replacement() {
+        const SOURCE: &str = r#"package main
+
+func fullSlice() {
+    source := make([]int, 4, 8)
+    window := source[1:3:3]
+    result := append(window, 7)
+    _ = result
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "fullSlice");
+        assert_eq!(
+            procedure
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.kind == AllocationKind::Slice)
+                .count(),
+            2,
+            "the full slice has capacity max-low=2, so append must replace its backing store: {procedure:#?}"
+        );
+        assert!(
+            procedure.call_sites.is_empty(),
+            "builtin append is lowered as storage semantics: {procedure:#?}"
+        );
+    }
+
+    #[test]
+    fn unknown_builtin_append_publishes_finite_backing_alternatives() {
+        const SOURCE: &str = r#"package main
+
+func unknownAppend(source []int, extra []int) []int {
+    result := append(source, extra...)
+    return result
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "unknownAppend");
+        let alternatives = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::BackingStoreAlternative { offset, allocation },
+                    source,
+                    target,
+                } => Some((offset, allocation, source, target)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(offset, allocation, source, target)] = alternatives.as_slice() else {
+            panic!("unknown append must publish one finite alternative: {procedure:#?}");
+        };
+        assert_eq!(*offset, BackingStoreOffset::Zero);
+        assert_ne!(*source, *target);
+        let fresh = &procedure.allocations[allocation.index()];
+        assert_eq!(fresh.kind, AllocationKind::Slice);
+        assert_eq!(
+            procedure.values[fresh.result.index()].kind,
+            SemanticValueKind::LanguageDefined("go.append.fresh_backing".into())
+        );
+        assert!(
+            procedure.call_sites.is_empty(),
+            "unknown builtin append must not become an ordinary call: {procedure:#?}"
+        );
+        assert!(
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| {
+                    let SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        ..
+                    } = event.effect
+                    else {
+                        return false;
+                    };
+                    matches!(
+                        procedure.memory_locations[location.index()].kind,
+                        MemoryLocationKind::Index {
+                            base,
+                            index: None,
+                            constant_index: None,
+                            identity: IndexedLocationIdentity::Element,
+                        } if base == *target
+                    )
+                }),
+            "appended values retain a structured wildcard index at the result backing: {procedure:#?}"
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "b43635d62ae5: captured Go formal entry stores were mistaken for later writes"
+    )]
+    #[test]
+    fn captured_formal_cells_initialize_on_entry_and_later_stores_remain_accesses() {
+        const SOURCE: &str = r#"package main
+
+type cell struct { value int }
+
+func (receiver *cell) factory(seed int) func() int {
+    closure := func() int {
+        seed = seed + 1
+        receiver.value = seed
+        return receiver.value
+    }
+    seed = seed + 2
+    receiver.value = seed
+    return closure
+}
+"#;
+
+        let lowered = lower_fixture(SOURCE);
+        let factory = named_procedure(&lowered, "factory");
+        let factory_id = factory.id;
+        let identity = GoSemanticLowerer.identity();
+        let key = SemanticArtifactKey::new(
+            factory.locator.mount(),
+            factory.locator.path().clone(),
+            factory.locator.language(),
+            SourceRevision::Disk {
+                content: ContentIdentity::hash_bytes(SOURCE.as_bytes()),
+            },
+            identity.adapter,
+            SemanticIrVersion::current(),
+            identity.configuration,
+            identity.dependencies,
+        );
+        let artifact = SemanticArtifact::try_new(key, GoSemanticLowerer.capabilities(), lowered)
+            .expect("lowered Go fixture is a valid semantic artifact");
+        let procedure = artifact.procedure(factory_id).expect("factory procedure");
+
+        let formals = procedure
+            .values()
+            .iter()
+            .filter_map(|value| match &value.kind {
+                SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. } => {
+                    Some(value.id)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(formals.len(), 2, "factory has seed and receiver formals");
+
+        let entry = procedure.entry_point();
+        let entry_stores = procedure.points()[entry.index()]
+            .events
+            .iter()
+            .filter_map(|event| match &event.effect {
+                SemanticEffect::MemoryStore { location, value, .. }
+                    if procedure.memory_location(*location).is_some_and(|location| {
+                        matches!(&location.kind, MemoryLocationKind::LexicalCell { binding } if formals.contains(binding))
+                    }) =>
+                {
+                    Some((*location, *value))
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            entry_stores.len(),
+            formals.len(),
+            "captured parameter and receiver cells are initialized at entry"
+        );
+        assert_eq!(
+            entry_stores
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<HashSet<_>>(),
+            formals,
+            "each formal initializes its own lexical cell"
+        );
+        for event in &procedure.points()[entry.index()].events {
+            assert!(
+                !matches!(&event.effect, SemanticEffect::MemoryStore { .. })
+                    || procedure.is_formal_cell_initialization(entry, &event.effect),
+                "entry formal stores are the only initialization stores: {event:?}"
+            );
+        }
+
+        let seed = procedure
+            .values()
+            .iter()
+            .find(|value| {
+                matches!(
+                    &value.kind,
+                    SemanticValueKind::Parameter { name: Some(name), .. }
+                        if name.as_ref() == "seed"
+                )
+            })
+            .map(|value| value.id)
+            .expect("seed parameter");
+        let later_seed_store = procedure
+            .points()
+            .iter()
+            .flat_map(|point| {
+                point.events.iter().filter_map(move |event| match &event.effect {
+                SemanticEffect::MemoryStore { location, .. }
+                    if point.id != entry
+                            && procedure.memory_location(*location).is_some_and(|location| {
+                                matches!(&location.kind, MemoryLocationKind::LexicalCell { binding } if *binding == seed)
+                            }) =>
+                    {
+                        Some((point.id, event))
+                    }
+                    _ => None,
+                })
+            })
+            .next()
+            .expect("later seed overwrite reaches its lexical cell");
+        assert!(
+            !procedure
+                .is_formal_cell_initialization(later_seed_store.0, &later_seed_store.1.effect)
+        );
+
+        let selected_store = procedure
+            .points()
+            .iter()
+            .flat_map(|point| {
+                point
+                    .events
+                    .iter()
+                    .filter_map(move |event| match &event.effect {
+                        SemanticEffect::MemoryStore { location, .. }
+                            if point.id != entry
+                                && procedure.memory_location(*location).is_some_and(
+                                    |location| {
+                                        matches!(&location.kind, MemoryLocationKind::Field { .. })
+                                    },
+                                ) =>
+                        {
+                            Some((point.id, event))
+                        }
+                        _ => None,
+                    })
+            })
+            .next()
+            .expect("receiver selected field store");
+        assert!(
+            !procedure.is_formal_cell_initialization(selected_store.0, &selected_store.1.effect)
+        );
+    }
+}

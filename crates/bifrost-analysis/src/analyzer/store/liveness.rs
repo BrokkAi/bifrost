@@ -20,7 +20,7 @@ pub struct Liveness {
     repo: Mutex<Repository>,
     workdir: PathBuf,
     startup_identity: Mutex<Option<Arc<gitblob::WorkingTreeIdentity>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     startup_oid_batches: Arc<AtomicUsize>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
@@ -28,7 +28,8 @@ pub struct Liveness {
     /// A workspace has one root, so this is one entry and one `canonicalize`.
     canonical_roots: Mutex<HashMap<PathBuf, Arc<Path>>>,
     /// Canonicalizations performed after construction, for the regression pin.
-    canonicalizations: AtomicUsize,
+    #[doc(hidden)]
+    pub canonicalizations: AtomicUsize,
 }
 
 impl Liveness {
@@ -42,7 +43,7 @@ impl Liveness {
             repo: Mutex::new(repo),
             workdir,
             startup_identity: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             startup_oid_batches: Arc::new(AtomicUsize::new(0)),
             snapshot: Mutex::new(None),
             overlay: Mutex::new(OverlayState::default()),
@@ -88,7 +89,7 @@ impl Liveness {
         &self,
         files: &[ProjectFile],
     ) -> Result<HashMap<ProjectFile, (Oid, FileStatStamp)>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.startup_oid_batches
             .fetch_add(1, AtomicOrdering::Relaxed);
         let identity = {
@@ -186,8 +187,9 @@ impl Liveness {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn startup_oid_batch_counter(&self) -> Arc<AtomicUsize> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn startup_oid_batch_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.startup_oid_batches)
     }
 
@@ -338,8 +340,9 @@ impl Liveness {
     /// Canonicalizations performed since construction. The pin: this is one per
     /// workspace root plus the rare below-root symlink fallback, not one per
     /// workspace file.
-    #[cfg(test)]
-    pub(crate) fn canonicalizations(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn canonicalizations(&self) -> usize {
         self.canonicalizations.load(AtomicOrdering::Relaxed)
     }
 }
@@ -800,7 +803,7 @@ impl LiveSnapshot {
     ) -> StableDigest {
         let Some(overlaid) = overlaid.filter(|overlaid| !overlaid.entries().is_empty()) else {
             return *self.content_digest.get_or_init(|| {
-                crate::analyzer::content_identity::analyzed_file_set_digest(
+                crate::analyzer::store::file_set_identity::analyzed_file_set_digest(
                     self.path_to_state
                         .iter()
                         .map(|(file, state)| (rel_path_string(file), state.oid)),
@@ -816,11 +819,12 @@ impl LiveSnapshot {
         {
             return *digest;
         }
-        let digest = crate::analyzer::content_identity::analyzed_file_set_digest_with_overlays(
-            self.path_to_state
-                .iter()
-                .map(|(file, state)| (rel_path_string(file), state.oid, overlaid.contains(file))),
-        );
+        let digest =
+            crate::analyzer::store::file_set_identity::analyzed_file_set_digest_with_overlays(
+                self.path_to_state.iter().map(|(file, state)| {
+                    (rel_path_string(file), state.oid, overlaid.contains(file))
+                }),
+            );
         *memo = Some((overlaid.digest(), digest));
         digest
     }
@@ -1074,18 +1078,20 @@ fn current_index_fingerprint(repo: &Repository) -> Result<IndexFingerprint> {
 // see the `fs::metadata` calls its own synchronous call chain made, not ones
 // from unrelated tests' threads (or from the production watcher's background
 // thread, which never touches the counting thread).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static STAT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn stat_call_count_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn stat_call_count_for_test() -> usize {
     STAT_CALLS.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
-pub(crate) fn reset_stat_call_count_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_stat_call_count_for_test() {
     STAT_CALLS.with(|calls| calls.set(0));
 }
 
@@ -1104,7 +1110,7 @@ pub(crate) struct FileStatStamp(FileStat);
 
 impl FileStat {
     fn from_path(path: &Path) -> Option<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STAT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let metadata = std::fs::metadata(path).ok()?;
         if !metadata.is_file() {

@@ -59,6 +59,71 @@ pub(crate) fn publish_jvm_declared_type_transfer(
     ));
 }
 
+/// Project a written nominal type into one expression occurrence's runtime
+/// value using the shared declared-value and contextual transfer families.
+pub(crate) fn publish_jvm_expression_type(
+    facts: &mut FileResolutionFacts,
+    identity: ResolutionTypeSlotId,
+    output: ResolutionTypeSlotId,
+) {
+    assert_eq!(
+        facts.type_slots[output.index()].role,
+        ResolutionTypeSlotRole::ExpressionValue
+    );
+    let site = facts.type_slots[output.index()].site;
+    let declared = facts.allocate_type_slot(site, ResolutionTypeSlotRole::DeclaredValue);
+    publish_jvm_declared_type_transfer(
+        facts,
+        identity,
+        declared,
+        ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+    );
+    facts.type_transfers.push(ResolutionTypeTransferFact::new(
+        declared,
+        output,
+        ResolutionTypeTransferKind::Contextual,
+        0,
+        0,
+        ResolutionTypeTransferValueTransform::Preserve,
+    ));
+}
+
+/// Refine an occurrence with an additional declared bound, preserving its
+/// original binding projection as an independent static-type input.
+pub(crate) fn publish_jvm_expression_refinement(
+    facts: &mut FileResolutionFacts,
+    bound: ResolutionTypeSlotId,
+    output: ResolutionTypeSlotId,
+) {
+    let site = facts.type_slots[output.index()].site;
+    let original = facts.allocate_type_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+    let mut projected = false;
+    for projection in &mut facts.binding_projections {
+        if projection.output == output {
+            projection.output = original;
+            projected = true;
+        }
+    }
+    assert!(
+        projected,
+        "refined reads must retain their binding projection"
+    );
+    let identity = facts.allocate_type_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+    facts.type_transfers.push(ResolutionTypeTransferFact::new(
+        original,
+        identity,
+        ResolutionTypeTransferKind::TypeIdentity,
+        0,
+        0,
+        ResolutionTypeTransferValueTransform::StaticTypeObject,
+    ));
+    let union = facts.allocate_type_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+    for input in [identity, bound] {
+        publish_jvm_type_union_transfer(facts, input, union);
+    }
+    publish_jvm_expression_type(facts, union, output);
+}
+
 /// Accumulate a JVM bound identity into the common multi-input producer family.
 pub(crate) fn publish_jvm_type_union_transfer(
     facts: &mut FileResolutionFacts,

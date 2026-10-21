@@ -236,3 +236,9 @@ Migration `0188-declaration-access-boundaries.sql` stores explicit package and
 lexical-template access regions as normalized source declaration rows. The native
 bridge view exposes the canonical template owner, while publication manifests
 and validation retain the boundary family alongside coarse visibility.
+
+Migration `0193-class-set-owner-storage-identity.sql` separates the semantic
+language of class-set rows from the physical dialect of their owner blob. It
+preserves parent IDs, children, generation constraints and cascades while
+binding the owner through `blobs.id`. Root-result attachment accounting retains
+the exact storage key once, without changing semantic output digests.

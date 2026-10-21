@@ -27,7 +27,12 @@ pub(super) fn attach_local_writes<'facts>(
     lexical: &LoweredResolutionFragment,
     identities: &mut ResolutionIdentityCatalogBuilder<'_>,
 ) -> Cow<'facts, FileResolutionFacts> {
-    if facts.local_writes.is_empty() {
+    if facts.local_writes.is_empty()
+        && !facts
+            .binding_events
+            .iter()
+            .any(|event| event.value.is_some())
+    {
         return Cow::Borrowed(facts);
     }
 
@@ -109,7 +114,18 @@ pub(super) fn attach_local_writes<'facts>(
     // A one-file preload cannot prove an outward route empty. Open the shared
     // root for this attachment query only; the native precedence machinery can
     // still prove a nearer lexical binder beats every outward alternative.
-    let first = facts.local_writes[0].target;
+    let first = facts
+        .local_writes
+        .first()
+        .map(|write| write.target)
+        .or_else(|| {
+            facts
+                .binding_events
+                .iter()
+                .find(|event| event.value.is_some())
+                .map(|event| event.target)
+        })
+        .expect("write attachment has an input");
     let origin = LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedPlacementBoundary);
     let reason = identities.semantic(gap_reason_semantic_identity(first, origin));
     let mut gaps = lexical.gaps().to_vec();
@@ -136,6 +152,17 @@ pub(super) fn attach_local_writes<'facts>(
     let cancellation = crate::CancellationToken::new();
     let mut inputs = HashMap::<ResolutionSiteId, Vec<ResolutionTypeSlotId>>::default();
     let mut failed_sites = HashSet::default();
+    // Binding events carry exact, source-proven identity even when the ordered
+    // scope timeline cannot yet prove the runtime availability of that slot.
+    for event in &facts.binding_events {
+        if let Some(value) = event.value {
+            assert!(matches!(
+                slots[&value].role,
+                ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+            ));
+            inputs.entry(event.slot).or_default().push(value);
+        }
+    }
     for write in &facts.local_writes {
         let reference = references[&write.target].semantic();
         let answer = engine
@@ -182,15 +209,12 @@ pub(super) fn attach_local_writes<'facts>(
 
     let mut normalized = facts.clone();
     normalized.local_writes.clear();
-    let mut seen_gaps = normalized.gaps.iter().copied().collect::<HashSet<_>>();
+    let mut seen_gaps = normalized.gaps.iter().cloned().collect::<HashSet<_>>();
     let mut failed_sites = failed_sites.into_iter().collect::<Vec<_>>();
     failed_sites.sort_unstable();
     for site in failed_sites {
-        let gap = ResolutionGapFact {
-            site,
-            kind: ResolutionGapKind::UnsupportedExpressionType,
-        };
-        if seen_gaps.insert(gap) {
+        let gap = ResolutionGapFact::new(site, ResolutionGapKind::UnsupportedExpressionType);
+        if seen_gaps.insert(gap.clone()) {
             normalized.gaps.push(gap);
         }
     }
@@ -368,12 +392,16 @@ fn append_slot(
 
 #[cfg(test)]
 mod tests {
+    use crate::analyzer::resolution::local_writes::go_extraction_support_0::*;
+
     use brokk_bifrost_core::analyzer::Language;
     use brokk_bifrost_core::analyzer::resolution_facts::{
         DeclarationTypeSlotFact, IntrinsicTypeKind, IntrinsicTypeSeedFact, ResolutionBinderFact,
-        ResolutionLocalWriteFact, ResolutionNameId, ResolutionScopeKind, ResolutionSiteKind,
+        ResolutionLocalWriteFact, ResolutionNameId, ResolutionScopeId, ResolutionScopeKind,
+        ResolutionSiteKind,
     };
     use brokk_bifrost_core::analyzer::structural::resolution::HoistingClass;
+    #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
@@ -382,7 +410,118 @@ mod tests {
         fragment, identifier, name, scope, site, transfer,
     };
 
-    fn fixture() -> FileResolutionFacts {
+    #[test]
+    #[hardwon("#5015: a parameter write lacks evidence for its incoming observed value")]
+    fn parameter_write_marks_the_gap_without_replacing_static_type_facts() {
+        let mut facts = fixture();
+        facts
+            .binders
+            .iter_mut()
+            .find(|binder| binder.declaration == ResolutionSiteId::new(0))
+            .expect("fixture parameter binder")
+            .kind = ResolutionBinderKind::Parameter;
+        facts
+            .declaration_type_slots
+            .iter_mut()
+            .find(|property| property.declaration == ResolutionSiteId::new(0))
+            .expect("fixture parameter property")
+            .role = DeclarationTypeRole::Parameter;
+        facts.local_writes = vec![ResolutionLocalWriteFact {
+            target: ResolutionSiteId::new(2),
+            value: ResolutionTypeSlotId::new(6),
+        }];
+
+        let static_type = facts.allocate_type_slot(
+            ResolutionSiteId::new(6),
+            ResolutionTypeSlotRole::TargetTypeIdentity,
+        );
+        facts
+            .intrinsic_type_seeds
+            .push(IntrinsicTypeSeedFact::direct(
+                static_type,
+                ResolutionNameId::new(2),
+                IntrinsicTypeKind::Primitive,
+            ));
+        let static_producer = ResolutionTypeTransferFact::new(
+            static_type,
+            ResolutionTypeSlotId::new(0),
+            ResolutionTypeTransferKind::DeclaredType,
+            0,
+            0,
+            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+        );
+        facts.type_transfers[0] = static_producer;
+        let parameter_assignment = facts
+            .type_slots
+            .iter()
+            .find(|slot| {
+                slot.site == ResolutionSiteId::new(0)
+                    && slot.role == ResolutionTypeSlotRole::AssignmentValue
+            })
+            .expect("fixture parameter assignment slot")
+            .id;
+        facts
+            .type_transfers
+            .retain(|transfer| transfer.output != parameter_assignment);
+        facts
+            .type_slots
+            .retain(|slot| slot.id != parameter_assignment);
+
+        let normalized = normalize(&facts);
+        assert!(normalized.gaps.contains(&ResolutionGapFact::new(
+            ResolutionSiteId::new(2),
+            ResolutionGapKind::UnsupportedExpressionType
+        )));
+        assert!(!normalized.gaps.contains(&ResolutionGapFact::new(
+            ResolutionSiteId::new(0),
+            ResolutionGapKind::UnsupportedExpressionType
+        )));
+        assert_eq!(
+            normalized.declaration_type_slots,
+            facts.declaration_type_slots
+        );
+        assert!(normalized.type_transfers.contains(&static_producer));
+        assert!(normalized.local_writes.is_empty());
+        assert!(!normalized.type_transfers.iter().any(|transfer| {
+            matches!(
+                transfer.kind,
+                ResolutionTypeTransferKind::ValueJoin | ResolutionTypeTransferKind::Assignment
+            ) && normalized
+                .type_slots
+                .iter()
+                .any(|slot| slot.id == transfer.output && slot.site == ResolutionSiteId::new(0))
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "assignment must remain a single producer")]
+    #[hardwon("#5015: normalizing local writes must not hide multiple assignment producers")]
+    fn local_write_normalization_still_rejects_multiple_assignments() {
+        let mut facts = fixture();
+        facts.type_transfers.push(facts.type_transfers[1]);
+        normalize(&facts);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod go_extraction_support_0 {
+    use crate::analyzer::resolution::local_identity::PerRequestSharedNames;
+    use crate::analyzer::resolution::local_writes::*;
+    use crate::analyzer::resolution::test_support::{
+        fragment, identifier, name, scope, site, transfer,
+    };
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        DeclarationTypeSlotFact, IntrinsicTypeKind, IntrinsicTypeSeedFact, ResolutionBinderFact,
+        ResolutionLocalWriteFact, ResolutionNameId, ResolutionScopeId, ResolutionScopeKind,
+        ResolutionSiteKind,
+    };
+    use brokk_bifrost_core::analyzer::structural::resolution::HoistingClass;
+    #[cfg(test)]
+    use brokk_bifrost_test_macros::hardwon;
+    #[doc(hidden)]
+    pub fn fixture() -> FileResolutionFacts {
         let mut facts = FileResolutionFacts {
             names: vec![name(0, "x"), name(1, "missing"), name(2, "int")],
             scopes: vec![
@@ -457,10 +596,10 @@ mod tests {
                         IntrinsicTypeKind::Primitive,
                     ));
             } else {
-                facts.gaps.push(ResolutionGapFact {
-                    site: ResolutionSiteId::new(id),
-                    kind: ResolutionGapKind::UnsupportedExpressionType,
-                });
+                facts.gaps.push(ResolutionGapFact::new(
+                    ResolutionSiteId::new(id),
+                    ResolutionGapKind::UnsupportedExpressionType,
+                ));
             }
         }
         facts.type_transfers = vec![
@@ -501,298 +640,17 @@ mod tests {
         }
         facts
     }
-
-    fn normalize(facts: &FileResolutionFacts) -> FileResolutionFacts {
+    #[doc(hidden)]
+    pub fn normalize(facts: &FileResolutionFacts) -> FileResolutionFacts {
         let names = PerRequestSharedNames::new();
         let mut identities =
             ResolutionIdentityCatalogBuilder::new(fragment("local-writes"), &names);
-        let lexical = super::super::fact_lowering::lower_file_resolution_facts_with_identities(
-            &mut identities,
-            Language::Go,
-            facts,
-        );
-        attach_local_writes(facts, &lexical, &mut identities).into_owned()
-    }
-
-    fn joined_inputs(facts: &FileResolutionFacts, declaration: u32) -> Vec<u32> {
-        let observed = facts
-            .type_slots
-            .iter()
-            .find(|slot| {
-                slot.site == ResolutionSiteId::new(declaration)
-                    && slot.role == ResolutionTypeSlotRole::AssignmentValue
-            })
-            .expect("observed slot")
-            .id;
-        let assignment = facts
-            .type_transfers
-            .iter()
-            .find(|transfer| transfer.output == observed)
-            .expect("single assignment");
-        assert_eq!(assignment.kind, ResolutionTypeTransferKind::Assignment);
-        let mut inputs = facts
-            .type_transfers
-            .iter()
-            .filter(|transfer| transfer.output == assignment.input)
-            .map(|transfer| {
-                assert_eq!(transfer.kind, ResolutionTypeTransferKind::ValueJoin);
-                transfer.input.get()
-            })
-            .collect::<Vec<_>>();
-        inputs.sort_unstable();
-        inputs
-    }
-
-    #[test]
-    #[hardwon(
-        "#5015: lexical writes lost their alternatives or violated the single assignment producer"
-    )]
-    fn local_write_publication_uses_native_shadow_order_and_keeps_rhs_gaps() {
-        let facts = fixture();
-        let normalized = normalize(&facts);
-        assert_eq!(joined_inputs(&normalized, 0), vec![4, 6, 8]);
-        assert_eq!(joined_inputs(&normalized, 1), vec![5, 7]);
-        for initialization in normalized
-            .type_transfers
-            .iter()
-            .filter(|transfer| transfer.kind == ResolutionTypeTransferKind::Initialization)
-        {
-            assert!(
-                normalized
-                    .type_transfers
-                    .iter()
-                    .any(
-                        |transfer| transfer.kind == ResolutionTypeTransferKind::Assignment
-                            && transfer.input == initialization.input
-                    )
+        let lexical =
+            crate::analyzer::resolution::fact_lowering::lower_file_resolution_facts_with_identities(
+                &mut identities,
+                Language::Go,
+                facts,
             );
-        }
-        let published = super::super::lower_resolution_facts_with_identity_catalog(
-            fragment("local-writes"),
-            Language::Go,
-            &facts,
-        );
-        assert_eq!(
-            published
-                .typed()
-                .transfers()
-                .iter()
-                .filter(|transfer| transfer.kind() == ResolutionTypeTransferKind::Assignment)
-                .count(),
-            2
-        );
-        assert_eq!(
-            published
-                .typed()
-                .transfers()
-                .iter()
-                .filter(|transfer| transfer.kind() == ResolutionTypeTransferKind::ValueJoin)
-                .count(),
-            5
-        );
-        for site in [5, 10, 11] {
-            assert!(published.lexical().gaps().iter().any(|gap| gap.site()
-                == ResolutionSiteId::new(site)
-                && gap.origin()
-                    == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedExpressionType)));
-        }
-    }
-
-    #[test]
-    #[hardwon(
-        "#5015: incomplete lexical writes must not become complete initializer-only bindings"
-    )]
-    fn incomplete_attachment_marks_the_known_binder_without_attaching_the_rhs() {
-        let mut facts = fixture();
-        facts.gaps.push(ResolutionGapFact {
-            site: ResolutionSiteId::new(2),
-            kind: ResolutionGapKind::UnsupportedRoute,
-        });
-        let normalized = normalize(&facts);
-        assert_eq!(joined_inputs(&normalized, 0), vec![4, 8]);
-        assert!(normalized.gaps.contains(&ResolutionGapFact {
-            site: ResolutionSiteId::new(0),
-            kind: ResolutionGapKind::UnsupportedExpressionType
-        }));
-        let published = super::super::lower_resolution_facts_with_identity_catalog(
-            fragment("incomplete-local-write"),
-            Language::Go,
-            &facts,
-        );
-        assert!(
-            published
-                .lexical()
-                .gaps()
-                .iter()
-                .any(|gap| gap.site() == ResolutionSiteId::new(0)
-                    && matches!(gap.frontier(), LoweringCoverageFrontier::Type { .. }))
-        );
-    }
-
-    #[test]
-    #[hardwon("#5015: a parameter write lacks evidence for its incoming observed value")]
-    fn parameter_write_marks_the_gap_without_replacing_static_type_facts() {
-        let mut facts = fixture();
-        facts
-            .binders
-            .iter_mut()
-            .find(|binder| binder.declaration == ResolutionSiteId::new(0))
-            .expect("fixture parameter binder")
-            .kind = ResolutionBinderKind::Parameter;
-        facts
-            .declaration_type_slots
-            .iter_mut()
-            .find(|property| property.declaration == ResolutionSiteId::new(0))
-            .expect("fixture parameter property")
-            .role = DeclarationTypeRole::Parameter;
-        facts.local_writes = vec![ResolutionLocalWriteFact {
-            target: ResolutionSiteId::new(2),
-            value: ResolutionTypeSlotId::new(6),
-        }];
-
-        let static_type = facts.allocate_type_slot(
-            ResolutionSiteId::new(6),
-            ResolutionTypeSlotRole::TargetTypeIdentity,
-        );
-        facts
-            .intrinsic_type_seeds
-            .push(IntrinsicTypeSeedFact::direct(
-                static_type,
-                ResolutionNameId::new(2),
-                IntrinsicTypeKind::Primitive,
-            ));
-        let static_producer = ResolutionTypeTransferFact::new(
-            static_type,
-            ResolutionTypeSlotId::new(0),
-            ResolutionTypeTransferKind::DeclaredType,
-            0,
-            0,
-            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
-        );
-        facts.type_transfers[0] = static_producer;
-        let parameter_assignment = facts
-            .type_slots
-            .iter()
-            .find(|slot| {
-                slot.site == ResolutionSiteId::new(0)
-                    && slot.role == ResolutionTypeSlotRole::AssignmentValue
-            })
-            .expect("fixture parameter assignment slot")
-            .id;
-        facts
-            .type_transfers
-            .retain(|transfer| transfer.output != parameter_assignment);
-        facts
-            .type_slots
-            .retain(|slot| slot.id != parameter_assignment);
-
-        let normalized = normalize(&facts);
-        assert!(normalized.gaps.contains(&ResolutionGapFact {
-            site: ResolutionSiteId::new(2),
-            kind: ResolutionGapKind::UnsupportedExpressionType,
-        }));
-        assert!(!normalized.gaps.contains(&ResolutionGapFact {
-            site: ResolutionSiteId::new(0),
-            kind: ResolutionGapKind::UnsupportedExpressionType,
-        }));
-        assert_eq!(
-            normalized.declaration_type_slots,
-            facts.declaration_type_slots
-        );
-        assert!(normalized.type_transfers.contains(&static_producer));
-        assert!(normalized.local_writes.is_empty());
-        assert!(!normalized.type_transfers.iter().any(|transfer| {
-            matches!(
-                transfer.kind,
-                ResolutionTypeTransferKind::ValueJoin | ResolutionTypeTransferKind::Assignment
-            ) && normalized
-                .type_slots
-                .iter()
-                .any(|slot| slot.id == transfer.output && slot.site == ResolutionSiteId::new(0))
-        }));
-    }
-
-    #[test]
-    #[hardwon(
-        "#5015: write joins must retain static types without inventing an uninitialized value"
-    )]
-    fn local_write_joins_keep_static_types_and_do_not_invent_initializers() {
-        let mut facts = fixture();
-        let identity = facts.allocate_type_slot(
-            ResolutionSiteId::new(6),
-            ResolutionTypeSlotRole::TargetTypeIdentity,
-        );
-        facts
-            .intrinsic_type_seeds
-            .push(IntrinsicTypeSeedFact::direct(
-                identity,
-                ResolutionNameId::new(2),
-                IntrinsicTypeKind::Primitive,
-            ));
-        let declared_type = ResolutionTypeTransferFact::new(
-            identity,
-            ResolutionTypeSlotId::new(0),
-            ResolutionTypeTransferKind::DeclaredType,
-            0,
-            0,
-            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
-        );
-        facts.type_transfers[0] = declared_type;
-        facts
-            .type_transfers
-            .retain(|transfer| !matches!(transfer.output.get(), 2 | 3));
-        facts.type_slots.retain(|slot| slot.id.get() != 3);
-        let normalized = normalize(&facts);
-        assert!(normalized.type_transfers.contains(&declared_type));
-        assert_eq!(joined_inputs(&normalized, 0), vec![4, 6, 8]);
-        assert_eq!(joined_inputs(&normalized, 1), vec![7]);
-        let initializations = normalized
-            .type_transfers
-            .iter()
-            .filter(|transfer| transfer.kind == ResolutionTypeTransferKind::Initialization)
-            .collect::<Vec<_>>();
-        assert_eq!(initializations.len(), 1);
-        let initialization = initializations[0];
-        assert_eq!(initialization.output, ResolutionTypeSlotId::new(2));
-        assert_eq!(
-            initialization.value_transform,
-            ResolutionTypeTransferValueTransform::Preserve
-        );
-        assert_eq!(
-            normalized
-                .type_transfers
-                .iter()
-                .filter(|transfer| transfer.output == initialization.input)
-                .map(|transfer| (transfer.kind, transfer.input))
-                .collect::<Vec<_>>(),
-            vec![(
-                ResolutionTypeTransferKind::ValueJoin,
-                ResolutionTypeSlotId::new(7)
-            )],
-            "the inferred value reads only the real write through the join"
-        );
-        let published = super::super::lower_resolution_facts_with_identity_catalog(
-            fragment("static-and-uninitialized-local-writes"),
-            Language::Go,
-            &facts,
-        );
-        assert_eq!(
-            published
-                .typed()
-                .transfers()
-                .iter()
-                .filter(|transfer| transfer.kind() == ResolutionTypeTransferKind::Assignment)
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "assignment must remain a single producer")]
-    #[hardwon("#5015: normalizing local writes must not hide multiple assignment producers")]
-    fn local_write_normalization_still_rejects_multiple_assignments() {
-        let mut facts = fixture();
-        facts.type_transfers.push(facts.type_transfers[1]);
-        normalize(&facts);
+        attach_local_writes(facts, &lexical, &mut identities).into_owned()
     }
 }

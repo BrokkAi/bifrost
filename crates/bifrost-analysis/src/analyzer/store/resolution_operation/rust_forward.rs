@@ -5,7 +5,8 @@ use crate::analyzer::resolution::{FactResolutionOperation, ResolutionCompletionA
 
 /// Values returned by this callback are provisional. The enclosing selected
 /// operation performs the final authority check before publishing them.
-pub(crate) trait SelectedRustForwardQueries {
+#[doc(hidden)]
+pub trait SelectedRustForwardQueries {
     /// Certify the producer's reference inventory for one admitted source
     /// fragment, including a fragment with no reference rows. This does not
     /// certify typing or invocation applicability of individual references.
@@ -224,7 +225,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// when it built `context`. They bound the mounts this request may bind
     /// into.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn with_rust_forward_queries_in_session<T>(
+    #[doc(hidden)]
+    pub fn with_rust_forward_queries_in_session<T>(
         mut self,
         context: SelectedResolutionContextSet,
         crate_keys: &[[u8; 32]],

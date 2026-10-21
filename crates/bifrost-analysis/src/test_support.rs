@@ -2,6 +2,13 @@
 //! materializes a `TempDir` workspace, builds a `WorkspaceAnalyzer` over
 //! it, and exposes both for assertions. Test-only.
 
+#[cfg(test)]
+pub(crate) use brokk_bifrost_core::test_support::write_file;
+
+/// Engine fixture shared with surface regression tests in the tools crate.
+pub const RUST_CFG_DECORATED_MACROS_SOURCE: &str =
+    include_str!("../fixtures/rust_cfg_decorated_macros.rs");
+
 /// Build fixed non-source inputs for read-ledger verification tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn read_ledger_test_inputs() -> crate::analyzer::HeadInputs {
@@ -114,15 +121,16 @@ pub fn ruby_gem_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
     gem
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "../../../test-support/git.rs"]
-pub(crate) mod shared_git;
+#[doc(hidden)]
+pub mod shared_git;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "../../../test-support/zip.rs"]
 pub(crate) mod zip_helpers;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::semantic::SemanticArtifact;
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::semantic::{
@@ -130,10 +138,8 @@ use crate::analyzer::semantic::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::{AnalyzerConfig, Language, ProjectFile, TestProject, WorkspaceAnalyzer};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::{FilesystemProject, Project};
-#[cfg(test)]
-use crate::analyzer::{JavaAnalyzer, RustAnalyzer};
 #[cfg(any(test, feature = "test-support"))]
 #[cfg(any(test, feature = "test-support"))]
 use std::fs;
@@ -180,8 +186,9 @@ pub fn call_backed_transfer_sites(
         .collect()
 }
 
-#[cfg(test)]
-pub(crate) fn discovery_declaring(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn discovery_declaring(
     language: &str,
     modules: &[&str],
     mut artifacts_for_module: impl FnMut(
@@ -222,8 +229,9 @@ pub(crate) fn discovery_declaring(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn incomplete_discovery_declaring(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn incomplete_discovery_declaring(
     language: &str,
     modules: &[&str],
     artifacts_for_module: impl FnMut(
@@ -236,8 +244,9 @@ pub(crate) fn incomplete_discovery_declaring(
     outcome
 }
 
-#[cfg(test)]
-pub(crate) fn activate_rust_declaration_pack(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn activate_rust_declaration_pack(
     analyzer: &dyn crate::analyzer::IAnalyzer,
     pack_id: &str,
     pack_json: &serde_json::Value,
@@ -879,8 +888,9 @@ pub fn go_semantic_model_activation_request(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn resolved_reference_site(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn resolved_reference_site(
     path: String,
     text: String,
     range: crate::analyzer::Range,
@@ -935,18 +945,17 @@ pub fn external_route_candidates(
         .collect()
 }
 
-#[cfg(test)]
-pub(crate) fn rust_analyzer(root: &Path) -> RustAnalyzer {
-    RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
-}
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn java_analyzer(root: &Path) -> crate::analyzer::JavaAnalyzer {
+    use crate::analyzer::JavaAnalyzer;
 
-#[cfg(test)]
-pub(crate) fn java_analyzer(root: &Path) -> JavaAnalyzer {
     JavaAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Java))
 }
 
-#[cfg(test)]
-pub(crate) fn procedure_named<'artifact>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn procedure_named<'artifact>(
     artifact: &'artifact SemanticArtifact,
     name: &str,
 ) -> &'artifact ProcedureSemantics {
@@ -1009,11 +1018,9 @@ pub fn token_range(source: &str, marker: &str, token: &str) -> (usize, usize) {
     (start, start + token.len())
 }
 
-#[cfg(test)]
-pub(crate) fn parse_fixture_tree(
-    source: &str,
-    language: tree_sitter::Language,
-) -> tree_sitter::Tree {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn parse_fixture_tree(source: &str, language: tree_sitter::Language) -> tree_sitter::Tree {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&language)
@@ -1151,8 +1158,9 @@ fn write_jdk_release_contents(home: &Path, release_contents: String) -> PathBuf 
     home.to_path_buf()
 }
 
-#[cfg(test)]
-pub(crate) fn commit_all(repo: &git2::Repository, message: &str) -> git2::Oid {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn commit_all(repo: &git2::Repository, message: &str) -> git2::Oid {
     let signature = git2::Signature::now("Tester", "tester@example.com").expect("signature");
     shared_git::commit_all_with_deletions(repo, message, &signature)
 }
@@ -1173,10 +1181,8 @@ pub fn cache_row_count(root: &Path, table: &str) -> i64 {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn cache_row_count_for_connection(
-    connection: &rusqlite::Connection,
-    table: &str,
-) -> i64 {
+#[doc(hidden)]
+pub fn cache_row_count_for_connection(connection: &rusqlite::Connection, table: &str) -> i64 {
     connection
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)
@@ -1184,23 +1190,26 @@ pub(crate) fn cache_row_count_for_connection(
         .expect("count cache rows")
 }
 
-#[cfg(test)]
-pub(crate) fn block_shared_analyzer_cache(root: &Path) -> PathBuf {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn block_shared_analyzer_cache(root: &Path) -> PathBuf {
     let path = crate::analyzer::store::analyzer_db_path(root);
     fs::create_dir_all(&path).expect("block the cache path");
     path
 }
 
-#[cfg(test)]
-pub(crate) fn assert_shared_analyzer_cache_error(error: &str, path: &Path) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_shared_analyzer_cache_error(error: &str, path: &Path) {
     assert!(
         error.contains(&path.display().to_string()),
         "the error must name the cache it could not open: {error}"
     );
 }
 
-#[cfg(test)]
-pub(crate) fn mixed_language_rust_workspace() -> (TempDir, WorkspaceAnalyzer) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn mixed_language_rust_workspace() -> (TempDir, WorkspaceAnalyzer) {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canonical root");
     for (relative_path, source) in [
@@ -1227,28 +1236,29 @@ pub(crate) fn mixed_language_rust_workspace() -> (TempDir, WorkspaceAnalyzer) {
     (temp, workspace)
 }
 
-#[cfg(test)]
-pub(crate) fn synthetic_oid(byte: u8) -> git2::Oid {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn synthetic_oid(byte: u8) -> git2::Oid {
     git2::Oid::from_bytes(&[byte; 20]).expect("twenty bytes is a valid object id")
 }
-
-#[cfg(test)]
-pub(crate) use brokk_bifrost_core::test_support::write_file;
 
 /// Owns a `TempDir` workspace and the analyzer built over it.
 #[cfg(any(test, feature = "test-support"))]
 pub struct AnalyzerFixture {
     _temp: TempDir,
-    pub(crate) analyzer: WorkspaceAnalyzer,
+    #[doc(hidden)]
+    pub analyzer: WorkspaceAnalyzer,
     #[allow(dead_code)]
-    test_project: Option<TestProject>,
+    #[doc(hidden)]
+    pub test_project: Option<TestProject>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl AnalyzerFixture {
     /// Build a fixture from `(relative_path, file_contents)` pairs.
-    #[cfg(test)]
-    pub(crate) fn new(files: &[(&str, &str)]) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(files: &[(&str, &str)]) -> Self {
         let temp = TempDir::new().expect("tempdir");
         for (rel, content) in files {
             let abs = temp.path().join(rel);
@@ -1291,7 +1301,8 @@ impl AnalyzerFixture {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn test_project(&self) -> &TestProject {
+    #[doc(hidden)]
+    pub fn test_project(&self) -> &TestProject {
         self.test_project
             .as_ref()
             .expect("fixture was not built with TestProject")

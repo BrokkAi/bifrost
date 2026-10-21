@@ -4,489 +4,98 @@
 //! reparse source, infer identities from names, or upgrade allocation-site
 //! identities into runtime singletons.
 
-use super::WorkspaceSemanticOracle;
-use super::common::{
-    Interruption, WorkStager, dedup_evidence, evidence_handle, evidence_quality, internal_contract,
-    value_flow_core_capabilities_are_open, value_handle,
-};
-use super::value_flow::{
-    call_target_refinement_call, constructor_allocation_identity_discharges_gap,
-    is_go_assignment_conversion,
-};
-use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, forward_reachability, loop_regions,
-    reverse_reachability,
-};
-use crate::analyzer::semantic::{
-    AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathAtPoint,
-    AccessPathRoot, AliasExclusivity, AliasExclusivityWitness, AliasQuery, AliasRelation,
-    AliasResult, CallBinding, CallResultHandle, CallSiteHandle, CandidateCoverage, CaptureSource,
-    DispatchBoundaryKind, DispatchOracle, DispatchResult, EscapeStatus, EscapeWitness,
-    EvidenceCompleteness, EvidenceHandle, FreshObjectPublication, FreshObjectPublicationKind,
-    FreshObjectPublicationQuery, FreshObjectPublicationResult, HeapOracle, LocationResult,
-    MemoryLocationKind, ObjectCardinality, ObservationPhase, OracleCandidate, OracleContractError,
-    OracleRelationArena, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, OracleSet, PointsToResult, ProcedureHandle, ProcedurePortHandle,
-    ProcedurePortKind, ProofStatus, SemanticArtifact, SemanticCallSite, SemanticCapability,
-    SemanticEffect, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    StoreAtPoint, StrongUpdateEvidence, TransferKind, UpdateEligibility, ValueAtPoint,
-    ValueFlowKind, ValueFlowOracle, ValueHandle, WeakUpdateReason, assignment_transfer,
-};
-use crate::analyzer::semantic_model::{
-    CompiledProcedureSummary, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryOutput, Completeness, SemanticModelMatchDisposition, compiled_flow_claims_agree,
-};
-use crate::analyzer::usages::{
-    CallRelationLimits, CallRelationService, UsageProof, UsageProofAuthority,
-};
-use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use crate::hash::{HashMap, HashSet};
+use crate::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
+
+use crate::analyzer::semantic::workspace_oracle::common::Interruption;
+use crate::analyzer::semantic::workspace_oracle::common::WorkStager;
+use crate::analyzer::semantic::workspace_oracle::common::dedup_evidence;
+use crate::analyzer::semantic::workspace_oracle::common::evidence_handle;
+use crate::analyzer::semantic::workspace_oracle::common::evidence_quality;
+use crate::analyzer::semantic::workspace_oracle::common::internal_contract;
+use crate::analyzer::semantic::workspace_oracle::common::value_handle;
+
+use crate::analyzer::semantic::workspace_oracle::value_flow::call_target_refinement_call;
+use crate::analyzer::semantic::workspace_oracle::value_flow::constructor_allocation_identity_discharges_gap;
+
+use crate::analyzer::semantic::AbstractLocation;
+use crate::analyzer::semantic::AbstractObject;
+use crate::analyzer::semantic::AbstractObjectIdentity;
+use crate::analyzer::semantic::AccessPath;
+use crate::analyzer::semantic::AccessPathAtPoint;
+use crate::analyzer::semantic::AccessPathRoot;
+use crate::analyzer::semantic::AliasQuery;
+use crate::analyzer::semantic::AliasResult;
+use crate::analyzer::semantic::CallBinding;
+use crate::analyzer::semantic::CallResultHandle;
+use crate::analyzer::semantic::CallSiteHandle;
+use crate::analyzer::semantic::CandidateCoverage;
+use crate::analyzer::semantic::CaptureSource;
+use crate::analyzer::semantic::DispatchBoundaryKind;
+use crate::analyzer::semantic::DispatchOracle;
+use crate::analyzer::semantic::DispatchResult;
+use crate::analyzer::semantic::EscapeStatus;
+use crate::analyzer::semantic::EvidenceCompleteness;
+use crate::analyzer::semantic::FreshObjectPublicationQuery;
+use crate::analyzer::semantic::FreshObjectPublicationResult;
+use crate::analyzer::semantic::HeapOracle;
+use crate::analyzer::semantic::LocationResult;
+use crate::analyzer::semantic::MemoryLocationKind;
+use crate::analyzer::semantic::ObjectCardinality;
+use crate::analyzer::semantic::ObservationPhase;
+use crate::analyzer::semantic::OracleContractError;
+use crate::analyzer::semantic::PointsToResult;
+use crate::analyzer::semantic::ProcedureHandle;
+use crate::analyzer::semantic::ProcedurePortHandle;
+use crate::analyzer::semantic::ProcedurePortKind;
+use crate::analyzer::semantic::ProofStatus;
+use crate::analyzer::semantic::SemanticArtifact;
+use crate::analyzer::semantic::SemanticCallSite;
+use crate::analyzer::semantic::SemanticEffect;
+use crate::analyzer::semantic::SemanticGap;
+use crate::analyzer::semantic::SemanticGapImpact;
+use crate::analyzer::semantic::SemanticGapSubject;
+use crate::analyzer::semantic::SemanticOutcome;
+use crate::analyzer::semantic::SemanticProviderError;
+use crate::analyzer::semantic::SemanticRequest;
+use crate::analyzer::semantic::SemanticValueKind;
+use crate::analyzer::semantic::SemanticWork;
+use crate::analyzer::semantic::StoreAtPoint;
+use crate::analyzer::semantic::UpdateEligibility;
+use crate::analyzer::semantic::ValueAtPoint;
+use crate::analyzer::semantic::ValueFlowKind;
+use crate::analyzer::semantic::ValueFlowOracle;
+use crate::analyzer::semantic::ValueHandle;
+use crate::analyzer::semantic::WeakUpdateReason;
+use crate::analyzer::semantic::assignment_transfer;
+
+use crate::analyzer::semantic_model::CompiledProcedureSummary;
+use crate::analyzer::semantic_model::CompiledSummaryEffect;
+use crate::analyzer::semantic_model::CompiledSummaryExitKind;
+use crate::analyzer::semantic_model::CompiledSummaryInput;
+use crate::analyzer::semantic_model::CompiledSummaryOutput;
+use crate::analyzer::semantic_model::Completeness;
+use crate::analyzer::semantic_model::SemanticModelMatchDisposition;
+use crate::analyzer::semantic_model::compiled_flow_claims_agree;
+
+use crate::analyzer::usages::CallRelationLimits;
+use crate::analyzer::usages::CallRelationService;
+use crate::analyzer::usages::UsageProof;
+use crate::analyzer::usages::UsageProofAuthority;
+
+use crate::analyzer::AnalyzerQueryScope;
+use crate::analyzer::QueryScope;
+
+use crate::hash::HashSet;
+
+pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::heap::*;
+
 use std::sync::Arc;
-
-#[derive(Clone)]
-struct ObjectDraft {
-    object: AbstractObject,
-    evidence: Vec<EvidenceHandle>,
-    proof: ProofStatus,
-    completeness: EvidenceCompleteness,
-    runtime_read: Option<crate::analyzer::semantic::RuntimeReadRelationEvidence>,
-}
-
-fn transfer_stops_identity_trace(
-    effect: &SemanticEffect,
-    value: crate::analyzer::semantic::ValueId,
-) -> bool {
-    matches!(
-        effect,
-        SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::Transfer(transfer),
-            source,
-            target,
-        } if *target == value
-            || (*source == value && matches!(transfer.kind, TransferKind::Move { .. }))
-    ) || matches!(
-        effect,
-        SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
-            source,
-            target,
-        } if *source == value || *target == value
-    )
-}
-
-#[derive(Clone)]
-struct LocationDraft {
-    location: AbstractLocation,
-    evidence: Vec<EvidenceHandle>,
-    proof: ProofStatus,
-    completeness: EvidenceCompleteness,
-}
-
-#[derive(Clone)]
-struct PublicationDraft {
-    publication: FreshObjectPublication,
-    evidence: Vec<EvidenceHandle>,
-    proof: ProofStatus,
-    completeness: EvidenceCompleteness,
-}
-
-struct DraftSet<T> {
-    candidates: Vec<T>,
-    coverage: CandidateCoverage,
-    ambiguous: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TraceState {
-    value: crate::analyzer::semantic::ValueId,
-    point: crate::analyzer::semantic::ProgramPointId,
-    event_limit: usize,
-    /// Number of transitive value-flow producers followed from the queried
-    /// value. Keeping this in the visited identity bounds value cycles while
-    /// allowing a shallower route to the same semantic state to retain facts
-    /// that a deeper, truncated route could not reach.
-    summary_depth: usize,
-    /// Quality forced by a finite runtime alternative. The alternatives are
-    /// exhaustive when retained, but neither arm is selected by the IR.
-    alternative_quality: Option<(ProofStatus, EvidenceCompleteness)>,
-}
-
-fn merge_quality(
-    left: &(ProofStatus, EvidenceCompleteness),
-    right: &(ProofStatus, EvidenceCompleteness),
-) -> (ProofStatus, EvidenceCompleteness) {
-    let proof = if matches!(left.0, ProofStatus::Proven) {
-        right.0.clone()
-    } else {
-        left.0.clone()
-    };
-    let completeness = if matches!(left.1, EvidenceCompleteness::Complete) {
-        right.1.clone()
-    } else {
-        left.1.clone()
-    };
-    (proof, completeness)
-}
-
-fn candidate_cardinality_for_root(root: &AccessPathRoot) -> ObjectCardinality {
-    match root {
-        AccessPathRoot::Static(_) | AccessPathRoot::LexicalCell(_) => ObjectCardinality::Singleton,
-        AccessPathRoot::CaptureSlot(_) | AccessPathRoot::TypeSummary(_) => {
-            ObjectCardinality::Summary
-        }
-        AccessPathRoot::Value(_)
-        | AccessPathRoot::CallResult(_)
-        | AccessPathRoot::ProcedurePort(_)
-        | AccessPathRoot::Allocation(_)
-        | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => ObjectCardinality::Unknown,
-        AccessPathRoot::FieldPath { base, .. } => candidate_cardinality_for_root(base),
-        AccessPathRoot::CallSubstitution {
-            base_cardinality, ..
-        } => *base_cardinality,
-        AccessPathRoot::RuntimeObject(root) => {
-            if root.singleton_proven() {
-                ObjectCardinality::Singleton
-            } else {
-                ObjectCardinality::Unknown
-            }
-        }
-    }
-}
-
-fn root_evidence(
-    procedure: &ProcedureHandle,
-    root: &AccessPathRoot,
-) -> Result<Vec<EvidenceHandle>, SemanticProviderError> {
-    if let AccessPathRoot::FieldPath { base, .. } = root {
-        let base_procedure = base.scoped_procedure().unwrap_or(procedure);
-        return root_evidence(base_procedure, base);
-    }
-    let evidence = match root {
-        AccessPathRoot::Value(value) => procedure
-            .semantics()
-            .value(value.id())
-            .map(|row| row.evidence),
-        AccessPathRoot::CallResult(result) => procedure
-            .semantics()
-            .call_site(result.call().id())
-            .map(|row| row.evidence),
-        AccessPathRoot::Allocation(allocation) => procedure
-            .semantics()
-            .allocation(allocation.id())
-            .map(|row| row.evidence),
-        AccessPathRoot::LexicalCell(location) => procedure
-            .semantics()
-            .memory_location(location.id())
-            .map(|row| row.evidence),
-        AccessPathRoot::CaptureSlot(port) => match port.kind() {
-            crate::analyzer::semantic::ProcedurePortKind::Capture { slot } => port
-                .procedure()
-                .semantics()
-                .memory_location(slot)
-                .map(|row| row.evidence),
-            _ => None,
-        },
-        AccessPathRoot::ProcedurePort(port) => {
-            let semantics = port.procedure().semantics();
-            match port.kind() {
-                crate::analyzer::semantic::ProcedurePortKind::IndexedNormalReturn { ordinal } => {
-                    semantics
-                        .points()
-                        .iter()
-                        .flat_map(|point| &point.events)
-                        .find_map(|event| match event.effect {
-                            SemanticEffect::ValueFlow {
-                                kind:
-                                    crate::analyzer::semantic::ValueFlowKind::IndexedReturn {
-                                        ordinal: actual,
-                                    },
-                                target,
-                                ..
-                            } if actual == ordinal => {
-                                semantics.value(target).map(|value| value.evidence)
-                            }
-                            _ => None,
-                        })
-                }
-                kind => semantics
-                    .values()
-                    .iter()
-                    .find(|value| match kind {
-                        crate::analyzer::semantic::ProcedurePortKind::Receiver => {
-                            matches!(value.kind, SemanticValueKind::Receiver { .. })
-                        }
-                        crate::analyzer::semantic::ProcedurePortKind::Parameter { ordinal } => {
-                            matches!(
-                                value.kind,
-                                SemanticValueKind::Parameter { ordinal: actual, .. }
-                                    if actual == ordinal
-                            )
-                        }
-                        crate::analyzer::semantic::ProcedurePortKind::NormalReturn => {
-                            value.kind == SemanticValueKind::Return
-                        }
-                        crate::analyzer::semantic::ProcedurePortKind::ExceptionalReturn => {
-                            value.kind == SemanticValueKind::Exception
-                        }
-                        crate::analyzer::semantic::ProcedurePortKind::Capture { .. }
-                        | crate::analyzer::semantic::ProcedurePortKind::IndexedNormalReturn {
-                            ..
-                        } => false,
-                    })
-                    .map(|value| value.evidence),
-            }
-        }
-        AccessPathRoot::Static(_)
-        | AccessPathRoot::TypeSummary(_)
-        | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_)
-        | AccessPathRoot::RuntimeObject(_)
-        | AccessPathRoot::CallSubstitution { .. } => Some(procedure.semantics().evidence()),
-        AccessPathRoot::FieldPath { .. } => unreachable!("field-path evidence handled above"),
-    };
-    Ok(vec![evidence_handle(
-        procedure,
-        evidence.unwrap_or_else(|| procedure.semantics().evidence()),
-    )?])
-}
-
-fn gap_impacts_heap(gap: &SemanticGap) -> bool {
-    gap.impacts.contains(SemanticGapImpact::HeapRead)
-        || gap.impacts.contains(SemanticGapImpact::HeapWrite)
-        || gap.impacts.contains(SemanticGapImpact::Aliasing)
-}
-
-/// Whether a modeled read partition leaves this exact allocation result's
-/// object identity unchanged.
-///
-/// The missing read can still make values copied into the object incomplete;
-/// it cannot change the identity created by the allocation at the same point.
-/// Keep the discharge tied to all three structured facts so a general heap
-/// read that produces a pointer remains relevant to points-to resolution.
-fn allocation_owns_modeled_read_partition(
-    procedure: &ProcedureHandle,
-    gap: &SemanticGap,
-    value: crate::analyzer::semantic::ValueId,
-) -> bool {
-    gap.discharge == SemanticGapDischarge::ModeledEffectPartition
-        && gap.impacts
-            == crate::analyzer::semantic::SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-        && gap.subject == SemanticGapSubject::Value(value)
-        && procedure
-            .semantics()
-            .allocations()
-            .iter()
-            .any(|allocation| allocation.point == gap.point && allocation.result == value)
-}
-
-/// Whether `gap` can open a heap, alias, or points-to answer at all.
-///
-/// An adapter's implicit-abort gap states that a runtime operation's edge to
-/// the exceptional exit is not lowered. Heap and points-to answers are may
-/// analyses, so a missing edge can only remove paths from them -- unless a
-/// handler or cleanup body on some abort path runs user code, which is the one
-/// way the removed path could have carried a store. That is exactly the rule
-/// the value-flow plan already applies to the same gap (#1952); applying it
-/// here keeps one rule instead of two, and stops an adapter that scopes its
-/// implicit-abort gap to the program point, as JavaScript, C# and Python do,
-/// from opening every traced value in the procedure (#2495).
-///
-/// `abort_user_code` memoizes the CFG walk: the answer is a property of the
-/// procedure, and most gaps never reach the question.
-fn gap_can_open_heap(
-    procedure: &ProcedureHandle,
-    gap: &SemanticGap,
-    abort_user_code: &mut Option<bool>,
-) -> bool {
-    if !gap_impacts_heap(gap) {
-        return false;
-    }
-    if gap.capability != SemanticCapability::ExceptionalControlFlow {
-        return true;
-    }
-    let user_code = *abort_user_code
-        .get_or_insert_with(|| super::abort_paths_run_user_code(procedure.semantics()));
-    !super::implicit_abort_gap_is_discharged(gap, user_code)
-}
-
-fn heap_gaps_are_open(
-    procedure: &ProcedureHandle,
-    staged: &mut WorkStager,
-    cancellation: &crate::cancellation::CancellationToken,
-    mut relevant: impl FnMut(&SemanticGap) -> bool,
-) -> Result<bool, Interruption> {
-    let mut open = false;
-    let mut abort_user_code = None;
-    for gap in procedure.semantics().gaps() {
-        if cancellation.is_cancelled() {
-            return Err(Interruption::Cancelled);
-        }
-        staged.charge(SemanticWork {
-            gaps: 1,
-            ..SemanticWork::default()
-        })?;
-        open |= relevant(gap) && gap_can_open_heap(procedure, gap, &mut abort_user_code);
-    }
-    Ok(open)
-}
-
-fn traced_gap_affects_value(
-    procedure: &ProcedureHandle,
-    gap: &SemanticGap,
-    value: crate::analyzer::semantic::ValueId,
-    staged: &mut WorkStager,
-    cancellation: &crate::cancellation::CancellationToken,
-) -> Result<bool, InterruptionOrProvider> {
-    if cancellation.is_cancelled() {
-        return Err(InterruptionOrProvider::Interruption(
-            Interruption::Cancelled,
-        ));
-    }
-    Ok(match gap.subject {
-        // Procedure gaps are handled before tracing because they apply even
-        // when an exact producer cuts the trace short.
-        SemanticGapSubject::Procedure => false,
-        SemanticGapSubject::Point
-        | SemanticGapSubject::CallContinuation { .. }
-        | SemanticGapSubject::AsyncContinuation { .. } => true,
-        SemanticGapSubject::Value(subject) => subject == value,
-        SemanticGapSubject::MemoryLocation(location) => {
-            staged
-                .charge(SemanticWork {
-                    memory_locations: 1,
-                    ..SemanticWork::default()
-                })
-                .map_err(InterruptionOrProvider::Interruption)?;
-            let _location = procedure
-                .semantics()
-                .memory_location(location)
-                .ok_or_else(|| {
-                    InterruptionOrProvider::Provider(SemanticProviderError::internal(
-                        "semantic gap has a stale memory location",
-                    ))
-                })?;
-            // A location's base and index determine which cell an operation
-            // addresses; uncertainty about that cell does not flow backward
-            // into either operand's own pointee identity. A MemoryLoad opens
-            // its result explicitly when this trace reaches the load effect.
-            // Location and alias queries retain the gap independently.
-            false
-        }
-        SemanticGapSubject::Capture(capture) => {
-            staged
-                .charge(SemanticWork {
-                    captures: 1,
-                    ..SemanticWork::default()
-                })
-                .map_err(InterruptionOrProvider::Interruption)?;
-            let capture = procedure.semantics().capture(capture).ok_or_else(|| {
-                InterruptionOrProvider::Provider(SemanticProviderError::internal(
-                    "semantic gap has a stale capture binding",
-                ))
-            })?;
-            let captured_value = match capture.captured {
-                CaptureSource::Value(captured) => captured == value,
-                CaptureSource::Location(location) => {
-                    staged
-                        .charge(SemanticWork {
-                            memory_locations: 1,
-                            ..SemanticWork::default()
-                        })
-                        .map_err(InterruptionOrProvider::Interruption)?;
-                    procedure
-                        .semantics()
-                        .memory_location(location)
-                        .is_some_and(|location| location.kind.uses_value(value))
-                }
-            };
-            staged
-                .charge(SemanticWork {
-                    allocations: 1,
-                    ..SemanticWork::default()
-                })
-                .map_err(InterruptionOrProvider::Interruption)?;
-            let environment_value = procedure
-                .semantics()
-                .allocation(capture.environment)
-                .is_some_and(|allocation| allocation.result == value);
-            capture.callable == value || captured_value || environment_value
-        }
-        SemanticGapSubject::CallSite(call_site) => {
-            staged
-                .charge(SemanticWork {
-                    call_sites: 1,
-                    ..SemanticWork::default()
-                })
-                .map_err(InterruptionOrProvider::Interruption)?;
-            let call = procedure.semantics().call_site(call_site).ok_or_else(|| {
-                InterruptionOrProvider::Provider(SemanticProviderError::internal(
-                    "semantic gap has a stale call site",
-                ))
-            })?;
-            // A call-site gap can weaken values produced by the call without
-            // weakening caller-side values that were evaluated before it.
-            // Adapters attach CallEvaluation explicitly when the callee,
-            // receiver, or argument evaluation is itself incomplete.
-            if call.normal_result_values().any(|result| result == value)
-                || call.thrown == Some(value)
-            {
-                true
-            } else if gap.impacts.contains(SemanticGapImpact::CallEvaluation) {
-                if call.callee == value || call.receiver == Some(value) {
-                    return Ok(true);
-                }
-                let mut argument_matches = false;
-                for argument in &call.arguments {
-                    if cancellation.is_cancelled() {
-                        return Err(InterruptionOrProvider::Interruption(
-                            Interruption::Cancelled,
-                        ));
-                    }
-                    staged
-                        .charge(SemanticWork {
-                            nested_entries: 1,
-                            ..SemanticWork::default()
-                        })
-                        .map_err(InterruptionOrProvider::Interruption)?;
-                    if argument.value == value {
-                        argument_matches = true;
-                        break;
-                    }
-                }
-                argument_matches
-            } else {
-                false
-            }
-        }
-    })
-}
-
-/// Whether call-result materialization owns the answer to this refinement gap.
-///
-/// The backward trace encounters a call's generic target-refinement gap before
-/// it invokes `materialize_call_result`. Opening the result at that point would
-/// make the later complete dispatch, binding, and callee-flow proof unable to
-/// close coverage. Defer only this exact result-value question to the
-/// materializer. It retains open coverage for unresolved, external, ambiguous,
-/// or otherwise incomplete callees, while gaps on the callee value, receiver,
-/// arguments, and thrown value keep their ordinary heap meaning.
-fn call_result_materialization_owns_gap(
-    procedure: &ProcedureHandle,
-    gap: &SemanticGap,
-    value: crate::analyzer::semantic::ValueId,
-) -> bool {
-    call_target_refinement_call(procedure.semantics(), gap)
-        .and_then(|call| procedure.semantics().call_site(call))
-        .is_some_and(|call| call.normal_result_values().any(|result| result == value))
-}
 
 /// Return the one complete, override-covering summary for a proven external
 /// boundary. A summary that declares an input escape also closes the caller's
 /// argument-evaluation gap: the external body is absent, but the reviewed
 /// summary accounts for the value crossing that boundary.
-fn complete_external_summary<'a>(
+pub(crate) fn complete_external_summary<'a>(
     oracle: &'a WorkspaceSemanticOracle<'_>,
     dispatch: &DispatchResult,
 ) -> Option<&'a CompiledProcedureSummary> {
@@ -525,58 +134,8 @@ fn complete_external_summary<'a>(
         .then_some(summary)
 }
 
-fn complete_external_summary_escapes_value(
-    summary: &CompiledProcedureSummary,
-    call_row: &SemanticCallSite,
-    value: crate::analyzer::semantic::ValueId,
-) -> bool {
-    let inputs = std::iter::once((CompiledSummaryInput::Receiver {}, call_row.receiver)).chain(
-        call_row
-            .arguments
-            .iter()
-            .enumerate()
-            .filter_map(|(ordinal, argument)| {
-                Some((
-                    CompiledSummaryInput::Parameter {
-                        ordinal: u32::try_from(ordinal).ok()?,
-                    },
-                    Some(argument.value),
-                ))
-            }),
-    );
-    inputs
-        .filter(|(_, actual)| *actual == Some(value))
-        .any(|(input, _)| {
-            summary.effects.iter().any(|effect| {
-                matches!(
-                    effect,
-                    CompiledSummaryEffect::Escape {
-                        input: escaped_input,
-                        ..
-                    } if *escaped_input == input
-                )
-            })
-        })
-}
-
-fn complete_external_summary_preserves_receiver(
-    summary: &CompiledProcedureSummary,
-    call_row: &SemanticCallSite,
-    value: crate::analyzer::semantic::ValueId,
-) -> bool {
-    call_row.receiver == Some(value)
-        && summary.transfers.iter().any(|transfer| {
-            transfer.exit_kind == CompiledSummaryExitKind::Normal
-                && matches!(transfer.input, CompiledSummaryInput::Receiver {})
-                && matches!(
-                    transfer.output,
-                    CompiledSummaryOutput::NormalReturn {} | CompiledSummaryOutput::Receiver {}
-                )
-        })
-}
-
 #[allow(clippy::too_many_arguments)]
-fn modeled_external_call_gap_discharges_value(
+pub(crate) fn modeled_external_call_gap_discharges_value(
     oracle: &WorkspaceSemanticOracle<'_>,
     procedure: &ProcedureHandle,
     gap: &SemanticGap,
@@ -624,463 +183,12 @@ fn modeled_external_call_gap_discharges_value(
     Ok(preserves || escapes)
 }
 
-fn points_to_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
-    let capabilities = procedure.artifact().capabilities();
-    value_flow_core_capabilities_are_open(procedure)
-        || !capabilities.is_available(SemanticCapability::Captures)
-}
-
-pub(super) fn points_to_capability_surface_is_incomplete(procedure: &ProcedureHandle) -> bool {
-    let capabilities = procedure.artifact().capabilities();
-    [
-        SemanticCapability::Values,
-        SemanticCapability::Assignments,
-        SemanticCapability::Allocations,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::Captures,
-    ]
-    .into_iter()
-    .any(|capability| !capabilities.is_complete(capability))
-}
-
-fn location_capabilities_are_open(access: &AccessPathAtPoint) -> bool {
-    let procedure = access.point().procedure();
-    let capabilities = procedure.artifact().capabilities();
-    points_to_capabilities_are_open(procedure)
-        || matches!(access.path().root(), AccessPathRoot::Static(_))
-            && !capabilities.is_available(SemanticCapability::StaticMemory)
-        || access
-            .path()
-            .selectors()
-            .iter()
-            .any(|selector| match selector {
-                crate::analyzer::semantic::AccessSelector::Field(_)
-                | crate::analyzer::semantic::AccessSelector::Property(_) => {
-                    !capabilities.is_available(SemanticCapability::FieldMemory)
-                }
-                crate::analyzer::semantic::AccessSelector::Index(_) => {
-                    !capabilities.is_available(SemanticCapability::IndexMemory)
-                }
-            })
-}
-
-/// Cyclic control-flow membership for one procedure, derived once per query.
-///
-/// `loop_regions` (#2102) is the workspace's one loop-membership algorithm and
-/// it is SCC-based, so it names an irreducible cycle as well as a natural loop.
-/// Membership is the whole allocation-cardinality question: a site inside a
-/// cyclic region runs an unbounded number of times per activation, so its
-/// abstraction summarizes many runtime objects, while a site outside every
-/// cyclic region runs at most once. The region's back edges are the exact
-/// evidence for that claim, which a per-allocation reachability walk could only
-/// approximate with every edge it happened to visit.
-struct CyclicRegions {
-    region_by_point: Box<[Option<usize>]>,
-    back_edge_evidence: Box<[Box<[crate::analyzer::semantic::EvidenceId]>]>,
-}
-
-impl CyclicRegions {
-    /// Evidence that the allocation point is inside a cyclic region, or `None`
-    /// when it is not.
-    fn cycle_evidence(
-        &self,
-        point: crate::analyzer::semantic::ProgramPointId,
-    ) -> Option<&[crate::analyzer::semantic::EvidenceId]> {
-        self.region_by_point
-            .get(point.index())
-            .copied()
-            .flatten()
-            .map(|region| self.back_edge_evidence[region].as_ref())
-    }
-}
-
-/// Derive cyclic membership, or `None` when the bounded algorithm could not
-/// answer. A caller that receives `None` must not claim a singleton.
-fn cyclic_regions(
-    procedure: &ProcedureHandle,
-    staged: &mut WorkStager,
-    cancellation: &crate::cancellation::CancellationToken,
-) -> Result<Option<CyclicRegions>, Interruption> {
-    let semantics = procedure.semantics();
-    staged.charge(SemanticWork {
-        program_points: semantics.points().len(),
-        control_edges: semantics.control_edges().len(),
-        ..SemanticWork::default()
-    })?;
-    let mut budget = CfgAlgorithmBudget::default();
-    let regions = match loop_regions(
-        semantics,
-        &mut CfgAlgorithmRequest::new(&mut budget, cancellation),
-    ) {
-        Ok(regions) => regions,
-        Err(CfgAlgorithmError::Cancelled { .. }) => return Err(Interruption::Cancelled),
-        Err(CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::InvalidNode(_)) => {
-            return Ok(None);
-        }
-    };
-    let mut region_by_point = vec![None; semantics.points().len()];
-    let mut back_edge_evidence = Vec::with_capacity(regions.regions.len());
-    for (index, region) in regions.regions.iter().enumerate() {
-        for member in &region.members {
-            region_by_point[member.index()] = Some(index);
-        }
-        back_edge_evidence.push(
-            region
-                .back_edges
-                .iter()
-                .filter_map(|edge| semantics.control_edge(*edge).map(|row| row.evidence))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-    }
-    Ok(Some(CyclicRegions {
-        region_by_point: region_by_point.into_boxed_slice(),
-        back_edge_evidence: back_edge_evidence.into_boxed_slice(),
-    }))
-}
-
-/// Whether a closure publishes this allocation outside its own activation.
-///
-/// A captured allocation is reachable from another procedure's activation, and
-/// this procedure's loop and recursion evidence says nothing about how many
-/// times that activation ran the site. The same rule already makes a
-/// [`AccessPathRoot::CaptureSlot`] root a summary object; applying it to the
-/// allocation the capture names keeps the two answers consistent.
-fn allocation_is_captured(
-    procedure: &ProcedureHandle,
-    allocation: crate::analyzer::semantic::AllocationId,
-    result: crate::analyzer::semantic::ValueId,
-) -> bool {
-    procedure.semantics().captures().iter().any(|capture| {
-        capture.environment == allocation
-            || capture.callable == result
-            || match capture.captured {
-                CaptureSource::Value(value) => value == result,
-                CaptureSource::Location(location) => procedure
-                    .semantics()
-                    .memory_location(location)
-                    .is_some_and(|row| row.kind.uses_value(result)),
-            }
-    })
-}
-
-fn push_object(
-    drafts: &mut Vec<ObjectDraft>,
-    object: AbstractObject,
-    evidence: Vec<EvidenceHandle>,
-) {
-    let evidence = dedup_evidence(evidence);
-    let quality = evidence_quality(&evidence);
-    push_object_with_quality(drafts, object, evidence, quality);
-}
-
-fn push_object_with_quality(
-    drafts: &mut Vec<ObjectDraft>,
-    object: AbstractObject,
-    evidence: Vec<EvidenceHandle>,
-    quality: (ProofStatus, EvidenceCompleteness),
-) {
-    let evidence = dedup_evidence(evidence);
-    let quality = merge_quality(&quality, &evidence_quality(&evidence));
-    if let Some(existing) = drafts
-        .iter_mut()
-        .find(|candidate| candidate.object == object)
-    {
-        existing.evidence = dedup_evidence(existing.evidence.iter().cloned().chain(evidence));
-        let merged = merge_quality(
-            &(existing.proof.clone(), existing.completeness.clone()),
-            &quality,
-        );
-        existing.proof = merged.0;
-        existing.completeness = merged.1;
-    } else {
-        drafts.push(ObjectDraft {
-            object,
-            evidence,
-            proof: quality.0,
-            completeness: quality.1,
-            runtime_read: None,
-        });
-    }
-}
-
-fn push_trace_object(
-    drafts: &mut Vec<ObjectDraft>,
-    object: AbstractObject,
-    evidence: Vec<EvidenceHandle>,
-    alternative_quality: &Option<(ProofStatus, EvidenceCompleteness)>,
-) {
-    if let Some(quality) = alternative_quality {
-        push_object_with_quality(
-            drafts,
-            object,
-            evidence.clone(),
-            merge_quality(quality, &evidence_quality(&evidence)),
-        );
-    } else {
-        push_object(drafts, object, evidence);
-    }
-}
-
-fn truncate_object_drafts(
-    drafts: &mut Vec<ObjectDraft>,
-    limits: crate::analyzer::semantic::OracleLimits,
-) {
-    drafts.truncate(limits.objects_per_value().min(limits.provenance_records()));
-    let mut remaining_evidence = limits.evidence_handles();
-    let mut retained = 0usize;
-    for draft in drafts.iter_mut() {
-        if remaining_evidence == 0 {
-            break;
-        }
-        if draft.evidence.len() > remaining_evidence {
-            draft.evidence.truncate(remaining_evidence);
-            draft.completeness = EvidenceCompleteness::Partial(
-                "points-to provenance was truncated by the oracle evidence limit".into(),
-            );
-        }
-        remaining_evidence = remaining_evidence.saturating_sub(draft.evidence.len());
-        retained += 1;
-    }
-    drafts.truncate(retained);
-}
-
-fn symbolic_object(
-    procedure: &ProcedureHandle,
-    value: ValueHandle,
-    evidence: Vec<EvidenceHandle>,
-) -> Result<ObjectDraft, SemanticProviderError> {
-    let row = procedure
-        .semantics()
-        .value(value.id())
-        .ok_or_else(|| SemanticProviderError::internal("value handle is stale"))?;
-    let identity = match &row.kind {
-        SemanticValueKind::Parameter { ordinal, .. } => AbstractObjectIdentity::ProcedurePort(
-            ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
-                .map_err(|error| internal_contract("invalid parameter object", error))?,
-        ),
-        SemanticValueKind::Receiver { .. } => AbstractObjectIdentity::ProcedurePort(
-            ProcedurePortHandle::receiver(procedure.clone())
-                .map_err(|error| internal_contract("invalid receiver object", error))?,
-        ),
-        _ => AbstractObjectIdentity::Value(value),
-    };
-    let object = AbstractObject::new(identity, ObjectCardinality::Unknown)
-        .map_err(|error| internal_contract("invalid symbolic object", error))?;
-    let evidence = dedup_evidence(evidence);
-    let quality = evidence_quality(&evidence);
-    Ok(ObjectDraft {
-        object,
-        evidence,
-        proof: quality.0,
-        completeness: quality.1,
-        runtime_read: None,
-    })
-}
-
-/// The evidence a reverse trace has collected on its way to a state.
-///
-/// A trace extends its evidence by one handle per step, so a copy per step costs
-/// time quadratic in the trace length, and every store of a large array literal
-/// traces back across the whole literal. The trail is a persistent list: a step
-/// is one shared node, and the deduplicated, first-seen-ordered handles are
-/// materialized only where a draft or a callee needs them.
-#[derive(Clone, Default)]
-struct EvidenceTrail(Option<Arc<EvidenceTrailNode>>);
-
-struct EvidenceTrailNode {
-    parent: EvidenceTrail,
-    handle: EvidenceHandle,
-}
-
-impl EvidenceTrail {
-    fn with(self, handle: EvidenceHandle) -> Self {
-        Self(Some(Arc::new(EvidenceTrailNode {
-            parent: self,
-            handle,
-        })))
-    }
-
-    /// The trail's handles from the trace's start, each kept at its first
-    /// occurrence.
-    fn to_vec(&self) -> Vec<EvidenceHandle> {
-        let mut newest_first = Vec::new();
-        let mut node = self.0.as_deref();
-        while let Some(current) = node {
-            newest_first.push(&current.handle);
-            node = current.parent.0.as_deref();
-        }
-        dedup_evidence(newest_first.into_iter().rev().cloned())
-    }
-
-    fn to_vec_with(&self, handle: EvidenceHandle) -> Vec<EvidenceHandle> {
-        dedup_evidence(self.to_vec().into_iter().chain(std::iter::once(handle)))
-    }
-}
-
-impl Drop for EvidenceTrailNode {
-    /// Release a long trail iteratively so its drop does not recurse once per
-    /// step.
-    fn drop(&mut self) {
-        let mut next = self.parent.0.take();
-        while let Some(node) = next {
-            match Arc::try_unwrap(node) {
-                Ok(mut node) => next = node.parent.0.take(),
-                Err(_) => break,
-            }
-        }
-    }
-}
-
-/// How the evidence of the state a trace step produces relates to the evidence
-/// the step inherited.
-enum ProducerEvidence {
-    /// The produced state starts a new evidence trail.
-    Fresh,
-    /// The produced state continues the inherited trail with this handle.
-    Extends(EvidenceHandle),
-}
-
-#[allow(clippy::too_many_arguments)]
-fn allocation_object_draft(
-    procedure: &ProcedureHandle,
-    query: &ValueAtPoint,
-    allocation: crate::analyzer::semantic::AllocationId,
-    inherited_evidence: &[EvidenceHandle],
-    event_evidence: EvidenceHandle,
-    cyclic: &mut Option<Option<CyclicRegions>>,
-    staged: &mut WorkStager,
-    cancellation: &crate::cancellation::CancellationToken,
-) -> Result<ObjectDraft, InterruptionOrProvider> {
-    let allocation_row = procedure
-        .semantics()
-        .allocation(allocation)
-        .ok_or_else(|| {
-            InterruptionOrProvider::Provider(SemanticProviderError::internal(
-                "allocation effect has a stale allocation ID",
-            ))
-        })?;
-    staged
-        .charge(SemanticWork {
-            allocations: 1,
-            ..SemanticWork::default()
-        })
-        .map_err(InterruptionOrProvider::Interruption)?;
-    if cyclic.is_none() {
-        *cyclic = Some(
-            cyclic_regions(procedure, staged, cancellation)
-                .map_err(InterruptionOrProvider::Interruption)?,
-        );
-    }
-    let regions = cyclic
-        .as_ref()
-        .expect("cyclic membership was derived above")
-        .as_ref();
-    let cycle_evidence = regions
-        .and_then(|regions| regions.cycle_evidence(allocation_row.point))
-        .map(<[_]>::to_vec);
-    let handle = procedure.allocation_handle(allocation).ok_or_else(|| {
-        InterruptionOrProvider::Provider(SemanticProviderError::internal(
-            "allocation handle is stale",
-        ))
-    })?;
-    let recursive_context = query
-        .context()
-        .calls()
-        .iter()
-        .any(|call| call.procedure() == procedure);
-    let cardinality = if cycle_evidence.is_some() || recursive_context {
-        ObjectCardinality::Summary
-    } else if regions.is_some()
-        && !allocation_is_captured(procedure, allocation, allocation_row.result)
-    {
-        ObjectCardinality::Singleton
-    } else {
-        ObjectCardinality::Unknown
-    };
-    let object = AbstractObject::new(AbstractObjectIdentity::Allocation(handle), cardinality)
-        .map_err(|error| {
-            InterruptionOrProvider::Provider(internal_contract("invalid allocation object", error))
-        })?;
-    let cycle_evidence = cycle_evidence
-        .unwrap_or_default()
-        .into_iter()
-        .map(|id| evidence_handle(procedure, id))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(InterruptionOrProvider::Provider)?;
-    let recursive_evidence = query
-        .context()
-        .calls()
-        .iter()
-        .filter(|call| call.procedure() == procedure)
-        .map(|call| {
-            let row = call
-                .procedure()
-                .semantics()
-                .call_site(call.id())
-                .ok_or_else(|| {
-                    SemanticProviderError::internal(
-                        "oracle call context contains a stale call site",
-                    )
-                })?;
-            evidence_handle(call.procedure(), row.evidence)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(InterruptionOrProvider::Provider)?;
-    let evidence = dedup_evidence(
-        inherited_evidence
-            .iter()
-            .cloned()
-            .chain([
-                event_evidence,
-                evidence_handle(procedure, allocation_row.evidence)
-                    .map_err(InterruptionOrProvider::Provider)?,
-            ])
-            .chain(cycle_evidence)
-            .chain(recursive_evidence),
-    );
-    let quality = evidence_quality(&evidence);
-    Ok(ObjectDraft {
-        object,
-        evidence,
-        proof: quality.0,
-        completeness: quality.1,
-        runtime_read: None,
-    })
-}
-
-#[derive(Debug, Default)]
-struct CallResultResolution {
-    open: bool,
-    truncated: bool,
-    ambiguous: bool,
-}
-
-impl CallResultResolution {
-    fn absorb_coverage(&mut self, coverage: CandidateCoverage) {
-        match coverage {
-            CandidateCoverage::Exhaustive => {}
-            CandidateCoverage::Open => self.open = true,
-            CandidateCoverage::Truncated => self.truncated = true,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum ModeledExternalCallResult {
-    Fresh,
-    Receiver(ValueHandle),
-}
-
 /// Return the object identity an activated complete summary assigns to one
 /// exact external call result. The ordinary heap trace cannot materialize a
 /// body outside the workspace, so it would otherwise retain a symbolic value
 /// with open coverage even when the summary proves either a fresh normal result
 /// or a receiver-to-return identity.
-fn modeled_external_call_result(
+pub(crate) fn modeled_external_call_result(
     oracle: &WorkspaceSemanticOracle<'_>,
     dispatch: &DispatchResult,
     call_row: &SemanticCallSite,
@@ -1118,7 +226,7 @@ fn modeled_external_call_result(
 /// normal continuation is represented by a different program point, so the
 /// point-indexed heap trace cannot discover the chain by itself. The scan is
 /// procedure-local and the visited value set is retained for this query only.
-fn modeled_external_receiver_identity(
+pub(crate) fn modeled_external_receiver_identity(
     oracle: &WorkspaceSemanticOracle<'_>,
     procedure: &ProcedureHandle,
     value: ValueHandle,
@@ -1176,33 +284,8 @@ fn modeled_external_receiver_identity(
     }
 }
 
-fn outcome_is_open<T>(outcome: &SemanticOutcome<T>) -> bool {
-    matches!(
-        outcome,
-        SemanticOutcome::Unknown { .. }
-            | SemanticOutcome::Unsupported { .. }
-            | SemanticOutcome::Unproven { .. }
-    )
-}
-
-fn outcome_is_ambiguous<T>(outcome: &SemanticOutcome<T>) -> bool {
-    matches!(outcome, SemanticOutcome::Ambiguous { .. })
-}
-
-fn outcome_interruption<T>(outcome: &SemanticOutcome<T>) -> Option<Interruption> {
-    match outcome {
-        SemanticOutcome::ExceededBudget { exceeded, .. } => Some(Interruption::Budget(*exceeded)),
-        SemanticOutcome::Cancelled { .. } => Some(Interruption::Cancelled),
-        SemanticOutcome::Complete { .. }
-        | SemanticOutcome::Ambiguous { .. }
-        | SemanticOutcome::Unknown { .. }
-        | SemanticOutcome::Unsupported { .. }
-        | SemanticOutcome::Unproven { .. } => None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn materialize_call_result(
+pub(crate) fn materialize_call_result(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
     state: &TraceState,
@@ -1258,7 +341,7 @@ fn materialize_call_result(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn materialize_one_call_result(
+pub(crate) fn materialize_one_call_result(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
     state: &TraceState,
@@ -1461,83 +544,11 @@ fn materialize_one_call_result(
     Ok(resolution)
 }
 
-/// Rust field identity is closed only when the adapter retained either the
-/// declaration locator or its cross-file canonical AST-selector locator.
-/// Other languages and unsupported Rust selectors keep their prior open
-/// field-load behavior.
-fn rust_field_identity_is_supported(
-    procedure: &ProcedureHandle,
-    member: &crate::analyzer::semantic::SemanticLocator,
-) -> bool {
-    matches!(
-        procedure.artifact().key().language(),
-        crate::analyzer::semantic::SemanticLanguage::Standard(crate::analyzer::Language::Rust)
-    ) && (member.is_artifact_independent_field()
-        || member.declaration() != procedure.semantics().locator().declaration())
-}
-
-#[derive(Clone)]
-struct IncomingActualQuery {
-    observation: ValueAtPoint,
-    proof: ProofStatus,
-    completeness: EvidenceCompleteness,
-    identity_context: crate::analyzer::semantic::OracleCallContext,
-}
-
-pub(super) type IncomingActualKey = (
-    (
-        crate::analyzer::semantic::SemanticArtifactKey,
-        crate::analyzer::semantic::ProcedureId,
-    ),
-    crate::analyzer::semantic::ValueId,
-    crate::analyzer::semantic::OracleCallContext,
-);
-
-#[derive(Clone)]
-pub(super) struct IncomingActualSet {
-    candidates: Vec<IncomingActualQuery>,
-    open: bool,
-}
-
-#[derive(Clone, Copy)]
-struct IncomingActualContext<'a> {
-    query: &'a crate::analyzer::semantic::OracleCallContext,
-    limits: crate::analyzer::semantic::OracleLimits,
-    proven_incoming_relation: bool,
-}
-
-fn substitute_object_into_callee(
-    object: AbstractObject,
-    procedure: &ProcedureHandle,
-    context: &crate::analyzer::semantic::OracleCallContext,
-) -> Result<AbstractObject, SemanticProviderError> {
-    let base = object.identity().durable_identity().map_err(|error| {
-        SemanticProviderError::internal(format!(
-            "could not make incoming object identity durable: {error}"
-        ))
-    })?;
-    let cardinality = object.cardinality();
-    // The handle scope is rehomed to the result procedure. Keep the bounded
-    // query context in the durable identity, while incoming edges only select
-    // possible actuals; encoding each enumerated edge here would split one
-    // caller object into several identities for a context-insensitive query.
-    AbstractObject::new(
-        AbstractObjectIdentity::CallSubstitution {
-            procedure: procedure.clone(),
-            context: context.clone(),
-            base: Box::new(base),
-            base_cardinality: cardinality,
-        },
-        cardinality,
-    )
-    .map_err(|error| internal_contract("invalid incoming object substitution", error))
-}
-
 /// Find semantic call handles for one already-proven source caller and call
 /// range. The source-level call relation has selected the caller, so scan only
 /// that procedure's call rows instead of rediscovering the call by walking all
 /// call sites in the caller artifact for every incoming actual.
-fn incoming_semantic_call_handles(
+pub(crate) fn incoming_semantic_call_handles(
     artifact: &Arc<SemanticArtifact>,
     caller: &crate::analyzer::CodeUnit,
     analyzer: &dyn crate::analyzer::IAnalyzer,
@@ -1546,21 +557,17 @@ fn incoming_semantic_call_handles(
     staged: &mut WorkStager,
 ) -> Result<(Vec<CallSiteHandle>, bool), InterruptionOrProvider> {
     let ranges = analyzer.ranges(caller);
-    staged
-        .charge(SemanticWork {
-            source_mappings: ranges.len(),
-            nested_entries: ranges.len(),
-            ..SemanticWork::default()
-        })
-        .map_err(InterruptionOrProvider::Interruption)?;
+    staged.charge_work(SemanticWork {
+        source_mappings: ranges.len(),
+        nested_entries: ranges.len(),
+        ..SemanticWork::default()
+    });
     let mut procedures = Vec::new();
     for procedure in artifact.procedures() {
-        staged
-            .charge(SemanticWork {
-                procedures: 1,
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
+        staged.charge_work(SemanticWork {
+            procedures: 1,
+            ..SemanticWork::default()
+        });
         let span = procedure.locator().anchor().span();
         if ranges.iter().any(|candidate| {
             candidate.start_byte == span.start_byte() as usize
@@ -1580,13 +587,11 @@ fn incoming_semantic_call_handles(
             .procedure_handle(procedure.id())
             .expect("semantic artifact procedure has a scoped handle");
         for semantic_call in procedure.call_sites() {
-            staged
-                .charge(SemanticWork {
-                    call_sites: 1,
-                    source_mappings: 1,
-                    ..SemanticWork::default()
-                })
-                .map_err(InterruptionOrProvider::Interruption)?;
+            staged.charge_work(SemanticWork {
+                call_sites: 1,
+                source_mappings: 1,
+                ..SemanticWork::default()
+            });
             let Some(mapping) = procedure.source_mapping(semantic_call.source) else {
                 continue;
             };
@@ -1612,7 +617,7 @@ fn incoming_semantic_call_handles(
                     ))
                 })?;
             staged
-                .charge(SemanticWork {
+                .admit(SemanticWork {
                     nested_entries: 1,
                     ..SemanticWork::default()
                 })
@@ -1625,7 +630,7 @@ fn incoming_semantic_call_handles(
     Ok((calls, truncated))
 }
 
-fn incoming_call_actual_queries(
+pub(crate) fn incoming_call_actual_queries(
     oracle: &WorkspaceSemanticOracle<'_>,
     call: &CallSiteHandle,
     target: &ProcedureHandle,
@@ -1834,7 +839,8 @@ fn incoming_call_actual_queries(
 /// services. This is query-local: every retained site and actual is charged
 /// to the semantic budget on the first enumeration; completed bindings are
 /// reused without another charge for the lifetime of this query provider.
-fn incoming_actual_queries(
+#[doc(hidden)]
+pub fn incoming_actual_queries(
     oracle: &WorkspaceSemanticOracle<'_>,
     procedure: &ProcedureHandle,
     formal_value: crate::analyzer::semantic::ValueId,
@@ -1871,7 +877,7 @@ fn incoming_actual_queries(
     Ok(answer)
 }
 
-fn compute_incoming_actual_queries(
+pub(crate) fn compute_incoming_actual_queries(
     oracle: &WorkspaceSemanticOracle<'_>,
     procedure: &ProcedureHandle,
     formal_value: crate::analyzer::semantic::ValueId,
@@ -1896,26 +902,22 @@ fn compute_incoming_actual_queries(
     let target_start = span.start_byte() as usize;
     let target_end = span.end_byte() as usize;
     let declarations = analyzer.declarations(&file);
-    staged
-        .charge(SemanticWork {
-            procedures: declarations.len(),
-            nested_entries: declarations.len(),
-            ..SemanticWork::default()
-        })
-        .map_err(InterruptionOrProvider::Interruption)?;
+    staged.charge_work(SemanticWork {
+        procedures: declarations.len(),
+        nested_entries: declarations.len(),
+        ..SemanticWork::default()
+    });
     let mut matching = Vec::new();
     for declaration in declarations {
         if !declaration.is_callable() {
             continue;
         }
         let ranges = analyzer.ranges(&declaration);
-        staged
-            .charge(SemanticWork {
-                source_mappings: ranges.len(),
-                nested_entries: ranges.len(),
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
+        staged.charge_work(SemanticWork {
+            source_mappings: ranges.len(),
+            nested_entries: ranges.len(),
+            ..SemanticWork::default()
+        });
         if ranges
             .iter()
             .any(|range| range.start_byte == target_start && range.end_byte == target_end)
@@ -1930,38 +932,27 @@ fn compute_incoming_actual_queries(
     let target = matching
         .pop()
         .expect("one matching callable was checked above");
-    let remaining = staged.budget.remaining();
-    if remaining.source_bytes == 0 || remaining.nested_entries == 0 {
-        staged
-            .charge(SemanticWork {
-                source_bytes: 1,
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
-    }
     let scope = AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
     let sites = CallRelationService::incoming_bounded(
         analyzer,
         scope.token(),
         &target,
         CallRelationLimits {
-            max_files: remaining.nested_entries,
-            max_source_bytes: remaining.source_bytes,
+            max_files: usize::MAX,
+            max_source_bytes: usize::MAX,
             max_candidates: limits.call_binding_entries(),
         },
         Some(cancellation),
     );
-    staged
-        .charge(SemanticWork {
-            source_bytes: sites.work.scanned_source_bytes,
-            call_sites: sites.sites.len(),
-            nested_entries: sites
-                .work
-                .scanned_files
-                .saturating_add(sites.work.examined_candidates),
-            ..SemanticWork::default()
-        })
-        .map_err(InterruptionOrProvider::Interruption)?;
+    staged.charge_work(SemanticWork {
+        source_bytes: sites.work.scanned_source_bytes,
+        call_sites: sites.sites.len(),
+        nested_entries: sites
+            .work
+            .scanned_files
+            .saturating_add(sites.work.examined_candidates),
+        ..SemanticWork::default()
+    });
     if sites.proof_authority != UsageProofAuthority::Native && sites.sites.is_empty() {
         // Cross-procedure substitution requires exact reverse-call and binding
         // facts. Without a reverse-call row, keep other language adapters'
@@ -2081,7 +1072,7 @@ fn compute_incoming_actual_queries(
     Ok(result)
 }
 
-fn resolve_objects(
+pub(crate) fn resolve_objects(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
     limits: crate::analyzer::semantic::OracleLimits,
@@ -2101,7 +1092,7 @@ fn resolve_objects(
     )
 }
 
-fn resolve_objects_with_active_query(
+pub(crate) fn resolve_objects_with_active_query(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
     limits: crate::analyzer::semantic::OracleLimits,
@@ -2134,7 +1125,7 @@ fn resolve_objects_with_active_query(
     result
 }
 
-fn resolve_objects_inner(
+pub(crate) fn resolve_objects_inner(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
     limits: crate::analyzer::semantic::OracleLimits,
@@ -2144,13 +1135,11 @@ fn resolve_objects_inner(
     active_queries: &mut HashSet<ValueAtPoint>,
 ) -> Result<DraftSet<ObjectDraft>, InterruptionOrProvider> {
     let procedure = query.point().procedure();
-    staged
-        .charge(SemanticWork {
-            procedures: 1,
-            values: 1,
-            ..SemanticWork::default()
-        })
-        .map_err(InterruptionOrProvider::Interruption)?;
+    staged.charge_work(SemanticWork {
+        procedures: 1,
+        values: 1,
+        ..SemanticWork::default()
+    });
     let runtime_outcome = oracle
         .runtime_refinements_for_procedure(procedure, &mut staged.request(cancellation))
         .map_err(InterruptionOrProvider::Provider)?;
@@ -2215,14 +1204,12 @@ fn resolve_objects_inner(
         if !visited.insert(state.clone()) {
             continue;
         }
-        staged
-            .charge(SemanticWork {
-                program_points: 1,
-                values: 1,
-                nested_entries: 1,
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
+        staged.charge_work(SemanticWork {
+            program_points: 1,
+            values: 1,
+            nested_entries: 1,
+            ..SemanticWork::default()
+        });
         let point = procedure.semantics().point(state.point).ok_or_else(|| {
             InterruptionOrProvider::Provider(SemanticProviderError::internal(
                 "trace reached a stale program point",
@@ -2231,19 +1218,15 @@ fn resolve_objects_inner(
         let mut producer = None;
         let mut producer_alternative_quality = None;
         for (index, event) in point.events[..state.event_limit].iter().enumerate().rev() {
-            staged
-                .charge(SemanticWork {
-                    events: 1,
-                    ..SemanticWork::default()
-                })
-                .map_err(InterruptionOrProvider::Interruption)?;
+            staged.charge_work(SemanticWork {
+                events: 1,
+                ..SemanticWork::default()
+            });
             if let SemanticEffect::Gap { gap } = event.effect {
-                staged
-                    .charge(SemanticWork {
-                        gaps: 1,
-                        ..SemanticWork::default()
-                    })
-                    .map_err(InterruptionOrProvider::Interruption)?;
+                staged.charge_work(SemanticWork {
+                    gaps: 1,
+                    ..SemanticWork::default()
+                });
                 let gap = procedure.semantics().gap(gap).ok_or_else(|| {
                     InterruptionOrProvider::Provider(SemanticProviderError::internal(
                         "semantic gap event has a stale gap ID",
@@ -2608,12 +1591,10 @@ fn resolve_objects_inner(
                 .predecessor_edges(state.point)
                 .map(|(_, edge)| (edge.source_point, edge.evidence))
                 .collect::<Vec<_>>();
-            staged
-                .charge(SemanticWork {
-                    control_edges: predecessors.len(),
-                    ..SemanticWork::default()
-                })
-                .map_err(InterruptionOrProvider::Interruption)?;
+            staged.charge_work(SemanticWork {
+                control_edges: predecessors.len(),
+                ..SemanticWork::default()
+            });
             if predecessors.is_empty() {
                 let value = value_handle(procedure, state.value)
                     .map_err(InterruptionOrProvider::Provider)?;
@@ -2775,73 +1756,7 @@ fn resolve_objects_inner(
     })
 }
 
-enum InterruptionOrProvider {
-    Interruption(Interruption),
-    Provider(SemanticProviderError),
-}
-
-impl From<Interruption> for InterruptionOrProvider {
-    fn from(interruption: Interruption) -> Self {
-        Self::Interruption(interruption)
-    }
-}
-
-fn materialize_points_to(
-    query: &ValueAtPoint,
-    drafts: DraftSet<ObjectDraft>,
-    limits: crate::analyzer::semantic::OracleLimits,
-) -> Result<PointsToResult, SemanticProviderError> {
-    let records = drafts
-        .candidates
-        .iter()
-        .map(|draft| {
-            OracleRelationRecord::new(OracleRelationKind::PointsTo, draft.evidence.clone(), limits)
-                .map(|record| match &draft.runtime_read {
-                    Some(evidence) => record.with_runtime_read(evidence.clone()),
-                    None => record,
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| internal_contract("could not create points-to provenance", error))?;
-    let arena = OracleRelationArena::new(
-        OracleRelationOwner::PointsTo(Box::new(query.clone())),
-        records,
-        limits,
-    )
-    .map_err(|error| internal_contract("could not create points-to arena", error))?;
-    let candidates = drafts
-        .candidates
-        .into_iter()
-        .enumerate()
-        .map(|(index, draft)| {
-            let id = u32::try_from(index)
-                .map(OracleRelationId::new)
-                .map_err(|_| SemanticProviderError::internal("points-to relation ID overflow"))?;
-            OracleCandidate::new(
-                draft.object,
-                draft.proof,
-                draft.completeness,
-                [arena
-                    .handle(id)
-                    .expect("points-to record was inserted into the arena")],
-                limits,
-            )
-            .map_err(|error| internal_contract("invalid points-to candidate", error))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    PointsToResult::new(query.clone(), candidates, drafts.coverage, limits)
-        .map_err(|error| internal_contract("invalid points-to result", error))
-}
-
-fn candidate_publication_work(candidate_count: usize, evidence_count: usize) -> SemanticWork {
-    SemanticWork {
-        evidence: evidence_count,
-        nested_entries: candidate_count,
-        ..SemanticWork::default()
-    }
-}
-
-fn resolve_locations(
+pub(crate) fn resolve_locations(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &AccessPathAtPoint,
     limits: crate::analyzer::semantic::OracleLimits,
@@ -2901,13 +1816,11 @@ fn resolve_locations(
         }
         objects
     } else {
-        staged
-            .charge(SemanticWork {
-                procedures: 1,
-                memory_locations: 1,
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
+        staged.charge_work(SemanticWork {
+            procedures: 1,
+            memory_locations: 1,
+            ..SemanticWork::default()
+        });
         let gaps_open = heap_gaps_are_open(procedure, staged, cancellation, |_| true)
             .map_err(InterruptionOrProvider::Interruption)?;
         let open =
@@ -2971,7 +1884,7 @@ fn resolve_locations(
             ));
         }
         staged
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 nested_entries: 1,
                 ..SemanticWork::default()
             })
@@ -3021,503 +1934,13 @@ fn resolve_locations(
     })
 }
 
-fn materialize_locations(
-    query: &AccessPathAtPoint,
-    drafts: DraftSet<LocationDraft>,
-    limits: crate::analyzer::semantic::OracleLimits,
-) -> Result<LocationResult, SemanticProviderError> {
-    let records = drafts
-        .candidates
-        .iter()
-        .map(|draft| {
-            OracleRelationRecord::new(OracleRelationKind::Location, draft.evidence.clone(), limits)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| internal_contract("could not create location provenance", error))?;
-    let arena = OracleRelationArena::new(
-        OracleRelationOwner::Locations(Box::new(query.clone())),
-        records,
-        limits,
-    )
-    .map_err(|error| internal_contract("could not create location arena", error))?;
-    let candidates = drafts
-        .candidates
-        .into_iter()
-        .enumerate()
-        .map(|(index, draft)| {
-            let id = u32::try_from(index)
-                .map(OracleRelationId::new)
-                .map_err(|_| SemanticProviderError::internal("location relation ID overflow"))?;
-            OracleCandidate::new(
-                draft.location,
-                draft.proof,
-                draft.completeness,
-                [arena
-                    .handle(id)
-                    .expect("location record was inserted into the arena")],
-                limits,
-            )
-            .map_err(|error| internal_contract("invalid location candidate", error))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    LocationResult::new(query.clone(), candidates, drafts.coverage, limits)
-        .map_err(|error| internal_contract("invalid location result", error))
-}
-
-fn candidates_proven_complete<T>(candidates: &[T], quality: impl Fn(&T) -> bool) -> bool {
-    candidates.iter().all(quality)
-}
-
-fn publish_set_outcome<T>(
-    value: T,
-    coverage: CandidateCoverage,
-    proven_complete: bool,
-    ambiguous: bool,
-    interruption: Option<Interruption>,
-    work: SemanticWork,
-) -> SemanticOutcome<T> {
-    match interruption {
-        Some(Interruption::Budget(exceeded)) => SemanticOutcome::ExceededBudget {
-            partial: Some(value),
-            exceeded,
-            work,
-        },
-        Some(Interruption::Cancelled) => SemanticOutcome::Cancelled {
-            partial: Some(value),
-            work,
-        },
-        None if coverage == CandidateCoverage::Truncated || !proven_complete => {
-            SemanticOutcome::Unproven {
-                partial: value,
-                work,
-            }
-        }
-        None if coverage == CandidateCoverage::Open => SemanticOutcome::Unknown {
-            partial: Some(value),
-            work,
-        },
-        None if ambiguous => SemanticOutcome::Ambiguous {
-            candidates: value,
-            work,
-        },
-        None => SemanticOutcome::Complete { value, work },
-    }
-}
-
-fn paths_structurally_disjoint(left: &AbstractLocation, right: &AbstractLocation) -> bool {
-    use AbstractObjectIdentity as Identity;
-    if left.object().identity() != right.object().identity() {
-        return matches!(
-            (left.object().identity(), right.object().identity()),
-            (Identity::Allocation(_), Identity::Allocation(_))
-                | (Identity::LexicalCell(_), Identity::LexicalCell(_))
-                | (Identity::CaptureSlot(_), Identity::CaptureSlot(_))
-                | (Identity::Static(_), Identity::Static(_))
-                | (Identity::Allocation(_), Identity::LexicalCell(_))
-                | (Identity::LexicalCell(_), Identity::Allocation(_))
-                | (Identity::Allocation(_), Identity::CaptureSlot(_))
-                | (Identity::CaptureSlot(_), Identity::Allocation(_))
-                | (Identity::LexicalCell(_), Identity::CaptureSlot(_))
-                | (Identity::CaptureSlot(_), Identity::LexicalCell(_))
-        );
-    }
-    if !left.path().is_exact() || !right.path().is_exact() {
-        return false;
-    }
-    left.path()
-        .selectors()
-        .iter()
-        .zip(right.path().selectors())
-        .find(|(left, right)| left != right)
-        .is_some_and(|(left, right)| {
-            matches!(
-                (left, right),
-                (
-                    crate::analyzer::semantic::AccessSelector::Field(_),
-                    crate::analyzer::semantic::AccessSelector::Field(_)
-                ) | (
-                    crate::analyzer::semantic::AccessSelector::Property(_),
-                    crate::analyzer::semantic::AccessSelector::Property(_)
-                )
-            )
-        })
-}
-
-fn alias_relation(
-    query: &AliasQuery,
-    left: &DraftSet<LocationDraft>,
-    right: &DraftSet<LocationDraft>,
-) -> AliasRelation {
-    let exhaustive = left.coverage == CandidateCoverage::Exhaustive
-        && right.coverage == CandidateCoverage::Exhaustive
-        && left.candidates.iter().all(|candidate| {
-            matches!(candidate.proof, ProofStatus::Proven)
-                && matches!(candidate.completeness, EvidenceCompleteness::Complete)
-        })
-        && right.candidates.iter().all(|candidate| {
-            matches!(candidate.proof, ProofStatus::Proven)
-                && matches!(candidate.completeness, EvidenceCompleteness::Complete)
-        });
-    if query.left() == query.right() {
-        return AliasRelation::MustAlias;
-    }
-    if exhaustive
-        && left.candidates.len() == 1
-        && right.candidates.len() == 1
-        && left.candidates[0].location == right.candidates[0].location
-        && left.candidates[0].location.path().is_exact()
-        && left.candidates[0].location.object().cardinality() == ObjectCardinality::Singleton
-    {
-        return AliasRelation::MustAlias;
-    }
-    if exhaustive
-        && !left.candidates.is_empty()
-        && !right.candidates.is_empty()
-        && left.candidates.iter().all(|left| {
-            right
-                .candidates
-                .iter()
-                .all(|right| paths_structurally_disjoint(&left.location, &right.location))
-        })
-    {
-        AliasRelation::Disjoint
-    } else {
-        AliasRelation::MayAlias
-    }
-}
-
-fn materialize_alias(
-    query: &AliasQuery,
-    relation: AliasRelation,
-    evidence: Vec<EvidenceHandle>,
-    quality: (ProofStatus, EvidenceCompleteness),
-    limits: crate::analyzer::semantic::OracleLimits,
-) -> Result<AliasResult, SemanticProviderError> {
-    let record = OracleRelationRecord::new(OracleRelationKind::Alias, evidence, limits)
-        .map_err(|error| internal_contract("could not create alias provenance", error))?;
-    let arena = OracleRelationArena::new(
-        OracleRelationOwner::Alias(Box::new(query.clone())),
-        vec![record],
-        limits,
-    )
-    .map_err(|error| internal_contract("could not create alias arena", error))?;
-    let answer = OracleCandidate::new(
-        relation,
-        quality.0,
-        quality.1,
-        [arena
-            .handle(OracleRelationId::new(0))
-            .expect("alias record was inserted into the arena")],
-        limits,
-    )
-    .map_err(|error| internal_contract("invalid alias answer", error))?;
-    AliasResult::new(query.clone(), answer, limits)
-        .map_err(|error| internal_contract("invalid alias result", error))
-}
-
-fn direct_weak_reasons(
-    coverage: CandidateCoverage,
-    locations: &[LocationDraft],
-) -> Box<[WeakUpdateReason]> {
-    let mut reasons = Vec::new();
-    match coverage {
-        CandidateCoverage::Exhaustive => {}
-        CandidateCoverage::Open => {
-            reasons.push(WeakUpdateReason::NonExhaustiveLocations);
-            reasons.push(WeakUpdateReason::NonExhaustiveObjects);
-        }
-        CandidateCoverage::Truncated => {
-            reasons.push(WeakUpdateReason::TruncatedLocations);
-            reasons.push(WeakUpdateReason::TruncatedObjects);
-        }
-    }
-    if locations.is_empty() {
-        reasons.push(WeakUpdateReason::NoLocation);
-        reasons.push(WeakUpdateReason::NoObject);
-    }
-    reasons.sort_unstable_by_key(|reason| *reason as u8);
-    reasons.dedup();
-    reasons.into_boxed_slice()
-}
-
-fn push_publication(
-    drafts: &mut Vec<PublicationDraft>,
-    publication: FreshObjectPublication,
-    evidence: Vec<EvidenceHandle>,
-    candidate_identity: bool,
-) {
-    let evidence = dedup_evidence(evidence);
-    let mut quality = evidence_quality(&evidence);
-    if candidate_identity {
-        quality = merge_quality(
-            &quality,
-            &(
-                ProofStatus::Unproven(
-                    "fresh-object identity crosses a Go assignment conversion".into(),
-                ),
-                EvidenceCompleteness::Partial(
-                    "fresh-object identity crosses a Go assignment conversion".into(),
-                ),
-            ),
-        );
-    }
-    if let Some(existing) = drafts
-        .iter_mut()
-        .find(|candidate| candidate.publication == publication)
-    {
-        existing.evidence = dedup_evidence(existing.evidence.iter().cloned().chain(evidence));
-        quality = merge_quality(
-            &(existing.proof.clone(), existing.completeness.clone()),
-            &quality,
-        );
-        existing.proof = quality.0;
-        existing.completeness = quality.1;
-    } else {
-        drafts.push(PublicationDraft {
-            publication,
-            evidence,
-            proof: quality.0,
-            completeness: quality.1,
-        });
-    }
-}
-
-fn fresh_object_seed_value(
-    query: &FreshObjectPublicationQuery,
-) -> Option<crate::analyzer::semantic::ValueId> {
-    let procedure = query.observation().procedure();
-    match query.object().identity() {
-        AccessPathRoot::Value(value) if value.procedure() == procedure => Some(value.id()),
-        AccessPathRoot::Allocation(allocation) if allocation.procedure() == procedure => procedure
-            .semantics()
-            .allocation(allocation.id())
-            .map(|row| row.result),
-        AccessPathRoot::CallResult(result) if result.result().procedure() == procedure => {
-            Some(result.result().id())
-        }
-        _ => None,
-    }
-}
-
-fn call_names_any(
-    call: &SemanticCallSite,
-    names: &HashSet<crate::analyzer::semantic::ValueId>,
-) -> bool {
-    names.contains(&call.callee)
-        || call.receiver.is_some_and(|value| names.contains(&value))
-        || call
-            .arguments
-            .iter()
-            .any(|argument| names.contains(&argument.value))
-}
-
-fn first_call_name(
-    call: &SemanticCallSite,
-    names: &HashSet<crate::analyzer::semantic::ValueId>,
-) -> Option<crate::analyzer::semantic::ValueId> {
-    std::iter::once(call.callee)
-        .chain(call.receiver)
-        .chain(call.arguments.iter().map(|argument| argument.value))
-        .find(|value| names.contains(value))
-}
-
-fn effect_names_any(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
-    effect: &SemanticEffect,
-    names: &HashSet<crate::analyzer::semantic::ValueId>,
-) -> bool {
-    match effect {
-        SemanticEffect::Assignment { target, value } => {
-            names.contains(target) || names.contains(value)
-        }
-        SemanticEffect::ValueFlow { source, target, .. } => {
-            names.contains(source) || names.contains(target)
-        }
-        SemanticEffect::AggregateInitializer {
-            aggregate, value, ..
-        } => names.contains(aggregate) || names.contains(value),
-        SemanticEffect::ValueUse { value, .. } => names.contains(value),
-        SemanticEffect::MemoryLoad {
-            location, result, ..
-        } => {
-            names.contains(result)
-                || semantics
-                    .memory_location(*location)
-                    .is_some_and(|location| {
-                        names.iter().any(|value| location.kind.uses_value(*value))
-                    })
-        }
-        SemanticEffect::MemoryStore {
-            location, value, ..
-        } => {
-            names.contains(value)
-                || semantics
-                    .memory_location(*location)
-                    .is_some_and(|location| {
-                        names.iter().any(|value| location.kind.uses_value(*value))
-                    })
-        }
-        SemanticEffect::CallableCreation {
-            result, callable, ..
-        }
-        | SemanticEffect::CallableReference {
-            result, callable, ..
-        } => {
-            names.contains(result)
-                || callable
-                    .bound_receiver
-                    .is_some_and(|receiver| names.contains(&receiver))
-        }
-        SemanticEffect::CaptureBind { capture } => semantics
-            .captures()
-            .iter()
-            .find(|row| row.id == *capture)
-            .is_some_and(|capture| match capture.captured {
-                CaptureSource::Value(value) => names.contains(&value),
-                CaptureSource::Location(location) => {
-                    semantics.memory_location(location).is_some_and(|location| {
-                        names.iter().any(|value| location.kind.uses_value(*value))
-                    })
-                }
-            }),
-        SemanticEffect::Invoke { call_site }
-        | SemanticEffect::CallContinuation { call_site, .. } => semantics
-            .call_site(*call_site)
-            .is_some_and(|call| call_names_any(call, names)),
-        SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
-            value.is_some_and(|value| names.contains(&value))
-        }
-        SemanticEffect::AsyncSuspend { awaited, .. } => {
-            awaited.is_some_and(|value| names.contains(&value))
-        }
-        SemanticEffect::AsyncResume { result, .. } => {
-            result.is_some_and(|value| names.contains(&value))
-        }
-        SemanticEffect::Entry
-        | SemanticEffect::NormalExit
-        | SemanticEffect::ExceptionalExit
-        | SemanticEffect::Synchronization { .. }
-        | SemanticEffect::Allocation { .. }
-        | SemanticEffect::Gap { .. } => false,
-    }
-}
-
-fn publication_gap_affects_names(
-    procedure: &ProcedureHandle,
-    gap: &SemanticGap,
-    names: &HashSet<crate::analyzer::semantic::ValueId>,
-) -> bool {
-    let semantics = procedure.semantics();
-    match gap.subject {
-        SemanticGapSubject::Procedure => true,
-        // A point-scoped gap is deliberately broader than its retained
-        // events: the missing event may be the operation that publishes the
-        // object. Only an explicit adapter-authored discharge can narrow it.
-        SemanticGapSubject::Point => true,
-        SemanticGapSubject::Value(value) => names.contains(&value),
-        SemanticGapSubject::MemoryLocation(location) => semantics
-            .memory_location(location)
-            .is_some_and(|location| names.iter().any(|value| location.kind.uses_value(*value))),
-        SemanticGapSubject::Capture(capture) => semantics
-            .captures()
-            .iter()
-            .find(|row| row.id == capture)
-            .is_some_and(|capture| match capture.captured {
-                CaptureSource::Value(value) => names.contains(&value),
-                CaptureSource::Location(location) => {
-                    semantics.memory_location(location).is_some_and(|location| {
-                        names.iter().any(|value| location.kind.uses_value(*value))
-                    })
-                }
-            }),
-        SemanticGapSubject::CallSite(call_site)
-        | SemanticGapSubject::CallContinuation { call_site, .. } => semantics
-            .call_site(call_site)
-            .is_some_and(|call| call_names_any(call, names)),
-        SemanticGapSubject::AsyncContinuation { suspend, .. } => {
-            semantics.point(suspend).is_some_and(|point| {
-                point
-                    .events
-                    .iter()
-                    .any(|event| effect_names_any(semantics, &event.effect, names))
-            })
-        }
-    }
-}
-
-/// Enumerate operations that can publish a fresh object's local aliases on
-/// the CFG slice between ownership establishment and one observation.
-fn formal_value_id(
-    procedure: &ProcedureHandle,
-    kind: ProcedurePortKind,
-) -> Option<crate::analyzer::semantic::ValueId> {
-    procedure.semantics().values().iter().find_map(|value| {
-        let matches = match kind {
-            ProcedurePortKind::Receiver => {
-                matches!(value.kind, SemanticValueKind::Receiver { .. })
-            }
-            ProcedurePortKind::Parameter { ordinal } => matches!(
-                value.kind,
-                SemanticValueKind::Parameter {
-                    ordinal: actual,
-                    ..
-                } if actual == ordinal
-            ),
-            ProcedurePortKind::NormalReturn => value.kind == SemanticValueKind::Return,
-            ProcedurePortKind::IndexedNormalReturn { .. }
-            | ProcedurePortKind::ExceptionalReturn
-            | ProcedurePortKind::Capture { .. } => false,
-        };
-        matches.then_some(value.id)
-    })
-}
-
-fn mapped_formals_for_actual(
-    bindings: &crate::analyzer::semantic::CallBindings,
-    actual: crate::analyzer::semantic::ValueId,
-) -> Vec<ProcedurePortHandle> {
-    let mut formals = Vec::new();
-    for binding in bindings.bindings() {
-        match binding {
-            crate::analyzer::semantic::CallBinding::Receiver {
-                actual: binding_actual,
-                formal,
-                ..
-            } if binding_actual.id() == actual => formals.push(formal.clone()),
-            crate::analyzer::semantic::CallBinding::ArgumentGroup(group) => {
-                formals.extend(
-                    group
-                        .mappings()
-                        .iter()
-                        .filter(|mapping| {
-                            mapping.value().actual().value().id() == actual
-                                && mapping.value().preserves_reference_identity()
-                                && mapping.is_proven_complete()
-                        })
-                        .map(|mapping| mapping.value().formal().clone()),
-                );
-            }
-            crate::analyzer::semantic::CallBinding::ImplicitArgument { source, formal, .. }
-                if source.id() == actual =>
-            {
-                formals.push(formal.clone())
-            }
-            crate::analyzer::semantic::CallBinding::NormalReturn { .. }
-            | crate::analyzer::semantic::CallBinding::ExceptionalReturn { .. }
-            | crate::analyzer::semantic::CallBinding::Receiver { .. }
-            | crate::analyzer::semantic::CallBinding::ImplicitArgument { .. } => {}
-        }
-    }
-    formals.dedup();
-    formals
-}
-
 /// Call proofs share exact syntax only while their enclosing escape proof is
 /// alive. Dropping this session also drops preparation whose staged charge
 /// might later roll back; no unpaid source survives into another heap query.
-struct EscapeCallSession<'a> {
+pub(crate) struct EscapeCallSession<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
-    dispatch: super::dispatch::PreparedWorkspaceDispatchPool<'a>,
+    dispatch:
+        crate::analyzer::semantic::workspace_oracle::dispatch::PreparedWorkspaceDispatchPool<'a>,
     active_calls: HashSet<crate::analyzer::semantic::CallSiteHandle>,
 }
 
@@ -3541,11 +1964,11 @@ impl EscapeCallSession<'_> {
                     Interruption::Cancelled,
                 ));
             }
-            staged.charge(SemanticWork {
+            staged.charge_work(SemanticWork {
                 program_points: 1,
                 events: point.events.len(),
                 ..SemanticWork::default()
-            })?;
+            });
             for (event_index, event) in point.events.iter().enumerate() {
                 match event.effect {
                     SemanticEffect::Assignment { target, value }
@@ -3573,10 +1996,10 @@ impl EscapeCallSession<'_> {
                     Interruption::Cancelled,
                 ));
             }
-            staged.charge(SemanticWork {
+            staged.charge_work(SemanticWork {
                 values: 1,
                 ..SemanticWork::default()
-            })?;
+            });
             for (source, target) in &copies {
                 if *source == current && names.insert(*target) {
                     pending.push(*target);
@@ -3590,10 +2013,10 @@ impl EscapeCallSession<'_> {
                     Interruption::Cancelled,
                 ));
             }
-            staged.charge(SemanticWork {
+            staged.charge_work(SemanticWork {
                 events: point.events.len(),
                 ..SemanticWork::default()
-            })?;
+            });
             for event in &point.events {
                 match event.effect {
                     SemanticEffect::AggregateInitializer {
@@ -3849,464 +2272,6 @@ impl EscapeCallSession<'_> {
     }
 }
 
-fn resolve_fresh_object_publications(
-    query: &FreshObjectPublicationQuery,
-    limits: crate::analyzer::semantic::OracleLimits,
-    staged: &mut WorkStager,
-    cancellation: &crate::cancellation::CancellationToken,
-) -> Result<DraftSet<PublicationDraft>, InterruptionOrProvider> {
-    let procedure = query.observation().procedure();
-    let semantics = procedure.semantics();
-    let Some(seed) = fresh_object_seed_value(query) else {
-        return Ok(DraftSet {
-            candidates: Vec::new(),
-            coverage: CandidateCoverage::Open,
-            ambiguous: false,
-        });
-    };
-    if query.context().was_truncated() {
-        return Ok(DraftSet {
-            candidates: Vec::new(),
-            coverage: CandidateCoverage::Open,
-            ambiguous: false,
-        });
-    }
-
-    staged
-        .charge(SemanticWork {
-            program_points: semantics.points().len().saturating_mul(2),
-            control_edges: semantics.control_edges().len().saturating_mul(2),
-            ..SemanticWork::default()
-        })
-        .map_err(InterruptionOrProvider::Interruption)?;
-    let mut cfg_budget = CfgAlgorithmBudget::default();
-    let from_start = match forward_reachability(
-        semantics,
-        query.ownership_start().id(),
-        &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
-    ) {
-        Ok(reachability) => reachability,
-        Err(CfgAlgorithmError::Cancelled { .. }) => {
-            return Err(InterruptionOrProvider::Interruption(
-                Interruption::Cancelled,
-            ));
-        }
-        Err(CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::InvalidNode(_)) => {
-            return Ok(DraftSet {
-                candidates: Vec::new(),
-                coverage: CandidateCoverage::Open,
-                ambiguous: false,
-            });
-        }
-    };
-    let to_observation = match reverse_reachability(
-        semantics,
-        query.observation().id(),
-        &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
-    ) {
-        Ok(reachability) => reachability,
-        Err(CfgAlgorithmError::Cancelled { .. }) => {
-            return Err(InterruptionOrProvider::Interruption(
-                Interruption::Cancelled,
-            ));
-        }
-        Err(CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::InvalidNode(_)) => {
-            return Ok(DraftSet {
-                candidates: Vec::new(),
-                coverage: CandidateCoverage::Open,
-                ambiguous: false,
-            });
-        }
-    };
-    if !from_start.contains(semantics, query.observation().id()) {
-        return Ok(DraftSet {
-            candidates: Vec::new(),
-            coverage: CandidateCoverage::Exhaustive,
-            ambiguous: false,
-        });
-    }
-    let in_slice = |point| {
-        point != query.observation().id()
-            && from_start.contains(semantics, point)
-            && to_observation.contains(semantics, point)
-    };
-
-    // Ownership can be established by a guard after the fresh result was
-    // copied into its local binding. Build the alias-name closure over every
-    // predecessor of the observation, while publication candidates below
-    // remain restricted to the post-ownership slice.
-    let before_observation =
-        |point| point != query.observation().id() && to_observation.contains(semantics, point);
-    let root_evidence = root_evidence(procedure, query.object().identity())
-        .map_err(InterruptionOrProvider::Provider)?;
-    struct NameCopy {
-        source: crate::analyzer::semantic::ValueId,
-        target: crate::analyzer::semantic::ValueId,
-        evidence: EvidenceHandle,
-        identity_preserving: bool,
-    }
-    let mut copies = Vec::new();
-    for point in semantics
-        .points()
-        .iter()
-        .filter(|point| before_observation(point.id))
-    {
-        staged
-            .charge(SemanticWork {
-                program_points: 1,
-                events: point.events.len(),
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
-        if cancellation.is_cancelled() {
-            return Err(InterruptionOrProvider::Interruption(
-                Interruption::Cancelled,
-            ));
-        }
-        for (event_index, event) in point.events.iter().enumerate() {
-            match event.effect {
-                SemanticEffect::Assignment { target, value }
-                    if assignment_transfer(&point.events, event_index, value, target).is_none() =>
-                {
-                    copies.push(NameCopy {
-                        source: value,
-                        target,
-                        evidence: evidence_handle(procedure, event.evidence)
-                            .map_err(InterruptionOrProvider::Provider)?,
-                        identity_preserving: true,
-                    })
-                }
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local,
-                    source: value,
-                    target,
-                } => copies.push(NameCopy {
-                    source: value,
-                    target,
-                    evidence: evidence_handle(procedure, event.evidence)
-                        .map_err(InterruptionOrProvider::Provider)?,
-                    identity_preserving: true,
-                }),
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::LanguageDefined,
-                    source,
-                    target,
-                } if is_go_assignment_conversion(semantics, target) => {
-                    copies.push(NameCopy {
-                        source,
-                        target,
-                        evidence: evidence_handle(procedure, event.evidence)
-                            .map_err(InterruptionOrProvider::Provider)?,
-                        // Go assignment conversion is structured dependence,
-                        // not exact resource identity. Retain it as a
-                        // candidate so a following field/index store cannot
-                        // disappear, while keeping the published relation
-                        // explicitly unproven and partial.
-                        identity_preserving: false,
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut name_exactness = HashMap::default();
-    name_exactness.insert(seed, true);
-    let mut name_evidence = HashMap::default();
-    name_evidence.insert(seed, root_evidence);
-    let mut pending = vec![seed];
-    while let Some(current) = pending.pop() {
-        staged
-            .charge(SemanticWork {
-                values: 1,
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
-        let current_exact = *name_exactness
-            .get(&current)
-            .expect("pending publication name has an exactness row");
-        for copy in &copies {
-            if copy.source == current {
-                let target_exact = current_exact && copy.identity_preserving;
-                if name_exactness
-                    .get(&copy.target)
-                    .is_some_and(|existing| *existing || !target_exact)
-                {
-                    continue;
-                }
-                let evidence = dedup_evidence(
-                    name_evidence
-                        .get(&copy.source)
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                        .chain(std::iter::once(copy.evidence.clone())),
-                );
-                name_exactness.insert(copy.target, target_exact);
-                name_evidence.insert(copy.target, evidence);
-                pending.push(copy.target);
-            }
-        }
-    }
-    let exact_names = name_exactness
-        .iter()
-        .filter_map(|(name, exact)| exact.then_some(*name))
-        .collect::<HashSet<_>>();
-    let candidate_names = name_exactness
-        .iter()
-        .filter_map(|(name, exact)| (!exact).then_some(*name))
-        .collect::<HashSet<_>>();
-    let names = exact_names
-        .iter()
-        .chain(&candidate_names)
-        .copied()
-        .collect::<HashSet<_>>();
-
-    let mut drafts = Vec::new();
-    let mut open = false;
-    let mut abort_user_code = None;
-    for gap in semantics.gaps().iter().filter(|gap| in_slice(gap.point)) {
-        staged
-            .charge(SemanticWork {
-                gaps: 1,
-                ..SemanticWork::default()
-            })
-            .map_err(InterruptionOrProvider::Interruption)?;
-        // Publication asks whether the object crosses an effect boundary, not
-        // which resolved target receives it or how retained evaluations are
-        // ordered. Those two structured proof obligations are therefore
-        // irrelevant; every other gap remains conservative.
-        if gap.discharge != SemanticGapDischarge::RetainedEvaluationOrder
-            && call_target_refinement_call(semantics, gap).is_none()
-            && publication_gap_affects_names(procedure, gap, &names)
-            && gap_can_open_heap(procedure, gap, &mut abort_user_code)
-        {
-            open = true;
-        }
-    }
-    for point in semantics.points().iter().filter(|point| in_slice(point.id)) {
-        let point_handle = procedure
-            .point_handle(point.id)
-            .expect("validated publication slice retains its program point");
-        for (event_index, event) in point.events.iter().enumerate() {
-            let publication = match &event.effect {
-                SemanticEffect::MemoryStore { value, .. } if names.contains(value) => Some((
-                    FreshObjectPublication::at_event(
-                        point_handle.clone(),
-                        event_index,
-                        FreshObjectPublicationKind::MemoryStore,
-                    )
-                    .expect("matched memory store is a valid publication event"),
-                    *value,
-                )),
-                SemanticEffect::ProcedureReturn { value }
-                    if value.is_some_and(|value| names.contains(&value)) =>
-                {
-                    Some((
-                        FreshObjectPublication::at_event(
-                            point_handle.clone(),
-                            event_index,
-                            FreshObjectPublicationKind::Return,
-                        )
-                        .expect("matched return is a valid publication event"),
-                        value.expect("matched return value"),
-                    ))
-                }
-                SemanticEffect::Throw { value }
-                    if value.is_some_and(|value| names.contains(&value)) =>
-                {
-                    Some((
-                        FreshObjectPublication::at_event(
-                            point_handle.clone(),
-                            event_index,
-                            FreshObjectPublicationKind::Throw,
-                        )
-                        .expect("matched throw is a valid publication event"),
-                        value.expect("matched throw value"),
-                    ))
-                }
-                SemanticEffect::AsyncSuspend { awaited, .. }
-                    if awaited.is_some_and(|value| names.contains(&value)) =>
-                {
-                    Some((
-                        FreshObjectPublication::at_event(
-                            point_handle.clone(),
-                            event_index,
-                            FreshObjectPublicationKind::AsyncSuspend,
-                        )
-                        .expect("matched suspension is a valid publication event"),
-                        awaited.expect("matched awaited value"),
-                    ))
-                }
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. },
-                    source,
-                    ..
-                } if names.contains(source) => Some((
-                    FreshObjectPublication::at_event(
-                        point_handle.clone(),
-                        event_index,
-                        FreshObjectPublicationKind::Return,
-                    )
-                    .expect("matched return flow is a valid publication event"),
-                    *source,
-                )),
-                SemanticEffect::CallableCreation { callable, .. }
-                | SemanticEffect::CallableReference { callable, .. }
-                    if callable
-                        .bound_receiver
-                        .is_some_and(|receiver| names.contains(&receiver)) =>
-                {
-                    Some((
-                        FreshObjectPublication::at_event(
-                            point_handle.clone(),
-                            event_index,
-                            FreshObjectPublicationKind::Capture,
-                        )
-                        .expect("matched bound receiver is a valid publication event"),
-                        callable.bound_receiver.expect("matched bound receiver"),
-                    ))
-                }
-                SemanticEffect::CaptureBind { capture } => semantics
-                    .captures()
-                    .iter()
-                    .find(|row| row.id == *capture)
-                    .and_then(|capture| match capture.captured {
-                        CaptureSource::Value(value) if names.contains(&value) => Some((
-                            FreshObjectPublication::at_event(
-                                point_handle.clone(),
-                                event_index,
-                                FreshObjectPublicationKind::Capture,
-                            )
-                            .expect("matched capture is a valid publication event"),
-                            value,
-                        )),
-                        CaptureSource::Value(_) | CaptureSource::Location(_) => None,
-                    }),
-                SemanticEffect::Invoke { call_site } => semantics
-                    .call_site(*call_site)
-                    .and_then(|call| {
-                        // A call is one publication even when several
-                        // operands name the object. Preserve an exact witness
-                        // when it coexists with a conversion-derived candidate.
-                        first_call_name(call, &exact_names)
-                            .or_else(|| first_call_name(call, &candidate_names))
-                            .map(|name| (call, name))
-                    })
-                    .and_then(|(call, name)| {
-                        procedure.call_site_handle(call.id).map(|call| {
-                            FreshObjectPublication::call(call)
-                                .map(|publication| (publication, name))
-                        })
-                    })
-                    .transpose()
-                    .map_err(|error| {
-                        InterruptionOrProvider::Provider(internal_contract(
-                            "could not retain fresh-object call publication",
-                            error,
-                        ))
-                    })?,
-                _ => None,
-            };
-            if let Some((publication, published_name)) = publication {
-                let event_evidence = evidence_handle(procedure, event.evidence)
-                    .map_err(InterruptionOrProvider::Provider)?;
-                let candidate_identity = !name_exactness
-                    .get(&published_name)
-                    .copied()
-                    .expect("published fresh-object name has an exactness row");
-                if candidate_identity {
-                    // The row is a useful structured positive, but the set of
-                    // actual publications remains open because the assignment
-                    // conversion did not preserve exact object identity.
-                    open = true;
-                }
-                push_publication(
-                    &mut drafts,
-                    publication,
-                    name_evidence
-                        .get(&published_name)
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                        .chain(std::iter::once(event_evidence))
-                        .collect(),
-                    candidate_identity,
-                );
-            }
-        }
-        if drafts.len() > limits.provenance_records()
-            || drafts
-                .iter()
-                .map(|draft| draft.evidence.len())
-                .sum::<usize>()
-                > limits.evidence_handles()
-        {
-            drafts.truncate(limits.provenance_records());
-            return Ok(DraftSet {
-                candidates: drafts,
-                coverage: CandidateCoverage::Truncated,
-                ambiguous: false,
-            });
-        }
-    }
-    Ok(DraftSet {
-        candidates: drafts,
-        coverage: if open {
-            CandidateCoverage::Open
-        } else {
-            CandidateCoverage::Exhaustive
-        },
-        ambiguous: false,
-    })
-}
-
-fn materialize_fresh_object_publications(
-    query: &FreshObjectPublicationQuery,
-    drafts: DraftSet<PublicationDraft>,
-    limits: crate::analyzer::semantic::OracleLimits,
-) -> Result<FreshObjectPublicationResult, SemanticProviderError> {
-    let records = drafts
-        .candidates
-        .iter()
-        .map(|draft| {
-            OracleRelationRecord::new(
-                OracleRelationKind::Publication,
-                draft.evidence.clone(),
-                limits,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| internal_contract("could not create publication provenance", error))?;
-    let arena = OracleRelationArena::new(
-        OracleRelationOwner::FreshObjectPublications(Box::new(query.clone())),
-        records,
-        limits,
-    )
-    .map_err(|error| internal_contract("could not create publication arena", error))?;
-    let candidates = drafts
-        .candidates
-        .into_iter()
-        .enumerate()
-        .map(|(index, draft)| {
-            let id = u32::try_from(index)
-                .map(OracleRelationId::new)
-                .map_err(|_| SemanticProviderError::internal("publication relation ID overflow"))?;
-            OracleCandidate::new(
-                draft.publication,
-                draft.proof,
-                draft.completeness,
-                [arena
-                    .handle(id)
-                    .expect("publication relation was inserted into the arena")],
-                limits,
-            )
-            .map_err(|error| internal_contract("invalid publication candidate", error))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    FreshObjectPublicationResult::new(query.clone(), candidates, drafts.coverage, limits)
-        .map_err(|error| internal_contract("invalid fresh-object publication result", error))
-}
-
 /// Whether the object a resolved location names can be reached under a name
 /// this procedure does not control.
 ///
@@ -4325,7 +2290,8 @@ fn materialize_fresh_object_publications(
 /// A lexical cell keeps its established rule: it does not escape while no
 /// capture names it. Every other identity has no such proof available here, so
 /// it may escape.
-fn object_escape_status(
+#[doc(hidden)]
+pub fn object_escape_status(
     oracle: &WorkspaceSemanticOracle<'_>,
     identity: &AbstractObjectIdentity,
     context: &crate::analyzer::semantic::OracleCallContext,
@@ -4370,11 +2336,11 @@ fn object_escape_status(
         crate::analyzer::semantic::ValueId,
     )> = Vec::new();
     for point in semantics.points() {
-        staged.charge(SemanticWork {
+        staged.charge_work(SemanticWork {
             program_points: 1,
             events: point.events.len(),
             ..SemanticWork::default()
-        })?;
+        });
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled.into());
         }
@@ -4398,10 +2364,10 @@ fn object_escape_status(
     names.insert(row.result);
     let mut pending = vec![row.result];
     while let Some(current) = pending.pop() {
-        staged.charge(SemanticWork {
+        staged.charge_work(SemanticWork {
             values: 1,
             ..SemanticWork::default()
-        })?;
+        });
         for (source, target) in &copies {
             if *source == current && names.insert(*target) {
                 pending.push(*target);
@@ -4415,10 +2381,10 @@ fn object_escape_status(
         active_calls: HashSet::default(),
     };
     for point in semantics.points() {
-        staged.charge(SemanticWork {
+        staged.charge_work(SemanticWork {
             events: point.events.len(),
             ..SemanticWork::default()
-        })?;
+        });
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled.into());
         }
@@ -4469,152 +2435,6 @@ fn object_escape_status(
     Ok(EscapeStatus::DoesNotEscape)
 }
 
-fn materialize_update(
-    store: &StoreAtPoint,
-    drafts: DraftSet<LocationDraft>,
-    escape: EscapeStatus,
-    limits: crate::analyzer::semantic::OracleLimits,
-) -> Result<UpdateEligibility, SemanticProviderError> {
-    if drafts.candidates.is_empty() {
-        return Ok(UpdateEligibility::Weak(direct_weak_reasons(
-            drafts.coverage,
-            &drafts.candidates,
-        )));
-    }
-    if drafts.ambiguous || drafts.candidates.len() != 1 {
-        let mut reasons = vec![
-            WeakUpdateReason::MultipleLocations,
-            WeakUpdateReason::MultipleObjects,
-            WeakUpdateReason::PotentialAliases,
-        ];
-        match drafts.coverage {
-            CandidateCoverage::Exhaustive => {}
-            CandidateCoverage::Open => {
-                reasons.push(WeakUpdateReason::NonExhaustiveLocations);
-                reasons.push(WeakUpdateReason::NonExhaustiveObjects);
-            }
-            CandidateCoverage::Truncated => {
-                reasons.push(WeakUpdateReason::TruncatedLocations);
-                reasons.push(WeakUpdateReason::TruncatedObjects);
-            }
-        }
-        reasons.sort_unstable_by_key(|reason| *reason as u8);
-        reasons.dedup();
-        return Ok(UpdateEligibility::Weak(reasons.into_boxed_slice()));
-    }
-    let first = &drafts.candidates[0];
-    // Strong-update locations must retain the exact store target, because the
-    // certificate is bound to this store's own IR address.
-    //
-    // A resolved location can differ from that target only in its root:
-    // `resolve_locations` copies the query's selectors and tail verbatim and
-    // rewrites the root to the object the root value was proven to denote. That
-    // refinement is not discarded here. Cardinality is a property of the
-    // runtime object, not of the syntactic root that names it, so when the
-    // resolution proved the root value denotes one object, the store target
-    // names one location -- which is exactly what a strong update needs. The
-    // syntactic default stands only when the two paths disagree about more than
-    // the root, which resolution does not produce.
-    let certificate_location = if first.location.path() == store.target().path() {
-        first.location.clone()
-    } else {
-        let refines_root = first.location.path().selectors() == store.target().path().selectors()
-            && first.location.path().tail() == store.target().path().tail();
-        let cardinality = if refines_root {
-            first.location.object().cardinality()
-        } else {
-            candidate_cardinality_for_root(store.target().path().root())
-        };
-        let object = AbstractObject::new(store.target().path().root().clone(), cardinality)
-            .map_err(|error| internal_contract("invalid store object", error))?;
-        AbstractLocation::new(object, store.target().path().clone())
-            .map_err(|error| internal_contract("invalid store location", error))?
-    };
-    let object = certificate_location.object().clone();
-    let evidence = dedup_evidence(
-        drafts
-            .candidates
-            .iter()
-            .flat_map(|candidate| candidate.evidence.iter().cloned()),
-    );
-    let quality = evidence_quality(&evidence);
-    let records = [
-        OracleRelationKind::Location,
-        OracleRelationKind::PointsTo,
-        OracleRelationKind::Alias,
-        OracleRelationKind::Escape,
-    ]
-    .into_iter()
-    .map(|kind| OracleRelationRecord::new(kind, evidence.clone(), limits))
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|error| internal_contract("could not create strong-update provenance", error))?;
-    let arena = OracleRelationArena::new(
-        OracleRelationOwner::StrongUpdate(Box::new(store.clone())),
-        records,
-        limits,
-    )
-    .map_err(|error| internal_contract("could not create strong-update arena", error))?;
-    let relation = |index| {
-        arena
-            .handle(OracleRelationId::new(index))
-            .expect("strong-update record was inserted into the arena")
-    };
-    let location_candidate = OracleCandidate::new(
-        certificate_location.clone(),
-        quality.0.clone(),
-        quality.1.clone(),
-        [relation(0)],
-        limits,
-    )
-    .map_err(|error| internal_contract("invalid update location", error))?;
-    let object_candidate = OracleCandidate::new(
-        object.clone(),
-        quality.0.clone(),
-        quality.1.clone(),
-        [relation(1)],
-        limits,
-    )
-    .map_err(|error| internal_contract("invalid update object", error))?;
-    let unique_exact = drafts.coverage == CandidateCoverage::Exhaustive
-        && drafts.candidates.len() == 1
-        && certificate_location.path().is_exact();
-    let alias = OracleCandidate::new(
-        AliasExclusivityWitness::new(
-            store.clone(),
-            certificate_location.clone(),
-            if unique_exact {
-                AliasExclusivity::Exclusive
-            } else {
-                AliasExclusivity::PotentialAliases
-            },
-        )
-        .map_err(|error| internal_contract("invalid alias-exclusivity witness", error))?,
-        quality.0.clone(),
-        quality.1.clone(),
-        [relation(2)],
-        limits,
-    )
-    .map_err(|error| internal_contract("invalid alias-exclusivity evidence", error))?;
-    let escape = OracleCandidate::new(
-        EscapeWitness::new(store.clone(), object.clone(), escape)
-            .map_err(|error| internal_contract("invalid escape witness", error))?,
-        quality.0,
-        quality.1,
-        [relation(3)],
-        limits,
-    )
-    .map_err(|error| internal_contract("invalid escape evidence", error))?;
-    let evidence = StrongUpdateEvidence::new(
-        OracleSet::bounded_locations([location_candidate], drafts.coverage, limits),
-        OracleSet::bounded_objects([object_candidate], drafts.coverage, limits),
-        alias,
-        escape,
-        limits,
-    )
-    .map_err(|error| internal_contract("invalid strong-update evidence", error))?;
-    Ok(UpdateEligibility::evaluate(store.clone(), evidence))
-}
-
 impl HeapOracle for WorkspaceSemanticOracle<'_> {
     fn pointees(
         &self,
@@ -4637,7 +2457,10 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             0,
         ) {
             Ok(drafts) => drafts,
-            Err(InterruptionOrProvider::Provider(error)) => return Err(error),
+            Err(InterruptionOrProvider::Provider(error)) => {
+                request.budget.retain_performed_work(&staged.budget);
+                return Err(error);
+            }
             Err(InterruptionOrProvider::Interruption(interruption)) => {
                 let empty = DraftSet {
                     candidates: Vec::new(),
@@ -4645,6 +2468,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                     ambiguous: false,
                 };
                 let result = materialize_points_to(value, empty, *self.limits())?;
+                request.budget.retain_performed_work(&staged.budget);
                 return Ok(publish_set_outcome(
                     result,
                     CandidateCoverage::Open,
@@ -4669,13 +2493,14 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                 .map(|candidate| candidate.evidence.len())
                 .sum(),
         );
-        if let Err(interruption) = staged.charge(publication) {
+        if let Err(interruption) = staged.admit(publication) {
             let empty = DraftSet {
                 candidates: Vec::new(),
                 coverage: CandidateCoverage::Open,
                 ambiguous: false,
             };
             let result = materialize_points_to(value, empty, *self.limits())?;
+            request.budget.retain_performed_work(&staged.budget);
             return Ok(publish_set_outcome(
                 result,
                 CandidateCoverage::Open,
@@ -4717,7 +2542,10 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             request.cancellation,
         ) {
             Ok(drafts) => drafts,
-            Err(InterruptionOrProvider::Provider(error)) => return Err(error),
+            Err(InterruptionOrProvider::Provider(error)) => {
+                request.budget.retain_performed_work(&staged.budget);
+                return Err(error);
+            }
             Err(InterruptionOrProvider::Interruption(interruption)) => {
                 let empty = DraftSet {
                     candidates: Vec::new(),
@@ -4725,6 +2553,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                     ambiguous: false,
                 };
                 let result = materialize_locations(access, empty, *self.limits())?;
+                request.budget.retain_performed_work(&staged.budget);
                 return Ok(publish_set_outcome(
                     result,
                     CandidateCoverage::Open,
@@ -4749,13 +2578,14 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                 .map(|candidate| candidate.evidence.len())
                 .sum(),
         );
-        if let Err(interruption) = staged.charge(publication) {
+        if let Err(interruption) = staged.admit(publication) {
             let empty = DraftSet {
                 candidates: Vec::new(),
                 coverage: CandidateCoverage::Open,
                 ambiguous: false,
             };
             let result = materialize_locations(access, empty, *self.limits())?;
+            request.budget.retain_performed_work(&staged.budget);
             return Ok(publish_set_outcome(
                 result,
                 CandidateCoverage::Open,
@@ -4878,7 +2708,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             );
         }
         let publication = candidate_publication_work(1, evidence.len());
-        if let Err(interruption) = staged.charge(publication) {
+        if let Err(interruption) = staged.admit(publication) {
             return Ok(match interruption {
                 Interruption::Budget(exceeded) => SemanticOutcome::ExceededBudget {
                     partial: None,
@@ -4937,7 +2767,10 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             request.cancellation,
         ) {
             Ok(drafts) => drafts,
-            Err(InterruptionOrProvider::Provider(error)) => return Err(error),
+            Err(InterruptionOrProvider::Provider(error)) => {
+                request.budget.retain_performed_work(&staged.budget);
+                return Err(error);
+            }
             Err(InterruptionOrProvider::Interruption(interruption)) => {
                 let empty = DraftSet {
                     candidates: Vec::new(),
@@ -4945,6 +2778,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                     ambiguous: false,
                 };
                 let result = materialize_fresh_object_publications(query, empty, *self.limits())?;
+                request.budget.retain_performed_work(&staged.budget);
                 return Ok(publish_set_outcome(
                     result,
                     CandidateCoverage::Open,
@@ -4968,8 +2802,9 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                 .map(|candidate| candidate.evidence.len())
                 .sum(),
         );
-        if let Err(interruption) = staged.charge(publication) {
+        if let Err(interruption) = staged.admit(publication) {
             let result = materialize_fresh_object_publications(query, drafts, *self.limits())?;
+            request.budget.retain_performed_work(&staged.budget);
             return Ok(publish_set_outcome(
                 result,
                 coverage,
@@ -5011,7 +2846,10 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             request.cancellation,
         ) {
             Ok(drafts) => drafts,
-            Err(InterruptionOrProvider::Provider(error)) => return Err(error),
+            Err(InterruptionOrProvider::Provider(error)) => {
+                request.budget.retain_performed_work(&staged.budget);
+                return Err(error);
+            }
             Err(InterruptionOrProvider::Interruption(interruption)) => {
                 let partial = UpdateEligibility::Weak(
                     [
@@ -5063,7 +2901,7 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
         } else {
             SemanticWork::default()
         };
-        if let Err(interruption) = staged.charge(publication) {
+        if let Err(interruption) = staged.admit(publication) {
             let partial = UpdateEligibility::Weak(
                 [
                     WeakUpdateReason::NonExhaustiveLocations,
@@ -5100,7 +2938,10 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                     request.cancellation,
                 ) {
                     Ok(escape) => escape,
-                    Err(InterruptionOrProvider::Provider(error)) => return Err(error),
+                    Err(InterruptionOrProvider::Provider(error)) => {
+                        request.budget.retain_performed_work(&staged.budget);
+                        return Err(error);
+                    }
                     Err(InterruptionOrProvider::Interruption(interruption)) => {
                         let partial = UpdateEligibility::Weak(
                             [WeakUpdateReason::IncompleteEscapeEvidence].into(),
@@ -5140,113 +2981,34 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::semantic::{
-        DurableCallContext, MoveInvalidation, OracleCallContext, OracleLimits, SemanticBudget,
-        SemanticRequest, TransferKind, TransferOperation, ValueTransfer,
-    };
-    use crate::analyzer::{Language, ProjectFile};
-    use crate::cancellation::CancellationToken;
-    use crate::test_support::AnalyzerFixture;
-    use brokk_bifrost_test_macros::hardwon;
-
-    #[test]
-    fn escape_proof_shares_only_paid_caller_source() {
-        let source = "def inspect(value):\n    pass\n\ndef caller():\n    items = [1]\n    inspect(items)\n    inspect(items)\n    items[0] = 2\n";
-        let fixture = AnalyzerFixture::new_for_language(Language::Python, &[("calls.py", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "calls.py");
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let artifact = fixture
-            .analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("materialization runs")
-            .available_value()
-            .cloned()
-            .expect("artifact");
-        let allocation = artifact
-            .procedures()
-            .iter()
-            .find_map(|semantics| {
-                let allocation = semantics.allocations().first()?;
-                artifact
-                    .procedure_handle(semantics.id())?
-                    .allocation_handle(allocation.id)
-            })
-            .expect("list allocation");
-        let oracle = fixture.analyzer.semantic_oracle_provider();
-        let identity = AbstractObjectIdentity::Allocation(allocation);
-        let mut limits = SemanticBudget::default().limits();
-        limits.source_bytes = source.len() - 1;
-        let mut tight = SemanticBudget::new(limits).expect("positive source limit");
-        let request = SemanticRequest::new(&mut tight, &cancellation);
-        let mut failed = WorkStager::new(&request);
-        assert!(matches!(
-            object_escape_status(
-                &oracle,
-                &identity,
-                &OracleCallContext::empty(),
-                &mut failed,
-                &cancellation
-            ),
-            Err(InterruptionOrProvider::Interruption(Interruption::Budget(
-                _
-            )))
-        ));
-        assert_eq!(tight.used().source_bytes, 0, "failed work is not committed");
-
-        let cancelled = CancellationToken::default();
-        cancelled.cancel();
-        let mut cancelled_budget = SemanticBudget::default();
-        let request = SemanticRequest::new(&mut cancelled_budget, &cancelled);
-        let mut interrupted = WorkStager::new(&request);
-        assert!(matches!(
-            object_escape_status(
-                &oracle,
-                &identity,
-                &OracleCallContext::empty(),
-                &mut interrupted,
-                &cancelled
-            ),
-            Err(InterruptionOrProvider::Interruption(
-                Interruption::Cancelled
-            ))
-        ));
-        assert_eq!(interrupted.work.source_bytes, 0);
-
-        let mut budget = SemanticBudget::default();
-        let request = SemanticRequest::new(&mut budget, &cancellation);
-        let mut staged = WorkStager::new(&request);
-        let escape = object_escape_status(
-            &oracle,
-            &identity,
-            &OracleCallContext::empty(),
-            &mut staged,
-            &cancellation,
-        )
-        .unwrap_or_else(|failure| match failure {
-            InterruptionOrProvider::Interruption(error) => {
-                panic!("escape proof interrupted: {error:?}")
-            }
-            InterruptionOrProvider::Provider(error) => panic!("escape provider failed: {error:?}"),
-        });
-        assert_eq!(escape, EscapeStatus::DoesNotEscape);
-        assert_eq!(
-            staged.work.source_bytes,
-            source.len(),
-            "one exact caller source is sufficient for both nonpublishing calls"
-        );
+impl crate::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle<'_> {
+    #[doc(hidden)]
+    pub fn incoming_actuals_artifact_bytes(&self) -> u64 {
+        self.incoming_actuals.artifact_bytes()
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticEffect;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::ValueFlowKind;
+
+    use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::heap::transfer_stops_identity_trace;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::MoveInvalidation;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::TransferKind;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::TransferOperation;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::ValueTransfer;
 
     #[test]
     fn moves_stop_identity_traces_on_both_sides() {
-        let source = crate::analyzer::semantic::ValueId::new(0);
-        let target = crate::analyzer::semantic::ValueId::new(1);
+        let source = brokk_bifrost_analysis::analyzer::semantic::ValueId::new(0);
+        let target = brokk_bifrost_analysis::analyzer::semantic::ValueId::new(1);
         for invalidation in [MoveInvalidation::Invalidated, MoveInvalidation::Unknown] {
             let effect = SemanticEffect::ValueFlow {
                 kind: ValueFlowKind::Transfer(ValueTransfer {
@@ -5270,393 +3032,5 @@ mod tests {
         };
         assert!(!transfer_stops_identity_trace(&copy, source));
         assert!(transfer_stops_identity_trace(&copy, target));
-    }
-
-    #[test]
-    #[hardwon("#2662: a Go array copy inherited its source allocation identity")]
-    fn go_array_copy_does_not_reuse_the_source_allocation_identity() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[(
-                "main.go",
-                r#"package main
-
-func inspect() {
-    first := [1]int{}
-    second := first
-    _ = second
-}
-"#,
-            )],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let cancellation = CancellationToken::default();
-        let mut materialization_budget = SemanticBudget::default();
-        let artifact = fixture
-            .analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
-            )
-            .expect("Go semantic materialization runs")
-            .available_value()
-            .cloned()
-            .expect("Go semantic artifact is available");
-        let (semantics, point, target) = artifact
-            .procedures()
-            .iter()
-            .find_map(|semantics| {
-                semantics.points().iter().find_map(|point| {
-                    point.events.iter().find_map(|event| match event.effect {
-                        SemanticEffect::ValueFlow {
-                            kind:
-                                ValueFlowKind::Transfer(ValueTransfer {
-                                    kind: TransferKind::AggregateCopy,
-                                    ..
-                                }),
-                            target,
-                            ..
-                        } => Some((semantics, point.id, target)),
-                        _ => None,
-                    })
-                })
-            })
-            .expect("array assignment publishes an aggregate-copy boundary");
-        let procedure = artifact
-            .procedure_handle(semantics.id())
-            .expect("inspect procedure handle");
-        let query = ValueAtPoint::new(
-            procedure
-                .value_handle(target)
-                .expect("array-copy target value"),
-            procedure.point_handle(point).expect("array-copy point"),
-            ObservationPhase::AfterEffects,
-            OracleCallContext::empty(),
-        )
-        .expect("array-copy observation");
-        let mut budget = SemanticBudget::default();
-        let outcome = fixture
-            .analyzer
-            .semantic_oracle_provider()
-            .pointees(
-                &query,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("array-copy points-to query runs");
-        let objects = outcome
-            .available_value()
-            .expect("open array-copy result retains its symbolic candidate")
-            .objects();
-        assert_eq!(objects.coverage(), CandidateCoverage::Open);
-        assert!(
-            objects.candidates().iter().all(|candidate| !matches!(
-                candidate.value().identity(),
-                AbstractObjectIdentity::Allocation(_)
-            )),
-            "a by-value array copy must not reuse its source allocation: {outcome:#?}"
-        );
-    }
-
-    #[test]
-    fn unresolved_field_location_does_not_open_its_base_pointees() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[(
-                "main.go",
-                r#"package main
-
-type Resource struct{}
-
-func OpenResource() *Resource { return &Resource{} }
-func (*Resource) Close() {}
-
-func inspect() {
-    resource := OpenResource()
-    resource.Close()
-}
-"#,
-            )],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let cancellation = CancellationToken::default();
-        let mut materialization_budget = SemanticBudget::default();
-        let artifact = fixture
-            .analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
-            )
-            .expect("Go semantic materialization runs")
-            .available_value()
-            .cloned()
-            .expect("Go semantic artifact is available");
-        let semantics = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .call_sites()
-                    .iter()
-                    .any(|call| call.receiver.is_some())
-            })
-            .expect("inspect procedure has a receiver call");
-        let call = semantics
-            .call_sites()
-            .iter()
-            .find(|call| call.receiver.is_some())
-            .expect("resource.Close call");
-        let procedure = artifact
-            .procedure_handle(semantics.id())
-            .expect("inspect procedure handle");
-        let point = procedure
-            .point_handle(call.point)
-            .expect("call program point");
-        let receiver = procedure
-            .value_handle(call.receiver.expect("receiver value"))
-            .expect("receiver handle");
-        let callee = procedure
-            .value_handle(call.callee)
-            .expect("callee value handle");
-        let oracle = fixture.analyzer.semantic_oracle_provider();
-
-        let mut receiver_budget = SemanticBudget::default();
-        let receiver_outcome = oracle
-            .pointees(
-                &ValueAtPoint::new(
-                    receiver,
-                    point.clone(),
-                    ObservationPhase::AfterEffects,
-                    OracleCallContext::empty(),
-                )
-                .expect("receiver observation"),
-                &mut SemanticRequest::new(&mut receiver_budget, &cancellation),
-            )
-            .expect("receiver points-to query runs");
-        let SemanticOutcome::Complete {
-            value: receiver_result,
-            ..
-        } = receiver_outcome
-        else {
-            panic!("the field-location gap must not open its base: {receiver_outcome:#?}");
-        };
-        assert_eq!(
-            receiver_result.objects().coverage(),
-            CandidateCoverage::Exhaustive
-        );
-
-        let mut callee_budget = SemanticBudget::default();
-        let callee_outcome = oracle
-            .pointees(
-                &ValueAtPoint::new(
-                    callee,
-                    point,
-                    ObservationPhase::AfterEffects,
-                    OracleCallContext::empty(),
-                )
-                .expect("callee observation"),
-                &mut SemanticRequest::new(&mut callee_budget, &cancellation),
-            )
-            .expect("callee points-to query runs");
-        assert!(
-            matches!(
-                &callee_outcome,
-                SemanticOutcome::Unknown {
-                    partial: Some(result),
-                    ..
-                } if result.objects().coverage() == CandidateCoverage::Open
-            ),
-            "the unresolved field load itself remains open: {callee_outcome:#?}"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "#4929: one source judgement enumerated the same formal's callers once per observation"
-    )]
-    fn incoming_actual_is_rebased_to_the_callee_with_query_context() {
-        let source = r#"
-struct Payload(u8);
-
-fn helper(payload: &Payload) {
-    let observed = payload;
-    let _byte = observed.0;
-}
-
-fn caller() {
-    let payload = Payload(1);
-    helper(&payload);
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let cancellation = CancellationToken::default();
-        let mut materialization_budget = SemanticBudget::default();
-        let artifact = fixture
-            .analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
-            )
-            .expect("Rust semantic materialization runs")
-            .available_value()
-            .cloned()
-            .expect("Rust semantic artifact is available");
-        let helper_semantics = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure.values().iter().any(|value| {
-                    matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. })
-                })
-            })
-            .expect("helper procedure with a formal parameter");
-        let formal = helper_semantics
-            .values()
-            .iter()
-            .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
-            .expect("helper formal value");
-        let helper = artifact
-            .procedure_handle(helper_semantics.id())
-            .expect("helper procedure handle");
-        let caller_semantics = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| !procedure.call_sites().is_empty())
-            .expect("caller procedure with the helper call");
-        let caller = artifact
-            .procedure_handle(caller_semantics.id())
-            .expect("caller procedure handle");
-        let incoming_call = caller_semantics
-            .call_sites()
-            .first()
-            .expect("caller invokes the helper");
-        let incoming_call = caller
-            .call_site_handle(incoming_call.id)
-            .expect("helper call handle");
-        let identity_context =
-            OracleCallContext::bounded(vec![incoming_call], OracleLimits::default());
-        let durable_context = DurableCallContext::of(&identity_context)
-            .expect("query call context has a durable form");
-        let query = ValueAtPoint::new(
-            helper
-                .value_handle(formal.id)
-                .expect("helper parameter handle"),
-            helper
-                .point_handle(helper_semantics.entry_point())
-                .expect("helper entry point"),
-            ObservationPhase::BeforeEffects,
-            identity_context.clone(),
-        )
-        .expect("formal observation");
-        let oracle = fixture.analyzer.semantic_oracle_provider();
-        let mut budget = SemanticBudget::default();
-        let outcome = oracle
-            .pointees(
-                &query,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("helper formal points-to query validates");
-        assert_eq!(
-            oracle
-                .incoming_actuals
-                .lock()
-                .expect("incoming actual memo poisoned")
-                .len(),
-            1
-        );
-        let request = SemanticRequest::new(&mut budget, &cancellation);
-        let mut hit = WorkStager::new(&request);
-        incoming_actual_queries(
-            &oracle,
-            &helper,
-            formal.id,
-            &identity_context,
-            *oracle.limits(),
-            &mut hit,
-            &cancellation,
-        )
-        .unwrap_or_else(|_| panic!("completed incoming query must be reusable"));
-        assert_eq!(
-            hit.work,
-            SemanticWork::default(),
-            "memo hits charge no work"
-        );
-        let mut reused_budget = SemanticBudget::default();
-        let reused = oracle
-            .pointees(
-                &query,
-                &mut SemanticRequest::new(&mut reused_budget, &cancellation),
-            )
-            .expect("memoized points-to query validates");
-        // Each points-to result owns a fresh provenance arena. Compare the
-        // semantic answer, not those deliberately distinct arena handles.
-        let answer = |outcome: &SemanticOutcome<PointsToResult>| {
-            let objects = outcome
-                .available_value()
-                .expect("points-to answer")
-                .objects();
-            (
-                objects.coverage(),
-                objects
-                    .candidates()
-                    .iter()
-                    .map(|candidate| {
-                        (
-                            candidate
-                                .value()
-                                .identity()
-                                .durable_identity()
-                                .expect("durable object"),
-                            candidate.value().cardinality(),
-                            candidate.proof().clone(),
-                            candidate.completeness().clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-        assert_eq!(answer(&reused), answer(&outcome));
-        oracle
-            .incoming_actuals
-            .lock()
-            .expect("incoming actual memo poisoned")
-            .clear();
-        let mut fresh_budget = SemanticBudget::default();
-        let fresh = oracle
-            .pointees(
-                &query,
-                &mut SemanticRequest::new(&mut fresh_budget, &cancellation),
-            )
-            .expect("unmemoized points-to query validates");
-        assert_eq!(answer(&fresh), answer(&reused));
-        let points_to = outcome
-            .available_value()
-            .expect("partial results retain the substituted candidate");
-        let candidate = points_to
-            .objects()
-            .candidates()
-            .iter()
-            .find(|candidate| {
-                matches!(
-                    candidate.value().identity(),
-                    AbstractObjectIdentity::CallSubstitution {
-                        procedure,
-                        context,
-                        ..
-                    } if procedure == &helper && context == &identity_context
-                )
-            })
-            .expect("incoming candidate is owned by the helper and records its call context");
-        assert!(matches!(
-            candidate
-                .value()
-                .identity()
-            .durable_identity()
-            .expect("callee-scoped identity has a durable form"),
-            crate::analyzer::semantic::DurableObjectIdentity::CallSubstitution {
-                context,
-                ..
-            } if context == durable_context
-        ));
     }
 }

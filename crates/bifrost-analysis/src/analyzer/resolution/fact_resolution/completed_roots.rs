@@ -4,10 +4,12 @@ use super::*;
 use std::sync::Mutex;
 
 #[derive(Debug, Default)]
-pub(crate) struct SelectedDemandState {
+#[doc(hidden)]
+pub struct SelectedDemandState {
     pub(super) identities: Arc<Mutex<crate::analyzer::resolution::CanonicalIdentityNumbers>>,
+    pub(super) service_reasons: Arc<Mutex<HashMap<SemanticId, ServiceReasonDetails>>>,
     roots: Mutex<HashMap<RootMemoKey, FactResolutionAnswer>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     hits: std::sync::atomic::AtomicUsize,
 }
 
@@ -15,7 +17,9 @@ pub(crate) struct SelectedDemandState {
 pub(super) struct RootMemoKey {
     declaration_access: u64,
     context: [u8; 32],
-    reference: SemanticId,
+    // The environment is request-local; authority and context remain part of
+    // this key and must describe the resources used to produce the answer.
+    reference: DemandReferenceKey,
     fragment: BindingFragmentId,
     site: FactReferenceSiteMetadata,
     request: u64,
@@ -27,7 +31,7 @@ pub(super) struct RootMemoKey {
 impl RootMemoKey {
     pub(super) fn new(
         session: &FactReadSession<'_>,
-        root: SemanticId,
+        root: DemandReferenceKey,
         seed: &ReferenceSeed,
         declaration_access: u64,
         context: [u8; 32],
@@ -74,8 +78,9 @@ impl SelectedDemandState {
             .number(digest)
     }
 
-    #[cfg(test)]
-    pub(crate) fn hits_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn hits_for_test(&self) -> usize {
         self.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -103,7 +108,7 @@ impl SelectedDemandState {
             )
         });
         if let Some(answer) = &answer {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug_assert!(
                 self.owns_answer(answer, session),
@@ -133,6 +138,7 @@ impl SelectedDemandState {
         };
         if stopped(answer.completion())
             || stopped(answer.binding().completion())
+            || stopped(&answer.call_target_boundary)
             || answer
                 .binding()
                 .witnesses()
@@ -154,6 +160,7 @@ impl SelectedDemandState {
             site_metadata,
             callable_receiver_dispositions,
             callable_candidate_applicability,
+            call_target_boundary,
             member_owners,
             member_rejections,
             absent_member,
@@ -232,6 +239,7 @@ impl SelectedDemandState {
             && observed_type_identity.is_none_or(semantic)
             && binding.targets().iter().copied().all(semantic)
             && completion(binding.completion())
+            && completion(call_target_boundary)
             && binding.witnesses().iter().all(|witness| {
                 semantic(witness.reference())
                     && semantic(witness.target())

@@ -1,15 +1,9 @@
 //! Compact exact-identity usage graph shared by relevance ranking and graph APIs.
 
 #[path = "canonical_workspace_graph.rs"]
-mod canonical_workspace_graph;
-#[cfg(test)]
-pub(crate) use canonical_workspace_graph::CanonicalWorkspaceUsageProjectedEdge;
-pub(crate) use canonical_workspace_graph::NativeWorkspaceUsageGraphAccumulator;
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use canonical_workspace_graph::build_selected_workspace_usage_graph_projection;
-pub(crate) use canonical_workspace_graph::{
-    SelectedWorkspaceUsageGraphProjection, SelectedWorkspaceUsageGraphProjectionOutcome,
-};
+#[doc(hidden)]
+pub mod canonical_workspace_graph;
+pub(crate) use canonical_workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
 #[cfg(any(test, feature = "test-support"))]
 pub use canonical_workspace_graph::{
     SelectedWorkspaceUsageRankingBuildOutcome, SelectedWorkspaceUsageRankingGraph,
@@ -32,7 +26,8 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 
-type CatalogDeclaration = (CodeUnit, Option<Range>);
+#[doc(hidden)]
+pub type CatalogDeclaration = (CodeUnit, Option<Range>);
 
 /// The name universe a declaration's identity belongs to.
 ///
@@ -74,11 +69,13 @@ impl UsageEcosystem {
         language_support(language).map_or(Self::Unknown, LanguageSupport::ecosystem)
     }
 
-    pub(crate) fn is_module_scoped(self) -> bool {
+    #[doc(hidden)]
+    pub fn is_module_scoped(self) -> bool {
         matches!(self, Self::JavaScriptTypeScript)
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    #[doc(hidden)]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::JavaScriptTypeScript => "js_ts",
             Self::Python => "python",
@@ -95,11 +92,16 @@ impl UsageEcosystem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct WorkspaceUsageNodeKey {
-    pub(crate) id: DeclarationId,
-    pub(crate) ecosystem: UsageEcosystem,
-    pub(crate) fqn: String,
-    pub(crate) defining_file: Option<ProjectFile>,
+#[doc(hidden)]
+pub struct WorkspaceUsageNodeKey {
+    #[doc(hidden)]
+    pub id: DeclarationId,
+    #[doc(hidden)]
+    pub ecosystem: UsageEcosystem,
+    #[doc(hidden)]
+    pub fqn: String,
+    #[doc(hidden)]
+    pub defining_file: Option<ProjectFile>,
 }
 
 impl WorkspaceUsageNodeKey {
@@ -125,14 +127,22 @@ impl WorkspaceUsageNodeKey {
 }
 
 #[derive(Clone)]
-pub(crate) struct WorkspaceUsageNode {
-    pub(crate) key: WorkspaceUsageNodeKey,
-    pub(crate) primary: CodeUnit,
-    pub(crate) primary_range: Option<Range>,
-    pub(crate) declaration_files: Vec<ProjectFile>,
-    pub(crate) declaration_ids: Vec<DeclarationId>,
-    pub(crate) truncated_inbound: Option<usize>,
-    pub(crate) unproven_inbound: usize,
+#[doc(hidden)]
+pub struct WorkspaceUsageNode {
+    #[doc(hidden)]
+    pub key: WorkspaceUsageNodeKey,
+    #[doc(hidden)]
+    pub primary: CodeUnit,
+    #[doc(hidden)]
+    pub primary_range: Option<Range>,
+    #[doc(hidden)]
+    pub declaration_files: Vec<ProjectFile>,
+    #[doc(hidden)]
+    pub declaration_ids: Vec<DeclarationId>,
+    #[doc(hidden)]
+    pub truncated_inbound: Option<usize>,
+    #[doc(hidden)]
+    pub unproven_inbound: usize,
 }
 
 impl WorkspaceUsageNode {
@@ -150,7 +160,8 @@ impl WorkspaceUsageNode {
     /// JVM nodes report their own language rather than the shared realm, so
     /// sharing a candidate space never costs a consumer the ability to tell
     /// Java from Scala from Kotlin.
-    pub(crate) fn language_label(&self) -> &'static str {
+    #[doc(hidden)]
+    pub fn language_label(&self) -> &'static str {
         match self.key.ecosystem {
             UsageEcosystem::Jvm => match self.source_language() {
                 Language::Java => "java",
@@ -163,14 +174,17 @@ impl WorkspaceUsageNode {
     }
 }
 
-pub(crate) struct WorkspaceUsageCatalog {
-    pub(crate) nodes: Vec<WorkspaceUsageNode>,
+#[doc(hidden)]
+pub struct WorkspaceUsageCatalog {
+    #[doc(hidden)]
+    pub nodes: Vec<WorkspaceUsageNode>,
     indices_by_id: HashMap<DeclarationId, usize>,
 }
 
 impl WorkspaceUsageCatalog {
-    #[cfg(test)]
-    pub(crate) fn build(analyzer: &dyn IAnalyzer) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn build(analyzer: &dyn IAnalyzer) -> Self {
         Self::build_with_cancellation(analyzer, &CancellationToken::default())
             .expect("uncancelled workspace usage catalog construction")
     }
@@ -193,7 +207,10 @@ impl WorkspaceUsageCatalog {
         if cancellation.is_cancelled() {
             return None;
         }
-        #[cfg(test)]
+        if !graph_file_is_selected(analyzer, file) {
+            return Some(Vec::new());
+        }
+        #[cfg(any(test, feature = "test-support"))]
         CATALOG_FILES_ENUMERATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut declarations = Vec::new();
@@ -241,7 +258,8 @@ impl WorkspaceUsageCatalog {
         (!cancellation.is_cancelled()).then_some(declarations)
     }
 
-    pub(crate) fn build_with_cancellation(
+    #[doc(hidden)]
+    pub fn build_with_cancellation(
         analyzer: &dyn IAnalyzer,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
@@ -250,11 +268,14 @@ impl WorkspaceUsageCatalog {
             if cancellation.is_cancelled() {
                 return None;
             }
-            let mut declarations =
-                analyzer.workspace_declarations_with_primary_ranges(cancellation)?;
+            let declarations = analyzer.workspace_declarations_with_primary_ranges(cancellation)?;
             if cancellation.is_cancelled() {
                 return None;
             }
+            let mut declarations: Vec<CatalogDeclaration> = declarations
+                .into_iter()
+                .filter(|(unit, _)| graph_file_is_selected(analyzer, unit.source()))
+                .collect();
             let files = analyzer.analyzed_files();
             for (index, file) in files.into_iter().enumerate() {
                 if index.is_multiple_of(512) && cancellation.is_cancelled() {
@@ -286,13 +307,15 @@ impl WorkspaceUsageCatalog {
     /// projection per file. This is the rooted `usage_graph` path: it must not
     /// enumerate every declaration in a long-lived workspace cache before it can
     /// answer a handful of changed-file roots.
-    #[cfg(test)]
-    pub(crate) fn build_for_files(analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn build_for_files(analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> Self {
         Self::build_for_files_with_cancellation(analyzer, files, &CancellationToken::default())
             .expect("uncancelled rooted workspace usage catalog construction")
     }
 
-    pub(crate) fn build_for_files_with_cancellation(
+    #[doc(hidden)]
+    pub fn build_for_files_with_cancellation(
         analyzer: &dyn IAnalyzer,
         files: &[ProjectFile],
         cancellation: &CancellationToken,
@@ -331,7 +354,8 @@ impl WorkspaceUsageCatalog {
     /// enumeration order the map gave them, groups are visited in group-key
     /// order, and `min_by` returns the first minimal element, which is what
     /// sorting a group and taking its head selected.
-    pub(crate) fn from_declarations(
+    #[doc(hidden)]
+    pub fn from_declarations(
         declarations: Vec<CatalogDeclaration>,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
@@ -458,12 +482,14 @@ impl WorkspaceUsageCatalog {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn ecosystems(&self) -> BTreeSet<UsageEcosystem> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn ecosystems(&self) -> BTreeSet<UsageEcosystem> {
         self.nodes.iter().map(|node| node.key.ecosystem).collect()
     }
 
-    pub(crate) fn ecosystems_for_files<'a>(
+    #[doc(hidden)]
+    pub fn ecosystems_for_files<'a>(
         &self,
         files: impl IntoIterator<Item = &'a ProjectFile>,
     ) -> BTreeSet<UsageEcosystem> {
@@ -479,12 +505,14 @@ impl WorkspaceUsageCatalog {
             .collect()
     }
 
-    pub(crate) fn index_for_id(&self, id: &DeclarationId) -> Option<usize> {
+    #[doc(hidden)]
+    pub fn index_for_id(&self, id: &DeclarationId) -> Option<usize> {
         self.indices_by_id.get(id).copied()
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn from_reduced_nodes(
+    #[doc(hidden)]
+    pub fn from_reduced_nodes(
         nodes: Vec<WorkspaceUsageNode>,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
@@ -517,7 +545,8 @@ impl WorkspaceUsageCatalog {
     /// a C++ or C# node merges redeclarations across files: a header prototype
     /// is the primary of its `.cpp` definition, whose body holds the sites. A
     /// site inside that definition must still join to the node (#3671).
-    pub(crate) fn join_members(&mut self, members: &HashMap<DeclarationId, DeclarationId>) {
+    #[doc(hidden)]
+    pub fn join_members(&mut self, members: &HashMap<DeclarationId, DeclarationId>) {
         for (member, node_id) in members {
             let index = self.index_for_id(node_id).unwrap_or_else(|| {
                 panic!("merged member {member:?} names uncataloged node {node_id:?}")
@@ -556,7 +585,15 @@ impl WorkspaceUsageCatalog {
     }
 }
 
-#[cfg(test)]
+fn graph_file_is_selected(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
+    language_support(crate::analyzer::common::language_for_file(file)).is_none_or(|support| {
+        support
+            .unnamed_module_root_for_file(analyzer, file)
+            .is_none()
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
 static CATALOG_FILES_ENUMERATED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// Declaration identities computed while building a catalog.
@@ -565,13 +602,13 @@ static CATALOG_FILES_ENUMERATED: std::sync::atomic::AtomicUsize =
 /// grouping used to compute one per row for each place the identity was
 /// needed. This is the cost shape the catalog pins: one identity per inventory
 /// row, not one per row per use of that identity.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CATALOG_DECLARATION_IDENTITIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// The declaration identity of `unit`, counted for the cost-shape pin.
 fn declaration_identity(unit: &CodeUnit) -> DeclarationId {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     CATALOG_DECLARATION_IDENTITIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     unit.declaration_id()
 }
@@ -580,7 +617,8 @@ fn range_key(range: &Range) -> (usize, usize) {
     (range.start_line, range.start_byte)
 }
 
-pub(crate) fn is_graph_declaration(unit: &CodeUnit) -> bool {
+#[doc(hidden)]
+pub fn is_graph_declaration(unit: &CodeUnit) -> bool {
     let is_java_module_descriptor_scope =
         unit.is_file_scope() && is_java_module_descriptor_file(unit.source());
     (!unit.is_synthetic() || is_java_module_descriptor_scope)
@@ -588,39 +626,58 @@ pub(crate) fn is_graph_declaration(unit: &CodeUnit) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WorkspaceUsageEdge {
-    pub(crate) from: usize,
-    pub(crate) to: usize,
-    pub(crate) counts: UsageReferenceCounts,
+#[doc(hidden)]
+pub struct WorkspaceUsageEdge {
+    #[doc(hidden)]
+    pub from: usize,
+    #[doc(hidden)]
+    pub to: usize,
+    #[doc(hidden)]
+    pub counts: UsageReferenceCounts,
 }
 
-pub(crate) struct WorkspaceUsageGraph {
-    pub(crate) nodes: Vec<WorkspaceUsageNode>,
-    pub(crate) edges: Vec<WorkspaceUsageEdge>,
-    #[cfg(test)]
-    pub(crate) resolved_ecosystems: Vec<UsageEcosystem>,
+#[doc(hidden)]
+pub struct WorkspaceUsageGraph {
+    #[doc(hidden)]
+    pub nodes: Vec<WorkspaceUsageNode>,
+    #[doc(hidden)]
+    pub edges: Vec<WorkspaceUsageEdge>,
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub resolved_ecosystems: Vec<UsageEcosystem>,
 }
 
-pub(crate) struct WorkspaceUsageRankingNode {
-    pub(crate) primary_file: ProjectFile,
-    pub(crate) seed_files: Vec<ProjectFile>,
-    pub(crate) incomplete: bool,
+#[doc(hidden)]
+pub struct WorkspaceUsageRankingNode {
+    #[doc(hidden)]
+    pub primary_file: ProjectFile,
+    #[doc(hidden)]
+    pub seed_files: Vec<ProjectFile>,
+    #[doc(hidden)]
+    pub incomplete: bool,
     /// Present on the coarse file-dependency graph, whose bulk file-fact read
     /// already knows whether each file contains tests. Exact symbol graphs do
     /// not currently consume this classification.
-    pub(crate) contains_tests: Option<bool>,
+    #[doc(hidden)]
+    pub contains_tests: Option<bool>,
 }
 
-pub(crate) struct WorkspaceUsageRankingGraph {
-    pub(crate) nodes: Vec<WorkspaceUsageRankingNode>,
-    pub(crate) edges: Vec<WorkspaceUsageEdge>,
-    pub(crate) node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
-    #[cfg(test)]
-    pub(crate) resolved_ecosystems: Vec<UsageEcosystem>,
+#[doc(hidden)]
+pub struct WorkspaceUsageRankingGraph {
+    #[doc(hidden)]
+    pub nodes: Vec<WorkspaceUsageRankingNode>,
+    #[doc(hidden)]
+    pub edges: Vec<WorkspaceUsageEdge>,
+    #[doc(hidden)]
+    pub node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub resolved_ecosystems: Vec<UsageEcosystem>,
 }
 
 impl WorkspaceUsageRankingGraph {
-    pub(crate) fn from_exact(graph: WorkspaceUsageGraph) -> Self {
+    #[doc(hidden)]
+    pub fn from_exact(graph: WorkspaceUsageGraph) -> Self {
         let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
         let nodes = graph
             .nodes
@@ -645,7 +702,7 @@ impl WorkspaceUsageRankingGraph {
             nodes,
             edges: graph.edges,
             node_indices_by_file,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             resolved_ecosystems: graph.resolved_ecosystems,
         }
     }
@@ -658,7 +715,7 @@ impl WorkspaceUsageRankingGraph {
         let WorkspaceUsageGraph {
             nodes: exact_nodes,
             edges,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             resolved_ecosystems,
         } = graph;
         let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
@@ -690,7 +747,7 @@ impl WorkspaceUsageRankingGraph {
             nodes,
             edges,
             node_indices_by_file,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             resolved_ecosystems,
         };
         (!cancellation.is_cancelled()).then_some(graph)
@@ -744,7 +801,8 @@ fn project_file_retained_bytes(file: &ProjectFile) -> usize {
         .saturating_add(file.rel_path().as_os_str().len())
 }
 
-pub(crate) enum WorkspaceUsageGraphBuildOutcome {
+#[doc(hidden)]
+pub enum WorkspaceUsageGraphBuildOutcome {
     Complete(WorkspaceUsageGraph),
     Incomplete(WorkspaceUsageGraph),
     Cancelled,
@@ -753,7 +811,8 @@ pub(crate) enum WorkspaceUsageGraphBuildOutcome {
     Failed(StoreError),
 }
 
-pub(crate) fn build_workspace_usage_graph_with_cancellation(
+#[doc(hidden)]
+pub fn build_workspace_usage_graph_with_cancellation(
     analyzer: &dyn IAnalyzer,
     catalog: WorkspaceUsageCatalog,
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
@@ -768,7 +827,8 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
     )
 }
 
-pub(crate) fn build_workspace_usage_graph_with_passes(
+#[doc(hidden)]
+pub fn build_workspace_usage_graph_with_passes(
     analyzer: &dyn IAnalyzer,
     catalog: WorkspaceUsageCatalog,
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
@@ -781,7 +841,7 @@ pub(crate) fn build_workspace_usage_graph_with_passes(
     let mut nodes = catalog.nodes.clone();
     let mut edges = Vec::new();
     let mut passes_complete = true;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let mut resolved_ecosystems = Vec::new();
     let keep_file = |_: &ProjectFile| !cancellation.is_cancelled();
     // This consumer's request is the whole workspace, so the preflight's file
@@ -876,7 +936,7 @@ pub(crate) fn build_workspace_usage_graph_with_passes(
         if fqns.is_empty() {
             continue;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         resolved_ecosystems.push(entry.ecosystem);
         let ctx = EdgeWeightScanCtx {
             analyzer,
@@ -904,12 +964,12 @@ pub(crate) fn build_workspace_usage_graph_with_passes(
         }
     }
     edges.sort_by_key(|edge| (edge.from, edge.to));
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     resolved_ecosystems.dedup();
     let graph = WorkspaceUsageGraph {
         nodes,
         edges,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         resolved_ecosystems,
     };
     if cancellation.is_cancelled() {
@@ -1010,206 +1070,11 @@ fn record_exact_weights<K>(
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::{
-        AnalyzerDelegate, GoAnalyzer, JavaAnalyzer, KotlinAnalyzer, MultiAnalyzer, RustAnalyzer,
-        ScalaAnalyzer, TestProject,
-    };
-    use crate::inline_project::InlineTestProject;
+    use crate::analyzer::usages::workspace_graph::cpp_test_support::*;
+
     use brokk_bifrost_test_macros::hardwon;
-    use std::collections::BTreeMap;
+
     use std::ffi::OsStr;
-    use std::sync::Arc;
-
-    static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Losing the canonical Rust facts must not become a complete empty graph.
-    ///
-    /// A blob whose fact manifests are gone also fails `source_fact_readiness`,
-    /// which is part of the analyzed-file predicate, so it is not in
-    /// `analyzed_files` at all. This consumer's preflight therefore asks about
-    /// the analyzable inventory, which still holds the file, and the pass is
-    /// skipped with the build reported incomplete. Taking the preflight's set
-    /// from the analyzed listing would have hidden the one file the preflight
-    /// exists to report and let the projection fail one stage later instead.
-    #[test]
-    fn unavailable_rust_facts_make_the_workspace_graph_incomplete() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        ProjectFile::new(root.clone(), "Cargo.toml")
-            .write(
-                "[package]\nname = \"workspace_graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .unwrap();
-        ProjectFile::new(root.clone(), "src/lib.rs")
-            .write("pub fn target() {}\n")
-            .unwrap();
-
-        let project = TestProject::new(root, Language::Rust);
-        let analyzer = RustAnalyzer::from_project(project);
-        let catalog = WorkspaceUsageCatalog::build(&analyzer);
-        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
-
-        let outcome = build_workspace_usage_graph_with_cancellation(
-            &analyzer,
-            catalog,
-            &BTreeSet::from([UsageEcosystem::Rust]),
-            &CancellationToken::default(),
-        );
-        let described = match &outcome {
-            WorkspaceUsageGraphBuildOutcome::Complete(graph) => {
-                format!("Complete({} edges)", graph.edges.len())
-            }
-            WorkspaceUsageGraphBuildOutcome::Incomplete(graph) => {
-                format!("Incomplete({} edges)", graph.edges.len())
-            }
-            WorkspaceUsageGraphBuildOutcome::Cancelled => "Cancelled".to_owned(),
-            WorkspaceUsageGraphBuildOutcome::Stale => "Stale".to_owned(),
-            WorkspaceUsageGraphBuildOutcome::Unavailable(reason) => {
-                format!("Unavailable({reason})")
-            }
-            WorkspaceUsageGraphBuildOutcome::Failed(error) => format!("Failed({error})"),
-        };
-        assert!(
-            matches!(outcome, WorkspaceUsageGraphBuildOutcome::Incomplete(_)),
-            "missing canonical Rust facts must not become a complete empty graph: {described}"
-        );
-    }
-
-    #[test]
-    fn unreprojected_go_module_overlay_makes_the_workspace_graph_incomplete_and_recovers() {
-        use crate::analyzer::{OverlayProject, Project};
-
-        let source = "package app\n\nfunc target() {}\nfunc caller() { target() }\n";
-        let fixture = InlineTestProject::with_language(Language::Go)
-            .file("go.mod", "module example.com/app\n")
-            .file("app.go", source)
-            .build();
-        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
-        let file = fixture.file("app.go");
-        assert!(overlay.set(file.abs_path(), source.to_owned()));
-        let analyzer = GoAnalyzer::new(overlay.clone() as Arc<dyn Project>);
-        let build = |catalog: WorkspaceUsageCatalog| {
-            assert!(
-                !catalog.nodes.is_empty(),
-                "the Go pass must have graph roots"
-            );
-            build_workspace_usage_graph_with_cancellation(
-                &analyzer,
-                catalog,
-                &BTreeSet::from([UsageEcosystem::Go]),
-                &CancellationToken::default(),
-            )
-        };
-        assert!(analyzer.graph_inventory_complete());
-        assert!(matches!(
-            build(WorkspaceUsageCatalog::build(&analyzer)),
-            WorkspaceUsageGraphBuildOutcome::Complete(_)
-        ));
-
-        // Preserve the selected roots while invalidating the authority for
-        // their package-qualified identities. A source-only edit can be
-        // hydrated on demand; a module rename requires workspace reprojection.
-        let catalog = WorkspaceUsageCatalog::build(&analyzer);
-        let module = fixture.file("go.mod");
-        assert!(overlay.set(module.abs_path(), "module example.com/renamed\n".to_owned()));
-        assert!(!analyzer.graph_inventory_complete());
-        assert!(
-            matches!(
-                build(catalog),
-                WorkspaceUsageGraphBuildOutcome::Incomplete(_)
-            ),
-            "unreprojected Go identities must not become a complete empty graph"
-        );
-
-        assert!(overlay.clear(&module.abs_path()));
-        assert!(analyzer.graph_inventory_complete());
-        assert!(matches!(
-            build(WorkspaceUsageCatalog::build(&analyzer)),
-            WorkspaceUsageGraphBuildOutcome::Complete(_)
-        ));
-    }
-
-    /// A persisted multi-language workspace, analyzed twice so the second
-    /// analyzer reads the same cache-backed summary projections a warm real
-    /// workspace reads.
-    fn persisted_multilanguage_analyzer(root: std::path::PathBuf) -> MultiAnalyzer {
-        ProjectFile::new(root.clone(), "module-info.java")
-            .write("module example.module {}\n")
-            .unwrap();
-        ProjectFile::new(root.clone(), "app/Greeter.java")
-            .write(
-                "package app;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n",
-            )
-            .unwrap();
-        // Scala indexes the anonymous class as a synthetic owner and its `run`
-        // as an ordinary declaration, and the Scala summary wrapper prunes
-        // synthetic entries out of `children`. So `run` is reachable only
-        // through the persisted declaration inventory (#2992).
-        ProjectFile::new(root.clone(), "app/Service.scala")
-            .write(
-                "package app\n\nclass Service {\n  def task(): Runnable = new Runnable {\n    def run(): Unit = println(\"scala\")\n  }\n}\n",
-            )
-            .unwrap();
-        // The Kotlin declaration tier deliberately does not index members of an
-        // anonymous object, so this file has no equivalent hidden `run`. It is
-        // here so the Kotlin summary wrapper's synthetic pruning is covered by
-        // the exact-equality check below.
-        ProjectFile::new(root.clone(), "app/Task.kt")
-            .write(
-                "package app\n\nclass Task(private val label: String) {\n    fun make(): Runnable = object : Runnable {\n        override fun run() {}\n    }\n}\n",
-            )
-            .unwrap();
-        ProjectFile::new(root.clone(), "app/Caller.kt")
-            .write("package app\n\nclass Caller {\n    fun call(): String = Greeter().greet()\n}\n")
-            .unwrap();
-
-        let project = TestProject::new(root, Language::Java);
-        let make_analyzer = || {
-            MultiAnalyzer::new(BTreeMap::from([
-                (
-                    Language::Java,
-                    AnalyzerDelegate::Java(JavaAnalyzer::new(Arc::new(project.clone()))),
-                ),
-                (
-                    Language::Scala,
-                    AnalyzerDelegate::Scala(ScalaAnalyzer::new(Arc::new(project.clone()))),
-                ),
-                (
-                    Language::Kotlin,
-                    AnalyzerDelegate::Kotlin(KotlinAnalyzer::new(Arc::new(project.clone()))),
-                ),
-            ]))
-        };
-        // The first generation persists the fixture. The second exercises the
-        // same cache-backed summary projections used by a warm real workspace.
-        drop(make_analyzer());
-        make_analyzer()
-    }
-
-    /// Every catalog field a graph consumer can observe on one node.
-    type CatalogNodeFields = (
-        WorkspaceUsageNodeKey,
-        CodeUnit,
-        Option<Range>,
-        Vec<ProjectFile>,
-        Vec<DeclarationId>,
-    );
-
-    fn catalog_node_fields(catalog: &WorkspaceUsageCatalog) -> Vec<CatalogNodeFields> {
-        catalog
-            .nodes
-            .iter()
-            .map(|node| {
-                (
-                    node.key.clone(),
-                    node.primary.clone(),
-                    node.primary_range,
-                    node.declaration_files.clone(),
-                    node.declaration_ids.clone(),
-                )
-            })
-            .collect()
-    }
 
     #[test]
     fn batched_catalog_enumeration_matches_authoritative_inventory_without_file_projections() {
@@ -1304,200 +1169,6 @@ mod tests {
         );
     }
 
-    /// The grouping this file replaced, written out as an independent oracle.
-    ///
-    /// This is the sequential `BTreeMap` walk `from_declarations` used before
-    /// #2935: one ordered map keyed by ecosystem, rendered name, kind,
-    /// signature, and exact declaration identity; each group sorted by source
-    /// file, primary start line, and signature; the head of that sort as the
-    /// node's primary; nodes ordered by declaration identity.
-    fn reference_catalog_nodes(declarations: Vec<CatalogDeclaration>) -> Vec<CatalogNodeFields> {
-        #[derive(PartialEq, Eq, PartialOrd, Ord)]
-        struct ReferenceGroupKey {
-            ecosystem: UsageEcosystem,
-            fqn: String,
-            kind: crate::analyzer::CodeUnitType,
-            signature: Option<String>,
-            exact_declaration: Option<DeclarationId>,
-        }
-
-        let mut grouped: BTreeMap<ReferenceGroupKey, Vec<CatalogDeclaration>> = BTreeMap::new();
-        for (unit, range) in declarations {
-            if !is_graph_declaration(&unit) {
-                continue;
-            }
-            let ecosystem = UsageEcosystem::of(language_for_target(&unit));
-            let exact_declaration =
-                (!matches!(ecosystem, UsageEcosystem::Cpp | UsageEcosystem::CSharp))
-                    .then(|| unit.declaration_id());
-            grouped
-                .entry(ReferenceGroupKey {
-                    ecosystem,
-                    fqn: unit.fq_name(),
-                    kind: unit.kind(),
-                    signature: unit.signature().map(str::to_string),
-                    exact_declaration,
-                })
-                .or_default()
-                .push((unit, range));
-        }
-
-        let mut nodes = Vec::with_capacity(grouped.len());
-        for (_, mut declarations) in grouped {
-            declarations.sort_by(|(left, left_range), (right, right_range)| {
-                left.source()
-                    .cmp(right.source())
-                    .then_with(|| {
-                        left_range
-                            .map(|range| range.start_line)
-                            .cmp(&right_range.map(|range| range.start_line))
-                    })
-                    .then_with(|| left.signature().cmp(&right.signature()))
-            });
-            let (primary, primary_range) = declarations.first().expect("non-empty group").clone();
-            let ecosystem = UsageEcosystem::of(language_for_target(&primary));
-            let key = WorkspaceUsageNodeKey {
-                id: primary.declaration_id(),
-                ecosystem,
-                fqn: primary.fq_name(),
-                defining_file: ecosystem
-                    .is_module_scoped()
-                    .then(|| primary.source().clone()),
-            };
-            let mut declaration_files: Vec<_> = declarations
-                .iter()
-                .map(|(unit, _)| unit.source().clone())
-                .collect();
-            declaration_files.sort();
-            declaration_files.dedup();
-            let mut declaration_ids: Vec<_> = declarations
-                .iter()
-                .map(|(unit, _)| unit.declaration_id())
-                .collect();
-            declaration_ids.sort();
-            declaration_ids.dedup();
-            nodes.push((
-                key,
-                primary,
-                primary_range,
-                declaration_files,
-                declaration_ids,
-            ));
-        }
-        nodes.sort_by(|left, right| left.0.id.cmp(&right.0.id));
-        nodes
-    }
-
-    /// Two C++ declarations of one entity, in a header and its translation
-    /// unit.
-    ///
-    /// C++ and C# omit the exact declaration identity from the group key, so
-    /// these land in one node. That is the only shape that exercises duplicate
-    /// grouping, primary selection among several rows, and the file/identity
-    /// deduplication -- the JVM fixture's rows are all exact identities, so
-    /// every one of its groups holds exactly one row.
-    fn cpp_redeclaration_pair(root: &std::path::Path) -> Vec<CatalogDeclaration> {
-        let signature = Some("void Widget::draw()".to_string());
-        let declaration = |rel_path: &str, start_line: usize| {
-            (
-                CodeUnit::with_signature(
-                    ProjectFile::new(root.to_path_buf(), rel_path),
-                    crate::analyzer::CodeUnitType::Function,
-                    "widgets",
-                    "Widget.draw",
-                    signature.clone(),
-                    false,
-                ),
-                Some(Range {
-                    start_byte: start_line * 40,
-                    end_byte: start_line * 40 + 20,
-                    start_line,
-                    end_line: start_line,
-                }),
-            )
-        };
-        // Deliberately enumerated header first while `lib/widget.cpp` sorts
-        // first, so primary selection is decided by source order and not by
-        // the order the rows arrived in.
-        vec![
-            declaration("lib/widget.h", 4),
-            declaration("lib/widget.cpp", 12),
-        ]
-    }
-
-    /// The inventory the parity and cost-shape tests group: every persisted
-    /// declaration of the multi-language fixture, its Java module descriptor,
-    /// and one C++ redeclaration pair.
-    fn parity_inventory(
-        analyzer: &MultiAnalyzer,
-        root: &std::path::Path,
-    ) -> Vec<CatalogDeclaration> {
-        let mut declarations = analyzer.all_declarations_with_primary_ranges();
-        for file in analyzer.analyzed_files() {
-            if is_java_module_descriptor_file(&file) {
-                let file_scope = CodeUnit::file_scope(file.clone());
-                let range = analyzer
-                    .ranges(&file_scope)
-                    .into_iter()
-                    .min_by_key(range_key);
-                declarations.push((file_scope, range));
-            }
-        }
-        declarations.extend(cpp_redeclaration_pair(root));
-        declarations
-    }
-
-    #[test]
-    #[hardwon(
-        "2d6e0d05e77f: A persisted fixture compares identities, duplicates, primary ranges, and order with an independent reference grouping"
-    )]
-    fn catalog_grouping_matches_the_ordered_map_reference_grouping() {
-        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let analyzer = persisted_multilanguage_analyzer(root.clone());
-        let declarations = parity_inventory(&analyzer, &root);
-        assert!(
-            declarations.len() > 8,
-            "the parity fixture must carry enough rows to exercise grouping: {declarations:?}"
-        );
-
-        let expected = reference_catalog_nodes(declarations.clone());
-        let actual =
-            WorkspaceUsageCatalog::from_declarations(declarations, &CancellationToken::default())
-                .expect("uncancelled catalog");
-
-        assert_eq!(
-            catalog_node_fields(&actual),
-            expected,
-            "the grouping rewrite must reproduce the ordered-map grouping exactly: identity, \
-             primary, primary range, duplicate files, duplicate identities, and node order"
-        );
-
-        // The C++ redeclarations are one node whose primary is the header, and
-        // the node is reachable by either declaration identity.
-        let merged = actual
-            .nodes
-            .iter()
-            .find(|node| node.declaration_files.len() == 2)
-            .expect("the C++ redeclaration pair must group into one node");
-        assert_eq!(
-            merged.primary.source().rel_path(),
-            std::path::Path::new("lib/widget.cpp"),
-            "primary selection must take the first declaration in source order, not enumeration \
-             order: {files:?}",
-            files = merged.declaration_files
-        );
-        assert_eq!(merged.declaration_ids.len(), 2, "{:?}", merged.primary);
-        for id in &merged.declaration_ids {
-            assert_eq!(
-                actual.index_for_id(id),
-                actual.index_for_id(&merged.key.id),
-                "every identity in a merged node must index that node"
-            );
-        }
-    }
-
     /// The cost shape the parallel grouping exists to fix.
     ///
     /// The ordered-map grouping hashed each row's declaration identity about
@@ -1564,3 +1235,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod cpp_test_support;

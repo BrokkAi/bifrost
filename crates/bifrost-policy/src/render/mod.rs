@@ -362,9 +362,8 @@ mod tests {
         UnavailablePolicyCapability,
     };
     use brokk_bifrost_analysis::CancellationToken;
-    use brokk_bifrost_analysis::analyzer::{
-        Language, ProjectFile, TestProject, TypescriptAnalyzer,
-    };
+    use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, TestProject};
+    use brokk_bifrost_js_ts_analysis::TypescriptAnalyzer;
     use brokk_bifrost_test_macros::hardwon;
 
     fn evaluated_report(

@@ -114,14 +114,10 @@ pub fn procedure_wire_id(handle: &ProcedureHandle) -> String {
 /// mount-independent artifact and structured-locator identity used by public
 /// semantic rows without decoding a rendered identifier.
 pub fn procedure_public_digest(handle: &ProcedureHandle) -> StableDigest {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost-code-query-semantic-wire-id-v2");
-    digest.push(handle.artifact().key().public_fingerprint().as_bytes());
-    digest.push(b"procedure");
-    handle
-        .semantics()
-        .locator()
-        .push_stable_identity(&mut digest);
-    digest.finish()
+    crate::analyzer::semantic::SemanticProcedureReference::public_digest_for(
+        handle.artifact().key(),
+        handle.semantics().locator(),
+    )
 }
 
 /// Stable content-scoped identity for one semantic program point.
@@ -5189,7 +5185,7 @@ impl ProcedureContinuationProjection {
         }
         request
             .budget
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 nested_entries: 1 + targets.len(),
                 ..SemanticWork::default()
             })
@@ -5216,7 +5212,7 @@ impl ProcedureContinuationProjection {
         }
         request
             .budget
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 nested_entries: self.mask.omitted.len()
                     + self.reasons.len()
                     + 2 * self.procedure.semantics().points().len()
@@ -5261,7 +5257,7 @@ impl ProcedureContinuationProjection {
     ) -> Result<bool, FlowStateIncompleteReason> {
         request
             .budget
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 nested_entries: exact_calls.len() + self.procedure.semantics().gaps().len() + 1,
                 ..SemanticWork::default()
             })
@@ -5281,8 +5277,7 @@ impl ProcedureContinuationProjection {
                 call.id()
             })
             .collect::<HashSet<_>>();
-        let mut cfg_budget =
-            CfgAlgorithmBudget::uniform(request.budget.remaining().nested_entries / 2);
+        let mut cfg_budget = CfgAlgorithmBudget::uniform(usize::MAX);
         let result = evaluate_projected_nonreturn(
             &self.procedure,
             &self.mask,
@@ -5292,13 +5287,10 @@ impl ProcedureContinuationProjection {
             request.cancellation,
         );
         let used = cfg_budget.used();
-        request
-            .budget
-            .charge(SemanticWork {
-                nested_entries: used.node_visits + used.edge_visits,
-                ..SemanticWork::default()
-            })
-            .expect("CFG work fits the reserved semantic budget");
+        request.budget.charge_work(SemanticWork {
+            nested_entries: used.node_visits + used.edge_visits,
+            ..SemanticWork::default()
+        });
         match result {
             WorkspaceNonreturnEvaluation::Proven => {
                 self.normal_return_absent = true;
@@ -12726,7 +12718,14 @@ fn receiver_adjustment(mut receiver: Receiver, value: Option<i32>) {
     receiver.consume(checked(value));
 }
 
-fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>) {
+// Guard carries a real Drop impl so the fixture retains destructor gaps after
+// #5911 stopped inventing them for proven non-Drop values.
+struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>, guard: Guard) {
     use_values(checked(value), ());
     receiver.consume(false);
     unknown_macro!();

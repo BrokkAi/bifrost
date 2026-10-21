@@ -13,9 +13,10 @@ fn accumulator(
     answer
 }
 
-impl RustReverseRetained {
-    fn translated(self, translation: &impl ResolutionIdentityTranslation) -> Self {
+impl WorkerAnswer for RustReverseRetained {
+    fn translate(self, translation: &impl ResolutionIdentityTranslation) -> Self {
         let Self {
+            proof,
             references,
             witnesses,
             bindings,
@@ -32,6 +33,7 @@ impl RustReverseRetained {
             evaluation_count,
         } = self;
         Self {
+            proof: proof.map(|proof| reverse::translate_reverse_proof(proof, translation)),
             references: references
                 .iter()
                 .map(|&id| translation.semantic(id))
@@ -87,9 +89,12 @@ impl RustReverseRetained {
             evaluation_count,
         }
     }
+}
 
+impl RustReverseRetained {
     pub(super) fn append(&mut self, other: Self) {
         let Self {
+            proof,
             references,
             witnesses,
             bindings,
@@ -105,6 +110,12 @@ impl RustReverseRetained {
             time_budget_exceeded,
             evaluation_count,
         } = other;
+        if let Some(proof) = proof {
+            match self.proof.as_mut() {
+                Some(into) => reverse::append_reverse_proof(into, proof),
+                None => self.proof = Some(proof),
+            }
+        }
         self.references.extend(references);
         self.witnesses.extend(witnesses);
         self.bindings.extend(bindings);
@@ -135,27 +146,27 @@ impl RustReverseRetained {
     }
 }
 
-/// Only reverse vocabulary lives here; worker authority and alias transfer
-/// belong to the shared transport boundary.
+/// Rust proof payload and stable source anchors for the shared worker transport.
 pub(super) struct RetainedPartition {
     pub(super) retained: RustReverseRetained,
     pub(super) definition: SemanticId,
     pub(super) sites: Vec<(usize, SemanticId)>,
-    pub(super) projected_units: Vec<CodeUnit>,
     pub(super) unattempted_blobs: Vec<std::path::PathBuf>,
 }
 
 impl WorkerAnswer for RetainedPartition {
-    fn translate(self, translation: &impl ResolutionIdentityTranslation) -> Self {
+    fn translate(
+        self,
+        translation: &impl crate::analyzer::resolution::ResolutionIdentityTranslation,
+    ) -> Self {
         Self {
-            retained: self.retained.translated(translation),
+            retained: self.retained.translate(translation),
             definition: translation.semantic(self.definition),
             sites: self
                 .sites
                 .into_iter()
                 .map(|(index, reference)| (index, translation.semantic(reference)))
                 .collect(),
-            projected_units: self.projected_units,
             unattempted_blobs: self.unattempted_blobs,
         }
     }

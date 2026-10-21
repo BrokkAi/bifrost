@@ -7,15 +7,15 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{CppAnalyzer, IAnalyzer, Language, ProjectFile, Range, resolve_analyzer};
+use crate::analyzer::{ IAnalyzer, Language, ProjectFile, Range, resolve_analyzer};
 use crate::hash::{HashMap, HashSet};
 use crate::query::CppRule;
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::imports::{include_path_from_node, resolve_include_targets_with_index};
 use brokk_bifrost_cpp::structural::declarator_name_node;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
-use super::language_rules::LanguageRuleMatches;
+use super::language_rules::{LanguageRuleMatches, UndecidedSite};
 
 /// Return the exact structural spans selected by one closed C/C++ relation.
 ///
@@ -31,9 +31,14 @@ pub(super) fn matches_for_file(
         return LanguageRuleMatches::default();
     };
     let root = tree.root_node();
-    let mut ranges = match rule {
-        CppRule::DuplicateIncludeGuard => duplicate_include_guard(analyzer, file, source),
-        CppRule::MissingHeaderGuard => missing_header_guard(analyzer, file, source, root),
+    let mut undecided = Vec::new();
+    let ranges = match rule {
+        CppRule::DuplicateIncludeGuard => {
+            duplicate_include_guard(analyzer, file, source, root, &mut undecided)
+        }
+        CppRule::MissingHeaderGuard => {
+            missing_header_guard(analyzer, file, source, root, &mut undecided)
+        }
         CppRule::DeclarationHidesParameter => declaration_hides_parameter(root, source),
         CppRule::DeclarationHidesVariable => declaration_hides_variable(root, source),
         CppRule::FunctionInBlock => function_in_block(root, source),
@@ -41,13 +46,21 @@ pub(super) fn matches_for_file(
             local_variable_hides_global_variable(root, source)
         }
         CppRule::ShortGlobalName => short_global_name(root, source),
-        CppRule::CallWithNullSal => call_with_null_sal(analyzer, file, source, root),
-        CppRule::IgnoreReturnValueSal => ignore_return_value_sal(analyzer, file, source, root),
-        CppRule::InconsistentSal => inconsistent_sal(analyzer, file, source, root),
+        CppRule::CallWithNullSal => {
+            call_with_null_sal(analyzer, file, source, root, &mut undecided)
+        }
+        CppRule::IgnoreReturnValueSal => {
+            ignore_return_value_sal(analyzer, file, source, root, &mut undecided)
+        }
+        CppRule::InconsistentSal => inconsistent_sal(analyzer, file, source, root, &mut undecided),
     };
-    ranges.sort();
-    ranges.dedup();
-    LanguageRuleMatches::from_ranges(ranges)
+    LanguageRuleMatches::decided(
+        ranges,
+        undecided,
+        Language::Cpp.config_label(),
+        rule.label(),
+        file,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -331,53 +344,62 @@ fn include_guard<'tree>(root: Node<'tree>, source: &str) -> Option<(String, Node
     None
 }
 
-fn cpp_files(analyzer: &dyn IAnalyzer) -> Vec<ProjectFile> {
-    analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| language_for_file(file) == Language::Cpp)
-        .collect()
-}
-
-fn source_for_file(
+/// Parse every analyzed C/C++ file, reusing `target_source` for the target.
+///
+/// Workspace relations count or collect facts across files, so a file whose
+/// source cannot be read or parsed leaves the relation undecided rather than
+/// silently smaller.
+fn workspace_trees(
     analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
     target: &ProjectFile,
     target_source: &str,
-) -> Option<String> {
-    if file == target {
-        Some(target_source.to_owned())
-    } else {
-        analyzer.indexed_source(file)
+    undecided: &mut Vec<UndecidedSite>,
+) -> Vec<(ProjectFile, String, Tree)> {
+    let mut trees = Vec::new();
+    for file in analyzer.analyzed_files() {
+        if language_for_file(&file) != Language::Cpp {
+            continue;
+        }
+        let source = if file == *target {
+            Some(target_source.to_owned())
+        } else {
+            analyzer.indexed_source(&file)
+        };
+        let Some(source) = source else {
+            undecided.push(UndecidedSite::in_file(&file, "the workspace file's source is unavailable"));
+            continue;
+        };
+        let Some(tree) = parse_tree_for_language(&file, Language::Cpp, &source) else {
+            undecided.push(UndecidedSite::in_file(&file, "the workspace file does not parse"));
+            continue;
+        };
+        trees.push((file, source, tree));
     }
+    trees
 }
 
 fn duplicate_include_guard(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
-    let mut counts: HashMap<String, usize> = HashMap::default();
-    for candidate in cpp_files(analyzer) {
-        let Some(candidate_source) = source_for_file(analyzer, &candidate, file, source) else {
-            continue;
-        };
-        let Some(tree) = parse_tree_for_language(&candidate, Language::Cpp, &candidate_source)
-        else {
-            continue;
-        };
-        if let Some((name, _)) = include_guard(tree.root_node(), &candidate_source) {
-            *counts.entry(name).or_default() += 1;
-        }
-    }
-    let Some(tree) = parse_tree_for_language(file, Language::Cpp, source) else {
+    let Some((guard, guard_node)) = include_guard(root, source) else {
         return Vec::new();
     };
-    include_guard(tree.root_node(), source)
-        .filter(|(name, _)| counts.get(name).copied().unwrap_or_default() > 1)
-        .map(|(_, node)| node_range(node))
-        .into_iter()
-        .collect()
+    let mut count = 0usize;
+    for (_, candidate_source, tree) in workspace_trees(analyzer, file, source, undecided) {
+        if include_guard(tree.root_node(), &candidate_source).is_some_and(|(name, _)| name == guard)
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    if count > 1 {
+        vec![node_range(guard_node)]
+    } else {
+        Vec::new()
+    }
 }
 
 fn is_header(file: &ProjectFile) -> bool {
@@ -392,22 +414,20 @@ fn missing_header_guard(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
     if !is_header(file) || include_guard(root, source).is_some() {
         return Vec::new();
     }
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+        undecided.push(UndecidedSite::in_file(
+            file,
+            "no C/C++ analyzer resolves the header's includers",
+        ));
         return Vec::new();
     };
     let mut include_count = 0usize;
-    for candidate in cpp_files(analyzer) {
-        let Some(candidate_source) = source_for_file(analyzer, &candidate, file, source) else {
-            continue;
-        };
-        let Some(tree) = parse_tree_for_language(&candidate, Language::Cpp, &candidate_source)
-        else {
-            continue;
-        };
+    for (candidate, candidate_source, tree) in workspace_trees(analyzer, file, source, undecided) {
         for node in descendants(tree.root_node()) {
             let Some((include, _)) = include_path_from_node(node, &candidate_source) else {
                 continue;
@@ -499,15 +519,10 @@ fn workspace_contracts(
     analyzer: &dyn IAnalyzer,
     target: &ProjectFile,
     target_source: &str,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<CallableContract> {
     let mut contracts = Vec::new();
-    for file in cpp_files(analyzer) {
-        let Some(source) = source_for_file(analyzer, &file, target, target_source) else {
-            continue;
-        };
-        let Some(tree) = parse_tree_for_language(&file, Language::Cpp, &source) else {
-            continue;
-        };
+    for (_, source, tree) in workspace_trees(analyzer, target, target_source, undecided) {
         for node in descendants(tree.root_node()) {
             if let Some(contract) = callable_contract(node, &source) {
                 contracts.push(contract);
@@ -535,9 +550,10 @@ fn call_with_null_sal(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
     let mut annotated = HashSet::default();
-    for contract in workspace_contracts(analyzer, file, source) {
+    for contract in workspace_contracts(analyzer, file, source, undecided) {
         if contract.annotated_parameters.contains(&0) {
             annotated.insert(contract.name);
         }
@@ -561,8 +577,9 @@ fn ignore_return_value_sal(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
-    let checked: HashSet<String> = workspace_contracts(analyzer, file, source)
+    let checked: HashSet<String> = workspace_contracts(analyzer, file, source, undecided)
         .into_iter()
         .filter(|contract| contract.check_return)
         .map(|contract| contract.name)
@@ -584,9 +601,10 @@ fn inconsistent_sal(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
     let mut declarations: HashMap<String, HashSet<usize>> = HashMap::default();
-    for contract in workspace_contracts(analyzer, file, source) {
+    for contract in workspace_contracts(analyzer, file, source, undecided) {
         if !contract.annotated_parameters.is_empty() {
             declarations
                 .entry(contract.name)
@@ -608,3 +626,5 @@ fn inconsistent_sal(
         .map(|(node, _)| node_range(node))
         .collect()
 }
+
+use brokk_bifrost_cpp_analysis::analyzer::{CppAnalyzer};

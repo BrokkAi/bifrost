@@ -153,11 +153,18 @@ pub(crate) fn resolved_policy_to_json(
                     .and_then(Value::as_array_mut)
                     .expect("the relational assertion projection has bindings");
                 for (binding, projected) in plan.bindings.iter().zip(bindings) {
-                    if !matches!(binding.source, RowBindingSource::Query(_)) {
+                    let RowBindingSource::Query(authored) = &binding.source;
+                    let path = relational_binding_selector_path(&binding.name);
+                    // A deferred declaration-selection import has no resolved
+                    // query yet; its authored reference is the identity.
+                    if matches!(authored, PolicySelector::DeclarationSelection(_))
+                        && !selectors
+                            .iter()
+                            .any(|selector| selector.path.as_str() == path)
+                    {
                         continue;
                     }
-                    let selector =
-                        selector_at(selectors, &relational_binding_selector_path(&binding.name))?;
+                    let selector = selector_at(selectors, &path)?;
                     projected
                         .as_object_mut()
                         .expect("a relational binding projection is an object")

@@ -3,18 +3,23 @@
 //! Preparation is an inventory-free handle. Discovery reads the requested
 //! endpoint's source halves and row routes; closure reads their exports and
 //! reachable re-export relation and publishes one immutable query relation.
-//! The eager topology compiler remains only as an independent test oracle.
+//! Outgoing and graph-stage operations share these published binding readers.
 
 use super::super::demand::{
     DemandLanguage, LanguageClosure, LanguageContextPreparation, LanguagePrefixInputs,
     LanguageRootDiscovery,
 };
-use super::super::source_demand::{SourceDemandKey as RustSourceDemandKey, root_source_key};
+use super::super::demand_closure::{
+    Admission, DemandRules, EndpointAdmission, Read, RootFrame, SharedDemand,
+};
+use super::super::source_demand::SourceDemandKey as RustSourceDemandKey;
 use super::super::*;
-use super::relations::{ClosedEndpointRegistration, ClosedRelations};
+use super::relations::ClosedRelations;
+use crate::analyzer::resolution::DemandReferenceKey;
+use crate::analyzer::resolution::DemandRelationKey;
 use crate::analyzer::resolution::{
-    BatchCandidateRequest, DemandRootUnavailableReason, DemandSelectedOverlayBlueprint,
-    EndpointSignature, FactResolutionAnswer, SelectedContextPathSource,
+    BatchCandidateRequest, DemandRootUnavailableReason, EndpointSignature, FactResolutionAnswer,
+    SelectedContextPathSource,
 };
 
 /// A demand handle retains no file, crate, profile, or endpoint inventory.
@@ -71,6 +76,7 @@ impl<'a, 'store, 'input> PreparedForwardSource<'a, 'store, 'input> {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn generated_base_endings(
         &self,
         paths: &[(
@@ -79,71 +85,20 @@ impl<'a, 'store, 'input> PreparedForwardSource<'a, 'store, 'input> {
         )],
         halves: &[SelectedRootPathHalf],
     ) -> Vec<(CandidatePathIdentity, RustSourceDemandKey)> {
-        paths
-            .iter()
-            .filter_map(|(id, path)| {
-                if path.end().node() != BindingNodeId::universal_root() {
-                    return None;
-                }
-                // A root terminal the overlay compiler issued for one of this
-                // relation's own source halves. Three conditions identify it,
-                // and they are conditions rather than assertions because an
-                // added path can also end at the universal root as an ordinary
-                // bridge continuation: the canonical two-cell (demand, token)
-                // terminal shape, a token that belongs to a sealed source half,
-                // and a token that is not an Export half's, because no selected
-                // bridge starts with this terminal lookup and token.
-                //
-                // The path's completion is deliberately not one of them. An
-                // unresolved route says `UnsupportedSemantic(token)` and a route
-                // whose prefix resolved exactly to a module-owned non-module
-                // declaration is a complete negative continuation, and both are
-                // root terminals of this relation. Whether the endpoint may then
-                // read the base relation or is a closed empty is decided by
-                // `generated_base_suppressed` from the prefix answers, which is
-                // the only place that knows whether authority was established.
-                let fixed = path.end().symbols().fixed();
-                let [demand, token] = fixed else {
-                    return None;
-                };
-                let source = RustSourceDemandKey {
-                    fragment: id.fragment(),
-                    demand: demand.symbol(),
-                    token: token.symbol(),
-                };
-                if !halves.iter().any(|half| match half {
-                    SelectedRootPathHalf::Import {
-                        identity,
-                        token,
-                        demand,
-                        ..
-                    }
-                    | SelectedRootPathHalf::Reference {
-                        identity,
-                        token,
-                        demand,
-                        ..
-                    } => {
-                        identity.fragment() == source.fragment
-                            && *token == source.token
-                            && *demand == source.demand
-                    }
-                    SelectedRootPathHalf::Export { .. } => false,
-                }) {
-                    return None;
-                }
-                Some((*id, source))
-            })
-            .collect()
+        super::super::demand_closure::generated_base_endings(paths, halves, None)
+            .expect("unbounded legacy terminal scan")
     }
 }
 
-pub(crate) struct ForwardProvider<'a, 'store, 'input> {
+pub(crate) struct RustRules<'a, 'store, 'input> {
     pub(crate) prepared: &'a PreparedForwardSource<'a, 'store, 'input>,
     pub(crate) arena: &'a RefCell<ClosedRelations>,
     pub(crate) session: &'a ResolutionSession,
     pub(crate) cancellation: &'a CancellationToken,
 }
+
+pub(crate) type ForwardProvider<'a, 'store, 'input> =
+    SharedDemand<'a, 'store, 'input, RustRules<'a, 'store, 'input>>;
 
 impl<'a, 'store, 'input> ForwardProvider<'a, 'store, 'input> {
     pub(crate) fn new(
@@ -152,22 +107,31 @@ impl<'a, 'store, 'input> ForwardProvider<'a, 'store, 'input> {
         session: &'a ResolutionSession,
         cancellation: &'a CancellationToken,
     ) -> Self {
-        Self {
-            prepared,
+        SharedDemand {
+            rules: RustRules {
+                prepared,
+                arena,
+                session,
+                cancellation,
+            },
             arena,
+            paths: prepared.paths,
+            ready: prepared.ready,
+            base: prepared.base,
             session,
             cancellation,
+            completion: &prepared.demand.completion,
         }
     }
 }
 
-impl ForwardProvider<'_, '_, '_> {
-    fn stopped(&self, evidence: &ResolutionCompletion) -> ResolutionCompletion {
+impl RustRules<'_, '_, '_> {
+    pub(super) fn stopped(&self, evidence: &ResolutionCompletion) -> ResolutionCompletion {
         evidence.combine(&crate::analyzer::resolution::cancelled_completion())
     }
 }
 
-impl DemandLanguage for ForwardProvider<'_, '_, '_> {
+impl DemandLanguage for RustRules<'_, '_, '_> {
     type RootQuestion = super::rows::RowRootPlan;
     type ContextKey = ();
     type ContextData = ();
@@ -342,182 +306,15 @@ impl DemandLanguage for ForwardProvider<'_, '_, '_> {
             self.arena
                 .borrow_mut()
                 .reverse_endpoints
-                .insert(endpoint.clone());
+                .insert(DemandRelationKey::caller(endpoint.clone()));
         }
     }
 
     fn discover_root(
         &mut self,
-        endpoint: &EndpointSignature,
+        _endpoint: &EndpointSignature,
     ) -> Result<LanguageRootDiscovery<Self::RootQuestion>> {
-        if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(LanguageRootDiscovery::Cancelled(
-                self.stopped(&self.prepared.demand.completion),
-            ));
-        }
-        {
-            let arena = self.arena.borrow();
-            if let Some(retained) = arena.rust.registrations.get(endpoint) {
-                assert!(arena.endpoints.contains_key(endpoint));
-                if matches!(
-                    self.prepared.ready.register_context_in_session(
-                        &retained.blueprint,
-                        self.cancellation,
-                        self.session,
-                    )?,
-                    ContextRegistrationOutcome::Cancelled
-                ) {
-                    return Ok(LanguageRootDiscovery::Cancelled(
-                        self.stopped(&retained.completion),
-                    ));
-                }
-                return Ok(LanguageRootDiscovery::AlreadyReady {
-                    completion: retained.completion.clone(),
-                });
-            }
-        }
-        if endpoint.node() != BindingNodeId::universal_root() {
-            // Local candidate relations are already immutable, but only a
-            // node actually issued by this selected base owns that authority.
-            let known_local = matches!(
-                self.prepared
-                    .ready
-                    .inventory
-                    .mount_rebaser()
-                    .borrow()
-                    .node_mount(endpoint.node()),
-                Some(crate::analyzer::resolution::SelectedNodeMount::FragmentLocal(_))
-            );
-            return Ok(if known_local {
-                LanguageRootDiscovery::AlreadyReady {
-                    completion: self.prepared.demand.completion.clone(),
-                }
-            } else {
-                LanguageRootDiscovery::Unavailable {
-                    reason: DemandRootUnavailableReason::MissingSourceProvenance,
-                    completion: self.prepared.demand.completion.clone(),
-                }
-            });
-        }
-        let generated = self
-            .arena
-            .borrow()
-            .generated_base_completion(endpoint, self.session);
-        if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
-            return Ok(LanguageRootDiscovery::Cancelled(
-                self.stopped(&self.prepared.demand.completion),
-            ));
-        }
-        if let Some((completion, use_base)) = generated {
-            if use_base {
-                self.arena.borrow_mut().base_ready.insert(endpoint.clone());
-            } else {
-                self.arena
-                    .borrow_mut()
-                    .excluded_base
-                    .insert(endpoint.clone());
-            }
-            return Ok(LanguageRootDiscovery::AlreadyReady { completion });
-        }
-        note_rust_point_work("demand_discover_generated", self.session);
-        let key = root_source_key(
-            self.prepared.ready,
-            self.prepared.base,
-            endpoint,
-            self.session,
-            self.cancellation,
-        )?;
-        note_rust_point_work("demand_discover_source_key", self.session);
-        let Some(source) = key else {
-            if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
-                return Ok(LanguageRootDiscovery::Cancelled(
-                    self.stopped(&self.prepared.demand.completion),
-                ));
-            }
-            return Ok(LanguageRootDiscovery::Unavailable {
-                reason: DemandRootUnavailableReason::MissingSourceProvenance,
-                completion: self.prepared.demand.completion.clone(),
-            });
-        };
-        let mut halves = Vec::new();
-        let anchors = self.prepared.ready.lexical_source();
-        let coverage = self
-            .prepared
-            .base
-            .visit_reverse_root_candidate_match_pages(
-                &[BatchCandidateRequest::new(0, endpoint.clone())],
-                None,
-                self.cancellation,
-                &mut |page| {
-                    let ids = page.iter().map(|row| row.candidate()).collect::<Vec<_>>();
-                    for (id, path) in self
-                        .prepared
-                        .base
-                        .hydrate_candidate_paths(&ids, self.cancellation)?
-                    {
-                        let Some(half) = classify_selected_root_path_half(
-                            &anchors,
-                            id,
-                            &path,
-                            self.cancellation,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let key = match &half {
-                            SelectedRootPathHalf::Import {
-                                identity,
-                                token,
-                                demand,
-                                ..
-                            }
-                            | SelectedRootPathHalf::Reference {
-                                identity,
-                                token,
-                                demand,
-                                ..
-                            } => RustSourceDemandKey {
-                                fragment: identity.fragment(),
-                                token: *token,
-                                demand: *demand,
-                            },
-                            _ => continue,
-                        };
-                        if key == source {
-                            // The evaluator owns a source path's provisional
-                            // evidence and may discharge it using typed facts.
-                            // The route must not copy it into its new bridge.
-                            halves.push(half);
-                        }
-                    }
-                    Ok(!self.cancellation.is_cancelled() && self.session.scope_step())
-                },
-            )?;
-        if self.cancellation.is_cancelled()
-            || coverage
-                .unconditional_completion()
-                .contains_reason(ResolutionIncompleteReason::Cancelled)
-        {
-            return Ok(LanguageRootDiscovery::Cancelled(
-                self.stopped(coverage.unconditional_completion()),
-            ));
-        }
-        let plan = super::rows::RowRootPlan {
-            prefixes: halves
-                .iter()
-                .filter_map(super::super::rust_prefix::rust_qualified_prefix)
-                .collect(),
-            halves,
-            // The base reader owns its candidate coverage. This relation
-            // contributes only the evidence established by its crate rows.
-            completion: ResolutionCompletion::Complete,
-        };
-        let completion = plan.completion.clone();
-        note_rust_point_work("demand_discover_plan", self.session);
-        Ok(LanguageRootDiscovery::Ready {
-            question: plan,
-            completion,
-        })
+        unreachable!("Rust discovery uses SharedDemand")
     }
 
     fn context_key(&self, _question: &Self::RootQuestion) -> Option<Self::ContextKey> {
@@ -537,251 +334,254 @@ impl DemandLanguage for ForwardProvider<'_, '_, '_> {
 
     fn prefix_inputs(
         &mut self,
-        question: &mut Self::RootQuestion,
+        _question: &mut Self::RootQuestion,
         _context: Option<&Self::ContextData>,
     ) -> Result<LanguagePrefixInputs> {
-        Ok(LanguagePrefixInputs {
-            references: question
-                .prefixes
-                .iter()
-                .map(|operand| operand.reference)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-            completion: ResolutionCompletion::Complete,
-        })
+        unreachable!("Rust prefixes use SharedDemand")
     }
 
     fn close_root(
         &mut self,
-        endpoint: &EndpointSignature,
-        plan: &Self::RootQuestion,
+        _endpoint: &EndpointSignature,
+        _plan: &Self::RootQuestion,
         _context: Option<&Self::ContextData>,
-        inputs: &[(SemanticId, &FactResolutionAnswer)],
+        _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
     ) -> Result<LanguageClosure> {
-        if let Some(retained) = self.arena.borrow().rust.registrations.get(endpoint) {
-            return Ok(LanguageClosure {
-                completion: retained.completion.clone(),
-                closed: true,
-                discharges: None,
-            });
-        }
-        let expected = plan
-            .prefixes
-            .iter()
-            .map(|operand| operand.reference)
-            .collect::<BTreeSet<_>>();
-        let actual = inputs
-            .iter()
-            .map(|(reference, _)| *reference)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            expected, actual,
-            "materialization requires every full prefix answer"
-        );
-        assert_eq!(
-            inputs.len(),
-            actual.len(),
-            "prefix operands form an exact bijection"
-        );
-        let mut evidence = plan.completion.clone();
-        for (_, answer) in inputs {
-            evidence = evidence.combine(answer.completion());
-        }
-        if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        }
-        let rows = super::rows::EndpointRows {
+        unreachable!("Rust closes through SharedDemand")
+    }
+}
+
+impl<'a, 'store, 'input> DemandRules for RustRules<'a, 'store, 'input> {
+    type Half<'b>
+        = super::rows::RustHalfRows<'b, 'store, 'input>
+    where
+        Self: 'b;
+
+    fn half_rows<'b>(
+        &'b self,
+        source: &'b super::super::demand_closure::SourceHalf,
+        frame: &'b RootFrame,
+        scopes: &'b crate::analyzer::store::resolution_lexical::NodeSourceScopes,
+        lexical: &'b dyn super::super::demand_closure::HalfSource,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+    ) -> Result<Option<Self::Half<'b>>> {
+        super::rows::EndpointRows {
             ready: self.prepared.ready,
             base: self.prepared.base,
             cancellation: self.cancellation,
+            session: self.session,
             topologies: &self.prepared.demand.topologies,
-        };
-        let Some(descriptors) = rows.close(plan, inputs)? else {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        };
-        for descriptor in &descriptors {
-            evidence = evidence.combine(descriptor.completion());
         }
-        note_rust_point_work("demand_close_prefix_bridges", self.session);
-        // Register with the existing selected owner, including exact local
-        // anchor keys. Build the readable overlay and retained registration
-        // once; subsequent requests reuse the closed endpoint relation.
-        // Crate gap evidence is issued by this endpoint's row reader. Register
-        // those identities with the context, just as the crate point reader
-        // does; they have no persisted fragment-local semantic coordinate.
-        let mut inventory_completion = self.prepared.demand.completion.clone();
-        let mut owned_reasons = BTreeSet::new();
-        for descriptor in &descriptors {
-            if let ResolutionCompletion::Incomplete(reasons) = descriptor.completion() {
-                for reason in reasons.iter() {
-                    if let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason
-                        && !self
-                            .prepared
-                            .ready
-                            .inventory
-                            .mount_rebaser()
-                            .borrow()
-                            .issued_semantic(*semantic)
-                    {
-                        owned_reasons.insert(*semantic);
-                        inventory_completion = inventory_completion
-                            .combine(&ResolutionCompletion::incomplete([*reason]));
-                    }
-                }
+        .half(source, frame, scopes, lexical, inputs)
+        .map(Some)
+    }
+    type PreparationKey = ();
+    type Certificate = ();
+    fn note_closure_work(&self, milestone: &'static str) {
+        note_rust_point_work(milestone, self.session);
+    }
+
+    fn commit_associations(
+        &self,
+        associations: &[super::super::demand_closure::ContextAssociation],
+    ) {
+        use super::super::demand_closure::ContextAssociation;
+        for association in associations {
+            match association {
+                ContextAssociation::ExternalTypeImport { boundary, paths } => self
+                    .prepared
+                    .ready
+                    .context_identities
+                    .record_rust_external_type_import_paths(*boundary, paths.iter().cloned()),
+                ContextAssociation::PreludeReference {
+                    reference,
+                    boundary,
+                } => self
+                    .prepared
+                    .ready
+                    .context_identities
+                    .record_rust_prelude_reference(*reference, *boundary),
             }
         }
-        let selected_mount_of = selected_mount_lookup(self.prepared.mount_table());
-        let mut contexts = empty_contexts_for(
-            self.prepared.mount_table(),
-            &inventory_completion,
-            &selected_mount_of,
-            self.prepared.ready.context_identities.clone(),
-        )?;
-        for reason in owned_reasons {
-            contexts = contexts.with_context_owned_inventory_reason(reason);
-        }
-        let contexts = contexts.extend_root_bridges(
-            descriptors,
-            self.cancellation,
-            Some(self.session),
-            &selected_mount_of,
-        )?;
-        let Some(contexts) = contexts else {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        };
-        let SelectedResolutionContextValidationOutcome::Ready(contexts) = contexts
-            .validate_exact_mounts_in_session(
-                self.prepared.mount_table().mount_count(),
-                &selected_mount_lookup(self.prepared.mount_table()),
-                self.cancellation,
-                self.session,
-            )?
-        else {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        };
-        let SelectedFactOperationBlueprintConstruction::Ready(registration) =
-            self.prepared.ready.collect_blueprint_in_session(
-                contexts,
-                self.cancellation,
-                self.session,
-            )?
-        else {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        };
-        if matches!(
-            self.prepared.ready.register_context_in_session(
-                &registration,
-                self.cancellation,
-                self.session
-            )?,
-            ContextRegistrationOutcome::Cancelled
-        ) {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        }
-        note_rust_point_work("demand_close_register_context", self.session);
-        let relation = DemandSelectedOverlayBlueprint::new(registration.context_token());
-        let Some(paths) = relation.added_candidate_paths(self.prepared.paths, self.cancellation)?
-        else {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        };
-        if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(LanguageClosure {
-                completion: self.stopped(&evidence),
-                closed: false,
-                discharges: None,
-            });
-        }
-        let generated = self.prepared.generated_base_endings(&paths, &plan.halves);
-        let prefix_has_target = inputs
+    }
+
+    fn closure_policy(
+        &self,
+        frame: &RootFrame,
+        facts: &super::super::demand_closure::ClosureFacts<'_>,
+    ) -> Result<Read<super::super::demand_closure::ClosurePolicy>> {
+        debug_assert!(facts.halves.iter().all(|half| {
+            half.placements
+                .iter()
+                .all(|placement| half.answered_placements.contains(&placement.placement))
+        }));
+        use super::super::demand_closure::{BaseEligibility, ClosurePolicy, GeneratedContinuation};
+        let generated = facts
+            .generated
             .iter()
-            .map(|(reference, answer)| (*reference, !answer.binding().targets().is_empty()))
-            .collect::<HashMap<_, _>>();
-        {
-            let mut arena = self.arena.borrow_mut();
-            assert!(!evidence.contains_reason(ResolutionIncompleteReason::Cancelled));
-            arena.publish(endpoint.clone(), relation, paths);
-            assert!(
-                arena
-                    .rust
-                    .registrations
-                    .insert(
-                        endpoint.clone(),
-                        ClosedEndpointRegistration {
-                            blueprint: registration,
-                            completion: evidence.clone(),
-                        }
-                    )
-                    .is_none(),
-                "one endpoint closes once per retained selection"
-            );
-            for (id, source) in generated {
-                let matching_prefixes = plan.halves.iter().filter_map(|half| {
+            .map(|(candidate, source)| {
+                let suppress = frame.halves.iter().any(|half| {
                     let SelectedRootPathHalf::Reference {
                         identity,
                         token,
                         demand,
-                        prefix_reference,
+                        prefix_reference: Some(prefix),
                         ..
                     } = half
                     else {
-                        return None;
+                        return false;
                     };
-                    (RustSourceDemandKey {
-                        fragment: identity.fragment(),
-                        token: *token,
-                        demand: *demand,
-                    } == source)
-                        .then_some(*prefix_reference)
-                        .flatten()
+                    identity.fragment() == source.fragment
+                        && *token == source.token
+                        && *demand == source.demand
+                        && facts.prefixes.entries.iter().any(|answer| {
+                            answer.key == DemandReferenceKey::caller(*prefix)
+                                && !answer.answer.binding().targets().is_empty()
+                        })
                 });
-                if matching_prefixes
-                    .into_iter()
-                    .any(|prefix| prefix_has_target[&prefix])
-                {
-                    arena.rust.generated_base_suppressed.insert(id);
+                GeneratedContinuation {
+                    candidate: *candidate,
+                    source: *source,
+                    base: if suppress {
+                        BaseEligibility::Exclude
+                    } else {
+                        BaseEligibility::Retain
+                    },
                 }
-                let fixed = arena.paths[&id].end().symbols().fixed();
-                let key = (fixed[0].symbol(), fixed[1].symbol());
-                let bucket = arena.rust.generated_base_endings.entry(key).or_default();
-                if !bucket.contains(&id) {
-                    bucket.push(id);
+            })
+            .collect();
+        let mut policy = ClosurePolicy::new(
+            ResolutionCompletion::Complete,
+            BaseEligibility::Retain,
+            crate::analyzer::resolution::DemandClosureDischarges::default(),
+            generated,
+        );
+        policy.associations = facts.associations.to_vec();
+        Ok(Read::ready(policy))
+    }
+
+    fn admit_endpoint(
+        &mut self,
+        endpoint: &EndpointSignature,
+        _already_published: bool,
+    ) -> Result<Read<EndpointAdmission>> {
+        {
+            let arena = self.arena.borrow();
+            if let Some(retained) = arena
+                .registrations
+                .get(&DemandRelationKey::caller(endpoint.clone()))
+            {
+                assert!(
+                    arena
+                        .endpoints
+                        .contains_key(&DemandRelationKey::caller(endpoint.clone()))
+                );
+                if matches!(
+                    self.prepared.ready.register_context_in_session(
+                        &retained.blueprint,
+                        self.cancellation,
+                        self.session,
+                    )?,
+                    ContextRegistrationOutcome::Cancelled
+                ) {
+                    return Ok(Read::Cancelled(self.stopped(&retained.completion)));
                 }
+                return Ok(Read::ready(EndpointAdmission::Ready(
+                    retained.completion.clone(),
+                )));
             }
         }
-        note_rust_point_work("demand_close_published", self.session);
-        Ok(LanguageClosure {
-            completion: evidence,
-            closed: true,
-            discharges: None,
-        })
+        if endpoint.node() != BindingNodeId::universal_root() {
+            // Local candidate relations are already immutable, but only a
+            // node actually issued by this selected base owns that authority.
+            let known_local = matches!(
+                self.prepared
+                    .ready
+                    .inventory
+                    .mount_rebaser()
+                    .borrow()
+                    .node_mount(endpoint.node()),
+                Some(crate::analyzer::resolution::SelectedNodeMount::FragmentLocal(_))
+            );
+            return Ok(if known_local {
+                Read::ready(EndpointAdmission::Ready(
+                    self.prepared.demand.completion.clone(),
+                ))
+            } else {
+                Read::Unavailable {
+                    reason: DemandRootUnavailableReason::MissingSourceProvenance,
+                    completion: self.prepared.demand.completion.clone(),
+                }
+            });
+        }
+        let generated = self
+            .arena
+            .borrow()
+            .generated_base_completion(endpoint, self.session);
+        if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
+            return Ok(Read::Cancelled(
+                self.stopped(&self.prepared.demand.completion),
+            ));
+        }
+        if let Some((completion, use_base)) = generated {
+            if use_base {
+                self.arena
+                    .borrow_mut()
+                    .base_ready
+                    .insert(DemandRelationKey::caller(endpoint.clone()));
+            } else {
+                self.arena
+                    .borrow_mut()
+                    .excluded_base
+                    .insert(DemandRelationKey::caller(endpoint.clone()));
+            }
+            return Ok(Read::ready(EndpointAdmission::Ready(completion)));
+        }
+        Ok(Read::ready(EndpointAdmission::Discover))
+    }
+    fn describe_source(
+        &mut self,
+        endpoint: &EndpointSignature,
+        source: Option<RustSourceDemandKey>,
+        halves: Vec<SelectedRootPathHalf>,
+        _completion: ResolutionCompletion,
+    ) -> Result<Read<Admission>> {
+        let Some(source) = source else {
+            return Ok(Read::Unavailable {
+                reason: DemandRootUnavailableReason::MissingSourceProvenance,
+                completion: _completion,
+            });
+        };
+        // Provisional path evidence stays with the base evaluator, which may
+        // discharge it using typed facts. Crate rows own closure evidence.
+        Ok(Read::ready(Admission::SourceOwned(RootFrame::positioned(
+            endpoint, source, halves,
+        ))))
+    }
+    fn root_starts<'b>(
+        &self,
+        rules: &mut Self::Half<'b>,
+        owner: &<Self::Half<'b> as super::super::demand_closure::HalfRules>::Placement,
+        facts: &mut super::super::demand_closure::PlacementFacts<
+            <Self::Half<'b> as super::super::demand_closure::HalfRules>::Target,
+        >,
+    ) -> Result<
+        Vec<
+            super::super::demand_closure::PlacementStart<
+                <Self::Half<'b> as super::super::demand_closure::HalfRules>::Member,
+            >,
+        >,
+    >
+    where
+        Self: 'b,
+    {
+        super::super::demand_closure::HalfRules::root_starts(rules, owner, facts)
+    }
+    fn prefix_operands(
+        &self,
+        frame: &RootFrame,
+        caller: super::super::demand_closure::EnvironmentId,
+    ) -> Vec<super::super::demand_closure::PrefixOperand> {
+        super::super::rust_prefix::rust_prefix_operands(frame, caller)
     }
 }

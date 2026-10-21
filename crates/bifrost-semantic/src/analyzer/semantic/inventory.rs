@@ -1,0 +1,522 @@
+//! Shared identity and work-accounting mechanics for procedure inventories.
+//!
+//! Language adapters own syntax and callable recognition. This module owns
+//! the iterative scope walk and syntax-free identity state shared by those
+//! adapters: declaration paths, sibling ordinals, dense procedure IDs,
+//! stable locators, and the distinction between observed enumeration work and
+//! the traversal-only work passed into procedure lowering.
+
+use tree_sitter::Node;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::hash::HashMap;
+
+use crate::analyzer::semantic::cfg::initial_procedure_cfg_work;
+
+use crate::analyzer::semantic::lowering::source_anchor;
+
+use crate::analyzer::semantic::DeclarationLocator;
+
+use crate::analyzer::semantic::DeclarationSegment;
+
+use crate::analyzer::semantic::DeclarationSegmentKind;
+
+use crate::analyzer::semantic::ProcedureId;
+
+use crate::analyzer::semantic::ProcedureSemanticsParts;
+
+use crate::analyzer::semantic::SemanticBudget;
+
+use crate::analyzer::semantic::SemanticBudgetExceeded;
+
+use brokk_bifrost_core::analyzer::model::LanguageDialect as SemanticLanguage;
+
+use crate::analyzer::semantic::SemanticLocator;
+
+use crate::analyzer::semantic::SemanticOutcome;
+
+use crate::analyzer::semantic::SemanticProviderError;
+
+use crate::analyzer::semantic::SemanticRole;
+
+use crate::analyzer::semantic::SemanticWork;
+
+use crate::analyzer::semantic::SourceAnchor;
+
+use crate::analyzer::semantic::WorkspaceMountId;
+
+use crate::analyzer::semantic::WorkspaceRelativePath;
+
+/// Result of a language-owned procedure inventory walk.
+#[doc(hidden)]
+pub enum ProcedureInventoryOutcome<T> {
+    Complete {
+        value: T,
+        /// One-time traversal work inherited by procedure lowering.
+        initial_work: SemanticWork,
+        /// Identity plus traversal work already observed by inventory.
+        inventory_work: SemanticWork,
+    },
+    ExceededBudget {
+        exceeded: SemanticBudgetExceeded,
+        /// All identity and traversal work observed before stopping.
+        work: SemanticWork,
+    },
+    Cancelled {
+        /// All identity and traversal work observed before cancellation.
+        work: SemanticWork,
+    },
+}
+
+#[doc(hidden)]
+pub enum ProcedureLoweringInput<T> {
+    Complete {
+        value: T,
+        initial_work: SemanticWork,
+    },
+    Stopped(SemanticOutcome<Vec<ProcedureSemanticsParts>>),
+}
+
+impl<T> ProcedureInventoryOutcome<T> {
+    #[doc(hidden)]
+    pub fn into_lowering_input(self) -> ProcedureLoweringInput<T> {
+        match self {
+            Self::Complete {
+                value,
+                initial_work,
+                ..
+            } => ProcedureLoweringInput::Complete {
+                value,
+                initial_work,
+            },
+            Self::ExceededBudget { exceeded, work } => {
+                ProcedureLoweringInput::Stopped(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                })
+            }
+            Self::Cancelled { work } => {
+                ProcedureLoweringInput::Stopped(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                })
+            }
+        }
+    }
+}
+
+/// A successfully allocated procedure identity.
+#[doc(hidden)]
+pub struct ProcedureIdentity {
+    #[doc(hidden)]
+    pub id: ProcedureId,
+    #[doc(hidden)]
+    pub locator: SemanticLocator,
+    #[doc(hidden)]
+    pub declaration_path: usize,
+}
+
+/// Budget stop produced by one inventory step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ProcedureInventoryStop {
+    #[doc(hidden)]
+    pub exceeded: SemanticBudgetExceeded,
+    work: Box<SemanticWork>,
+}
+
+/// A prepass stopped either because the budget ended or cancellation arrived.
+#[doc(hidden)]
+pub enum ProcedureInventoryPrepassStop {
+    Budget(ProcedureInventoryStop),
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct ProcedureEnumerationFrame<'tree> {
+    #[doc(hidden)]
+    pub node: Node<'tree>,
+    #[doc(hidden)]
+    pub lexical_parent: Option<ProcedureId>,
+    #[doc(hidden)]
+    pub declaration_path: usize,
+}
+
+#[doc(hidden)]
+pub struct ProcedureWalkScopes {
+    #[doc(hidden)]
+    pub container_body: Option<(usize, usize)>,
+    #[doc(hidden)]
+    pub callable_body: Option<(usize, ProcedureId, usize)>,
+}
+
+#[doc(hidden)]
+pub enum ProcedureWalkStep<T> {
+    Continue {
+        value: Option<T>,
+        scopes: ProcedureWalkScopes,
+    },
+    ExceededBudget(ProcedureInventoryStop),
+}
+
+#[doc(hidden)]
+pub enum ProcedureTreeWalkOutcome<T> {
+    Complete(Vec<T>),
+    ExceededBudget(ProcedureInventoryStop),
+    Cancelled,
+}
+
+impl ProcedureInventoryStop {
+    #[doc(hidden)]
+    pub fn into_outcome<T>(self) -> ProcedureInventoryOutcome<T> {
+        ProcedureInventoryOutcome::ExceededBudget {
+            exceeded: self.exceeded,
+            work: *self.work,
+        }
+    }
+}
+
+/// Syntax-free state shared by every language's iterative inventory walk.
+#[doc(hidden)]
+pub struct ProcedureInventoryBuilder<'budget> {
+    mount: WorkspaceMountId,
+    path: WorkspaceRelativePath,
+    language: SemanticLanguage,
+    siblings: HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
+    declaration_paths: Vec<DeclarationPathEntry>,
+    identity_work: SemanticWork,
+    traversal_work: SemanticWork,
+    next_procedure: usize,
+    budget: &'budget SemanticBudget,
+}
+
+impl<'budget> ProcedureInventoryBuilder<'budget> {
+    #[doc(hidden)]
+    pub fn new(
+        file: &ProjectFile,
+        language: SemanticLanguage,
+        root: Node<'_>,
+        fallback_file_name: &str,
+        budget: &'budget SemanticBudget,
+    ) -> Result<Self, SemanticProviderError> {
+        let mount = WorkspaceMountId::from_root(file.root());
+        let path = WorkspaceRelativePath::try_from_path(file.rel_path())
+            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
+        let file_anchor =
+            source_anchor(root, 0).map_err(SemanticProviderError::invalid_identity)?;
+        let file_name = file
+            .rel_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(fallback_file_name);
+        let file_segment =
+            DeclarationSegment::named(DeclarationSegmentKind::File, file_name, file_anchor, 0)
+                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
+
+        Ok(Self {
+            mount,
+            path,
+            language,
+            siblings: HashMap::default(),
+            declaration_paths: vec![DeclarationPathEntry {
+                parent: None,
+                segment: file_segment,
+            }],
+            identity_work: SemanticWork::default(),
+            traversal_work: SemanticWork::default(),
+            next_procedure: 0,
+            budget,
+        })
+    }
+
+    #[doc(hidden)]
+    pub const fn root_path(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    pub fn locator(
+        &self,
+        declaration_path: usize,
+        role: SemanticRole,
+        anchor: SourceAnchor,
+    ) -> Result<SemanticLocator, SemanticProviderError> {
+        let declaration = DeclarationLocator::new(collect_declaration_path(
+            &self.declaration_paths,
+            declaration_path,
+        ))
+        .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
+        Ok(SemanticLocator::new(
+            self.mount,
+            self.path.clone(),
+            self.language,
+            declaration,
+            role,
+            anchor,
+        ))
+    }
+
+    #[doc(hidden)]
+    pub fn push_container(
+        &mut self,
+        parent: usize,
+        kind: DeclarationSegmentKind,
+        name: Option<&str>,
+        anchor: SourceAnchor,
+    ) -> Result<usize, SemanticProviderError> {
+        let ordinal = next_sibling_ordinal(&mut self.siblings, parent, kind, name);
+        let segment = declaration_segment(kind, name, anchor, ordinal)
+            .map_err(SemanticProviderError::invalid_identity)?;
+        Ok(push_declaration_path(
+            &mut self.declaration_paths,
+            parent,
+            segment,
+        ))
+    }
+
+    #[doc(hidden)]
+    pub fn allocate_procedure(
+        &mut self,
+        parent: usize,
+        kind: DeclarationSegmentKind,
+        name: Option<&str>,
+        anchor: SourceAnchor,
+    ) -> Result<Result<ProcedureIdentity, ProcedureInventoryStop>, SemanticProviderError> {
+        let id = ProcedureId::try_from_index(self.next_procedure)
+            .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+        let ordinal = next_sibling_ordinal(&mut self.siblings, parent, kind, name);
+        let segment = declaration_segment(kind, name, anchor, ordinal)
+            .map_err(SemanticProviderError::invalid_identity)?;
+        let mut segments = collect_declaration_path(&self.declaration_paths, parent);
+        segments.push(segment.clone());
+        let declaration = DeclarationLocator::new(segments)
+            .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
+        let locator = SemanticLocator::new(
+            self.mount,
+            self.path.clone(),
+            self.language,
+            declaration,
+            SemanticRole::Procedure,
+            anchor,
+        );
+        let identity_candidate = self
+            .identity_work
+            .conservative_add(procedure_identity_preflight(&locator));
+        let observed_candidate = identity_candidate.conservative_add(self.traversal_work);
+        if let Err(exceeded) = self.budget.check_admission(observed_candidate) {
+            return Ok(Err(ProcedureInventoryStop {
+                exceeded,
+                work: Box::new(observed_candidate),
+            }));
+        }
+
+        self.identity_work = identity_candidate;
+        self.next_procedure = self.next_procedure.saturating_add(1);
+        let declaration_path = push_declaration_path(&mut self.declaration_paths, parent, segment);
+        Ok(Ok(ProcedureIdentity {
+            id,
+            locator,
+            declaration_path,
+        }))
+    }
+
+    pub(crate) fn charge_traversal(
+        &mut self,
+        work: SemanticWork,
+    ) -> Result<(), ProcedureInventoryStop> {
+        let traversal_candidate = self.traversal_work.conservative_add(work);
+        let observed_candidate = self.identity_work.conservative_add(traversal_candidate);
+        if let Err(exceeded) = self.budget.check_admission(observed_candidate) {
+            return Err(ProcedureInventoryStop {
+                exceeded,
+                work: Box::new(observed_candidate),
+            });
+        }
+        self.traversal_work = traversal_candidate;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn charge_traversal_entry(&mut self) -> Result<(), ProcedureInventoryStop> {
+        self.charge_traversal(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn observe_additional_work(
+        &mut self,
+        work: SemanticWork,
+    ) -> Result<(), ProcedureInventoryStop> {
+        self.charge_traversal(work)
+    }
+
+    #[doc(hidden)]
+    pub fn observed_work(&self) -> SemanticWork {
+        self.identity_work.conservative_add(self.traversal_work)
+    }
+
+    #[doc(hidden)]
+    pub fn complete<T>(self, value: T) -> ProcedureInventoryOutcome<T> {
+        ProcedureInventoryOutcome::Complete {
+            value,
+            initial_work: self.traversal_work,
+            inventory_work: self.observed_work(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn cancelled<T>(&self) -> ProcedureInventoryOutcome<T> {
+        ProcedureInventoryOutcome::Cancelled {
+            work: self.observed_work(),
+        }
+    }
+}
+
+/// Check cancellation before charging one shared inventory traversal entry.
+#[doc(hidden)]
+pub fn charge_prepass(
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<(), ProcedureInventoryPrepassStop> {
+    if cancellation.is_cancelled() {
+        return Err(ProcedureInventoryPrepassStop::Cancelled);
+    }
+    inventory
+        .charge_traversal_entry()
+        .map_err(ProcedureInventoryPrepassStop::Budget)
+}
+
+#[doc(hidden)]
+pub fn walk_procedure_tree<'tree, T>(
+    root: Node<'tree>,
+    root_path: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    mut children_of: impl FnMut(Node<'tree>) -> Vec<Node<'tree>>,
+    mut visit: impl FnMut(
+        ProcedureEnumerationFrame<'tree>,
+        &mut ProcedureInventoryBuilder<'_>,
+    ) -> Result<ProcedureWalkStep<T>, SemanticProviderError>,
+) -> Result<ProcedureTreeWalkOutcome<T>, SemanticProviderError> {
+    let mut values = Vec::new();
+    let mut stack = vec![ProcedureEnumerationFrame {
+        node: root,
+        lexical_parent: None,
+        declaration_path: root_path,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if cancellation.is_cancelled() {
+            return Ok(ProcedureTreeWalkOutcome::Cancelled);
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(ProcedureTreeWalkOutcome::ExceededBudget(stop));
+        }
+        let scopes = match visit(frame, inventory)? {
+            ProcedureWalkStep::Continue { value, scopes } => {
+                if let Some(value) = value {
+                    values.push(value);
+                }
+                scopes
+            }
+            ProcedureWalkStep::ExceededBudget(stop) => {
+                return Ok(ProcedureTreeWalkOutcome::ExceededBudget(stop));
+            }
+        };
+
+        let child_path = frame.declaration_path;
+        for child in children_of(frame.node).into_iter().rev() {
+            let child_path = scopes
+                .container_body
+                .filter(|(body_id, _)| *body_id == child.id())
+                .map(|(_, path)| path)
+                .unwrap_or(child_path);
+            let (lexical_parent, declaration_path) = scopes
+                .callable_body
+                .filter(|(body_id, _, _)| *body_id == child.id())
+                .map(|(_, procedure, path)| (Some(procedure), path))
+                .unwrap_or((frame.lexical_parent, child_path));
+            stack.push(ProcedureEnumerationFrame {
+                node: child,
+                lexical_parent,
+                declaration_path,
+            });
+        }
+    }
+
+    Ok(ProcedureTreeWalkOutcome::Complete(values))
+}
+
+/// One node in the persistent declaration path assembled while adapters walk
+/// nested syntax iteratively.
+struct DeclarationPathEntry {
+    parent: Option<usize>,
+    segment: DeclarationSegment,
+}
+
+fn push_declaration_path(
+    paths: &mut Vec<DeclarationPathEntry>,
+    parent: usize,
+    segment: DeclarationSegment,
+) -> usize {
+    let id = paths.len();
+    paths.push(DeclarationPathEntry {
+        parent: Some(parent),
+        segment,
+    });
+    id
+}
+
+fn collect_declaration_path(
+    paths: &[DeclarationPathEntry],
+    mut path: usize,
+) -> Vec<DeclarationSegment> {
+    let mut segments = Vec::new();
+    loop {
+        let entry = &paths[path];
+        segments.push(entry.segment.clone());
+        let Some(parent) = entry.parent else {
+            break;
+        };
+        path = parent;
+    }
+    segments.reverse();
+    segments
+}
+
+fn next_sibling_ordinal(
+    siblings: &mut HashMap<(usize, DeclarationSegmentKind, Option<Box<str>>), u32>,
+    scope: usize,
+    kind: DeclarationSegmentKind,
+    name: Option<&str>,
+) -> u32 {
+    let key = (scope, kind, name.map(Box::<str>::from));
+    let next = siblings.entry(key).or_default();
+    let ordinal = *next;
+    *next += 1;
+    ordinal
+}
+
+fn declaration_segment(
+    kind: DeclarationSegmentKind,
+    name: Option<&str>,
+    anchor: SourceAnchor,
+    sibling_ordinal: u32,
+) -> Result<DeclarationSegment, String> {
+    match name {
+        Some(name) => DeclarationSegment::named(kind, name, anchor, sibling_ordinal)
+            .map_err(|error| error.to_string()),
+        None => Ok(DeclarationSegment::anonymous(kind, anchor, sibling_ordinal)),
+    }
+}
+
+/// Work retained for the shared procedure identity rows created by
+/// [`super::lowering::ProcedureLoweringSession::start`].
+fn procedure_identity_preflight(locator: &SemanticLocator) -> SemanticWork {
+    initial_procedure_cfg_work(locator, std::iter::once(locator), std::iter::once(1))
+}

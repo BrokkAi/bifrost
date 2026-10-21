@@ -10,6 +10,7 @@ use brokk_bifrost_flow::scalar_state::{
     ScalarCallEffects, ScalarStateDerivation, ScalarTyping, declared_scalar_seeds, guard_decides,
     java_scalar_seeds,
 };
+use brokk_bifrost_php_analysis::analyzer::php::php_declared_scalar_types;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -17,6 +18,7 @@ use tree_sitter::Node;
 use crate::analyzer::declared_scalar::{
     csharp_declared_scalar_types, go_declared_scalar_types, rust_declared_scalar_types,
 };
+use crate::analyzer::resolve_analyzer;
 use crate::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
 use crate::analyzer::semantic::{
     ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, EvidenceId, GuardFact, GuardPredicate,
@@ -24,12 +26,8 @@ use crate::analyzer::semantic::{
     SemanticCapability, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
     SemanticValueKind, SourceMappingKind,
 };
-use crate::analyzer::{CppAnalyzer, resolve_analyzer};
 use crate::analyzer::{Language, LanguageDialect, ProjectFile, WorkspaceAnalyzer};
-use crate::analyzer::{
-    kotlin_declared_scalar_types, php_declared_scalar_types, ruby_declared_scalar_types,
-    scala_declared_scalar_types,
-};
+use crate::analyzer::{kotlin_declared_scalar_types, scala_declared_scalar_types};
 use crate::cancellation::CancellationToken;
 
 // The scalar solver retains one value vector per reachable program point and
@@ -1599,3 +1597,7 @@ impl ComposedConditions<'_> {
         })
     }
 }
+
+use brokk_bifrost_ruby_analysis::ruby_declared_scalar_types;
+
+use brokk_bifrost_cpp_analysis::analyzer::CppAnalyzer;

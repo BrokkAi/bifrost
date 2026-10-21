@@ -1,34 +1,26 @@
 //! Exact bridge from shared call conversion proofs to semantic call bindings.
 
-use super::WorkspaceSemanticOracle;
-use super::dispatch::{
+use crate::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
+use crate::analyzer::semantic::workspace_oracle::dispatch::{
     ProcedureRangeLookupStatus, exact_call_range, exact_source_for_procedure,
     procedures_for_definition_with_limits,
 };
 use crate::analyzer::semantic::{
     CallSiteHandle, DispatchCandidate, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticWork, ValueTransfer,
+    SemanticWork,
 };
 use crate::analyzer::usages::CallBindingCache;
 use crate::analyzer::usages::call_binding::{
     CallBindingTarget, CallReceiverBinding, call_binding_report,
 };
-use crate::analyzer::usages::call_conversion::{CallConversionCache, ConversionUnknown};
+use crate::analyzer::usages::call_conversion::CallConversionCache;
 use crate::analyzer::usages::call_shape::call_shapes_in_file;
 use crate::analyzer::usages::callable_signature::callable_signature_reports;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_call_target_batch_with_source,
 };
-use crate::analyzer::{AnalyzerQueryScope, QueryScope, Range};
-
-#[derive(Clone)]
-pub(super) struct ArgumentConversion {
-    pub range: Range,
-    pub formal: usize,
-    pub transfer: Result<Option<ValueTransfer>, ConversionUnknown>,
-    pub incomplete_reason: Option<String>,
-}
-
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::conversions::*;
 impl WorkspaceSemanticOracle<'_> {
     pub(super) fn java_call_conversions(
         &self,
@@ -41,13 +33,7 @@ impl WorkspaceSemanticOracle<'_> {
             ($cost:expr) => {{
                 let cost = $cost;
                 work = work.conservative_add(cost);
-                if let Err(exceeded) = request.budget.charge(cost) {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
+                request.budget.charge_work(cost);
                 if request.cancellation.is_cancelled() {
                     return Ok(SemanticOutcome::Cancelled {
                         partial: None,
@@ -58,14 +44,23 @@ impl WorkspaceSemanticOracle<'_> {
         }
         let mut sources = Vec::new();
         for procedure in [call.procedure(), candidate.target()] {
-            let remaining = request.budget.remaining().source_bytes;
-            let Some(source) = exact_source_for_procedure(self.workspace, procedure, remaining)?
+            let maximum_source_bytes = request.budget.limits().source_bytes;
+            let Some(source) =
+                exact_source_for_procedure(self.workspace, procedure, maximum_source_bytes)?
             else {
-                charge!(SemanticWork {
-                    source_bytes: remaining.saturating_add(1),
+                let census = SemanticWork {
+                    source_bytes: maximum_source_bytes.saturating_add(1),
                     ..SemanticWork::default()
+                };
+                let exceeded = request
+                    .budget
+                    .check_admission(census)
+                    .expect_err("source preparation exceeds the resident byte grant");
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
                 });
-                unreachable!("over-budget source charge must stop");
             };
             charge!(SemanticWork {
                 source_bytes: source.1.len(),
@@ -153,14 +148,10 @@ impl WorkspaceSemanticOracle<'_> {
                 analyzer,
                 target,
                 candidate.target().artifact(),
-                request.budget.remaining().nested_entries,
+                usize::MAX,
                 request.cancellation,
             );
-            examined = if procedures.status == ProcedureRangeLookupStatus::BudgetExhausted {
-                request.budget.remaining().nested_entries.saturating_add(1)
-            } else {
-                procedures.examined
-            };
+            examined = procedures.examined;
             if procedures.status != ProcedureRangeLookupStatus::Complete
                 || procedures.handles.as_slice() != [candidate.target().clone()]
             {

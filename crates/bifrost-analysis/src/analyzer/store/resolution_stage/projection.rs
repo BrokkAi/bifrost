@@ -23,7 +23,8 @@ use serde_json::json;
 pub(in crate::analyzer::store) const CAPSULE_MEMBERSHIP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_mounts mount CROSS JOIN temp.selected_resolution_admissions admission ON admission.workspace_id=mount.workspace_id AND admission.storage_language=mount.storage_language AND admission.generation=mount.generation AND admission.revision=mount.revision AND admission.host_content_oid=mount.blob_oid AND admission.invocation=?2 AND admission.input_kind=1 CROSS JOIN temp.selected_resolution_stage_producers producer ON producer.host_ordinal=mount.mount_ordinal AND producer.admission_id=admission.admission_id AND producer.admission_id IS NOT NULL WHERE mount.mount_ordinal=?1)";
 
 impl SelectedResolutionStage<'_, '_> {
-    pub(crate) fn has_admitted_macro_input(
+    #[doc(hidden)]
+    pub fn has_admitted_macro_input(
         &self,
         host: crate::analyzer::resolution::SelectedResolutionMountOrdinal,
         invocation: brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId,
@@ -59,7 +60,8 @@ impl SelectedResolutionStage<'_, '_> {
     /// definition rows so that a crate-declared macro item
     /// (`rust_crate_macro_items`), whose declaration replay recorded at the
     /// same range, can be found and projected to its `CodeUnit`.
-    pub(crate) fn admit_capsule(
+    #[doc(hidden)]
+    pub fn admit_capsule(
         &self,
         content: PublishedResolutionContent,
         host: &SelectedResolutionMountRecord,
@@ -141,9 +143,10 @@ impl SelectedResolutionStage<'_, '_> {
 
     /// A generated lexical bridge may have runtime authority without producer
     /// descriptors. No identity is manufactured when its catalog is absent.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn insert_generated_bridge(
+    #[doc(hidden)]
+    pub fn insert_generated_bridge(
         &self,
         host: &SelectedResolutionMountRecord,
         bridge_identity: [u8; 32],

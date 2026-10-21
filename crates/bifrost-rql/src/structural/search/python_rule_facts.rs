@@ -16,7 +16,6 @@ use crate::analyzer::usages::python_class_hierarchy::{
     PythonBaseResolution, PythonHierarchyOutcome, PythonHierarchyReason, PythonOverrideAnswer,
     PythonOverrideOutcome,
 };
-use crate::analyzer::{python_builtin_exception_is_subclass, python_builtin_exception_name};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::{
     ClassIdentity, MemberAccessKind, MemberLookup, UnknownReason, type_flow_adapter,
@@ -25,6 +24,9 @@ use brokk_bifrost_core::analyzer::tree_walk::children_by_field_name;
 use brokk_bifrost_flow::type_flow::{ClassSetStatus, ReceiverClassSet, TypeFlowSitePurpose};
 use brokk_bifrost_python::declarations::{
     PythonParameterSplat, python_parameter_label_node, python_parameter_splat,
+};
+use brokk_bifrost_python::exception_identity::{
+    python_builtin_exception_is_subclass, python_builtin_exception_name,
 };
 use brokk_bifrost_python::imports::{
     PythonImportDetails, python_import_details, python_import_infos_from_node,

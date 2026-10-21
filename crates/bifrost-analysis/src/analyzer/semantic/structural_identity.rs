@@ -6,8 +6,6 @@
 //! executable value at that occurrence. The map is built once per prepared
 //! source, and each mapping then performs only a tree-node-id lookup.
 
-use tree_sitter::Node;
-
 use crate::analyzer::parser_language_for_dialect;
 use crate::analyzer::semantic::{
     ContentIdentity, SemanticProviderError, StableDigest, StructuralNodeIdentity,
@@ -19,14 +17,16 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 use brokk_bifrost_core::cancellation::CancellationToken;
-
+use tree_sitter::Node;
 #[derive(Debug)]
-pub(crate) struct StructuralNodeIndex {
+#[doc(hidden)]
+pub struct StructuralNodeIndex {
     content: ContentIdentity,
     node_ids: HashMap<usize, u32>,
 }
 
-pub(crate) enum StructuralNodeIndexOutcome {
+#[doc(hidden)]
+pub enum StructuralNodeIndexOutcome {
     Complete {
         index: StructuralNodeIndex,
         work_items: usize,
@@ -38,7 +38,8 @@ pub(crate) enum StructuralNodeIndexOutcome {
 }
 
 impl StructuralNodeIndex {
-    pub(crate) fn for_source(
+    #[doc(hidden)]
+    pub fn for_source(
         spec: &dyn StructuralSpec,
         prepared: &PreparedSyntaxTree,
         max_work_items: usize,
@@ -67,7 +68,8 @@ impl StructuralNodeIndex {
         Self::for_source_with_forest(spec, prepared, &forest, max_work_items, cancellation)
     }
 
-    pub(crate) fn for_source_with_forest(
+    #[doc(hidden)]
+    pub fn for_source_with_forest(
         spec: &dyn StructuralSpec,
         prepared: &PreparedSyntaxTree,
         forest: &brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest,
@@ -118,7 +120,8 @@ impl StructuralNodeIndex {
         })
     }
 
-    pub(crate) fn identity(&self, node: Node<'_>) -> Option<StructuralNodeIdentity> {
+    #[doc(hidden)]
+    pub fn identity(&self, node: Node<'_>) -> Option<StructuralNodeIdentity> {
         self.node_ids
             .get(&node.id())
             .copied()

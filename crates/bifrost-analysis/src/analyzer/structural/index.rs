@@ -1790,15 +1790,6 @@ fn hash_table_allocation_bytes<K, V>(capacity: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::Language;
-    use crate::analyzer::Range;
-    use crate::analyzer::structural::facts::{FileFacts, NormalizedNode};
-    use crate::analyzer::structural::occurrences::OccurrenceRole;
-    use crate::analyzer::structural::test_support::content_identity as content;
-    use crate::compact_graph::CompactRows;
-    use brokk_bifrost_test_macros::hardwon;
-
     struct FakeProvider {
         files: Vec<ProjectFile>,
         facts: HashMap<ProjectFile, Arc<FileFacts>>,
@@ -1810,14 +1801,12 @@ mod tests {
         /// observe an index build while it is still in flight.
         gate: Option<Arc<BuildGate>>,
     }
-
     /// A latch the test opens to let a stalled build finish.
     #[derive(Default)]
     struct BuildGate {
         released: Mutex<bool>,
         changed: std::sync::Condvar,
     }
-
     impl BuildGate {
         fn wait(&self) {
             let mut released = self.released.lock().expect("build gate poisoned");
@@ -1831,26 +1820,6 @@ mod tests {
             self.changed.notify_all();
         }
     }
-
-    /// Order the provider's files the way [`SnapshotStructuralIndexCache`]
-    /// does before it censuses and builds them.
-    fn build_index_for_test(
-        provider: &dyn StructuralFactProvider,
-        max_retained_bytes: u64,
-        content_identity: WorkspaceContentIdentity,
-    ) -> Result<(SnapshotStructuralIndex, StructuralIndexBuildMetrics), BuildFailure> {
-        let mut files = provider.structural_files();
-        files.sort();
-        files.dedup();
-        build_index(
-            provider,
-            files,
-            &CancellationToken::default(),
-            max_retained_bytes,
-            content_identity,
-        )
-    }
-
     impl StructuralFactProvider for FakeProvider {
         fn structural_language(&self) -> Language {
             Language::Python
@@ -1936,7 +1905,6 @@ mod tests {
             true
         }
     }
-
     fn provider() -> FakeProvider {
         let temp = tempfile::tempdir().expect("temp dir").keep();
         let root = temp.canonicalize().expect("canonical root");
@@ -1979,6 +1947,34 @@ mod tests {
             census: None,
             gate: None,
         }
+    }
+
+    use super::*;
+    use crate::Language;
+    use crate::analyzer::Range;
+    use crate::analyzer::structural::facts::{FileFacts, NormalizedNode};
+    use crate::analyzer::structural::occurrences::OccurrenceRole;
+    use crate::analyzer::structural::test_support::content_identity as content;
+    use crate::compact_graph::CompactRows;
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// Order the provider's files the way [`SnapshotStructuralIndexCache`]
+    /// does before it censuses and builds them.
+    fn build_index_for_test(
+        provider: &dyn StructuralFactProvider,
+        max_retained_bytes: u64,
+        content_identity: WorkspaceContentIdentity,
+    ) -> Result<(SnapshotStructuralIndex, StructuralIndexBuildMetrics), BuildFailure> {
+        let mut files = provider.structural_files();
+        files.sort();
+        files.dedup();
+        build_index(
+            provider,
+            files,
+            &CancellationToken::default(),
+            max_retained_bytes,
+            content_identity,
+        )
     }
 
     fn ambiguous_name_provider() -> FakeProvider {
@@ -2464,39 +2460,6 @@ mod tests {
         );
         assert!(reason.ends_with(".py"), "{reason}");
         assert_eq!(cache.len_for_test(), 0);
-    }
-
-    /// #1459: an empty file (a real workspace shape -- empty `__init__.py`)
-    /// must not abort the provider index. Before the fix,
-    /// `extract_file_facts_limited` returned `Unavailable` for empty sources,
-    /// this acquire came back `Unavailable { "structural index facts
-    /// unavailable" }`, and the whole Python slice fell back to scan mode for
-    /// the session.
-    #[test]
-    #[hardwon("#1459: an empty file prevented the structural provider index from completing")]
-    fn empty_file_does_not_abort_the_provider_index() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let empty = ProjectFile::new(root.clone(), "pkg/__init__.py");
-        empty.write("").expect("write empty file");
-        let module = ProjectFile::new(root.clone(), "pkg/module.py");
-        module
-            .write("def real_function():\n    return 1\n")
-            .expect("write module");
-        let analyzer = crate::analyzer::PythonAnalyzer::from_project(
-            crate::analyzer::TestProject::new(root, crate::analyzer::Language::Python),
-        );
-        let providers = crate::analyzer::IAnalyzer::structural_fact_providers(&analyzer);
-        let provider = *providers.first().expect("python structural provider");
-
-        let cache = SnapshotStructuralIndexCache::new(64 * 1024 * 1024);
-        let StructuralIndexAcquisition::Ready { index, .. } =
-            cache.acquire(provider, &CancellationToken::default())
-        else {
-            panic!("empty file must not reject the index")
-        };
-        assert!(index.file(&empty).is_some());
-        assert!(index.file(&module).is_some());
     }
 
     #[test]

@@ -1618,6 +1618,9 @@ fn scala_anonymous_template_body(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn scala_type_declaration_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(name);
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {

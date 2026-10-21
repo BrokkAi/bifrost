@@ -182,10 +182,11 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         // lands there — a written type either resolves to the target or does not,
         // with no receiver to be uncertain about — but a call through a receiver
         // whose type could not be established does.
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven_limit(
             target.clone(),
             hits,
             unproven_hits,
+            scan_scope.max_unproven(),
         ))
     }
 }

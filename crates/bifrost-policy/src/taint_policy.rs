@@ -4,6 +4,9 @@
 //! closed [`ResolvedTaintPolicySpec`] boundary and lowers only structured,
 //! source-backed selector results into the diagnostic-neutral taint engine.
 
+use brokk_bifrost_rust_analysis::{
+    RustStdBuiltinCall, RustStdBuiltinTransfer, rust_std_builtin_call,
+};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
@@ -51,16 +54,16 @@ use crate::resolved::{
     ResolvedTaintTransformDefinition,
 };
 use crate::selector_compiler::{
-    ReceiverBindingApplicability, parameter_name_matches, parameter_names_match,
+    IncompleteTaintSelector, ReceiverBindingApplicability, parameter_name_matches,
+    parameter_names_match,
 };
 use crate::taint_compose_provider::{CompositionMemo, PolicyCompositionProvider};
 use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    GapOpenness, PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus, RustStdBuiltinCall,
-    RustStdBuiltinTransfer, abort_paths_run_user_code, classify_gap_openness,
-    procedures_in_artifact, rust_std_builtin_call,
+    GapOpenness, PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus,
+    abort_paths_run_user_code, classify_gap_openness, procedures_in_artifact,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings, CallSiteHandle,
@@ -115,8 +118,8 @@ use brokk_bifrost_flow::value_flow::{
     ValueFlowEdgeKillSpec, ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause,
     ValueFlowInput, ValueFlowLocalRuleSpec, ValueFlowObservationPhase, ValueFlowPlan,
     ValueFlowPlanLimits, ValueFlowProvider, ValueFlowReturnedCallable, ValueFlowSinkId,
-    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, ValueFlowSummaryLocationBinding,
-    discover_closure_with,
+    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, ValueFlowSources,
+    ValueFlowSummaryLocationBinding, discover_closure_with,
 };
 use brokk_bifrost_flow::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
@@ -333,7 +336,7 @@ enum TaintPolicyCompilation {
         /// Non-empty means the run does not cover the whole selection, so it
         /// must not report `Complete`.
         refusals: Vec<RefusalNotice>,
-        incomplete_selectors: Vec<String>,
+        incomplete_selectors: Vec<IncompleteTaintSelector>,
         authored_selector_summary: bool,
         skipped_region_roots: usize,
     },
@@ -343,7 +346,7 @@ enum TaintPolicyCompilation {
     Clean {
         work: PolicyWorkReport,
         refusals: Vec<RefusalNotice>,
-        incomplete_selectors: Vec<String>,
+        incomplete_selectors: Vec<IncompleteTaintSelector>,
         empty_endpoints: EmptyEndpointSets,
         /// Set only for a changed-range answer with no sink in the range
         /// An empty selection leaves both absent.
@@ -413,7 +416,7 @@ fn compiled_payload(
     refusals: Vec<RefusalNotice>,
     empty_endpoints: Option<EmptyEndpointSets>,
     authored_selector_summary: bool,
-    incomplete_selectors: Vec<String>,
+    incomplete_selectors: Vec<IncompleteTaintSelector>,
 ) -> TaintProjectionPayload {
     let mut diagnostics = empty_endpoints
         .map(|empty| empty_selection_diagnostics(policy_id, empty))
@@ -467,12 +470,12 @@ fn compiled_payload(
     let completion = PolicyRunCompletion::inconclusive(reasons)
         .expect("nonempty selector gaps have canonical reasons");
     diagnostics.extend(refusal_diagnostics);
-    diagnostics.extend(incomplete_selectors.into_iter().map(|message| {
+    diagnostics.extend(incomplete_selectors.into_iter().map(|gap| {
         PolicyDiagnostic::new_bounded(
             PolicyDiagnosticCode::EvaluationFailure,
             PolicyDiagnosticSeverity::Warning,
             PolicyDiagnosticImpact::RunIncomplete,
-            message,
+            gap.message,
         )
     }));
     TaintProjectionPayload {
@@ -720,7 +723,7 @@ impl From<String> for TaintBatchError {
 
 impl TaintExecutionBudget {
     fn fresh_semantic(budget: &PolicyBudget) -> SemanticBudget {
-        SemanticBudget::new(super::selector_compiler::semantic_work_limits(
+        SemanticBudget::new(super::selector_compiler::semantic_resident_limits(
             budget.query_limits().semantic,
         ))
         .expect("validated policy semantic limits are positive")
@@ -792,7 +795,7 @@ impl TaintExecutionBudget {
         // carry over, so a shared artifact is charged once per compile.
         let census = self.semantic.scope_snapshot();
         self.semantic = SemanticBudget::new_child(
-            super::selector_compiler::semantic_work_limits(budget.query_limits().semantic),
+            super::selector_compiler::semantic_resident_limits(budget.query_limits().semantic),
             &census,
         );
         self.solver = Self::fresh_solver(budget);
@@ -1297,6 +1300,35 @@ pub(crate) struct EmptyEndpointSets {
 impl EmptyEndpointSets {
     const fn any(self) -> bool {
         self.sources || self.sinks
+    }
+
+    /// Whether this empty selection proves that no flow exists, so the
+    /// selector gaps in `gaps` cannot change the verdict.
+    ///
+    /// A finding needs a bound source and a bound sink. A side that bound
+    /// nothing while every one of its own selectors finished has nothing to
+    /// pair with, so a gap anywhere else (the other side, a sanitizer, a
+    /// transform or a model) could only add sites that reach no flow. A side
+    /// that is empty because its own selector did not finish proves nothing.
+    /// Refused rows are not selector gaps; they still make the run incomplete.
+    fn proves_no_flow(
+        self,
+        spec: &ResolvedTaintPolicySpec,
+        gaps: &[IncompleteTaintSelector],
+    ) -> bool {
+        let has_gap = |path: &PolicySelectorPath| gaps.iter().any(|gap| &gap.path == path);
+        let sources_proven_empty = self.sources
+            && !spec
+                .sources
+                .iter()
+                .chain(&spec.entry_points)
+                .any(|source| has_gap(&source.definition.selector_path));
+        let sinks_proven_empty = self.sinks
+            && !spec
+                .sinks
+                .iter()
+                .any(|sink| has_gap(&sink.definition.selector_path));
+        sources_proven_empty || sinks_proven_empty
     }
 
     /// Every empty set, source before sink. Both are named when both are
@@ -2370,15 +2402,12 @@ fn taint_call_resolution_evidence(
 /// The guard rule itself lives in `partial_flow::rules::guard_edge_kills`.
 fn automatic_comparison_guard_edge_kills(
     snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
-    source_specs: &[ValueFlowSourceSpec],
+    source_specs: &mut ValueFlowSources,
 ) -> Vec<ValueFlowEdgeKillSpec> {
     if source_specs.is_empty() {
         return Vec::new();
     }
-    let source_keys = source_specs
-        .iter()
-        .map(|source| source.key().clone())
-        .collect::<Vec<_>>();
+    let source_list = source_specs.intern_list(source_specs.ids().collect());
     let mut kills = Vec::new();
     for snapshot in snapshots {
         let procedure = snapshot.value().procedure();
@@ -2390,7 +2419,7 @@ fn automatic_comparison_guard_edge_kills(
                 target: kill.target_point,
                 kind: kill.kind,
                 carrier: ValueFlowCarrier::from(kill.carrier),
-                sources: source_keys.clone(),
+                sources: source_list,
             });
         }
     }
@@ -3139,11 +3168,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                 })
             }
             Err(TaintPolicyCompileError::EmptyCompiledEndpoints(empty_endpoints)) => {
+                let mut incomplete_selectors = self.selectors.take_incomplete_taint_selectors();
+                if empty_endpoints.proves_no_flow(spec, &incomplete_selectors) {
+                    incomplete_selectors.clear();
+                }
                 Ok(TaintPolicyCompilation::Clean {
                     work,
                     refusals: refusal_messages(&self.refused_sites),
                     empty_endpoints,
-                    incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
+                    incomplete_selectors,
                     engine: None,
                     scope: None,
                 })
@@ -4454,13 +4487,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             .selectors
             .materialize(&selection.file)
             .map_err(taint_selector_error)?;
-        let lookup = procedures_in_artifact(
-            &artifact,
-            self.selectors
-                .remaining_semantic_traversal_steps()
-                .map_err(taint_selector_error)?,
-            self.selectors.cancellation(),
-        );
+        let lookup = procedures_in_artifact(&artifact, usize::MAX, self.selectors.cancellation());
         match lookup.status {
             ProcedureRangeLookupStatus::Complete => {}
             ProcedureRangeLookupStatus::Cancelled => {
@@ -4954,14 +4981,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             .call
             .as_ref()
             .expect("a selected store operand has a call");
-        let mut limits =
+        let limits =
             brokk_bifrost_analysis::analyzer::semantic::LocalConstantOriginLimits::default();
-        limits.max_work = limits
-            .max_work
-            .min(self.selectors.semantic_remaining().nested_entries);
-        limits.max_source_bytes = limits
-            .max_source_bytes
-            .min(self.selectors.semantic_remaining().source_bytes);
         let origins = brokk_bifrost_analysis::analyzer::semantic::derive_local_constant_origins(
             self.selectors.workspace(),
             procedure,
@@ -4977,20 +4998,13 @@ impl<'a> TaintPolicyCompiler<'a> {
                 detail: "store key origin analysis was cancelled".to_owned(),
             });
         }
-        if self
-            .selectors
+        self.selectors
             .semantic_budget_mut()
-            .charge(SemanticWork {
+            .charge_work(SemanticWork {
                 nested_entries: origins.work,
                 source_bytes: origins.source_bytes,
                 ..SemanticWork::default()
-            })
-            .is_err()
-        {
-            self.store_key_metrics.budget_hits += 1;
-            self.store_key_metrics.unproven += 1;
-            return Ok(TaintStoreDimension::Unproven);
-        }
+            });
         self.store_key_metrics.budget_hits += u64::from(origins.budget_exhausted);
         let Some(roots) = origins.roots else {
             self.store_key_metrics.unproven += 1;
@@ -6162,13 +6176,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             .selectors
             .materialize_with_artifact_continuation(&selection.file)
             .map_err(taint_selector_error)?;
-        let lookup = procedures_in_artifact(
-            &artifact,
-            self.selectors
-                .remaining_semantic_traversal_steps()
-                .map_err(taint_selector_error)?,
-            self.selectors.cancellation(),
-        );
+        let lookup = procedures_in_artifact(&artifact, usize::MAX, self.selectors.cancellation());
         match lookup.status {
             ProcedureRangeLookupStatus::Complete => {}
             ProcedureRangeLookupStatus::Cancelled => {
@@ -6399,7 +6407,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             root.artifact().key(),
             call_behavior,
         )?;
-        let edge_kills = automatic_comparison_guard_edge_kills(&snapshots, &source_specs);
+        let mut source_specs = ValueFlowSources::from(source_specs);
+        let edge_kills = automatic_comparison_guard_edge_kills(&snapshots, &mut source_specs);
         let mut resolved_external_calls = exact_python_external_resolution_calls(
             &call_coverage,
             &dispatch_boundaries,
@@ -7289,10 +7298,7 @@ fn seed_store_channels(
             (!batch.analysis().value_type_barriers().is_empty()).then(|| {
                 crate::taint_barriers::ValueTypeBarrierService::new(
                     workspace,
-                    SemanticExecutionBudget::new(
-                        semantic_limits.max_materialized_files,
-                        semantic_limits.max_traversal_steps,
-                    ),
+                    SemanticExecutionBudget::new(semantic_limits.max_materialized_files),
                 )
             })
         })
@@ -7675,10 +7681,7 @@ fn solve_icfg_batch(
         let semantic = budget.query_limits().semantic;
         let service = crate::taint_barriers::ValueTypeBarrierService::new(
             workspace,
-            SemanticExecutionBudget::new(
-                semantic.max_materialized_files,
-                semantic.max_traversal_steps,
-            ),
+            SemanticExecutionBudget::new(semantic.max_materialized_files),
         );
         let mut semantic_request =
             SemanticRequest::new(&mut execution_budget.semantic, cancellation);
@@ -7977,7 +7980,13 @@ impl<'a> FrontierEndpointBinder<'a> {
             .filter(|refusal| refusal.impact == PolicyDiagnosticImpact::RunIncomplete)
             .map(|refusal| refusal.message.clone())
             .collect::<Vec<_>>();
-        gaps.extend(self.compiler.selectors.take_incomplete_taint_selectors());
+        gaps.extend(
+            self.compiler
+                .selectors
+                .take_incomplete_taint_selectors()
+                .into_iter()
+                .map(|gap| gap.message),
+        );
         Ok(FrontierBindings {
             endpoints,
             gaps,
@@ -8167,10 +8176,7 @@ fn compose_batch(
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.bind");
         PolicyCompositionProvider::new(
             workspace,
-            SemanticExecutionBudget::new(
-                semantic.max_materialized_files,
-                semantic.max_traversal_steps,
-            ),
+            SemanticExecutionBudget::new(semantic.max_materialized_files),
             &cache,
             batch.analysis(),
             &prepared.external_models,
@@ -12555,7 +12561,11 @@ mod tests {
             Vec::new(),
             None,
             false,
-            vec!["selector /analysis/sources/entries/input is incomplete".to_owned()],
+            vec![super::IncompleteTaintSelector {
+                path: crate::PolicySelectorPath::new("/analysis/sources/entries/input/selector")
+                    .expect("valid selector path"),
+                message: "selector /analysis/sources/entries/input is incomplete".to_owned(),
+            }],
         );
         assert!(matches!(
             payload.completion,
@@ -12888,7 +12898,7 @@ def run_fanout():
         let solver_limits = execution.solver.limits();
         execution
             .semantic
-            .charge(semantic_limits)
+            .admit(semantic_limits)
             .expect("a first batch may spend the whole semantic ledger");
         execution
             .solver
@@ -12896,7 +12906,7 @@ def run_fanout():
             .expect("a first batch may spend the whole solver ledger");
         execution
             .semantic
-            .charge(SemanticWork::uniform(1))
+            .admit(SemanticWork::uniform(1))
             .expect_err("the drained semantic ledger refuses further work");
         execution
             .solver
@@ -12908,7 +12918,7 @@ def run_fanout():
 
         execution
             .semantic
-            .charge(semantic_limits)
+            .admit(semantic_limits)
             .expect("the next batch starts from a fresh semantic ledger");
         execution
             .solver
@@ -14247,7 +14257,7 @@ pub fn run() {
         let memo = CompositionMemo::default();
         let provider = PolicyCompositionProvider::new(
             &workspace,
-            SemanticExecutionBudget::new(usize::MAX, usize::MAX),
+            SemanticExecutionBudget::new(usize::MAX),
             &cache,
             plan,
             &root.external_models,
@@ -15261,7 +15271,7 @@ pub fn run(receiver: String) {
         let memo = CompositionMemo::default();
         let provider = PolicyCompositionProvider::new(
             &workspace,
-            SemanticExecutionBudget::new(usize::MAX, usize::MAX),
+            SemanticExecutionBudget::new(usize::MAX),
             &cache,
             plan,
             &root.external_models,
@@ -15396,7 +15406,7 @@ pub fn caller() {
         let memo = CompositionMemo::default();
         let provider = PolicyCompositionProvider::new(
             &workspace,
-            SemanticExecutionBudget::new(usize::MAX, usize::MAX),
+            SemanticExecutionBudget::new(usize::MAX),
             &cache,
             plan,
             &root.external_models,

@@ -85,6 +85,9 @@ impl RustItemSourceCollector {
                 self.facts.macro_inputs.push(
                     brokk_bifrost_core::analyzer::rust_facts::RustMacroInvocationInputSourceFact {
                         invocation,
+                        macro_name: crate::declarations::rust_macro_invocation_path_name(
+                            node, source,
+                        ),
                         cfg_condition: sink.cfg_condition(node, source),
                         native_frontier: None,
                         tree,

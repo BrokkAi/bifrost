@@ -1,7 +1,4 @@
-use super::java_artifact::{
-    MAX_ARCHIVE_ENTRIES, MAX_SOURCE_ENTRY_BYTES, MAX_TOTAL_ARCHIVE_BYTES, ZipDirectoryStatus,
-    zip_directory_status,
-};
+use super::java_artifact::{ZipDirectoryStatus, zip_directory_status};
 use super::parent_index;
 use super::{restrict_effective_visibility, take_artifact_record as take_record};
 use crate::CancellationToken;
@@ -38,9 +35,7 @@ use brokk_bifrost_jvm::scala::ambient_use::scala_declaration_ambient_use;
 use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableRole, ScalaCallableSourceAlternative, ScalaTypeExpressionPath,
 };
-use std::io::{Cursor, Read};
 use tree_sitter::Node;
-use zip::ZipArchive;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScalaSourceJarPackProducer;
@@ -51,6 +46,18 @@ crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
 );
 
 impl ScalaSourceJarPackProducer {
+    /// Name-only extraction uses the same recoverable declaration walk as workspace files.
+    /// Body and signature errors do not reject an otherwise named declaration.
+    #[cfg(test)]
+    pub(super) fn parse_names(&self, source: &str) -> (tree_sitter::Tree, ParsedFile) {
+        let tree =
+            super::parse_source_tree(language::LANGUAGE.into(), source, "scala inventory grammar")
+                .expect("source parser returns a tree");
+        let file = ProjectFile::new(std::env::temp_dir(), "inventory.scala");
+        let parsed = parse_scala_file(&file, source, &tree);
+        (tree, parsed)
+    }
+
     fn produce(
         &self,
         request: &ArtifactProductionRequest,
@@ -100,98 +107,19 @@ impl ScalaSourceJarPackProducer {
                 limits,
             );
         }
-        let mut archive = match ZipArchive::new(Cursor::new(artifact.bytes())) {
-            Ok(archive) => archive,
-            Err(_) => {
-                return ArtifactProduction::failed(
-                    ProducerDiagnostic {
-                        severity: ProducerDiagnosticSeverity::Error,
-                        source_entry: None,
-                        code: "scala.archive.invalid".to_owned(),
-                        location: None,
-                        declaration: None,
-                        message: "artifact is not a readable ZIP/JAR archive".to_owned(),
-                    },
-                    limits,
-                );
-            }
-        };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        let mut entries = Vec::new();
-        let mut total_bytes = 0u64;
-        let entry_limit = archive.len().min(MAX_ARCHIVE_ENTRIES);
-        if archive.len() > MAX_ARCHIVE_ENTRIES {
-            diagnostics.warning(
-                "limit.archive_entries",
-                None,
-                format!("producer inspected at most {MAX_ARCHIVE_ENTRIES} archive entries"),
-            );
-        }
-        for index in 0..entry_limit {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return crate::analyzer::semantic_model::failed_artifact_production(
-                    "artifact.cancelled",
-                    "Scala archive production was cancelled",
-                    limits,
-                );
-            }
-            let Ok(mut entry) = archive.by_index(index) else {
-                diagnostics.warning(
-                    "scala.archive.entry",
-                    None,
-                    format!("could not read archive entry at index {index}"),
-                );
-                continue;
-            };
-            let entry_name = match entry.name() {
-                Ok(name) => name.into_owned(),
-                Err(error) => {
-                    diagnostics.warning(
-                        "scala.archive.entry_name",
-                        None,
-                        format!("could not decode archive entry name at index {index}: {error}"),
-                    );
-                    continue;
-                }
-            };
-            if !entry_name.ends_with(".scala") {
-                continue;
-            }
-            let next_total = total_bytes.saturating_add(entry.size());
-            if entry.size() > MAX_SOURCE_ENTRY_BYTES || next_total > MAX_TOTAL_ARCHIVE_BYTES {
-                diagnostics.warning(
-                    "limit.archive_bytes",
-                    Some(entry_name),
-                    "archive entry exceeded the bounded Scala extraction budget",
-                );
-                continue;
-            }
-            total_bytes = next_total;
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
-            if entry
-                .by_ref()
-                .take(MAX_SOURCE_ENTRY_BYTES.saturating_add(1))
-                .read_to_end(&mut bytes)
-                .is_err()
-                || bytes.len() as u64 > MAX_SOURCE_ENTRY_BYTES
-            {
-                diagnostics.warning(
-                    "scala.archive.entry_read",
-                    Some(entry_name),
-                    "could not read bounded archive entry bytes",
-                );
-                continue;
-            }
-            match String::from_utf8(bytes) {
-                Ok(source) => entries.push((entry_name, source)),
-                Err(_) => diagnostics.warning(
-                    "scala.source.encoding",
-                    Some(entry_name),
-                    "Scala source entry is not valid UTF-8",
-                ),
-            }
-        }
-        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let entries = match super::source_archive_entries(
+            artifact,
+            &[".scala"],
+            "scala",
+            usize::MAX,
+            limits,
+            cancellation,
+            &mut diagnostics,
+        ) {
+            Ok(entries) => entries,
+            Err(production) => return *production,
+        };
 
         let mut types = Vec::new();
         let mut members = Vec::new();
@@ -222,6 +150,7 @@ impl ScalaSourceJarPackProducer {
                 &parsed,
                 &mut remaining_records,
                 &mut record_limit_hit,
+                &mut diagnostics,
                 standard_library_artifact,
             );
             types.append(&mut entry_facts.types);
@@ -330,6 +259,7 @@ fn scala_entry_facts(
     entry: &ParsedScalaEntry,
     remaining_records: &mut usize,
     record_limit_hit: &mut bool,
+    diagnostics: &mut BoundedProducerDiagnostics,
     standard_library_artifact: bool,
 ) -> ScalaEntryFacts {
     let tree = &entry.tree;
@@ -499,7 +429,9 @@ fn scala_entry_facts(
             .expect("Scala artifact declaration has primary source facts");
         let callable = declaration_source.callable.as_ref();
         let member_kind = scala_member_kind(declaration, callable);
-        let signature = callable.and_then(|callable| {
+        // Exact source formal types still define the declaration identity when
+        // the public flat signature cannot express its parameter-list boundary.
+        let identity_signature = callable.and_then(|callable| {
             scala_signature(
                 callable,
                 node,
@@ -511,7 +443,19 @@ fn scala_entry_facts(
                     .unwrap_or_default(),
             )
         });
-        let parameter_types = signature
+        let omit_signature = identity_signature.is_some()
+            && callable.is_some_and(scala_signature_has_unrepresentable_parameter_lists);
+        if omit_signature {
+            diagnostics.absorb(vec![ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                code: "scala.signature.repeated_parameter_list".to_owned(),
+                location: Some(entry_name.to_owned()),
+                source_entry: None,
+                declaration: Some(declaration.fq_name()),
+                message: "Scala callable has a repeated parameter list followed by another parameter list; the flat external signature cannot represent that list boundary, so formal binding was withheld".to_owned(),
+            }]);
+        }
+        let parameter_types = identity_signature
             .as_ref()
             .map(|signature| {
                 signature
@@ -521,7 +465,7 @@ fn scala_entry_facts(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let parameter_variadics = signature
+        let parameter_variadics = identity_signature
             .as_ref()
             .map(|signature| {
                 signature
@@ -531,13 +475,13 @@ fn scala_entry_facts(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let generic_arity = signature
+        let generic_arity = identity_signature
             .as_ref()
             .map_or(0, |signature| signature.type_parameters.len());
         let name = declaration.identifier().to_owned();
         let owner_kind = type_kinds.get(owner).copied().unwrap_or(TypeKind::Class);
         let is_static = owner_kind == TypeKind::Module;
-        let parameter_arity = signature.as_ref().map_or_else(
+        let parameter_arity = identity_signature.as_ref().map_or_else(
             || {
                 callable.map_or(0, |callable| {
                     callable
@@ -558,10 +502,15 @@ fn scala_entry_facts(
             generic_arity,
             parameter_types: &parameter_types,
             parameter_variadics: &parameter_variadics,
-            return_type: signature
+            return_type: identity_signature
                 .as_ref()
                 .and_then(|signature| signature.returns.as_ref()),
         });
+        let signature = if omit_signature {
+            None
+        } else {
+            identity_signature
+        };
         if let Some(receiver) =
             callable.and_then(|callable| callable.extension_receiver_type_path.as_ref().cloned())
         {
@@ -1102,6 +1051,18 @@ fn scala_signature(
     })
 }
 
+fn scala_signature_has_unrepresentable_parameter_lists(
+    callable: &ScalaCallableSourceAlternative,
+) -> bool {
+    callable
+        .shape
+        .iter()
+        .enumerate()
+        .any(|(list_index, parameter_list)| {
+            parameter_list.arity.is_repeated() && list_index + 1 < callable.shape.len()
+        })
+}
+
 fn scala_type_ref(path: &ScalaTypeExpressionPath, type_parameters: &[String]) -> TypeRef {
     if path.segments.len() == 1 && type_parameters.contains(&path.segments[0]) {
         return TypeRef::TypeParameter {
@@ -1448,6 +1409,133 @@ trait Overloads[A] {
             assert_ne!(overloads[0].id, overloads[1].id);
             assert!(overloads.iter().all(|member| member.signature.is_some()));
         }
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    #[hardwon(
+        "#4709: curried Scala `xs: T*)(y: U)` flattened into a positional formal after a vararg and failed native pack validation"
+    )]
+    fn scala_source_jar_withholds_unrepresentable_repeated_parameter_lists() {
+        let source = r#"
+package sample
+trait RepeatedLists {
+  def ordinaryAfter(values: String*)(suffix: String): String = suffix
+  def contextualAfter(values: String*)(implicit suffix: String): String = suffix
+  def finalVararg(values: String*): String = ""
+  def ordinary(value: String, suffix: String): String = value
+}
+"#;
+        let jar = source_jar(&[("sample/RepeatedLists.scala", source)]);
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request(jar.path().to_owned()),
+            &ArtifactProducerLimits::default(),
+        );
+
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert_eq!(
+            production
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "scala.signature.repeated_parameter_list")
+                .count(),
+            2
+        );
+        for declaration in [
+            "sample.RepeatedLists.ordinaryAfter",
+            "sample.RepeatedLists.contextualAfter",
+        ] {
+            let diagnostic = production
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.declaration.as_deref() == Some(declaration))
+                .expect("unrepresentable signature warning");
+            assert!(diagnostic.source_entry.is_none());
+            assert_eq!(
+                diagnostic.location.as_deref(),
+                Some("sample/RepeatedLists.scala")
+            );
+        }
+
+        let pack = production.pack.unwrap();
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        let owner = types
+            .iter()
+            .find(|fact| fact.name == "sample.RepeatedLists")
+            .expect("RepeatedLists owner");
+        let ordinary_after = members
+            .iter()
+            .find(|member| member.name == "ordinaryAfter")
+            .expect("ordinaryAfter member");
+        assert!(ordinary_after.signature.is_none());
+        assert!(
+            members
+                .iter()
+                .find(|member| member.name == "contextualAfter")
+                .expect("contextualAfter member")
+                .signature
+                .is_none()
+        );
+
+        let string_type = || TypeRef::Named {
+            name: "String".to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let parameter_types = [string_type(), string_type()];
+        let return_type = string_type();
+        assert_eq!(
+            ordinary_after.id,
+            member_declaration_id(MemberIdentity {
+                owner_id: &owner.id,
+                kind: MemberKind::Method,
+                is_static: false,
+                parameter_arity: 2,
+                name: "ordinaryAfter",
+                generic_arity: 0,
+                parameter_types: &parameter_types,
+                parameter_variadics: &[true, false],
+                return_type: Some(&return_type),
+            })
+        );
+
+        for name in ["finalVararg", "ordinary"] {
+            let member = members
+                .iter()
+                .find(|member| member.name == name)
+                .expect("positive-control member");
+            assert!(member.signature.is_some(), "{name} signature");
+        }
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    fn scala_source_jar_does_not_emit_flow_for_withheld_signature() {
+        let source = r#"
+package scala.collection.mutable
+trait Map[K, V] {
+  def apply(keys: K*)(key: K): V = ???
+}
+"#;
+        let jar = source_jar(&[("scala/collection/mutable/Map.scala", source)]);
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request(jar.path().to_owned()),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.unwrap();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        assert!(
+            members
+                .iter()
+                .find(|member| member.name == "apply")
+                .is_some_and(|member| member.signature.is_none())
+        );
+        assert!(pack.shards[0].collection_flows.is_none());
         compile_pack(&pack, &Default::default()).unwrap();
     }
 

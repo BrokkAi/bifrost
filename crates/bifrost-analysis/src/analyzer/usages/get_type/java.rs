@@ -1,7 +1,9 @@
 use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, JavaTypeLookupResolution,
-    java::{JavaResolutionSession, java_type_lookup_resolution_in_session},
+    BoundedResolution,
+    java::{
+        JavaResolutionSession, JavaTypeLookupResolution, java_type_lookup_resolution_in_session,
+    },
 };
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile};

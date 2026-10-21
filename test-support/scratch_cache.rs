@@ -25,22 +25,25 @@
 //!   That override is per-process by construction, which is exactly what a
 //!   spawned binary needs and what an in-process test cannot have.
 //!
-//! Both assert that the cache they hand out really is outside the checkout, so
-//! a change that quietly re-binds the repository database or generated
-//! semantic-pack catalog fails the tests that rely on it instead of corrupting
-//! them. The catalog shares the analyzer cache parent.
+//! Both assert that the workspace owns its cache. An ambient
+//! `BIFROST_CACHE_ROOT` may relocate it into a private repository namespace,
+//! but a checked-in fixture must not borrow its containing checkout's namespace
+//! and an ambient exact-directory override must not funnel unrelated roots
+//! into one database.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use brokk_bifrost_analysis::gitblob::{CACHE_DIR_ENV, cache_db_path};
+use brokk_bifrost_analysis::gitblob::{
+    CACHE_DIR_ENV, CACHE_ROOT_ENV, cache_db_path, discover, primary_repo_root,
+};
 use tempfile::TempDir;
 
 /// A checked-in fixture corpus, materialized outside the repository.
 ///
-/// The copy is a workspace root in its own right, so every derived artifact
-/// (the persisted cache above all) lands beside it and is removed with it.
+/// The copy owns its cache: by default it lives beside the workspace; an
+/// ambient BIFROST_CACHE_ROOT instead gives it a private repository namespace.
 pub struct FixtureCorpus {
     _temp: TempDir,
     root: PathBuf,
@@ -111,14 +114,38 @@ impl Default for ScratchCacheDir {
     }
 }
 
-/// Fail unless the cache `scratch_root` resolves to lives inside it.
+/// Fail unless `scratch_root` owns its resolved cache directory.
 ///
 /// This is the regression guard for issue #1588, re-evaluated by every test
 /// that takes a scratch root rather than recorded once somewhere it can rot.
 /// It also catches an ambient `BIFROST_CACHE_DIR`, which would silently defeat
 /// the isolation by pointing every root at one shared database.
 pub(crate) fn cache_is_scratch(scratch_root: &Path) -> bool {
-    cache_db_path(scratch_root).starts_with(scratch_root)
+    let resolved = cache_db_path(scratch_root);
+    if resolved.starts_with(scratch_root) {
+        return true;
+    }
+    let Some(cache_root) = std::env::var_os(CACHE_ROOT_ENV).filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if std::env::var_os(CACHE_DIR_ENV).is_some_and(|value| !value.is_empty()) {
+        return false;
+    }
+    // A checked-in fixture must not borrow its containing checkout's namespace.
+    let canonical_root = scratch_root
+        .canonicalize()
+        .unwrap_or_else(|_| scratch_root.to_path_buf());
+    if discover(scratch_root)
+        .as_ref()
+        .and_then(primary_repo_root)
+        .is_some_and(|primary| primary != canonical_root)
+    {
+        return false;
+    }
+    // The resolver gives each primary root one child of CACHE_ROOT. Accept
+    // that private namespace, never the machine root itself as a shared cache.
+    resolved.parent().and_then(Path::parent) == Some(Path::new(&cache_root))
 }
 
 pub(crate) fn assert_cache_is_scratch(scratch_root: &Path) {
@@ -126,9 +153,9 @@ pub(crate) fn assert_cache_is_scratch(scratch_root: &Path) {
     assert!(
         cache_is_scratch(scratch_root),
         "a test workspace must own its cache: {} resolved to {}. \
-         A scratch root inside a Git checkout resolves to that checkout's shared \
-         `.bifrost/cache` database, and an ambient {CACHE_DIR_ENV} redirects every \
-         root to one database; neither is safe for tests (issue #1588).",
+         The cache must live inside the scratch workspace or its private \
+         {CACHE_ROOT_ENV} namespace. A containing checkout's cache and a shared \
+         ambient {CACHE_DIR_ENV} are unsafe for tests (issue #1588).",
         scratch_root.display(),
         resolved.display(),
     );

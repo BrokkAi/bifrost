@@ -33,13 +33,15 @@ use brokk_bifrost::policy::{
     BuiltInPolicyCatalogManifest, BuiltInPolicySelection, BuiltInPolicySelectionRecord,
     ExplanationCandidate, ExplanationGeneration, ExplanationLimits, ExplanationTarget,
     FlowExplanationCandidate, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
-    NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument,
-    PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate,
-    PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExecutionStage, PolicyFailOn,
-    PolicyFindingId, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions, PolicyScopeSource,
+    MAX_RQLP_SOURCE_BYTES, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE,
+    PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome,
+    PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExecutionStage,
+    PolicyFailOn, PolicyFindingId, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions,
+    PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
     PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
-    escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, rank_policy_near_misses,
-    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif_for_outcome,
+    escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, policy_bundles,
+    policy_source_identity, rank_policy_near_misses, relation_schema_catalog, write_policy_human,
+    write_policy_json, write_policy_sarif_for_outcome,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
@@ -168,14 +170,15 @@ fn main() -> ExitCode {
 
 fn acquire_open_packs_for_process() -> Result<(), String> {
     const SEMANTIC_BUNDLE_ENV: &str = "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE";
-    const POLICY_ROOT_ENV: &str = "BIFROST_OPEN_POLICY_PACK_ROOT";
     const SEMANTIC_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
     if open_packs_disabled() {
         return Ok(());
     }
     if std::env::var_os(SEMANTIC_BUNDLE_ENV).is_some()
-        || std::env::var_os(POLICY_ROOT_ENV).is_some()
+        || brokk_bifrost::policy::policy_pack_roots_from_env()
+            .map_err(|error| error.to_string())?
+            .is_some()
     {
         return Ok(());
     }
@@ -188,7 +191,12 @@ fn acquire_open_packs_for_process() -> Result<(), String> {
                 if let Some(bundle_root) = selection.semantic_bundle_root.as_ref() {
                     std::env::set_var(SEMANTIC_BUNDLE_ENV, bundle_root);
                 }
-                std::env::set_var(POLICY_ROOT_ENV, selection.policy_pack_root);
+                if let Some(policy_root) = selection.policy_pack_root.as_ref() {
+                    std::env::set_var(brokk_bifrost::policy::POLICY_PACK_ROOT_ENV, policy_root);
+                }
+                if let Some(bundle_root) = selection.policy_bundle_root.as_ref() {
+                    std::env::set_var(brokk_bifrost::policy::POLICY_BUNDLE_ROOT_ENV, bundle_root);
+                }
                 if std::env::var_os(SEMANTIC_CACHE_ROOT_ENV).is_none() {
                     std::env::set_var(SEMANTIC_CACHE_ROOT_ENV, selection.semantic_cache_root);
                 }
@@ -291,6 +299,7 @@ fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, 
                 install_semantic_packs(Path::new(&args[1]), Path::new(&args[2]))
             }
         }
+        Some("policy-source-identity") => run_policy_source_identity_command(&args[1..]),
         Some("prepare-open-packs") => match run_prepare_open_packs(&args[1..]) {
             Ok(result) => Ok(result),
             Err(message) => {
@@ -301,6 +310,72 @@ fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, 
         _ => return None,
     };
     Some(result)
+}
+
+fn run_policy_source_identity_command(args: &[String]) -> Result<CliRunResult, String> {
+    let output = policy_source_identity_json(args)?;
+    println!("{output}");
+    Ok(CliRunResult::Complete)
+}
+
+fn policy_source_identity_json(args: &[String]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("usage: bifrost policy-source-identity SOURCE_ID POLICY_FILE".to_owned());
+    }
+    let source_id = PolicySourceIdentity::new(&args[0]);
+    let source = read_bounded_policy_source(Path::new(&args[1]))?;
+    let report = policy_source_identity(source_id, &source).map_err(|error| {
+        format!(
+            "cannot compute policy source identity for `{}`: {error}",
+            args[0]
+        )
+    })?;
+    let resolved = match &report.analyzer_free {
+        PolicySourceIdentityResolution::Available { semantic_hash } => json!({
+            "status": "available",
+            "semantic_hash": semantic_hash.to_string(),
+        }),
+        PolicySourceIdentityResolution::WorkspaceRequired {
+            diagnostic_code,
+            message,
+        } => json!({
+            "status": "workspace-required",
+            "diagnostic_code": diagnostic_code,
+            "message": message,
+        }),
+    };
+    Ok(json!({
+        "format": "bifrost_policy_source_identity/v1",
+        "source_id": report.source_identity.as_str(),
+        "policy_file": args[1],
+        "source_sha256": format!("{:x}", Sha256::digest(&source)),
+        "authored_hash": report.authored_hash.to_string(),
+        "resolved": resolved,
+        "provenance": {
+            "source_sha256": "raw-policy-file-bytes",
+            "authored_hash": "PolicyRegistry::register_policy_bytes_deferred",
+            "resolved": "PolicyRegistry::register_policy_bytes",
+        },
+        "engine_version": brokk_bifrost::BIFROST_VERSION,
+        "build_identity": brokk_bifrost::BIFROST_BUILD_IDENTITY,
+    }))
+}
+
+fn read_bounded_policy_source(path: &Path) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("cannot read policy source `{}`: {error}", path.display()))?;
+    let mut source = Vec::new();
+    file.take((MAX_RQLP_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut source)
+        .map_err(|error| format!("cannot read policy source `{}`: {error}", path.display()))?;
+    if source.len() > MAX_RQLP_SOURCE_BYTES {
+        return Err(format!(
+            "policy source `{}` exceeds the {}-byte limit",
+            path.display(),
+            MAX_RQLP_SOURCE_BYTES
+        ));
+    }
+    Ok(source)
 }
 
 fn run_prepare_open_packs(args: &[String]) -> Result<CliRunResult, String> {
@@ -429,9 +504,17 @@ fn run_prepare_open_packs(args: &[String]) -> Result<CliRunResult, String> {
             .as_ref()
             .expect("selected acquisition outcome has selected roots");
         let mut environment = json!({
-            "BIFROST_OPEN_POLICY_PACK_ROOT": selection.policy_pack_root.to_string_lossy(),
             "BIFROST_SEMANTIC_PACK_CACHE_ROOT": selection.semantic_cache_root.to_string_lossy(),
         });
+        // Hosts and workflows pin this document's exact keys for catalog
+        // releases, so it keeps the deprecated name until the v0.15.0 cutover.
+        if let Some(policy_root) = selection.policy_pack_root.as_ref() {
+            environment["BIFROST_OPEN_POLICY_PACK_ROOT"] = json!(policy_root.to_string_lossy());
+        }
+        if let Some(bundle_root) = selection.policy_bundle_root.as_ref() {
+            environment[brokk_bifrost::policy::POLICY_BUNDLE_ROOT_ENV] =
+                json!(bundle_root.to_string_lossy());
+        }
         if let Some(bundle_root) = selection.semantic_bundle_root.as_ref() {
             environment["BIFROST_OPEN_SEMANTIC_PACK_BUNDLE"] = json!(bundle_root.to_string_lossy());
         }
@@ -1244,7 +1327,7 @@ fn run_inner(
         // An explicit selection of any kind replaces the zero-configuration
         // default; --no-builtin-policies asserts a controlled run stays free
         // of shipped policies even when no explicit input survived.
-        let use_builtin_default =
+        let mut use_builtin_default =
             policy_files.is_empty() && policy_selection.is_empty() && !no_builtin_policies;
         if use_builtin_default && explain_mode.is_some() {
             // An explanation is about exactly one policy, so the multi-policy
@@ -1256,6 +1339,14 @@ fn run_inner(
         }
         acquire_open_packs_for_process()?;
         install_semantic_model_packs_for_process()?;
+        // Policy-bundle entries run only when named by ID; they never widen a
+        // default, pack, or category selection.
+        let bundle_inputs = policy_bundles()
+            .and_then(|bundles| bundles.take_selected(&mut policy_selection))
+            .map_err(|error| error.to_string())?;
+        if !bundle_inputs.is_empty() {
+            use_builtin_default = false;
+        }
         let (mut policy_inputs, builtin_selection) =
             if use_builtin_default || !policy_selection.is_empty() {
                 let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
@@ -1292,6 +1383,7 @@ fn run_inner(
             } else {
                 (Vec::new(), None)
             };
+        policy_inputs.extend(bundle_inputs);
         policy_inputs.extend(
             policy_files
                 .into_iter()
@@ -2576,6 +2668,9 @@ USAGE:
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
     bifrost --install          Register brokk with installed coding hosts and exit
     bifrost pack-engine-profile Print the portable pack-consumer profile as JSON
+    bifrost policy-source-identity SOURCE_ID POLICY_FILE
+                               Print production policy authoring identities without a workspace
+                               or built-in/open pack catalog
     bifrost prepare-open-packs --cache-dir DIR --receipt-path FILE --env-path FILE
                                Select packs and write a typed outcome; accepts --request-path FILE
     bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT
@@ -2822,6 +2917,21 @@ mod portable_runtime_cli_tests {
     fn only_the_one_shot_policy_tool_requires_open_pack_acquisition() {
         assert!(tool_activates_open_packs("run_policy"));
         assert!(!tool_activates_open_packs("get_symbol_sources"));
+    }
+
+    #[test]
+    fn policy_source_identity_refuses_a_source_over_the_bounded_read_limit() {
+        let fixture = tempdir().expect("temporary policy identity fixture");
+        let policy = fixture.path().join("oversized.rqlp");
+        fs::write(&policy, vec![b'x'; MAX_RQLP_SOURCE_BYTES + 1]).expect("write oversized source");
+        let args = vec![
+            String::from("test.oversized"),
+            policy.to_string_lossy().into_owned(),
+        ];
+
+        let error = policy_source_identity_json(&args)
+            .expect_err("the bounded reader must refuse an oversized source");
+        assert!(error.contains("exceeds the 262144-byte limit"), "{error}");
     }
 
     fn authored_release_bundle(root: &Path) -> PathBuf {

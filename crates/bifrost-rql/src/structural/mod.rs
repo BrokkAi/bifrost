@@ -8,6 +8,9 @@ pub mod search;
 
 pub use crate::query;
 pub use crate::query::*;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use brokk_bifrost_analysis::analyzer::structural::test_support;
 pub use brokk_bifrost_analysis::analyzer::structural::*;
 pub use brokk_bifrost_flow::flow_state;
 pub use brokk_bifrost_flow::scalar_state;

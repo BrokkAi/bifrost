@@ -23,19 +23,49 @@
 //! traversal that stops early says why (`RouteTermination`), never silently.
 
 use super::facts::FileFacts;
+
 use super::kinds::NormalizedKind;
-use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget, occurrences_for_file};
-use super::occurrences::{Namespace, OccurrenceRole};
-use super::routes::{
-    CanonicalIdentity, CuratedExportSurface, IdentityAxis, RouteHopKind, RouteTermination,
-};
+
+use super::occurrence_rows::OccurrenceRow;
+
+use super::occurrence_rows::OccurrenceTarget;
+
+use super::occurrence_rows::occurrences_for_file;
+
+use super::occurrences::Namespace;
+
+use super::occurrences::OccurrenceRole;
+
+use super::routes::CanonicalIdentity;
+
+use super::routes::CuratedExportSurface;
+
+use super::routes::IdentityAxis;
+
+use super::routes::RouteHopKind;
+
+use super::routes::RouteTermination;
+
 use super::spec::StructuralSpec;
+
 use crate::analyzer::common::language_for_file;
+
 use crate::analyzer::structural_spec_for;
+
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+
+use crate::analyzer::CodeUnit;
+
+use crate::analyzer::IAnalyzer;
+
+use crate::analyzer::ProjectFile;
+
+use crate::analyzer::Range;
+
 use crate::cancellation::CancellationToken;
+
 use crate::hash::HashMap;
+
 use std::collections::HashSet;
 
 /// The structured semantic identity of `unit`: language from its source file,
@@ -916,278 +946,18 @@ pub const IDENTITY_ROUTE_PRODUCER_AXES: &[IdentityAxis] = &[
     IdentityAxis::PhysicalGrouping,
 ];
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
+
     use super::*;
-    use crate::analyzer::structural::test_support::workspace_fixture;
-    use crate::analyzer::{Language, WorkspaceAnalyzer};
-    use tempfile::TempDir;
 
-    struct Fixture {
-        _temp: TempDir,
-        workspace: WorkspaceAnalyzer,
-        files: Vec<ProjectFile>,
-        sources: Vec<String>,
-    }
+    use crate::analyzer::Language;
 
-    impl Fixture {
-        fn new(language: Language, files: &[(&str, &str)]) -> Self {
-            let (temp, workspace, project_files, sources) = workspace_fixture(language, files);
-            Self {
-                _temp: temp,
-                workspace,
-                files: project_files,
-                sources,
-            }
-        }
-
-        fn analyzer(&self) -> &dyn IAnalyzer {
-            self.workspace.analyzer()
-        }
-
-        fn declaration(&self, fq_suffix: &str) -> CodeUnit {
-            let mut all: Vec<CodeUnit> =
-                crate::analyzer::structural::test_support::declarations_ending_with(
-                    self.analyzer(),
-                    fq_suffix,
-                )
-                .collect();
-            assert_eq!(
-                all.len(),
-                1,
-                "expected exactly one declaration ending with {fq_suffix:?}, got {all:?}"
-            );
-            all.remove(0)
-        }
-
-        fn rows(&self, file_index: usize) -> RouteRelationsFileResult {
-            route_relations_for_file(
-                self.analyzer(),
-                &self.files[file_index],
-                &CancellationToken::new(),
-            )
-            .expect("not cancelled")
-        }
-
-        fn at(&self, file_index: usize, needle: &str) -> usize {
-            crate::test_support::fixture_marker(&self.sources[file_index], needle)
-        }
-    }
-
-    fn rows_of_kind(
-        result: &RouteRelationsFileResult,
-        kind: RouteHopKind,
-    ) -> Vec<&RouteRelationRow> {
-        result.rows.iter().filter(|row| row.kind == kind).collect()
-    }
-
-    /// Arity alone separates two identities whose every other component
-    /// coincides: same language, same namespace, same segment kinds and
-    /// spellings. This is what `generic_arity` exists to do, and it cannot be
-    /// shown by two differently named siblings.
-    #[test]
-    fn same_named_generic_and_nongeneric_types_differ_on_arity_alone() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[
-                ("src/a.rs", "pub struct S;\n"),
-                ("src/b.rs", "pub struct S<T> {\n    pub value: T,\n}\n"),
-            ],
-        );
-        let plain = canonical_identity_of(fixture.analyzer(), &fixture.declaration("a.S"));
-        let generic = canonical_identity_of(fixture.analyzer(), &fixture.declaration("b.S"));
-        assert_eq!(plain.generic_arity, Some(0));
-        assert_eq!(generic.generic_arity, Some(1));
-        assert_ne!(plain, generic);
-
-        // Strip the owning module segment and the two are the same identity
-        // except for the arity, so arity is doing the separating on its own.
-        let terminal = |identity: &CanonicalIdentity| CanonicalIdentity {
-            segments: identity.segments[identity.segments.len() - 1..].to_vec(),
-            ..identity.clone()
-        };
-        let plain_terminal = terminal(&plain);
-        let generic_terminal = terminal(&generic);
-        assert_eq!(plain_terminal.segments, generic_terminal.segments);
-        assert_ne!(plain_terminal, generic_terminal);
-        assert_eq!(
-            CanonicalIdentity {
-                generic_arity: generic_terminal.generic_arity,
-                ..plain_terminal.clone()
-            },
-            generic_terminal
-        );
-    }
-
-    /// A Rust type-alias chain traverses hop by hop to the origin struct, and
-    /// a mutual alias cycle terminates as an explicit cycle, not an answer.
-    #[test]
-    fn rust_type_alias_chain_traverses_and_cycles_stay_explicit() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[(
-                "src/lib.rs",
-                concat!(
-                    "pub struct Widget;\n",
-                    "pub type A = Widget;\n",
-                    "pub type B = A;\n",
-                ),
-            )],
-        );
-        let b = fixture.declaration("B");
-        let routes = identity_routes_from(
-            fixture.analyzer(),
-            &RouteEndpoint::Declaration(b),
-            None,
-            &CancellationToken::new(),
-        )
-        .expect("not cancelled");
-        let terminal: Vec<_> = routes
-            .iter()
-            .filter(|route| route.termination == RouteTermination::Terminal)
-            .collect();
-        assert_eq!(terminal.len(), 1, "routes: {routes:?}");
-        assert_eq!(terminal[0].hops.len(), 2, "routes: {routes:?}");
-        assert!(
-            terminal[0]
-                .terminal_declaration()
-                .expect("terminal declaration")
-                .fq_name()
-                .ends_with("Widget")
-        );
-        assert!(
-            terminal[0]
-                .hops
-                .iter()
-                .all(|hop| hop.kind == RouteHopKind::Alias)
-        );
-
-        let cyclic = Fixture::new(
-            Language::Rust,
-            &[(
-                "src/lib.rs",
-                concat!("pub type A = B;\n", "pub type B = A;\n"),
-            )],
-        );
-        let a = cyclic.declaration("A");
-        let routes = identity_routes_from(
-            cyclic.analyzer(),
-            &RouteEndpoint::Declaration(a),
-            None,
-            &CancellationToken::new(),
-        )
-        .expect("not cancelled");
-        assert!(
-            routes
-                .iter()
-                .any(|route| route.termination == RouteTermination::Cycle),
-            "routes: {routes:?}"
-        );
-        assert!(
-            routes
-                .iter()
-                .all(|route| route.termination != RouteTermination::Terminal),
-            "a cycle must not also read as a terminal answer: {routes:?}"
-        );
-    }
-
-    /// The Python facade fixture of issue #1649: a package with an
-    /// implementation module, and a `facade.py` whose body the test supplies.
-    fn python_facade(facade: &str) -> Fixture {
-        Fixture::new(
-            Language::Python,
-            &[
-                ("pkg/__init__.py", ""),
-                ("pkg/impl.py", "class Widget:\n    pass\n"),
-                ("facade.py", facade),
-            ],
-        )
-    }
-
-    /// `from x import *` forwards the whole public surface of `x` as one star
-    /// hop on the module reference. The expansion stays the import machinery's
-    /// answer, so the producer records the hop and enumerates nothing.
-    #[test]
-    fn python_star_import_is_one_reexport_hop() {
-        let fixture = Fixture::new(
-            Language::Python,
-            &[
-                ("pkg/__init__.py", "from .impl import *\n"),
-                ("pkg/impl.py", "class Widget:\n    pass\n"),
-            ],
-        );
-        let rows = fixture.rows(0);
-        let reexports = rows_of_kind(&rows, RouteHopKind::ReExport);
-        assert_eq!(reexports.len(), 1, "rows: {:?}", rows.rows);
-        let RouteEndpoint::Site { name, range, .. } = &reexports[0].from else {
-            panic!("re-export site expected");
-        };
-        assert_eq!(name, "impl");
-        assert_eq!(range.start_byte, fixture.at(0, "impl import"));
-        let RouteEndpoint::Declaration(target) = &reexports[0].to else {
-            panic!("re-export target must be a declaration");
-        };
-        assert_eq!(target.source(), &fixture.files[1]);
-    }
-
-    /// A computed `__all__` settles no name's membership, so the facade's
-    /// site-anchored relations report incomplete instead of guessing. The
-    /// declaration-anchored relations are untouched by that gap, and the site
-    /// still carries the plain import its occurrence role already states.
-    #[test]
-    fn python_computed_all_leaves_site_relations_incomplete() {
-        let rows = python_facade("__all__ = build_exports()\nimport pkg.impl as impl\n").rows(2);
-        assert!(
-            !rows.completeness.covers(RouteHopKind::ReExport),
-            "an unreadable __all__ must not read as a complete re-export answer: {:?}",
-            rows.completeness
-        );
-        assert!(
-            !rows.completeness.covers(RouteHopKind::Import),
-            "the same site is unclassified for the import relation: {:?}",
-            rows.completeness
-        );
-        assert!(
-            rows.completeness.covers(RouteHopKind::NestedOwner),
-            "nested owners are declaration-anchored, so the gap does not reach them: {:?}",
-            rows.completeness
-        );
-        assert!(
-            rows_of_kind(&rows, RouteHopKind::ReExport).is_empty(),
-            "nothing is guessed into a re-export row: {:?}",
-            rows.rows
-        );
-        assert_eq!(
-            rows_of_kind(&rows, RouteHopKind::Import).len(),
-            1,
-            "rows: {:?}",
-            rows.rows
-        );
-    }
-
-    #[test]
-    fn rust_type_declarations_record_generic_arity() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[(
-                "src/lib.rs",
-                "pub struct Plain;\npub struct Generic<T> {\n    pub value: T,\n}\n\
-                 pub struct Pair<K, V> {\n    pub key: K,\n    pub value: V,\n}\n\
-                 pub enum Choice<T> {\n    Only(T),\n}\npub trait Marker {}\n\
-                 pub type Alias<T> = Option<T>;\npub type Plainest = usize;\n",
-            )],
-        );
-        let arity = |fq_suffix: &str| {
-            canonical_identity_of(fixture.analyzer(), &fixture.declaration(fq_suffix)).generic_arity
-        };
-        assert_eq!(arity("Plain"), Some(0));
-        assert_eq!(arity("Generic"), Some(1));
-        assert_eq!(arity("Pair"), Some(2));
-        assert_eq!(arity("Choice"), Some(1));
-        assert_eq!(arity("Marker"), Some(0));
-        assert_eq!(arity("Alias"), Some(1));
-        assert_eq!(arity("Plainest"), Some(0));
-    }
     #[test]
     fn same_terminal_different_owner_decoys_compare_unequal() {
         let fixture = Fixture::new(
@@ -1207,170 +977,5 @@ mod tests {
             b_identity.segments.last().unwrap().text
         );
         assert_eq!(a_identity.namespace, Namespace::Type);
-    }
-    #[test]
-    fn csharp_partial_parts_group_physically() {
-        let fixture = Fixture::new(
-            Language::CSharp,
-            &[
-                (
-                    "src/WidgetA.cs",
-                    "namespace App;\n\npublic partial class Widget {\n    public void A() {}\n}\n",
-                ),
-                (
-                    "src/WidgetB.cs",
-                    "namespace App;\n\npublic partial class Widget {\n    public void B() {}\n}\n",
-                ),
-            ],
-        );
-        let analyzer = fixture.analyzer();
-        let mut widgets: Vec<CodeUnit> = analyzer
-            .all_declarations()
-            .filter(|unit| unit.is_class() && unit.fq_name().ends_with("Widget"))
-            .collect();
-        assert!(!widgets.is_empty(), "no Widget class declarations found");
-        let widget = widgets.remove(0);
-        let occurrences = physical_occurrences(analyzer, &widget);
-        let files: std::collections::BTreeSet<&std::path::Path> = occurrences
-            .iter()
-            .map(|occurrence| occurrence.file.rel_path())
-            .collect();
-        assert!(
-            files.len() >= 2,
-            "expected parts in both files, got occurrences {occurrences:?}"
-        );
-
-        // And the partial-part relation rows point across parts.
-        let rows = fixture.rows(0);
-        let parts = rows_of_kind(&rows, RouteHopKind::PartialPart);
-        assert!(
-            !parts.is_empty(),
-            "expected partial-part rows; rows: {:?}",
-            rows.rows
-        );
-    }
-    #[test]
-    fn rust_pub_use_yields_reexport_and_alias_rows() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[(
-                "src/lib.rs",
-                concat!(
-                    "pub mod util {\n",
-                    "    pub struct Widget;\n",
-                    "}\n",
-                    "pub use crate::util::Widget as W;\n",
-                    "use crate::util::Widget;\n",
-                    "pub fn build() -> Widget {\n",
-                    "    Widget\n",
-                    "}\n",
-                ),
-            )],
-        );
-        let rows = fixture.rows(0);
-
-        let reexports = rows_of_kind(&rows, RouteHopKind::ReExport);
-        assert_eq!(reexports.len(), 1, "rows: {:?}", rows.rows);
-        let RouteEndpoint::Declaration(target) = &reexports[0].to else {
-            panic!("re-export target must be a declaration");
-        };
-        assert!(target.fq_name().ends_with("Widget"));
-
-        let aliases = rows_of_kind(&rows, RouteHopKind::Alias);
-        assert_eq!(aliases.len(), 1, "rows: {:?}", rows.rows);
-        let RouteEndpoint::Site { name, range, .. } = &aliases[0].from else {
-            panic!("an import alias is a site, not a declaration");
-        };
-        assert_eq!(name, "W");
-        assert_eq!(range.start_byte, fixture.at(0, "W;"));
-
-        let imports = rows_of_kind(&rows, RouteHopKind::Import);
-        assert_eq!(imports.len(), 1, "rows: {:?}", rows.rows);
-    }
-    #[test]
-    fn rust_trait_member_implementation_rows() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[(
-                "src/lib.rs",
-                concat!(
-                    "pub trait Runner {\n",
-                    "    fn run(&self);\n",
-                    "}\n",
-                    "pub struct App;\n",
-                    "impl Runner for App {\n",
-                    "    fn run(&self) {}\n",
-                    "}\n",
-                ),
-            )],
-        );
-        let rows = fixture.rows(0);
-        let implementations = rows_of_kind(&rows, RouteHopKind::Implementation);
-        assert!(
-            !implementations.is_empty(),
-            "expected implementation rows; rows: {:?}",
-            rows.rows
-        );
-    }
-    #[test]
-    fn js_export_of_imported_name_reaches_the_origin() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            &[
-                (
-                    "index.js",
-                    "import { widget } from './widget.js';\nexport { widget };\n",
-                ),
-                ("widget.js", "export function widget() { return 1; }\n"),
-            ],
-        );
-        let rows = fixture.rows(0);
-        let exports = rows_of_kind(&rows, RouteHopKind::Export);
-        assert_eq!(exports.len(), 1, "rows: {:?}", rows.rows);
-        let RouteEndpoint::Declaration(target) = &exports[0].to else {
-            panic!("export target must be a declaration");
-        };
-        assert_eq!(target.source(), &fixture.files[1]);
-
-        let imports = rows_of_kind(&rows, RouteHopKind::Import);
-        assert_eq!(imports.len(), 1, "rows: {:?}", rows.rows);
-        let RouteEndpoint::Declaration(imported) = &imports[0].to else {
-            panic!("import target must be a declaration");
-        };
-        assert_eq!(imported.source(), &fixture.files[1]);
-    }
-    #[test]
-    fn round_trip_holds_for_rust_reexport_site() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[(
-                "src/lib.rs",
-                concat!(
-                    "pub mod util {\n",
-                    "    pub struct Widget;\n",
-                    "}\n",
-                    "pub use crate::util::Widget;\n",
-                ),
-            )],
-        );
-        let rows = fixture.rows(0);
-        let reexports = rows_of_kind(&rows, RouteHopKind::ReExport);
-        assert_eq!(reexports.len(), 1, "rows: {:?}", rows.rows);
-        let RouteEndpoint::Site { file, range, name } = &reexports[0].from else {
-            panic!("re-export site expected");
-        };
-        let outcome = round_trip_from_site(
-            fixture.analyzer(),
-            file,
-            *range,
-            name,
-            &fixture.files,
-            &CancellationToken::new(),
-        )
-        .expect("not cancelled");
-        let RoundTripOutcome::Holds { terminals } = outcome else {
-            panic!("round trip must hold, got {outcome:?}");
-        };
-        assert!(terminals[0].fq_name().ends_with("Widget"));
     }
 }

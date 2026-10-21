@@ -25,7 +25,7 @@ selection or evaluation options.
 ## Built-in catalog source
 
 The binary embeds four policy packs. Setting the environment variable
-`BIFROST_OPEN_POLICY_PACK_ROOT` to a directory replaces the embedded catalog
+`BIFROST_POLICY_PACK_ROOT` to a directory replaces the embedded catalog
 for every policy surface: `--list-policies`, `--version`, `bifrost scan`,
 default runs, built-in selectors, and MCP. The directory must contain one
 subdirectory per pack. Each subdirectory name must equal the pack ID and must
@@ -146,7 +146,7 @@ Each policy object has these fields:
 | `authored_hash`, `resolved_semantic_hash` | SHA-256 semantic hashes of the policy as authored and as resolved. |
 | `category` | One of the four categories above. |
 | `supported_languages` | Languages the policy claims. |
-| `required_capabilities` | Analyzer capabilities the policy depends on. |
+| `required_capabilities` | Analyzer capabilities the policy depends on. A policy that requires a capability this engine does not provide is reported as `not_run`. |
 | `severity_rationale` | Why the policy has its severity. |
 | `remediation` | What to do about a finding. |
 | `activation` | `default` or `opt-in`. See [Policy selection](#policy-selection). |
@@ -226,9 +226,9 @@ The declared-storage family has two policies per language. Every row is category
 
 ### `bifrost.effects`
 
-Version 1.4.0, 10 policies. Manifest description: Configurable forbidden-network-effect specializations. Each policy asserts that one explicitly selected declaration reaches no declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact API identity; purity is never inferred from a name, a file name, a comment, or an unqualified annotation, and a repository that configures no selection carries no obligation.
+Version 2.0.0, 10 policies. Manifest description: Configurable forbidden-network-effect specializations. Each policy asserts that every declaration a reviewed declaration-selection document selects reaches no declared network effect, directly or through workspace helpers. The effect is declared by a reviewed semantic model on the exact API identity; purity is never inferred from a name, a file name, a comment, or an unqualified annotation. The policies are opt-in, and a missing or invalid selection document fails activation instead of passing.
 
-Every row is category `effects`, severity `error`, analysis `assertion`, activation `default`, and has one language. Each policy asserts that the declarations its selection names reach no `bifrost.network_io` effect. The shipped selection is empty.
+Every row is category `effects`, severity `error`, analysis `assertion`, activation `opt-in`, and has one language. Each policy imports its selection from `.bifrost/effect-boundaries/<language>-network-io.rqlp` and requires the `declaration-selection-imports` capability.
 
 | Policy ID | Language |
 | --- | --- |
@@ -250,8 +250,9 @@ schema version, `1`. Omitting a version selects `1`. Pinning any other value
 fails with `unsupported-policy-schema-version` or
 `unsupported-rql-schema-version`.
 
-A `.rqlp` file holds exactly one top-level document: `policy`, `endpoint`, or
-`endpoint-set-document`. Only `policy` is executable. A record is a
+A `.rqlp` file holds exactly one top-level document: `policy`, `endpoint`,
+`endpoint-set-document`, or `declaration-selection-document`. Only `policy` is
+executable. A record is a
 parenthesized form whose first symbol is its label. Keyword fields are written
 `:name value`. Each field may appear at most once in a record.
 
@@ -345,6 +346,52 @@ Reference one nested typed endpoint-set document by workspace-relative path. Leg
 | --- | --- | --- | --- |
 | `:path` | required | a validated workspace-relative path | `:path "workspace-relative.rqlp"`. Name one workspace-relative endpoint-set document. |
 | `:sha256` | optional | a lowercase 64-hex SHA-256 value | `:sha256 "64-lower-hex"`. Optionally pin the imported endpoint-set semantic content hash. |
+
+#### `declaration-selection-document`
+
+```lisp
+(declaration-selection-document [:schema-version N] :language LANGUAGE [:rql-schema-version N] :declarations [(rql ...)...])
+```
+
+Define one standalone reviewed set of exact declarations for a policy to import. Top-level document of a declaration-selection file.
+
+| Field | Required | Value | Meaning |
+| --- | --- | --- | --- |
+| `:schema-version` | optional | a supported positive schema version | `:schema-version N`. Pin the standalone declaration-selection document version exactly. |
+| `:language` | required | one public analyzer language label | `:language LANGUAGE`. Declare the one analyzer language of every selected declaration; it must equal the importing reference's language. A family alias such as `jvm` is rejected. |
+| `:rql-schema-version` | optional | a supported positive schema version | `:rql-schema-version N`. Provide one inherited RQL schema version default for selectors in this document. |
+| `:declarations` | required | one or more inline rql exact declaration selectors; set (no duplicates) of 1 to 16 items | `:declarations [(rql (enclosing-decl ...))...]`. List the exact declarations: each an inline enclosing-decl selector of a function, method, or class with an exact name, optionally inside one exactly named owner. |
+
+An entry that is not exactly `(enclosing-decl DECLARATION)` or
+`(enclosing-decl (inside-decl OWNER DECLARATION))` over a `function`, `method`,
+or `class` pattern with an exact `:name` fails with
+`declaration-selection-not-exact`; an entry of another language fails with
+`declaration-selection-wrong-language`; an empty list fails with
+`declaration-selection-empty`; and a nested `rql-file`,
+`declaration-selection-file`, or `endpoint-set-file` fails with
+`declaration-selection-nested-import`.
+
+#### `declaration-selection-file`
+
+```lisp
+(declaration-selection-file :path "workspace-relative.rqlp" :language LANGUAGE)
+```
+
+Bind the declarations of one workspace-relative declaration-selection document; a missing or invalid document fails activation. Legal in: policy, `assertion`, as a `bind :query`.
+
+| Field | Required | Value | Meaning |
+| --- | --- | --- | --- |
+| `:path` | required | a validated workspace-relative path | `:path "workspace-relative.rqlp"`. Name one workspace-relative declaration-selection document. |
+| `:language` | required | one public analyzer language label | `:language LANGUAGE`. Require the imported document to select declarations of exactly this analyzer language. |
+
+The document is read when the policy activates against a workspace, never
+before. A missing document fails with `declaration-selection-unavailable`, a
+document of another kind with `declaration-selection-wrong-document`, and a
+document of another language with `declaration-selection-wrong-language`. Each
+failure is a `policy-validation-failed` diagnostic whose message names that
+cause, and the policy does not run. The analysis's `:languages` and `:where`
+scopes do not apply to an imported selection, so an analysis that sets either
+rejects the reference with `declaration-selection-scope-conflict`.
 
 ### Analysis
 
@@ -1078,7 +1125,23 @@ Bind one named typed row relation from a CodeQuery. Legal in: policy, `assertion
 | Field | Required | Value | Meaning |
 | --- | --- | --- | --- |
 | `:name` | required | a bounded row binding, group, or aggregate name | `:name NAME`. Set the unique row binding name. |
-| `:query` | required | an inline rql or deferred rql-file selector | `:query (rql ...)\|(rql-file ...)`. Execute one typed CodeQuery as the binding source. |
+| `:query` | required | an inline rql, deferred rql-file, declaration-selection-file, or procedure-effects-of selector | `:query (rql ...)\|(rql-file ...)\|(declaration-selection-file ...)\|(procedure-effects-of ...)`. Execute one typed CodeQuery as the binding source. |
+
+#### `procedure-effects-of`
+
+```lisp
+(procedure-effects-of :binding NAME)
+```
+
+Bind the procedure effects of the declarations an earlier row binding selects, so both bindings read one selection. Legal in: policy, `assertion`, as a `bind :query`.
+
+| Field | Required | Value | Meaning |
+| --- | --- | --- | --- |
+| `:binding` | required | a bounded row binding, group, or aggregate name | `:binding NAME`. Name the earlier row binding whose selected declarations feed procedure-effects. |
+
+The named binding must come earlier and use an inline `rql` query or a
+`declaration-selection-file`; otherwise the policy fails with
+`unknown-row-binding` or `invalid-procedure-effects-input`.
 
 #### `join`
 

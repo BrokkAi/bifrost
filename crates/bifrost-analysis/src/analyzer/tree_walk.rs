@@ -26,7 +26,8 @@
 use tree_sitter::Node;
 
 /// Find the first identifier with exact source text in preorder, including `root`.
-pub(crate) fn find_identifier_node<'tree>(
+#[doc(hidden)]
+pub fn find_identifier_node<'tree>(
     root: Node<'tree>,
     source: &str,
     expected: &str,
@@ -48,7 +49,8 @@ pub(crate) fn find_identifier_node<'tree>(
     None
 }
 
-pub(crate) fn body_contains_kind_outside_nested_callables(
+#[doc(hidden)]
+pub fn body_contains_kind_outside_nested_callables(
     body: Node<'_>,
     target_kind: &str,
     is_callable_kind: fn(&str) -> bool,
@@ -61,7 +63,8 @@ pub(crate) fn body_contains_kind_outside_nested_callables(
 }
 
 /// Search the body, including its root, through caller-selected scope children.
-pub(crate) fn body_contains_kind_with_children<'tree, Children>(
+#[doc(hidden)]
+pub fn body_contains_kind_with_children<'tree, Children>(
     body: Node<'tree>,
     target_kind: &str,
     mut children: impl FnMut(Node<'tree>) -> Children,
@@ -84,11 +87,11 @@ pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tr
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
     child_by_field_or_named_child_of_kinds, children_iter, first_named_child_of_kind,
     named_children, named_children_iter, node_for_exact_range, push_children_reversed,
-    push_named_children_reversed, push_named_children_reversed_as, single_named_child_matching,
-    subtree_contains,
+    push_named_children_reversed, single_named_child_matching, subtree_contains,
 };
 
-pub(crate) fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+#[doc(hidden)]
+pub fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
     child_by_field_or_named_child_of_kinds(node, "arguments", &["argument_list"])
         .map(named_children)
         .unwrap_or_default()
@@ -96,8 +99,9 @@ pub(crate) fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
 
 /// All named descendants of `node` (excluding `node`) whose kind matches,
 /// in source-order preorder, using an explicit stack.
-#[cfg(test)]
-pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
     let mut out = Vec::new();
     let mut stack: Vec<Node<'tree>> = named_children(node).into_iter().rev().collect();
     while let Some(candidate) = stack.pop() {
@@ -112,11 +116,9 @@ pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<N
 }
 
 /// All named nodes in source-order preorder, including `node` when it matches.
-#[cfg(test)]
-pub(crate) fn descendants_or_self_of_kind<'tree>(
-    node: Node<'tree>,
-    kind: &str,
-) -> Vec<Node<'tree>> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn descendants_or_self_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
     let mut out = Vec::new();
     if node.kind() == kind {
         out.push(node);

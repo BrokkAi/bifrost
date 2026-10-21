@@ -4,37 +4,58 @@
 //! language lowering are deliberately separate: both the preload test source
 //! and the eventual SQL source present the same normalized fragment contract.
 
-mod batch;
+#[doc(hidden)]
+pub mod batch;
 mod canonical_identity;
-mod common_fact_lowering;
+#[doc(hidden)]
+pub mod common_fact_lowering;
 mod completion_reasons;
-mod demand_overlay;
-mod engine;
-mod fact_lowering;
-mod fact_reference_edges;
-mod fact_resolution;
-mod fact_source;
-mod local_identity;
-mod local_writes;
-mod model;
-mod mounted;
-mod remount;
+#[doc(hidden)]
+pub mod demand_overlay;
+#[doc(hidden)]
+pub mod engine;
+#[doc(hidden)]
+pub mod fact_lowering;
+#[doc(hidden)]
+pub use crate::analyzer::store_bridge::fact_reference_edges;
+#[doc(hidden)]
+pub mod fact_resolution;
+#[doc(hidden)]
+pub mod fact_source;
+#[doc(hidden)]
+pub mod local_identity;
+
+#[doc(hidden)]
+pub mod local_writes;
+#[doc(hidden)]
+pub mod model;
+#[doc(hidden)]
+pub mod mounted;
+#[doc(hidden)]
+pub mod remount;
 mod saturation;
 pub mod seam_profile;
 pub mod seed_key_profile;
-mod selected_context;
-#[cfg(test)]
-pub(crate) mod test_support;
-mod typed_fact_lowering;
-pub(crate) mod universe;
-pub(crate) mod worker_transport;
+#[doc(hidden)]
+pub mod selected_context;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+#[doc(hidden)]
+pub mod typed_fact_lowering;
+#[doc(hidden)]
+pub mod universe;
+#[doc(hidden)]
+pub mod worker_transport;
 pub use universe::UniverseEntry;
-pub(crate) use universe::{
-    has_table as universe_has_table, is_entry_digest as universe_is_entry_digest,
-    lookup as universe_lookup, projects_intrinsic_definitions,
-};
 
-use crate::hash::{HashMap, HashSet};
+pub(crate) use universe::has_table as universe_has_table;
+pub(crate) use universe::is_entry_digest as universe_is_entry_digest;
+pub(crate) use universe::lookup as universe_lookup;
+pub(crate) use universe::projects_intrinsic_definitions;
+
+use crate::hash::HashMap;
+use crate::hash::HashSet;
 
 fn write_profile_line(
     output: &std::sync::Mutex<std::fs::File>,
@@ -51,7 +72,9 @@ fn write_profile_line(
 }
 
 pub(crate) use engine::cancelled_completion;
-pub(crate) use fact_source::{ResolutionIdentityDomain, language_identity_domain};
+
+pub(crate) use fact_source::ResolutionIdentityDomain;
+pub(crate) use fact_source::language_identity_domain;
 
 pub(crate) fn with_bounded_resolution_session<T>(
     budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
@@ -237,8 +260,9 @@ fn runtime_type_for_test(value: &str) -> ResolutionSlotValue {
     )
 }
 
-#[cfg(test)]
-fn positioned_identifier_for_test(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn positioned_identifier_for_test(
     site: u32,
     name: u32,
     role: brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole,
@@ -251,9 +275,8 @@ fn positioned_identifier_for_test(
 fn partial_path_id_for_test(value: &str) -> PartialPathId {
     PartialPathId::for_test(value)
 }
-pub(crate) use fact_lowering::{
-    jvm_terminal_type_gap_origin_is_safe, jvm_type_prefix_gap_origin_is_safe,
-};
+pub(crate) use fact_lowering::jvm_terminal_type_gap_origin_is_safe;
+pub(crate) use fact_lowering::jvm_type_prefix_gap_origin_is_safe;
 
 static GO_UNIVERSE_IDENTITY_DIGESTS: std::sync::LazyLock<HashSet<[u8; 32]>> =
     std::sync::LazyLock::new(|| {
@@ -380,209 +403,455 @@ pub(super) const fn declaration_type_role_rank(
     }
 }
 
-pub use batch::{
-    BatchCandidateCompletionOutcome, BatchCandidateMatch, BatchCandidateOutcome,
-    BatchCandidateRequest, BatchDefinitionNode, BatchEndpointClassification, BatchReferenceSeed,
-    BatchResolutionEngine, BatchResolutionFragmentSource, BatchedReferenceAnswer,
-    CandidatePathIdentity, FactReferenceSiteMetadata, MAX_REFERENCE_SEEDS_PER_BATCH,
-    ReferenceBatchAnswer, ReferenceLocalPathEvidence, ReferenceSeed, ReferenceSeedBatch,
-    ReferenceSeedReadOutcome, ReferenceSeedReadTerminal, ResolutionBatchMetrics,
-    ResolutionBatchSummary, ReverseCandidateGapExclusionPlan, ReverseCandidateGapIdentity,
-    ReverseReferenceSeedRequest, SeedReadAuthority, SeededPartialPath, SeededPathKey,
-    SeededReferenceRequest,
-};
-pub(crate) use batch::{
-    ForwardCandidateArtifactCache, MAX_REVERSE_TARGETS_PER_BATCH, MAX_SOURCE_ROWS_PER_BATCH,
-    ReverseCandidateGapCoverage, ReverseCandidateGapCoverageBuilder,
-    ReverseCandidateGapCoverageView, ReverseCandidateGapLocation, ReverseCandidateGapRow,
-    SelectedContextPathFragmentSource,
-};
+pub use batch::BatchCandidateCompletionOutcome;
+pub use batch::BatchCandidateMatch;
+pub use batch::BatchCandidateOutcome;
+pub use batch::BatchCandidateRequest;
+pub use batch::BatchDefinitionNode;
+pub use batch::BatchEndpointClassification;
+pub use batch::BatchReferenceSeed;
+pub use batch::BatchResolutionEngine;
+pub use batch::BatchResolutionFragmentSource;
+pub use batch::BatchedReferenceAnswer;
+pub use batch::CandidatePathIdentity;
+pub use batch::ClassificationMemberOwnerReader;
+pub use batch::FactReferenceSiteMetadata;
+pub use batch::MAX_REFERENCE_SEEDS_PER_BATCH;
+pub use batch::ReferenceBatchAnswer;
+pub use batch::ReferenceLocalPathEvidence;
+pub use batch::ReferenceSeed;
+pub use batch::ReferenceSeedBatch;
+pub use batch::ReferenceSeedReadOutcome;
+pub use batch::ReferenceSeedReadTerminal;
+pub use batch::ResolutionBatchMetrics;
+pub use batch::ResolutionBatchSummary;
+pub use batch::ReverseCandidateGapExclusionPlan;
+pub use batch::ReverseCandidateGapIdentity;
+pub use batch::ReverseReferenceSeedRequest;
+pub use batch::SeedReadAuthority;
+pub use batch::SeededPartialPath;
+pub use batch::SeededPathKey;
+pub use batch::SeededReferenceRequest;
+
+pub(crate) use batch::ForwardCandidateArtifactCache;
+pub(crate) use batch::MAX_REVERSE_TARGETS_PER_BATCH;
+pub(crate) use batch::MAX_SOURCE_ROWS_PER_BATCH;
+pub(crate) use batch::ReverseCandidateGapCoverage;
+pub(crate) use batch::ReverseCandidateGapCoverageBuilder;
+pub(crate) use batch::ReverseCandidateGapCoverageView;
+pub(crate) use batch::ReverseCandidateGapLocation;
+pub(crate) use batch::ReverseCandidateGapRow;
+pub(crate) use batch::SelectedContextPathFragmentSource;
+
 pub use canonical_identity::ResolutionIdentityDigestKey;
-pub(crate) use canonical_identity::{
-    CanonicalIdentityDescriptor, CanonicalIdentityHasher, CanonicalIdentityNumbers,
-    CanonicalIdentityPart, mounted_identity_digest, selected_identity_content_digest,
-};
+
+pub(crate) use canonical_identity::CanonicalIdentityDescriptor;
+pub(crate) use canonical_identity::CanonicalIdentityHasher;
+pub(crate) use canonical_identity::CanonicalIdentityNumbers;
+pub(crate) use canonical_identity::CanonicalIdentityPart;
+pub(crate) use canonical_identity::mounted_identity_digest;
+pub(crate) use canonical_identity::selected_identity_content_digest;
+
 pub use common_fact_lowering::LoweredDeferredMemberOwner;
-pub(crate) use common_fact_lowering::{
-    LoweredReferenceLookupIdentity, LoweredRootImportProvenance,
-};
+
+pub(crate) use common_fact_lowering::LoweredReferenceLookupIdentity;
+pub(crate) use common_fact_lowering::LoweredRootImportProvenance;
+
 pub use completion_reasons::CompletionReasons;
+
 pub(crate) use demand_overlay::DemandSelectedOverlayBlueprint;
-pub use engine::{
-    PreloadedFragment, PreloadedFragmentSource, ReferenceSearchAnswer, ResolutionEngine,
-    ResolutionFragmentSource, ResolutionQuery,
-};
+
+pub use engine::PreloadedFragment;
+pub use engine::PreloadedFragmentSource;
+pub use engine::ReferenceSearchAnswer;
+pub use engine::ResolutionEngine;
+pub use engine::ResolutionFragmentSource;
+pub use engine::ResolutionQuery;
+
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use fact_lowering::fixture_names::{
-    FixtureRootImportAnchors, record as record_fixture_identity_catalog,
-    record_selected as record_fixture_selected_identity_catalog,
-};
+pub(crate) use fact_lowering::fixture_names::FixtureRootImportAnchors;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use fact_lowering::fixture_names::record as record_fixture_identity_catalog;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use fact_lowering::fixture_names::record_selected as record_fixture_selected_identity_catalog;
+
 pub(crate) use fact_lowering::gap_reason_semantic_identity;
-pub(crate) use fact_lowering::package::{
-    LoweredGoPackageImport, LoweredPackageMember, LoweredPackageReference, package_domain_semantic,
-};
-pub use fact_lowering::{
-    LoweredCandidateDirection, LoweredCoverageGap, LoweredResolutionFragment, LoweredSemanticRole,
-    LoweredSemanticSite, LoweringCoverageFrontier, LoweringGapOrigin,
-};
+
+pub(crate) use fact_lowering::package::LoweredGoPackageImport;
+pub(crate) use fact_lowering::package::LoweredPackageMember;
+pub(crate) use fact_lowering::package::LoweredPackageReference;
+pub(crate) use fact_lowering::package::package_domain_semantic;
+
+pub use fact_lowering::LoweredCandidateDirection;
+pub use fact_lowering::LoweredCoverageGap;
+pub use fact_lowering::LoweredResolutionFragment;
+pub use fact_lowering::LoweredSemanticRole;
+pub use fact_lowering::LoweredSemanticSite;
+pub use fact_lowering::LoweringCoverageFrontier;
+pub use fact_lowering::LoweringGapOrigin;
+
+pub(crate) use fact_lowering::alias_lookup_surface_node_identities;
+pub(crate) use fact_lowering::definition_node;
+pub(crate) use fact_lowering::definition_node_identity;
+pub(crate) use fact_lowering::definition_semantic;
+pub(crate) use fact_lowering::gap_reason_semantic;
+pub(crate) use fact_lowering::hierarchy_terminal_node_identity;
+pub(crate) use fact_lowering::lookup_semantic;
+pub(crate) use fact_lowering::mounted_site_node;
+pub(crate) use fact_lowering::mounted_site_semantic;
+pub(crate) use fact_lowering::placement_gap_path_id;
+pub(crate) use fact_lowering::reference_node_identity;
+pub(crate) use fact_lowering::reference_semantic;
+pub(crate) use fact_lowering::root_export_path_id;
+pub(crate) use fact_lowering::scope_head_node;
+pub(crate) use fact_lowering::scope_head_node_identity;
+pub(crate) use fact_lowering::structured_import_gap_path_id;
+
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use fact_lowering::{
-    catalog_node, catalog_semantic, lower_for_test, lower_lexical_for_test,
-};
-pub(crate) use fact_lowering::{
-    definition_node, definition_node_identity, definition_semantic, gap_reason_semantic,
-    hierarchy_terminal_node_identity, lookup_semantic, mounted_site_node, mounted_site_semantic,
-    placement_gap_path_id, reference_node_identity, reference_semantic, root_export_path_id,
-    scope_head_node, scope_head_node_identity, structured_import_gap_path_id,
-};
-pub(crate) use fact_lowering::{
-    root_export_token, root_import_anchor_for_identity, root_import_anchor_semantic_identity,
-    root_import_token,
-};
+pub(crate) use fact_lowering::catalog_node;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use fact_lowering::catalog_semantic;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use fact_lowering::lower_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use fact_lowering::lower_lexical_for_test;
+
+pub(crate) use fact_lowering::root_export_token;
+pub(crate) use fact_lowering::root_import_anchor_for_identity;
+pub(crate) use fact_lowering::root_import_anchor_semantic_identity;
+pub(crate) use fact_lowering::root_import_token;
+
 pub(crate) use fact_reference_edges::NativeReferenceEdgeBatchProjector;
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use fact_reference_edges::validate_selected_reference_edge_coverage;
-pub use fact_reference_edges::{
-    FactCallableReceiverTargetAdmission, FactCallableReceiverTargetProjection,
-    FactReferenceBindingShape, FactReferenceEdgeBatch, FactReferenceEdgeCatalog,
-    FactReferenceEdgeDeclarationDomain, FactReferenceEdgeDomainStatus, FactReferenceEdgeGap,
-    FactReferenceEdgeGapDomain, FactReferenceEdgeSelectedFragment, FactReferenceEdgeSummary,
-    FactReferenceGraphAdmission, FactReferenceProjectionStatus, FactReferenceTargetProjection,
-    classify_fact_reference_binding, fact_callable_receiver_target_admission,
-    project_fact_callable_receiver_target, project_fact_reference_edge_batch,
-    project_fact_reference_targets, stage_selected_reference_edge_batches,
-};
+
+pub use fact_reference_edges::FactCallableReceiverTargetAdmission;
+pub use fact_reference_edges::FactCallableReceiverTargetProjection;
+pub use fact_reference_edges::FactReferenceBindingShape;
+pub use fact_reference_edges::FactReferenceEdgeBatch;
+pub use fact_reference_edges::FactReferenceEdgeCatalog;
+pub use fact_reference_edges::FactReferenceEdgeDeclarationDomain;
+pub use fact_reference_edges::FactReferenceEdgeDomainStatus;
+pub use fact_reference_edges::FactReferenceEdgeGap;
+pub use fact_reference_edges::FactReferenceEdgeGapDomain;
+pub use fact_reference_edges::FactReferenceEdgeSelectedFragment;
+pub use fact_reference_edges::FactReferenceEdgeSummary;
+pub use fact_reference_edges::FactReferenceGraphAdmission;
+pub use fact_reference_edges::FactReferenceProjectionStatus;
+pub use fact_reference_edges::FactReferenceTargetProjection;
+pub use fact_reference_edges::classify_fact_reference_binding;
+pub use fact_reference_edges::fact_callable_receiver_target_admission;
+pub use fact_reference_edges::project_fact_callable_receiver_target;
+pub use fact_reference_edges::project_fact_reference_edge_batch;
+pub use fact_reference_edges::project_fact_reference_targets;
+pub use fact_reference_edges::stage_selected_reference_edge_batches;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use fact_reference_edges::{
-    SelectedReferenceInverseIndex, SelectedReferenceInverseIndexBuildOutcome,
-    build_selected_reference_inverse_index,
-};
+pub use fact_reference_edges::SelectedReferenceInverseIndex;
+#[cfg(any(test, feature = "test-support"))]
+pub use fact_reference_edges::SelectedReferenceInverseIndexBuildOutcome;
+#[cfg(any(test, feature = "test-support"))]
+pub use fact_reference_edges::build_selected_reference_inverse_index;
+
 #[cfg(any(test, feature = "test-support"))]
 pub use fact_resolution::PreloadedFactResolutionService;
-pub(crate) use fact_resolution::call_applicability::{
-    ArgumentFormalBinding, CallApplicabilityAdapter, CandidateAssessment, ConversionEvidence,
-    ConversionKind, IntrinsicCallType, MappingAssessment, PartialOrder, TypeInCallPosition,
-    map_call_shape, map_scala_call_shape,
-};
-pub(crate) use fact_resolution::{
-    AnswerMap, CallCandidateApplicability, CallTypeSubstitution, DemandAcyclicOutcome,
-    DemandClosureDischarges, DemandMemberSelection, DemandMemberSelectionRequest,
-    DemandRootDiscovery, DemandRootPlan, DemandRootProvider, DemandRootUnavailableReason,
-    FactDemandResolution, FactEvaluation, InternedFactRow, SelectedDemandState, StateMap,
-};
-pub use fact_resolution::{
-    FactBatchedReferenceAnswer, FactCallableCandidateApplicability, FactCallableReceiverChannels,
-    FactCallableReceiverDisposition, FactCallableReceiverTargetDisposition, FactReadSession,
-    FactReferenceBatchAnswer, FactReferenceReceiverGap, FactResolutionAnswer,
-    FactResolutionBatchSummary, FactReverseReferenceBinding, FactReverseResolutionMetrics,
-    FactTargetReferenceAnswer, FactTargetReferenceBatchAnswer, SelectedFactResolutionEngine,
-    SelectedFactResolutionSnapshot,
-};
-pub(crate) use fact_resolution::{
-    FactIntrinsicTypeDescriptor, FactMemberRouteKind, FactProjectedTypeNode,
-    FactProjectedTypeNodeForm, FactProjectedTypeShape, FactResolutionOperation,
-    ForwardOperationArtifactContext, GoReceiverSlotTypeOverlay, PolledCompletionAccumulator,
-    SelectedFactOperationBlueprint, SelectedFactOperationBlueprintConstruction,
-};
+
+pub(crate) use fact_resolution::call_applicability::ArgumentFormalBinding;
+pub(crate) use fact_resolution::call_applicability::CallApplicabilityAdapter;
+pub(crate) use fact_resolution::call_applicability::CandidateAssessment;
+pub(crate) use fact_resolution::call_applicability::ConversionEvidence;
+pub(crate) use fact_resolution::call_applicability::ConversionKind;
+pub(crate) use fact_resolution::call_applicability::ImplicitReceiverLookup;
+pub(crate) use fact_resolution::call_applicability::ImplicitReceiverScopeKind;
+pub(crate) use fact_resolution::call_applicability::IntrinsicCallType;
+pub(crate) use fact_resolution::call_applicability::MappingAssessment;
+pub(crate) use fact_resolution::call_applicability::PartialOrder;
+pub(crate) use fact_resolution::call_applicability::TypeInCallPosition;
+pub(crate) use fact_resolution::call_applicability::map_call_shape;
+pub(crate) use fact_resolution::call_applicability::map_scala_call_shape;
+pub(crate) use fact_resolution::call_applicability::unresolved_argument_conversion_completion;
+
+pub(crate) use fact_resolution::AnswerMap;
+pub(crate) use fact_resolution::CALLER_ENVIRONMENT;
+pub(crate) use fact_resolution::CallCandidateApplicability;
+pub(crate) use fact_resolution::CallTypeSubstitution;
+pub(crate) use fact_resolution::DemandAcyclicOutcome;
+pub(crate) use fact_resolution::DemandClosureDischarges;
+pub(crate) use fact_resolution::DemandMemberSelection;
+pub(crate) use fact_resolution::DemandMemberSelectionOutcome;
+pub(crate) use fact_resolution::DemandMemberSelectionRequest;
+pub(crate) use fact_resolution::DemandReferenceKey;
+pub(crate) use fact_resolution::DemandRelationKey;
+pub(crate) use fact_resolution::DemandRootDiscovery;
+pub(crate) use fact_resolution::DemandRootPlan;
+pub(crate) use fact_resolution::DemandRootProvider;
+pub(crate) use fact_resolution::DemandRootUnavailableReason;
+pub(crate) use fact_resolution::EnvironmentId;
+pub(crate) use fact_resolution::FactDemandResolution;
+pub(crate) use fact_resolution::FactEvaluation;
+pub(crate) use fact_resolution::InternedFactRow;
+pub(crate) use fact_resolution::SelectedDemandState;
+pub(crate) use fact_resolution::StateMap;
+
+pub use fact_resolution::FactBatchedReferenceAnswer;
+pub use fact_resolution::FactCallableCandidateApplicability;
+pub use fact_resolution::FactCallableReceiverChannels;
+pub use fact_resolution::FactCallableReceiverDisposition;
+pub use fact_resolution::FactCallableReceiverTargetDisposition;
+pub use fact_resolution::FactReadSession;
+pub use fact_resolution::FactReferenceBatchAnswer;
+pub use fact_resolution::FactReferenceReceiverGap;
+pub use fact_resolution::FactResolutionAnswer;
+pub use fact_resolution::FactResolutionBatchSummary;
+pub use fact_resolution::FactReverseReferenceBinding;
+pub use fact_resolution::FactReverseResolutionMetrics;
+pub use fact_resolution::FactTargetReferenceAnswer;
+pub use fact_resolution::FactTargetReferenceBatchAnswer;
+pub use fact_resolution::SelectedFactResolutionEngine;
+pub use fact_resolution::SelectedFactResolutionSnapshot;
+
+pub(crate) use fact_resolution::FactIntrinsicTypeDescriptor;
+pub(crate) use fact_resolution::FactMemberRouteKind;
+pub(crate) use fact_resolution::FactProjectedTypeNode;
+pub(crate) use fact_resolution::FactProjectedTypeNodeForm;
+pub(crate) use fact_resolution::FactProjectedTypeShape;
+pub(crate) use fact_resolution::FactResolutionOperation;
+pub(crate) use fact_resolution::ForwardOperationArtifactContext;
+pub(crate) use fact_resolution::GoReceiverSlotTypeOverlay;
+pub(crate) use fact_resolution::PolledCompletionAccumulator;
+pub(crate) use fact_resolution::SelectedFactOperationBlueprint;
+pub(crate) use fact_resolution::SelectedFactOperationBlueprintConstruction;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use fact_resolution::{
-    reset_reverse_fact_evaluation_count_for_test, reverse_fact_evaluation_count_for_test,
-};
+pub use fact_resolution::reset_reverse_fact_evaluation_count_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use fact_resolution::reverse_fact_evaluation_count_for_test;
+
 #[cfg(test)]
-pub(crate) use fact_resolution::{
-    reset_selected_fact_operation_construction_count_for_test,
-    selected_fact_operation_construction_count_for_test,
-};
-pub(crate) use fact_source::{
-    CompanionTypeRelation, DeclarationAccessDecision, DeclarationAccessRequest,
-    DeclarationAccessRow, JvmDeclarationAccessRules, JvmImplicitRootProvider, ReasonOwnerRow,
-    RustDeclarationContextSource, RustReferenceContextSource, SelectedDeclarationAccessSource,
-    SubclassAccessContext, language_callables_occupy_value_namespace, language_has_jvm_semantics,
-    language_implicit_root_member_names, language_implicit_root_providers,
-    language_import_owner_steps_bind_singletons, language_jvm_declaration_access_rules,
-    language_jvm_package_requires_directory_agreement,
-    language_type_qualifiers_search_companion_members, visit_mapped_typed_pages,
-};
-pub use fact_source::{
-    DeferredMemberOwnerLookupName, DeferredMemberOwnerProof, ExternalMemberIdentity,
-    ExternalOwnerIdentity, FactPageVisitor, FactReadOutcome, FactReadTerminal, FactRequest,
-    FactResolutionSource, GoInterfaceMethod, GoMemberDeclaration, GoMemberDeclarationKind,
-    GoStructField, JavaAccessEndpoint, JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
-    JvmAccessEndpoint, LoweredIntrinsicTypeDescriptor, LoweredRustDeclarationAuthority,
-    LoweredRustReferenceContext, MAX_FACT_REQUESTS_PER_BATCH, MAX_FACT_ROWS_PER_PAGE,
-    MAX_TYPED_FACT_REQUESTS_PER_BATCH, MAX_TYPED_FACT_ROWS_PER_PAGE, NamedArgumentLabel,
-    NamedArgumentLabelRead, QualifiedRouteSlotLookup, RustImplementedTraits, SelectedFactRow,
-    SelectedGapReasonProvenance, SelectedInvocationRole, SelectedQualifiedRoute,
-    SelectedTypeFrontierCompletion, SelectedTypedFactSource, SelectedTypedRow,
-    SelectedTypedRowIdentity, SelectedTypedRowKey, TypedFactPageVisitor, TypedFactReadOutcome,
-    TypedFactReadTerminal, TypedFactRequest,
-};
+pub(crate) use fact_resolution::reset_selected_fact_operation_construction_count_for_test;
+#[cfg(test)]
+pub(crate) use fact_resolution::selected_fact_operation_construction_count_for_test;
+
+pub(crate) use fact_source::CompanionTypeRelation;
+pub(crate) use fact_source::DeclarationAccessDecision;
+pub(crate) use fact_source::DeclarationAccessRequest;
+pub(crate) use fact_source::DeclarationAccessRow;
+pub(crate) use fact_source::JvmDeclarationAccessRules;
+pub(crate) use fact_source::JvmImplicitRootProvider;
+pub(crate) use fact_source::ReasonOwnerRow;
+pub(crate) use fact_source::RustDeclarationContextSource;
+pub(crate) use fact_source::RustReferenceContextSource;
+pub(crate) use fact_source::SelectedDeclarationAccessSource;
+pub(crate) use fact_source::SubclassAccessContext;
+pub(crate) use fact_source::language_callables_occupy_value_namespace;
+pub(crate) use fact_source::language_has_jvm_semantics;
+pub(crate) use fact_source::language_implicit_root_member_names;
+pub(crate) use fact_source::language_implicit_root_providers;
+pub(crate) use fact_source::language_implicit_root_providers_in_namespace;
+pub(crate) use fact_source::language_import_owner_steps_bind_singletons;
+pub(crate) use fact_source::language_jvm_declaration_access_rules;
+pub(crate) use fact_source::language_jvm_import_binary_owner;
+pub(crate) use fact_source::language_jvm_package_requires_directory_agreement;
+pub(crate) use fact_source::language_type_qualifiers_search_companion_members;
+pub(crate) use fact_source::visit_mapped_typed_pages;
+
+pub use fact_source::DeferredMemberOwnerLookupName;
+pub use fact_source::DeferredMemberOwnerProof;
+pub use fact_source::ExternalMemberIdentity;
+pub use fact_source::ExternalOwnerIdentity;
+pub use fact_source::FactPageVisitor;
+pub use fact_source::FactReadOutcome;
+pub use fact_source::FactReadTerminal;
+pub use fact_source::FactRequest;
+pub use fact_source::FactResolutionSource;
+pub use fact_source::GoInterfaceMethod;
+pub use fact_source::GoMemberDeclaration;
+pub use fact_source::GoMemberDeclarationKind;
+pub use fact_source::GoStructField;
+pub use fact_source::JavaAccessEndpoint;
+pub use fact_source::JavaInheritanceDeclaration;
+pub use fact_source::JavaInheritanceDeclarationKind;
+pub use fact_source::JvmAccessEndpoint;
+pub use fact_source::LoweredIntrinsicTypeDescriptor;
+pub use fact_source::LoweredRustDeclarationAuthority;
+pub use fact_source::LoweredRustReferenceContext;
+pub use fact_source::MAX_FACT_REQUESTS_PER_BATCH;
+pub use fact_source::MAX_FACT_ROWS_PER_PAGE;
+pub use fact_source::MAX_TYPED_FACT_REQUESTS_PER_BATCH;
+pub use fact_source::MAX_TYPED_FACT_ROWS_PER_PAGE;
+pub use fact_source::NamedArgumentLabel;
+pub use fact_source::NamedArgumentLabelRead;
+pub use fact_source::QualifiedRouteSlotLookup;
+pub use fact_source::RustImplementedTraits;
+pub use fact_source::SelectedFactRow;
+pub use fact_source::SelectedGapReasonProvenance;
+pub use fact_source::SelectedInvocationRole;
+pub use fact_source::SelectedQualifiedRoute;
+pub use fact_source::SelectedTypeFrontierCompletion;
+pub use fact_source::SelectedTypedFactSource;
+pub use fact_source::SelectedTypedRow;
+pub use fact_source::SelectedTypedRowIdentity;
+pub use fact_source::SelectedTypedRowKey;
+pub use fact_source::TypedFactPageVisitor;
+pub use fact_source::TypedFactReadOutcome;
+pub use fact_source::TypedFactReadTerminal;
+pub use fact_source::TypedFactRequest;
+
 pub(crate) use local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE;
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use local_identity::test_shared_names;
-pub(crate) use local_identity::{
-    MountRebaser, MountRebaserRegistration, ResolutionIdentityCatalog,
-    ResolutionIdentityCatalogBuilder, ResolutionLocalKey, ResolutionLookupSemanticRecipe,
-    ResolutionNodeIdentity, ResolutionPathIdentity, ResolutionSemanticIdentity,
-    ResolutionSemanticIdentitySpace, ResolutionStackVariableIdentity,
-    SelectedLocalIdentityProvenance, SelectedNodeMount, SelectedNodeProvenance,
-    SelectedResolutionFragmentDigest, SelectedResolutionMount, SelectedResolutionMountOrdinal,
-    SelectedSemanticLocator, SelectedSemanticMount, SelectedSemanticProvenance,
-    SelectedStageIdentityProvenance, selected_resolution_fragment_id,
-};
-pub use local_identity::{PerRequestSharedNames, SharedNameInterner};
-pub(crate) use local_identity::{ResolutionIdentityTranslation, ResolutionRegisteredIdentities};
-pub use model::{
-    BindingCandidateAdmission, BindingFragmentId, BindingNodeId, BindingNodeKind, CompletionReason,
-    DerivationKey, EndpointSignature, GoDefinitionNamespaces, PartialPath, PartialPathId,
-    PartialScopedSymbol, PrecedenceStep, ResolutionAnswer, ResolutionCompletion,
-    ResolutionIncompleteReason, ResolutionSlotValue, ResolutionTypeRef, ResolutionWitness,
-    ScopeStackPattern, SemanticId, SharedNameId, StackPattern, StackVariable, StackVariableId,
-    SymbolStackPattern, TypeTransferRule, TypeTransferValueTransform, TypedFrontierState,
-    WitnessStep,
-};
-pub(crate) use model::{
-    BindingOrigin, GoBindingClassification, UnindexedExternalFrontier, binding_origin_rank,
-    classify_go_binding,
-};
-pub(crate) use model::{ResolutionCompletionAccumulator, combine_completion_with_poll};
+
+pub(crate) use local_identity::MountRebaser;
+pub(crate) use local_identity::MountRebaserRegistration;
+pub(crate) use local_identity::ResolutionIdentityCatalog;
+pub(crate) use local_identity::ResolutionIdentityCatalogBuilder;
+pub(crate) use local_identity::ResolutionLocalKey;
+pub(crate) use local_identity::ResolutionLookupSemanticRecipe;
+pub(crate) use local_identity::ResolutionNodeIdentity;
+pub(crate) use local_identity::ResolutionPathIdentity;
+pub(crate) use local_identity::ResolutionSemanticIdentity;
+pub(crate) use local_identity::ResolutionSemanticIdentitySpace;
+pub(crate) use local_identity::ResolutionStackVariableIdentity;
+pub(crate) use local_identity::SelectedLocalIdentityProvenance;
+pub(crate) use local_identity::SelectedNodeMount;
+pub(crate) use local_identity::SelectedNodeProvenance;
+pub(crate) use local_identity::SelectedResolutionFragmentDigest;
+pub(crate) use local_identity::SelectedResolutionMount;
+pub(crate) use local_identity::SelectedResolutionMountOrdinal;
+pub(crate) use local_identity::SelectedSemanticLocator;
+pub(crate) use local_identity::SelectedSemanticMount;
+pub(crate) use local_identity::SelectedSemanticProvenance;
+pub(crate) use local_identity::SelectedStageIdentityProvenance;
+pub(crate) use local_identity::selected_resolution_fragment_id;
+
+pub use local_identity::PerRequestSharedNames;
+pub use local_identity::SharedNameInterner;
+
+pub(crate) use local_identity::ResolutionIdentityTranslation;
+pub(crate) use local_identity::ResolutionRegisteredIdentities;
+
+pub use model::BindingCandidateAdmission;
+pub use model::BindingFragmentId;
+pub use model::BindingNodeId;
+pub use model::BindingNodeKind;
+pub use model::CompletionReason;
+pub use model::DerivationKey;
+pub use model::EndpointSignature;
+pub use model::GoDefinitionNamespaces;
+pub use model::PartialPath;
+pub use model::PartialPathId;
+pub use model::PartialScopedSymbol;
+pub use model::PrecedenceStep;
+pub use model::ResolutionAnswer;
+pub use model::ResolutionCompletion;
+pub use model::ResolutionIncompleteReason;
+pub use model::ResolutionSlotValue;
+pub use model::ResolutionTypeRef;
+pub use model::ResolutionWitness;
+pub use model::ScopeStackPattern;
+pub use model::SemanticId;
+pub use model::SharedNameId;
+pub use model::StackPattern;
+pub use model::StackVariable;
+pub use model::StackVariableId;
+pub use model::SymbolStackPattern;
+pub use model::TypeTransferRule;
+pub use model::TypeTransferValueTransform;
+pub use model::TypedFrontierState;
+pub use model::WitnessStep;
+
+pub(crate) use model::BindingOrigin;
+pub(crate) use model::GoBindingClassification;
+pub(crate) use model::UnindexedExternalFrontier;
+pub(crate) use model::binding_origin_rank;
+pub(crate) use model::classify_binding_namespace;
+pub(crate) use model::classify_go_binding;
+
+pub(crate) use model::ResolutionCompletionAccumulator;
+pub(crate) use model::combine_completion_with_poll;
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use mounted::OperationBlind;
-pub(crate) use mounted::{Mounted, SpliceMount, into_interior, out_of_interior};
+
+pub(crate) use mounted::Mounted;
+pub(crate) use mounted::SpliceMount;
+pub(crate) use mounted::into_interior;
+pub(crate) use mounted::out_of_interior;
+
 pub(crate) use remount::retarget_lexical;
+
 pub(crate) use seam_profile::SeamProfiled;
-pub(crate) use selected_context::{
-    CatalogRootImportAnchors, SelectedContextIdentities, SelectedContextOverlay,
-    SelectedContextOverlayCompilation, SelectedContextPathPublication,
-    SelectedContextPathPublicationOutcome, SelectedContextPathSource, SelectedContextPathToken,
-    SelectedJvmBridgeEvidence, SelectedJvmBridgeProvenance, SelectedJvmBridgeVisibility,
-    SelectedResolutionContextInputs, SelectedResolutionContextSet,
-    SelectedResolutionContextValidationOutcome, SelectedResolutionMountContext,
-    SelectedRootBridgeDescriptor, SelectedRootBridgeProjection, SelectedRootImportAnchors,
-    SelectedRootPathHalf, classify_selected_root_path_half, compile_selected_context_overlay,
-    compile_selected_context_overlay_in_session, compile_selected_root_bridge,
-    selected_root_source_anchor, visit_selected_root_export_half_pages,
-    visit_selected_root_import_half_pages, visit_selected_root_import_half_pages_with_targets,
-};
-pub(crate) use selected_context::{
-    SelectedGoImportBindingDescriptor, SelectedPackageBridgeDescriptor,
-};
+
+pub(crate) use selected_context::CatalogRootImportAnchors;
+pub(crate) use selected_context::SelectedContextIdentities;
+pub(crate) use selected_context::SelectedContextOverlay;
+pub(crate) use selected_context::SelectedContextOverlayCompilation;
+pub(crate) use selected_context::SelectedContextPathPublication;
+pub(crate) use selected_context::SelectedContextPathPublicationOutcome;
+pub(crate) use selected_context::SelectedContextPathSource;
+pub(crate) use selected_context::SelectedContextPathToken;
+pub(crate) use selected_context::SelectedJvmBridgeEvidence;
+pub(crate) use selected_context::SelectedJvmBridgeProvenance;
+pub(crate) use selected_context::SelectedJvmBridgeVisibility;
+pub(crate) use selected_context::SelectedResolutionContextInputs;
+pub(crate) use selected_context::SelectedResolutionContextSet;
+pub(crate) use selected_context::SelectedResolutionContextValidationOutcome;
+pub(crate) use selected_context::SelectedResolutionMountContext;
+pub(crate) use selected_context::SelectedRootBridgeDescriptor;
+pub(crate) use selected_context::SelectedRootBridgeProjection;
+pub(crate) use selected_context::SelectedRootImportAnchors;
+pub(crate) use selected_context::SelectedRootPathHalf;
+pub(crate) use selected_context::classify_selected_root_path_half;
+pub(crate) use selected_context::compile_selected_context_overlay;
+pub(crate) use selected_context::compile_selected_context_overlay_in_session;
+pub(crate) use selected_context::compile_selected_root_bridge;
+pub(crate) use selected_context::selected_root_source_anchor;
+pub(crate) use selected_context::visit_selected_root_export_half_pages;
+pub(crate) use selected_context::visit_selected_root_import_half_pages;
+pub(crate) use selected_context::visit_selected_root_import_half_pages_with_targets;
+
+pub(crate) use selected_context::SelectedGoImportBindingDescriptor;
+pub(crate) use selected_context::SelectedPackageBridgeDescriptor;
+
+pub use typed_fact_lowering::ExternalMemberCoverage;
+pub use typed_fact_lowering::LoweredBindingProjection;
+pub use typed_fact_lowering::LoweredCallApplicabilityObligation;
+pub use typed_fact_lowering::LoweredCallArgumentProperty;
+pub use typed_fact_lowering::LoweredCallableParameterApplicability;
+pub use typed_fact_lowering::LoweredCallableParameterProperty;
+pub use typed_fact_lowering::LoweredCallableResultBinding;
+pub use typed_fact_lowering::LoweredCallableResultTypeProperty;
+pub use typed_fact_lowering::LoweredCallableSignatureProperty;
+pub use typed_fact_lowering::LoweredConstructionRequirementProperty;
+pub use typed_fact_lowering::LoweredDeclarationTypeProperty;
+pub use typed_fact_lowering::LoweredDeclarationVisibilityProperty;
+pub use typed_fact_lowering::LoweredDeclaredTypeArgument;
+pub use typed_fact_lowering::LoweredDefinitionPropertyGap;
+pub use typed_fact_lowering::LoweredGenericFormal;
+pub use typed_fact_lowering::LoweredGenericFormalDefault;
+pub use typed_fact_lowering::LoweredGenericTypeAliasParameter;
+pub use typed_fact_lowering::LoweredIntrinsicSeed;
+pub use typed_fact_lowering::LoweredMemberOwnerProperty;
+pub use typed_fact_lowering::LoweredMemberScopeProperty;
+pub use typed_fact_lowering::LoweredQualifiedSeededRoute;
+pub use typed_fact_lowering::LoweredSupertypeProperty;
+pub use typed_fact_lowering::LoweredSupertypeTarget;
+pub use typed_fact_lowering::LoweredTypeArgument;
+pub use typed_fact_lowering::LoweredTypeComponent;
+pub use typed_fact_lowering::LoweredTypeProduction;
+pub use typed_fact_lowering::LoweredTypeTransfer;
+pub use typed_fact_lowering::LoweredTypedFragment;
+pub use typed_fact_lowering::LoweredTypedFrontier;
+pub use typed_fact_lowering::LoweredUnderlyingType;
+
 pub(crate) use typed_fact_lowering::call_semantic_identity;
-pub use typed_fact_lowering::{
-    ExternalMemberCoverage, LoweredBindingProjection, LoweredCallApplicabilityObligation,
-    LoweredCallArgumentProperty, LoweredCallableParameterApplicability,
-    LoweredCallableParameterProperty, LoweredCallableResultBinding,
-    LoweredCallableResultTypeProperty, LoweredCallableSignatureProperty,
-    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
-    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
-    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
-    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSupertypeProperty,
-    LoweredSupertypeTarget, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction,
-    LoweredTypeTransfer, LoweredTypedFragment, LoweredTypedFrontier, LoweredUnderlyingType,
-};
-#[cfg(test)]
-pub(crate) fn rich_java_resolution_facts_for_test()
+pub(crate) use typed_fact_lowering::validate_type_identity_transfer;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn rich_java_resolution_facts_for_test()
 -> brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts {
     const SOURCE: &str = r#"
 package com.acme;
@@ -622,11 +891,16 @@ public class Outer extends HierarchyBase {
 /// One source-lowered resolution artifact and the complete content identity
 /// catalog needed to persist its mounted in-memory IDs as local recipes.
 #[derive(Debug)]
-pub(crate) struct LoweredResolutionFactsWithIdentityCatalog {
-    lexical: LoweredResolutionFragment,
-    typed: LoweredTypedFragment,
-    common: common_fact_lowering::LoweredCommonFacts,
-    identities: Box<ResolutionIdentityCatalog>,
+#[doc(hidden)]
+pub struct LoweredResolutionFactsWithIdentityCatalog {
+    #[doc(hidden)]
+    pub lexical: LoweredResolutionFragment,
+    #[doc(hidden)]
+    pub typed: LoweredTypedFragment,
+    #[doc(hidden)]
+    pub common: common_fact_lowering::LoweredCommonFacts,
+    #[doc(hidden)]
+    pub identities: Box<ResolutionIdentityCatalog>,
 }
 
 fn binder_namespace_matches_kind(
@@ -645,7 +919,9 @@ fn binder_namespace_matches_kind(
         | ResolutionBinderKind::Local
         | ResolutionBinderKind::Parameter
         | ResolutionBinderKind::Pattern => namespace == ResolutionNamespace::Value,
-        ResolutionBinderKind::Import => namespace != ResolutionNamespace::TypeOrValue,
+        ResolutionBinderKind::Alias { .. } | ResolutionBinderKind::Import => {
+            namespace != ResolutionNamespace::TypeOrValue
+        }
         ResolutionBinderKind::Macro => namespace == ResolutionNamespace::Macro,
     }
 }
@@ -661,7 +937,7 @@ fn declaration_namespace_matches_site_kind(
             kind,
             ResolutionSiteKind::TypeDeclaration | ResolutionSiteKind::TypeAliasDeclaration
         ),
-        ResolutionNamespace::Value => kind == ResolutionSiteKind::ValueDeclaration,
+        ResolutionNamespace::Value => kind.is_value_declaration(),
         ResolutionNamespace::Callable => kind == ResolutionSiteKind::CallableDeclaration,
         ResolutionNamespace::Constructor => kind == ResolutionSiteKind::ConstructorDeclaration,
         ResolutionNamespace::Macro => kind == ResolutionSiteKind::MacroDeclaration,
@@ -709,9 +985,10 @@ fn declaration_namespace_is_declared(
             .any(|fact| fact.declaration == declaration && fact.namespace == namespace)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl LoweredResolutionFactsWithIdentityCatalog {
-    pub(crate) fn clone_for_stage_admission_test(&self) -> Self {
+    #[doc(hidden)]
+    pub fn clone_for_stage_admission_test(&self) -> Self {
         Self {
             lexical: fact_lowering::LoweredResolutionFragment::new(
                 self.lexical.fragment(),
@@ -729,7 +1006,8 @@ impl LoweredResolutionFactsWithIdentityCatalog {
 
     /// Constructor extension of a real capsule, before publication. The parsed
     /// macro itself need not emit a stack variable.
-    pub(crate) fn with_open_variable_for_publication_test(mut self) -> Self {
+    #[doc(hidden)]
+    pub fn with_open_variable_for_publication_test(mut self) -> Self {
         let variable = self.identities.register_variable_for_publication_test();
         let selected = self
             .identities
@@ -768,7 +1046,8 @@ impl LoweredResolutionFactsWithIdentityCatalog {
         self.rekey_dense()
     }
 
-    pub(crate) fn with_changed_reference_end_for_publication_test(&self) -> Self {
+    #[doc(hidden)]
+    pub fn with_changed_reference_end_for_publication_test(&self) -> Self {
         let mut semantics = self.lexical.semantics().to_vec();
         let index = semantics
             .iter()
@@ -814,7 +1093,8 @@ impl LoweredResolutionFactsWithIdentityCatalog {
         .rekey_dense()
     }
 
-    pub(crate) fn with_generic_node_payloads_for_publication_test(mut self) -> Self {
+    #[doc(hidden)]
+    pub fn with_generic_node_payloads_for_publication_test(mut self) -> Self {
         let local = self
             .identities
             .semantics()
@@ -885,19 +1165,23 @@ impl LoweredResolutionFactsWithIdentityCatalog {
         .rekey_dense()
     }
 
-    pub(crate) const fn lexical(&self) -> &LoweredResolutionFragment {
+    #[doc(hidden)]
+    pub const fn lexical(&self) -> &LoweredResolutionFragment {
         &self.lexical
     }
 
-    pub(crate) const fn typed(&self) -> &LoweredTypedFragment {
+    #[doc(hidden)]
+    pub const fn typed(&self) -> &LoweredTypedFragment {
         &self.typed
     }
 
-    pub(crate) const fn common(&self) -> &common_fact_lowering::LoweredCommonFacts {
+    #[doc(hidden)]
+    pub const fn common(&self) -> &common_fact_lowering::LoweredCommonFacts {
         &self.common
     }
 
-    pub(crate) const fn identities(&self) -> &ResolutionIdentityCatalog {
+    #[doc(hidden)]
+    pub const fn identities(&self) -> &ResolutionIdentityCatalog {
         &self.identities
     }
 
@@ -1063,7 +1347,8 @@ fn assert_precedence_namespaces_reach_emitted_artifact(
 /// that into `resolution_identities.id`. So the runtime ids of its shared
 /// names never leave it and are numbered per preparation, in the range that
 /// says "no store row names this".
-pub(crate) fn lower_resolution_facts_with_identity_catalog(
+#[doc(hidden)]
+pub fn lower_resolution_facts_with_identity_catalog(
     fragment: BindingFragmentId,
     language: brokk_bifrost_core::analyzer::Language,
     facts: &brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts,
@@ -1080,12 +1365,14 @@ pub(crate) fn lower_resolution_facts_with_identity_catalog(
 ///
 /// The catalog this returns is what a request meets, so its shared names carry
 /// the ids the store interned them at and compare with the ids the rows hold.
-pub(crate) fn lower_resolution_facts_for_selection(
+#[doc(hidden)]
+pub fn lower_resolution_facts_for_selection(
     fragment: BindingFragmentId,
     names: &dyn local_identity::SharedNameInterner,
     language: brokk_bifrost_core::analyzer::Language,
     facts: &brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts,
 ) -> LoweredResolutionFactsWithIdentityCatalog {
+    common_fact_lowering::validate_binding_facts(facts);
     let mut identities = ResolutionIdentityCatalogBuilder::new(fragment, names);
     let mut lexical = fact_lowering::lower_file_resolution_facts_with_identities(
         &mut identities,
@@ -1165,4 +1452,22 @@ pub fn site_type_frontier_semantic_for_test(
 #[cfg(test)]
 pub(crate) use fact_resolution::SelectedContextTestOracle;
 
-pub(crate) use fact_resolution::{GoInterfaceSatisfaction, GoMethodSatisfaction};
+pub(crate) use fact_resolution::GoInterfaceSatisfaction;
+pub(crate) use fact_resolution::GoMethodSatisfaction;
+
+#[doc(hidden)]
+pub mod diagnostic_kinds;
+#[doc(hidden)]
+pub mod file_paths;
+#[doc(hidden)]
+pub mod lexical_definition;
+#[doc(hidden)]
+pub mod reference_vocabulary;
+#[doc(hidden)]
+pub mod registry_vocabulary;
+#[doc(hidden)]
+pub mod trace_vocabulary;
+
+mod diagnostics;
+pub use diagnostics::ResolutionDiagnostics;
+pub use engine::resolution_diagnostics;

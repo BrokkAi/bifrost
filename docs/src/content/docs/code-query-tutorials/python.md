@@ -4020,14 +4020,6 @@ comments are excluded.
 <!-- code-query-case:public-operator-role:expected -->
 ```json
 {
-  "diagnostics": [
-    {
-      "code": "unsupported_structural_feature",
-      "impact": "incomplete",
-      "language": "python",
-      "message": "Python comparison chains do not expose singular left/right/operator roles required by this query in python/public-vocabulary.py at byte ranges [(234, 247)]"
-    }
-  ],
   "results": [
     {
       "enclosing_symbol": "python.public-vocabulary.shapes",

@@ -1,10 +1,11 @@
 use super::*;
 use crate::analyzer::resolution::{
-    BatchCandidateRequest, EndpointSignature, PartialPath, PartialPathId,
-    ReverseCandidateGapExclusionPlan, ReverseCandidateGapIdentity,
-    SelectedContextPathFragmentSource, SelectedContextPathSource, StackPattern, StackVariableId,
+    BatchCandidateCompletionOutcome, BatchCandidateRequest, DemandSelectedOverlayBlueprint,
+    EndpointSignature, PartialPath, PartialPathId, ReverseCandidateGapExclusionPlan,
+    ReverseCandidateGapIdentity, SelectedContextPathFragmentSource, SelectedContextPathSource,
+    StackPattern, StackVariableId,
 };
-use crate::analyzer::store::resolution_selection::tests::SelectionFixture;
+use crate::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
 use crate::analyzer::store::resolution_stage::SelectedResolutionStage;
 
 /// SQL stores a path's variable-sharing relation, not its caller's numeric
@@ -351,6 +352,147 @@ fn sql_context_adapter_late_body_completion_conflict_rolls_back_new_token() {
         &source.hydrate_candidate_paths(&[identity], &live).unwrap(),
         &[(identity, path)],
     );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#2771: identical caller import cells collided with the point base"
+)]
+fn demanded_context_delta_reuses_identical_sql_cells_and_rejects_changed_evidence() {
+    let fixture = SelectionFixture::new(1);
+    let selection = fixture.open_ready(&[]);
+    let live = CancellationToken::new();
+    let paths = SelectedResolutionLexicalSource::new_on_demand(&selection);
+    let requests = root_request();
+    let matches = paths.match_forward_candidates(&requests, &live).unwrap();
+    let original_id = matches.matches()[0].candidate();
+    let original = paths
+        .hydrate_candidate_paths(&[original_id], &live)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
+    let shared = CandidatePathIdentity::new(
+        original_id.fragment(),
+        PartialPathId::context_local((1 << 53) + 901),
+    );
+    let added = CandidatePathIdentity::new(
+        original_id.fragment(),
+        PartialPathId::context_local((1 << 53) + 902),
+    );
+    let stage = SelectedResolutionStage::new(&selection);
+    let base_token = stage
+        .publish_context_paths(&live, |writer| writer.insert(shared, &original))
+        .unwrap()
+        .unwrap();
+    let base = SelectedContextPathFragmentSource::new(&paths, &paths, base_token, None);
+    let demand_token = stage
+        .publish_context_paths(&live, |writer| {
+            assert!(writer.insert(shared, &original)?);
+            writer.insert(added, &original)
+        })
+        .unwrap()
+        .unwrap();
+    let (verification, delta) =
+        DemandSelectedOverlayBlueprint::delta(demand_token, &paths, base_token, &live)
+            .unwrap()
+            .unwrap();
+    assert_eq!(delta.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [added]);
+    assert!(
+        verification
+            .check_base_candidates(&paths, &base, &[shared], &live)
+            .unwrap()
+    );
+    let delta_token = stage
+        .publish_context_delta(demand_token, base_token, &live)
+        .unwrap()
+        .unwrap();
+    let relation = DemandSelectedOverlayBlueprint::new(delta_token);
+    let budget = ReceiverAnalysisBudget {
+        max_scope_nodes: 1,
+        ..ReceiverAnalysisBudget::default()
+    };
+    let forward_session = ResolutionSession::bounded(budget, Some(&live));
+    let mut forward = Vec::new();
+    relation
+        .visit_forward_additions(
+            &paths,
+            &requests,
+            BatchCandidateCompletionOutcome::new(
+                1,
+                ResolutionCompletion::Complete,
+                [ResolutionCompletion::Complete],
+            ),
+            1,
+            &live,
+            &forward_session,
+            &mut |page| {
+                forward.extend(page.iter().map(|row| row.candidate()));
+                Ok(true)
+            },
+        )
+        .unwrap();
+    assert_eq!(forward, [added]);
+    assert_eq!(forward_session.finish(()).work().scope_nodes, 1);
+    let reverse_session = ResolutionSession::bounded(budget, Some(&live));
+    let mut reverse = Vec::new();
+    relation
+        .visit_reverse_additions(
+            &paths,
+            &[BatchCandidateRequest::new(0, original.end().clone())],
+            BatchCandidateCompletionOutcome::new(
+                1,
+                ResolutionCompletion::Complete,
+                [ResolutionCompletion::Complete],
+            ),
+            1,
+            &live,
+            &reverse_session,
+            &mut |page| {
+                reverse.extend(page.iter().map(|row| row.candidate()));
+                Ok(true)
+            },
+        )
+        .unwrap();
+    assert_eq!(reverse, [added]);
+    assert_eq!(reverse_session.finish(()).work().scope_nodes, 1);
+    let changed_completion =
+        original
+            .clone()
+            .with_additional_completion(&ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::context_local(999)),
+            ]));
+    let changed_target = PartialPath::new(
+        original.start().clone(),
+        EndpointSignature::new_scoped(
+            BindingNodeId::context_local(991),
+            original.end().symbols().clone(),
+            original.end().scopes().clone(),
+        ),
+        original.precedence().to_vec(),
+        original.witness().to_vec(),
+        original.completion().clone(),
+    );
+    for changed in [changed_completion, changed_target] {
+        let token = stage
+            .publish_context_paths(&live, |writer| writer.insert(shared, &changed))
+            .unwrap()
+            .unwrap();
+        let error = DemandSelectedOverlayBlueprint::delta(token, &paths, base_token, &live)
+            .err()
+            .expect("differing cells remain a hard collision");
+        assert!(
+            error
+                .to_string()
+                .contains("demand context collides with base paths"),
+            "{error}"
+        );
+        assert!(
+            DemandSelectedOverlayBlueprint::new(token)
+                .check_base_candidates(&paths, &base, &[shared], &live)
+                .is_err()
+        );
+    }
 }
 
 /// Inject cancellation at the actual base-to-context handoff, after the base

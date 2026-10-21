@@ -36,7 +36,7 @@ pub(super) fn insert_capsule_closed_reasons(
     static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let sql = SQL.get_or_init(|| {
  let sql = format!("INSERT INTO temp.selected_resolution_stage_closed_reasons(producer_id,semantic_key,semantic_shared) SELECT ?3,runtime,NULL FROM ({MACRO_GAP_REASONS_SQL})");
- #[cfg(test)]
+ #[cfg(any(test, feature = "test-support"))]
  crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(16, sql.capacity());
  sql
 });
@@ -81,7 +81,8 @@ fn proof(
 }
 
 impl SelectedResolutionStage<'_, '_> {
-    pub(crate) fn close_unmatched_macro_input(
+    #[doc(hidden)]
+    pub fn close_unmatched_macro_input(
         &self,
         host: &SelectedResolutionMountRecord,
         invocation: SourceOccurrenceId,
@@ -101,7 +102,8 @@ impl SelectedResolutionStage<'_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn close_empty_macro_input(
+    #[doc(hidden)]
+    pub fn close_empty_macro_input(
         &self,
         host: &SelectedResolutionMountRecord,
         invocation: SourceOccurrenceId,
@@ -123,7 +125,8 @@ impl SelectedResolutionStage<'_, '_> {
         self.publish_macro_closure(host, invocation, definition, hash.finish(), cancellation)
     }
 
-    pub(crate) fn close_included_macro_input(
+    #[doc(hidden)]
+    pub fn close_included_macro_input(
         &self,
         host: &SelectedResolutionMountRecord,
         invocation: SourceOccurrenceId,
@@ -252,7 +255,3 @@ fn publish_closed_reasons(
     connection.prepare_cached("INSERT INTO temp.selected_resolution_stage_closed_reasons(producer_id,semantic_key,semantic_shared) SELECT ?1,value,NULL FROM json_each(?2)")?.execute(params![producer,serde_json::to_string(reasons).expect("closure reason parameters")])?;
     Ok(Some(((), !reasons.is_empty())))
 }
-
-#[cfg(test)]
-#[path = "closure_tests.rs"]
-mod tests;

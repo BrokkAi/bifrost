@@ -61,7 +61,8 @@ pub use model::{
     ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCarrierKey, ValueFlowEventKey,
     ValueFlowEventKind, ValueFlowModelError, ValueFlowObservationPhase, ValueFlowPortKey,
     ValueFlowScopedRootKind, ValueFlowSelectorKey, ValueFlowSinkId, ValueFlowSinkSpec,
-    ValueFlowSourceId, ValueFlowSourceSpec,
+    ValueFlowSourceId, ValueFlowSourceListId, ValueFlowSourceLists, ValueFlowSourceSpec,
+    ValueFlowSources,
 };
 pub use plan::{
     AuthoredArmClosure, CallerContentLocation, CallerContentLocations, SummaryCallBinding,

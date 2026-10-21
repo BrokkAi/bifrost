@@ -1,97 +1,139 @@
-mod analyzer_definition_lookup;
-mod assignment_facts;
-mod loop_facts;
-mod source_admission;
-pub use assignment_facts::{
-    OverwrittenLocalCandidate, OverwrittenLocalCandidates, OverwrittenLocalSourceKind,
-    PlainAssignmentCandidate, PlainAssignmentCandidates, PlainAssignmentVerdict,
-    go_overwritten_local_candidates, java_overwritten_local_candidates,
-    js_ts_overwritten_local_candidates, plain_assignment_candidates,
-    python_overwritten_local_candidates, single_target_overwritten_local_candidates,
-};
-pub use loop_facts::{
-    LoopCandidate, LoopCandidates, LoopCoordinates, LoopKind, LoopSite, LoopSyntax,
-    NestedLoopFacts, loop_candidates, nested_loop_facts,
-};
-pub(crate) use loop_facts::{build_loop_candidates, weight_loop_candidates};
+#[doc(hidden)]
+pub mod analyzer_definition_lookup;
+#[doc(hidden)]
+pub mod assignment_facts;
+#[doc(hidden)]
+pub mod loop_facts;
+#[doc(hidden)]
+pub mod source_admission;
+pub use assignment_facts::OverwrittenLocalCandidate;
+
+pub use assignment_facts::OverwrittenLocalCandidates;
+
+pub use assignment_facts::OverwrittenLocalSourceKind;
+
+pub use assignment_facts::PlainAssignmentCandidate;
+
+pub use assignment_facts::PlainAssignmentCandidates;
+
+pub use assignment_facts::PlainAssignmentVerdict;
+
+pub use assignment_facts::go_overwritten_local_candidates;
+
+pub use assignment_facts::java_overwritten_local_candidates;
+
+pub use assignment_facts::js_ts_overwritten_local_candidates;
+
+pub use assignment_facts::plain_assignment_candidates;
+
+pub use assignment_facts::python_overwritten_local_candidates;
+
+pub use assignment_facts::single_target_overwritten_local_candidates;
+
+pub use loop_facts::LoopCandidate;
+
+pub use loop_facts::LoopCandidates;
+
+pub use loop_facts::LoopCoordinates;
+
+pub use loop_facts::LoopKind;
+
+pub use loop_facts::LoopSite;
+
+pub use loop_facts::LoopSyntax;
+
+pub use loop_facts::NestedLoopFacts;
+
+pub use loop_facts::loop_candidates;
+
+pub use loop_facts::nested_loop_facts;
+
+pub(crate) use loop_facts::build_loop_candidates;
+
+pub(crate) use loop_facts::weight_loop_candidates;
+
+pub use source_admission::AdmissionDimension;
+
+pub use source_admission::SourceAdmissionRefusal;
+
 pub mod branch_boolean;
-mod cache_weight;
-mod clone_detection;
+#[doc(hidden)]
+pub mod cache_weight;
+#[doc(hidden)]
+pub mod clone_detection;
 pub mod cognitive_complexity;
-mod comment_density;
+#[doc(hidden)]
+pub mod comment_density;
 pub mod common;
 pub mod configuration;
 pub mod content_identity;
 pub mod correspondence;
-mod cpp;
-pub(crate) mod dependency_support;
-pub use cpp::expression_branch_facts::{
-    CAssignmentCandidate, CAssignmentCandidates, CAssignmentSyntaxVerdict, c_assignment_candidates,
-    cpp_overwritten_local_candidates,
-};
-pub use cpp::initializer_facts::{
-    CppInitializerAccessKind, CppInitializerCandidate, CppInitializerCandidates,
-    CppInitializerSyntaxVerdict, cpp_initializer_candidates,
-};
-pub use cpp::provenance_facts::{
-    CppProvenanceOutcome, cpp_provenance_for_anchor, cpp_provenance_for_anchor_with_model_key,
-};
-pub use cpp::range_facts;
+
+#[doc(hidden)]
+pub mod dependency_support;
+
 pub use dependency_support::resolve_dependency_path;
-mod csharp;
+
 pub mod declaration_range;
 pub(crate) mod digest;
 pub(crate) mod exception_handling;
-mod go;
-#[cfg(test)]
-pub(crate) use go::native_graph::GoNativeWorkspaceGraphProvider;
-pub use go::package_identity::{
-    modeled_go_callable_result_nominal_type, modeled_go_callable_result_pointer_field,
-};
-pub use go::{
-    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES,
-    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS, GoHttpHandlerDispatch, GoHttpHandlerOpenReason,
-    go_http_handler_dispatch, go_modeled_result_binding_type_identity_is_exact,
-    go_modeled_result_binding_type_identity_proof_work, go_native_error_function_value_obligation,
-    go_native_error_result_obligation, go_native_obligation_exclusion,
-    reference_assertion_payload_type_is_exact, workspace_reference_assertion_accepts_payload,
-};
+
 pub mod declared_scalar;
-mod i_analyzer;
-mod index_warmer;
+#[doc(hidden)]
+pub mod i_analyzer;
+#[doc(hidden)]
+pub mod index_warmer;
 pub mod invalidation;
-mod java;
+#[doc(hidden)]
+pub mod java;
 pub mod java_integral_parameter;
-mod javascript;
-mod js_ts;
-pub(crate) mod jvm;
-mod kotlin;
-pub(crate) mod languages;
+#[doc(hidden)]
+pub mod jvm;
+#[doc(hidden)]
+pub mod kotlin;
+#[doc(hidden)]
+pub mod languages;
 pub mod lexical_definitions;
-mod multi_analyzer;
+#[doc(hidden)]
+pub mod multi_analyzer;
 // Shared bounded native point-resolution machinery used by production language routes.
-mod native_points;
+#[doc(hidden)]
+pub mod native_points;
 #[cfg(any(test, feature = "test-support"))]
-pub use native_points::{
-    NativeAssignmentValueProbe, NativeTypeProbe, probe_native_assignment_value,
-    probe_native_definition, probe_native_definition_trace, probe_native_type,
-};
+pub use native_points::NativeAssignmentValueProbe;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use native_points::NativeTypeProbe;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use native_points::probe_native_assignment_value;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use native_points::probe_native_definition;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use native_points::probe_native_definition_trace;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use native_points::probe_native_type;
+
 pub mod packs_document;
-mod php;
-mod python;
+
 pub mod read_ledger;
 pub mod read_verification;
 pub mod reference_candidates;
-pub(crate) mod relational_frontier;
+#[doc(hidden)]
+pub mod relational_frontier;
+pub mod rename;
 // The native engine lands before the first language route so its algebra can
 // be tested independently. Remove this allowance when the Java spike becomes
 // its first non-test caller.
 #[allow(dead_code, unused_imports)]
-pub(crate) mod resolution;
-mod ruby;
-mod rust;
+#[doc(hidden)]
+pub mod resolution;
 
-pub(crate) fn whole_workspace_descendants(
+#[doc(hidden)]
+pub fn whole_workspace_descendants(
     operation: impl for<'scope> FnOnce(
         &DescendantIndexScope<'scope>,
     ) -> Option<crate::hash::HashSet<CodeUnit>>,
@@ -101,35 +143,20 @@ pub(crate) fn whole_workspace_descendants(
     operation(&scope).expect("a descendant index that cannot stop always completes")
 }
 
-pub(crate) use rust::crate_identity::RustOverlayCrates;
-pub(crate) use rust::generated_model::{
-    is_generated_function as is_rust_generated_function,
-    resolve_generated_functions as resolve_rust_generated_functions,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use rust::selected_reverse::{
-    RustSelectedReverseOutcome, RustSelectedReverseQueries, with_rust_selected_reverse_queries,
-};
-#[cfg(test)]
-pub(crate) use rust::selected_shadow::selected_rust_native_usage_consumer_shadow;
-pub use rust::{
-    RustNativeObligationProof, rust_call_is_standard_drop, rust_native_result_obligation,
-};
-#[cfg(test)]
-pub(crate) use rust::{
-    RustNativeWorkspaceGraphOutcome, build_rust_native_workspace_graph_for_files,
-};
-pub(crate) mod scala;
-pub mod semantic;
-pub mod semantic_model;
+#[doc(hidden)]
+pub mod scala;
 mod source_ingestion;
 pub mod store;
+#[doc(hidden)]
+pub mod store_bridge;
 pub mod structural;
-pub(crate) mod symbol_lookup;
+#[doc(hidden)]
+pub mod symbol_lookup;
 pub mod topology;
 pub use brokk_bifrost_core::analyzer::test_assertions;
 
-pub(crate) fn test_assertion_source(
+#[doc(hidden)]
+pub fn test_assertion_source(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     language: Language,
@@ -142,7 +169,8 @@ pub(crate) fn test_assertion_source(
     analyzer.project().read_source(file).ok()
 }
 
-pub(crate) fn with_analyzer_usage_definitions(
+#[doc(hidden)]
+pub fn with_analyzer_usage_definitions(
     analyzer: &dyn IAnalyzer,
     language: brokk_bifrost_core::analyzer::model::Language,
     read: &mut dyn FnMut(
@@ -153,7 +181,8 @@ pub(crate) fn with_analyzer_usage_definitions(
     read(&lookup);
 }
 
-pub(crate) fn test_assertion_smells_for_file(
+#[doc(hidden)]
+pub fn test_assertion_smells_for_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     language: Language,
@@ -167,35 +196,25 @@ pub(crate) fn test_assertion_smells_for_file(
 
 pub(crate) mod tier_demand;
 pub mod tree_sitter_analyzer;
-pub(crate) mod tree_walk;
+#[doc(hidden)]
+pub mod tree_walk;
 
-#[cfg(test)]
-pub(crate) mod test_support;
-mod typescript;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
 pub mod usages;
 
-#[cfg(test)]
-pub(crate) fn test_typescript_project(
-    source: &str,
-) -> (
-    tempfile::TempDir,
-    crate::analyzer::ProjectFile,
-    TypescriptAnalyzer,
-) {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical temp dir");
-    let file = crate::analyzer::ProjectFile::new(root.clone(), "src/app.ts");
-    file.write(source).expect("write source");
-    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    (temp, file, analyzer)
-}
 pub(crate) use brokk_bifrost_core::analyzer::weighted_cache;
-pub(crate) use brokk_bifrost_core::analyzer::work_budget;
+
 pub(crate) use brokk_bifrost_core::complete_value_cache;
-mod workspace;
+
+#[doc(hidden)]
+pub mod workspace;
 
 /// Retain a lazy external index until one of its discovery inputs changes.
-pub(crate) fn updated_external_index<T>(
+#[doc(hidden)]
+pub fn updated_external_index<T>(
     current: &std::sync::Arc<std::sync::OnceLock<T>>,
     changed_files: &std::collections::BTreeSet<ProjectFile>,
     is_dependency_input: impl Fn(&ProjectFile) -> bool,
@@ -208,7 +227,8 @@ pub(crate) fn updated_external_index<T>(
 }
 
 /// Add a collection's shallow size to the estimates of its retained values.
-pub(crate) fn estimate_collection_bytes<T>(
+#[doc(hidden)]
+pub fn estimate_collection_bytes<T>(
     collection_size: u64,
     values: impl IntoIterator<Item = T>,
     estimate_value: impl Fn(T) -> u64,
@@ -223,207 +243,444 @@ pub(crate) fn estimate_collection_bytes<T>(
 // blocks below read the same as when the modules were declared here.
 // Each keeps the visibility its `mod` declaration had, so the seam does not
 // quietly widen this crate's public surface.
-pub use brokk_bifrost_core::analyzer::{canonical_hash, identifier, test_paths};
-use brokk_bifrost_core::analyzer::{
-    capabilities, code_unit_index, config, definition_lookup, model, pool_memo, project,
-    source_content,
-};
-pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, type_relations};
-pub use code_unit_index::CodeUnitIndex;
-pub(crate) use code_unit_index::default_parent_fq_name;
-pub(crate) use definition_lookup::{
-    BoundedDefinitionLookup, DefinitionLanguageScope, RelationalBatchError, RelationalBatchOutcome,
-    RelationalCallableFact, RelationalDefinitionFrontier, RelationalDefinitionLookup,
-    RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionRequest,
-    RelationalDefinitionResult, RelationalDefinitionValue, RelationalFrontierOutcome, sort_units,
-};
+pub use brokk_bifrost_core::analyzer::canonical_hash;
 
-/// The damaged-tree namespace index, for the root suites' index-level
-/// regressions over corpus-derived C++ fixtures that stay private.
+pub use brokk_bifrost_core::analyzer::identifier;
+
+pub use brokk_bifrost_core::analyzer::test_paths;
+
+use brokk_bifrost_core::analyzer::capabilities;
+
+use brokk_bifrost_core::analyzer::code_unit_index;
+
+use brokk_bifrost_core::analyzer::config;
+
+use brokk_bifrost_core::analyzer::model;
+
+use brokk_bifrost_core::analyzer::pool_memo;
+
+use brokk_bifrost_core::analyzer::project;
+
+use brokk_bifrost_core::analyzer::source_content;
+
+pub(crate) use brokk_bifrost_core::analyzer::dense_id;
+
+pub(crate) use brokk_bifrost_core::analyzer::fq_name;
+
+pub(crate) use brokk_bifrost_core::analyzer::type_relations;
+
+pub use code_unit_index::CodeUnitIndex;
+
+pub(crate) use definition_lookup::BoundedDefinitionLookup;
+
+pub(crate) use definition_lookup::DefinitionLanguageScope;
+
+pub(crate) use definition_lookup::RelationalBatchError;
+
+pub(crate) use definition_lookup::RelationalBatchOutcome;
+
+pub(crate) use definition_lookup::RelationalCallableFact;
+
+pub(crate) use definition_lookup::RelationalDefinitionFrontier;
+
+pub(crate) use definition_lookup::RelationalDefinitionLookup;
+
+pub(crate) use definition_lookup::RelationalDefinitionQuery;
+
+pub(crate) use definition_lookup::RelationalDefinitionQuestion;
+
+pub(crate) use definition_lookup::RelationalDefinitionRequest;
+
+pub(crate) use definition_lookup::RelationalDefinitionResult;
+
+pub(crate) use definition_lookup::RelationalDefinitionValue;
+
+pub(crate) use definition_lookup::RelationalFrontierOutcome;
+
+pub(crate) use definition_lookup::sort_units;
+
+pub use analyzer_definition_lookup::AnalyzerDefinitionLookup;
+
+pub use analyzer_definition_lookup::DefinitionLookupMemo;
+
+pub(crate) use analyzer_definition_lookup::ForwardQueryProvider;
+
+pub(crate) use analyzer_definition_lookup::impl_forward_query_provider;
+
+#[doc = " The damaged-tree namespace index, for the root suites' index-level"]
+#[doc = " regressions over corpus-derived C++ fixtures that stay private."]
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceScopeIndex;
-pub(crate) use brokk_bifrost_cpp::imports::{
-    include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
-};
-pub use capabilities::{
-    AdditionalFileDependencies, CapabilityProvider, DescendantIndexScope, DescendantIndexVariant,
-    FileDependencyFacts, ImportAnalysisProvider, ImportGraphBindingSurface,
-    ImportGraphInputDigests, ImportLookupDependency, ImportReachability,
-    ImportResolutionDependencies, ImportedFileEdgeFacts, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider,
-};
-pub(crate) use capabilities::{
-    DirectDescendantIndex, build_direct_descendant_index, build_reverse_file_index,
-    build_reverse_import_index, descendants_from_variant_index, memoized_reverse_file_index,
-    memoized_reverse_import_index, resolve_imported_files_from_infos,
-};
-pub use config::{
-    AnalyzerConfig, CSharpAnalyzerConfig, DispatchHierarchyExpansion, GoAnalyzerConfig,
-    GoDependencyDiscoveryConfig, GoDependencyDiscoveryMode, JsTsAnalyzerConfig,
-    JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
-    JvmExternalDependencies, JvmMavenCoordinate, JvmSourceToolchainBinding,
-    JvmSourceToolchainSelectionOpen, JvmStandardLibraryDiscoveryConfig, PhpAnalyzerConfig,
-    PhpDependencyApiEvidence, PythonAnalyzerConfig, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
-    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
-    ensure_global_rayon_pool,
-};
-pub use cpp::CppAnalyzer;
-pub(crate) use cpp::{
-    CppCallableUnitRole, cpp_callable_definitions_share_identity_evidence,
-    cpp_header_body_files_are_related, node_text as cpp_node_text,
-};
-pub use cpp::{CppNativeObligationProof, cpp_native_result_obligation};
-pub use cpp::{
-    cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
-    cpp_is_recovered_macro_character_token_type,
-};
-pub use csharp::external::{
-    CSharpAssemblyPackProducer, CSharpDependencyPackAdapter, CSharpExternalDeclarationIndex,
-    CSharpExternalDeclarationSource, CSharpExternalMember, CSharpExternalMemberKind,
-    CSharpExternalType, CSharpExternalTypeKind, CSharpVisibility,
-    resolve_csharp_semantic_pack_dependencies,
-};
-pub use csharp::{CSharpAnalyzer, CSharpCatchFacts, CSharpCatchTypeRelation, csharp_catch_facts};
-// The C# usage graph left with `brokk-bifrost-csharp`, taking most of this
-// block's consumers with it. What remains is what the parked definition route
-// (`usages/get_definition/csharp.rs`, `usages/get_type/csharp.rs`) and the
-// framework hub still read.
-pub use analyzer_definition_lookup::{AnalyzerDefinitionLookup, DefinitionLookupMemo};
-pub(crate) use analyzer_definition_lookup::{ForwardQueryProvider, impl_forward_query_provider};
+
 pub use brokk_bifrost_csharp::syntax::csharp_transparent_expression_parent;
-pub(crate) use csharp::{
-    csharp_attribute_name_node, csharp_attribute_type_names, csharp_conditional_member_access,
-    csharp_member_name, csharp_normalize_full_name, csharp_source_identifier,
-};
-pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
+
+pub use capabilities::AdditionalFileDependencies;
+
+pub use capabilities::CapabilityProvider;
+
+pub use capabilities::DescendantIndexScope;
+
+pub use capabilities::DescendantIndexVariant;
+
+pub use capabilities::FileDependencyFacts;
+
+pub use capabilities::ImportAnalysisProvider;
+
+pub use capabilities::ImportGraphBindingSurface;
+
+pub use capabilities::ImportGraphInputDigests;
+
+pub use capabilities::ImportLookupDependency;
+
+pub use capabilities::ImportReachability;
+
+pub use capabilities::ImportResolutionDependencies;
+
+pub use capabilities::ImportedFileEdgeFacts;
+
+pub use capabilities::TestDetectionProvider;
+
+pub use capabilities::TypeAliasProvider;
+
+pub use capabilities::TypeHierarchyProvider;
+
+pub(crate) use capabilities::DirectDescendantIndex;
+
+pub(crate) use capabilities::build_reverse_file_index;
+
+pub(crate) use capabilities::descendants_from_variant_index;
+
+pub(crate) use capabilities::memoized_reverse_import_index;
+
+pub(crate) use capabilities::resolve_imported_files_from_infos;
+
+pub use config::AnalyzerConfig;
+
+pub use config::CSharpAnalyzerConfig;
+
+pub use config::DispatchHierarchyExpansion;
+
+pub use config::GoAnalyzerConfig;
+
+pub use config::GoDependencyDiscoveryConfig;
+
+pub use config::GoDependencyDiscoveryMode;
+
+pub use config::JsTsAnalyzerConfig;
+
+pub use config::JsTsDependencyDiscoveryConfig;
+
+pub use config::JvmAnalyzerConfig;
+
+pub use config::JvmDependencyDiscoveryConfig;
+
+pub use config::JvmDependencyDiscoveryMode;
+
+pub use config::JvmExternalArtifact;
+
+pub use config::JvmExternalArtifactOrigin;
+
+pub use config::JvmExternalDependencies;
+
+pub use config::JvmMavenCoordinate;
+
+pub use config::JvmSourceToolchainBinding;
+
+pub use config::JvmSourceToolchainSelectionOpen;
+
+pub use config::JvmStandardLibraryDiscoveryConfig;
+
+pub use config::PhpAnalyzerConfig;
+
+pub use config::PhpDependencyApiEvidence;
+
+pub use config::PythonAnalyzerConfig;
+
+pub use config::PythonEnvironmentConfig;
+
+pub use config::PythonEnvironmentLimits;
+
+pub use config::RubyAnalyzerConfig;
+
+pub use config::RubyDependencyApiEvidence;
+
+pub use config::RubyGemApiArtifact;
+
+pub use config::RustAnalyzerConfig;
+
+pub use config::RustDependencyApiEvidence;
+
+pub use config::RustPackageApiArtifact;
+
+pub use config::RustSelectedTarget;
+
+pub use config::ensure_global_rayon_pool;
+
 pub use fq_name::FqName;
+
 // Go language knowledge lives in `brokk-bifrost-go`; these keep their
 // historical `crate::analyzer::` paths for the analysis-side consumers
 // (symbol_lookup, searchtools, the definition routes).
-pub(crate) use brokk_bifrost_go::packages::{
-    GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, go_internal_import_allowed, go_module_roots,
-};
-/// The git object id a [`ReadKey::File`] and a policy unit's seed partition
-/// name their blob by.
-///
-/// Re-exported because those types are public and a consumer outside this
-/// crate cannot otherwise name the type of a field it holds.
-pub use git2::Oid;
-pub use go::build_evidence::{
-    GoBuildSnapshot, collect_go_build_evidence, go_build_project, go_build_workspace,
-    go_evidence_version_cmp,
-};
+pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
 
-pub use brokk_bifrost_core::analyzer::structural::native_obligation::{
-    NativeResultObligation, NativeResultObligationBasis, NativeResultObligationKind,
-};
-pub use brokk_bifrost_core::analyzer::structural::result_use::{
-    CallResultUse, CallResultUseFact, CallResultUseIndex, CallResultUseOpenReason,
-    CallResultUseSite, IntentionalDiscardKind,
-};
-pub use brokk_bifrost_csharp::structural::{CSharpCallResultUseIndex, csharp_call_result_use};
+#[doc = " The git object id a [`ReadKey::File`] and a policy unit's seed partition"]
+#[doc = " name their blob by."]
+#[doc = ""]
+#[doc = " Re-exported because those types are public and a consumer outside this"]
+#[doc = " crate cannot otherwise name the type of a field it holds."]
+pub use git2::Oid;
+
+pub use brokk_bifrost_core::analyzer::structural::native_obligation::NativeResultObligation;
+
+pub use brokk_bifrost_core::analyzer::structural::native_obligation::NativeResultObligationBasis;
+
+pub use brokk_bifrost_core::analyzer::structural::native_obligation::NativeResultObligationKind;
+
+pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUse;
+
+pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseFact;
+
+pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseIndex;
+
+pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseOpenReason;
+
+pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseSite;
+
+pub use brokk_bifrost_core::analyzer::structural::result_use::IntentionalDiscardKind;
+
+pub use brokk_bifrost_csharp::structural::CSharpCallResultUseIndex;
+
+pub use brokk_bifrost_csharp::structural::csharp_call_result_use;
+
 pub use brokk_bifrost_python::declarations::python_function_has_decorator;
-pub use cpp::{CppCallResultUseIndex, cpp_call_result_use};
-#[cfg(any(test, feature = "test-support"))]
-pub use go::native_call_relations::{GoNativeCallRelations, go_native_incoming_calls};
-#[cfg(any(test, feature = "test-support"))]
-pub use go::native_rename::{GoNativeRenameProvider, go_native_rename};
-#[cfg(any(test, feature = "test-support"))]
-pub use go::native_usages::GoNativeUsageStrategy;
-#[cfg(any(test, feature = "test-support"))]
-pub use go::persist_live_go_sources_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use go::selected_reverse::{
-    GoNativeSelectedInverseProvider, GoNativeSelectedReferenceIndex, GoSelectedReverseOutcome,
-    go_selected_inverse_for,
-};
-pub use go::{
-    GoAggregateOperand, GoAggregateSourceBinding, GoAnalyzer,
-    GoAnonymousCallableIdentityBindingError, GoBoundAnonymousCallableIdentity,
-    GoCallableCaptureBindingError, GoCaptureSlot, GoCaptureSlotPlan,
-    GoCatalogAnonymousCallableBindingError, GoDeclaredTypeShape, GoDeclaredTypeUnknown,
-    GoDependencyPackAdapter, GoExternalField, GoExternalFieldGap, GoExternalFieldMemory,
-    GoExternalFieldQuery, GoFieldReplayRoute, GoFunctionParameterShape, GoFunctionTypeShape,
-    GoMaterializedAnonymousCallable, GoModulePackProducer, GoOuterTypeShape, GoPinnedPackage,
-    GoReceiverOwnerUnknown, GoReceiverTypeOwner, GoSourceAnchor, GoSourceByteRange,
-    GoSourceDeclarationIdentity, GoSourceDeclarationKind, GoSourceIdentityAnalysis,
-    GoSourceIdentityGap, GoSourceIdentityGapKind, GoSourceName, GoSourceTypeNode,
-    GoStructFieldIdentity, analyze_go_package_source_identities,
-    bind_catalog_go_anonymous_callable_target, bind_go_aggregate_operand_source,
-    bind_go_anonymous_callable_identity, bind_go_external_field_source,
-    go_aggregate_object_is_singleton, go_failure_handler_body_shapes,
-    materialize_go_anonymous_callable, observe_go_aggregate_object, resolve_go_external_field,
-    resolve_go_semantic_pack_dependencies,
-};
-pub use go::{GoCallResultUseIndex, go_call_result_use};
+
 pub use i_analyzer::AnalyzerStreamingFileScope;
+
 pub(crate) use i_analyzer::replay_query_reads;
-pub(crate) use i_analyzer::with_query_scope;
-pub use i_analyzer::{
-    AnalyzerBuildTierAccess, AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer,
-    PersistedImportAdjacency, PersistedImportDependencies, PersistedImportDirection,
-    PersistedImportEdge, PersistedImportGraphRefresh, QueryBatch, QueryReadIncomplete,
-    SearchSymbolCandidates, SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
-    capture_query_reads,
-};
-pub use i_analyzer::{AnalyzerQueryScope, InformationTier, QueryScope, QueryToken};
+
+pub use i_analyzer::AnalyzerBuildTierAccess;
+
+pub use i_analyzer::AnalyzerQueryContext;
+
+pub use i_analyzer::AnalyzerSnapshotCaches;
+
+pub use i_analyzer::IAnalyzer;
+
+pub use i_analyzer::PersistedImportAdjacency;
+
+pub use i_analyzer::PersistedImportDependencies;
+
+pub use i_analyzer::PersistedImportDirection;
+
+pub use i_analyzer::PersistedImportEdge;
+
+pub use i_analyzer::PersistedImportGraphRefresh;
+
+pub use i_analyzer::QueryBatch;
+
+pub use i_analyzer::QueryReadIncomplete;
+
+pub use i_analyzer::SearchSymbolCandidates;
+
+pub use i_analyzer::SearchSymbolPatternBatch;
+
+pub use i_analyzer::WorkspaceFileIndex;
+
+pub use i_analyzer::WorkspaceFileIndexCell;
+
+pub use i_analyzer::capture_query_reads;
+
+pub use i_analyzer::AnalyzerQueryScope;
+
+pub use i_analyzer::InformationTier;
+
+pub use i_analyzer::QueryScope;
+
+pub use i_analyzer::QueryToken;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use i_analyzer::{AnalyzerTestHooks, NoOpAnalyzerTestHooks};
+pub use i_analyzer::AnalyzerTestHooks;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use i_analyzer::NoOpAnalyzerTestHooks;
+
 pub use index_warmer::IndexWarmer;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use java::native_call_relations::{JavaNativeCallRelations, java_native_incoming_calls};
+pub use java::native_call_relations::JavaNativeCallRelations;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use java::native_rename::{JavaNativeRenameProvider, java_native_rename};
+pub use java::native_call_relations::java_native_incoming_calls;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use java::native_rename::JavaNativeRenameProvider;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use java::native_rename::java_native_rename;
+
 #[cfg(any(test, feature = "test-support"))]
 pub use java::native_usages::JavaNativeUsageStrategy;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use java::selected_reverse::{
-    JavaNativeSelectedInverseProvider, JavaNativeSelectedReferenceIndex,
-    JavaSelectedReverseOutcome, java_selected_inverse_for,
-};
-pub use java::{
-    JavaAnalyzer, JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, JavaCallResultUse,
-    JavaCallResultUseIndex, JavaCallResultUseOpen, JavaCallResultUseRelationIndex,
-    JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence, java_call_result_use_site,
-    java_plain_string_literal, resolve_java_annotation_type,
-};
-pub use javascript::JavascriptAnalyzer;
-pub use js_ts::dependency_evidence;
-pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
-pub use js_ts::{
-    JsTsCallResultUseIndex, JsTsDependencyPackAdapter, JsTsLexicalBindingIndex,
-    JsTsLexicalBindingScope, TYPESCRIPT_STDLIB_PACKAGE, TYPESCRIPT_STDLIB_VERSION,
-    TypeScriptDeclarationPackProducer, TypeScriptLibraryActivationOutcome,
-    resolve_js_ts_semantic_pack_dependencies, static_member_property, static_property_name,
-    ts_object_literal_property_name, typescript_library_activation_evidence,
-};
-pub use jvm::external::{
-    JdkVersion, JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies,
-};
+pub use java::selected_reverse::JavaNativeSelectedInverseProvider;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use java::selected_reverse::JavaNativeSelectedReferenceIndex;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use java::selected_reverse::JavaSelectedReverseOutcome;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use java::selected_reverse::java_selected_inverse_for;
+
+pub use java::JavaAnalyzer;
+
+pub use java::JavaAnnotationTypeResolution;
+
+pub use java::JavaAnnotationTypeStatus;
+
+pub use java::JavaCallResultUse;
+
+pub use java::JavaCallResultUseIndex;
+
+pub use java::JavaCallResultUseOpen;
+
+pub use java::JavaCallResultUseRelationIndex;
+
+pub use java::JavaLocalAssignmentConversionProver;
+
+pub use java::JavaLocalAssignmentEvidence;
+
+pub use java::java_call_result_use_site;
+
+pub use java::java_plain_string_literal;
+
+pub use java::resolve_java_annotation_type;
+
+pub use jvm::external::JdkVersion;
+
+pub use jvm::external::JvmDependencyPackAdapter;
+
+pub use jvm::external::resolve_jvm_semantic_pack_dependencies;
+
 pub use jvm::java_artifact::JavaJarPackProducer;
-pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer};
+
+pub use jvm::jdk_artifact::JdkSourceArchiveLayout;
+
+pub use jvm::jdk_artifact::JdkSourceArchivePackProducer;
+
 pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
+
 pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
+
 pub use kotlin::KotlinAnalyzer;
+
 pub use kotlin::kotlin_declared_scalar_types;
-pub use model::{
-    CallableArity, CallableFacts, CallableOverrideModifier, CloneSmell, CloneSmellWeights,
-    CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationId, DeclarationInfo,
-    DeclarationKind, DispatchExtensibility, ExceptionHandlingAnalysis, ExceptionHandlingSmell,
-    ExceptionSmellWeights, ImportInfo, JVM_SEMANTIC_PACK_LANGUAGES, Language, LanguageDialect,
-    MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, PackageAnchor, ParameterMetadata,
-    ParseCompleteness, ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode,
-    ScalaExportInfo, ScalaExportSelector, SearchSymbolCandidate, SemanticAbsenceProof,
-    SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
-    SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
-    SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
-    StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations, semantic_pack_realm,
-};
-pub use ruby::{RubyCallResultUseIndex, ruby_call_result_use};
+
+pub use model::CallableArity;
+
+pub use model::CallableFacts;
+
+pub use model::CallableOverrideModifier;
+
+pub use model::CloneSmell;
+
+pub use model::CloneSmellWeights;
+
+pub use model::CodeBaseMetrics;
+
+pub use model::CodeUnit;
+
+pub use model::CodeUnitType;
+
+pub use model::CommentDensityStats;
+
+pub use model::DeclarationId;
+
+pub use model::DeclarationInfo;
+
+pub use model::DeclarationKind;
+
+pub use model::DispatchExtensibility;
+
+pub use model::ExceptionHandlingAnalysis;
+
+pub use model::ExceptionHandlingSmell;
+
+pub use model::ExceptionSmellWeights;
+
+pub use model::ImportInfo;
+
+pub use model::JVM_SEMANTIC_PACK_LANGUAGES;
+
+pub use model::Language;
+
+pub use model::LanguageDialect;
+
+pub use model::MaintainabilitySizeSmell;
+
+pub use model::MaintainabilitySizeSmellWeights;
+
+pub use model::PackageAnchor;
+
+pub use model::ParameterMetadata;
+
+pub use model::ParseCompleteness;
+
+pub use model::ParseError;
+
+pub use model::ParseErrorKind;
+
+pub use model::ProjectFile;
+
+pub use model::Range;
+
+pub use model::RubyMethodDispatchMode;
+
+pub use model::ScalaExportInfo;
+
+pub use model::ScalaExportSelector;
+
+pub use model::SearchSymbolCandidate;
+
+pub use model::SemanticAbsenceProof;
+
+pub use model::SemanticDiagnostic;
+
+pub use model::SemanticDiagnosticDomain;
+
+pub use model::SemanticDiagnosticIncompleteReason;
+
+pub use model::SemanticDiagnosticOutcome;
+
+pub use model::SemanticDiagnosticReport;
+
+pub use model::SemanticDiagnosticReportStatus;
+
+pub use model::SignatureMetadata;
+
+pub use model::StructuredImportPath;
+
+pub use model::StructuredImportPathKind;
+
+pub use model::StructuredImportScope;
+
+pub use model::StructuredTypeIdentity;
+
+pub use model::StructuredTypeName;
+
+pub use model::SummaryFileProjection;
+
+pub use model::TestAssertionAnalysis;
+
+pub use model::TestAssertionSmell;
+
+pub use model::TestAssertionWeights;
+
+pub use model::metrics_from_declarations;
+
+pub use model::semantic_pack_realm;
 
 /// Select the earliest range by source line, then by byte offset.
 pub fn primary_range(ranges: &[Range]) -> Option<Range> {
@@ -433,129 +690,183 @@ pub fn primary_range(ranges: &[Range]) -> Option<Range> {
         .copied()
 }
 
-pub(crate) use model::{CallableLinkage, CppFieldLinkage, CppTemplateMetadata};
+pub(crate) use model::CallableLinkage;
+
+pub(crate) use model::CppFieldLinkage;
+
+pub(crate) use model::CppTemplateMetadata;
+
 pub(crate) use multi_analyzer::forward_query_provider;
+
 pub use multi_analyzer::resolve_analyzer;
-pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer, is_language_configuration_input};
-pub use php::{
-    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDeclarationStubPackProducer,
-    PhpDependencyPackAdapter, resolve_php_semantic_pack_dependencies,
-};
-pub use php::{
-    PhpAnalyzer, PhpCallResultUseIndex, PhpUseAliases, parse_php_use_aliases,
-    parse_php_use_aliases_by_kind, parse_php_use_aliases_from_source, php_call_result_use,
-    php_declared_scalar_types, php_namespace_to_fq,
-};
-pub(crate) use pool_memo::{
-    KeyedPoolSafeMemo, PoolSafeMemo, install_on_dedicated_build_pool, spawn_on_dedicated_build_pool,
-};
-pub use project::{
-    BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
-    MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectCoverage,
-    ProjectSourceOrigin, ProjectSourceSnapshot, SubsetCoverage, TestProject,
-    WorkspaceFileListingCache, collect_workspace_files,
-};
-pub use python::packaging as python_packaging;
-pub use python::runtime_artifact as python_runtime_artifact;
-pub(crate) use python::{
-    ModuleBindingEventKind, ModuleBindingTimeline, python_exact_external_receiver_identities,
-    python_external_class_call_identity, python_external_member_declaration,
-    resolve_fqn_candidates, resolve_module_code_unit, retain_modules_for_importer,
-    usage_resolve_module_files,
-};
-pub use python::{
-    PythonAnalyzer, PythonImportBinding,
-    external::{
-        PythonArtifactPackProducer, PythonDependencyPackAdapter,
-        resolve_python_semantic_pack_dependencies,
-    },
-    parse_python_import_bindings, parse_python_import_infos, python_builtin_exception_is_subclass,
-    python_builtin_exception_name,
-};
-pub use read_ledger::{
-    IndexFamily, LookupKind, LookupQuestion, ReadKey, ReadLedger, ReadSetDigest,
-    absent_summary_digest,
-};
-pub use read_verification::{
-    ChangedFacts, ChangedRead, HeadInputs, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
-    ProcedureDispatchReadCallError, ReadVerdict, SummaryAnswers, WorkspaceFactIndex,
-    analysis_epoch_digest, procedure_dispatch_read_call, replay_lookup,
-    verify_procedure_dispatch_read, verify_read_set, verify_read_set_for_artifact,
-};
+
+pub use multi_analyzer::AnalyzerDelegate;
+
+pub use multi_analyzer::LanguageAnalyzer;
+
+pub use multi_analyzer::MultiAnalyzer;
+
+pub use multi_analyzer::is_language_configuration_input;
+
+pub(crate) use pool_memo::KeyedPoolSafeMemo;
+
+pub(crate) use pool_memo::PoolSafeMemo;
+
+pub(crate) use pool_memo::install_on_dedicated_build_pool;
+
+pub(crate) use pool_memo::spawn_on_dedicated_build_pool;
+
+pub use project::BIFROST_IGNORE_FILE_NAME;
+
+pub use project::DEFAULT_MAX_OVERLAY_BYTES;
+
+pub use project::FileSetProject;
+
+pub use project::FilesystemProject;
+
+pub use project::MultiRootProject;
+
+pub use project::OverlayProject;
+
+pub use project::OverlayRevision;
+
+pub use project::Project;
+
+pub use project::ProjectCoverage;
+
+pub use project::ProjectSourceOrigin;
+
+pub use project::ProjectSourceSnapshot;
+
+pub use project::SubsetCoverage;
+
+pub use project::TestProject;
+
+pub use project::WorkspaceFileListingCache;
+
+pub use project::collect_workspace_files;
+
+pub use read_ledger::IndexFamily;
+
+pub use read_ledger::LookupKind;
+
+pub use read_ledger::LookupQuestion;
+
+pub use read_ledger::ReadKey;
+
+pub use read_ledger::ReadLedger;
+
+pub use read_ledger::ReadSetDigest;
+
+pub use read_ledger::absent_summary_digest;
+
+pub use read_verification::ChangedFacts;
+
+pub use read_verification::ChangedRead;
+
+pub use read_verification::HeadInputs;
+
+pub use read_verification::LookupMemo;
+
+pub use read_verification::LookupReplayLimits;
+
+pub use read_verification::NoSummaryAnswers;
+
+pub use read_verification::ProcedureDispatchReadCallError;
+
+pub use read_verification::ReadVerdict;
+
+pub use read_verification::SummaryAnswers;
+
+pub use read_verification::WorkspaceFactIndex;
+
+pub use read_verification::analysis_epoch_digest;
+
+pub use read_verification::procedure_dispatch_read_call;
+
+pub use read_verification::replay_lookup;
+
+pub use read_verification::verify_procedure_dispatch_read;
+
+pub use read_verification::verify_read_set;
+
+pub use read_verification::verify_read_set_for_artifact;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use resolution::{
-    reset_reverse_fact_evaluation_count_for_test, reverse_fact_evaluation_count_for_test,
-};
-pub use ruby::RubyAnalyzer;
-pub use ruby::{
-    RubyDependencyPackAdapter, RubyGemArchivePackProducer, resolve_ruby_semantic_pack_dependencies,
-    ruby_declared_scalar_types,
-};
-pub(crate) use rust::is_rust_public_like_declaration;
-pub use rust::rust_is_field_declaration_name;
-pub use rust::{
-    RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustReferenceNamespace,
-    RustdocJsonPackProducer, acquire_rust_file_dependency_evidence,
-    failure_handlers::rust_failure_handler_body_shapes, resolve_rust_semantic_pack_dependencies,
-    rust_declaration_is_enum_variant, rust_declaration_matches_reference_namespace,
-    rust_file_dependency_evidence, rust_reference_namespace,
-};
-pub use rust::{RustCallResultUseIndex, rust_call_result_use};
+pub use resolution::reset_reverse_fact_evaluation_count_for_test;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use rust::{
-    reset_rust_tree_parse_counters_for_test, rust_scope_index_build_count_for_test,
-    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
-    rust_tree_parsed_bytes_for_test,
-};
+pub use resolution::reverse_fact_evaluation_count_for_test;
+
 pub use scala::ScalaAnalyzer;
+
 pub use scala::scala_declared_scalar_types;
+
 pub use source_content::SourceContent;
-pub use source_ingestion::{
-    IngestedSource, SourceIngestionError, SourceIngestionKind, ingest_source_bytes,
-};
-pub(crate) use tree_sitter_analyzer::{
-    AnalyzerStoreContext, BuildAbort, BulkFileStateSource, RevisionBlobIdentities,
-    ephemeral_store_context, persistent_store_context,
-    persistent_store_context_without_automatic_gc, revision_image_store_context,
-    scoped_store_context,
-};
-pub use tree_sitter_analyzer::{
-    BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
-};
-pub use typescript::TypescriptAnalyzer;
+
+pub use source_ingestion::IngestedSource;
+
+pub use source_ingestion::SourceIngestionError;
+
+pub use source_ingestion::SourceIngestionKind;
+
+pub use source_ingestion::ingest_source_bytes;
+
+pub(crate) use tree_sitter_analyzer::AnalyzerStoreContext;
+
+pub(crate) use tree_sitter_analyzer::BuildAbort;
+
+pub(crate) use tree_sitter_analyzer::BulkFileStateSource;
+
+pub(crate) use tree_sitter_analyzer::RevisionBlobIdentities;
+
+pub(crate) use tree_sitter_analyzer::ephemeral_store_context;
+
+pub(crate) use tree_sitter_analyzer::persistent_store_context;
+
+pub(crate) use tree_sitter_analyzer::persistent_store_context_without_automatic_gc;
+
+pub(crate) use tree_sitter_analyzer::revision_image_store_context;
+
+pub(crate) use tree_sitter_analyzer::scoped_store_context;
+
+pub use tree_sitter_analyzer::BuildProgress;
+
+pub use tree_sitter_analyzer::BuildProgressEvent;
+
+pub use tree_sitter_analyzer::BuildProgressPhase;
+
+pub use tree_sitter_analyzer::LanguageAdapter;
+
+pub use tree_sitter_analyzer::TreeSitterAnalyzer;
+
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use usages::java_usage_evidence_cache::JavaUsageEvidenceCacheStats;
+
 pub use usages::workspace_graph::UsageEcosystem;
-pub use workspace::{
-    DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
-    DependencyPackWorkspaceContext, EmptyAnalyzer, InstalledDependencyPackActivationOutcome,
-    PythonSemanticModelActivationOutcome, PythonSemanticModelWorkspaceContext, WorkspaceAnalyzer,
-};
-pub(crate) use workspace::{SharedAnalyzerCache, WorkspaceProjectionLease};
 
-/// Which of a language's grammars parses one file.
-///
-/// Named for the grammar, not for the dialect that asked for it: two dialects
-/// select [`ParserFlavor::Tsx`], TypeScript's `.tsx` and JavaScript's `.jsx`
-/// (#3322), and a language that ships one grammar answers [`Self::Default`]
-/// for every dialect it has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParserFlavor {
-    Default,
-    Tsx,
-}
+pub(crate) use workspace::WorkspaceProjectionLease;
 
-impl ParserFlavor {
-    const fn for_dialect(dialect: LanguageDialect) -> Self {
-        match dialect {
-            // C and C++ share one grammar; the dialect only changes how the
-            // parsed tree is interpreted, never which parser produces it.
-            LanguageDialect::Standard(_) | LanguageDialect::CppC => Self::Default,
-            LanguageDialect::TypeScriptTsx | LanguageDialect::JavaScriptJsx => Self::Tsx,
-        }
-    }
-}
+pub use workspace::DependencyPackActivationOutcome;
+
+pub use workspace::DependencyPackEcosystem;
+
+pub use workspace::DependencyPackEcosystemOutcome;
+
+pub use workspace::DependencyPackWorkspaceContext;
+
+pub use workspace::EmptyAnalyzer;
+
+pub use workspace::InstalledDependencyPackActivationOutcome;
+
+pub use workspace::PythonSemanticModelActivationOutcome;
+
+pub use workspace::PythonSemanticModelWorkspaceContext;
+
+pub use workspace::WorkspaceAnalyzer;
+
+pub use brokk_bifrost_core::analyzer::language_knowledge::ParserFlavor;
 
 /// Resolve the default parser grammar registered for a language.
 pub fn parser_language_for(language: Language) -> Option<tree_sitter::Language> {
@@ -576,11 +887,12 @@ pub(crate) fn parser_language_for_flavor(
     language: Language,
     flavor: ParserFlavor,
 ) -> Option<tree_sitter::Language> {
-    languages::language_support(language).map(|support| support.parser_language(flavor))
+    languages::language_knowledge(language).map(|knowledge| knowledge.parser_language(flavor))
 }
 
 /// Resolve the parser grammar used by the indexed analyzer for a specific path.
-pub(crate) fn parser_language_for_path(
+#[doc(hidden)]
+pub fn parser_language_for_path(
     language: Language,
     path: &std::path::Path,
 ) -> Option<tree_sitter::Language> {
@@ -594,7 +906,7 @@ pub(crate) fn parser_flavor_for_path(language: Language, path: &std::path::Path)
 /// Resolve the normalized structural adapter registered for a language
 /// without constructing a workspace analyzer.
 pub fn structural_spec_for(language: Language) -> Option<&'static dyn structural::StructuralSpec> {
-    languages::language_support(language).map(languages::LanguageSupport::structural_spec)
+    languages::language_knowledge(language).map(|knowledge| knowledge.structural_spec())
 }
 
 /// Swap `tree` for the repair `language`'s bundled grammar needs, when it needs
@@ -619,3 +931,9 @@ pub(crate) fn repaired_grammar_gap_tree(
         .and_then(|spec| spec.reparse_grammar_gap(source, &tree, None))
         .unwrap_or(tree)
 }
+
+#[doc(hidden)]
+pub use brokk_bifrost_core::analyzer::definition_lookup;
+
+pub mod semantic;
+pub mod semantic_model;

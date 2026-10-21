@@ -33,7 +33,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
     ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
     ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
-    ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
+    ResolutionRootReferenceSegmentFact, ResolutionRouteGap, ResolutionScopeFact, ResolutionScopeId,
     ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteId, ResolutionSiteKind,
     ResolutionSupertypeFact, ResolutionSupertypeKind, ResolutionTypeArgumentFact,
     ResolutionTypeConstructorKind, ResolutionTypeProductionFact, ResolutionTypeRelationId,
@@ -724,10 +724,10 @@ impl<'source> RustResolutionBuilder<'source> {
         let properties = self.declaration_properties_for_node(node);
         let source_declaration = properties.declaration;
         if properties.cfg_condition != RustCfgCondition::Always {
-            self.facts.gaps.push(ResolutionGapFact {
-                site: declaration,
-                kind: ResolutionGapKind::UnprovenActivation,
-            });
+            self.facts.gaps.push(ResolutionGapFact::new(
+                declaration,
+                ResolutionGapKind::UnprovenActivation,
+            ));
         }
         self.declaration_sources
             .push((declaration, source_declaration));
@@ -1154,10 +1154,10 @@ impl<'source> RustResolutionBuilder<'source> {
                     site,
                     role: ResolutionTypeSlotRole::TargetTypeIdentity,
                 });
-                self.facts.gaps.push(ResolutionGapFact {
+                self.facts.gaps.push(ResolutionGapFact::new(
                     site,
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                });
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                ));
                 assert!(
                     self.self_type_frontiers
                         .insert(
@@ -1740,7 +1740,19 @@ impl<'source> RustResolutionBuilder<'source> {
             rust_path_segments_have_misplaced_anchor(segments.iter().copied(), self.source, false)
         }) {
             self.mark_scoped_path_consumed(node);
-            self.add_local_gap(node, ResolutionGapKind::UnsupportedRoute);
+            let terminal = segments
+                .as_ref()
+                .and_then(|segments| segments.last())
+                .copied()
+                .map(|terminal| self.intern_name(terminal));
+            self.add_local_route_gap(
+                node,
+                ResolutionRouteGap::OmittedReference {
+                    scope: self.current_scope(),
+                    terminal,
+                    namespace: Some(namespace),
+                },
+            );
             return None;
         }
         let explicit_module_anchor = segments.as_ref().is_some_and(|segments| {
@@ -2370,10 +2382,10 @@ impl<'source> RustResolutionBuilder<'source> {
             .and_then(|target| {
                 self.lower_impl_type_identity(target).map(|lowered| {
                     let reference = self.facts.type_slots[lowered.identity.index()].site;
-                    self.facts.gaps.push(ResolutionGapFact {
-                        site: reference,
-                        kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                    });
+                    self.facts.gaps.push(ResolutionGapFact::new(
+                        reference,
+                        ResolutionGapKind::UnsupportedHierarchyTraversal,
+                    ));
                     (reference, lowered.identity)
                 })
             });
@@ -2648,10 +2660,10 @@ impl<'source> RustResolutionBuilder<'source> {
             // shared typed-graph relation. Retain that source-owned boundary;
             // the common visibility pass must not certify the candidate, and
             // the selected access policy decides it per requester module.
-            self.facts.gaps.push(ResolutionGapFact {
-                site: declaration,
-                kind: ResolutionGapKind::UnsupportedVisibility,
-            });
+            self.facts.gaps.push(ResolutionGapFact::new(
+                declaration,
+                ResolutionGapKind::UnsupportedVisibility,
+            ));
         }
     }
 
@@ -3143,10 +3155,10 @@ impl<'source> RustResolutionBuilder<'source> {
             // reference with a located lexical definition rather than a
             // `CodeUnit`.
             if node.kind() != "type_item" {
-                self.facts.gaps.push(ResolutionGapFact {
-                    site: declaration,
-                    kind: ResolutionGapKind::UnsupportedScopeOrBinder,
-                });
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    declaration,
+                    ResolutionGapKind::UnsupportedScopeOrBinder,
+                ));
             }
             let source_declaration = self.declaration_properties_for_node(node).declaration;
             self.source_collector
@@ -3671,10 +3683,10 @@ impl<'source> RustResolutionBuilder<'source> {
     }
 
     fn retain_call_applicability_gap(&mut self, callable: ResolutionSiteId) {
-        self.facts.gaps.push(ResolutionGapFact {
-            site: callable,
-            kind: ResolutionGapKind::UnsupportedCallApplicability,
-        });
+        self.facts.gaps.push(ResolutionGapFact::new(
+            callable,
+            ResolutionGapKind::UnsupportedCallApplicability,
+        ));
     }
 
     fn lower_standard_self_parameter(
@@ -3850,10 +3862,10 @@ impl<'source> RustResolutionBuilder<'source> {
             // The annotation describes Future::Output, not the invocation's
             // value type. Retain the binding without inventing a Future type.
             // Async does not hide any source references: only typing is open.
-            self.facts.gaps.push(ResolutionGapFact {
-                site: declaration,
-                kind: ResolutionGapKind::UnsupportedTypeSyntax,
-            });
+            self.facts.gaps.push(ResolutionGapFact::new(
+                declaration,
+                ResolutionGapKind::UnsupportedTypeSyntax,
+            ));
             return;
         }
         let type_identity = match node.child_by_field_name("return_type") {
@@ -4474,10 +4486,10 @@ impl<'source> RustResolutionBuilder<'source> {
                     self.current_scope(),
                 );
                 if rust_type_reference_is_self(node, self.source) {
-                    self.facts.gaps.push(ResolutionGapFact {
-                        site: reference,
-                        kind: ResolutionGapKind::UnsupportedScopeOrBinder,
-                    });
+                    self.facts.gaps.push(ResolutionGapFact::new(
+                        reference,
+                        ResolutionGapKind::UnsupportedScopeOrBinder,
+                    ));
                 }
                 Some(reference)
             }
@@ -6950,9 +6962,11 @@ impl<'source> RustResolutionBuilder<'source> {
                 .iter()
                 .filter(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
                 .filter(|identifier| unsupported.insert(identifier.site))
-                .map(|identifier| ResolutionGapFact {
-                    site: identifier.site,
-                    kind: ResolutionGapKind::UnsupportedExpression,
+                .map(|identifier| {
+                    ResolutionGapFact::new(
+                        identifier.site,
+                        ResolutionGapKind::UnsupportedExpression,
+                    )
                 }),
         );
     }
@@ -7483,10 +7497,89 @@ impl<'source> RustResolutionBuilder<'source> {
         }
     }
 
+    fn lower_unprojected_use_declaration(&mut self, node: Node<'_>, scope: ResolutionScopeId) {
+        // No projected leaves can mean either no binders (empty groups) or an
+        // unknown binder surface (for example `use *;`). Decide from the tree,
+        // not from the size of the projection. Comments do not introduce leaves.
+        let mut empty_groups = !node.has_error();
+        let mut prefixes = Vec::new();
+        let mut pending = node
+            .child_by_field_name("argument")
+            .map(|argument| vec![(argument, Vec::new())])
+            .unwrap_or_default();
+        empty_groups &= !pending.is_empty();
+        while let Some((argument, mut prefix)) = pending.pop() {
+            match argument.kind() {
+                "use_list" => {
+                    let mut cursor = argument.walk();
+                    pending.extend(
+                        argument
+                            .named_children(&mut cursor)
+                            .map(|child| (child, prefix.clone())),
+                    );
+                }
+                "scoped_use_list" => {
+                    if let Some(path) = argument.child_by_field_name("path") {
+                        let Some(segments) = rust_path_segments(path) else {
+                            empty_groups = false;
+                            break;
+                        };
+                        prefix.extend(segments);
+                        if prefix
+                            .iter()
+                            .any(|segment| !name_node_has_spelling(*segment))
+                            || rust_path_segments_have_misplaced_anchor(
+                                prefix.iter().copied(),
+                                self.source,
+                                false,
+                            )
+                        {
+                            empty_groups = false;
+                            break;
+                        }
+                        prefixes.push((path, prefix.last().copied()));
+                    }
+                    let Some(list) = argument.child_by_field_name("list") else {
+                        empty_groups = false;
+                        break;
+                    };
+                    pending.push((list, prefix));
+                }
+                "line_comment" | "block_comment" => {}
+                _ => {
+                    empty_groups = false;
+                    break;
+                }
+            }
+        }
+        if !empty_groups {
+            self.add_local_binder_route_gap(node, scope, &[]);
+            return;
+        }
+        // Prefix lowering emits references only when it reaches a leaf. Empty
+        // groups have none, but their paths still name modules. State exactly
+        // that omitted reference, without opening the scope's binder surface.
+        for (path, terminal) in prefixes {
+            let terminal = terminal.map(|terminal| self.intern_name(terminal));
+            self.add_local_route_gap(
+                path,
+                ResolutionRouteGap::OmittedReference {
+                    scope,
+                    terminal,
+                    namespace: Some(ResolutionNamespace::Type),
+                },
+            );
+        }
+    }
+
     fn lower_use_declaration(&mut self, node: Node<'_>, projected_imports: &[RustProjectedImport]) {
         // A `use` is an item: where a block declares items, its binder belongs
         // in that block's item scope, beside the items that can name it.
         let root_scope = self.item_scope();
+        if projected_imports.is_empty() {
+            self.lower_unprojected_use_declaration(node, root_scope);
+            return;
+        }
         if !matches!(
             self.facts.scopes[root_scope.index()].kind,
             ResolutionScopeKind::CompilationUnit
@@ -7494,12 +7587,12 @@ impl<'source> RustResolutionBuilder<'source> {
                 | ResolutionScopeKind::Executable
                 | ResolutionScopeKind::Block
         ) {
-            self.add_local_gap(node, ResolutionGapKind::UnsupportedRoute);
+            self.add_local_binder_route_gap(node, root_scope, projected_imports);
             return;
         }
 
         let route_root_scope = self.nearest_root_scope();
-        let mut unsupported = projected_imports.is_empty();
+        let mut unsupported = false;
         for projected in projected_imports {
             assert!(
                 !projected.import.is_extern_crate(),
@@ -7663,7 +7756,7 @@ impl<'source> RustResolutionBuilder<'source> {
         }
         unsupported |= self.lower_use_prefix_references(node);
         if unsupported {
-            self.add_local_gap(node, ResolutionGapKind::UnsupportedRoute);
+            self.add_local_binder_route_gap(node, root_scope, projected_imports);
         }
     }
 
@@ -8668,10 +8761,10 @@ impl<'source> RustResolutionBuilder<'source> {
         // The common callable obligation owns and can discharge this exact
         // callee gap. Omitted argument/signature inventories below have
         // distinct source-site gaps which that discharge cannot erase.
-        self.facts.gaps.push(ResolutionGapFact {
-            site: callee,
-            kind: ResolutionGapKind::UnsupportedCallApplicability,
-        });
+        self.facts.gaps.push(ResolutionGapFact::new(
+            callee,
+            ResolutionGapKind::UnsupportedCallApplicability,
+        ));
         let call = self.add_site(node, ResolutionSiteKind::Call, self.current_scope());
         let result = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
             .expect("Rust resolution type-slot count exceeds u32");
@@ -9587,12 +9680,16 @@ impl<'source> RustResolutionBuilder<'source> {
                 "arguments"
                     | "array_expression"
                     | "assignment_expression"
+                    | "await_expression"
+                    | "base_field_initializer"
                     | "binary_expression"
                     | "block"
+                    | "break_expression"
                     | "compound_assignment_expr"
                     | "else_clause"
                     | "expression_statement"
                     | "index_expression"
+                    | "let_chain"
                     | "parenthesized_expression"
                     | "range_expression"
                     | "return_expression"
@@ -9652,6 +9749,59 @@ impl<'source> RustResolutionBuilder<'source> {
         }
     }
 
+    fn add_local_binder_route_gap(
+        &mut self,
+        node: Node<'_>,
+        scope: ResolutionScopeId,
+        projected_imports: &[RustProjectedImport],
+    ) {
+        let site = self.add_site(
+            node,
+            ResolutionSiteKind::UnsupportedExpression,
+            self.current_scope(),
+        );
+        let bindings = if projected_imports.is_empty() {
+            // Unprojectable syntax supplies no publishing binder evidence.
+            vec![(None, false)]
+        } else {
+            projected_imports
+                .iter()
+                .map(|projected| {
+                    let name = projected
+                        .import
+                        .binding_name()
+                        .named()
+                        .map(|name| self.intern_spelling(name));
+                    (name, projected.import.visibility != RustVisibility::Private)
+                })
+                .collect()
+        };
+        for (name, may_publish) in bindings {
+            self.facts.add_route_gap(
+                site,
+                ResolutionRouteGap::UnknownBinder {
+                    scope,
+                    name,
+                    namespace: None,
+                    may_publish,
+                },
+            );
+        }
+        self.facts
+            .add_reference_enumeration_gap(site, ResolutionGapKind::UnsupportedRoute);
+    }
+
+    fn add_local_route_gap(&mut self, node: Node<'_>, route: ResolutionRouteGap) {
+        let site = self.add_site(
+            node,
+            ResolutionSiteKind::UnsupportedExpression,
+            self.current_scope(),
+        );
+        self.facts.add_route_gap(site, route);
+        self.facts
+            .add_reference_enumeration_gap(site, ResolutionGapKind::UnsupportedRoute);
+    }
+
     fn add_local_gap(&mut self, node: Node<'_>, kind: ResolutionGapKind) {
         let site = self.add_site(
             node,
@@ -9671,7 +9821,7 @@ impl<'source> RustResolutionBuilder<'source> {
     }
 
     fn add_semantic_gap_at_site(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
-        self.facts.gaps.push(ResolutionGapFact { site, kind });
+        self.facts.gaps.push(ResolutionGapFact::new(site, kind));
     }
 
     fn add_local_gap_at_site(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
@@ -16556,7 +16706,7 @@ cfg_if::cfg_if! {
         let facts = crate::test_helpers::parse_rust_fixture(source).resolution_facts;
         let mut seen = std::collections::HashSet::new();
         for gap in &facts.gaps {
-            assert!(seen.insert(*gap), "duplicate gap: {gap:?}");
+            assert!(seen.insert(gap), "duplicate gap: {gap:?}");
         }
         let methods = facts
             .identifiers

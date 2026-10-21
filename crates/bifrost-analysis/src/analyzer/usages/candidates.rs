@@ -8,7 +8,7 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     CodeUnit, DescendantIndexScope, IAnalyzer, ImportAnalysisProvider, ImportReachability,
-    Language, ProjectFile, cpp_callable_definitions_share_identity_evidence,
+    Language, ProjectFile,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -258,7 +258,8 @@ fn find_import_graph_candidates(
     candidates
 }
 
-fn is_constructor_target(target: &CodeUnit, analyzer: &dyn IAnalyzer) -> bool {
+#[doc(hidden)]
+pub fn is_constructor_target(target: &CodeUnit, analyzer: &dyn IAnalyzer) -> bool {
     crate::analyzer::usages::common::is_constructor_metadata(&analyzer.signature_metadata(target))
 }
 
@@ -269,7 +270,8 @@ fn is_constructor_target(target: &CodeUnit, analyzer: &dyn IAnalyzer) -> bool {
 /// JavaScript and TypeScript. Every other supported language is isolated. This
 /// boundary must be applied before import prefetch: filtering resolved answers
 /// afterwards still pays to hydrate every unrelated language in the workspace.
-fn usage_ecosystem_files(
+#[doc(hidden)]
+pub fn usage_ecosystem_files(
     files: impl IntoIterator<Item = ProjectFile>,
     target_language: Language,
 ) -> Vec<ProjectFile> {
@@ -317,8 +319,11 @@ fn cpp_related_callable_source_files(
             {
                 continue;
             }
-            if cpp_callable_definitions_share_identity_evidence(analyzer, token, target, &candidate)
-            {
+            if language_support(Language::Cpp).is_some_and(|support| {
+                support.callable_definitions_share_identity_evidence(
+                    analyzer, token, target, &candidate,
+                )
+            }) {
                 related.insert(candidate.source().clone());
             }
         }
@@ -420,7 +425,8 @@ fn find_direct_importers_with_cancellation(
     importers.into_inner().expect("importers set poisoned")
 }
 
-pub(super) fn find_transitive_importers_with_cancellation(
+#[doc(hidden)]
+pub fn find_transitive_importers_with_cancellation(
     files: impl IntoIterator<Item = ProjectFile>,
     import_provider: &dyn ImportAnalysisProvider,
     token: QueryToken<'_>,
@@ -837,7 +843,8 @@ pub fn default_provider()
     )
 }
 
-pub(crate) fn find_default_candidates_within(
+#[doc(hidden)]
+pub fn find_default_candidates_within(
     target: &CodeUnit,
     analyzer: &dyn IAnalyzer,
     scope: &DescendantIndexScope<'_>,
@@ -894,7 +901,8 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+#[doc(hidden)]
+pub mod tests {
     use super::*;
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::KotlinAnalyzer;
@@ -1023,53 +1031,6 @@ mod tests {
                 "unexpected Scala operator {identifier:?}"
             );
         }
-    }
-
-    /// Constructors do not participate in polymorphic dispatch. Before this
-    /// gate, asking for one constructor's usages built Kotlin's complete
-    /// descendant index and resolved every unrelated class hierarchy in the
-    /// workspace (#1748).
-    #[test]
-    #[hardwon(
-        "#2602: Kotlin constructor candidate lookup avoids scanning workspace descendants when the constructor has a direct type identity"
-    )]
-    fn kotlin_constructor_candidates_skip_workspace_descendant_resolution() {
-        let unrelated_hierarchy = (0..64)
-            .map(|index| format!("open class Base{index}\nclass Child{index} : Base{index}()\n"))
-            .collect::<String>();
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Kotlin,
-            &[
-                (
-                    "DuplicateColumnException.kt",
-                    "package api\nclass DuplicateColumnException(message: String) : Exception(message)\n",
-                ),
-                ("Unrelated.kt", &unrelated_hierarchy),
-            ],
-        );
-        let analyzer = KotlinAnalyzer::new(Arc::new(fixture.test_project().clone()));
-        let constructor = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.fq_name() == "api.DuplicateColumnException.DuplicateColumnException")
-            .expect("fixture declares the DuplicateColumnException constructor");
-        assert!(is_constructor_target(&constructor, &analyzer));
-
-        let cancellation = CancellationToken::default();
-        let scope = DescendantIndexScope::whole_workspace(&cancellation);
-        analyzer
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
-        let candidates = find_default_candidates_within(&constructor, &analyzer, &scope);
-        let definition_queries = analyzer
-            .test_hooks()
-            .definition_candidates_query_count_for_test();
-
-        assert!(candidates.contains(constructor.source()));
-        assert!(
-            definition_queries < 8,
-            "constructor discovery must not resolve the unrelated workspace hierarchy; got {definition_queries} definition queries"
-        );
     }
 
     #[test]
@@ -1236,45 +1197,6 @@ mod tests {
     }
 
     #[test]
-    #[hardwon(
-        "6074c794e6bd: Verifies batched importer prefetch respects language ecosystems instead of crossing into unrelated candidate rows"
-    )]
-    fn importer_prefetch_scope_follows_language_ecosystems() {
-        let root = std::env::temp_dir();
-        let files = [
-            ProjectFile::new(root.clone(), "lib.rs"),
-            ProjectFile::new(root.clone(), "Main.java"),
-            ProjectFile::new(root.clone(), "Main.scala"),
-            ProjectFile::new(root.clone(), "Main.kt"),
-            ProjectFile::new(root.clone(), "app.js"),
-            ProjectFile::new(root, "app.ts"),
-        ];
-        let relative_paths = |selected: Vec<ProjectFile>| {
-            selected
-                .into_iter()
-                .map(|file| file.rel_path().to_string_lossy().into_owned())
-                .collect::<BTreeSet<_>>()
-        };
-
-        assert_eq!(
-            relative_paths(usage_ecosystem_files(files.clone(), Language::Rust)),
-            BTreeSet::from(["lib.rs".to_string()])
-        );
-        assert_eq!(
-            relative_paths(usage_ecosystem_files(files.clone(), Language::Java)),
-            BTreeSet::from([
-                "Main.java".to_string(),
-                "Main.kt".to_string(),
-                "Main.scala".to_string(),
-            ])
-        );
-        assert_eq!(
-            relative_paths(usage_ecosystem_files(files, Language::TypeScript)),
-            BTreeSet::from(["app.js".to_string(), "app.ts".to_string()])
-        );
-    }
-
-    #[test]
     fn cancellable_importer_scan_stops_after_current_file_without_recording_partial_work() {
         let root = std::env::temp_dir();
         let target_file = ProjectFile::new(root.clone(), "Target.java");
@@ -1380,6 +1302,52 @@ mod tests {
                 .expect("prefetch record poisoned")
                 .is_empty(),
             "a pre-cancelled scan must not spend the batch either"
+        );
+    }
+    /// Constructors do not participate in polymorphic dispatch. Before this
+    /// gate, asking for one constructor's usages built Kotlin's complete
+    /// descendant index and resolved every unrelated class hierarchy in the
+    /// workspace (#1748).
+    #[test]
+    #[hardwon(
+        "#2602: Kotlin constructor candidate lookup avoids scanning workspace descendants when the constructor has a direct type identity"
+    )]
+    fn kotlin_constructor_candidates_skip_workspace_descendant_resolution() {
+        let unrelated_hierarchy = (0..64)
+            .map(|index| format!("open class Base{index}\nclass Child{index} : Base{index}()\n"))
+            .collect::<String>();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Kotlin,
+            &[
+                (
+                    "DuplicateColumnException.kt",
+                    "package api\nclass DuplicateColumnException(message: String) : Exception(message)\n",
+                ),
+                ("Unrelated.kt", &unrelated_hierarchy),
+            ],
+        );
+        let analyzer = KotlinAnalyzer::new(Arc::new(fixture.test_project().clone()));
+        let constructor = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name() == "api.DuplicateColumnException.DuplicateColumnException")
+            .expect("fixture declares the DuplicateColumnException constructor");
+        assert!(is_constructor_target(&constructor, &analyzer));
+
+        let cancellation = CancellationToken::default();
+        let scope = DescendantIndexScope::whole_workspace(&cancellation);
+        analyzer
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+        let candidates = find_default_candidates_within(&constructor, &analyzer, &scope);
+        let definition_queries = analyzer
+            .test_hooks()
+            .definition_candidates_query_count_for_test();
+
+        assert!(candidates.contains(constructor.source()));
+        assert!(
+            definition_queries < 8,
+            "constructor discovery must not resolve the unrelated workspace hierarchy; got {definition_queries} definition queries"
         );
     }
 }

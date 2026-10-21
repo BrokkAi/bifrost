@@ -1265,13 +1265,19 @@ pub fn single_target_overwritten_local_candidates(
 
 /// A simple-name write joined to the one binding the lowering assigns at the
 /// write's point.
-pub(crate) struct BindingWrite<'tree> {
-    pub(crate) point: ProgramPointId,
-    pub(crate) binding: ValueId,
-    pub(crate) value: ValueId,
-    pub(crate) parameter: bool,
+#[doc(hidden)]
+pub struct BindingWrite<'tree> {
+    #[doc(hidden)]
+    pub point: ProgramPointId,
+    #[doc(hidden)]
+    pub binding: ValueId,
+    #[doc(hidden)]
+    pub value: ValueId,
+    #[doc(hidden)]
+    pub parameter: bool,
     /// The binding's declared name.
-    pub(crate) declaration: Node<'tree>,
+    #[doc(hidden)]
+    pub declaration: Node<'tree>,
 }
 
 /// Join the simple name `target` to the one binding (Local or Parameter)
@@ -1279,7 +1285,8 @@ pub(crate) struct BindingWrite<'tree> {
 /// and spelled like `target`. C#, Kotlin, Go, Rust, Scala, PHP, and Ruby lower a
 /// simple-name write to exactly one binding assignment; a C# point also
 /// assigns the expression's own Temporary, which is not a binding.
-pub(crate) fn join_binding_write<'tree>(
+#[doc(hidden)]
+pub fn join_binding_write<'tree>(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     points_by_span: &HashMap<(usize, usize), Vec<&crate::analyzer::semantic::ProgramPoint>>,
     source: &str,
@@ -3595,7 +3602,8 @@ fn next_assignment_start(assignment: Node<'_>, language: Language) -> Option<usi
     is_assignment(next_assignment, language).then_some(next_assignment.start_byte())
 }
 
-pub(super) fn is_plain_assignment_operator_kind(kind: &str) -> bool {
+#[doc(hidden)]
+pub fn is_plain_assignment_operator_kind(kind: &str) -> bool {
     kind == "="
 }
 

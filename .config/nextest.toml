@@ -27,6 +27,12 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [profile.default.junit]
 path = "junit.xml"
 
+# #6018 owns the genuine single-connection reverse deadlocks. If explicitly
+# requested with --run-ignored, stop them instead of wedging the test run.
+[[profile.default.overrides]]
+filter = 'test(reverse_macro_generated_callers_equal_across_worker_counts_writer_only) | test(incoming_call_recheck_keeps_budget_stopped_sites_unproven_writer_only)'
+slow-timeout = { period = "30s", terminate-after = 1 }
+
 # Start the real-process repository corpus checks before the short unit tests
 # so their analyzer/server setup overlaps the rest of the run instead of
 # becoming a serial tail. They still reserve only the default single slot.
@@ -161,4 +167,10 @@ threads-required = "num-cpus"
 # It preserves the complete archive and all member/dependency/export assertions.
 [[profile.default.overrides]]
 filter = 'test(vector_archive_rust_summary_differential_census)'
+threads-required = "num-cpus"
+
+# The manual Go discovery corpus differential partitions real source files over
+# all available CPUs, like the existing Go corpus profile tier.
+[[profile.default.overrides]]
+filter = 'test(shared_closer_differential_go_discovery_corpus)'
 threads-required = "num-cpus"

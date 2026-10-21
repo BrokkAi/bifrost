@@ -337,10 +337,11 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven_limit(
             target.clone(),
             hits,
             unproven_hits,
+            scan_scope.max_unproven(),
         ))
     }
 }

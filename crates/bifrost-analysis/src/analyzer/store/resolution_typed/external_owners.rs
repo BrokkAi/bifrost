@@ -7,6 +7,30 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 };
 use std::sync::Arc;
 
+pub(in crate::analyzer::store) const EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL: &str = "SELECT member.ordinal,member.member_name,member.member_kind,member.visibility,member.is_static FROM jvm_external_owner_members member JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE member.provider_id=?1 AND member.owner_fqn=?2 AND member.ordinal=?3 AND member.provider_id IN (SELECT value FROM json_each(?4))";
+
+pub(in crate::analyzer::store) const INTRINSIC_MEMBER_OWNER_INDEXED_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2)";
+
+pub(in crate::analyzer::store) fn intrinsic_member_inventory_for_owner(
+    connection: &rusqlite::Connection,
+    owner: &ExternalOwnerIdentity,
+) -> StoreResult<Option<&'static [crate::analyzer::resolution::universe::IntrinsicMember]>> {
+    let Some(inventory) =
+        crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
+    else {
+        return Ok(None);
+    };
+    // Indexed artifacts own their ordinals. Never overlay intrinsic ordinals
+    // onto an existing provider's rows; the fixed table fills an unindexed root.
+    let indexed: bool = connection.query_row(
+        INTRINSIC_MEMBER_OWNER_INDEXED_SQL,
+        rusqlite::params![owner.provider_id.as_ref(), owner.owner_fqn.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok((!indexed).then_some(inventory))
+}
+
 impl SelectedResolutionTypedSource<'_, '_> {
     pub(super) fn external_callable_result_type_identities(
         &self,
@@ -109,6 +133,20 @@ impl SelectedResolutionTypedSource<'_, '_> {
         ))
     }
 
+    fn intrinsic_member_inventory_for_owner(
+        &self,
+        owner: &ExternalOwnerIdentity,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<Option<&'static [crate::analyzer::resolution::universe::IntrinsicMember]>>,
+    > {
+        self.read_statement(cancellation, |connection| {
+            Ok(Some(intrinsic_member_inventory_for_owner(
+                connection, owner,
+            )?))
+        })
+    }
+
     fn visit_external_rows<T>(
         &self,
         definitions: &[SemanticId],
@@ -123,6 +161,14 @@ impl SelectedResolutionTypedSource<'_, '_> {
             let Some(owner) = self.context_identities.external_owner_identity(definition) else {
                 continue;
             };
+            let Some(intrinsic) =
+                self.intrinsic_member_inventory_for_owner(&owner, cancellation)?
+            else {
+                return cancelled();
+            };
+            if intrinsic.is_some() {
+                continue;
+            }
             let mut cursor = -1i64;
             loop {
                 if cancellation.is_cancelled() {
@@ -206,6 +252,42 @@ impl SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberScopeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return cancelled();
+            }
+            let Some(owner) = self.context_identities.external_owner_identity(definition) else {
+                continue;
+            };
+            let Some(intrinsic) =
+                self.intrinsic_member_inventory_for_owner(&owner, cancellation)?
+            else {
+                return cancelled();
+            };
+            if intrinsic.is_some() {
+                let row = SelectedTypedRow::external_owner(
+                    owner,
+                    LoweredMemberScopeProperty::external(
+                        definition,
+                        crate::analyzer::resolution::ExternalMemberCoverage {
+                            callables_complete: true,
+                            values_complete: true,
+                            types_complete: true,
+                            supertypes_complete: true,
+                        },
+                    ),
+                );
+                let keep_going = visitor.visit_page(std::slice::from_ref(&row))?;
+                if cancellation.is_cancelled() {
+                    return cancelled();
+                }
+                if !keep_going {
+                    return Ok(TypedFactReadOutcome::stopped(
+                        ResolutionCompletion::Complete,
+                    ));
+                }
+            }
+        }
         self.visit_external_rows(definitions,
             "SELECT 0,callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2 AND 0>?3 AND provider_id IN (SELECT value FROM json_each(?5)) LIMIT ?4",
             cancellation, visitor, |owner, definition, row| {
@@ -229,26 +311,230 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .selection
             .shared_name_table()
             .interner(self.selection.connection());
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return cancelled();
+            }
+            let Some(owner) = self.context_identities.external_owner_identity(definition) else {
+                continue;
+            };
+            let Some(intrinsic) =
+                self.intrinsic_member_inventory_for_owner(&owner, cancellation)?
+            else {
+                return cancelled();
+            };
+            if let Some(members) = intrinsic {
+                for (ordinal, member) in members.iter().enumerate() {
+                    let row = self.external_member_owner_row(
+                        &owner,
+                        definition,
+                        ordinal as u32,
+                        member.name,
+                        "method",
+                        member.visibility,
+                        false,
+                        &names,
+                    )?;
+                    let keep_going = visitor.visit_page(std::slice::from_ref(&row))?;
+                    if cancellation.is_cancelled() {
+                        return cancelled();
+                    }
+                    if !keep_going {
+                        return Ok(TypedFactReadOutcome::stopped(
+                            ResolutionCompletion::Complete,
+                        ));
+                    }
+                }
+            }
+        }
         self.visit_external_rows(definitions,
             "SELECT member.ordinal,member.member_name,member.member_kind,member.visibility,member.is_static FROM jvm_external_owner_members member JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE member.provider_id=?1 AND member.owner_fqn=?2 AND member.ordinal>?3 AND member.provider_id IN (SELECT value FROM json_each(?5)) ORDER BY member.ordinal LIMIT ?4",
             cancellation, visitor, |owner, definition, row| {
-                let ordinal: u32 = row.get(0)?;
-                let name: String = row.get(1)?;
-                let kind: String = row.get(2)?;
-                let visibility: String = row.get(3)?;
-                let is_static: bool = row.get(4)?;
-                let kind = match kind.as_str() { "method"|"function" => ResolutionMemberKind::Method, "constructor" => ResolutionMemberKind::Constructor, "nested_type" => ResolutionMemberKind::NestedType, _ => ResolutionMemberKind::Field };
-                let visibility = DeclaredVisibility::from_label(&visibility).ok_or_else(|| invalid_fact(format!("invalid external member visibility {visibility:?}")))?;
-                // External member lookup identities use effective namespaces;
-                // TypeOrValue is a source-site union and cannot form a lookup recipe.
-                let namespaces = [ResolutionNamespace::Callable, ResolutionNamespace::Value, ResolutionNamespace::Constant, ResolutionNamespace::Type, ResolutionNamespace::Type];
-                let languages = [Language::Java,Language::Kotlin,Language::Scala];
-                let lookups = std::array::from_fn(|i| crate::analyzer::resolution::lookup_semantic(&names,languages[i/5],namespaces[i%5],&name));
-                let member = self.context_identities.external_member_semantic(owner, ordinal, &names);
-                Ok(SelectedTypedRow::external_member(owner.clone(), ordinal, LoweredMemberOwnerProperty::external(member, definition, name.as_str(), kind,
-                    if is_static || kind == ResolutionMemberKind::NestedType { ResolutionMemberAccess::Type } else { ResolutionMemberAccess::Instance },
-                    if is_static || kind == ResolutionMemberKind::NestedType { ResolutionMemberQualifierCompatibility::RuntimeOrType } else { ResolutionMemberQualifierCompatibility::RuntimeOnly }, lookups, visibility)))
+                self.decode_external_member_owner(owner, definition, row, &names)
             })
+    }
+
+    pub(super) fn visit_external_member_owners_for_definitions(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberOwnerProperty>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let names = self
+            .selection
+            .shared_name_table()
+            .interner(self.selection.connection());
+        let providers = serde_json::to_string(&self.external_providers)
+            .map_err(|error| StoreError::new(error.to_string()))?;
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return cancelled();
+            }
+            let Some((owner, ordinal)) =
+                self.context_identities.external_member_identity(definition)
+            else {
+                continue;
+            };
+            let owner_definition = self
+                .context_identities
+                .external_owner_semantic(&owner, &names);
+            let Some(intrinsic) =
+                self.intrinsic_member_inventory_for_owner(&owner, cancellation)?
+            else {
+                return cancelled();
+            };
+            if let Some(members) = intrinsic {
+                let member = &members[ordinal as usize];
+                let row = self.external_member_owner_row(
+                    &owner,
+                    owner_definition,
+                    ordinal,
+                    member.name,
+                    "method",
+                    member.visibility,
+                    false,
+                    &names,
+                )?;
+                let keep_going = visitor.visit_page(std::slice::from_ref(&row))?;
+                if cancellation.is_cancelled() {
+                    return cancelled();
+                }
+                if !keep_going {
+                    return Ok(TypedFactReadOutcome::stopped(
+                        ResolutionCompletion::Complete,
+                    ));
+                }
+                continue;
+            }
+            let Some(row) = self.read_statement(cancellation, |conn| {
+                let mut statement = conn.prepare_cached(EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL)?;
+                let mut rows = statement.query(rusqlite::params![
+                    owner.provider_id.as_ref(),
+                    owner.owner_fqn.as_ref(),
+                    ordinal,
+                    providers
+                ])?;
+                rows.next()?
+                    .map(|row| {
+                        self.decode_external_member_owner(&owner, owner_definition, row, &names)
+                    })
+                    .transpose()
+                    .map(Some)
+            })?
+            else {
+                return cancelled();
+            };
+            if cancellation.is_cancelled() {
+                return cancelled();
+            }
+            if let Some(row) = row {
+                debug_assert_eq!(row.row().definition(), definition);
+                let keep_going = visitor.visit_page(std::slice::from_ref(&row))?;
+                if cancellation.is_cancelled() {
+                    return cancelled();
+                }
+                if !keep_going {
+                    return Ok(TypedFactReadOutcome::stopped(
+                        ResolutionCompletion::Complete,
+                    ));
+                }
+            }
+        }
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+        } else {
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        })
+    }
+
+    fn decode_external_member_owner(
+        &self,
+        owner: &ExternalOwnerIdentity,
+        definition: SemanticId,
+        row: &Row<'_>,
+        names: &dyn SharedNameInterner,
+    ) -> StoreResult<SelectedTypedRow<LoweredMemberOwnerProperty>> {
+        let ordinal: u32 = row.get(0)?;
+        let name: String = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let visibility: String = row.get(3)?;
+        let is_static: bool = row.get(4)?;
+        self.external_member_owner_row(
+            owner,
+            definition,
+            ordinal,
+            &name,
+            &kind,
+            &visibility,
+            is_static,
+            names,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn external_member_owner_row(
+        &self,
+        owner: &ExternalOwnerIdentity,
+        definition: SemanticId,
+        ordinal: u32,
+        name: &str,
+        kind: &str,
+        visibility: &str,
+        is_static: bool,
+        names: &dyn SharedNameInterner,
+    ) -> StoreResult<SelectedTypedRow<LoweredMemberOwnerProperty>> {
+        let kind = match kind {
+            "method" | "function" => ResolutionMemberKind::Method,
+            "constructor" => ResolutionMemberKind::Constructor,
+            "nested_type" => ResolutionMemberKind::NestedType,
+            _ => ResolutionMemberKind::Field,
+        };
+        let visibility = DeclaredVisibility::from_label(visibility).ok_or_else(|| {
+            invalid_fact(format!("invalid external member visibility {visibility:?}"))
+        })?;
+        // External member lookup identities use effective namespaces;
+        // TypeOrValue is a source-site union and cannot form a lookup recipe.
+        let namespaces = [
+            ResolutionNamespace::Callable,
+            ResolutionNamespace::Value,
+            ResolutionNamespace::Constant,
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Type,
+        ];
+        let languages = [Language::Java, Language::Kotlin, Language::Scala];
+        let lookups = std::array::from_fn(|i| {
+            crate::analyzer::resolution::lookup_semantic(
+                names,
+                languages[i / 5],
+                namespaces[i % 5],
+                name,
+            )
+        });
+        let member = self
+            .context_identities
+            .external_member_semantic(owner, ordinal, names);
+        Ok(SelectedTypedRow::external_member(
+            owner.clone(),
+            ordinal,
+            LoweredMemberOwnerProperty::external(
+                member,
+                definition,
+                name,
+                kind,
+                if is_static || kind == ResolutionMemberKind::NestedType {
+                    ResolutionMemberAccess::Type
+                } else {
+                    ResolutionMemberAccess::Instance
+                },
+                if is_static || kind == ResolutionMemberKind::NestedType {
+                    ResolutionMemberQualifierCompatibility::RuntimeOrType
+                } else {
+                    ResolutionMemberQualifierCompatibility::RuntimeOnly
+                },
+                lookups,
+                visibility,
+            ),
+        ))
     }
 
     pub(super) fn visit_external_supertypes(

@@ -49,3 +49,6 @@ pub(crate) mod source_context;
 
 mod source_dependencies;
 mod source_projection;
+
+mod knowledge;
+pub use knowledge::CppKnowledge;

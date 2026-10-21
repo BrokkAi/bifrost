@@ -1,0 +1,644 @@
+use crate::searchtools::selectors::*;
+
+use crate::searchtools::*;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+
+use brokk_bifrost_core::analyzer::query_token::QueryScope;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetDefinitionByReferenceParams {
+    pub references: Vec<DefinitionContextReferenceQuery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionContextReferenceQuery {
+    pub symbol: String,
+    pub context: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct DefinitionReferenceSite {
+    pub path: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GetDefinitionByReferenceResult {
+    pub results: Vec<DefinitionByReferenceLookupResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DefinitionByReferenceLookupResult {
+    pub query: DefinitionContextReferenceQuery,
+    pub status: String,
+    #[serde(
+        default = "definition_lookup_complete_default",
+        skip_serializing_if = "definition_lookup_complete"
+    )]
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<DefinitionLookupIncompleteReason>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub definitions: Vec<DefinitionCandidate>,
+    #[serde(default)]
+    pub diagnostics: Vec<DefinitionDiagnostic>,
+}
+
+/// Report whether one definition lookup finished, and why it did not.
+///
+/// The diagnostic vocabulary names the reason whenever a resolver emitted a
+/// kind the public vocabulary knows. The status is the second source, and it is
+/// the authority on refusals: a lookup that reports `unavailable`, `cancelled`
+/// or `exceeded_budget` produced no answer, so it can never be complete, no
+/// matter which diagnostic kind carried the refusal. Without this, a resolver
+/// that refuses with a kind outside the vocabulary reports the contradiction
+/// `status: unavailable` with `complete: true` and no reason, which tells a
+/// consumer the absence was proved.
+pub(crate) fn definition_result_completion(
+    status: &str,
+    diagnostics: &[DefinitionDiagnostic],
+) -> (bool, Option<DefinitionLookupIncompleteReason>) {
+    let incomplete_reason = definition_lookup_incomplete_reason(diagnostics)
+        .or_else(|| definition_status_incomplete_reason(status));
+    (incomplete_reason.is_none(), incomplete_reason)
+}
+
+/// The incomplete reason a lookup status carries on its own.
+///
+/// `no_definition`, `not_found` and `invalid_location` are answers about the
+/// request, so they stay complete. Refusals and partial answers stay incomplete.
+fn definition_status_incomplete_reason(status: &str) -> Option<DefinitionLookupIncompleteReason> {
+    match status {
+        "unavailable" | "incomplete" => {
+            Some(DefinitionLookupIncompleteReason::StructureUnavailable)
+        }
+        "cancelled" => Some(DefinitionLookupIncompleteReason::Cancelled),
+        "exceeded_budget" => Some(DefinitionLookupIncompleteReason::ResolutionBudget),
+        _ => None,
+    }
+}
+
+fn definition_lookup_diagnostics_completion(
+    diagnostics: &[brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupDiagnostic],
+) -> (bool, Option<DefinitionLookupIncompleteReason>) {
+    let incomplete_reason = definition_lookup_incomplete_reason_for_kinds(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind.as_str()),
+    );
+    (incomplete_reason.is_none(), incomplete_reason)
+}
+
+pub fn get_definitions_by_reference(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionByReferenceParams,
+) -> GetDefinitionByReferenceResult {
+    get_definitions_by_reference_with_cancellation(analyzer, params, None)
+}
+
+pub fn get_definitions_by_reference_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionByReferenceParams,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> GetDefinitionByReferenceResult {
+    let scope = cancellation.map_or_else(
+        || AnalyzerQueryScope::new(analyzer),
+        |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+    );
+    let token = scope.token();
+    let _scope = profiling::scope("searchtools::get_definitions_by_reference");
+
+    let mut results = Vec::with_capacity(params.references.len());
+
+    for query in params.references {
+        let mut result = resolve_definition_context_query(analyzer, token, query, cancellation);
+        if let Err(reason) = scope.read_completion() {
+            record_query_read_incomplete(&mut result, reason, cancellation);
+        }
+        results.push(result);
+    }
+
+    GetDefinitionByReferenceResult { results }
+}
+
+fn record_query_read_incomplete(
+    result: &mut DefinitionByReferenceLookupResult,
+    reason: QueryReadIncomplete,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) {
+    let (kind, incomplete_reason, message) = match reason {
+        QueryReadIncomplete::Cancelled
+            if cancellation
+                .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_timed_out) =>
+        {
+            (
+                "definition_time_budget_exceeded",
+                DefinitionLookupIncompleteReason::TimeBudget,
+                "definition lookup exceeded its time budget; results are incomplete".to_string(),
+            )
+        }
+        QueryReadIncomplete::Cancelled => (
+            "cancelled",
+            DefinitionLookupIncompleteReason::Cancelled,
+            "definition lookup was cancelled; results are incomplete".to_string(),
+        ),
+        QueryReadIncomplete::StructureUnavailable(file) => (
+            "cpp_navigation_structure_unavailable",
+            DefinitionLookupIncompleteReason::StructureUnavailable,
+            format!(
+                "indexed syntax was unavailable for {file:?}; definition results are incomplete"
+            ),
+        ),
+        QueryReadIncomplete::SemanticEvidenceUnavailable(detail) => (
+            "analysis_incomplete",
+            DefinitionLookupIncompleteReason::AnalysisFailure,
+            format!("structured semantic evidence was incomplete: {detail}"),
+        ),
+        QueryReadIncomplete::StoreFailure(error) => (
+            "analysis_incomplete",
+            DefinitionLookupIncompleteReason::AnalysisFailure,
+            format!("indexed definition reads failed: {error}"),
+        ),
+    };
+    result.complete = false;
+    result.incomplete_reason = Some(incomplete_reason);
+    if !result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == kind)
+    {
+        result.diagnostics.push(DefinitionDiagnostic {
+            claim: None,
+            kind: kind.to_string(),
+            message,
+        });
+    }
+}
+
+pub(crate) fn resolve_definition_context_query(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    query: DefinitionContextReferenceQuery,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> DefinitionByReferenceLookupResult {
+    let units = match resolve_definition_context_symbol(analyzer, token, &query.symbol) {
+        Ok(units) => units,
+        Err(diagnostics) => {
+            let (complete, incomplete_reason) =
+                definition_result_completion("not_found", &diagnostics);
+            return DefinitionByReferenceLookupResult {
+                query,
+                status: "not_found".to_string(),
+                complete,
+                incomplete_reason,
+                definitions: Vec::new(),
+                diagnostics,
+            };
+        }
+    };
+    if query.context.is_empty() {
+        return invalid_context_lookup(query, "empty_context", "context must not be empty");
+    }
+    if query.target.is_empty() {
+        return invalid_context_lookup(query, "empty_target", "target must not be empty");
+    }
+
+    let mut requests_by_source: Vec<(
+        ProjectFile,
+        Arc<str>,
+        Vec<brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest>,
+    )> = Vec::new();
+    for unit in units {
+        let Some(range) = primary_range(analyzer, &unit) else {
+            continue;
+        };
+        // `range` above is derived from the analyzer's own declaration data,
+        // so the analyzed snapshot (not a fresh disk read) is the source
+        // whose byte offsets it actually corresponds to.
+        let source: Arc<str> = match analyzer.indexed_source(unit.source()) {
+            Some(source) => source.into(),
+            None => {
+                return DefinitionByReferenceLookupResult {
+                    query,
+                    status: "not_found".to_string(),
+                    complete: false,
+                    incomplete_reason: Some(DefinitionLookupIncompleteReason::AnalysisFailure),
+                    definitions: Vec::new(),
+                    diagnostics: vec![DefinitionDiagnostic {
+                        claim: None,
+                        kind: "read_failed".to_string(),
+                        message: "failed to read source file: not indexed by analyzer".to_string(),
+                    }],
+                };
+            }
+        };
+        let Some(symbol_source) = source.get(range.start_byte..range.end_byte) else {
+            continue;
+        };
+        let language = language_for_file(unit.source());
+        for (context_offset, context) in symbol_source.match_indices(&query.context) {
+            for target_offset in reference_target_match_offsets(context, &query.target, language) {
+                let start_byte = range.start_byte + context_offset + target_offset;
+                let request = brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
+                    file: unit.source().clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + query.target.len()),
+                };
+                match requests_by_source
+                    .iter_mut()
+                    .find(|(file, _, _)| file == unit.source())
+                {
+                    Some((_, _, requests)) => requests.push(request),
+                    None => requests_by_source.push((
+                        unit.source().clone(),
+                        Arc::clone(&source),
+                        vec![request],
+                    )),
+                }
+            }
+        }
+    }
+
+    if requests_by_source.is_empty() {
+        return invalid_context_lookup(
+            query,
+            "target_not_found",
+            "target was not found inside any exact context match",
+        );
+    }
+
+    let outcomes = requests_by_source
+        .into_iter()
+        .flat_map(|(file, source, requests)| {
+            brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch_with_source_exact_token_focus(
+                analyzer,
+                requests,
+                file,
+                source,
+                cancellation,
+            )
+        })
+        .collect();
+    collapse_context_outcomes(analyzer, token, query, outcomes)
+}
+
+/// Group a resolved candidate set for the `definitions` (reference) surface the
+/// same way the anchored branch and the other symbol tools do: run
+/// `distinct_definitions` and report `ambiguous_symbol` when more than one
+/// distinct declaration matches. This keeps bare and fully-qualified spellings
+/// symmetric with `get_symbol_sources`/`get_summaries` (#1057). The
+/// `ambiguous_symbol` message format and the `symbol_not_found` shape are those
+/// the MCP property fuzzer's `classify_spelling` already reads; do not change
+/// the diagnostic vocabulary here.
+pub(crate) fn group_definition_context_symbols(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    symbol: &str,
+    units: Vec<CodeUnit>,
+) -> Result<Vec<CodeUnit>, Vec<DefinitionDiagnostic>> {
+    let groups = distinct_definitions(analyzer, token, units);
+    match groups.as_slice() {
+        [(_, _)] => Ok(groups.into_iter().flat_map(|(_, units)| units).collect()),
+        [] => Err(vec![DefinitionDiagnostic {
+            claim: None,
+            kind: "symbol_not_found".to_string(),
+            message: format!("`{symbol}` does not resolve to a workspace symbol"),
+        }]),
+        _ => Err(vec![DefinitionDiagnostic {
+            claim: None,
+            kind: "ambiguous_symbol".to_string(),
+            message: format!(
+                "`{symbol}` is ambiguous; matches: {}",
+                groups
+                    .into_iter()
+                    .map(|(selector, _)| selector)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }]),
+    }
+}
+
+pub(crate) fn resolve_definition_context_symbol(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    symbol: &str,
+) -> Result<Vec<CodeUnit>, Vec<DefinitionDiagnostic>> {
+    if symbol.trim().is_empty() {
+        return Err(vec![DefinitionDiagnostic {
+            claim: None,
+            kind: "empty_symbol".to_string(),
+            message: "symbol must not be empty".to_string(),
+        }]);
+    }
+
+    // For qualified/multi-segment names keep exact-first resolution so canonical
+    // `/`- or `::`-bearing spellings (Go import paths, `fmt::formatter`) are
+    // never misrouted, but route the exact result through the shared grouping
+    // helper: a fully-qualified twin spelling (same FQN in two files) now
+    // reports `ambiguous_symbol` instead of silently returning both twins,
+    // while a unique qualified name still returns Ok. A bare name skips the
+    // exact short-circuit entirely and falls through to the member-aware fuzzy
+    // path, so a top-level namesake can no longer silently win over a same-named
+    // member (#1057), mirroring `exact_codeunit_resolution`.
+    if !is_bare_symbol_query(analyzer, symbol) {
+        let exact = resolve_codeunit_exact(analyzer, symbol);
+        if !exact.is_empty() {
+            return group_definition_context_symbols(analyzer, token, symbol, exact);
+        }
+    }
+
+    let mut anchored_is_dotted_guess = false;
+    let anchored = match split_workspace_definition_selector(analyzer, symbol) {
+        DefinitionSelector::FileAnchored { anchor, lookup } => Some((anchor, lookup)),
+        DefinitionSelector::Name(_) => {
+            match split_path_qualified_definition_selector(analyzer, symbol) {
+                Some(PathQualifiedSelector::Resolved { anchor, lookup }) => Some((anchor, lookup)),
+                Some(PathQualifiedSelector::DottedGuess { anchor, lookup }) => {
+                    // The dotted-file fallback is a guess: only adopt it when
+                    // the anchor actually names the symbol. Otherwise the input
+                    // is a dotted symbol spelling whose first segment collides
+                    // with a file's basename, and the fuzzy stage below must
+                    // see it (#2409).
+                    anchored_is_dotted_guess = true;
+                    Some((anchor, lookup))
+                }
+                Some(PathQualifiedSelector::AmbiguousPath(item)) => {
+                    return Err(vec![DefinitionDiagnostic {
+                        claim: None,
+                        kind: "ambiguous_path".to_string(),
+                        message: format!(
+                            "`{}` is ambiguous; matches: {}",
+                            item.input,
+                            item.matches.join(", ")
+                        ),
+                    }]);
+                }
+                None => None,
+            }
+        }
+    };
+    if let Some((anchor, lookup)) = anchored {
+        let candidates = match anchor_scoped_codeunit_resolution(analyzer, &anchor, lookup) {
+            CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
+            CodeUnitResolution::NotFound => Vec::new(),
+        };
+        let narrowed: Vec<_> = candidates
+            .into_iter()
+            .filter(|unit| rel_path_string(unit.source()) == anchor)
+            .collect();
+        if !(anchored_is_dotted_guess && narrowed.is_empty()) {
+            return group_definition_context_symbols(analyzer, token, symbol, narrowed);
+        }
+    }
+
+    match resolve_codeunit_fuzzy(analyzer, symbol) {
+        CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => {
+            group_definition_context_symbols(analyzer, token, symbol, units)
+        }
+        CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
+            claim: None,
+            kind: "symbol_not_found".to_string(),
+            message: path_like_symbol_guidance(
+                symbol,
+                PathLikeSymbolGuidanceContext::DefinitionByReference,
+            )
+            .unwrap_or_else(|| format!("`{symbol}` does not resolve to a workspace symbol")),
+        }]),
+    }
+}
+
+pub(crate) fn invalid_context_lookup(
+    query: DefinitionContextReferenceQuery,
+    kind: &str,
+    message: &str,
+) -> DefinitionByReferenceLookupResult {
+    let (complete, incomplete_reason) = definition_result_completion(
+        "invalid_location",
+        &[DefinitionDiagnostic {
+            claim: None,
+            kind: kind.to_string(),
+            message: message.to_string(),
+        }],
+    );
+    DefinitionByReferenceLookupResult {
+        query,
+        status: "invalid_location".to_string(),
+        complete,
+        incomplete_reason,
+        definitions: Vec::new(),
+        diagnostics: vec![DefinitionDiagnostic {
+            claim: None,
+            kind: kind.to_string(),
+            message: message.to_string(),
+        }],
+    }
+}
+
+pub(crate) fn collapse_context_outcomes(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    query: DefinitionContextReferenceQuery,
+    outcomes: Vec<
+        brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    >,
+) -> DefinitionByReferenceLookupResult {
+    let Some(first) = outcomes.first() else {
+        return invalid_context_lookup(query, "target_not_found", "no target candidates found");
+    };
+    let incomplete_reason = outcomes
+        .iter()
+        .find_map(|outcome| definition_lookup_diagnostics_completion(&outcome.diagnostics).1);
+    let mut render_cache = DefinitionCandidateRenderCache::default();
+    let first_key = semantic_outcome_key(analyzer, token, first, &mut render_cache);
+    if outcomes.iter().skip(1).all(|outcome| {
+        semantic_outcome_key(analyzer, token, outcome, &mut render_cache) == first_key
+    }) {
+        let mut result = render_definition_reference_lookup(
+            analyzer,
+            token,
+            query,
+            first.clone(),
+            &mut render_cache,
+        );
+        if result.incomplete_reason.is_none() {
+            result.incomplete_reason = incomplete_reason;
+        }
+        for outcome in outcomes.iter().skip(1) {
+            for diagnostic in &outcome.diagnostics {
+                if definition_lookup_incomplete_reason_for_kind(&diagnostic.kind).is_some()
+                    && !result
+                        .diagnostics
+                        .iter()
+                        .any(|existing| existing.kind == diagnostic.kind)
+                {
+                    result.diagnostics.push(definition_by_reference_diagnostic(
+                        &result.query,
+                        diagnostic.clone(),
+                    ));
+                }
+            }
+        }
+        result.complete &= result.incomplete_reason.is_none();
+        return result;
+    }
+
+    let mut diagnostics = vec![DefinitionDiagnostic {
+        claim: None,
+        kind: "ambiguous_reference_target".to_string(),
+        message:
+            "target appears multiple times in context and resolves to different semantic outcomes"
+                .to_string(),
+    }];
+    for outcome in &outcomes {
+        for diagnostic in &outcome.diagnostics {
+            if definition_lookup_incomplete_reason_for_kind(&diagnostic.kind).is_some() {
+                let rendered = definition_by_reference_diagnostic(&query, diagnostic.clone());
+                if !diagnostics
+                    .iter()
+                    .any(|existing| existing.kind == rendered.kind)
+                {
+                    diagnostics.push(rendered);
+                }
+            }
+        }
+    }
+    DefinitionByReferenceLookupResult {
+        query,
+        status: "ambiguous".to_string(),
+        complete: incomplete_reason.is_none(),
+        incomplete_reason,
+        definitions: Vec::new(),
+        diagnostics,
+    }
+}
+
+pub(crate) fn render_definition_reference_lookup(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    query: DefinitionContextReferenceQuery,
+    outcome: brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    render_cache: &mut DefinitionCandidateRenderCache,
+) -> DefinitionByReferenceLookupResult {
+    let terminal_incomplete = matches!(
+        outcome.status,
+        brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Incomplete
+            | brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Cancelled
+            | brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::ExceededBudget(_)
+    );
+    let incomplete_reason = definition_lookup_diagnostics_completion(&outcome.diagnostics).1;
+    if outcome.lexical_definition.is_some() && !terminal_incomplete {
+        return DefinitionByReferenceLookupResult {
+            query,
+            status: "no_definition".to_string(),
+            complete: incomplete_reason.is_none() && !terminal_incomplete,
+            incomplete_reason,
+            definitions: Vec::new(),
+            diagnostics: vec![DefinitionDiagnostic {
+            claim: None,
+                kind: "local_binding_requires_location".to_string(),
+                message: "the target resolves to a lexical binding; use get_definitions_by_location with its source position"
+                    .to_string(),
+            }],
+        };
+    }
+    let mut diagnostics: Vec<_> = outcome
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| definition_by_reference_diagnostic(&query, diagnostic))
+        .collect();
+    let candidate_count = outcome.definitions.len();
+    let definitions =
+        definition_candidates_with_cache(analyzer, token, &outcome.definitions, render_cache);
+    if definitions.len() < candidate_count {
+        diagnostics.push(DefinitionDiagnostic {
+            claim: None,
+            kind: "source_unavailable".to_string(),
+            message: format!(
+                "not all indexed definition candidates could be rendered: {:?}",
+                outcome.definitions
+            ),
+        });
+    }
+    diagnostics.extend(unclosed_construct_diagnostic(&definitions));
+    let (mut complete, incomplete_reason) =
+        definition_result_completion(outcome.status.as_str(), &diagnostics);
+    if terminal_incomplete {
+        complete = false;
+    }
+    DefinitionByReferenceLookupResult {
+        query,
+        status: outcome.status.as_str().to_string(),
+        complete,
+        incomplete_reason,
+        definitions,
+        diagnostics,
+    }
+}
+
+pub(crate) fn definition_by_reference_diagnostic(
+    query: &DefinitionContextReferenceQuery,
+    diagnostic: brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupDiagnostic,
+) -> DefinitionDiagnostic {
+    let message = match diagnostic.kind.as_str() {
+        "invalid_location"
+            if diagnostic.message
+                == "byte range must identify a single reference token; use start_byte inside the token for qualified expressions" =>
+        {
+            "target must identify a single reference token; for qualified expressions, set target to the member or name token inside the expression rather than the whole qualified expression"
+                .to_string()
+        }
+        "invalid_location" if diagnostic.message == "provide either start_byte or line/column" => {
+            "provide a positive line and, when needed, a positive character column".to_string()
+        }
+        SCALA_UNSUPPORTED_CALL_TARGET_SHAPE => {
+            format!(
+                "{}. The reference tool cannot follow this Scala call target shape yet. Try search_symbols for the callable/member name or owner/member selector when known, then use get_symbol_sources on the owner or resolved member symbol.",
+                diagnostic.message
+            )
+        }
+        SCALA_UNSUPPORTED_RECEIVER => {
+            let target = query.target.trim();
+            format!(
+                "{}. The reference tool cannot follow this Scala receiver/member shape yet. Try search_symbols for `{target}` or an owner/member selector when known, then use get_symbol_sources on the owner or resolved member symbol.",
+                diagnostic.message
+            )
+        }
+        _ => external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
+    };
+    DefinitionDiagnostic {
+        claim: diagnostic.claim,
+        kind: diagnostic.kind,
+        message,
+    }
+}
+
+pub(crate) fn semantic_outcome_key(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    outcome: &brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    render_cache: &mut DefinitionCandidateRenderCache,
+) -> DefinitionOutcomeKey {
+    let definition = outcome
+        .definitions
+        .iter()
+        .filter_map(|unit| definition_candidate_with_cache(analyzer, token, unit, render_cache))
+        .map(|candidate| definition_candidate_key(&candidate))
+        .collect();
+    let incomplete_reason = outcome
+        .diagnostics
+        .iter()
+        .find_map(|diagnostic| definition_lookup_incomplete_reason_for_kind(&diagnostic.kind));
+    (
+        outcome.status.as_str().to_string(),
+        definition,
+        incomplete_reason,
+    )
+}

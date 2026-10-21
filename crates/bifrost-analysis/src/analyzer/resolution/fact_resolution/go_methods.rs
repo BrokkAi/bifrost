@@ -96,7 +96,8 @@ impl FactEvaluation<'_, '_> {
     /// A known method receiver admits a value receiver, or a pointer receiver
     /// through a pointer value or an addressable operand. Without those facts,
     /// preserve the declaration's applicability marker on the target binding.
-    pub(crate) fn go_receiver_binding_completion(
+    #[doc(hidden)]
+    pub fn go_receiver_binding_completion(
         &mut self,
         candidate: SemanticId,
         call: &LoweredCallApplicabilityObligation,
@@ -267,28 +268,19 @@ impl FactEvaluation<'_, '_> {
 
     /// A Go interface method declaration is a statically selected name, but
     /// invoking it can dispatch to implementations that are not in this
-    /// binding. Preserve that open receiver boundary on the call answer.
+    /// binding. Preserve that boundary only on the implementation family;
+    /// it cannot change which interface declaration the source name denotes.
     pub(super) fn retain_go_interface_dispatch_boundary(
         &mut self,
         answer: ResolutionAnswer,
         obligation: &LoweredCallApplicabilityObligation,
         states: &StateMap,
     ) -> StoreResult<Option<ResolutionAnswer>> {
-        if !self.session.lexical_source.supports_go_universe() || answer.targets().len() != 1 {
-            return Ok(Some(answer));
+        if obligation.callee_reference() == self.root {
+            // Recompute the selected root's family evidence on each refinement.
+            self.call_target_boundary = ResolutionCompletion::Complete;
         }
-        if self
-            .session
-            .go_receiver_slot_type_overlay
-            .as_ref()
-            .is_some_and(|overlay| {
-                overlay.query_binding == (obligation.callee_reference(), answer.targets()[0])
-            })
-        {
-            // This point site's keyed receiver chain names the exact interface
-            // declaration that the shared lookup selected. Dynamic
-            // implementations cannot change which declaration the name at this
-            // source site denotes.
+        if !self.session.lexical_source.supports_go_universe() || answer.targets().len() != 1 {
             return Ok(Some(answer));
         }
         let Some(receiver_slot) = obligation.receiver_slot() else {
@@ -325,8 +317,10 @@ impl FactEvaluation<'_, '_> {
                 CanonicalIdentityPart::identity(owner),
             ],
         )?;
-        let completion = answer.completion().combine(&incomplete(reason));
-        Ok(Some(answer_with_completion(answer, completion)))
+        if obligation.callee_reference() == self.root {
+            self.call_target_boundary = incomplete(reason);
+        }
+        Ok(Some(answer))
     }
 }
 
@@ -703,7 +697,7 @@ impl FactEvaluation<'_, '_> {
                         continue;
                     }
                 };
-                if crate::analyzer::languages::language_support(Language::Go)
+                if crate::analyzer::languages::language_knowledge(Language::Go)
                     .is_some_and(|support| support.call_may_apply_value())
                     && path.fields.is_empty()
                     && matches!(receiver, ResolutionSlotValue::Runtime { .. })
@@ -1022,7 +1016,8 @@ impl FactEvaluation<'_, '_> {
 
 /// Satisfaction is query evidence, never a persisted concrete/interface pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GoMethodSatisfaction {
+#[doc(hidden)]
+pub enum GoMethodSatisfaction {
     Satisfies,
     DoesNotSatisfy,
     Inconclusive(&'static str),

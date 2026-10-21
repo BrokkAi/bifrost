@@ -9,9 +9,7 @@ use super::*;
 
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::usages::effects::EffectCoverage;
-use brokk_bifrost_analysis::analyzer::{
-    CppInitializerCandidate, CppInitializerSyntaxVerdict, cpp_initializer_candidates,
-};
+
 use brokk_bifrost_flow::flow_state::{FlowStateAxis, FlowSubject, StateEventClass, StateEventRow};
 
 const INITIALIZER_RELATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.self_initializer.v1";
@@ -256,3 +254,7 @@ fn relation_row(
 fn contains_range(container: &Range, value: &Range) -> bool {
     container.start_byte <= value.start_byte && value.end_byte <= container.end_byte
 }
+
+use brokk_bifrost_cpp_analysis::analyzer::CppInitializerCandidate;
+use brokk_bifrost_cpp_analysis::analyzer::CppInitializerSyntaxVerdict;
+use brokk_bifrost_cpp_analysis::analyzer::cpp_initializer_candidates;

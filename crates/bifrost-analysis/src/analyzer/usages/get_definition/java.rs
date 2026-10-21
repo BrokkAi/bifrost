@@ -1,6 +1,8 @@
-pub(super) mod lambda;
+pub mod lambda;
 
 use super::*;
+use crate::analyzer::JavaAnalyzer;
+
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::languages::{ExternalCalleeSite, ImportedExternalCallee};
@@ -956,6 +958,43 @@ fn resolve_java_type_reference(
     );
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
+    }
+    // Share the intrinsic provider with native resolution after source tiers.
+    // The selected operation still checks stronger unindexed import providers.
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::analyzer::resolution::universe_lookup(
+        Language::Java,
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+        normalized,
+    )
+    .is_some()
+    {
+        let prepared = java.inner().prepared_syntax(token, file);
+        let site = ResolvedReferenceSite {
+            path: file.to_string(),
+            text: normalized.to_owned(),
+            range: node_range(node),
+            focus_start_byte: node.start_byte(),
+            focus_end_byte: node.end_byte(),
+        };
+        if let BoundedResolution::Complete { value, .. } =
+            crate::analyzer::java::native_points::resolve_java_definition_bounded(
+                crate::analyzer::languages::BoundedReceiverQuery {
+                    analyzer,
+                    file,
+                    source,
+                    tree: prepared.as_ref().map(|syntax| syntax.tree()),
+                    site: &site,
+                    budget:
+                        crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(
+                        ),
+                    cancellation: None,
+                },
+                || {},
+            )
+        {
+            return value;
+        }
     }
     // `java_import_boundary_for_type` fuses the unresolved-import signal with the
     // workspace-type check; its negation is the workspace-internal gate.
@@ -6594,6 +6633,116 @@ fn java_workspace_fqn_exists(support: &dyn BoundedDefinitionLookup, fqn: &str) -
 
 fn java_workspace_package_exists(support: &dyn BoundedDefinitionLookup, package: &str) -> bool {
     support.package_exists(package) || support.fqn_prefix_exists(package)
+}
+
+use super::call_sites::enclosing_call_reference_candidate;
+
+pub(crate) fn java_call_reference_candidate(node: Node<'_>) -> bool {
+    enclosing_call_reference_candidate(
+        node,
+        |parent, current| {
+            (parent.kind() == "method_invocation"
+                && parent.child_by_field_name("name") == Some(current))
+                || (parent.kind() == "object_creation_expression"
+                    && parent.child_by_field_name("type") == Some(current))
+        },
+        |parent| matches!(parent.kind(), "scoped_type_identifier" | "generic_type"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_definition_dispatch<'a>(
+    analyzer: &'a dyn crate::analyzer::IAnalyzer,
+    _token: crate::analyzer::QueryToken<'_>,
+    context: &mut crate::analyzer::usages::get_definition::DefinitionBatchContext<'a, '_>,
+    request: &crate::analyzer::usages::get_definition::DefinitionLookupRequest,
+    source: &std::sync::Arc<str>,
+    tree: &Option<tree_sitter::Tree>,
+    site: &crate::analyzer::usages::get_definition::ResolvedReferenceSite,
+    _operation: Option<crate::navigation::NavigationOperation>,
+    cancellation: Option<&crate::cancellation::CancellationToken>,
+    _go_session: Option<&crate::analyzer::usages::get_definition::ResolutionSession>,
+) -> std::ops::ControlFlow<
+    crate::analyzer::usages::get_definition::DefinitionResolution,
+    crate::analyzer::usages::get_definition::DefinitionResolution,
+> {
+    let evidence;
+    let outcome = {
+        if let Some(resolver) =
+            language_support(Language::Java).and_then(|support| support.structural_receiver())
+        {
+            let query = crate::analyzer::languages::BoundedReceiverQuery {
+                analyzer,
+                file: &request.file,
+                source,
+                tree: tree.as_ref(),
+                site,
+                budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                cancellation,
+            };
+            return std::ops::ControlFlow::Break(
+                match resolver.resolve_definition_with_call_evidence_bounded(query) {
+                    BoundedResolution::Complete {
+                        value: (outcome, evidence),
+                        ..
+                    } => DefinitionResolution { outcome, evidence },
+                    BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
+                        limit,
+                        format!(
+                            "Java definition resolution exceeded its {} budget",
+                            limit.as_str()
+                        ),
+                    )
+                    .into(),
+                    BoundedResolution::Cancelled { .. } => {
+                        cancelled("Java definition resolution was cancelled").into()
+                    }
+                },
+            );
+        }
+
+        let resolution = java::resolve_java(
+            analyzer,
+            context.bounded_support(),
+            &request.file,
+            source,
+            tree.as_ref(),
+            site,
+        );
+        evidence = resolution.evidence;
+        resolution.outcome
+    };
+    std::ops::ControlFlow::Continue(DefinitionResolution { outcome, evidence })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn trial_definition(
+    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+) -> Option<DefinitionResolution> {
+    std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA")?;
+    let language = Language::Java;
+    Some(
+        match crate::analyzer::java::native_points::resolve_java_definition_with_evidence_bounded(
+            query,
+            || {},
+        ) {
+            BoundedResolution::Complete { value, .. } => DefinitionResolution {
+                outcome: value.outcome,
+                evidence: value.evidence,
+            },
+            BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
+                limit,
+                format!(
+                    "{language:?} definition resolution exceeded its {} budget",
+                    limit.as_str()
+                ),
+            )
+            .into(),
+            BoundedResolution::Cancelled { .. } => {
+                cancelled(format!("{language:?} definition resolution was cancelled")).into()
+            }
+        },
+    )
 }
 
 #[cfg(test)]

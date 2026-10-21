@@ -363,19 +363,33 @@ test("publisher dependency order and protected identities remain explicit", () =
   ]) {
     assert.equal(analysisDependencies.has(dependency), true, `analysis crate must wait for ${dependency}`);
   }
-  assert.match(
-    jobBlock(release, "publish-crate-flow"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-analysis\]$/mu,
-  );
-  for (const sibling of ["rql", "semantic-packs"]) {
+  const implementations = [
+    { name: "rust-analysis", consumers: ["tools", "rql", "semantic-packs", "policy"] },
+    { name: "go-analysis", consumers: ["tools", "rql", "semantic-packs"] },
+    { name: "csharp-analysis", consumers: ["tools", "semantic-packs", "rql"] },
+    { name: "php-analysis", consumers: ["tools", "rql", "semantic-packs"] },
+    { name: "cpp-analysis", consumers: ["tools", "rql"] },
+    { name: "python-analysis", consumers: ["tools", "semantic-packs", "rql"] },
+    { name: "js-ts-analysis", consumers: ["tools", "semantic-packs", "rql"] },
+    { name: "ruby-analysis", consumers: ["tools", "semantic-packs", "rql"] },
+  ];
+  for (const sibling of ["flow", ...implementations.map(({ name }) => name)]) {
     assert.match(
       jobBlock(release, `publish-crate-${sibling}`),
-      /^    needs: \[release-context, promote-qualification, publish-crate-flow\]$/mu,
+      /^    needs: \[release-context, promote-qualification, publish-crate-analysis\]$/mu,
     );
+  }
+  for (const [consumer, base] of [["tools", []], ["semantic-packs", ["publish-crate-flow", "publish-crate-tools"]], ["rql", ["publish-crate-flow", "publish-crate-tools"]]]) {
+    const expected = ["release-context", "promote-qualification", ...base,
+      ...implementations.filter(({ consumers }) => consumers.includes(consumer))
+        .map(({ name }) => `publish-crate-${name}`)];
+    const needs = jobBlock(release, `publish-crate-${consumer}`).match(/^    needs: \[([^\]]*)\]$/mu);
+    assert.ok(needs, `${consumer} must declare its publication dependencies`);
+    assert.deepEqual(needs[1].split(",").map((name) => name.trim()).sort(), expected.sort());
   }
   assert.match(
     jobBlock(release, "publish-crate-policy"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs, publish-crate-tools, publish-crate-rust-analysis\]$/mu,
   );
   assert.match(
     jobBlock(release, "publish-crate-runtime"),
@@ -383,7 +397,7 @@ test("publisher dependency order and protected identities remain explicit", () =
   );
   assert.match(
     jobBlock(release, "publish-crate-mcp"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-runtime\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-runtime, publish-crate-tools\]$/mu,
   );
   assert.doesNotMatch(
     release,
@@ -392,7 +406,7 @@ test("publisher dependency order and protected identities remain explicit", () =
   );
   assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-mcp\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis\]$/mu,
   );
   assert.match(cratePublisher, /^      id-token:\s*write$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);
@@ -611,6 +625,28 @@ readinessTest("release readiness is read-only and contains no publishing boundar
   }
 });
 
+readinessTest("x86 macOS wheels cross-compile on Apple silicon and smoke the x86_64 artifact", () => {
+  assert.doesNotMatch(readiness, /macos-15-intel/u);
+  for (const jobName of ["python-wheels", "uv-wheels"]) {
+    const job = jobBlock(readiness, jobName);
+    assert.match(
+      job,
+      /- target: x86_64-apple-darwin\n            runner: macos-latest\n            kind: macos\n            python_architecture: x64\n/u,
+      `${jobName} must build x86_64-apple-darwin on arm64 and smoke it with an x64 Python`,
+    );
+    const setup = stepBlocks(job).find((step) => step.includes("actions/setup-python@"));
+    assert.match(setup, /architecture: \$\{\{ matrix\.python_architecture \}\}/u);
+  }
+  const uv = jobBlock(readiness, "uv-wheels");
+  const steps = stepBlocks(uv);
+  const archCheck = steps.findIndex((step) => step.startsWith("      - name: Verify packaged macOS CLI architecture"));
+  assert.ok(archCheck > 0, "uv-wheels must check the packaged macOS binary architecture");
+  assert.match(steps[archCheck], /lipo -archs/u);
+  assert.ok(archCheck < steps.findIndex((step) => step.startsWith("      - name: Upload exact uv CLI wheel")));
+  assert.match(uv, /target: x86_64-apple-darwin[\s\S]{0,200}?macho_arch: x86_64\n/u);
+  assert.match(uv, /target: aarch64-apple-darwin[\s\S]{0,120}?macho_arch: arm64\n/u);
+});
+
 readinessTest("release readiness starts every binary and wheel target without an artificial matrix queue", () => {
   const caps = [...readiness.matchAll(/^\s+max-parallel:\s*(\d+)\s*$/gmu)].map((match) => Number(match[1]));
   assert.deepEqual(caps, [5, 5, 5]);
@@ -690,9 +726,19 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.match(offlinePackAcceptance, /BIFROST_OPEN_POLICY_PACK_ROOT/u);
   assert.match(offlinePackAcceptance, /BIFROST_SEMANTIC_PACK_CACHE_ROOT/u);
   assert.match(offlinePackAcceptance, /open-packs-receipt\.json/u);
-  assert.match(offlinePackAcceptance, /if \[\[ \$# -ne 5 \]\]/u);
-  assert.match(offlinePackAcceptance, /BIFROST_LAUNCHER_CACHE_DIR="\$launcher_cache"/u);
-  assert.match(offlinePackAcceptance, /"\$bifrost" --root/u);
+  // The acceptance step passes the roots and receipt that the staged binary's
+  // prepare-open-packs selected; the script must take exactly that many
+  // arguments, or the step fails at its usage check. Commit 0dc456c380
+  // changed only the workflow side, and nothing noticed because the step
+  // was skipped for v0.13.x.
+  const acceptanceStep = stepBlocks(policySmoke).find((step) =>
+    step.includes("accept-offline-semantic-pack-install.sh"));
+  assert.ok(acceptanceStep, "expected the offline policy acceptance step");
+  const passed = acceptanceStep.slice(acceptanceStep.indexOf("accept-offline-semantic-pack-install.sh"))
+    .split("\n").slice(1).filter((line) => /^\s+"\$/u.test(line)).length;
+  const declared = Number(offlinePackAcceptance.match(/if \[\[ \$# -ne (\d+) \]\]/u)?.[1]);
+  assert.equal(passed, declared, "readiness passes the acceptance script the arguments it declares");
+  assert.match(offlinePackAcceptance, /\[\[ -f "\$bundle\/index\.json" \]\]/u);
   assert.match(offlinePackAcceptance, /mounted_java_home=/u);
   assert.match(offlinePackAcceptance, /missing-JAVA_HOME acceptance unexpectedly selected/u);
   assert.match(offlinePackAcceptance, /\[\[ "\$label" == "missing" \|\| "\$label" == "positive" \]\]/u);

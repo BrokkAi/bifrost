@@ -574,15 +574,34 @@ pub(crate) fn rust_imports_with_visibility_from_use_declaration_with_sources<'tr
     node: Node<'tree>,
     source: &str,
 ) -> Vec<RustImportProjectionLeaf<'tree>> {
+    rust_imports_with_visibility_from_use_declaration_bounded(node, source, |_| {
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .expect("infallible legacy use projection")
+}
+
+/// The existing use-tree projection, with interruption before traversal or
+/// retention. No partial leaf list escapes a stopped caller.
+pub(crate) fn rust_imports_with_visibility_from_use_declaration_bounded<'tree, F, E>(
+    node: Node<'tree>,
+    source: &str,
+    mut charge: F,
+) -> Result<Vec<RustImportProjectionLeaf<'tree>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(1)?;
     if node.kind() != "use_declaration" {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(argument) = node.child_by_field_name("argument") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let lexical_scope_nodes = rust_import_lexical_scope_nodes(node);
+    let lexical_scope_nodes = rust_import_lexical_scope_nodes_bounded(node, &mut charge)?;
+    let visibility = rust_item_visibility_bounded(node, source, &mut charge)?;
+    charge(lexical_scope_nodes.len())?;
     let declaration = RustUseDeclaration {
-        visibility: rust_item_visibility(node, source),
+        visibility,
         lexical_scopes: lexical_scope_nodes
             .iter()
             .map(|scope| StructuredImportScope {
@@ -594,56 +613,80 @@ pub(crate) fn rust_imports_with_visibility_from_use_declaration_with_sources<'tr
         declaration_start_byte: node.start_byte(),
     };
     let mut imports = Vec::new();
-    collect_rust_use_tree(argument, source, &declaration, &mut imports);
-    imports
+    // Check late cancellation after owner setup, before use-tree scheduling.
+    charge(0)?;
+    collect_rust_use_tree_bounded(argument, source, &declaration, &mut imports, &mut charge)?;
+    charge(0)?;
+    Ok(imports)
 }
 
-pub(crate) fn rust_import_lexical_scope_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+fn rust_import_lexical_scope_nodes_bounded<'tree, F, E>(
+    node: Node<'tree>,
+    charge: &mut F,
+) -> Result<Vec<Node<'tree>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
     let mut scopes = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
+        charge(1)?;
         if matches!(parent.kind(), "declaration_list" | "block") {
             scopes.push(parent);
         }
         current = parent.parent();
     }
+    charge(scopes.len())?;
     scopes.reverse();
-    scopes
+    Ok(scopes)
 }
 
-fn collect_rust_use_tree<'tree>(
+fn collect_rust_use_tree_bounded<'tree, F, E>(
     node: Node<'tree>,
     source: &str,
     declaration: &RustUseDeclaration<'tree>,
     out: &mut Vec<RustImportProjectionLeaf<'tree>>,
-) {
+    charge: &mut F,
+) -> Result<(), E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(1)?;
     let mut pending = vec![(node, Vec::<RustUsePathSegment<'tree>>::new(), false)];
     while let Some((node, prefix, leading_absolute)) = pending.pop() {
+        charge(1)?;
         match node.kind() {
             "scoped_use_list" => {
                 let mut scoped_prefix = prefix;
                 let mut scoped_absolute = leading_absolute;
                 if let Some(path) = node.child_by_field_name("path") {
-                    let path_is_absolute = rust_use_path_is_absolute(path);
+                    let path_is_absolute = rust_use_path_is_absolute_bounded(path, charge)?;
                     if path_is_absolute {
                         scoped_prefix.clear();
                     }
-                    scoped_prefix.extend(rust_use_path_segments_with_spans(path, source));
+                    extend_use_path_bounded(&mut scoped_prefix, path, source, charge)?;
                     scoped_absolute |= path_is_absolute;
                 }
                 if let Some(list) = node.child_by_field_name("list") {
+                    charge(1)?;
                     pending.push((list, scoped_prefix, scoped_absolute));
                 }
             }
             "use_list" => {
                 let mut cursor = node.walk();
-                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-                pending.extend(
-                    children
-                        .into_iter()
-                        .rev()
-                        .map(|child| (child, prefix.clone(), leading_absolute)),
-                );
+                let mut children = Vec::new();
+                for child in node.named_children(&mut cursor) {
+                    charge(1)?;
+                    children.push(child);
+                }
+                for child in children.into_iter().rev() {
+                    charge(1)?;
+                    for segment in &prefix {
+                        charge(1)?;
+                        charge(segment.name.len())?;
+                    }
+                    pending.push((child, prefix.clone(), leading_absolute));
+                }
             }
             "use_as_clause" => {
                 let Some(path_node) = node.child_by_field_name("path") else {
@@ -652,11 +695,16 @@ fn collect_rust_use_tree<'tree>(
                 let Some(alias_node) = node.child_by_field_name("alias") else {
                     continue;
                 };
+                charge(
+                    alias_node
+                        .end_byte()
+                        .saturating_sub(alias_node.start_byte()),
+                )?;
                 let alias = rust_node_text(alias_node, source).trim();
                 if alias.is_empty() {
                     continue;
                 }
-                let path_is_absolute = rust_use_path_is_absolute(path_node);
+                let path_is_absolute = rust_use_path_is_absolute_bounded(path_node, charge)?;
                 let mut path = if path_is_absolute { Vec::new() } else { prefix };
                 // In a grouped import, `self` denotes the entity named by the
                 // prefix rather than a literal trailing path component:
@@ -664,7 +712,10 @@ fn collect_rust_use_tree<'tree>(
                 // `crate::service`, not to `crate::service::self`.
                 let module_self = path_node.kind() == "self" && !path.is_empty();
                 if !module_self {
-                    path.extend(rust_use_path_segments_with_spans(path_node, source));
+                    extend_use_path_bounded(&mut path, path_node, source, charge)?;
+                }
+                if let Some(segment) = path.last() {
+                    charge(segment.name.len())?;
                 }
                 let Some(identifier) = path.last().map(|segment| segment.name.clone()) else {
                     continue;
@@ -674,27 +725,36 @@ fn collect_rust_use_tree<'tree>(
                 } else {
                     path.last().map(|segment| segment.node)
                 };
-                out.push(declaration.leaf(
+                charge(1)?;
+                out.push(declaration.leaf_bounded(
                     path,
                     false,
                     Some(identifier),
-                    Some(alias.to_string()),
+                    Some({
+                        charge(alias.len())?;
+                        alias.to_string()
+                    }),
                     Some(node_span(alias_node)),
                     target_node,
                     Some(alias_node),
                     leading_absolute || path_is_absolute,
                     module_self,
-                ));
+                    charge,
+                )?);
             }
             "use_wildcard" => {
                 let path_node = first_named_child(node);
-                let path_is_absolute = path_node.is_some_and(rust_use_path_is_absolute);
+                let path_is_absolute = match path_node {
+                    Some(path) => rust_use_path_is_absolute_bounded(path, charge)?,
+                    None => false,
+                };
                 let mut path = if path_is_absolute { Vec::new() } else { prefix };
                 if let Some(path_node) = path_node {
-                    path.extend(rust_use_path_segments_with_spans(path_node, source));
+                    extend_use_path_bounded(&mut path, path_node, source, charge)?;
                 }
                 if !path.is_empty() {
-                    out.push(declaration.leaf(
+                    charge(1)?;
+                    out.push(declaration.leaf_bounded(
                         path,
                         true,
                         None,
@@ -704,16 +764,20 @@ fn collect_rust_use_tree<'tree>(
                         None,
                         leading_absolute || path_is_absolute,
                         false,
-                    ));
+                        charge,
+                    )?);
                 }
             }
             "crate" | "identifier" | "metavariable" | "scoped_identifier" | "self" | "super" => {
-                let path_is_absolute = rust_use_path_is_absolute(node);
+                let path_is_absolute = rust_use_path_is_absolute_bounded(node, charge)?;
                 let mut path = if path_is_absolute { Vec::new() } else { prefix };
                 let prefix_was_empty = path.is_empty();
                 let module_self = node.kind() == "self" && !prefix_was_empty;
                 if !module_self {
-                    path.extend(rust_use_path_segments_with_spans(node, source));
+                    extend_use_path_bounded(&mut path, node, source, charge)?;
+                }
+                if let Some(segment) = path.last() {
+                    charge(segment.name.len())?;
                 }
                 let Some(identifier) = path.last().map(|segment| segment.name.clone()) else {
                     continue;
@@ -724,7 +788,8 @@ fn collect_rust_use_tree<'tree>(
                 } else {
                     path.last().map(|segment| segment.node)
                 };
-                out.push(declaration.leaf(
+                charge(1)?;
+                out.push(declaration.leaf_bounded(
                     path,
                     false,
                     Some(identifier),
@@ -734,11 +799,13 @@ fn collect_rust_use_tree<'tree>(
                     None,
                     leading_absolute || path_is_absolute,
                     module_self,
-                ));
+                    charge,
+                )?);
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -759,21 +826,57 @@ fn rust_use_path_segments_with_spans<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Vec<RustUsePathSegment<'tree>> {
+    rust_use_path_segments_with_spans_bounded(node, source, &mut |_| {
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .expect("infallible legacy use path walk")
+}
+
+fn extend_use_path_bounded<'tree, F, E>(
+    path: &mut Vec<RustUsePathSegment<'tree>>,
+    node: Node<'tree>,
+    source: &str,
+    charge: &mut F,
+) -> Result<(), E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let segments = rust_use_path_segments_with_spans_bounded(node, source, charge)?;
+    charge(segments.len())?;
+    path.extend(segments);
+    Ok(())
+}
+
+fn rust_use_path_segments_with_spans_bounded<'tree, F, E>(
+    node: Node<'tree>,
+    source: &str,
+    charge: &mut F,
+) -> Result<Vec<RustUsePathSegment<'tree>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
     let mut segments = Vec::new();
+    charge(1)?;
     let mut pending = vec![node];
     while let Some(node) = pending.pop() {
+        charge(1)?;
         match node.kind() {
             "scoped_identifier" | "scoped_type_identifier" => {
                 if let Some(name) = node.child_by_field_name("name") {
+                    charge(1)?;
                     pending.push(name);
                 }
                 if let Some(path) = node.child_by_field_name("path") {
+                    charge(1)?;
                     pending.push(path);
                 }
             }
             "crate" | "identifier" | "type_identifier" | "metavariable" | "self" | "super" => {
+                charge(node.end_byte().saturating_sub(node.start_byte()))?;
                 let segment = rust_node_text(node, source).trim();
                 if !segment.is_empty() {
+                    charge(1)?;
+                    charge(segment.len())?;
                     segments.push(RustUsePathSegment {
                         name: segment.to_string(),
                         span: node_span(node),
@@ -784,61 +887,102 @@ fn rust_use_path_segments_with_spans<'tree>(
             _ => {}
         }
     }
-    segments
+    Ok(segments)
 }
 
 /// Whether a structured Rust use path starts with the grammar's root `::`
 /// anchor. A scoped identifier with no `path` field is exactly the tree-sitter
 /// representation of `::name`; walking its `path` fields reaches that root
 /// without inspecting source text.
-fn rust_use_path_is_absolute(mut node: Node<'_>) -> bool {
-    while node.kind() == "scoped_identifier" {
+fn rust_use_path_is_absolute_bounded<F, E>(mut node: Node<'_>, charge: &mut F) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    loop {
+        charge(1)?;
+        if node.kind() != "scoped_identifier" {
+            return Ok(false);
+        }
         let Some(path) = node.child_by_field_name("path") else {
-            return true;
+            return Ok(true);
         };
         node = path;
     }
-    false
 }
 
 pub fn rust_item_visibility(node: Node<'_>, source: &str) -> RustVisibility {
-    // Trait members and enum variant fields are accessible through their
-    // owner. Access to that owner is checked independently through its route.
+    rust_item_visibility_bounded(node, source, &mut |_| Ok::<_, std::convert::Infallible>(()))
+        .expect("infallible legacy visibility projection")
+}
+
+fn rust_item_visibility_bounded<F, E>(
+    node: Node<'_>,
+    source: &str,
+    charge: &mut F,
+) -> Result<RustVisibility, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(2)?;
     if node
         .parent()
         .and_then(|body| body.parent())
         .is_some_and(|owner| matches!(owner.kind(), "trait_item" | "enum_variant"))
     {
-        return RustVisibility::Public;
+        return Ok(RustVisibility::Public);
     }
     let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == "visibility_modifier")
-        .map(|visibility| rust_visibility_from_modifier(visibility, source))
-        .unwrap_or(RustVisibility::Private)
+    for child in node.named_children(&mut cursor) {
+        charge(1)?;
+        if child.kind() == "visibility_modifier" {
+            return rust_visibility_from_modifier_bounded(child, source, charge);
+        }
+    }
+    Ok(RustVisibility::Private)
 }
 
 pub fn rust_visibility_from_modifier(node: Node<'_>, source: &str) -> RustVisibility {
+    rust_visibility_from_modifier_bounded(node, source, &mut |_| {
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .expect("infallible legacy visibility modifier")
+}
+
+fn rust_visibility_from_modifier_bounded<F, E>(
+    node: Node<'_>,
+    source: &str,
+    charge: &mut F,
+) -> Result<RustVisibility, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(1)?;
     if node.kind() == "crate" {
-        return RustVisibility::Crate;
+        return Ok(RustVisibility::Crate);
     }
     let mut cursor = node.walk();
     let Some(scope) = node.named_children(&mut cursor).next() else {
-        return RustVisibility::Public;
+        return Ok(RustVisibility::Public);
     };
-    match scope.kind() {
+    charge(1)?;
+    Ok(match scope.kind() {
         "crate" => RustVisibility::Crate,
         "self" => RustVisibility::SelfModule,
         "super" => RustVisibility::SuperModule,
         _ => {
-            let segments = rust_use_path_segments(scope, source);
+            let segments = rust_use_path_segments_with_spans_bounded(scope, source, charge)?;
+            charge(segments.len())?;
+            let segments = segments
+                .into_iter()
+                .map(|segment| segment.name)
+                .collect::<Vec<_>>();
             if segments.is_empty() {
                 RustVisibility::Private
             } else {
                 RustVisibility::InPath(segments)
             }
         }
-    }
+    })
 }
 
 /// The facts every leaf of one `use` tree shares: the declaration's
@@ -860,7 +1004,7 @@ impl<'tree> RustUseDeclaration<'tree> {
         clippy::too_many_arguments,
         reason = "each leaf carries the independent AST and spelling projections"
     )]
-    fn leaf(
+    fn leaf_bounded<F, E>(
         &self,
         path: Vec<RustUsePathSegment<'tree>>,
         is_wildcard: bool,
@@ -871,7 +1015,11 @@ impl<'tree> RustUseDeclaration<'tree> {
         alias_node: Option<Node<'tree>>,
         leading_absolute: bool,
         module_self: bool,
-    ) -> RustImportProjectionLeaf<'tree> {
+        charge: &mut F,
+    ) -> Result<RustImportProjectionLeaf<'tree>, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
         assert_eq!(is_wildcard, target_node.is_none());
         // The span keeps naming the imported entity by its path, so a
         // `{self}` leaf spells its module's last prefix segment here while its
@@ -881,12 +1029,33 @@ impl<'tree> RustUseDeclaration<'tree> {
         } else {
             path.last().map(|segment| segment.span)
         };
+        charge(path.len())?;
         let path = path
             .into_iter()
             .map(|segment| segment.name)
             .collect::<Vec<_>>();
+        for segment in &path {
+            charge(1)?;
+            charge(segment.len().saturating_add(2))?;
+        }
         let rendered_path = path.join("::");
+        if let RustVisibility::InPath(scope) = &self.visibility {
+            for segment in scope {
+                charge(1)?;
+                charge(segment.len().saturating_mul(3).saturating_add(6))?;
+            }
+        }
+        charge(16)?;
         let prefix = self.rendered_use_prefix();
+        charge(
+            rendered_path
+                .len()
+                .saturating_add(prefix.len())
+                .saturating_add(8),
+        )?;
+        if let Some(alias) = &alias {
+            charge(alias.len())?;
+        }
         let anchor = if leading_absolute { "::" } else { "" };
         let raw_snippet = if is_wildcard {
             format!("{prefix}{anchor}{rendered_path}::*;")
@@ -895,7 +1064,12 @@ impl<'tree> RustUseDeclaration<'tree> {
         } else {
             format!("{prefix}{anchor}{rendered_path};")
         };
-        RustImportProjectionLeaf {
+        charge(
+            self.lexical_scopes
+                .len()
+                .saturating_add(self.lexical_scope_nodes.len()),
+        )?;
+        Ok(RustImportProjectionLeaf {
             import: RustImportInfo {
                 info: ImportInfo {
                     raw_snippet,
@@ -920,7 +1094,7 @@ impl<'tree> RustUseDeclaration<'tree> {
             target: target_node,
             alias: alias_node,
             lexical_scopes: self.lexical_scope_nodes.clone(),
-        }
+        })
     }
 
     /// The canonical `use` keyword with this declaration's visibility

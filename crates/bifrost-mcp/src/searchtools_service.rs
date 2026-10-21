@@ -51,7 +51,7 @@ use crate::{
         PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn, PolicyFindingId, PolicyId,
         PolicyNearMissRanking, PolicyRangeRequest, PolicyReportDocument, PolicyRun,
         PolicyScopeOptions, PolicyScopeSource, PolicyStageTiming, PolicySuppressionOptions,
-        PolicySuppressionSource, built_in_policy_catalog, explain_policy_inputs,
+        PolicySuppressionSource, built_in_policy_catalog, explain_policy_inputs, policy_bundles,
         rank_policy_near_misses, workspace_snapshot_deadline_outcome_with_preflight,
     },
     profiling,
@@ -291,9 +291,10 @@ fn activate_configured_semantic_models(
     // The activation publishes its models onto the session analyzer, which is
     // what the session's tools read. Policy evaluation activates its own
     // workspace (#3735), so nothing reads the transaction's own record.
+    let activation_config = workspace_activation_config(workspace);
     let failure = activate_workspace_semantic_sources_in_catalog(
         workspace,
-        &AnalyzerConfig::default(),
+        &activation_config,
         &catalog,
         WorkspaceActivationSources {
             catalog_root: workspace_root,
@@ -350,9 +351,10 @@ fn activate_configured_semantic_models_installed_stage(
         Ok(prelude) => prelude,
         Err(failure_state) => return Ok(InstalledPackStageOutcome::Settled(failure_state)),
     };
+    let activation_config = workspace_activation_config(workspace);
     match activate_installed_workspace_semantic_sources_in_catalog(
         workspace,
-        &AnalyzerConfig::default(),
+        &activation_config,
         &catalog,
         WorkspaceActivationSources {
             catalog_root: workspace_root,
@@ -498,6 +500,15 @@ fn open_session_pack_catalog(
         catalog,
         additional_evidence,
     })
+}
+
+/// Dependency discovery runs under this configuration, so a build target the
+/// host selected (for example a Go `goos`/`goarch` pair) must reach semantic
+/// activation rather than being replaced by the defaults. A workspace assembled
+/// without a build context has no configuration and behaves as the defaults
+/// describe.
+fn workspace_activation_config(workspace: &WorkspaceAnalyzer) -> AnalyzerConfig {
+    workspace.config().cloned().unwrap_or_default()
 }
 
 fn activate_legacy_configured_semantic_models(
@@ -2068,12 +2079,15 @@ fn explain_policy_inputs_from(
         inputs.push(PolicyEvaluationInput::workspace_file(path.as_str()));
     }
 
-    let selection = BuiltInPolicySelection {
+    let mut selection = BuiltInPolicySelection {
         packs: params.policy_packs.clone(),
         categories: params.policy_categories.clone(),
         policy_ids: params.policy_ids.clone(),
         excluded_policy_ids: Vec::new(),
     };
+    let mut bundle_inputs = policy_bundles()
+        .and_then(|bundles| bundles.take_selected(&mut selection))
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
     let selected = built_in_policy_catalog()
         .map_err(|error| {
             SearchToolsServiceError::internal(format!(
@@ -2086,6 +2100,7 @@ fn explain_policy_inputs_from(
         .into_iter()
         .map(PolicyEvaluationInput::selected_builtin)
         .collect::<Vec<_>>();
+    built_in.append(&mut bundle_inputs);
     built_in.append(&mut inputs);
     if built_in.len() != 1 {
         return Err(SearchToolsServiceError::invalid_params(format!(
@@ -3250,12 +3265,21 @@ fn decode_run_policy_arguments(
         policy_inputs.push(PolicyEvaluationInput::workspace_file(path.as_str()));
     }
 
-    let selection = BuiltInPolicySelection {
+    let mut selection = BuiltInPolicySelection {
         packs: params.policy_packs,
         categories: params.policy_categories,
         policy_ids: params.policy_ids,
         excluded_policy_ids: Vec::new(),
     };
+    let bundle_ids = selection.policy_ids.clone();
+    let mut bundle_inputs = policy_bundles()
+        .and_then(|bundles| bundles.take_selected(&mut selection))
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+    let bundle_ids = bundle_ids
+        .into_iter()
+        .filter(|id| !selection.policy_ids.contains(id))
+        .map(|id| PolicyId::new(&id).expect("policy-bundle IDs are validated"))
+        .collect::<Vec<_>>();
     let selected = built_in_policy_catalog()
         .map_err(|error| {
             SearchToolsServiceError::internal(format!(
@@ -3264,16 +3288,18 @@ fn decode_run_policy_arguments(
         })?
         .select(&selection)
         .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
-    let selected_policy_ids = selected
+    let mut selected_policy_ids = selected
         .iter()
         .map(|policy| {
             PolicyId::new(&policy.manifest().id).expect("built-in policy IDs are validated")
         })
         .collect::<Vec<_>>();
+    selected_policy_ids.extend(bundle_ids);
     let mut built_in_inputs = selected
         .into_iter()
         .map(PolicyEvaluationInput::selected_builtin)
         .collect::<Vec<_>>();
+    built_in_inputs.append(&mut bundle_inputs);
     built_in_inputs.append(&mut policy_inputs);
     let policy_inputs = built_in_inputs;
     if policy_inputs.len() > max_policy_files {
@@ -5280,7 +5306,7 @@ impl SearchToolsService {
         // only navigates ranks without the history tier for its whole life. The walk is a
         // `git rev-list`/`git log` pair that takes seconds on a large repository, so it gets
         // its own thread and no request waits for it.
-        match brokk_bifrost_analysis::relevance::spawn_commit_history_warm(canonical.clone()) {
+        match brokk_bifrost_tools::relevance::spawn_commit_history_warm(canonical.clone()) {
             // Detached deliberately: nothing in the service ever joins the warm, and the
             // thread reports its own failures.
             Ok(_warm) => {}
@@ -6056,7 +6082,7 @@ impl SearchToolsService {
     }
 
     fn symbol_sources_budget_error(
-        exceeded: brokk_bifrost_analysis::searchtools::SymbolSourcesBudgetExceeded,
+        exceeded: brokk_bifrost_tools::searchtools::SymbolSourcesBudgetExceeded,
     ) -> SearchToolsServiceError {
         SearchToolsServiceError::invalid_params(format!(
             "get_symbol_sources exceeded the {}-byte response budget while resolving source; re-call with fewer or narrower symbols",
@@ -8469,7 +8495,7 @@ mod watcher_startup_tests {
             .into_iter()
             .find(|unit| unit.identifier() == "Item")
             .unwrap();
-        let renamed = brokk_bifrost_analysis::native_resolution_test_support::go_native_rename(
+        let renamed = brokk_bifrost_go_analysis::analyzer::go_native_rename(
             request.analyzer(),
             request.analyzer().project(),
             &target,
@@ -9511,7 +9537,6 @@ mod analyzer_failure_boundary_tests {
         );
         assert!(trusted.semantic.max_source_bytes >= defaults.semantic.max_source_bytes);
         assert!(trusted.semantic.max_retained_bytes >= defaults.semantic.max_retained_bytes);
-        assert!(trusted.semantic.max_traversal_steps >= defaults.semantic.max_traversal_steps);
         for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
             assert!(
                 trusted.semantic.rows(dimension) >= defaults.semantic.rows(dimension),

@@ -219,12 +219,12 @@ can instead import the extracted bundle through the facade bootstrap:
 ```bash
 export BIFROST_SEMANTIC_PACK_CACHE_ROOT=/path/to/cache
 export BIFROST_OPEN_SEMANTIC_PACK_BUNDLE=/path/to/bifrost-semantic-packs
-export BIFROST_OPEN_POLICY_PACK_ROOT=/path/to/extracted-rules/rules
+export BIFROST_POLICY_PACK_ROOT=/path/to/extracted-rules/rules
 bifrost --root /path/to/project --mcp 'symbol|extended'
 ```
 
 When both `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` and
-`BIFROST_OPEN_POLICY_PACK_ROOT` are unset, the `bifrost` binary supplies its
+`BIFROST_POLICY_PACK_ROOT` are unset, the `bifrost` binary supplies its
 verified selection before the existing native and policy installers run.
 Setting either variable supplies host-owned content and disables automatic
 acquisition. The native bundle replaces embedded semantic registration; it is

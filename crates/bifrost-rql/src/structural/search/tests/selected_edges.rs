@@ -18,12 +18,12 @@ fn execute_rust_native_edges(
     query: &CodeQuery,
     cancellation: &CancellationToken,
     after_staging: impl FnOnce(&CodeQueryResult),
-) -> brokk_bifrost_analysis::native_resolution_test_support::RustSelectedReverseOutcome<
+) -> brokk_bifrost_rust_analysis::analyzer::rust::selected_reverse::RustSelectedReverseOutcome<
     Option<CodeQueryResult>,
 > {
-    use brokk_bifrost_analysis::native_resolution_test_support::with_rust_selected_reverse_queries;
+    use brokk_bifrost_rust_analysis::analyzer::rust::selected_reverse::with_rust_selected_reverse_queries;
     let rust = brokk_bifrost_analysis::analyzer::resolve_analyzer::<
-        brokk_bifrost_analysis::RustAnalyzer,
+        brokk_bifrost_rust_analysis::RustAnalyzer,
     >(workspace.analyzer())
     .expect("Rust fixture analyzer");
     with_rust_selected_reverse_queries(rust, cancellation, |queries| {
@@ -57,7 +57,7 @@ fn execute_rust_native_edges(
 
 #[test]
 fn native_rust_edges_of_does_not_certify_absence_under_open_inventory() {
-    use brokk_bifrost_analysis::native_resolution_test_support::RustSelectedReverseOutcome;
+    use brokk_bifrost_rust_analysis::analyzer::rust::selected_reverse::RustSelectedReverseOutcome;
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
             "Cargo.toml",
@@ -715,7 +715,7 @@ fn selected_inverse_scope_rejects_retryable_branch_local_edges() {
 
 #[test]
 fn native_rust_edges_of_filters_aliases_and_decoys_and_renders_public_rows() {
-    use brokk_bifrost_analysis::native_resolution_test_support::RustSelectedReverseOutcome;
+    use brokk_bifrost_rust_analysis::analyzer::rust::selected_reverse::RustSelectedReverseOutcome;
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
             "Cargo.toml",

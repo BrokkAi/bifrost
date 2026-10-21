@@ -286,7 +286,7 @@ mod tests {
         limits.source_bytes = limit;
         SemanticBudget::new(limits)
             .expect("positive budget")
-            .check(SemanticWork {
+            .check_admission(SemanticWork {
                 source_bytes: attempted,
                 ..SemanticWork::default()
             })

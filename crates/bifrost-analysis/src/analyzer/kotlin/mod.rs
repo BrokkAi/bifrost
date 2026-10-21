@@ -22,9 +22,9 @@
 //! unknown.
 //!
 //! Definition, declaration, type, hover, and signature navigation are live
-//! (#1238); the resolver itself lives in
-//! `crate::analyzer::usages::get_definition::kotlin` because it is a consumer
-//! of this module's index rather than part of it.
+//! (#1238); definition and type points use the shared selected native JVM
+//! resolver in `crate::analyzer::jvm::native_points`. The usage graph retains
+//! its existing Kotlin edge pass.
 //!
 //! Structural CodeQuery/RQL is live too (#1240): [`structural`] supplies the
 //! [`crate::analyzer::structural::StructuralSpec`] the shared engine needs, so
@@ -69,7 +69,6 @@ use crate::analyzer::structural::BoundaryStatus;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
 use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
-use brokk_bifrost_jvm::kotlin::syntax;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -81,17 +80,12 @@ use crate::analyzer::jvm::retained_external_index_state;
 mod call_applicability;
 
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
-    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    ExternalCalleeSite, ImportedExternalCallee, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
-    fqn_has_multiple_function_definitions, ready_preflight,
+    DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
+    EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, ExternalCalleeSite, ImportedExternalCallee,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, fqn_has_multiple_function_definitions, ready_preflight,
 };
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
-use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
-};
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
 use crate::analyzer::usages::inverted_edges::{UsageEdgesCache, weight_usage_edges};
 use crate::analyzer::usages::kotlin_graph::{
     KotlinUsageGraphStrategy, build_inbound_kotlin_usage_edges_with_completeness,
@@ -115,10 +109,10 @@ use brokk_bifrost_jvm::proof::JvmRetainedExternalIndex;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-use tree_sitter::Node;
 
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-pub(crate) use adapter::KotlinAdapter;
+#[doc(hidden)]
+pub use adapter::KotlinAdapter;
 use clones::build_kotlin_clone_candidate_data;
 
 #[derive(Clone)]
@@ -177,7 +171,6 @@ crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
 mod hierarchy_tests;
 
 impl KotlinAnalyzer {
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn tree_sitter_analyzer(&self) -> &TreeSitterAnalyzer<KotlinAdapter> {
         &self.inner
     }
@@ -228,14 +221,6 @@ impl KotlinAnalyzer {
         source_mode: crate::analyzer::BulkFileStateSource,
     ) -> crate::hash::HashMap<ProjectFile, crate::analyzer::tree_sitter_analyzer::FileState> {
         self.inner.bulk_file_states(files, source_mode)
-    }
-
-    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
-        pub(crate) fn raw_supertypes_limited(
-        &self,
-        code_unit: &CodeUnit,
-        limit: usize,
-    ) -> crate::analyzer::store::LimitedQueryRows<String>;
     }
 
     crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
@@ -1071,6 +1056,75 @@ impl TestDetectionProvider for KotlinAnalyzer {}
 
 static KOTLIN_USAGE_STRATEGY: KotlinUsageGraphStrategy = KotlinUsageGraphStrategy::new();
 
+/// Kotlin point consumers use the selected native JVM resolver in every build.
+pub(crate) fn native_kotlin_selected() -> bool {
+    true
+}
+
+impl crate::analyzer::multi_analyzer::LanguageAnalyzer for KotlinAnalyzer {
+    fn analyzer(&self) -> &dyn IAnalyzer {
+        self
+    }
+
+    fn program_semantics_provider(
+        &self,
+    ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
+        self
+    }
+
+    fn clone_with_project(
+        &self,
+        project: Arc<dyn Project>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(KotlinAnalyzer::clone_with_project(self, project))
+    }
+
+    fn clone_for_index_warm(
+        &self,
+        project: Arc<dyn Project>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(KotlinAnalyzer::clone_for_index_warm(self, project))
+    }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn crate::analyzer::TypeHierarchyProvider> {
+        IAnalyzer::type_hierarchy_provider(self)
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn crate::analyzer::TypeAliasProvider> {
+        IAnalyzer::type_alias_provider(self)
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        Some(self)
+    }
+
+    fn update(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(IAnalyzer::update(self, changed_files))
+    }
+
+    fn update_all_with_progress(
+        &self,
+        progress: Option<BuildProgress>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(KotlinAnalyzer::update_all_with_progress(self, progress))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(Clone::clone(self))
+    }
+}
+
 pub(crate) struct KotlinSupport;
 
 static KOTLIN_DEAD_CODE_BULK: KotlinDeadCodeBulk = KotlinDeadCodeBulk;
@@ -1136,7 +1190,262 @@ impl DeadCodeBulkProof for KotlinDeadCodeBulk {
     }
 }
 
+impl KotlinSupport {
+    /// The Kotlin delegate, together with a view of the whole JVM source realm,
+    /// when this workspace has Kotlin alongside at least one other JVM
+    /// language.
+    ///
+    /// A Kotlin analyzer only indexes `.kt` files, so on its own it cannot see
+    /// that the interface a Kotlin class implements is declared in a Java file
+    /// next door. `MultiAnalyzer` is the only place that holds every delegate,
+    /// so the realm view is built from it. `None` means the widening
+    /// would add nothing and the delegate's own answer already stands.
+    fn kotlin_realm(
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+    ) -> Option<(
+        &KotlinAnalyzer,
+        brokk_bifrost_jvm::realm::JvmSourceRealm<'_>,
+    )> {
+        let kotlin = workspace
+            .delegates()
+            .get(&Language::Kotlin)?
+            .as_any()
+            .downcast_ref::<KotlinAnalyzer>()?;
+        let realm = crate::analyzer::jvm::realm_builder::jvm_source_realm(workspace);
+        realm
+            .has_peers_of(Language::Kotlin)
+            .then_some((kotlin, realm))
+    }
+}
+
 impl LanguageSupport for KotlinSupport {
+    /// A Kotlin file can import a Java or Scala declaration from the same
+    /// workspace, and only the workspace dispatcher can see both sides.
+    fn workspace_imported_code_units(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
+        let (kotlin, realm) = Self::kotlin_realm(workspace)?;
+        Some(kotlin.imported_code_units_in_realm(token, file, Some(&realm)))
+    }
+    /// A Kotlin class can extend a Java class or implement a Scala trait
+    /// declared in the same workspace; resolving that needs every JVM
+    /// delegate, which only the workspace dispatcher holds.
+    fn workspace_direct_ancestors(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Vec<CodeUnit>> {
+        let (kotlin, realm) = Self::kotlin_realm(workspace)?;
+        Some(kotlin.direct_ancestors_in_realm(token, unit, Some(&realm)))
+    }
+    fn workspace_direct_ancestors_within(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+        scope: &crate::analyzer::DescendantIndexScope<'_>,
+    ) -> Option<Option<Vec<CodeUnit>>> {
+        let (kotlin, realm) = Self::kotlin_realm(workspace)?;
+        Some(
+            (!scope.cancellation().is_cancelled())
+                .then(|| kotlin.direct_ancestors_in_realm(token, unit, Some(&realm))),
+        )
+    }
+    fn workspace_additional_direct_descendants(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+        scope: &crate::analyzer::DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        // Kotlin subclasses of a Java or Scala type are invisible to that
+        // language's own descendant index, which only walks its own
+        // declarations. Kotlin's realm-aware index does resolve across the
+        // realm, so folding it in is what makes `Api`'s Kotlin implementors
+        // show up.
+        //
+        // The reverse direction, Java and Scala subclasses of a Kotlin type,
+        // is still missing, and cannot be fixed here. Each language's
+        // descendant index is the inverse of its own ancestor resolution, and
+        // Java's and Scala's resolve a spelled supertype against their own
+        // declarations only; folding their indexes in for a Kotlin unit would
+        // fold in indexes that never saw the Kotlin declaration in the first
+        // place. Closing it means giving those two hierarchy resolvers the
+        // realm-aware existence predicate Kotlin's already has (`realm_type_exists`
+        // / `realm_type_by_fqn` in `kotlin/hierarchy.rs`), a change to those
+        // analyzers, not to this hook. Issue #1239 made usage resolution
+        // realm-aware in both directions; hierarchy resolution is a separate
+        // seam and remains one-directional.
+        if crate::analyzer::common::language_for_file(unit.source()) != Language::Kotlin
+            && let Some((kotlin, realm)) = Self::kotlin_realm(workspace)
+        {
+            return kotlin.direct_descendants_in_realm(token, unit, Some(&realm), scope);
+        }
+        Some(HashSet::default())
+    }
+    fn default_definition_points(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        self.structural_receiver()
+    }
+    fn workspace_external_member_family(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        identity: &brokk_bifrost_jvm::realm::JvmExternalMemberIdentity,
+        max_visits: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
+        if let Some(language) = [Language::Java, Language::Scala]
+            .into_iter()
+            .find(|language| workspace.languages().contains(language))
+        {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
+                    crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
+                        language,
+                    ),
+                    0,
+                );
+        }
+        let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(workspace) else {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
+        };
+        kotlin.resolve_external_member_family(workspace, identity, max_visits, cancellation)
+    }
+    fn workspace_semantic_diagnostics(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<crate::analyzer::SemanticDiagnosticReport> {
+        // JVM diagnostics must see the same wider JVM source realm that import
+        // and hierarchy resolution see: otherwise a type declared in a Java or
+        // Scala sibling file would be misreported as unrecognized.
+        //
+        // Every Kotlin file routes here, not only one with Java or Scala
+        // peers: the realm widens resolution, but the active dependency model
+        // that decides whether a miss is provable is published on the
+        // dispatcher either way. Falling through to the delegate for a
+        // Kotlin-only workspace would read its empty overlay and suppress
+        // every unknown name.
+        //
+        // The workspace, not the Kotlin delegate, for the same reason, plus
+        // the enclosing-declaration lookup, which crosses languages. The shim
+        // downcasts to the Kotlin analyzer itself.
+        let realm = Self::kotlin_realm(workspace).map(|(_, realm)| realm);
+        Some(diagnostics::collect_kotlin_semantic_diagnostics(
+            workspace,
+            token,
+            file,
+            source,
+            realm.as_ref(),
+        ))
+    }
+    fn definition_boundary_evidence(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Option<(
+        crate::analyzer::structural::resolution::BoundaryStatus,
+        Option<String>,
+    )> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|kotlin| {
+            kotlin.external_boundary_evidence(token, analyzer.semantic_model_overlay(), file, name)
+        })
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    fn probe_assignment_value(
+        &self,
+        query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+        _request: &brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest,
+        _cancellation: &crate::CancellationToken,
+    ) -> Result<
+        Option<
+            crate::analyzer::usages::get_definition::BoundedResolution<
+                crate::analyzer::native_points::NativeAssignmentValueProbe,
+            >,
+        >,
+        String,
+    > {
+        Ok(Some(
+            crate::analyzer::native_points::probe_jvm_assignment_value(
+                resolve_analyzer::<KotlinAnalyzer>(query.analyzer)
+                    .ok_or("assignment-value probe has no Kotlin analyzer")?
+                    .tree_sitter_analyzer(),
+                query,
+            ),
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn selected_reverse_reference_file<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+        _target_analyzer: &'a dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> crate::analyzer::store::Result<
+        crate::analyzer::structural::reference_edges::SelectedReferenceFileProjection<'a>,
+    > {
+        let caller = resolve_analyzer::<KotlinAnalyzer>(analyzer).ok_or_else(|| {
+            crate::analyzer::store::StoreError::new(format!(
+                "selected reverse caller analyzer is unavailable: {file}"
+            ))
+        })?;
+        crate::analyzer::structural::reference_edges::SelectedReferenceFileProjection::new(
+            caller,
+            analyzer,
+            file,
+            |source| {
+                caller
+                    .inner
+                    .source_matches_selected_native_content(file, source)
+            },
+        )
+    }
+
+    fn knowledge(
+        &self,
+    ) -> &'static dyn brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge {
+        &brokk_bifrost_jvm::KotlinKnowledge
+    }
+
+    fn build_analyzer(
+        &self,
+        project: Arc<dyn crate::analyzer::Project>,
+        config: crate::analyzer::AnalyzerConfig,
+        store_context: crate::analyzer::AnalyzerStoreContext,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Result<crate::analyzer::multi_analyzer::AnalyzerDelegate, crate::analyzer::store::StoreError>
+    {
+        Ok(crate::analyzer::multi_analyzer::AnalyzerDelegate::new(
+            KotlinAnalyzer::new_with_config_store_context(
+                project,
+                config,
+                store_context,
+                progress,
+            )?,
+        ))
+    }
+
+    fn is_configuration_input(&self, file: &ProjectFile) -> bool {
+        crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
+    }
+
+    fn definition_site_for_focus(
+        &self,
+        site: crate::analyzer::usages::get_definition::ResolvedReferenceSite,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        _start: Option<usize>,
+        _end: Option<usize>,
+    ) -> crate::analyzer::usages::get_definition::ResolvedReferenceSite {
+        crate::analyzer::usages::get_definition::kotlin::kotlin_site_for_focus(site, tree, source)
+    }
+
     fn native_member_attribution(
         &self,
         context: &crate::analyzer::store::resolution_operation::ProjectedNativeMemberContext,
@@ -1181,19 +1490,11 @@ impl LanguageSupport for KotlinSupport {
     fn native_rollout_points(
         &self,
     ) -> Option<&'static dyn crate::analyzer::languages::StructuralReceiverResolver> {
-        Some(&crate::analyzer::jvm::native_points::JVM_NATIVE_ROLLOUT_POINTS)
+        self.structural_receiver()
     }
 
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
         crate::analyzer::jvm::is_jvm_configuration_input_path(path)
-    }
-
-    fn language(&self) -> Language {
-        Language::Kotlin
-    }
-
-    fn call_may_apply_value(&self) -> bool {
-        true
     }
 
     fn call_applicability_adapter(
@@ -1223,43 +1524,6 @@ impl LanguageSupport for KotlinSupport {
                 callee_text,
             )
             .map(|member| ImportedExternalCallee::text(member.fqn()))
-    }
-
-    /// Kotlin's grammar names neither the callee of a call nor the member of a
-    /// navigation, so both are read through the positional readers the Kotlin adapters
-    /// already use.
-    fn call_callee_node<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
-        syntax::kotlin_callee(call)
-    }
-
-    /// No Kotlin declaration names its identifier with a field either, so the header
-    /// token is read positionally. Without this, name selection falls through to a text
-    /// search over the whole declaration and can answer with a same-named occurrence in
-    /// the body, such as `this.offset` inside `fun offset` (#2712).
-    fn declaration_name_node<'t>(&self, declaration: Node<'t>) -> Option<Node<'t>> {
-        syntax::kotlin_declaration_name(declaration)
-    }
-
-    /// The argument list is `value_arguments`, which an ordinary call nests one level
-    /// down inside `call_suffix`.
-    fn call_argument_nodes<'t>(&self, call: Node<'t>) -> Option<Vec<Node<'t>>> {
-        Some(syntax::kotlin_value_arguments(call).into_iter().collect())
-    }
-
-    fn factory_name_node<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
-        if call.kind() != "call_expression" {
-            return None;
-        }
-        let callee = syntax::kotlin_callee(call)?;
-        match callee.kind() {
-            "navigation_expression" => syntax::kotlin_navigation_member(callee),
-            "simple_identifier" => Some(callee),
-            _ => None,
-        }
-    }
-
-    fn positional_parameter_default<'t>(&self, parameter: Node<'t>) -> Option<Node<'t>> {
-        syntax::kotlin_parameter_default(parameter)
     }
 
     fn signature_metadata_limited(
@@ -1321,19 +1585,10 @@ impl LanguageSupport for KotlinSupport {
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
-        Some(&KotlinSupport)
-    }
-
-    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
-        language::LANGUAGE.into()
-    }
-
-    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &brokk_bifrost_jvm::kotlin::structural::KOTLIN_STRUCTURAL_SPEC
-    }
-
-    fn highlight_query(&self) -> Option<&'static str> {
-        Some(brokk_bifrost_jvm::queries::KOTLIN_HIGHLIGHTS_QUERY)
+        native_kotlin_selected().then_some(
+            &crate::analyzer::jvm::native_points::JVM_NATIVE_ROLLOUT_POINTS
+                as &dyn StructuralReceiverResolver,
+        )
     }
 }
 
@@ -1362,40 +1617,6 @@ impl LanguageEdgePass for KotlinEdgePass {
         crate::analyzer::languages::fqn_edge_weights(ctx, |token| {
             build_kotlin_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
         })
-    }
-}
-
-impl StructuralReceiverResolver for KotlinSupport {
-    fn resolve_type_bounded(
-        &self,
-        query: BoundedReceiverQuery<'_>,
-    ) -> BoundedResolution<TypeLookupOutcome> {
-        let scope = AnalyzerQueryScope::new(query.analyzer);
-        resolve_kotlin_type_bounded(
-            query.analyzer,
-            scope.token(),
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.budget,
-            query.cancellation,
-        )
-    }
-
-    fn resolve_definition_bounded(
-        &self,
-        query: BoundedReceiverQuery<'_>,
-    ) -> BoundedResolution<DefinitionLookupOutcome> {
-        resolve_kotlin_bounded(
-            query.analyzer,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.budget,
-            query.cancellation,
-        )
     }
 }
 

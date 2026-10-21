@@ -1,4 +1,4 @@
--- Continues `rust_crate_point_targets.sql`. Topology routes determine
+-- Continues `rust_crate_published_targets.sql`. Topology routes determine
 -- placement. Changed content supplies its own canonical export name, declaration site, visibility and module authority.
 -- The returned site always belongs to the returned blob and mount ordinal.
 --
@@ -17,7 +17,7 @@
         mount.blob_id AS selected_blob, mount.mount_ordinal
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=unit.summary_id AND source.module_path=targets.module_path
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
@@ -30,7 +30,7 @@
         mount.blob_id AS selected_blob, mount.mount_ordinal
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=unit.summary_id
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
@@ -54,7 +54,7 @@
   ON authority.blob_id=path.blob_id AND authority.semantic_key=path.end_node
  CROSS JOIN source_rust_declaration_properties AS properties
   ON properties.blob_id=authority.blob_id AND properties.declaration_id=authority.declaration
- CROSS JOIN selected_rust_module_placements AS placement
+ CROSS JOIN selected_rust_container_placements AS placement
   ON placement.mount_ordinal=source.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
   AND placement.topology_id=source.topology_id

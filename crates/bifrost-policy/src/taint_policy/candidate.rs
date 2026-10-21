@@ -70,6 +70,7 @@ use crate::explain::{
 use crate::finding::{BoundedWitness, PolicyIncompleteReason, PolicySourceLocation};
 use crate::finding_identity::WitnessId;
 use crate::resolved::{LoadedPolicy, ResolvedEndpointIdentity, ResolvedTaintPolicySpec};
+use crate::selector_compiler::IncompleteTaintSelector;
 use crate::semantic_identity::{
     call_site_locator, policy_location, program_point_locator, stable_hex,
 };
@@ -790,7 +791,7 @@ fn resolve_position(
 /// exhaustive.
 fn selection_gaps(
     refusals: &[RefusalNotice],
-    incomplete_selectors: &[String],
+    incomplete_selectors: &[IncompleteTaintSelector],
     skipped_region_roots: usize,
 ) -> Vec<CandidateBoundary> {
     let mut gaps = Vec::new();
@@ -799,7 +800,13 @@ fn selection_gaps(
             CandidateBoundaryKind::DiscoveryIncomplete,
             vec![PolicyIncompleteReason::PartialDiscovery],
             None,
-            format!("endpoint selectors did not finish: {incomplete_selectors:?}"),
+            format!(
+                "endpoint selectors did not finish: {:?}",
+                incomplete_selectors
+                    .iter()
+                    .map(|gap| gap.message.as_str())
+                    .collect::<Vec<_>>()
+            ),
         ));
     }
     let incomplete_refusals = refusals

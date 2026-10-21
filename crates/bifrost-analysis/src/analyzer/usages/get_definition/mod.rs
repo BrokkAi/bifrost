@@ -1,133 +1,106 @@
 use super::read_source;
-use crate::analyzer::common::{IdentifierSeek, decorated_identifier_seeks, language_for_file};
-use crate::analyzer::go::native_go_selected;
+
+use crate::analyzer::common::IdentifierSeek;
+use crate::analyzer::common::decorated_identifier_seeks;
+use crate::analyzer::common::language_for_file;
+
 use crate::analyzer::languages::language_support;
-use crate::analyzer::lexical_definitions::{
-    LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
-    resolve_lexical_binding_from_focus,
-};
-use crate::analyzer::read_ledger::{IndexFamily, ReadKey};
+
+use crate::analyzer::lexical_definitions::LexicalBindingResolution;
+use crate::analyzer::lexical_definitions::LexicalDefinition;
+use crate::analyzer::lexical_definitions::resolve_lexical_binding;
+
+use crate::analyzer::read_ledger::IndexFamily;
+use crate::analyzer::read_ledger::ReadKey;
+
 use crate::analyzer::usages::common::namespace_prefixes;
-use crate::analyzer::usages::cpp_graph::{
-    CppBareCallTargetResolution, CppBlockUsingCallTargetResolution, CppDesignatedInitializerOwner,
-    CppDispatch, CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind,
-    CppTemplateResolutionError, CppVisibilityIndex, cpp_argument_children,
-    cpp_constructor_type_node, cpp_declaration_declarator, cpp_designated_initializer_owner,
-    cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
-    cpp_function_return_type_text, cpp_initialized_effective_using_imports,
-    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for,
-    cpp_recovered_c_new_expression_argument_at, cpp_reference_fqn_candidates,
-    cpp_resolve_bare_call_target, cpp_resolve_block_using_call_target,
-    cpp_resolve_type_components_lexically_at_preserving_alias, cpp_split_top_level_commas,
-    cpp_template_reference_arguments, cpp_type_name_components, extract_variable_name,
-    is_globally_qualified_cpp_name, normalize_cpp_type_text,
-};
-use crate::analyzer::usages::csharp_graph::{
-    CSharpInitializerOwnerLookups, CSharpInitializerOwnerTarget, csharp_argument_count,
-    csharp_collection_target_element_type_node, csharp_extension_invocation_return_type_fq_name,
-    csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
-    csharp_member_declared_collection_element_type_fq_name,
-    csharp_member_declared_collection_element_type_fq_name_in_session,
-    csharp_member_declared_type_fq_name, csharp_method_return_type_fq_name_for_arity,
-    csharp_node_text, csharp_object_created_type, csharp_object_initializer_for_label,
-    csharp_object_initializer_owners, csharp_reference_type_text,
-    csharp_type_parameter_shadows_reference, csharp_visible_extension_method_candidates,
-    member_access_name as csharp_member_access_name,
-    member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
-};
-use crate::analyzer::usages::go_graph::{
-    GoSelectorDescriptor, go_selector_descriptor, go_selector_descriptor_with_scope,
-    resolve_go_reference_with_namespaces,
-};
-use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
-use crate::analyzer::usages::js_ts_graph::{
-    JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
-    cached_jsts_index, compute_jsts_import_binder,
-};
-use crate::analyzer::usages::local_inference::{
-    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine,
-};
-use crate::analyzer::usages::model::{ImportBinder, ImportKind};
-use crate::analyzer::usages::php_graph::{
-    FileContext, PhpCallableCandidates, php_node_text, resolve_php_constant, resolve_php_function,
-    resolve_php_type,
-};
-use crate::analyzer::usages::python_graph::{
-    collect_module_binding_timeline, collect_scope_facts_from_parsed_source, enclosing_scope_facts,
-    is_declaration_identifier as python_is_declaration_identifier, python_slice,
-    resolve_receiver_type as resolve_python_receiver_type, with_python_graph_source,
-};
-use crate::analyzer::usages::receiver_analysis::{
-    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverBudgetLimit,
-};
-pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;
-pub(crate) use crate::analyzer::usages::reference_site::{
-    ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
-    simple_reference_name, smallest_named_node_covering,
-};
-use crate::analyzer::{QueryScope, QueryToken};
+
+use crate::analyzer::usages::inverted_edges::first_precise;
+
+use crate::analyzer::usages::local_inference::LocalInferenceConfig;
+use crate::analyzer::usages::local_inference::LocalInferenceEngine;
+
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+
+pub(crate) use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+pub(crate) use crate::analyzer::usages::reference_site::SourceLocationRequest;
+pub(crate) use crate::analyzer::usages::reference_site::resolve_reference_site_with_line_starts;
+pub(crate) use crate::analyzer::usages::reference_site::smallest_named_node_covering;
+
+use crate::analyzer::QueryScope;
+use crate::analyzer::QueryToken;
+
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
-use brokk_bifrost_js_ts::providers::JsTsSource;
-use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
-use serde::{Deserialize, Serialize};
-// The Ruby definition route is parked on `ResolutionSession`'s siblings while
-// `ruby_graph/*` has moved into `brokk-bifrost-ruby`, so this block -- the
-// fleet's largest reach-in into a language's graph module -- inverts through the
-// crate. The direction is one-way, exactly as it is for rust and python:
-// `brokk_bifrost_ruby::graph` names `ResolutionSession`, `get_definition`,
-// `get_type` and `DefinitionBatchContext` zero times.
+
 use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
+
 use crate::analyzer::structural::PrecedenceTier;
-use crate::analyzer::usages::scala_graph::{
-    import_candidate_fq_names, import_candidate_owner_fq_names,
-    package_name_of as scala_package_name_of, scala_builtin_type_name,
-    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_node_text,
-    scala_normalized_fq_name,
-};
-use crate::analyzer::{
-    AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
-    CSharpAnalyzer, CodeUnit, CodeUnitIndex, CppAnalyzer, DeclarationKind, DispatchExtensibility,
-    GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, Language,
-    ModuleBindingEventKind, ModuleBindingTimeline, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range,
-    RubyAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text, resolve_analyzer,
-    resolve_include_targets,
-};
+
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::analyzer::AnalyzerDefinitionLookup;
+use crate::analyzer::AnalyzerQueryScope;
+use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::CodeUnit;
+use crate::analyzer::DispatchExtensibility;
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::ImportAnalysisProvider;
+use crate::analyzer::Language;
+use crate::analyzer::ProjectFile;
+use crate::analyzer::Range;
+use crate::analyzer::resolve_analyzer;
+
 use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
+
+use crate::hash::HashMap;
+use crate::hash::HashSet;
+
 use crate::navigation::NavigationOperation;
+
 use crate::path_utils::rel_path_string;
+
 use crate::profiling;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use brokk_bifrost_core::analyzer::weighted_cache::{build_weighted_cache, weight_source_text};
-use brokk_bifrost_jvm::scala::graph::syntax::ScalaPackageContextIndex;
-use brokk_bifrost_python::graph_support::PythonSource;
-use brokk_bifrost_ruby::graph::RubyGraphSource;
-use brokk_bifrost_ruby::graph::extractor::{
-    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
-    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
-};
-use brokk_bifrost_ruby::graph::resolver::{
-    ReceiverMode as RubyReceiverMode, ReceiverType as RubyReceiverType, RubySemanticIndex,
-    ruby_field_target as ruby_field_target_from_code_unit,
-};
-use brokk_bifrost_ruby::graph::syntax::{
-    is_call_method_identifier as ruby_is_call_method_identifier,
-    is_declaration_constant as ruby_is_declaration_constant,
-    is_declaration_identifier as ruby_is_declaration_identifier,
-    is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
-    is_plain_assignment_left_variable as ruby_is_plain_assignment_left_variable,
-    method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
-    symbol_or_string_value as ruby_symbol_or_string_value,
-};
+
+use crate::text_utils::compute_line_starts;
+use crate::text_utils::find_line_index_for_offset;
+
+use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
+use brokk_bifrost_core::analyzer::weighted_cache::weight_source_text;
+
 use moka::sync::Cache;
-use std::sync::{Arc, OnceLock};
-use tree_sitter::{Node, Parser, Tree};
+
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+use tree_sitter::Node;
+use tree_sitter::Parser;
+use tree_sitter::Tree;
+
+#[doc(hidden)]
+pub const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
+#[doc(hidden)]
+pub struct DefinitionNavigationSelection {
+    #[doc(hidden)]
+    pub targets: Vec<NavigationTarget>,
+    #[doc(hidden)]
+    pub structure_unavailable: bool,
+    #[doc(hidden)]
+    pub unproven_link_unit: bool,
+    #[doc(hidden)]
+    pub truncated: bool,
+}
 
 pub(crate) const NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC: &str = "navigation_targets_truncated";
-pub(crate) const PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC: &str = "partial_import_boundary";
-pub(crate) const PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC: &str = "partial_import_unresolved";
-pub(crate) const IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC: &str = "import_bindings_truncated";
-pub(crate) const CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC: &str =
+#[doc(hidden)]
+pub const PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC: &str = "partial_import_boundary";
+#[doc(hidden)]
+pub const PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC: &str = "partial_import_unresolved";
+#[doc(hidden)]
+pub const IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC: &str = "import_bindings_truncated";
+#[doc(hidden)]
+pub const CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC: &str =
     "cpp_navigation_structure_unavailable";
 /// Maximum navigation targets retained for one reference.
 ///
@@ -135,15 +108,18 @@ pub(crate) const CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC: &str =
 /// requests in a batch made unrelated references change a C++ answer: a
 /// request with two valid targets became a one-target truncated answer in a
 /// large batch (#4512).
-pub(super) const MAX_NAVIGATION_TARGETS_PER_RESULT: usize = 256;
+#[doc(hidden)]
+pub const MAX_NAVIGATION_TARGETS_PER_RESULT: usize = 256;
 
-pub(super) fn summary_step(
+#[doc(hidden)]
+pub fn summary_step(
     session: Option<&brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession>,
 ) -> bool {
     crate::analyzer::resolution::charge_summary_step(session)
 }
 
-pub(super) fn record_hierarchy_parents(
+#[doc(hidden)]
+pub fn record_hierarchy_parents(
     parents: &mut HashMap<CodeUnit, CodeUnit>,
     owner: &CodeUnit,
     ancestors: &[CodeUnit],
@@ -155,7 +131,8 @@ pub(super) fn record_hierarchy_parents(
     }
 }
 
-pub(super) fn record_member_trace_found<Owner, MakeOwner>(
+#[doc(hidden)]
+pub fn record_member_trace_found<Owner, MakeOwner>(
     found: &mut HashMap<CodeUnit, (Owner, usize)>,
     candidates: &[CodeUnit],
     make_owner: MakeOwner,
@@ -170,14 +147,16 @@ pub(super) fn record_member_trace_found<Owner, MakeOwner>(
     }
 }
 
-fn query_limited_definition_units(
+#[doc(hidden)]
+pub fn query_limited_definition_units(
     session: &ResolutionSession,
     query: impl FnOnce(usize) -> brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows<CodeUnit>,
 ) -> Vec<CodeUnit> {
     crate::analyzer::definition_lookup::sort_dedup_units(session.query_limited_rows(query))
 }
 
-fn fqn_direct_children(
+#[doc(hidden)]
+pub fn fqn_direct_children(
     owners: Vec<CodeUnit>,
     mut query: impl FnMut(&CodeUnit) -> Vec<CodeUnit>,
     mut observe_cancellation: impl FnMut() -> bool,
@@ -192,7 +171,8 @@ fn fqn_direct_children(
     crate::analyzer::definition_lookup::sort_dedup_units(children)
 }
 
-fn record_external_member_identity(
+#[doc(hidden)]
+pub fn record_external_member_identity(
     slot: &mut Option<ResolverOwnedExternalCalleeIdentity>,
     language: Language,
     owner_fqn: &str,
@@ -207,30 +187,6 @@ fn record_external_member_identity(
     *slot = Some(identity);
 }
 
-pub(crate) fn with_bounded_go_definition_provider<T>(
-    analyzer: &dyn IAnalyzer,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-    analyzer_unavailable: impl FnOnce() -> T,
-    resolve: impl FnOnce(&dyn GoDefinitionProvider) -> T,
-) -> BoundedResolution<T> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return session.finish(analyzer_unavailable());
-    };
-    let support =
-        go::AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
-    session.finish(resolve(&support))
-}
-
-fn with_go_file<T>(file: &ProjectFile, resolve: impl FnOnce() -> Option<T>) -> Option<T> {
-    if language_for_file(file) == Language::Go {
-        resolve()
-    } else {
-        None
-    }
-}
-
 fn record_companion_owner<S: std::hash::BuildHasher>(
     companion_of: &mut std::collections::HashMap<CodeUnit, CodeUnit, S>,
     owner: &CodeUnit,
@@ -241,137 +197,17 @@ fn record_companion_owner<S: std::hash::BuildHasher>(
         .or_insert_with(|| owner.clone());
 }
 
-mod call_sites;
-mod cpp;
-mod csharp;
-mod go;
-pub(crate) use csharp::CSHARP_INDEXER_MEMBER_NAME;
-pub(crate) use go::parse_go_tree;
-pub(crate) use go::{
-    go_function_value_result_type_identity, go_imported_package_at_range,
-    go_type_owner_at_node_bounded,
-};
+#[doc(hidden)]
+pub mod call_sites;
 
-pub(crate) fn go_native_call_application(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-    overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
-    selected_imports: &[crate::analyzer::store::resolution_operation::GoSelectedExternalImport],
-) -> CallApplicationKind {
-    go::go_native_call_application(query, go, session, overlay, selected_imports)
-}
+pub mod java;
 
-pub(crate) fn go_native_external_import_binding_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-    selected_import: &crate::analyzer::store::resolution_operation::GoSelectedExternalImport,
-) -> Option<DefinitionLookupOutcome> {
-    go::go_native_external_import_binding_resolution(query, go, session, selected_import)
-}
+pub(crate) mod kotlin;
 
-pub(crate) fn go_native_external_package_member_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-    overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
-    selected_import: &crate::analyzer::store::resolution_operation::GoSelectedExternalImport,
-) -> Option<(
-    DefinitionLookupOutcome,
-    Option<ExactExternalCallProof>,
-    CallApplicationKind,
-    Option<ResolverOwnedExternalCalleeIdentity>,
-)> {
-    go::go_native_external_package_member_resolution(query, go, session, overlay, selected_import)
-}
+pub mod scala;
 
-pub(crate) fn go_native_unmodeled_external_package_member_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-    overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
-    selected_imports: &[crate::analyzer::store::resolution_operation::GoSelectedExternalImport],
-) -> Option<(
-    DefinitionLookupOutcome,
-    Option<ExactExternalCallProof>,
-    Option<crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity>,
-)> {
-    go::go_native_unmodeled_external_package_member_resolution(
-        query,
-        go,
-        session,
-        overlay,
-        selected_imports,
-    )
-}
-
-pub(crate) fn go_native_source_imported_member_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-) -> Option<(
-    DefinitionLookupOutcome,
-    Option<ExactExternalCallProof>,
-    CallApplicationKind,
-    Option<ResolverOwnedExternalCalleeIdentity>,
-)> {
-    go::go_native_source_imported_member_resolution(query, go, session)
-}
-
-pub(crate) fn go_native_external_receiver_call_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    session: &ResolutionSession,
-    selected_imports: &[crate::analyzer::store::resolution_operation::GoSelectedExternalImport],
-) -> Option<(DefinitionLookupOutcome, ExactExternalCallProof)> {
-    go::go_native_external_receiver_call_resolution(query, session, selected_imports)
-}
-
-pub(crate) fn go_native_local_receiver_call_application(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    session: &ResolutionSession,
-) -> Option<CallApplicationKind> {
-    go::go_native_local_receiver_call_application(query, session)
-}
-
-pub(crate) fn go_native_workspace_unqualified_call_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    session: &ResolutionSession,
-) -> Option<DefinitionLookupOutcome> {
-    go::go_native_workspace_unqualified_call_resolution(query, session)
-}
-
-pub(crate) fn go_native_import_namespace_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-) -> Option<DefinitionLookupOutcome> {
-    go::go_native_import_namespace_resolution(query, go, session)
-}
-
-pub(crate) fn go_native_external_dot_import_call_resolution(
-    query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-) -> Option<(
-    DefinitionLookupOutcome,
-    Option<ExactExternalCallProof>,
-    CallApplicationKind,
-    Option<ResolverOwnedExternalCalleeIdentity>,
-)> {
-    go::go_native_external_dot_import_call_resolution(query, go, session)
-}
-pub(crate) mod java;
-pub use java::lambda::java_expression_lambda_result_use;
-pub(crate) mod js_ts;
-mod kotlin;
-mod php;
-mod python;
-pub(crate) use python::python_bound_receiver_class_for_method_call;
-mod ruby;
-mod scala;
-
-fn member_precedence_tier(depth: usize) -> PrecedenceTier {
+#[doc(hidden)]
+pub fn member_precedence_tier(depth: usize) -> PrecedenceTier {
     if depth == 0 {
         PrecedenceTier::OwnMember
     } else {
@@ -380,82 +216,49 @@ fn member_precedence_tier(depth: usize) -> PrecedenceTier {
 }
 pub mod trace;
 
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn record_native_external_route(name: String) {
     trace::record_named_boundary(name);
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn record_native_external_route_with_target(name: String, target: String) {
     trace::record_named_boundary_with_target(name, target);
 }
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::resolution_session;
-pub use call_sites::CallSyntaxKind;
-pub use call_sites::call_signature_context;
-pub(crate) use call_sites::{
-    CallSiteSyntax, ExactCallReference, ExactCallReferenceGap, call_reference_ranges_in_tree,
-    call_reference_requires_point_lookup, call_site_syntax_for_reference,
-    exact_call_reference_for_call, exact_call_reference_for_reverse_site,
-    is_call_reference_range_in_tree, range_is_call_keyword_label,
-};
-pub(crate) use cpp::{
-    CppBoundedLocalBindingIndex, cpp_bounded_local_binding_index,
-    cpp_type_lookup_resolution_in_session, resolve_cpp_bounded,
-    resolve_cpp_bounded_with_known_local_names,
-};
-pub(crate) use csharp::{
-    CSharpTypeLookupResolution, csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
-};
-pub use go::go_allocation_selector_method;
-pub(crate) use go::{
-    GoDefinitionProvider, GoTypeLookupResolutionKind, GoTypedSelectorTarget,
-    go_type_lookup_resolution, go_typed_selector_target, resolve_go_bounded,
-};
-pub(crate) use java::JavaTypeLookupResolution;
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use kotlin::kotlin_import_model_outcome;
-pub(crate) use kotlin::{
-    KotlinDefinitionProvider, KotlinTypeLookupResolution, kotlin_type_lookup_resolution_in_session,
-    resolve_kotlin_bounded,
-};
-pub(crate) use php::{
-    PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
-};
-pub use python::python_visible_same_file_candidates;
-pub(crate) use python::{
-    PythonAttributeCalleeKind, PythonDefinitionProvider, PythonTypeLookupTarget,
-    python_attribute_callee_kind_bounded,
-    python_attribute_callee_names_enclosing_nested_class_bounded,
-    python_attribute_callee_reads_a_field_bounded,
-    python_attribute_callee_uses_self_or_cls_bounded, python_class_candidate_for_name,
-    python_class_object_base_candidate, python_external_imported_symbol_bounded,
-    python_external_model_namespace_available, python_namespace_imported_class_name_bounded,
-    python_type_checking_imported_class_candidate, python_type_lookup_resolution_bounded,
-    resolve_python_bounded,
-};
-pub(crate) use resolution_session::{BoundedResolution, ResolutionSession};
 
-pub(super) fn session_scope_step(session: Option<&ResolutionSession>) -> bool {
+pub use call_sites::CallSyntaxKind;
+
+pub use call_sites::call_signature_context;
+
+pub(crate) use call_sites::CallSiteSyntax;
+pub(crate) use call_sites::ExactCallReference;
+pub(crate) use call_sites::ExactCallReferenceGap;
+pub(crate) use call_sites::call_reference_ranges_in_tree;
+pub(crate) use call_sites::call_reference_requires_point_lookup;
+pub(crate) use call_sites::call_site_syntax_for_reference;
+pub(crate) use call_sites::exact_call_reference_for_call;
+pub(crate) use call_sites::is_call_reference_range_in_tree;
+pub(crate) use call_sites::range_is_call_keyword_label;
+
+pub(crate) use kotlin::kotlin_import_model_outcome;
+pub(crate) use kotlin::kotlin_package_reference_outcome;
+
+pub(crate) use resolution_session::BoundedResolution;
+pub(crate) use resolution_session::ResolutionSession;
+
+#[doc(hidden)]
+pub fn session_scope_step(session: Option<&ResolutionSession>) -> bool {
     ResolutionSession::scope_step_with_optional_session(session)
 }
 
-pub(crate) use ruby::{
-    RubyBoundedPreflight, RubyDefinitionProvider, resolve_ruby_bounded, ruby_bounded_preflight,
-    ruby_modeled_result_class_bounded, ruby_type_lookup_resolution_bounded,
-};
-pub(crate) use scala::{
-    ScalaDefinitionProvider, ScalaTypeLookupResolution, resolve_scala_bounded,
-    scala_type_lookup_resolution_in_session,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use scala::{
-    reset_scala_active_path_node_visits_for_test, scala_active_path_node_visits_for_test,
-};
-pub use trace::{
-    DispatchQuality, ResolutionTraceResult, TraceCandidate, TraceCandidateRef, TraceCompleteness,
-    boundary_evidence, dispatch_quality_for_status, resolve_definition_batch_with_trace,
-};
+pub use trace::DispatchQuality;
+pub use trace::ResolutionTraceResult;
+pub use trace::TraceCandidate;
+pub use trace::TraceCandidateRef;
+pub use trace::TraceCompleteness;
+pub use trace::boundary_evidence;
+pub use trace::dispatch_quality_for_status;
+pub use trace::resolve_definition_batch_with_trace;
 
 /// Resolve a bare `name` against the lexically enclosing scope chain, innermost
 /// first — the language-agnostic generalization of Java's nested-type resolution
@@ -473,7 +276,8 @@ pub use trace::{
 /// languages: scopes that are CodeUnits (Rust modules) and scopes that are only fqn
 /// prefixes (C#/C++ namespaces, which are not indexed as units) are handled the same
 /// way. `accept` filters the wanted declaration kind (e.g. `CodeUnit::is_class`).
-pub(super) fn resolve_in_enclosing_scopes(
+#[doc(hidden)]
+pub fn resolve_in_enclosing_scopes(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     name: &str,
@@ -598,7 +402,8 @@ pub(super) fn resolve_qualified_name_in_shrinking_scopes_fq(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn resolve_qualified_name_in_fq_prefixes(
+#[doc(hidden)]
+pub fn resolve_qualified_name_in_fq_prefixes(
     language: Language,
     scope: &crate::analyzer::fq_name::FqName,
     reference: &crate::analyzer::fq_name::FqName,
@@ -645,7 +450,8 @@ pub(super) fn resolve_qualified_name_in_fq_prefixes(
 /// unbounded callers). Once `charge_hop` declines, the walk stops
 /// immediately without formatting or looking up further prefixes — matching
 /// how csharp's/java's per-hop `scope_step` budgets truncate the walk today.
-pub(super) fn resolve_qualified_name_in_shrinking_scopes(
+#[doc(hidden)]
+pub fn resolve_qualified_name_in_shrinking_scopes(
     scope: &str,
     reference: &str,
     mut charge_hop: impl FnMut() -> bool,
@@ -663,8 +469,10 @@ pub(super) fn resolve_qualified_name_in_shrinking_scopes(
         })
 }
 
-pub(crate) const SCALA_UNSUPPORTED_CALL_TARGET_SHAPE: &str = "unsupported_scala_call_target_shape";
-pub(crate) const SCALA_UNSUPPORTED_RECEIVER: &str = "unsupported_scala_receiver";
+#[doc(hidden)]
+pub const SCALA_UNSUPPORTED_CALL_TARGET_SHAPE: &str = "unsupported_scala_call_target_shape";
+#[doc(hidden)]
+pub const SCALA_UNSUPPORTED_RECEIVER: &str = "unsupported_scala_receiver";
 
 #[derive(Debug, Clone)]
 pub struct DefinitionLookupRequest {
@@ -727,18 +535,24 @@ pub struct NavigationTarget {
 
 #[derive(Debug, Clone)]
 pub struct NavigationLookupOutcome {
-    pub(crate) modeled_definitions: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
+    #[doc(hidden)]
+    pub modeled_definitions: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
     pub status: DefinitionLookupStatus,
-    pub(crate) reference: Option<ResolvedReferenceSite>,
+    #[doc(hidden)]
+    pub reference: Option<ResolvedReferenceSite>,
     pub targets: Vec<NavigationTarget>,
     pub lexical_definition: Option<LexicalDefinition>,
     pub diagnostics: Vec<DefinitionLookupDiagnostic>,
-    pub(crate) structure_unavailable: bool,
-    pub(crate) unproven_link_unit: bool,
-    pub(crate) truncated: bool,
+    #[doc(hidden)]
+    pub structure_unavailable: bool,
+    #[doc(hidden)]
+    pub unproven_link_unit: bool,
+    #[doc(hidden)]
+    pub truncated: bool,
     /// The resolver's own call evidence for this request, retained so the
     /// navigation route can answer a call-target batch without discarding it.
-    pub(crate) evidence: CallEvidence,
+    #[doc(hidden)]
+    pub evidence: CallEvidence,
 }
 
 impl NavigationLookupOutcome {
@@ -760,21 +574,25 @@ pub struct CallTargetLookupOutcome {
     /// receiver, retained from the same language-resolution pass that produced
     /// `outcome`. This shapes model applicability without identifying a method
     /// target.
-    pub(crate) call_application: CallApplicationKind,
+    #[doc(hidden)]
+    pub call_application: CallApplicationKind,
     /// Exact declaration-side evidence about whether the selected callable can
     /// dispatch beyond itself. `None` means the resolver did not prove it.
-    pub(crate) dispatch_extensibility: Option<DispatchExtensibility>,
+    #[doc(hidden)]
+    pub dispatch_extensibility: Option<DispatchExtensibility>,
     /// Canonical external callee identity carried from the exact declaration
     /// proof that selected it, together with every call-shape fact needed to
     /// bind a model. This is stronger than recovering a name or arity from
     /// `outcome` and the structural call independently: presence proves one
     /// modeled callable rather than merely a spelling that crossed the
     /// workspace boundary.
-    pub(crate) exact_external_call: Option<ExactExternalCallProof>,
+    #[doc(hidden)]
+    pub exact_external_call: Option<ExactExternalCallProof>,
     /// Resolver-owned external owner/member identity. Unlike
     /// `exact_external_call`, this carries no arity or receiver evidence and
     /// must never mint an exact semantic procedure target on its own.
-    pub(crate) external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
+    #[doc(hidden)]
+    pub external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
     pub structure_unavailable: bool,
     pub unproven_link_unit: bool,
     pub truncated: bool,
@@ -789,7 +607,8 @@ impl CallTargetLookupOutcome {
     /// route that decides instead -- by language, as this one did until #3496
     /// -- silently drops the proof of any language it has not been taught
     /// about.
-    fn from_resolution(resolution: DefinitionResolution) -> Self {
+    #[doc(hidden)]
+    pub fn from_resolution(resolution: DefinitionResolution) -> Self {
         Self {
             outcome: resolution.outcome,
             authority: resolution.evidence.authority,
@@ -893,11 +712,16 @@ impl CallTargetLookupOutcome {
 /// the call site. Consumers must not rebuild these facts from separate display,
 /// structural, or semantic representations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExactExternalCallProof {
-    canonical_callee: Box<str>,
-    call_application: CallApplicationKind,
-    dispatch_extensibility: Option<DispatchExtensibility>,
-    parameter_count: u32,
+#[doc(hidden)]
+pub struct ExactExternalCallProof {
+    #[doc(hidden)]
+    pub canonical_callee: Box<str>,
+    #[doc(hidden)]
+    pub call_application: CallApplicationKind,
+    #[doc(hidden)]
+    pub dispatch_extensibility: Option<DispatchExtensibility>,
+    #[doc(hidden)]
+    pub parameter_count: u32,
     /// The source module's configured, prepared JDK artifact, retained only
     /// after the selected callee declaration names the same exact artifact.
     /// A separate model and dispatch check is still required for an obligation.
@@ -905,12 +729,16 @@ pub(crate) struct ExactExternalCallProof {
     /// Exact PyPI artifact resolved for this Python callable from installed
     /// artifact state joined to an active semantic profile, and promoted only
     /// by matching defining-binding and provider tokens.
-    python_runtime_artifact:
+    #[doc(hidden)]
+    pub python_runtime_artifact:
         Option<crate::analyzer::semantic_model::SemanticModelActivationEvidence>,
     /// Formal declaration slots copied only from the checked Python defining
     /// binding that promoted this proof.
-    python_formal_slots: Option<Box<[crate::analyzer::lexical_definitions::FormalParameterSlot]>>,
-    python_model_manifest_sha256: Option<Box<str>>,
+    #[doc(hidden)]
+    pub python_formal_slots:
+        Option<Box<[crate::analyzer::lexical_definitions::FormalParameterSlot]>>,
+    #[doc(hidden)]
+    pub python_model_manifest_sha256: Option<Box<str>>,
     external_member_identity: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
 }
 
@@ -959,14 +787,16 @@ impl ExactExternalCallProof {
         }
     }
 
-    pub(crate) fn go_package_function(
+    #[doc(hidden)]
+    pub fn go_package_function(
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
     ) -> Self {
         Self::package_function(canonical_callee, parameter_count)
     }
 
-    pub(crate) fn go_concrete_receiver(
+    #[doc(hidden)]
+    pub fn go_concrete_receiver(
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
     ) -> Self {
@@ -983,7 +813,8 @@ impl ExactExternalCallProof {
         }
     }
 
-    pub(crate) fn go_interface_receiver(
+    #[doc(hidden)]
+    pub fn go_interface_receiver(
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
     ) -> Self {
@@ -1004,7 +835,8 @@ impl ExactExternalCallProof {
     /// when external declaration facts do not prove the method body or its
     /// dispatch closure. This can name a reviewed model lookup, but cannot
     /// discharge the caller's dynamic-dispatch gap.
-    pub(crate) fn go_receiver_candidate(
+    #[doc(hidden)]
+    pub fn go_receiver_candidate(
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
     ) -> Self {
@@ -1021,7 +853,8 @@ impl ExactExternalCallProof {
         }
     }
 
-    pub(crate) fn js_ts_direct_named_import(
+    #[doc(hidden)]
+    pub fn js_ts_direct_named_import(
         module_specifier: &str,
         imported_name: &str,
         parameter_count: u32,
@@ -1054,21 +887,15 @@ impl ExactExternalCallProof {
     /// modeled declaration rather than by the callee's spelling, and the call
     /// shape is a package function because no written value participates --
     /// exactly as a direct named import is receiverless.
-    pub(crate) fn js_ts_global_function(
-        global_object: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn js_ts_global_function(global_object: &str, member: &str, parameter_count: u32) -> Self {
         assert!(!global_object.is_empty(), "a global object must be named");
         assert!(!member.is_empty(), "a global member must be named");
         Self::package_function(format!("{global_object}.{member}"), parameter_count)
     }
 
-    pub(crate) fn js_ts_bound_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn js_ts_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external receiver owner must be named"
@@ -1088,11 +915,8 @@ impl ExactExternalCallProof {
     /// names. Ruby permits reopening a class at runtime, so the reviewed pack
     /// proves the selected declaration, not that the language has a closed
     /// dispatch universe.
-    pub(crate) fn ruby_bound_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn ruby_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external receiver owner must be named"
@@ -1139,11 +963,8 @@ impl ExactExternalCallProof {
     /// A C# type-qualified call whose modeled declaration proves one static
     /// signature. The receiverless application is kept with the canonical
     /// owner/member identity so an activated summary can select its formals.
-    pub(crate) fn csharp_static_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn csharp_static_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external receiver owner must be named"
@@ -1155,11 +976,8 @@ impl ExactExternalCallProof {
     /// A C# instance call whose external declaration proves the receiver's
     /// owner and one applicable signature. The target may still dispatch to
     /// an external override, so the proof leaves dispatch extensibility open.
-    pub(crate) fn csharp_bound_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn csharp_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external receiver owner must be named"
@@ -1186,11 +1004,8 @@ impl ExactExternalCallProof {
     /// An external C# object creation has no written receiver. Its exact
     /// constructor declaration and applicable arity are supplied by the
     /// assembly/model surface, just as for an external Java constructor.
-    pub(crate) fn csharp_external_constructor(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn csharp_external_constructor(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external constructor owner must be named"
@@ -1201,18 +1016,16 @@ impl ExactExternalCallProof {
         proof
     }
 
-    pub(crate) fn python_imported_call(
+    #[doc(hidden)]
+    pub fn python_imported_call(
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
     ) -> Self {
         Self::python_package_function(canonical_callee, parameter_count)
     }
 
-    pub(crate) fn python_bound_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn python_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external Python receiver owner must be named"
@@ -1224,7 +1037,8 @@ impl ExactExternalCallProof {
         Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
     }
 
-    pub(crate) fn python_builtin_call(
+    #[doc(hidden)]
+    pub fn python_builtin_call(
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
     ) -> Self {
@@ -1251,11 +1065,8 @@ impl ExactExternalCallProof {
     /// `owner` is the dot-joined model key. The member follows the Rust
     /// qualified-call separator, which is where the shared splitter cuts the
     /// text back into the same owner and member.
-    pub(crate) fn rust_bound_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn rust_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external receiver owner must be named"
@@ -1283,10 +1094,8 @@ impl ExactExternalCallProof {
     /// (`has_receiver: false`), exactly as #2596 pinned for the summary key.
     /// The emitted member is the path's terminal segment and the owner is the
     /// dot-joined prefix.
-    pub(crate) fn rust_external_call(
-        canonical_callee: impl Into<Box<str>>,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn rust_external_call(canonical_callee: impl Into<Box<str>>, parameter_count: u32) -> Self {
         let canonical_callee = canonical_callee.into();
         assert!(
             !canonical_callee.is_empty(),
@@ -1305,11 +1114,8 @@ impl ExactExternalCallProof {
     /// target `path` (#2610). The text uses the C/C++ scope separator so the
     /// shared call-site splitter recovers exactly that pair. A C function binds
     /// no written value, so the call shape is a package function.
-    pub(crate) fn c_header_function(
-        header_module: &str,
-        function: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn c_header_function(header_module: &str, function: &str, parameter_count: u32) -> Self {
         assert!(
             !header_module.is_empty() && !header_module.contains("::"),
             "a header module identity must round-trip through the C/C++ separator: {header_module:?}"
@@ -1332,11 +1138,8 @@ impl ExactExternalCallProof {
     /// closure declares one exact external function at the written arity.
     /// The namespace is part of the structured declaration identity, so it may
     /// contain nested scope components.
-    pub(crate) fn cpp_header_function(
-        namespace: &str,
-        function: &str,
-        parameter_count: u32,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn cpp_header_function(namespace: &str, function: &str, parameter_count: u32) -> Self {
         assert!(!namespace.is_empty(), "a C++ namespace must be named");
         assert!(!function.is_empty(), "a C++ function must be named");
         Self {
@@ -1352,7 +1155,8 @@ impl ExactExternalCallProof {
         }
     }
 
-    pub(crate) fn canonical_callee(&self) -> &str {
+    #[doc(hidden)]
+    pub fn canonical_callee(&self) -> &str {
         &self.canonical_callee
     }
 
@@ -1381,690 +1185,55 @@ impl ExactExternalCallProof {
         self
     }
 
-    /// Promote the lexical Python call-shape proof only when the active
-    /// defining binding and installed-provider proof identify the same exact
-    /// artifact in the same source and published workspace snapshot.
-    pub(crate) fn with_python_runtime_binding(
-        mut self,
-        binding: &crate::analyzer::python::runtime_binding::PythonDefiningBinding,
-        provider: &crate::analyzer::python::runtime_binding::PythonRuntimeProviderProof,
-    ) -> Option<Self> {
-        if binding.artifact() != provider.artifact()
-            || binding.source_path() != provider.source_path()
-            || binding.snapshot() != provider.snapshot()
-        {
-            return None;
-        }
-
-        let artifact = provider.artifact();
-        let evidence = provider.evidence();
-        assert_eq!(evidence.language, "python");
-        assert_eq!(evidence.ecosystem, "python");
-        let package = evidence
-            .package
-            .as_ref()
-            .expect("checked Python provider evidence names its PyPI artifact");
-        assert_eq!(package.name, artifact.purl());
-        assert!(package.version.is_none());
-        assert_eq!(
-            evidence.artifact_sha256.as_deref(),
-            Some(artifact.archive_sha256()),
-            "provider evidence retains the raw installed archive SHA-256"
-        );
-        assert!(
-            !binding.canonical().is_empty()
-                && binding
-                    .canonical()
-                    .iter()
-                    .all(|component| !component.is_empty()),
-            "checked defining bindings have nonempty canonical components"
-        );
-
-        self.canonical_callee = binding.canonical().join(".").into_boxed_str();
-        self.python_runtime_artifact = Some(evidence.clone());
-        self.python_model_manifest_sha256 = Some(binding.model_manifest_sha256().into());
-        self.python_formal_slots = Some(binding.formal_slots().to_vec().into_boxed_slice());
-        Some(self)
-    }
-
     pub(crate) fn source_jdk_artifact(
         &self,
     ) -> Option<&crate::analyzer::semantic_model::SemanticModelActivationEvidence> {
         self.source_jdk_artifact.as_ref()
     }
 
-    pub(crate) fn python_model_manifest_sha256(&self) -> Option<&str> {
+    #[doc(hidden)]
+    pub fn python_model_manifest_sha256(&self) -> Option<&str> {
         self.python_model_manifest_sha256.as_deref()
     }
 
-    pub(crate) fn python_runtime_artifact(
+    #[doc(hidden)]
+    pub fn python_runtime_artifact(
         &self,
     ) -> Option<&crate::analyzer::semantic_model::SemanticModelActivationEvidence> {
         self.python_runtime_artifact.as_ref()
     }
 
-    pub(crate) fn python_formal_slots(
+    #[doc(hidden)]
+    pub fn python_formal_slots(
         &self,
     ) -> Option<&[crate::analyzer::lexical_definitions::FormalParameterSlot]> {
         self.python_formal_slots.as_deref()
     }
 
-    pub(crate) const fn call_application(&self) -> CallApplicationKind {
+    #[doc(hidden)]
+    pub const fn call_application(&self) -> CallApplicationKind {
         self.call_application
     }
 
-    pub(crate) const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
+    #[doc(hidden)]
+    pub const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
         self.dispatch_extensibility
     }
 
-    pub(crate) const fn parameter_count(&self) -> u32 {
+    #[doc(hidden)]
+    pub const fn parameter_count(&self) -> u32 {
         self.parameter_count
     }
 
-    pub(crate) const fn has_receiver(&self) -> bool {
+    #[doc(hidden)]
+    pub const fn has_receiver(&self) -> bool {
         matches!(self.call_application, CallApplicationKind::BoundReceiver)
     }
 }
 
-struct PythonRuntimeBindingAndProvider {
-    binding: crate::analyzer::python::runtime_binding::PythonDefiningBinding,
-    provider: crate::analyzer::python::runtime_binding::PythonRuntimeProviderProof,
-}
-
-struct PythonImportedMember<'a> {
-    module: &'a [String],
-    member: &'a str,
-}
-
-type PythonDefiningBindingResolver = fn(
-    &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
-    &crate::analyzer::semantic_model::SemanticModelActivationEvidence,
-    &[String],
-    &str,
-    &std::path::Path,
-    &crate::analyzer::store::WorkspaceSnapshotId,
-    Option<&crate::analyzer::semantic_model::PythonConditionSnapshot>,
-) -> Result<
-    crate::analyzer::python::runtime_binding::PythonDefiningBinding,
-    crate::analyzer::python::runtime_binding::PythonRuntimeBindingError,
->;
-
-enum PythonRuntimeBindingFailure {
-    Binding(crate::analyzer::python::runtime_binding::PythonRuntimeBindingError),
-    ProviderIncomplete(String),
-    ProviderStale(String),
-    ProviderVerification(String),
-}
-
-fn python_runtime_binding_failure_parts(
-    failure: PythonRuntimeBindingFailure,
-) -> (DefinitionLookupStatus, &'static str, String) {
-    match failure {
-        PythonRuntimeBindingFailure::Binding(error) => {
-            let status = if matches!(
-                &error,
-                crate::analyzer::python::runtime_binding::PythonRuntimeBindingError::Ambiguous(_)
-            ) {
-                DefinitionLookupStatus::Ambiguous
-            } else {
-                DefinitionLookupStatus::Incomplete
-            };
-            (
-                status,
-                "python_runtime_binding_incomplete",
-                format!("{error:?}"),
-            )
-        }
-        PythonRuntimeBindingFailure::ProviderIncomplete(message) => (
-            DefinitionLookupStatus::Incomplete,
-            "python_runtime_provider_incomplete",
-            message,
-        ),
-        PythonRuntimeBindingFailure::ProviderStale(message) => (
-            DefinitionLookupStatus::Incomplete,
-            "python_runtime_provider_stale",
-            message,
-        ),
-        PythonRuntimeBindingFailure::ProviderVerification(message) => (
-            DefinitionLookupStatus::Incomplete,
-            "python_runtime_applicability_incomplete",
-            message,
-        ),
-    }
-}
-
-fn python_runtime_binding_failure_diagnostic(
-    failure: PythonRuntimeBindingFailure,
-) -> DefinitionLookupDiagnostic {
-    let (_, kind, message) = python_runtime_binding_failure_parts(failure);
-    DefinitionLookupDiagnostic {
-        kind: kind.to_owned(),
-        message,
-        claim: None,
-    }
-}
-
-fn python_class_resolution_incomplete_diagnostic(
-    message: impl Into<String>,
-) -> DefinitionLookupDiagnostic {
-    DefinitionLookupDiagnostic {
-        kind: "python_imported_class_resolution_incomplete".to_owned(),
-        message: message.into(),
-        claim: None,
-    }
-}
-
-fn python_incomplete_class_value(
-    mut outcome: DefinitionLookupOutcome,
-    status: DefinitionLookupStatus,
-    diagnostic: DefinitionLookupDiagnostic,
-) -> DefinitionLookupOutcome {
-    if status == DefinitionLookupStatus::Ambiguous {
-        // no candidates: the binding resolver proves competing native class
-        // declarations but withholds their identities, so there is no exact
-        // modeled symbol this outcome can safely publish.
-        let mut ambiguous = ambiguous_without_candidates(
-            "the imported Python class binding has multiple native declarations",
-        );
-        ambiguous.reference = outcome.reference.take();
-        ambiguous.diagnostics.append(&mut outcome.diagnostics);
-        ambiguous.diagnostics.push(diagnostic);
-        return ambiguous;
-    }
-    outcome.status = status;
-    outcome.definitions.clear();
-    outcome.modeled_definitions.clear();
-    outcome.lexical_definition = None;
-    outcome.diagnostics.push(diagnostic);
-    outcome
-}
-
-enum PythonRuntimeBindingAttempt {
-    Unavailable,
-    Cancelled,
-    Resolved(Box<PythonRuntimeBindingAndProvider>),
-    Failed(PythonRuntimeBindingFailure),
-}
-
-fn resolve_python_runtime_binding(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    imported: PythonImportedMember<'_>,
-    cancellation: Option<&CancellationToken>,
-    resolve_binding: PythonDefiningBindingResolver,
-) -> PythonRuntimeBindingAttempt {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return PythonRuntimeBindingAttempt::Cancelled;
-    }
-    let Some(active_snapshot) = analyzer.active_semantic_model_snapshot() else {
-        return PythonRuntimeBindingAttempt::Unavailable;
-    };
-    let Some(publication) = active_snapshot.python_runtime() else {
-        return PythonRuntimeBindingAttempt::Unavailable;
-    };
-    let Some(python_analyzer) = resolve_analyzer::<crate::analyzer::PythonAnalyzer>(analyzer)
-    else {
-        return PythonRuntimeBindingAttempt::Unavailable;
-    };
-    let Some((store, current_snapshot)) = python_analyzer.python_runtime_store_snapshot() else {
-        return PythonRuntimeBindingAttempt::Unavailable;
-    };
-
-    let selected = store.with_python_runtime_acquisition(
-        publication.acquisition_id,
-        &publication.snapshot,
-        |tx| {
-            crate::analyzer::python::runtime_provider::python_runtime_provider_lookup(
-                tx,
-                publication.acquisition_id,
-                &publication.snapshot,
-                file.rel_path(),
-                &imported.module.join("."),
-            )
-        },
-    );
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return PythonRuntimeBindingAttempt::Cancelled;
-    }
-    let candidate = match selected {
-        Ok(rows)
-            if current_snapshot == publication.snapshot
-                && !rows.has_scope_ambiguity
-                && rows.unresolved_scopes.is_empty()
-                && rows.candidates.len() == 1 =>
-        {
-            rows.candidates.into_iter().next().expect("one provider")
-        }
-        Ok(rows) => {
-            return PythonRuntimeBindingAttempt::Failed(
-                PythonRuntimeBindingFailure::ProviderIncomplete(format!("{rows:?}")),
-            );
-        }
-        Err(error) => {
-            return PythonRuntimeBindingAttempt::Failed(
-                PythonRuntimeBindingFailure::ProviderStale(error.to_string()),
-            );
-        }
-    };
-    let selected_evidence = crate::analyzer::semantic_model::SemanticModelActivationEvidence {
-        language: "python".into(),
-        ecosystem: "python".into(),
-        package: candidate.purl.as_ref().map(|purl| {
-            crate::analyzer::semantic_model::CatalogCoordinate {
-                name: purl.clone(),
-                version: None,
-            }
-        }),
-        module: None,
-        toolchain: None,
-        target: None,
-        configuration: None,
-        artifact_sha256: candidate.archive_sha256.clone(),
-    };
-    let fallback_cancellation = CancellationToken::default();
-    let provider_limits = crate::analyzer::semantic_model::DependencyPackLimits::default();
-    let provider_context =
-        crate::analyzer::python::runtime_provider::PythonRuntimeProviderContext {
-            store: &store,
-            publication,
-            workspace_root: analyzer.project().root(),
-            limits: &provider_limits,
-            cancellation: cancellation.unwrap_or(&fallback_cancellation),
-        };
-    let binding = match provider_context.checked_environment(candidate.environment_id) {
-        Ok(checked) => resolve_binding(
-            active_snapshot.active_models(),
-            &selected_evidence,
-            imported.module,
-            imported.member,
-            file.rel_path(),
-            &publication.snapshot,
-            Some(&checked.condition_snapshot()),
-        ),
-        Err(error) => Err(
-            crate::analyzer::python::runtime_binding::PythonRuntimeBindingError::Incomplete(vec![
-                crate::analyzer::python::runtime_binding::PythonRuntimeBindingDiagnostic {
-                    code: "python.runtime_binding.environment_incomplete",
-                    message: format!("{error:?}"),
-                },
-            ]),
-        ),
-    };
-    let binding = match binding {
-        Ok(_) if cancellation.is_some_and(CancellationToken::is_cancelled) => {
-            return PythonRuntimeBindingAttempt::Cancelled;
-        }
-        Ok(binding) => binding,
-        Err(_) if cancellation.is_some_and(CancellationToken::is_cancelled) => {
-            return PythonRuntimeBindingAttempt::Cancelled;
-        }
-        Err(
-            crate::analyzer::python::runtime_binding::PythonRuntimeBindingError::NotClassOrModuleValue,
-        ) => return PythonRuntimeBindingAttempt::Unavailable,
-        Err(error) => {
-            return PythonRuntimeBindingAttempt::Failed(PythonRuntimeBindingFailure::Binding(
-                error,
-            ));
-        }
-    };
-
-    let mut provider = Err(crate::analyzer::store::StoreError::stale_resolution(
-        "Python defining binding touched no import module",
-    ));
-    let mut provider_environment = None;
-    for module in binding.touched_modules() {
-        let checked = provider_context.verify_selected_provider(
-            file.rel_path(),
-            module,
-            &binding,
-            &selected_evidence,
-        );
-        match checked {
-            Ok(checked)
-                if provider_environment
-                    .is_none_or(|environment| environment == checked.environment_id()) =>
-            {
-                provider_environment = Some(checked.environment_id());
-                provider = Ok(checked);
-            }
-            Ok(checked) => {
-                provider = Err(crate::analyzer::store::StoreError::stale_resolution(
-                    format!(
-                        "Python touched modules resolved through different environments: {} and {}",
-                        provider_environment.expect("an earlier touched module was checked"),
-                        checked.environment_id()
-                    ),
-                ));
-                break;
-            }
-            Err(error) => {
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    return PythonRuntimeBindingAttempt::Cancelled;
-                }
-                provider = Err(error);
-                break;
-            }
-        }
-    }
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return PythonRuntimeBindingAttempt::Cancelled;
-    }
-    match provider {
-        Ok(provider) => {
-            PythonRuntimeBindingAttempt::Resolved(Box::new(PythonRuntimeBindingAndProvider {
-                binding,
-                provider,
-            }))
-        }
-        Err(error) => PythonRuntimeBindingAttempt::Failed(
-            PythonRuntimeBindingFailure::ProviderVerification(error.to_string()),
-        ),
-    }
-}
-
-fn python_class_symbol_from_binding(
-    analyzer: &dyn IAnalyzer,
-    binding: &crate::analyzer::python::runtime_binding::PythonDefiningBinding,
-    provider: &crate::analyzer::python::runtime_binding::PythonRuntimeProviderProof,
-) -> Result<crate::analyzer::semantic_model::SemanticModelSymbol, String> {
-    if binding.value_identity().is_some() {
-        return python_module_value_symbol_from_binding(analyzer, binding, provider);
-    }
-    use crate::analyzer::semantic_model::{
-        Locator, SemanticModelOriginKind, SemanticModelProof, SemanticModelSymbolKind, TypeKind,
-    };
-
-    let Some(identity) = binding.class_identity() else {
-        return Err("Python defining binding is callable, not a class object".to_owned());
-    };
-    if identity.native_declaration_id().is_empty()
-        || identity.portable_symbol().is_empty()
-        || binding.artifact() != provider.artifact()
-        || binding.source_path() != provider.source_path()
-        || binding.snapshot() != provider.snapshot()
-    {
-        return Err("Python class identity and installed-provider evidence disagree".to_owned());
-    }
-    let Some(active_snapshot) = analyzer.active_semantic_model_snapshot() else {
-        return Err("active Python semantic-model snapshot is unavailable".to_owned());
-    };
-    if active_snapshot
-        .python_runtime()
-        .is_none_or(|publication| publication.snapshot != *binding.snapshot())
-    {
-        return Err("active Python provider publication changed during lookup".to_owned());
-    }
-    let Some(overlay) = active_snapshot.semantic_model_overlay() else {
-        return Err("active Python declaration overlay is unavailable".to_owned());
-    };
-    let modeled = overlay.symbols_with_id(identity.native_declaration_id());
-    if modeled.disposition
-        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-        || modeled.records.len() != 1
-    {
-        return Err(format!(
-            "native Python class identity did not select one overlay symbol: {:?}",
-            modeled.disposition
-        ));
-    }
-    let symbol = modeled.records[0];
-    let active_models = active_snapshot.active_models();
-    let mut matching_declarations = Vec::new();
-    for shard in active_models.shards().iter().filter(|shard| {
-        shard.manifest.content_sha256 == binding.model_manifest_sha256()
-            && shard
-                .matching_evidence
-                .iter()
-                .any(|evidence| evidence == provider.evidence())
-    }) {
-        let Some((types, _, _)) = shard.shard.payload().declaration_facts() else {
-            continue;
-        };
-        for declaration in types
-            .iter()
-            .filter(|declaration| declaration.id == identity.native_declaration_id())
-        {
-            let Locator::Interchange {
-                symbol: portable_symbol,
-                identity: portable_identity,
-                ..
-            } = &declaration.locator
-            else {
-                continue;
-            };
-            if declaration.type_kind == TypeKind::Class
-                && portable_symbol == identity.portable_symbol()
-                && crate::analyzer::semantic_model::csmi::python::validate_identity(
-                    portable_identity,
-                )
-                .is_ok()
-                && crate::analyzer::semantic_model::csmi::python::native_id(portable_identity)
-                    == declaration.id
-            {
-                matching_declarations.push((shard, declaration));
-            }
-        }
-    }
-    if matching_declarations.len() != 1 {
-        let candidates = matching_declarations
-            .iter()
-            .map(|(shard, declaration)| {
-                (
-                    shard.manifest.content_sha256.as_str(),
-                    shard.shard.shard_id(),
-                    shard.source_id.as_str(),
-                    declaration.id.as_str(),
-                )
-            })
-            .collect::<Vec<_>>();
-        return Err(format!(
-            "native Python class identity did not select one checked active manifest declaration record: {candidates:?}"
-        ));
-    }
-    let (native_shard, native_declaration) = matching_declarations[0];
-    if symbol.language != "python"
-        || symbol.kind != SemanticModelSymbolKind::Class
-        || symbol.provenance.ambiguous
-        || symbol.provenance.origin != SemanticModelOriginKind::DeclarativeModel
-        || symbol.provenance.proof != SemanticModelProof::ExactArtifact
-        || symbol.locator_symbol.as_deref() != Some(identity.portable_symbol())
-        || symbol.qualified_name != binding.canonical().join(".")
-        || symbol.provenance.active_model_set_hash != active_models.active_model_set_hash()
-        || symbol.provenance.pack_id != native_shard.manifest.pack_id
-        || symbol.provenance.pack_digest != native_shard.manifest.semantic_sha256
-        || symbol.provenance.pack_version != native_shard.manifest.version
-        || symbol.provenance.producer != native_shard.manifest.producer.name
-        || symbol.provenance.producer_version != native_shard.manifest.producer.version
-        || symbol.provenance.record_id != native_declaration.id
-        || symbol.provenance.activation.status != "active"
-        || symbol.provenance.activation.source_id != native_shard.source_id
-        || !python_model_symbol_matches_provider(symbol, provider.evidence())
-    {
-        return Err(format!(
-            "native Python class identity does not match the checked model publication: {}",
-            symbol.id
-        ));
-    }
-    Ok(symbol.clone())
-}
-
-fn python_module_value_symbol_from_binding(
-    analyzer: &dyn IAnalyzer,
-    binding: &crate::analyzer::python::runtime_binding::PythonDefiningBinding,
-    provider: &crate::analyzer::python::runtime_binding::PythonRuntimeProviderProof,
-) -> Result<crate::analyzer::semantic_model::SemanticModelSymbol, String> {
-    use crate::analyzer::semantic_model::{
-        Locator, MemberKind, SemanticModelOriginKind, SemanticModelProof, SemanticModelSymbolKind,
-        TypeKind,
-    };
-
-    let Some(identity) = binding.value_identity() else {
-        return Err("Python defining binding is not a module-level value".to_owned());
-    };
-    if identity.native_declaration_id().is_empty()
-        || identity.portable_symbol().is_empty()
-        || binding.artifact() != provider.artifact()
-        || binding.source_path() != provider.source_path()
-        || binding.snapshot() != provider.snapshot()
-    {
-        return Err("Python module-value identity and installed-provider evidence disagree".into());
-    }
-    let Some(active_snapshot) = analyzer.active_semantic_model_snapshot() else {
-        return Err("active Python semantic-model snapshot is unavailable".to_owned());
-    };
-    if active_snapshot
-        .python_runtime()
-        .is_none_or(|publication| publication.snapshot != *binding.snapshot())
-    {
-        return Err("active Python provider publication changed during lookup".to_owned());
-    }
-    let Some(overlay) = active_snapshot.semantic_model_overlay() else {
-        return Err("active Python declaration overlay is unavailable".to_owned());
-    };
-    let modeled = overlay.symbols_with_id(identity.native_declaration_id());
-    if modeled.disposition
-        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-        || modeled.records.len() != 1
-    {
-        return Err(format!(
-            "native Python module-value identity did not select one overlay symbol: {:?}",
-            modeled.disposition
-        ));
-    }
-    let symbol = modeled.records[0];
-    let active_models = active_snapshot.active_models();
-    let mut matching_declarations = Vec::new();
-    for shard in active_models.shards().iter().filter(|shard| {
-        shard.manifest.content_sha256 == binding.model_manifest_sha256()
-            && shard
-                .matching_evidence
-                .iter()
-                .any(|evidence| evidence == provider.evidence())
-    }) {
-        let Some((types, members, _)) = shard.shard.payload().declaration_facts() else {
-            continue;
-        };
-        for member in members
-            .iter()
-            .filter(|member| member.id == identity.native_declaration_id())
-        {
-            let Some((_, module_segments)) = binding.canonical().split_last() else {
-                return Err("Python module-value identity has no owner path".to_owned());
-            };
-            if module_segments.is_empty() {
-                return Err("Python module-value identity has no owner path".to_owned());
-            }
-            let module_name = module_segments.join(".");
-            let Locator::Interchange {
-                symbol: portable_symbol,
-                identity: portable_identity,
-                ..
-            } = &member.locator
-            else {
-                continue;
-            };
-            let module_owner = types.iter().any(|owner| {
-                owner.id == member.owner
-                    && owner.type_kind == TypeKind::Module
-                    && owner.name == module_name
-            });
-            if member.member_kind == MemberKind::Field
-                && member.value_type.is_some()
-                && module_owner
-                && portable_symbol == identity.portable_symbol()
-                && crate::analyzer::semantic_model::csmi::python::validate_identity(
-                    portable_identity,
-                )
-                .is_ok()
-                && crate::analyzer::semantic_model::csmi::python::native_id(portable_identity)
-                    == member.id
-            {
-                matching_declarations.push((shard, member));
-            }
-        }
-    }
-    if matching_declarations.len() != 1 {
-        let candidates = matching_declarations
-            .iter()
-            .map(|(shard, member)| {
-                (
-                    shard.manifest.content_sha256.as_str(),
-                    shard.shard.shard_id(),
-                    shard.source_id.as_str(),
-                    member.id.as_str(),
-                )
-            })
-            .collect::<Vec<_>>();
-        return Err(format!(
-            "native Python module-value identity did not select one checked active manifest declaration record: {candidates:?}"
-        ));
-    }
-    let (native_shard, native_declaration) = matching_declarations[0];
-    if symbol.language != "python"
-        || symbol.kind != SemanticModelSymbolKind::Field
-        || symbol.provenance.ambiguous
-        || symbol.provenance.origin != SemanticModelOriginKind::DeclarativeModel
-        || symbol.provenance.proof != SemanticModelProof::ExactArtifact
-        || symbol.locator_symbol.as_deref() != Some(identity.portable_symbol())
-        || symbol.qualified_name != binding.canonical().join(".")
-        || symbol.owner_id.as_deref() != Some(native_declaration.owner.as_str())
-        || symbol.provenance.active_model_set_hash != active_models.active_model_set_hash()
-        || symbol.provenance.pack_id != native_shard.manifest.pack_id
-        || symbol.provenance.pack_digest != native_shard.manifest.semantic_sha256
-        || symbol.provenance.pack_version != native_shard.manifest.version
-        || symbol.provenance.producer != native_shard.manifest.producer.name
-        || symbol.provenance.producer_version != native_shard.manifest.producer.version
-        || symbol.provenance.record_id != native_declaration.id
-        || symbol.provenance.activation.status != "active"
-        || symbol.provenance.activation.source_id != native_shard.source_id
-        || !python_model_symbol_matches_provider(symbol, provider.evidence())
-    {
-        return Err(format!(
-            "native Python module-value identity does not match the checked model publication: {}",
-            symbol.id
-        ));
-    }
-    Ok(symbol.clone())
-}
-
-fn python_model_symbol_matches_provider(
-    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
-    evidence: &crate::analyzer::semantic_model::SemanticModelActivationEvidence,
-) -> bool {
-    use crate::analyzer::semantic_model::{CatalogCoordinate, SemanticModelMatchedCoordinate};
-
-    fn coordinate_matches(
-        matched: Option<&SemanticModelMatchedCoordinate>,
-        expected: Option<&CatalogCoordinate>,
-    ) -> bool {
-        match (matched, expected) {
-            (None, None) => true,
-            (Some(matched), Some(expected)) => {
-                matched.name == expected.name
-                    && match &expected.version {
-                        None => matched.version.is_none(),
-                        Some(version) => {
-                            matched.version.as_deref() == Some(version.to_string().as_str())
-                        }
-                    }
-            }
-            _ => false,
-        }
-    }
-
-    let matched = &symbol.provenance.activation.matched_evidence;
-    matched.language == evidence.language
-        && matched.ecosystem == evidence.ecosystem
-        && coordinate_matches(matched.package.as_ref(), evidence.package.as_ref())
-        && coordinate_matches(matched.module.as_ref(), evidence.module.as_ref())
-        && coordinate_matches(matched.toolchain.as_ref(), evidence.toolchain.as_ref())
-        && matched.target == evidence.target
-        && matched.configuration == evidence.configuration
-        && matched.artifact_sha256 == evidence.artifact_sha256
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum CallApplicationKind {
+#[doc(hidden)]
+pub enum CallApplicationKind {
     /// `p.F(args...)`: no receiver participates in the callable contract.
     PackageFunction,
     /// `v.M(args...)`: the selected method is bound to the written value.
@@ -2087,12 +1256,18 @@ pub(crate) enum CallApplicationKind {
 /// of evidence-publishing languages discarded Ruby's boundary proof for as
 /// long as Ruby was missing from it (#3459, #3496).
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CallEvidence {
-    pub(crate) authority: DefinitionResolutionAuthority,
-    call_application: CallApplicationKind,
-    dispatch_extensibility: Option<DispatchExtensibility>,
-    exact_external_call: Option<ExactExternalCallProof>,
-    external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
+#[doc(hidden)]
+pub struct CallEvidence {
+    #[doc(hidden)]
+    pub authority: DefinitionResolutionAuthority,
+    #[doc(hidden)]
+    pub call_application: CallApplicationKind,
+    #[doc(hidden)]
+    pub dispatch_extensibility: Option<DispatchExtensibility>,
+    #[doc(hidden)]
+    pub exact_external_call: Option<ExactExternalCallProof>,
+    #[doc(hidden)]
+    pub external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
 }
 
 impl CallEvidence {
@@ -2151,22 +1326,26 @@ impl CallEvidence {
     }
 
     #[cfg(test)]
-    pub(crate) const fn call_application(&self) -> CallApplicationKind {
+    #[doc(hidden)]
+    pub const fn call_application(&self) -> CallApplicationKind {
         self.call_application
     }
 
     #[cfg(test)]
-    pub(crate) const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
+    #[doc(hidden)]
+    pub const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
         self.dispatch_extensibility
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn exact_external_call(&self) -> Option<&ExactExternalCallProof> {
+    #[doc(hidden)]
+    pub fn exact_external_call(&self) -> Option<&ExactExternalCallProof> {
         self.exact_external_call.as_ref()
     }
 
     #[cfg(test)]
-    pub(crate) fn external_callee_identity(&self) -> Option<&ResolverOwnedExternalCalleeIdentity> {
+    #[doc(hidden)]
+    pub fn external_callee_identity(&self) -> Option<&ResolverOwnedExternalCalleeIdentity> {
         self.external_callee_identity.as_ref()
     }
 }
@@ -2183,9 +1362,12 @@ pub enum DefinitionResolutionAuthority {
     NativeGoSelected,
 }
 
-struct DefinitionResolution {
-    outcome: DefinitionLookupOutcome,
-    evidence: CallEvidence,
+#[doc(hidden)]
+pub struct DefinitionResolution {
+    #[doc(hidden)]
+    pub outcome: DefinitionLookupOutcome,
+    #[doc(hidden)]
+    pub evidence: CallEvidence,
 }
 
 impl From<DefinitionLookupOutcome> for DefinitionResolution {
@@ -2371,11 +1553,6 @@ pub const PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND: &str = "predeclared_symb
 /// The site is a declaration or import occurrence, not a reference, so there is
 /// no definition for it to reach.
 pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_import_site";
-
-/// A Go keyed composite-literal label whose exact owning type could not be
-/// established from indexed structure. A same-spelled declaration elsewhere
-/// in the file is not evidence that the label can bind to it.
-pub const GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND: &str = "go_literal_owner_unresolved";
 
 /// A complete Go package and dot-import scope contains no declaration for an
 /// unqualified call name.
@@ -2574,7 +1751,10 @@ pub fn rust_closed_world_for_diagnostic_kind(kind: &str) -> Option<RustClosedWor
 /// The downgrade is deliberately not an assertion. A missing entitlement is a
 /// gap a lane can introduce, not a state that cannot occur, and the answer a
 /// consumer needs in that case is doubt, not a panic.
-fn hold_rust_answer_to_its_proof(mut outcome: DefinitionLookupOutcome) -> DefinitionLookupOutcome {
+#[doc(hidden)]
+pub fn hold_rust_answer_to_its_proof(
+    mut outcome: DefinitionLookupOutcome,
+) -> DefinitionLookupOutcome {
     let claimed = match outcome.status {
         DefinitionLookupStatus::NoDefinition
         | DefinitionLookupStatus::UnresolvableImportBoundary => outcome.status,
@@ -2621,7 +1801,8 @@ fn with_definition_batch_context<T>(
     resolve(analyzer, &mut context)
 }
 
-pub(crate) fn resolve_definition_batch(
+#[doc(hidden)]
+pub fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     requests: Vec<DefinitionLookupRequest>,
@@ -2635,7 +1816,8 @@ pub(crate) fn resolve_definition_batch(
     })
 }
 
-pub(crate) fn resolve_navigation_batch(
+#[doc(hidden)]
+pub fn resolve_navigation_batch(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     requests: Vec<DefinitionLookupRequest>,
@@ -2701,13 +1883,42 @@ fn resolve_navigation_requests<'a>(
         .collect()
 }
 
+/// Optional per-batch resolver supplied by the language. Its operation and
+/// factory remain owned by that language for the duration of this query.
+#[doc(hidden)]
+pub trait DefinitionBatchResolver<'a> {
+    fn precompute(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        context: &mut DefinitionBatchContext<'_, '_>,
+        requests: &[DefinitionLookupRequest],
+        cancellation: Option<&CancellationToken>,
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_definition_dispatch(
+        &mut self,
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'_>,
+        context: &mut DefinitionBatchContext<'a, '_>,
+        request: &DefinitionLookupRequest,
+        source: &Arc<str>,
+        tree: &Option<Tree>,
+        site: &ResolvedReferenceSite,
+        operation: Option<NavigationOperation>,
+        cancellation: Option<&CancellationToken>,
+        go_session: Option<&ResolutionSession>,
+    ) -> std::ops::ControlFlow<DefinitionResolution, DefinitionResolution>;
+}
+
 /// Resolve one batch of requests for callers that need only the declarations.
 ///
 /// The batch driver keeps each resolver's [`CallEvidence`]; a caller that
 /// answers a definition question has no use for it and drops it here. A
 /// caller that answers a *call* question keeps it, so that no route has to
 /// know which languages publish evidence.
-fn resolve_definition_requests<'a>(
+#[doc(hidden)]
+pub fn resolve_definition_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a, '_>,
@@ -2738,7 +1949,8 @@ fn resolve_definition_requests<'a>(
 /// receiver with no proven type, a name in no visible scope -- returns before
 /// any funnel runs, and a memoized answer skips the funnel a second time. So
 /// every request names its speculative keys here before it resolves.
-fn record_definition_batch_probe_reads(
+#[doc(hidden)]
+pub fn record_definition_batch_probe_reads(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_, '_>,
     requests: &[DefinitionLookupRequest],
@@ -2894,247 +2106,6 @@ fn record_definition_probe_reads(
     }
 }
 
-struct RustDefinitionBatchOperation<'analyzer, 'factory, 'selection, 'borrow> {
-    factory:
-        &'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
-    operation: Option<
-        crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            'selection,
-        >,
-    >,
-    borrowed_operation: Option<
-        &'borrow mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            'selection,
-        >,
-    >,
-    reuse_disabled: bool,
-    precomputed: Vec<Option<BoundedResolution<DefinitionLookupOutcome>>>,
-    precomputed_index: usize,
-}
-
-impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
-    RustDefinitionBatchOperation<'analyzer, 'factory, 'selection, 'borrow>
-{
-    fn resolver_parts<'operation>(
-        &'operation mut self,
-    ) -> (
-        Option<&'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>>,
-        Option<&'operation mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>>,
-    ){
-        if self.reuse_disabled {
-            (None, None)
-        } else {
-            (
-                Some(self.factory),
-                self.borrowed_operation
-                    .as_deref_mut()
-                    .or(self.operation.as_mut()),
-            )
-        }
-    }
-
-    fn precompute(
-        &mut self,
-        queries: Vec<crate::analyzer::languages::BoundedReceiverQuery<'_>>,
-        request_indices: &[usize],
-        request_count: usize,
-        cancellation: &CancellationToken,
-    ) {
-        if queries.is_empty() {
-            return;
-        }
-        assert_eq!(queries.len(), request_indices.len());
-        self.precomputed = std::iter::repeat_with(|| None)
-            .take(request_count)
-            .collect();
-        if self.reuse_disabled {
-            return;
-        }
-        if self.operation.is_none() && self.borrowed_operation.is_none() {
-            match self.factory.open(cancellation) {
-                Ok(
-                    crate::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(
-                        operation,
-                    ),
-                ) => self.operation = Some(*operation),
-                outcome => {
-                    self.reuse_disabled = true;
-                    let failure = match outcome {
-                        Ok(crate::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Unavailable(reason)) => {
-                            crate::analyzer::rust::native_points::RustDefinitionOperationOpenFailure::Unavailable(format!("{reason:?}"))
-                        }
-                        Ok(crate::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Stale(reason)) => {
-                            crate::analyzer::rust::native_points::RustDefinitionOperationOpenFailure::Stale(format!("{reason:?}"))
-                        }
-                        Ok(crate::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Cancelled) => {
-                            crate::analyzer::rust::native_points::RustDefinitionOperationOpenFailure::Cancelled
-                        }
-                        Ok(crate::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(_)) => {
-                            unreachable!("ready Rust batch operation was handled above")
-                        }
-                        Err(error) => {
-                            crate::analyzer::rust::native_points::RustDefinitionOperationOpenFailure::StoreError(error.to_string())
-                        }
-                    };
-                    for (request_index, query) in request_indices.iter().copied().zip(queries) {
-                        self.precomputed[request_index] = Some(
-                            crate::analyzer::rust::native_points::resolve_rust_definition_open_failure_for_batch(
-                                query,
-                                &failure,
-                            ),
-                        );
-                    }
-                    return;
-                }
-            }
-        }
-        let results = self.factory.resolve_many(
-            self.borrowed_operation
-                .as_deref_mut()
-                .or(self.operation.as_mut())
-                .expect("ready Rust batch operation is retained"),
-            &queries,
-            cancellation,
-        );
-        assert_eq!(results.len(), request_indices.len());
-        for (request_index, result) in request_indices.iter().copied().zip(results) {
-            self.precomputed[request_index] = result;
-        }
-        if self.precomputed.iter().flatten().any(|result| {
-            matches!(
-                result,
-                BoundedResolution::Complete { value, .. }
-                    if value.diagnostics.iter().any(|diagnostic| {
-                        matches!(diagnostic.kind.as_str(), "native_stale" | "native_store_error")
-                    })
-            )
-        }) {
-            self.operation.take();
-            self.borrowed_operation.take();
-            self.reuse_disabled = true;
-        }
-    }
-
-    fn resolve(
-        &mut self,
-        query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    ) -> BoundedResolution<DefinitionLookupOutcome> {
-        if self.precomputed_index < self.precomputed.len() {
-            let precomputed = self.precomputed[self.precomputed_index].take();
-            self.precomputed_index += 1;
-            if let Some(precomputed) = precomputed {
-                return precomputed;
-            }
-        }
-        self.resolve_unprepared(query)
-    }
-
-    fn resolve_unprepared(
-        &mut self,
-        query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
-    ) -> BoundedResolution<DefinitionLookupOutcome> {
-        if self.reuse_disabled {
-            return crate::analyzer::rust::native_points::resolve_rust_definition_bounded(query);
-        }
-        if self.operation.is_none() && self.borrowed_operation.is_none() {
-            let cancellation = query.cancellation.cloned().unwrap_or_default();
-            let opened = self.factory.open(&cancellation);
-            match opened {
-                Ok(
-                    crate::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(
-                        operation,
-                    ),
-                ) => self.operation = Some(*operation),
-                outcome => {
-                    self.reuse_disabled = true;
-                    return crate::analyzer::rust::native_points::
-                        resolve_rust_definition_open_failure(
-                        query, outcome,
-                    );
-                }
-            }
-        }
-        let result = self.factory.resolve(
-            self.borrowed_operation
-                .as_deref_mut()
-                .or(self.operation.as_mut())
-                .expect("ready Rust batch operation is retained"),
-            query,
-        );
-        if matches!(
-            &result,
-            BoundedResolution::Complete { value, .. }
-                if value.diagnostics.iter().any(|diagnostic| {
-                    matches!(diagnostic.kind.as_str(), "native_stale" | "native_store_error")
-                })
-        ) {
-            self.operation.take();
-            self.borrowed_operation.take();
-            self.reuse_disabled = true;
-        }
-        result
-    }
-}
-
-fn precompute_rust_call_target_batch<'analyzer: 'selection, 'selection>(
-    analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_, '_>,
-    requests: &[DefinitionLookupRequest],
-    cancellation: Option<&CancellationToken>,
-    batch: &mut RustDefinitionBatchOperation<'analyzer, '_, 'selection, '_>,
-) {
-    let Some(first) = requests.first() else {
-        return;
-    };
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return;
-    }
-    let Ok(source) = context.source(&first.file) else {
-        return;
-    };
-    let tree = context.tree(&first.file, Language::Rust, &source);
-    let mut request_indices = Vec::with_capacity(requests.len());
-    let mut sites = Vec::with_capacity(requests.len());
-    for (index, request) in requests.iter().enumerate() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return;
-        }
-        if let Ok(site) =
-            focused_reference_site(context, request, Language::Rust, &source, tree.as_ref())
-        {
-            request_indices.push(index);
-            sites.push(site);
-        }
-    }
-    if sites.len() < 2 {
-        return;
-    }
-    let queries = request_indices
-        .iter()
-        .zip(&sites)
-        .map(
-            |(&index, site)| crate::analyzer::languages::BoundedReceiverQuery {
-                analyzer,
-                file: &requests[index].file,
-                source: &source,
-                tree: tree.as_ref(),
-                site,
-                budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-                cancellation,
-            },
-        )
-        .collect();
-    let batch_cancellation = cancellation.cloned().unwrap_or_default();
-    batch.precompute(
-        queries,
-        &request_indices,
-        requests.len(),
-        &batch_cancellation,
-    );
-}
-
 /// Resolve one batch of requests, keeping each resolver's own call evidence
 /// and optionally draining the resolution trace after each one.
 ///
@@ -3164,42 +2135,25 @@ fn resolve_definition_resolutions<'a>(
         || AnalyzerQueryScope::new(analyzer),
         |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
     );
-    let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
+    let mut remaining_file_requests: HashMap<ProjectFile, usize> = HashMap::default();
     for request in &requests {
-        if language_for_file(&request.file) == Language::Python {
-            *remaining_python_requests
-                .entry(request.file.clone())
-                .or_default() += 1;
-        }
+        *remaining_file_requests
+            .entry(request.file.clone())
+            .or_default() += 1;
     }
 
-    let reusable_rust_batch = trace_session.is_none()
+    let reusable_definition_batch = trace_session.is_none()
         && operation.is_none()
         && requests.len() > 1
-        && requests.first().is_some_and(|first| {
-            language_for_file(&first.file) == Language::Rust
-                && requests.iter().all(|request| request.file == first.file)
-        });
-    let batch_cancellation = cancellation.cloned().unwrap_or_default();
-    let rust_operation_factory = reusable_rust_batch
+        && requests
+            .first()
+            .is_some_and(|first| requests.iter().all(|request| request.file == first.file));
+    let mut definition_batch = reusable_definition_batch
         .then(|| {
-            crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
-                analyzer,
-                &batch_cancellation,
-            )
+            language_support(language_for_file(&requests[0].file))
+                .and_then(|support| support.definition_batch_resolver(analyzer, cancellation))
         })
         .flatten();
-    let mut rust_definition_batch =
-        rust_operation_factory
-            .as_ref()
-            .map(|factory| RustDefinitionBatchOperation {
-                factory,
-                operation: None,
-                borrowed_operation: None,
-                reuse_disabled: false,
-                precomputed: Vec::new(),
-                precomputed_index: 0,
-            });
 
     requests
         .into_iter()
@@ -3214,7 +2168,6 @@ fn resolve_definition_resolutions<'a>(
                 .into();
             }
             let language = language_for_file(&request.file);
-            let is_python = language == Language::Python;
             let file = request.file.clone();
             let probes = if analyzer.read_ledger_attached() {
                 crate::analyzer::i_analyzer::capture_nested_reads(analyzer, || {
@@ -3237,7 +2190,9 @@ fn resolve_definition_resolutions<'a>(
                     operation,
                     cancellation,
                     None,
-                    rust_definition_batch.as_mut(),
+                    definition_batch
+                        .as_mut()
+                        .map(|batch| batch.as_mut() as &mut dyn DefinitionBatchResolver<'a>),
                 )
             };
             let resolution = if analyzer.read_ledger_attached() {
@@ -3254,10 +2209,12 @@ fn resolve_definition_resolutions<'a>(
             } else {
                 resolve()
             };
-            if is_python && let Some(remaining) = remaining_python_requests.get_mut(&file) {
+            if let Some(remaining) = remaining_file_requests.get_mut(&file) {
                 *remaining -= 1;
-                if *remaining == 0 {
-                    context.python_contexts.remove(&file);
+                if *remaining == 0
+                    && let Some(support) = language_support(language)
+                {
+                    support.release_definition_file(context, &file);
                 }
             }
             if let Some(session) = trace_session {
@@ -3287,6 +2244,31 @@ pub fn resolve_definition_batch_with_source(
     let token = scope.token();
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = definition_batch_context_with_source(analyzer, scope.token(), file, source);
+    resolve_definition_requests(analyzer, token, &mut context, requests, None, None)
+}
+
+/// Preserve incumbent deferred-site authority for the legacy usage graph.
+#[doc(hidden)]
+pub fn resolve_legacy_usage_graph_definition_batch_with_source(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+) -> Vec<DefinitionLookupOutcome> {
+    // Recorded per analyzer instance through the test-hook counter on
+    // `analyzer` itself, rather than a process-wide static: a static here was
+    // inflated by any other test calling this function concurrently (#3010).
+    // A batching caller asserts this collapsed many per-edge calls into one
+    // call per file rather than re-deriving that from timing (bifrost#15).
+    #[cfg(test)]
+    analyzer
+        .test_hooks()
+        .record_resolve_definition_batch_with_source_call_for_test();
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = definition_batch_context_with_source(analyzer, scope.token(), file, source);
+    context.route = DefinitionBatchRoute::LegacyUsageGraph;
     resolve_definition_requests(analyzer, token, &mut context, requests, None, None)
 }
 
@@ -3351,50 +2333,23 @@ pub fn resolve_value_identity_with_source(
         if resolved.is_some() {
             return resolved;
         }
-        if crate::analyzer::common::language_for_file(&file) == Language::Python {
-            return python_external_value_identity_at_range(
-                analyzer,
-                &request,
-                &file,
-                &source,
-                cancellation,
-            )
-            .or_else(|| {
-                python_attribute_value_identity_at_range(
-                    analyzer,
-                    &request,
-                    &file,
-                    &source,
-                    cancellation,
-                )
-            });
-        }
-        return None;
-    }
-
-    if outcome.status == DefinitionLookupStatus::InvalidLocation
-        && crate::analyzer::common::language_for_file(&file) == Language::Python
-    {
-        // Python value identity selects the complete module-qualified
-        // attribute expression. The navigation resolver accepts identifier
-        // focus ranges, so this structured import resolver owns the exact
-        // attribute range selected by the RQL value query.
-        return python_external_value_identity_at_range(
+        return language_support(language_for_file(&file))?.definition_value_identity(
             analyzer,
             &request,
             &file,
             &source,
             cancellation,
-        )
-        .or_else(|| {
-            python_attribute_value_identity_at_range(
-                analyzer,
-                &request,
-                &file,
-                &source,
-                cancellation,
-            )
-        });
+        );
+    }
+
+    if outcome.status == DefinitionLookupStatus::InvalidLocation {
+        return language_support(language_for_file(&file))?.definition_value_identity(
+            analyzer,
+            &request,
+            &file,
+            &source,
+            cancellation,
+        );
     }
 
     if outcome.status != DefinitionLookupStatus::UnresolvableImportBoundary
@@ -3429,135 +2384,17 @@ pub fn resolve_value_identity_with_source(
             aliases: symbol.aliases.clone(),
         });
     }
-    python_external_value_identity_at_range(analyzer, &request, &file, &source, cancellation)
-        .or_else(|| {
-            python_attribute_value_identity_at_range(
-                analyzer,
-                &request,
-                &file,
-                &source,
-                cancellation,
-            )
-        })
-}
-
-fn python_attribute_value_identity_at_range(
-    analyzer: &dyn IAnalyzer,
-    request: &DefinitionLookupRequest,
-    file: &ProjectFile,
-    source: &str,
-    cancellation: Option<&CancellationToken>,
-) -> Option<ResolvedValueIdentity> {
-    let (start_byte, end_byte) = (request.start_byte?, request.end_byte?);
-    let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
-    let (terminal_start_byte, terminal_end_byte) =
-        crate::analyzer::python::python_attribute_value_terminal_range(
-            python, file, source, start_byte, end_byte,
-        )?;
-    let terminal_request = DefinitionLookupRequest {
-        file: file.clone(),
-        line: None,
-        column: None,
-        start_byte: Some(terminal_start_byte),
-        end_byte: Some(terminal_end_byte),
-    };
-    let outcome = if let Some(cancellation) = cancellation {
-        resolve_definition_batch_with_source_and_cancellation(
-            analyzer,
-            vec![terminal_request],
-            file.clone(),
-            Arc::<str>::from(source),
-            cancellation,
-        )
-    } else {
-        resolve_definition_batch_with_source(
-            analyzer,
-            vec![terminal_request],
-            file.clone(),
-            Arc::<str>::from(source),
-        )
-    }
-    .into_iter()
-    .next()?;
-    if outcome.status != DefinitionLookupStatus::Resolved {
-        return None;
-    }
-    let mut definitions = outcome.definitions;
-    definitions.sort_by_key(|definition| definition.declaration_id());
-    definitions.dedup_by(|left, right| left.declaration_id() == right.declaration_id());
-    let mut modeled = outcome.modeled_definitions;
-    modeled.sort_by(|left, right| left.id.cmp(&right.id));
-    modeled.dedup_by(|left, right| left.id == right.id);
-    match (definitions.as_slice(), modeled.as_slice()) {
-        ([definition], []) => Some(ResolvedValueIdentity {
-            kind: ResolvedValueIdentityKind::WorkspaceDeclaration,
-            identity: definition.declaration_id().to_string(),
-            aliases: Vec::new(),
-        }),
-        ([], [symbol]) if exact_semantic_model_value_identity(symbol) => {
-            Some(ResolvedValueIdentity {
-                kind: ResolvedValueIdentityKind::ActiveSemanticModel,
-                identity: symbol.id.clone(),
-                aliases: symbol.aliases.clone(),
-            })
-        }
-        _ => None,
-    }
-}
-
-fn python_external_value_identity_at_range(
-    analyzer: &dyn IAnalyzer,
-    request: &DefinitionLookupRequest,
-    file: &ProjectFile,
-    source: &str,
-    cancellation: Option<&CancellationToken>,
-) -> Option<ResolvedValueIdentity> {
-    let (start_byte, end_byte) = (request.start_byte?, request.end_byte?);
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
-    let resolution = python::python_external_imported_symbol_at_range_bounded(
-        python,
-        scope.token(),
-        file,
-        source,
-        start_byte,
-        end_byte,
+    language_support(language_for_file(&file))?.definition_value_identity(
+        analyzer,
+        &request,
+        &file,
+        &source,
         cancellation,
-    );
-    let (module, member) = match resolution {
-        BoundedResolution::Complete {
-            value: Some((module, member)),
-            ..
-        } => (module, member),
-        BoundedResolution::Complete { value: None, .. }
-        | BoundedResolution::Exceeded { .. }
-        | BoundedResolution::Cancelled { .. } => return None,
-    };
-    let external = format!("{module}.{member}");
-    let overlay = analyzer.semantic_model_overlay()?;
-    let matched = overlay.symbols_named(&external);
-    if matched.disposition
-        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-    {
-        return None;
-    }
-    let [symbol] = matched.records.as_slice() else {
-        return None;
-    };
-    if symbol.qualified_name != external
-        || symbol.language != Language::Python.config_label()
-        || !exact_semantic_model_value_identity(symbol)
-    {
-        return None;
-    }
-    Some(ResolvedValueIdentity {
-        kind: ResolvedValueIdentityKind::ActiveSemanticModel,
-        identity: symbol.id.clone(),
-        aliases: symbol.aliases.clone(),
-    })
+    )
 }
 
-fn exact_semantic_model_value_identity(
+#[doc(hidden)]
+pub fn exact_semantic_model_value_identity(
     symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> bool {
     !symbol.provenance.ambiguous
@@ -3575,7 +2412,8 @@ fn exact_semantic_model_value_identity(
 /// The context-reference tool is the sole caller because its `target` field is
 /// an exact-token contract; location, differential, rename, and inverse scans
 /// retain their established point-navigation semantics.
-pub(crate) fn resolve_definition_batch_with_source_exact_token_focus(
+#[doc(hidden)]
+pub fn resolve_definition_batch_with_source_exact_token_focus(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
@@ -3623,42 +2461,6 @@ pub fn resolve_navigation_batch_with_source(
     resolve_navigation_requests(analyzer, token, &mut context, requests, operation, None)
 }
 
-fn rust_associated_navigation_targets(
-    analyzer: &dyn IAnalyzer,
-    candidate: CodeUnit,
-    operation: NavigationOperation,
-) -> Vec<NavigationTarget> {
-    use crate::analyzer::structural::resolution::MethodFamilyRelation;
-    let mut members = Vec::new();
-    if language_for_file(candidate.source()) == Language::Rust
-        && candidate.is_class()
-        && let Some(provider) = analyzer.member_family_provider()
-    {
-        let relation = match operation {
-            NavigationOperation::Declaration => MethodFamilyRelation::Implements,
-            NavigationOperation::Definition => MethodFamilyRelation::ImplementedBy,
-        };
-        members.extend(
-            provider
-                .member_family(&candidate, None)
-                .edges
-                .into_iter()
-                .filter(|edge| edge.relation == relation)
-                .map(|edge| edge.target),
-        );
-    }
-    if members.is_empty() {
-        members.push(candidate);
-    }
-    members
-        .into_iter()
-        .map(|code_unit| NavigationTarget {
-            code_unit,
-            declaration_range: None,
-        })
-        .collect()
-}
-
 pub fn navigation_declaration_site_targets(
     analyzer: &dyn IAnalyzer,
     candidate: CodeUnit,
@@ -3666,20 +2468,15 @@ pub fn navigation_declaration_site_targets(
 ) -> Vec<NavigationTarget> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    if language_for_file(candidate.source()) != Language::Cpp {
-        return rust_associated_navigation_targets(analyzer, candidate, operation);
+    match language_support(language_for_file(candidate.source())) {
+        Some(support) => {
+            support.definition_declaration_site_targets(analyzer, token, candidate, operation)
+        }
+        None => vec![NavigationTarget {
+            code_unit: candidate,
+            declaration_range: None,
+        }],
     }
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-    let reference_file = candidate.source().clone();
-    cpp::select_navigation_targets(
-        &mut context,
-        token,
-        &reference_file,
-        &[candidate],
-        operation,
-    )
-    .targets
 }
 
 /// Whether the allocation expression at `offset` binds its result by
@@ -3695,10 +2492,8 @@ pub fn allocation_binds_by_reference_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<bool> {
-    match language_for_file(file) {
-        Language::Go => go::allocation_binds_by_reference_at_offset(file, source, offset),
-        _ => None,
-    }
+    language_support(language_for_file(file))
+        .and_then(|support| support.allocation_binds_by_reference_at_offset(file, source, offset))
 }
 
 /// Whether the allocation expression at `offset` boxes a reference payload
@@ -3714,8 +2509,8 @@ pub fn allocation_boxes_reference_payload_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<bool> {
-    with_go_file(file, || {
-        go::allocation_boxes_reference_payload_at_offset(file, source, offset)
+    language_support(language_for_file(file)).and_then(|support| {
+        support.allocation_boxes_reference_payload_at_offset(file, source, offset)
     })
 }
 
@@ -3731,12 +2526,9 @@ pub fn result_binds_by_reference_at_ordinal(
     declaration: &CodeUnit,
     ordinal: usize,
 ) -> Option<bool> {
-    match language_for_file(file) {
-        Language::Go => {
-            go::result_binds_by_reference_at_ordinal(analyzer, file, source, declaration, ordinal)
-        }
-        _ => None,
-    }
+    language_support(language_for_file(file)).and_then(|support| {
+        support.result_binds_by_reference_at_ordinal(analyzer, file, source, declaration, ordinal)
+    })
 }
 
 /// Exact pointer-versus-copy binding for a parameter at a callable source
@@ -3749,8 +2541,8 @@ pub fn parameter_binds_by_reference_at_span(
     end: usize,
     ordinal: usize,
 ) -> Option<bool> {
-    with_go_file(file, || {
-        go::parameter_binds_by_reference_at_span(file, source, start, end, ordinal)
+    language_support(language_for_file(file)).and_then(|support| {
+        support.parameter_binds_by_reference_at_span(file, source, start, end, ordinal)
     })
 }
 
@@ -3764,10 +2556,9 @@ pub fn parameter_preserves_backing_at_span(
     end: usize,
     ordinal: usize,
 ) -> Option<bool> {
-    match language_for_file(file) {
-        Language::Go => go::parameter_preserves_backing_at_span(file, source, start, end, ordinal),
-        _ => None,
-    }
+    language_support(language_for_file(file)).and_then(|support| {
+        support.parameter_preserves_backing_at_span(file, source, start, end, ordinal)
+    })
 }
 
 /// Whether one exact Go callable parameter's declared type is an interface
@@ -3781,8 +2572,8 @@ pub fn parameter_boxes_reference_payload_at_span(
     end: usize,
     ordinal: usize,
 ) -> Option<bool> {
-    with_go_file(file, || {
-        go::parameter_boxes_reference_payload_at_span(file, source, start, end, ordinal)
+    language_support(language_for_file(file)).and_then(|support| {
+        support.parameter_boxes_reference_payload_at_span(file, source, start, end, ordinal)
     })
 }
 
@@ -3796,12 +2587,9 @@ pub fn parameter_is_reference_free_at_ordinal(
     declaration: &CodeUnit,
     ordinal: usize,
 ) -> Option<bool> {
-    match language_for_file(file) {
-        Language::Go => {
-            go::parameter_is_reference_free_at_ordinal(analyzer, file, source, declaration, ordinal)
-        }
-        _ => None,
-    }
+    language_support(language_for_file(file)).and_then(|support| {
+        support.parameter_is_reference_free_at_ordinal(analyzer, file, source, declaration, ordinal)
+    })
 }
 
 /// Prove that an exact selector occurrence names a modeled method declaration.
@@ -3813,10 +2601,9 @@ pub fn modeled_method_selection_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<String> {
-    match language_for_file(file) {
-        Language::Go => go::modeled_method_selection_at_offset(analyzer, file, source, offset),
-        _ => None,
-    }
+    language_support(language_for_file(file)).and_then(|support| {
+        support.modeled_method_selection_at_offset(analyzer, file, source, offset)
+    })
 }
 
 /// Whether the Go lexical binding declared at `offset` may be created more
@@ -3831,10 +2618,8 @@ pub fn lexical_binding_repeats_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<bool> {
-    match language_for_file(file) {
-        Language::Go => go::lexical_binding_repeats_at_offset(file, source, offset),
-        _ => None,
-    }
+    language_support(language_for_file(file))
+        .and_then(|support| support.lexical_binding_repeats_at_offset(file, source, offset))
 }
 
 /// The declaration one offset falls inside, for a consumer holding an
@@ -3850,12 +2635,8 @@ pub fn declaration_site_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<CodeUnit> {
-    match language_for_file(file) {
-        Language::Cpp => cpp::declaration_at_offset(analyzer, file, source, offset)
-            .map(|(declaration, _, _)| declaration),
-        Language::Go => go::field_declaration_at_offset(analyzer, file, source, offset),
-        _ => None,
-    }
+    language_support(language_for_file(file))
+        .and_then(|support| support.declaration_site_at_offset(analyzer, file, source, offset))
 }
 
 pub fn navigation_declaration_site_at_offset(
@@ -3864,11 +2645,9 @@ pub fn navigation_declaration_site_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<CodeUnit> {
-    if language_for_file(file) != Language::Cpp {
-        return None;
-    }
-    cpp::declaration_at_offset(analyzer, file, source, offset)
-        .map(|(declaration, _, _)| declaration)
+    language_support(language_for_file(file)).and_then(|support| {
+        support.navigation_declaration_site_at_offset(analyzer, file, source, offset)
+    })
 }
 
 pub fn resolve_definition_batch_with_source_and_cancellation(
@@ -3904,112 +2683,29 @@ pub fn resolve_call_target_batch_with_source(
     if profiling::enabled() {
         profiling::note(format!("request_count={}", requests.len()));
     }
-    if language_for_file(&file) == Language::Go {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        context.sources.insert(file.clone(), Ok(source));
-        debug_assert!(
-            requests.iter().all(|request| request.file == file),
-            "one call-target source batch must contain requests for that source file"
-        );
-        record_definition_batch_probe_reads(analyzer, &mut context, &requests);
-
-        // Namespace discovery is one all-or-nothing bounded answer for this
-        // source file. Never let a stopped session publish partial aliases or
-        // dot imports into the batch cache. Exact target lookup then receives
-        // a fresh session per request so one expensive call cannot make later
-        // answers depend on request order.
-        if !native_go_selected()
-            && let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer)
-            && let Ok(source) = context.source(&file)
-            && let Some(tree) = context.tree(&file, Language::Go, &source)
-        {
-            let namespace_session =
-                ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
-            let definitions = go::AnalyzerGoDefinitionProvider::bounded(
-                go,
-                &namespace_session,
-                analyzer.semantic_model_overlay(),
-            );
-            let namespace = DefinitionBatchContext::build_go_context(
-                &definitions,
-                context.token,
-                go,
-                &file,
-                &source,
-                &tree,
-            );
-            match namespace_session.finish(namespace) {
-                BoundedResolution::Complete { value, .. } => {
-                    context.go_contexts.insert(file.clone(), value);
-                }
-                BoundedResolution::Exceeded { limit, .. } => {
-                    return requests
-                        .into_iter()
-                        .map(|_| CallTargetLookupOutcome {
-                            truncated: true,
-                            ..CallTargetLookupOutcome::from_resolution(
-                                exceeded_budget(limit, format!(
-                                    "Go call-target namespace resolution exceeded its {} budget", limit.as_str()
-                                ))
-                                .into(),
-                            )
-                        })
-                        .collect();
-                }
-                BoundedResolution::Cancelled { .. } => {
-                    return requests
-                        .into_iter()
-                        .map(|_| {
-                            CallTargetLookupOutcome::from_resolution(
-                                cancelled("Go call-target namespace resolution was cancelled")
-                                    .into(),
-                            )
-                        })
-                        .collect();
-                }
-            }
+    match language_support(language_for_file(&file)) {
+        Some(support) => support.resolve_definition_call_target_batch(
+            analyzer,
+            token,
+            requests,
+            file,
+            source,
+            cancellation,
+        ),
+        None => {
+            resolve_generic_call_target_batch(analyzer, token, requests, file, source, cancellation)
         }
-        return requests
-            .into_iter()
-            .map(|request| {
-                let session =
-                    ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
-                let resolution = resolve_one_with_evidence(
-                    analyzer,
-                    token,
-                    &mut context,
-                    request,
-                    None,
-                    cancellation,
-                    Some(&session),
-                    None,
-                );
-                let (resolution, truncated) = match session.finish(resolution) {
-                    BoundedResolution::Complete { value, .. } => (value, false),
-                    BoundedResolution::Exceeded { limit, .. } => (
-                        exceeded_budget(
-                            limit,
-                            format!(
-                                "Go call-target resolution exceeded its {} budget",
-                                limit.as_str()
-                            ),
-                        )
-                        .into(),
-                        true,
-                    ),
-                    BoundedResolution::Cancelled { .. } => (
-                        cancelled("Go call-target resolution was cancelled").into(),
-                        false,
-                    ),
-                };
-                CallTargetLookupOutcome {
-                    truncated,
-                    ..CallTargetLookupOutcome::from_resolution(resolution)
-                }
-            })
-            .collect();
     }
+}
+
+pub(crate) fn resolve_generic_call_target_batch(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+    cancellation: Option<&CancellationToken>,
+) -> Vec<CallTargetLookupOutcome> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token());
     context.sources.insert(file.clone(), Ok(source));
@@ -4075,86 +2771,35 @@ pub fn resolve_call_target_batch_with_source(
     let _deadline = cancellation
         .map(|cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation));
     record_definition_batch_probe_reads(analyzer, &mut context, &requests);
-    let batch_cancellation = cancellation.cloned().unwrap_or_default();
-    let rust_operation_factory = (language_for_file(&file) == Language::Rust
-        && !requests.is_empty())
-    .then(|| {
-        crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
-            analyzer,
-            &batch_cancellation,
-        )
-    })
-    .flatten();
-    let rust_definition_batch =
-        rust_operation_factory
-            .as_ref()
-            .map(|factory| RustDefinitionBatchOperation {
-                factory,
-                operation: None,
-                borrowed_operation: None,
-                reuse_disabled: false,
-                precomputed: Vec::new(),
-                precomputed_index: 0,
-            });
+    let mut definition_batch = (!requests.is_empty())
+        .then(|| {
+            language_support(language_for_file(&file))
+                .and_then(|support| support.definition_batch_resolver(analyzer, cancellation))
+        })
+        .flatten();
     resolve_call_target_requests(
         analyzer,
         token,
         &mut context,
         requests,
         cancellation,
-        rust_definition_batch,
+        definition_batch
+            .as_mut()
+            .map(|batch| batch.as_mut() as &mut dyn DefinitionBatchResolver<'_>),
     )
 }
 
-/// Resolve native call targets on an already captured worker operation.
-/// The returned vocabulary contains no semantic artifact or relation handles.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_call_target_batch_in_operation<'a: 'selection, 'selection>(
-    analyzer: &'a dyn IAnalyzer,
-    requests: Vec<DefinitionLookupRequest>,
-    file: ProjectFile,
-    source: Arc<str>,
-    cancellation: &CancellationToken,
-    factory: &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'a>,
-    operation: &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
-        'a,
-        'selection,
-    >,
-) -> Vec<CallTargetLookupOutcome> {
-    let _timing = profiling::scope("get_definition::resolve_call_target_batch");
-    profiling::note_with(|| format!("request_count={}", requests.len()));
-    let scope = AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
-    let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-    context.sources.insert(file, Ok(source));
-    record_definition_batch_probe_reads(analyzer, &mut context, &requests);
-    let batch = RustDefinitionBatchOperation {
-        factory,
-        operation: None,
-        borrowed_operation: Some(operation),
-        reuse_disabled: false,
-        precomputed: Vec::new(),
-        precomputed_index: 0,
-    };
-    resolve_call_target_requests(
-        analyzer,
-        scope.token(),
-        &mut context,
-        requests,
-        Some(cancellation),
-        Some(batch),
-    )
-}
-
-fn resolve_call_target_requests<'a: 'selection, 'selection>(
+#[doc(hidden)]
+pub fn resolve_call_target_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a, '_>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
-    mut rust_definition_batch: Option<RustDefinitionBatchOperation<'a, '_, 'selection, '_>>,
+    mut definition_batch: Option<&mut dyn DefinitionBatchResolver<'a>>,
 ) -> Vec<CallTargetLookupOutcome> {
-    if let Some(batch) = rust_definition_batch.as_mut() {
-        precompute_rust_call_target_batch(analyzer, context, &requests, cancellation, batch);
+    if let Some(batch) = definition_batch.as_mut() {
+        batch.precompute(analyzer, context, &requests, cancellation);
     }
     requests
         .into_iter()
@@ -4172,7 +2817,9 @@ fn resolve_call_target_requests<'a: 'selection, 'selection>(
                 None,
                 cancellation,
                 None,
-                rust_definition_batch.as_mut(),
+                definition_batch
+                    .as_mut()
+                    .map(|batch| &mut **batch as &mut dyn DefinitionBatchResolver<'a>),
             ))
         })
         .collect()
@@ -4216,284 +2863,105 @@ pub fn resolve_call_reference_definition_with_source(
     ))
 }
 
-#[derive(Clone)]
-pub(super) struct JsTsDefinitionContext {
-    pub(super) imports: JsTsImportBinder,
-    pub(super) aliases: Arc<AliasResolver>,
-    pub(super) syntax_index: Arc<JsTsReceiverSyntaxIndex>,
-    /// This file's module-member write evidence, shared by every reference the
-    /// batch resolves in it. The proof walks the whole file, so asking it per
-    /// reference would make a file's resolution quadratic in its own size
-    /// (#3427).
-    pub(super) module_member_writes: Arc<crate::analyzer::js_ts::JsTsModuleMemberWriteMemo>,
-}
+#[doc(hidden)]
+pub struct DefinitionBatchContext<'a: 'token, 'token> {
+    #[doc(hidden)]
+    pub route: DefinitionBatchRoute,
 
-#[derive(Clone)]
-struct GoDefinitionContext {
-    package: String,
-    aliases: HashMap<String, Vec<String>>,
-    dot_imports: Vec<String>,
-}
-
-#[derive(Clone)]
-pub(super) struct ScalaDefinitionContext {
-    pub(super) file: ProjectFile,
-    pub(super) package: Arc<str>,
-    pub(super) imports: Arc<Vec<ImportInfo>>,
-}
-
-struct DefinitionBatchContext<'a: 'token, 'token> {
-    analyzer: &'a dyn IAnalyzer,
+    #[doc(hidden)]
+    pub analyzer: &'a dyn IAnalyzer,
     /// Proof that the batch's request scope is open for the batch's whole life
     /// (issue #2414 step 3).
-    token: QueryToken<'token>,
-    bounded_support: AnalyzerDefinitionLookup<'a>,
-    js_ts_contexts: HashMap<(ProjectFile, Language), JsTsDefinitionContext>,
-    go_contexts: HashMap<ProjectFile, GoDefinitionContext>,
-    scala_contexts: HashMap<ProjectFile, ScalaDefinitionContext>,
-    scala_package_contexts: HashMap<ProjectFile, ScalaPackageContextIndex>,
-    scala_lookup_cache: scala::ScalaLookupCache,
-    sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
+    #[doc(hidden)]
+    pub token: QueryToken<'token>,
+    #[doc(hidden)]
+    pub bounded_support: AnalyzerDefinitionLookup<'a>,
+    #[doc(hidden)]
+    pub language_state: HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
+    #[doc(hidden)]
+    pub sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
-    line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
+    #[doc(hidden)]
+    pub line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     // Covers visibility construction as well as candidate lookup. Incomplete
-    // inputs stay visible after a nested or concurrent cancelling scope closes.
-    cpp_read_scope: AnalyzerQueryScope<'a>,
-    cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex<'token>>>,
-    cpp_live_sources_seeded: bool,
-    cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
-    cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
-    enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
-    python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
-    /// Source receiver facts built once for each Rust blob visited by this
-    /// definition batch. The cache dies with the query and retains no tree
-    /// nodes, only bounded byte ranges and parser-derived binding identities.
-    rust_receiver_type_facts:
-        HashMap<ProjectFile, Arc<crate::analyzer::rust::RustReceiverTypeFacts>>,
-    navigation_operation: Option<NavigationOperation>,
-    exact_token_focus: bool,
-    #[cfg(test)]
-    cpp_class_range_builds: usize,
+    // reads stay visible after a nested cancelling scope closes.
+    #[doc(hidden)]
+    pub read_scope: AnalyzerQueryScope<'a>,
+    #[doc(hidden)]
+    pub enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
+    #[doc(hidden)]
+    pub navigation_operation: Option<NavigationOperation>,
+    #[doc(hidden)]
+    pub exact_token_focus: bool,
 }
 
 impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
-    fn new(analyzer: &'a dyn IAnalyzer, token: QueryToken<'token>) -> Self {
+    #[doc(hidden)]
+    pub fn new(analyzer: &'a dyn IAnalyzer, token: QueryToken<'token>) -> Self {
         Self {
             analyzer,
             token,
+            route: DefinitionBatchRoute::default(),
             bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
-            js_ts_contexts: HashMap::default(),
-            go_contexts: HashMap::default(),
-            scala_contexts: HashMap::default(),
-            scala_package_contexts: HashMap::default(),
-            scala_lookup_cache: scala::ScalaLookupCache::default(),
+            language_state: HashMap::default(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
-            cpp_read_scope: AnalyzerQueryScope::new(analyzer),
-            cpp_visibility: HashMap::default(),
-            cpp_live_sources_seeded: false,
-            cpp_structural_alias_paths: HashMap::default(),
-            cpp_class_ranges: HashMap::default(),
+            read_scope: AnalyzerQueryScope::new(analyzer),
             enclosing_owner_chains: HashMap::default(),
-            python_contexts: HashMap::default(),
-            rust_receiver_type_facts: HashMap::default(),
             navigation_operation: None,
             exact_token_focus: false,
-            #[cfg(test)]
-            cpp_class_range_builds: 0,
         }
     }
 
-    fn bounded_support(&self) -> &dyn BoundedDefinitionLookup {
+    #[doc(hidden)]
+    pub fn language_state<T: Default + 'static>(&mut self) -> &mut T {
+        self.language_state
+            .entry(std::any::TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut::<T>()
+            .expect("definition language state matches its type key")
+    }
+
+    fn language_state_ref<T: Default + 'static>(&self) -> &T {
+        self.language_state
+            .get(&std::any::TypeId::of::<T>())
+            .expect("definition language state was initialized")
+            .downcast_ref::<T>()
+            .expect("definition language state matches its type key")
+    }
+
+    #[doc(hidden)]
+    pub fn bounded_support(&self) -> &dyn BoundedDefinitionLookup {
         &self.bounded_support
     }
 
-    fn source(&mut self, file: &ProjectFile) -> Result<Arc<str>, String> {
+    #[doc(hidden)]
+    pub fn source(&mut self, file: &ProjectFile) -> Result<Arc<str>, String> {
         self.sources
             .entry(file.clone())
             .or_insert_with(|| read_source(file).map(Arc::<str>::from))
             .clone()
     }
 
-    fn tree(&mut self, file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
+    #[doc(hidden)]
+    pub fn tree(&mut self, file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
         self.trees
             .entry((file.clone(), language))
             .or_insert_with(|| {
-                // Semantic dispatch already obtained this exact analyzer
-                // snapshot while lowering the procedure. Reuse its immutable
-                // tree when the caller's source still matches; an explicitly
-                // supplied older source must keep the raw-source parse below.
-                if language == Language::Python
-                    && let Some(py) = resolve_analyzer::<PythonAnalyzer>(self.analyzer)
-                    && let Some(prepared) = py.prepared_syntax(self.token, file)
-                    && prepared.source() == source
-                {
-                    return Some(prepared.tree().clone());
-                }
-                parse_tree_for_language(file, language, source)
+                language_support(language).and_then(|support| {
+                    support.definition_tree(self.analyzer, self.token, file, language, source)
+                })
             })
             .clone()
     }
 
-    fn line_starts(&mut self, file: &ProjectFile, source: &str) -> Arc<Vec<usize>> {
+    #[doc(hidden)]
+    pub fn line_starts(&mut self, file: &ProjectFile, source: &str) -> Arc<Vec<usize>> {
         self.line_starts
             .entry(file.clone())
             .or_insert_with(|| Arc::new(compute_line_starts(source)))
             .clone()
-    }
-
-    /// The per-file JS/TS state this batch reuses. `host` supplies the analyzer's
-    /// own alias resolver rather than a fresh one, so every file in the batch
-    /// resolves specifiers through one warm `tsconfig` memo and one warm
-    /// workspace-package index instead of rebuilding both per file.
-    fn js_ts_context(
-        &mut self,
-        host: &dyn JsTsSource,
-        file: &ProjectFile,
-        language: Language,
-        source: &str,
-        tree: &Tree,
-    ) -> JsTsDefinitionContext {
-        self.js_ts_contexts
-            .entry((file.clone(), language))
-            .or_insert_with(|| {
-                let (syntax_index, _) =
-                    build_js_ts_receiver_syntax_index(tree.root_node(), source, None)
-                        .expect("uncancelled JS/TS syntax index build");
-                JsTsDefinitionContext {
-                    imports: compute_jsts_import_binder(source, tree),
-                    aliases: Arc::clone(host.alias_resolver()),
-                    syntax_index,
-                    module_member_writes: Arc::default(),
-                }
-            })
-            .clone()
-    }
-
-    fn go_context_with_provider(
-        &mut self,
-        definitions: &dyn go::GoDefinitionProvider,
-        token: QueryToken<'_>,
-        go: &GoAnalyzer,
-        file: &ProjectFile,
-        source: &str,
-        tree: &Tree,
-    ) -> &GoDefinitionContext {
-        if definitions.session().is_some() {
-            return self.go_contexts.get(file).expect(
-                "bounded Go namespace context must complete before exact request resolution",
-            );
-        }
-        self.go_contexts
-            .entry(file.clone())
-            .or_insert_with(|| Self::build_go_context(definitions, token, go, file, source, tree))
-    }
-
-    fn build_go_context(
-        definitions: &dyn go::GoDefinitionProvider,
-        token: QueryToken<'_>,
-        go: &GoAnalyzer,
-        file: &ProjectFile,
-        source: &str,
-        tree: &Tree,
-    ) -> GoDefinitionContext {
-        let (aliases, dot_imports) =
-            go::go_definition_import_namespaces(definitions, token, go, file);
-        GoDefinitionContext {
-            package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
-            aliases,
-            dot_imports,
-        }
-    }
-
-    fn scala_context(
-        &mut self,
-        token: QueryToken<'_>,
-        scala: &ScalaAnalyzer,
-        file: &ProjectFile,
-    ) -> ScalaDefinitionContext {
-        self.scala_contexts
-            .entry(file.clone())
-            .or_insert_with(|| ScalaDefinitionContext {
-                file: file.clone(),
-                package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
-                imports: Arc::new(scala.import_info_of(token, file)),
-            })
-            .clone()
-    }
-
-    fn scala_package_prefixes(
-        &mut self,
-        file: &ProjectFile,
-        root: Node<'_>,
-        source: &str,
-        byte: usize,
-    ) -> Vec<String> {
-        self.scala_package_contexts
-            .entry(file.clone())
-            .or_insert_with(|| ScalaPackageContextIndex::new(root, source))
-            .prefixes_at(byte)
-            .to_vec()
-    }
-
-    fn cpp_visibility(
-        &mut self,
-        cpp: &'a crate::analyzer::CppAnalyzer,
-        analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
-    ) -> Arc<CppVisibilityIndex<'token>> {
-        let token = self.token;
-        let dispatch = CppDispatch::new(analyzer, token);
-        if !self.cpp_live_sources_seeded {
-            // Visibility construction walks include edges before it builds the
-            // per-root declaration set. Those edges can read a candidate's
-            // live source directly, while the declaration walk seeds the
-            // complete live-source snapshot. Seed it first so a candidate
-            // file is validated once per request, independent of whether a
-            // warmed import cache changes which visibility phase reaches it
-            // first.
-            let _ = cpp.analyzed_files();
-            self.cpp_live_sources_seeded = true;
-        }
-        if let Some(index) = self.cpp_visibility.get(file) {
-            return Arc::clone(index);
-        }
-        self.cpp_visibility
-            .entry(file.clone())
-            .or_insert_with(|| {
-                let mut roots = HashSet::default();
-                roots.insert(file.clone());
-                Arc::new(CppVisibilityIndex::build(
-                    cpp,
-                    token,
-                    &dispatch.source(),
-                    &roots,
-                ))
-            })
-            .clone()
-    }
-
-    #[cfg(test)]
-    fn scala_lookup_cache_counts(&self) -> (usize, usize) {
-        (
-            self.scala_lookup_cache.direct_children_builds_for_test(),
-            self.scala_lookup_cache.direct_ancestor_builds_for_test(),
-        )
-    }
-
-    fn cpp_class_ranges(&mut self, file: &ProjectFile) -> Arc<ClassRangeIndex> {
-        if let Some(index) = self.cpp_class_ranges.get(file) {
-            return Arc::clone(index);
-        }
-        let index = self.analyzer.class_range_index(file);
-        self.cpp_class_ranges
-            .insert(file.clone(), Arc::clone(&index));
-        #[cfg(test)]
-        {
-            self.cpp_class_range_builds += 1;
-        }
-        index
     }
 
     /// Generalized, memoized version of the enclosing-owner-chain walk (see
@@ -4505,7 +2973,8 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
     /// predicate reused through this same cache would silently return the
     /// first-cached chain for a given owner; give it a predicate-aware key
     /// before adding one.
-    fn enclosing_owner_chain(
+    #[doc(hidden)]
+    pub fn enclosing_owner_chain(
         &mut self,
         owner: CodeUnit,
         accept: impl Fn(&CodeUnit) -> bool,
@@ -4524,43 +2993,6 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
             })
             .clone()
     }
-
-    fn python_context(
-        &mut self,
-        token: QueryToken<'_>,
-        py: &PythonAnalyzer,
-        file: &ProjectFile,
-        source: &str,
-    ) -> Arc<python::PythonDefinitionContext> {
-        self.python_contexts
-            .entry(file.clone())
-            .or_insert_with(|| {
-                python::request_definition_context(py, self.analyzer, token, file, source)
-            })
-            .clone()
-    }
-
-    fn rust_receiver_type_facts(
-        &mut self,
-        file: &ProjectFile,
-        source: &str,
-        tree: &Tree,
-    ) -> Arc<crate::analyzer::rust::RustReceiverTypeFacts> {
-        self.rust_receiver_type_facts
-            .entry(file.clone())
-            .or_insert_with(|| {
-                Arc::new(crate::analyzer::rust::RustReceiverTypeFacts::from_tree(
-                    source, tree,
-                ))
-            })
-            .clone()
-    }
-
-    #[cfg(test)]
-    fn python_build_counts(&self) -> (usize, usize, usize, usize) {
-        let py = resolve_analyzer::<PythonAnalyzer>(self.analyzer).expect("Python analyzer");
-        python::request_definition_build_counts(py)
-    }
 }
 
 /// The reference site one request names, focused the way the language's own
@@ -4571,7 +3003,8 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
 /// records the index keys that token probes before any resolver can return
 /// without probing. A second spelling of this in either place would record a
 /// name the resolver never asked for and, worse, miss the one it did.
-fn focused_reference_site(
+#[doc(hidden)]
+pub fn focused_reference_site(
     context: &mut DefinitionBatchContext<'_, '_>,
     request: &DefinitionLookupRequest,
     language: Language,
@@ -4586,21 +3019,18 @@ fn focused_reference_site(
         &line_starts,
         tree.map(Tree::root_node),
     )?;
-    let site = match tree {
-        Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
-            js_ts::jsts_site_for_focus(site, tree.root_node(), source, language)
-        }
-        Some(tree) if language == Language::Python => {
-            python::python_site_for_focus(site, tree, source, request.start_byte, request.end_byte)
-        }
-        Some(tree) if language == Language::Kotlin => {
-            kotlin::kotlin_site_for_focus(site, tree, source)
-        }
-        _ => site,
-    };
-    Ok(match (language, tree) {
-        (Language::Ruby, Some(tree)) => ruby::ruby_site_for_focus(site, tree, source),
-        _ => site,
+    Ok(match tree {
+        Some(tree) => match language_support(language) {
+            Some(support) => support.definition_site_for_focus(
+                site,
+                tree,
+                source,
+                request.start_byte,
+                request.end_byte,
+            ),
+            None => site,
+        },
+        None => site,
     })
 }
 
@@ -4626,7 +3056,8 @@ fn resolve_one<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borrow>(
+#[doc(hidden)]
+pub fn resolve_one_with_evidence<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a, '_>,
@@ -4634,9 +3065,7 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
     operation: Option<NavigationOperation>,
     cancellation: Option<&CancellationToken>,
     go_session: Option<&ResolutionSession>,
-    mut rust_definition_batch: Option<
-        &'batch mut RustDefinitionBatchOperation<'a, 'factory, 'selection, 'borrow>,
-    >,
+    definition_batch: Option<&mut dyn DefinitionBatchResolver<'a>>,
 ) -> DefinitionResolution {
     let _scope = profiling::scope("get_definition::resolve_one");
     context.navigation_operation = operation;
@@ -4685,38 +3114,13 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
             .into();
         }
     };
-    if language == Language::Cpp
-        && let Some(tree) = tree.as_ref()
-        && let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer)
+    let site = match language_support(language)
+        .expect("supported definition language")
+        .definition_lexical_site(analyzer, context, &request, &source, tree.as_ref(), site)
     {
-        let visibility = context.cpp_visibility(cpp, analyzer, &request.file);
-        // An explicit range inside an opaque preproc_arg has been widened to
-        // that whole parser leaf. The replacement AST, not the opaque leaf,
-        // decides whether the original selection names a macro binding.
-        let (start, end) = match (request.start_byte, request.end_byte) {
-            (Some(start), Some(end)) => (start, end),
-            _ => (site.focus_start_byte, site.focus_end_byte),
-        };
-        if let Some(binding) =
-            visibility.macro_lexical_binding(&request.file, tree.root_node(), &source, start, end)
-            && let Some(definition) = super::macro_lexical::lexical_definition(analyzer, binding)
-        {
-            let mut site = site;
-            if (start, end) != (site.focus_start_byte, site.focus_end_byte) {
-                let line_starts = context.line_starts(&request.file, &source);
-                site.focus_start_byte = start;
-                site.focus_end_byte = end;
-                site.text = source[start..end].to_string();
-                site.range = Range {
-                    start_byte: start,
-                    end_byte: end,
-                    start_line: find_line_index_for_offset(&line_starts, start) + 1,
-                    end_line: find_line_index_for_offset(&line_starts, end - 1) + 1,
-                };
-            }
-            return finish_lookup_outcome(lexical_definition_outcome(definition), site).into();
-        }
-    }
+        std::ops::ControlFlow::Break(resolution) => return resolution,
+        std::ops::ControlFlow::Continue(site) => site,
+    };
     // Rust lexical declarations are projected by the native operation with
     // the same source authority and completion as item definitions.
     if language != Language::Rust
@@ -4732,32 +3136,17 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
             identifier,
         )
         .or_else(|| {
-            if language != Language::Cpp {
-                return None;
-            }
-            let focus = smallest_named_node_covering(
-                tree.root_node(),
-                site.focus_start_byte,
-                site.focus_end_byte,
-            )?;
-            let dispatch = CppDispatch::new(analyzer, token);
-            let graph = dispatch.source();
-            let value = cpp_recovered_c_new_expression_argument_at(
-                focus,
-                site.focus_start_byte,
-                site.focus_end_byte,
-                graph.reference_uses_c_semantics(&request.file),
-            )?;
-            let recovered_expression = value
-                .parent()
-                .filter(|parent| parent.kind() == "new_expression")?;
-            resolve_lexical_binding_from_focus(
-                language,
-                recovered_expression,
-                &source,
-                site.focus_start_byte,
-                identifier,
-            )
+            language_support(language).and_then(|support| {
+                support.definition_lexical_fallback(
+                    analyzer,
+                    token,
+                    &request.file,
+                    &source,
+                    tree,
+                    &site,
+                    identifier,
+                )
+            })
         });
         match lexical_binding {
             Some(
@@ -4769,11 +3158,8 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
             None => {}
         }
     }
-    // The native Java route keeps the richer entry point so that the call
-    // evidence it proves reaches the call-graph consumers, which the
-    // outcome-only JVM rollout points cannot carry.
     #[cfg(any(test, feature = "test-support"))]
-    if language == Language::Java && std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+    if let Some(resolution) = language_support(language).and_then(|support| {
         let query = crate::analyzer::languages::BoundedReceiverQuery {
             analyzer,
             file: &request.file,
@@ -4783,32 +3169,20 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
             budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
             cancellation,
         };
-        return match crate::analyzer::java::native_points::resolve_java_definition_with_evidence_bounded(
-            query,
-            || {},
-        ) {
-            BoundedResolution::Complete { value, .. } => DefinitionResolution {
-                outcome: value.outcome,
-                evidence: value.evidence,
-            },
-            BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
-                limit,
-                format!(
-                    "{language:?} definition resolution exceeded its {} budget",
-                    limit.as_str()
-                ),
-            )
-            .into(),
-            BoundedResolution::Cancelled { .. } => {
-                cancelled(format!("{language:?} definition resolution was cancelled")).into()
-            }
-        };
+        support.trial_definition(query)
+    }) {
+        return resolution;
     }
+    let native_points =
+        language_support(language).and_then(|support| support.default_definition_points());
+    // The Scala native trial is selectable only in test builds.
     #[cfg(any(test, feature = "test-support"))]
-    if (language == Language::Scala && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
-        || (language == Language::Kotlin
-            && std::env::var_os("BIFROST_TRIAL_NATIVE_KOTLIN").is_some())
-    {
+    let native_points = native_points.or_else(|| {
+        (language == Language::Scala && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
+            .then(|| language_support(language).and_then(|support| support.native_rollout_points()))
+            .flatten()
+    });
+    if let Some(native_points) = native_points {
         let query = crate::analyzer::languages::BoundedReceiverQuery {
             analyzer,
             file: &request.file,
@@ -4820,7 +3194,7 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
         };
         return match crate::analyzer::languages::StructuralReceiverResolver::
             resolve_definition_bounded(
-                &crate::analyzer::jvm::native_points::JVM_NATIVE_ROLLOUT_POINTS,
+                native_points,
                 query,
             )
         {
@@ -4842,600 +3216,39 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
         };
     }
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
-    let mut evidence = CallEvidence::default();
-    let resolved = match language {
-        Language::Rust => {
-            let query = crate::analyzer::languages::BoundedReceiverQuery {
-                analyzer,
-                file: &request.file,
-                source: &source,
-                tree: tree.as_ref(),
-                site: &site,
-                // The budget written for an interactive lookup, which the
-                // type route already uses (`resolve_type_batch`, Ruby's
-                // type flow). The default's 64 expansions were exceeded by a
-                // second field hop through a declared type (issue 693).
-                budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-                cancellation,
-            };
-            let rust_resolution = match rust_definition_batch.as_mut() {
-                Some(batch) => batch.resolve(query),
-                None => {
-                    crate::analyzer::rust::native_points::resolve_rust_definition_bounded(query)
-                }
-            };
-            let rust_outcome = match rust_resolution {
-                BoundedResolution::Complete { value, .. } => hold_rust_answer_to_its_proof(value),
-                BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
-                    limit,
-                    format!(
-                        "Rust definition resolution exceeded its {} budget",
-                        limit.as_str()
-                    ),
-                ),
-                BoundedResolution::Cancelled { .. } => {
-                    cancelled("Rust definition resolution was cancelled")
-                }
-            };
-            let mut outcome = rust_outcome;
-            let rust_receiver_call = tree.as_ref().is_some_and(|tree| {
-                crate::analyzer::rust::external_calls::call_path_for_site(tree, &site)
-                    .is_some_and(|callee| callee.kind() == "field_expression")
-            });
-            // The member in `lock.lock()` is not a lexical reference to its
-            // receiver parameter, even though the two identifiers match.
-            let has_no_workspace_target = outcome.definitions.is_empty()
-                && (rust_receiver_call || outcome.lexical_definition.is_none());
-            let has_external_call_shape = tree.as_ref().is_some_and(|tree| {
-                crate::analyzer::rust::external_calls::call_path_for_site(tree, &site).is_some_and(
-                    |callee| {
-                        matches!(
-                            callee.kind(),
-                            "field_expression" | "scoped_identifier" | "generic_function"
-                        )
-                    },
-                )
-            });
-            let should_try_model_receiver_fallback = has_no_workspace_target
-                && matches!(
-                    outcome.status,
-                    DefinitionLookupStatus::NoDefinition
-                        | DefinitionLookupStatus::UnresolvableImportBoundary
-                        | DefinitionLookupStatus::Incomplete
-                )
-                && has_external_call_shape;
-            let should_try_exact_rust_external_call = (rust_receiver_call
-                && has_no_workspace_target)
-                || should_try_model_receiver_fallback;
-            let exact = if should_try_exact_rust_external_call {
-                tree.as_ref().and_then(|tree| {
-                    let token = context.token;
-                    let (operation_factory, selected_operation) = rust_definition_batch
-                        .as_mut()
-                        .map_or((None, None), |batch| batch.resolver_parts());
-                    crate::analyzer::rust::external_calls::
-                        resolve_exact_rust_external_call_with_operation(
-                        analyzer,
-                        token,
-                        &request.file,
-                        source.as_ref(),
-                        tree,
-                        &site,
-                        || {
-                            if !should_try_model_receiver_fallback {
-                                return None;
-                            }
-                            let callee = crate::analyzer::rust::external_calls::call_path_for_site(
-                                tree, &site,
-                            )?;
-                            (callee.kind() == "field_expression").then(|| {
-                                context.rust_receiver_type_facts(&request.file, &source, tree)
-                            })
-                        },
-                        cancellation,
-                        operation_factory,
-                        selected_operation,
-                    )
-                })
-            } else {
-                None
-            };
-            if let Some((proof, identity)) = exact {
-                outcome = boundary_unchecked(
-                    format!(
-                        "`{}` is a resolver-proven external Rust callable",
-                        proof.canonical_callee()
-                    ),
-                    UnindexedClaim::external_boundary(identity.owner_fqn(), ClaimSubjectRole::Any),
-                );
-                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
-                reference.text = proof.canonical_callee().to_owned();
-                outcome.reference = Some(reference);
-                evidence.call_application = proof.call_application();
-                evidence.dispatch_extensibility = proof.dispatch_extensibility();
-                evidence.exact_external_call = Some(proof);
-                evidence.external_callee_identity = Some(identity);
-            }
-            outcome
-        }
-        Language::JavaScript | Language::TypeScript => {
-            let mut outcome = js_ts::resolve_js_ts(
-                analyzer,
-                context,
-                &request.file,
-                language,
-                &source,
-                tree.as_ref(),
-                &site,
-            );
-            if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
-                && let Some(proof) = tree.as_ref().and_then(|tree| {
-                    let imports = &context
-                        .js_ts_contexts
-                        .get(&(request.file.clone(), language))?
-                        .imports;
-                    js_ts::exact_direct_named_import_call(source.as_ref(), tree, &site, imports)
-                        .or_else(|| {
-                            js_ts::exact_modeled_external_call(
-                                analyzer,
-                                language,
-                                source.as_ref(),
-                                tree,
-                                &site,
-                            )
-                        })
-                })
-            {
-                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
-                reference.text = proof.canonical_callee().to_owned();
-                outcome.reference = Some(reference);
-                evidence.call_application = proof.call_application();
-                evidence.dispatch_extensibility = proof.dispatch_extensibility();
-                evidence.exact_external_call = Some(proof);
-            }
-            outcome
-        }
-        Language::Go if native_go_selected() => {
-            let query = crate::analyzer::languages::BoundedReceiverQuery {
-                analyzer,
-                file: &request.file,
-                source: &source,
-                tree: tree.as_ref(),
-                site: &site,
-                budget: if go_session.is_some() {
-                    ReceiverAnalysisBudget::default()
-                } else {
-                    crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET
-                },
-                cancellation,
-            };
-            evidence.authority = DefinitionResolutionAuthority::NativeGoSelected;
-            match crate::analyzer::go::native_points::resolve_go_definition_with_evidence_bounded(
-                query,
-                || {},
-            ) {
-                BoundedResolution::Complete { value, .. } => {
-                    evidence.call_application = value.call_application;
-                    evidence.external_callee_identity = value.external_callee_identity;
-                    if let Some(proof) = value.exact_external_call {
-                        evidence.call_application = proof.call_application();
-                        evidence.dispatch_extensibility = proof.dispatch_extensibility();
-                        evidence.exact_external_call = Some(proof);
-                    }
-                    value.outcome
-                }
-                BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
-                    limit,
-                    format!(
-                        "Go definition resolution exceeded its {} budget",
-                        limit.as_str()
-                    ),
-                ),
-                BoundedResolution::Cancelled { .. } => {
-                    cancelled("Go definition resolution was cancelled")
-                }
-            }
-        }
-        Language::Go => {
-            if let Some(go_analyzer) = resolve_analyzer::<GoAnalyzer>(analyzer) {
-                let definitions = match go_session {
-                    Some(session) => go::AnalyzerGoDefinitionProvider::bounded(
-                        go_analyzer,
-                        session,
-                        analyzer.semantic_model_overlay(),
-                    ),
-                    None => go::AnalyzerGoDefinitionProvider::new(
-                        go_analyzer,
-                        analyzer.semantic_model_overlay(),
-                    ),
-                };
-                let selector = tree.as_ref().and_then(|tree| match go_session {
-                    Some(_) => go_selector_descriptor_with_scope(tree.root_node(), &site, || {
-                        definitions.scope_step()
-                    }),
-                    None => go_selector_descriptor(tree.root_node(), &site),
-                });
-                let namespace_resolution = tree.as_ref().map(|tree| {
-                    let batch = context.go_context_with_provider(
-                        &definitions,
-                        token,
-                        go_analyzer,
-                        &request.file,
-                        &source,
-                        tree,
-                    );
-                    resolve_go_reference_with_namespaces(
-                        tree.root_node(),
-                        &source,
-                        &batch.package,
-                        &batch.aliases,
-                        &batch.dot_imports,
-                        &site,
-                        selector.as_ref(),
-                    )
-                });
-                let resolution = go::resolve_go(
-                    analyzer,
-                    &definitions,
-                    &request.file,
-                    &source,
-                    tree.as_ref(),
-                    &site,
-                    selector.as_ref(),
-                    namespace_resolution,
-                );
-                evidence.call_application = resolution.call_application;
-                evidence.dispatch_extensibility = resolution.dispatch_extensibility;
-                evidence.exact_external_call = resolution.exact_external_call;
-                evidence.external_callee_identity = resolution.external_callee_identity;
-                resolution.outcome
-            } else {
-                no_definition("go_analyzer_unavailable", "Go analyzer is unavailable")
-            }
-        }
-        Language::Java => {
-            if let Some(resolver) =
-                language_support(Language::Java).and_then(|support| support.structural_receiver())
-            {
-                let query = crate::analyzer::languages::BoundedReceiverQuery {
-                    analyzer,
-                    file: &request.file,
-                    source: &source,
-                    tree: tree.as_ref(),
-                    site: &site,
-                    budget:
-                        crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-                    cancellation,
-                };
-                return match resolver.resolve_definition_with_call_evidence_bounded(query) {
-                    BoundedResolution::Complete {
-                        value: (outcome, evidence),
-                        ..
-                    } => DefinitionResolution { outcome, evidence },
-                    BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
-                        limit,
-                        format!(
-                            "Java definition resolution exceeded its {} budget",
-                            limit.as_str()
-                        ),
-                    )
-                    .into(),
-                    BoundedResolution::Cancelled { .. } => {
-                        cancelled("Java definition resolution was cancelled").into()
-                    }
-                };
-            }
-
-            let resolution = java::resolve_java(
-                analyzer,
-                context.bounded_support(),
-                &request.file,
-                &source,
-                tree.as_ref(),
-                &site,
-            );
-            evidence = resolution.evidence;
-            resolution.outcome
-        }
-        Language::Php => {
-            let resolution = php::resolve_php(
-                analyzer,
-                context.bounded_support(),
-                &request.file,
-                &source,
-                tree.as_ref(),
-                &site,
-                context.exact_token_focus,
-            );
-            evidence.external_callee_identity = resolution.external_callee_identity;
-            resolution.outcome
-        }
-        Language::Python => {
-            let mut outcome = python::resolve_python(
-                analyzer,
-                token,
-                context,
-                &request.file,
-                &source,
-                tree.as_ref(),
-                &site,
-            );
-            if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
-                && cancellation.is_some_and(CancellationToken::is_cancelled)
-            {
-                outcome = cancelled("Python imported class value resolution was cancelled");
-            } else if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
-                && analyzer
-                    .active_semantic_model_snapshot()
-                    .is_some_and(|snapshot| snapshot.python_runtime().is_some())
-            {
-                match tree.as_ref().map(|tree| {
-                    python::python_imported_class_value_selection_bounded(
-                        resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer"),
-                        token,
-                        &request.file,
-                        source.as_ref(),
-                        tree.root_node(),
-                        &site,
-                        cancellation,
-                    )
-                }) {
-                    Some(BoundedResolution::Complete {
-                        value: Some(selection),
-                        ..
-                    }) => {
-                        outcome = match selection {
-                            python::PythonImportedClassValueSelection::Unproven(message) => {
-                                python_incomplete_class_value(
-                                    outcome,
-                                    DefinitionLookupStatus::Incomplete,
-                                    python_class_resolution_incomplete_diagnostic(message),
-                                )
-                            }
-                            python::PythonImportedClassValueSelection::Proven {
-                                import_module,
-                                class_name,
-                            } => {
-                                let attempt = resolve_python_runtime_binding(
-                                    analyzer,
-                                    &request.file,
-                                    PythonImportedMember {
-                                        module: &import_module,
-                                        member: &class_name,
-                                    },
-                                    cancellation,
-                                    crate::analyzer::python::runtime_binding::resolve_python_defining_class_binding,
-                                );
-                                match attempt {
-                                    PythonRuntimeBindingAttempt::Resolved(proof) => {
-                                        let canonical = proof.binding.canonical().join(".");
-                                        match python_class_symbol_from_binding(
-                                            analyzer,
-                                            &proof.binding,
-                                            &proof.provider,
-                                        ) {
-                                            Ok(symbol) => {
-                                                let mut reference = outcome
-                                                    .reference
-                                                    .take()
-                                                    .unwrap_or_else(|| site.clone());
-                                                reference.text = canonical;
-                                                let resolved = DefinitionLookupOutcome {
-                                                    modeled_definitions: vec![symbol],
-                                                    status: DefinitionLookupStatus::Resolved,
-                                                    reference: Some(reference),
-                                                    definitions: Vec::new(),
-                                                    lexical_definition: None,
-                                                    diagnostics: Vec::new(),
-                                                };
-                                                trace::record_selected_modeled(&resolved);
-                                                resolved
-                                            }
-                                            Err(message) => python_incomplete_class_value(
-                                                outcome,
-                                                DefinitionLookupStatus::Incomplete,
-                                                python_class_resolution_incomplete_diagnostic(
-                                                    message,
-                                                ),
-                                            ),
-                                        }
-                                    }
-                                    // No selected provider proof is available
-                                    // to refine the boundary, so retain the
-                                    // source resolver's existing claim.
-                                    PythonRuntimeBindingAttempt::Unavailable => outcome,
-                                    PythonRuntimeBindingAttempt::Cancelled => cancelled(
-                                        "Python imported class value resolution was cancelled",
-                                    ),
-                                    PythonRuntimeBindingAttempt::Failed(failure) => {
-                                        let (status, kind, message) =
-                                            python_runtime_binding_failure_parts(failure);
-                                        // A provider can withhold its competing declarations while
-                                        // still proving ambiguity; retain that typed verdict.
-                                        python_incomplete_class_value(
-                                            outcome,
-                                            status,
-                                            DefinitionLookupDiagnostic {
-                                                kind: kind.to_owned(),
-                                                message,
-                                                claim: None,
-                                            },
-                                        )
-                                    }
-                                }
-                            }
-                        };
-                    }
-                    Some(BoundedResolution::Exceeded { limit, .. }) => {
-                        outcome = exceeded_budget(
-                            limit,
-                            "Python imported class value resolution exceeded its bounded scope",
-                        );
-                    }
-                    Some(BoundedResolution::Cancelled { .. }) => {
-                        outcome = cancelled("Python imported class value resolution was cancelled");
-                    }
-                    Some(BoundedResolution::Complete { value: None, .. }) | None => {}
-                }
-            }
-            if matches!(
-                outcome.status,
-                DefinitionLookupStatus::UnresolvableImportBoundary
-                    | DefinitionLookupStatus::Incomplete
-                    | DefinitionLookupStatus::NoDefinition
-            ) && let Some(selection) = tree.as_ref().and_then(|tree| {
-                let imports = analyzer
-                    .import_analysis_provider()
-                    .expect("Python import provider")
-                    .import_info_of(token, &request.file);
-                python::exact_python_imported_call_selection(source.as_ref(), tree, &site, &imports)
-            }) {
-                let mut proof = selection.proof;
-                let runtime_binding = resolve_python_runtime_binding(
-                    analyzer,
-                    &request.file,
-                    PythonImportedMember {
-                        module: &selection.module,
-                        member: &selection.member,
-                    },
-                    cancellation,
-                    crate::analyzer::python::runtime_binding::resolve_python_defining_binding,
-                );
-                match runtime_binding {
-                    PythonRuntimeBindingAttempt::Resolved(proof_and_provider) => {
-                        if let Some(promoted) = proof.clone().with_python_runtime_binding(
-                            &proof_and_provider.binding,
-                            &proof_and_provider.provider,
-                        ) {
-                            proof = promoted;
-                            // A complete callable family can be selected exactly
-                            // through a partial package import surface. Preserve
-                            // the external-body boundary while closing this
-                            // callable's identity and formal contract.
-                            outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
-                        }
-                    }
-                    PythonRuntimeBindingAttempt::Unavailable => {}
-                    PythonRuntimeBindingAttempt::Cancelled => {
-                        outcome =
-                            cancelled("Python imported call binding resolution was cancelled");
-                    }
-                    PythonRuntimeBindingAttempt::Failed(failure) => {
-                        outcome
-                            .diagnostics
-                            .push(python_runtime_binding_failure_diagnostic(failure));
-                    }
-                }
-                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
-                reference.text = proof.canonical_callee().to_owned();
-                outcome.reference = Some(reference);
-                evidence.call_application = proof.call_application();
-                evidence.dispatch_extensibility = proof.dispatch_extensibility();
-                evidence.exact_external_call = Some(proof);
-            }
-            outcome
-        }
-        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer).map_or_else(
-            || no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable"),
-            |csharp_analyzer| {
-                let definitions = csharp::CSharpDefinitionProvider::new(csharp_analyzer);
-                let resolution = csharp::resolve_csharp(
-                    analyzer,
-                    token,
-                    &definitions,
-                    &request.file,
-                    &source,
-                    tree.as_ref(),
-                    &site,
-                    operation.is_some(),
-                );
-                evidence = resolution.evidence;
-                resolution.outcome
-            },
-        ),
-        Language::Cpp => {
-            let mut outcome = cpp::resolve_cpp(
-                analyzer,
-                token,
-                context,
-                &request.file,
-                &source,
-                tree.as_ref(),
-                &site,
-                context.exact_token_focus,
-                operation,
-                &mut evidence,
-            );
-            // A C call bound to a reached header's file-scope function
-            // publishes the proven identity as the boundary's callee text,
-            // exactly as every other exact external route does.
-            if let Some(proof) = &evidence.exact_external_call {
-                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
-                reference.text = proof.canonical_callee().to_owned();
-                outcome.reference = Some(reference);
-            }
-            outcome
-        }
-        Language::Scala => scala::resolve_scala(
+    let support = language_support(language).expect("supported definition language");
+    let resolution = match definition_batch {
+        Some(batch) => batch.resolve_definition_dispatch(
             analyzer,
             token,
             context,
-            &request.file,
+            &request,
             &source,
-            tree.as_ref(),
+            &tree,
             &site,
+            operation,
+            cancellation,
+            go_session,
         ),
-        Language::Ruby => {
-            let mut outcome = ruby::resolve_ruby(
-                analyzer,
-                context.bounded_support(),
-                &request.file,
-                &source,
-                tree.as_ref(),
-                &site,
-            );
-            if matches!(
-                outcome.status,
-                DefinitionLookupStatus::NoDefinition
-                    | DefinitionLookupStatus::UnresolvableImportBoundary
-            ) && let Some((proof, identity)) = tree.as_ref().and_then(|tree| {
-                ruby::exact_ruby_external_call(
-                    analyzer,
-                    &request.file,
-                    source.as_ref(),
-                    tree,
-                    &site,
-                    cancellation,
-                )
-            }) {
-                outcome = boundary_unchecked(
-                    format!(
-                        "`{}` is declared by the activated Ruby model",
-                        proof.canonical_callee()
-                    ),
-                    UnindexedClaim::external_boundary(identity.owner_fqn(), ClaimSubjectRole::Any),
-                );
-                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
-                reference.text = proof.canonical_callee().to_owned();
-                outcome.reference = Some(reference);
-                evidence.call_application = proof.call_application();
-                evidence.dispatch_extensibility = proof.dispatch_extensibility();
-                evidence.exact_external_call = Some(proof);
-                evidence.external_callee_identity = Some(identity);
-            }
-            outcome
-        }
-        Language::Kotlin => kotlin::resolve_kotlin(
+        None => support.resolve_definition_dispatch(
             analyzer,
-            context.bounded_support(),
-            &request.file,
+            token,
+            context,
+            &request,
             &source,
-            tree.as_ref(),
+            &tree,
             &site,
+            operation,
+            cancellation,
+            go_session,
         ),
-        Language::None => {
-            unreachable!("unsupported language handled before source extraction")
-        }
+    };
+    let DefinitionResolution {
+        outcome: resolved,
+        evidence,
+    } = match resolution {
+        std::ops::ControlFlow::Break(resolution) => return resolution,
+        std::ops::ControlFlow::Continue(resolution) => resolution,
     };
 
     let resolved = if let Some(operation) = operation {
@@ -5454,7 +3267,8 @@ fn resolve_one_with_evidence<'a: 'selection, 'batch, 'factory, 'selection, 'borr
     }
 }
 
-fn finish_lookup_outcome(
+#[doc(hidden)]
+pub fn finish_lookup_outcome(
     mut outcome: DefinitionLookupOutcome,
     site: ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
@@ -5465,12 +3279,14 @@ fn finish_lookup_outcome(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum QualifiedAccessFocus {
+#[doc(hidden)]
+pub enum QualifiedAccessFocus {
     Qualifier,
     Member,
 }
 
-pub(super) fn qualified_access_focus(
+#[doc(hidden)]
+pub fn qualified_access_focus(
     focus: Node<'_>,
     access: Node<'_>,
     qualifier_fields: &[&str],
@@ -5493,7 +3309,8 @@ fn fields_contain_focus(access: Node<'_>, fields: &[&str], focus: Node<'_>) -> b
     })
 }
 
-pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
+#[doc(hidden)]
+pub fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
     node.id() == focus.id()
         || (node.start_byte() <= focus.start_byte() && focus.end_byte() <= node.end_byte())
 }
@@ -5512,14 +3329,16 @@ pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
 ///
 /// One memo per language: source bytes alone must never answer for a
 /// different grammar's parse.
-pub(super) struct TreeParseMemo {
+#[doc(hidden)]
+pub struct TreeParseMemo {
     cache: OnceLock<Cache<Arc<str>, Option<Tree>>>,
 }
 
 const TREE_PARSE_MEMO_SOURCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
 impl TreeParseMemo {
-    pub(super) const fn new() -> Self {
+    #[doc(hidden)]
+    pub const fn new() -> Self {
         Self {
             cache: OnceLock::new(),
         }
@@ -5531,11 +3350,8 @@ impl TreeParseMemo {
         })
     }
 
-    pub(super) fn parse(
-        &self,
-        source: &str,
-        parse: impl FnOnce(&str) -> Option<Tree>,
-    ) -> Option<Tree> {
+    #[doc(hidden)]
+    pub fn parse(&self, source: &str, parse: impl FnOnce(&str) -> Option<Tree>) -> Option<Tree> {
         let cache = self.cache();
         if let Some(tree) = cache.get(source) {
             return tree;
@@ -5582,7 +3398,8 @@ pub fn parse_tree_for_language(
     Some(tree)
 }
 
-pub(crate) fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {
+#[doc(hidden)]
+pub fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {
     sort_units(&mut candidates);
     candidates.dedup();
     let mut semantic_keys = HashSet::default();
@@ -5622,7 +3439,8 @@ pub(crate) fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLoo
     outcome
 }
 
-fn finalize_navigation_outcome(
+#[doc(hidden)]
+pub fn finalize_navigation_outcome(
     mut outcome: DefinitionLookupOutcome,
     operation: NavigationOperation,
 ) -> DefinitionLookupOutcome {
@@ -5681,7 +3499,8 @@ fn finalize_navigation_outcome(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn navigation_lookup_outcome(
+#[doc(hidden)]
+pub fn navigation_lookup_outcome(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'_, '_>,
@@ -5710,52 +3529,67 @@ fn navigation_lookup_outcome(
         modeled_definitions.clear();
         lexical_definition = None;
     }
-    let (mut targets, structure_unavailable, unproven_link_unit, mut truncated) = if language
-        == Language::Cpp
-    {
-        // C++ candidates_outcome already groups one logical symbol across
-        // physical declarations as Resolved, and bypasses the generic
-        // definition finalizer. Its occurrence selector can therefore choose
-        // that symbol's body or conditional-family representative below.
-        // Explicit Ambiguous outcomes also cover base-subobject and receiver
-        // uncertainty; selecting one occurrence cannot discharge those proofs.
-        let selection =
-            cpp::select_navigation_targets(context, token, reference_file, &definitions, operation);
-        (
-            selection.targets,
-            selection.structure_unavailable
-                || diagnostics.iter().any(|diagnostic| {
-                    diagnostic.kind == CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC
-                }),
-            selection.unproven_link_unit,
-            selection.truncated,
-        )
-    } else {
-        // A reference's definition is the resolver's answer. The resolver
-        // already names an impl's associated type for a concrete qualifier
-        // (`View::Node`), so a trait's declaration here means the qualifier is
-        // bounded by traits: a type parameter (`G::Node` under `G: Dense`) or
-        // `Self` in a trait body. Every impl of the trait is not a definition
-        // of that reference, so only the upward (declaration) direction
-        // follows the member family. A click on the trait's own declaration
-        // still reaches its impls (`navigation_declaration_site_targets`).
-        let mut targets: Vec<_> = definitions
-            .iter()
-            .cloned()
-            .flat_map(|code_unit| match operation {
-                NavigationOperation::Declaration => {
-                    rust_associated_navigation_targets(analyzer, code_unit, operation)
-                }
-                NavigationOperation::Definition => vec![NavigationTarget {
-                    code_unit,
-                    declaration_range: None,
-                }],
-            })
-            .collect();
-        let truncated = targets.len() > MAX_NAVIGATION_TARGETS_PER_RESULT;
-        targets.truncate(MAX_NAVIGATION_TARGETS_PER_RESULT);
-        (targets, false, false, truncated)
-    };
+    let (mut targets, structure_unavailable, unproven_link_unit, mut truncated) =
+        if language == Language::Cpp {
+            // C++ candidates_outcome already groups one logical symbol across
+            // physical declarations as Resolved, and bypasses the generic
+            // definition finalizer. Its occurrence selector can therefore choose
+            // that symbol's body or conditional-family representative below.
+            // Explicit Ambiguous outcomes also cover base-subobject and receiver
+            // uncertainty; selecting one occurrence cannot discharge those proofs.
+            let selection = language_support(language)
+                .expect("supported navigation language")
+                .definition_navigation_selection(
+                    context,
+                    token,
+                    reference_file,
+                    &definitions,
+                    operation,
+                )
+                .expect("C++ navigation selects physical occurrences");
+            (
+                selection.targets,
+                selection.structure_unavailable
+                    || diagnostics.iter().any(|diagnostic| {
+                        diagnostic.kind == CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC
+                    }),
+                selection.unproven_link_unit,
+                selection.truncated,
+            )
+        } else {
+            // A reference's definition is the resolver's answer. The resolver
+            // already names an impl's associated type for a concrete qualifier
+            // (`View::Node`), so a trait's declaration here means the qualifier is
+            // bounded by traits: a type parameter (`G::Node` under `G: Dense`) or
+            // `Self` in a trait body. Every impl of the trait is not a definition
+            // of that reference, so only the upward (declaration) direction
+            // follows the member family. A click on the trait's own declaration
+            // still reaches its impls (`navigation_declaration_site_targets`).
+            let mut targets: Vec<_> = definitions
+                .iter()
+                .cloned()
+                .flat_map(|code_unit| match operation {
+                    NavigationOperation::Declaration => {
+                        match language_support(language_for_file(code_unit.source())) {
+                            Some(support) => support.definition_associated_navigation_targets(
+                                analyzer, token, code_unit, operation,
+                            ),
+                            None => vec![NavigationTarget {
+                                code_unit,
+                                declaration_range: None,
+                            }],
+                        }
+                    }
+                    NavigationOperation::Definition => vec![NavigationTarget {
+                        code_unit,
+                        declaration_range: None,
+                    }],
+                })
+                .collect();
+            let truncated = targets.len() > MAX_NAVIGATION_TARGETS_PER_RESULT;
+            targets.truncate(MAX_NAVIGATION_TARGETS_PER_RESULT);
+            (targets, false, false, truncated)
+        };
     targets.sort_by(|left, right| {
         (&left.code_unit, left.declaration_range).cmp(&(&right.code_unit, right.declaration_range))
     });
@@ -5775,7 +3609,7 @@ fn navigation_lookup_outcome(
             "no_definition"
                 | "no_declaration"
                 | NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC
-                | cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC
+                | CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC
         )
     });
 
@@ -5851,7 +3685,7 @@ fn navigation_lookup_outcome(
     if unproven_link_unit {
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
-            kind: cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
+            kind: CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
             message:
                 "multiple C/C++ definition bodies remain, but no build graph proves one link unit"
                     .to_string(),
@@ -5893,7 +3727,8 @@ fn navigation_lookup_outcome(
 /// downgrade in [`navigation_lookup_outcome`]: ambiguity means "choose one of
 /// these", so an answer with nothing to choose from is a missing answer, not an
 /// ambiguous one (#1811).
-fn ambiguous_candidates_outcome(
+#[doc(hidden)]
+pub fn ambiguous_candidates_outcome(
     candidates: Vec<CodeUnit>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
@@ -5908,7 +3743,8 @@ fn ambiguous_candidates_outcome(
 /// something the plain kind does not. What it must not keep is an empty answer:
 /// the contenders travel with the verdict so a caller, and an audit, can see
 /// what the resolver was choosing between (#2167).
-fn ambiguous_candidates_outcome_of_kind(
+#[doc(hidden)]
+pub fn ambiguous_candidates_outcome_of_kind(
     mut candidates: Vec<CodeUnit>,
     kind: impl Into<String>,
     message: impl Into<String>,
@@ -5932,7 +3768,8 @@ fn ambiguous_candidates_outcome_of_kind(
     }
 }
 
-fn lexical_definition_outcome(definition: LexicalDefinition) -> DefinitionLookupOutcome {
+#[doc(hidden)]
+pub fn lexical_definition_outcome(definition: LexicalDefinition) -> DefinitionLookupOutcome {
     let outcome = DefinitionLookupOutcome {
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::Resolved,
@@ -5945,7 +3782,8 @@ fn lexical_definition_outcome(definition: LexicalDefinition) -> DefinitionLookup
     outcome
 }
 
-fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
+#[doc(hidden)]
+pub fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
     (unit.fq_name(), format!("{:?}", unit.kind()))
 }
 
@@ -5961,10 +3799,8 @@ fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
 /// preceding enclosing-scope/workspace-namespace probe that returned early, or a
 /// predicate that already fused the workspace check. Each such call MUST carry a
 /// `// gated upstream:` comment naming where its guard lives.
-pub(crate) fn boundary_unchecked(
-    message: String,
-    claim: UnindexedClaim,
-) -> DefinitionLookupOutcome {
+#[doc(hidden)]
+pub fn boundary_unchecked(message: String, claim: UnindexedClaim) -> DefinitionLookupOutcome {
     diagnostic_outcome_with_claim(
         DefinitionLookupStatus::UnresolvableImportBoundary,
         "unresolvable_import_boundary",
@@ -5995,7 +3831,8 @@ pub(crate) fn boundary_unchecked(
 /// `claim` is the structured form of the indexing claim the boundary message
 /// makes (which unit is asserted external, and in which role), so contract
 /// consumers can test the claim without parsing the message.
-fn gated_boundary(
+#[doc(hidden)]
+pub fn gated_boundary(
     workspace_internal: impl FnOnce() -> bool,
     boundary_message: String,
     claim: UnindexedClaim,
@@ -6010,7 +3847,8 @@ fn gated_boundary(
     }
 }
 
-fn external_member_boundary_outcome(
+#[doc(hidden)]
+pub fn external_member_boundary_outcome(
     canonical: String,
     message: String,
     mut reference: Option<ResolvedReferenceSite>,
@@ -6041,7 +3879,8 @@ fn external_member_boundary_outcome(
 ///
 /// Matching is exact-fq only, never normalized and never identifier-level, so a
 /// merely same-named declaration in another language can never be produced.
-fn cross_language_declarations(
+#[doc(hidden)]
+pub fn cross_language_declarations(
     support: &dyn BoundedDefinitionLookup,
     fqn: &str,
     own_language: Language,
@@ -6069,14 +3908,16 @@ fn import_boundary_workspace_message(message: String) -> String {
     )
 }
 
-pub(crate) fn no_definition(
+#[doc(hidden)]
+pub fn no_definition(
     kind: impl Into<String>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
     diagnostic_outcome(DefinitionLookupStatus::NoDefinition, kind, message)
 }
 
-fn exceeded_budget(
+#[doc(hidden)]
+pub fn exceeded_budget(
     limit: ReceiverBudgetLimit,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
@@ -6087,7 +3928,8 @@ fn exceeded_budget(
     )
 }
 
-fn cancelled(message: impl Into<String>) -> DefinitionLookupOutcome {
+#[doc(hidden)]
+pub fn cancelled(message: impl Into<String>) -> DefinitionLookupOutcome {
     diagnostic_outcome(DefinitionLookupStatus::Cancelled, "cancelled", message)
 }
 
@@ -6106,7 +3948,8 @@ fn cancelled(message: impl Into<String>) -> DefinitionLookupOutcome {
 /// specialization patterns, semantic-model records, or a provider that
 /// deliberately withholds candidate evidence. Each such call site MUST carry a
 /// `// no candidates:` comment naming where the contenders were lost.
-fn ambiguous_without_candidates(message: impl Into<String>) -> DefinitionLookupOutcome {
+#[doc(hidden)]
+pub fn ambiguous_without_candidates(message: impl Into<String>) -> DefinitionLookupOutcome {
     DefinitionLookupOutcome {
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::Ambiguous,
@@ -6162,15 +4005,10 @@ fn diagnostic_outcome_with_claim(
 }
 
 #[cfg(test)]
-mod native_navigation_tests;
-
-#[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::analyzer::{Project, TestProject};
-    use crate::inline_project::InlineTestProject;
 
-    use crate::test_support::AnalyzerFixture;
+    use super::*;
+
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
@@ -6194,986 +4032,26 @@ mod tests {
             Some(RustClosedWorld::InactiveSelection)
         );
     }
-
-    #[test]
-    fn navigation_keeps_incomplete_candidates_without_singleton_proof() {
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", "")]);
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let candidate = CodeUnit::file_scope(file.clone());
-        let outcome = DefinitionLookupOutcome {
-            modeled_definitions: Vec::new(),
-            status: DefinitionLookupStatus::Incomplete,
-            reference: None,
-            definitions: vec![candidate],
-            lexical_definition: None,
-            diagnostics: vec![DefinitionLookupDiagnostic {
-                claim: None,
-                kind: "analysis_incomplete".to_string(),
-                message: "candidate set is partial".to_string(),
-            }],
-        };
-
-        let navigation = navigation_lookup_outcome(
-            analyzer,
-            scope.token(),
-            &mut context,
-            &file,
-            outcome.into(),
-            Language::Rust,
-            NavigationOperation::Definition,
-        );
-
-        assert_eq!(navigation.status, DefinitionLookupStatus::Incomplete);
-        assert_eq!(navigation.targets.len(), 1);
-        assert_ne!(navigation.status, DefinitionLookupStatus::Resolved);
-    }
-
-    #[test]
-    #[hardwon(
-        "04c089199ae3: Scala named-argument fixture verifies direct-child lookup state is reused without changing parameter resolution"
-    )]
-    fn scala_batch_context_reuses_direct_children_for_named_arguments() {
-        // Asserts an incumbent-only cache counter; the native trial answers before that cache, so this moves or dies at the Scala flip.
-        if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
-            return;
-        }
-        let source = "package demo\nobject Main {\n  class Widget(val alpha: Boolean, val beta: Boolean)\n  val widget = new Widget(alpha = true, beta = false)\n}\n";
-        let fixture = AnalyzerFixture::new_for_language(Language::Scala, &[("main.scala", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "main.scala");
-        let analyzer = fixture.analyzer.analyzer();
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let requests = ["alpha", "beta"]
-            .into_iter()
-            .map(|needle| {
-                let start_byte = source.rfind(needle).expect("named argument in source");
-                DefinitionLookupRequest {
-                    file: file.clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + needle.len()),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let _outcomes =
-            resolve_definition_requests(analyzer, token, &mut context, requests, None, None);
-        assert_eq!(context.scala_lookup_cache_counts(), (1, 0));
-    }
-
-    #[test]
-    #[hardwon(
-        "#784: Real C++ references verify class-range preparation is reused across many focused qualifiers in one file"
-    )]
-    fn cpp_focused_qualifiers_build_class_ranges_once_per_file() {
-        const REFERENCE_COUNT: usize = 32;
-        const UNRELATED_CLASSES: usize = 128;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let mut source = String::new();
-        for index in 0..UNRELATED_CLASSES {
-            source.push_str(&format!("struct Unrelated{index} {{ int value; }};\n"));
-        }
-        source.push_str("struct Host { void exercise() {\n");
-        for _ in 0..REFERENCE_COUNT {
-            source.push_str("  Unknown::BindOnce();\n");
-        }
-        source.push_str("} };\n");
-        consumer.write(&source).unwrap();
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
-        let analyzer = CppAnalyzer::new(project);
-        let requests = source
-            .match_indices("Unknown")
-            .map(|(start_byte, name)| DefinitionLookupRequest {
-                file: consumer.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start_byte),
-                end_byte: Some(start_byte + name.len()),
-            })
-            .collect::<Vec<_>>();
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let mut context = DefinitionBatchContext::new(&analyzer, scope.token());
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let outcomes =
-            resolve_definition_requests(&analyzer, token, &mut context, requests, None, None);
-
-        assert_eq!(outcomes.len(), REFERENCE_COUNT);
-        assert!(outcomes.iter().all(|outcome| {
-            outcome.status == DefinitionLookupStatus::NoDefinition && outcome.definitions.is_empty()
-        }));
-        assert_eq!(
-            context.cpp_class_range_builds, 1,
-            "focused qualifiers in one file should share one class-range index"
-        );
-        assert_eq!(
-            context.enclosing_owner_chains.len(),
-            1,
-            "focused qualifiers in one class should share its enclosing owner chain"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "d6fe0c806939: cancelled definition batches used to lose their terminal status or return partial targets"
-    )]
-    fn cancelled_definition_batch_returns_terminal_outcomes_without_targets() {
-        let source = "fn target() {}\nfn caller() { target(); }\n";
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let requests = ["target", "caller"]
-            .into_iter()
-            .map(|name| {
-                let start_byte = source.find(name).expect("request token");
-                DefinitionLookupRequest {
-                    file: file.clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + name.len()),
-                }
-            })
-            .collect();
-
-        let outcomes = resolve_definition_batch_with_source_and_cancellation(
-            fixture.analyzer.analyzer(),
-            requests,
-            file,
-            Arc::from(source),
-            &cancellation,
-        );
-
-        assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|outcome| {
-            outcome.status == DefinitionLookupStatus::Cancelled
-                && outcome.status.as_str() == "cancelled"
-                && outcome.definitions.is_empty()
-                && outcome.lexical_definition.is_none()
-        }));
-    }
-
-    #[test]
-    #[hardwon("d6fe0c806939: cancelled navigation exposed a partial candidate prefix")]
-    fn navigation_with_cancelled_status_discards_partial_candidates() {
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", "")]);
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let outcome = DefinitionLookupOutcome {
-            modeled_definitions: Vec::new(),
-            status: DefinitionLookupStatus::Cancelled,
-            reference: None,
-            definitions: vec![CodeUnit::file_scope(file.clone())],
-            lexical_definition: None,
-            diagnostics: vec![DefinitionLookupDiagnostic {
-                claim: None,
-                kind: "cancelled".to_string(),
-                message: "resolution was cancelled".to_string(),
-            }],
-        };
-
-        let navigation = navigation_lookup_outcome(
-            analyzer,
-            scope.token(),
-            &mut context,
-            &file,
-            outcome.into(),
-            Language::Rust,
-            NavigationOperation::Definition,
-        );
-
-        assert_eq!(navigation.status, DefinitionLookupStatus::Cancelled);
-        assert!(navigation.targets.is_empty());
-    }
-
-    #[test]
-    #[hardwon(
-        "#3164: one-call Python batches repeatedly rebuilt scope facts and parsed prepared source"
-    )]
-    fn python_call_target_batches_reuse_request_context_and_prepared_syntax() {
-        let source = Arc::<str>::from(
-            "from service import Service\n\ndef handle(service: Service):\n    service.run()\n",
-        );
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[
-                (
-                    "service.py",
-                    "class Service:\n    def run(self):\n        pass\n",
-                ),
-                ("app.py", source.as_ref()),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "app.py");
-        let analyzer = fixture.analyzer.analyzer();
-        let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
-        let member_start = source.rfind("run").expect("receiver member in source");
-        let request = DefinitionLookupRequest {
-            file: file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(member_start),
-            end_byte: Some(member_start + "run".len()),
-        };
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let prepared = py
-            .prepared_syntax(scope.token(), &file)
-            .expect("prepared Python syntax");
-        assert_eq!(prepared.source(), source.as_ref());
-        let mut ledgers = Vec::new();
-
-        for _ in 0..2 {
-            let ledger = Arc::new(crate::analyzer::ReadLedger::new());
-            let ledger_scope = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
-            let outcomes = resolve_call_target_batch_with_source(
-                analyzer,
-                scope.token(),
-                vec![request.clone()],
-                file.clone(),
-                Arc::clone(&source),
-                None,
-            );
-            assert_eq!(outcomes.len(), 1);
-            assert_eq!(outcomes[0].outcome.status, DefinitionLookupStatus::Resolved);
-            assert_eq!(
-                outcomes[0].outcome.definitions[0].fq_name(),
-                "service.Service.run"
-            );
-            drop(ledger_scope);
-            ledgers.push(ledger);
-        }
-
-        assert_eq!(py.prepared_syntax_parse_count_for_test(&file), 1);
-        assert_eq!(python::request_definition_build_counts(py), (1, 1, 1, 0));
-        assert!(!ledgers[0].is_empty());
-        let cached_reads =
-            python::request_definition_cached_read_keys(py, analyzer, &file, source.as_ref());
-        let replayed_reads = ledgers[1].keys();
-        assert!(
-            cached_reads
-                .iter()
-                .all(|read| replayed_reads.contains(read)),
-            "cached Python definition reads were not replayed: cached={cached_reads:?}, replayed={replayed_reads:?}"
-        );
-    }
-
-    /// #3496: one call-target batch keeps whatever its resolver proved about
-    /// the call, whichever language wrote it.
-    ///
-    /// The route used to send a hand-kept list of languages through the branch
-    /// that retains `exact_external_call` and `external_callee_identity`, and
-    /// flattened every other language's evidence to `None` one layer above the
-    /// resolver that produced it. Ruby's boundary proof was discarded that way
-    /// for as long as Ruby was absent from the list (#3459). These rows read
-    /// the languages that publish a proof today back through the production
-    /// entry point, beside one that publishes none, so an absent proof stays
-    /// the resolver's own answer rather than the route's.
-
-    #[test]
-    #[hardwon("#3496: the general call-target route discarded resolver-owned proof evidence")]
-    fn call_target_batch_keeps_every_resolver_proof() {
-        struct Case {
-            language: Language,
-            files: &'static [(&'static str, &'static str)],
-            caller: &'static str,
-            callee: &'static str,
-            canonical_callee: Option<&'static str>,
-        }
-
-        let cases = [
-            Case {
-                language: Language::Python,
-                files: &[(
-                    "app.py",
-                    "import httpx\n\n\ndef fetch(url):\n    return httpx.get(url)\n",
-                )],
-                caller: "app.py",
-                callee: "get",
-                canonical_callee: Some("httpx.get"),
-            },
-            Case {
-                language: Language::JavaScript,
-                files: &[(
-                    "app.js",
-                    "import { get } from \"axios\";\n\nexport function fetch(url) {\n  return get(url);\n}\n",
-                )],
-                caller: "app.js",
-                callee: "get",
-                canonical_callee: Some("axios.get"),
-            },
-            Case {
-                language: Language::Java,
-                files: &[(
-                    "App.java",
-                    "class App { void run(java.util.List<String> values) { values.size(); } }",
-                )],
-                caller: "App.java",
-                callee: "size",
-                canonical_callee: None,
-            },
-        ];
-
-        for case in cases {
-            let mut project = InlineTestProject::with_language(case.language);
-            for (path, contents) in case.files {
-                project = project.file(*path, *contents);
-            }
-            let project = project.build();
-            let workspace = project.workspace_analyzer(crate::AnalyzerConfig::default());
-            let analyzer = workspace.analyzer();
-            let file = project.file(case.caller);
-            let source = Arc::<str>::from(
-                case.files
-                    .iter()
-                    .find(|(path, _)| *path == case.caller)
-                    .expect("the caller is one of the case files")
-                    .1,
-            );
-            let start_byte = source
-                .rfind(case.callee)
-                .expect("the callee token appears in the caller");
-            let scope = AnalyzerQueryScope::new(analyzer);
-            let outcomes = resolve_call_target_batch_with_source(
-                analyzer,
-                scope.token(),
-                vec![DefinitionLookupRequest {
-                    file: file.clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + case.callee.len()),
-                }],
-                file,
-                source,
-                None,
-            );
-
-            let [outcome] = outcomes.as_slice() else {
-                panic!("one request answers once, got {outcomes:?}");
-            };
-            match case.canonical_callee {
-                Some(canonical) => {
-                    let proof = outcome.exact_external_call.as_ref().unwrap_or_else(|| {
-                        panic!(
-                            "{:?} published an exact external call proof the batch must carry: {outcome:?}",
-                            case.language
-                        )
-                    });
-                    assert_eq!(proof.canonical_callee(), canonical, "{outcome:?}");
-                    assert_ne!(
-                        outcome.call_application,
-                        CallApplicationKind::Unknown,
-                        "the proof's call shape travels with it: {outcome:?}"
-                    );
-                    // `call_target_boundary_evidence` reads the proof against
-                    // the reference text, so the two must name one callee.
-                    assert_eq!(
-                        outcome.outcome.resolved_reference_target(),
-                        Some(canonical),
-                        "{outcome:?}"
-                    );
-                }
-                None => {
-                    assert!(
-                        outcome.exact_external_call.is_none()
-                            && outcome.external_callee_identity.is_none(),
-                        "{:?} publishes no call proof, so the batch has none to carry: {outcome:?}",
-                        case.language
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "finds real bug: a two-step Rust member chain answers with the right definition but reports Incomplete. `outer.inner` resolves to `Outer.inner` and `outer.inner.value` returns `Inner.value`, yet the terminal keeps one UnsupportedSemantic reason that the same read one step shorter (`inner.value` on a parameter) does not, and a two-step chain whose terminal field has a named type exceeds the summary-expansion budget instead. Owned by lane B R2.B Rust reference lowering"]
-    fn rust_batch_context_reuses_supplied_syntax_for_repeated_field_lookups() {
-        let source = "struct Inner { value: i32 }\nstruct Outer { inner: Inner }\nfn first(outer: Outer) -> i32 { outer.inner.value }\nfn second(outer: Outer) -> i32 { outer.inner.value }\n";
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let analyzer = fixture.analyzer.analyzer();
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let requests = source
-            .match_indices("value")
-            .skip(1)
-            .map(|(start_byte, reference)| DefinitionLookupRequest {
-                file: file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start_byte),
-                end_byte: Some(start_byte + reference.len()),
-            })
-            .collect();
-
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let outcomes =
-            resolve_definition_requests(analyzer, token, &mut context, requests, None, None);
-
-        assert!(outcomes.iter().all(|outcome| {
-            outcome.status == DefinitionLookupStatus::Resolved
-                && outcome
-                    .definitions
-                    .iter()
-                    .any(|unit| unit.fq_name() == "Inner.value")
-        }));
-    }
-
-    #[test]
-    fn python_batch_context_resolves_explicit_reexports_without_generic_imports() {
-        let source =
-            "from facade import Service\n\ndef handle(service: Service):\n    service.run()\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[
-                (
-                    "service.py",
-                    "class Service:\n    def run(self):\n        pass\n",
-                ),
-                ("facade.py", "from service import Service\n"),
-                ("app.py", source),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "app.py");
-        let analyzer = fixture.analyzer.analyzer();
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let start_byte = source.rfind("run").expect("receiver member in source");
-
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let outcomes = resolve_definition_requests(
-            analyzer,
-            token,
-            &mut context,
-            vec![DefinitionLookupRequest {
-                file,
-                line: None,
-                column: None,
-                start_byte: Some(start_byte),
-                end_byte: Some(start_byte + "run".len()),
-            }],
-            None,
-            None,
-        );
-
-        assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
-        assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
-        assert_eq!(context.python_build_counts(), (1, 1, 1, 0));
-        assert!(context.python_contexts.is_empty());
-    }
-
-    #[test]
-    fn python_batch_context_preserves_reexport_source_order_across_facades() {
-        let source = "from facade_import_wins import Service as ImportedWins\nfrom facade_local_wins import Service as LocalWins\n\ndef handle(imported: ImportedWins, local: LocalWins):\n    imported.leaf_only()\n    local.local_only()\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[
-                (
-                    "leaf.py",
-                    "class Service:\n    def leaf_only(self):\n        pass\n",
-                ),
-                (
-                    "middle_import_wins.py",
-                    "class Service:\n    pass\n\nfrom leaf import Service\n",
-                ),
-                (
-                    "middle_local_wins.py",
-                    "from leaf import Service\n\nclass Service:\n    def local_only(self):\n        pass\n",
-                ),
-                (
-                    "facade_import_wins.py",
-                    "from middle_import_wins import Service\n",
-                ),
-                (
-                    "facade_local_wins.py",
-                    "from middle_local_wins import Service\n",
-                ),
-                ("app.py", source),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "app.py");
-        let analyzer = fixture.analyzer.analyzer();
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let requests = ["leaf_only", "local_only"]
-            .into_iter()
-            .map(|needle| {
-                let start_byte = source.rfind(needle).expect("receiver member in source");
-                DefinitionLookupRequest {
-                    file: file.clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + needle.len()),
-                }
-            })
-            .collect();
-
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let outcomes =
-            resolve_definition_requests(analyzer, token, &mut context, requests, None, None);
-
-        assert_eq!(
-            outcomes[0].definitions[0].fq_name(),
-            "leaf.Service.leaf_only"
-        );
-        assert_eq!(
-            outcomes[1].definitions[0].fq_name(),
-            "middle_local_wins.Service.local_only"
-        );
-        assert_eq!(context.python_build_counts(), (1, 1, 2, 0));
-        assert!(context.python_contexts.is_empty());
-    }
-
-    #[test]
-    fn python_batch_context_keeps_receiver_types_isolated_by_file() {
-        let source_a =
-            "from service_a import Service\n\ndef handle(service: Service):\n    service.run()\n";
-        let source_b =
-            "from service_b import Service\n\ndef handle(service: Service):\n    service.stop()\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[
-                (
-                    "service_a.py",
-                    "class Service:\n    def run(self):\n        pass\n",
-                ),
-                (
-                    "service_b.py",
-                    "class Service:\n    def stop(self):\n        pass\n",
-                ),
-                ("app_a.py", source_a),
-                ("app_b.py", source_b),
-            ],
-        );
-        let file_a = ProjectFile::new(fixture.project_root(), "app_a.py");
-        let file_b = ProjectFile::new(fixture.project_root(), "app_b.py");
-        let analyzer = fixture.analyzer.analyzer();
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let requests = [(file_a, source_a, "run"), (file_b, source_b, "stop")]
-            .into_iter()
-            .map(|(file, source, needle)| {
-                let start_byte = source.rfind(needle).expect("receiver member in source");
-                DefinitionLookupRequest {
-                    file,
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + needle.len()),
-                }
-            })
-            .collect();
-
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let outcomes =
-            resolve_definition_requests(analyzer, token, &mut context, requests, None, None);
-
-        assert_eq!(
-            outcomes[0].definitions[0].fq_name(),
-            "service_a.Service.run"
-        );
-        assert_eq!(
-            outcomes[1].definitions[0].fq_name(),
-            "service_b.Service.stop"
-        );
-        assert_eq!(context.python_build_counts(), (2, 2, 2, 0));
-        assert!(context.python_contexts.is_empty());
-    }
-
-    #[test]
-    fn python_batch_receiver_type_cache_bypasses_inserts_at_its_limit() {
-        let source = "from service import Service\nfrom other import Other\n\ndef handle(service: Service, other: Other):\n    service.run()\n    other.stop()\n    service.run()\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[
-                (
-                    "service.py",
-                    "class Service:\n    def run(self):\n        pass\n",
-                ),
-                (
-                    "other.py",
-                    "class Other:\n    def stop(self):\n        pass\n",
-                ),
-                ("app.py", source),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "app.py");
-        let analyzer = fixture.analyzer.analyzer();
-        let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let python_context = context.python_context(token, py, &file, source);
-        python_context.set_receiver_type_cache_limit(1);
-        let member_offsets = [
-            source
-                .find("service.run")
-                .expect("first service call in source")
-                + "service.".len(),
-            source.find("other.stop").expect("other call in source") + "other.".len(),
-            source
-                .rfind("service.run")
-                .expect("second service call in source")
-                + "service.".len(),
-        ];
-        let requests = member_offsets
-            .into_iter()
-            .zip(["run", "stop", "run"])
-            .map(|(start_byte, needle)| DefinitionLookupRequest {
-                file: file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start_byte),
-                end_byte: Some(start_byte + needle.len()),
-            })
-            .collect();
-
-        let outcomes =
-            resolve_definition_requests(analyzer, token, &mut context, requests, None, None);
-
-        assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
-        assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
-        assert_eq!(outcomes[2].definitions[0].fq_name(), "service.Service.run");
-        assert_eq!(python_context.receiver_type_cache_len(), 1);
-        assert_eq!(context.python_build_counts(), (1, 1, 2, 0));
-        assert!(context.python_contexts.is_empty());
-    }
-
-    #[test]
-    fn cpp_type_definition_routing_classifies_only_name_bounded_candidates() {
-        const UNRELATED_DECLARATIONS: usize = 128;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let types = ProjectFile::new(root.clone(), "types.hpp");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let mut header = "namespace ns { struct Target { void run(); }; }\n".to_string();
-        for index in 0..UNRELATED_DECLARATIONS / 2 {
-            header.push_str(&format!("int unrelated_function_{index}();\n"));
-            header.push_str(&format!("using UnrelatedAlias{index} = unsigned long;\n"));
-        }
-        types.write(&header).unwrap();
-        let source = "#include \"types.hpp\"\nnamespace ns { void local_case() { Target local; local.run(); } }\nvoid qualified_case() { ns::Target qualified; qualified.run(); }\n";
-        consumer.write(source).unwrap();
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
-        let analyzer = CppAnalyzer::new(project);
-        analyzer.reset_type_alias_classification_count_for_test();
-        let requests = source
-            .match_indices("run")
-            .map(|(start_byte, name)| DefinitionLookupRequest {
-                file: consumer.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start_byte),
-                end_byte: Some(start_byte + name.len()),
-            })
-            .collect::<Vec<_>>();
-
-        let first = resolve_definition_batch_with_source(
-            &analyzer,
-            requests.clone(),
-            consumer.clone(),
-            Arc::from(source),
-        );
-        let first_batch_classifications = analyzer.type_alias_classification_count_for_test();
-        let second = resolve_definition_batch_with_source(
-            &analyzer,
-            vec![requests[1].clone()],
-            consumer,
-            Arc::from(source),
-        );
-        let second_batch_classifications = analyzer
-            .type_alias_classification_count_for_test()
-            .saturating_sub(first_batch_classifications);
-        for outcome in first.iter().chain(&second) {
-            assert_eq!(outcome.status, DefinitionLookupStatus::Resolved);
-            assert!(
-                outcome
-                    .definitions
-                    .iter()
-                    .any(|unit| unit.short_name() == "Target.run" && unit.package_name() == "ns")
-            );
-        }
-        assert!(
-            first_batch_classifications <= requests.len() * 10
-                && second_batch_classifications <= 10,
-            "provider-backed alias classification must scale with named requests, not {UNRELATED_DECLARATIONS} unrelated visible declarations: first={first_batch_classifications}, second={second_batch_classifications}"
-        );
-    }
-
-    #[test]
-    fn cpp_complete_visible_types_skip_global_fqn_reconciliation() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Cpp,
-            &[
-                (
-                    "types.hpp",
-                    "struct CompleteClass { int value; };\nusing CompleteAlias = CompleteClass;\n",
-                ),
-                (
-                    "consumer.cpp",
-                    "#include \"types.hpp\"\nCompleteClass object;\nCompleteAlias alias;\n",
-                ),
-            ],
-        );
-        let analyzer =
-            resolve_analyzer::<CppAnalyzer>(fixture.analyzer.analyzer()).expect("C++ analyzer");
-        let file = ProjectFile::new(fixture.project_root(), "consumer.cpp");
-        let source = file.read_to_string().expect("consumer source");
-        analyzer.reset_reconcile_counts_for_test();
-        let requests = ["CompleteClass", "CompleteAlias"]
-            .into_iter()
-            .map(|name| {
-                let start_byte = source.rfind(name).expect("type reference");
-                DefinitionLookupRequest {
-                    file: file.clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + name.len()),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let outcomes = resolve_navigation_batch_with_source(
-            fixture.analyzer.analyzer(),
-            requests,
-            file,
-            Arc::from(source),
-            NavigationOperation::Definition,
-        );
-
-        assert!(outcomes.iter().all(|outcome| {
-            outcome.status == DefinitionLookupStatus::Resolved && !outcome.targets.is_empty()
-        }));
-        assert_eq!(
-            analyzer.reconcile_candidate_scan_count_for_test(),
-            0,
-            "complete visible classes and aliases must not enter global FQN reconciliation"
-        );
-    }
-
-    #[test]
-    fn cpp_visible_forward_declaration_still_finds_external_definition() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Cpp,
-            &[
-                ("forward.hpp", "struct Forward;\n"),
-                ("definition.cpp", "struct Forward { int value; };\n"),
-                (
-                    "consumer.cpp",
-                    "#include \"forward.hpp\"\nForward *pointer;\n",
-                ),
-            ],
-        );
-        let analyzer =
-            resolve_analyzer::<CppAnalyzer>(fixture.analyzer.analyzer()).expect("C++ analyzer");
-        let file = ProjectFile::new(fixture.project_root(), "consumer.cpp");
-        let source = file.read_to_string().expect("consumer source");
-        let start_byte = source.rfind("Forward").expect("forward reference");
-        analyzer.reset_reconcile_counts_for_test();
-
-        let outcome = resolve_navigation_batch_with_source(
-            fixture.analyzer.analyzer(),
-            vec![DefinitionLookupRequest {
-                file: file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start_byte),
-                end_byte: Some(start_byte + "Forward".len()),
-            }],
-            file,
-            Arc::from(source),
-            NavigationOperation::Definition,
-        )
-        .remove(0);
-
-        assert_eq!(outcome.status, DefinitionLookupStatus::Resolved);
-        assert!(outcome.targets.iter().any(|target| {
-            target
-                .code_unit
-                .source()
-                .rel_path()
-                .ends_with("definition.cpp")
-        }));
-        assert!(
-            analyzer.reconcile_candidate_scan_count_for_test() > 0,
-            "a forward-only visible declaration must retain the global definition fallback"
-        );
-    }
-
-    #[test]
-    #[hardwon("#4512: buffered_file::close changed with unrelated C++ batch requests")]
-    fn cpp_buffered_file_close_is_batch_size_and_order_independent() {
-        let header = r#"
-namespace fmt {
-class buffered_file {
- public:
-  void close();
-  void helper();
-  void assign() {
-    close();
-    helper();
-  }
-};
 }
-"#;
-        let implementation = r#"
-#include "../include/fmt/os.h"
-void fmt::buffered_file::close() {}
-void fmt::buffered_file::helper() {}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Cpp,
-            &[("include/fmt/os.h", header), ("src/os.cc", implementation)],
-        );
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "include/fmt/os.h");
-        let source = Arc::<str>::from(header);
-        let close_start = source
-            .match_indices("close")
-            .nth(1)
-            .map(|(start, _)| start)
-            .expect("close call");
-        let helper_start = source
-            .match_indices("helper")
-            .nth(1)
-            .map(|(start, _)| start)
-            .expect("helper call");
-        let close_request = DefinitionLookupRequest {
-            file: file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(close_start),
-            end_byte: Some(close_start + "close".len()),
-        };
-        let helper_request = DefinitionLookupRequest {
-            file: file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(helper_start),
-            end_byte: Some(helper_start + "helper".len()),
-        };
-        let resolve = |requests| {
-            let scope = AnalyzerQueryScope::new(analyzer);
-            resolve_call_target_batch_with_source(
-                analyzer,
-                scope.token(),
-                requests,
-                file.clone(),
-                Arc::clone(&source),
-                None,
-            )
-        };
-        let singleton = resolve(vec![close_request.clone()]).remove(0);
-        let close_first = resolve(vec![close_request.clone(), helper_request.clone()]).remove(0);
-        let close_last = resolve(vec![helper_request, close_request]).remove(1);
 
-        for outcome in [&singleton, &close_first, &close_last] {
-            assert_eq!(outcome.outcome.status, DefinitionLookupStatus::Resolved);
-            assert!(!outcome.truncated);
-            let [target] = outcome.outcome.definitions.as_slice() else {
-                panic!("expected one buffered_file::close definition: {outcome:?}");
-            };
-            assert_eq!(target.terminal_name(), "close");
-            assert!(target.short_name().ends_with("buffered_file.close"));
-            assert_eq!(
-                target.source().rel_path(),
-                std::path::Path::new("src/os.cc")
-            );
-        }
-        assert_eq!(
-            close_first.outcome.definitions,
-            singleton.outcome.definitions
-        );
-        assert_eq!(
-            close_last.outcome.definitions,
-            singleton.outcome.definitions
-        );
-    }
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 
-    #[test]
-    #[hardwon("#4512: C++ definition targets changed with batch size")]
-    fn cpp_complete_visible_redeclarations_stay_collapsed_and_bounded() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Cpp,
-            &[
-                ("left.hpp", "struct Duplicate { int left; };\n"),
-                ("right.hpp", "struct Duplicate { int right; };\n"),
-                (
-                    "consumer.cpp",
-                    "#include \"left.hpp\"\n#include \"right.hpp\"\nDuplicate value;\n",
-                ),
-            ],
-        );
-        let analyzer =
-            resolve_analyzer::<CppAnalyzer>(fixture.analyzer.analyzer()).expect("C++ analyzer");
-        let file = ProjectFile::new(fixture.project_root(), "consumer.cpp");
-        let source = file.read_to_string().expect("consumer source");
-        let start_byte = source.rfind("Duplicate").expect("ambiguous reference");
-        analyzer.reset_reconcile_counts_for_test();
+/// The incumbent graph retains its own deferred-site resolution authority.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum DefinitionBatchRoute {
+    #[default]
+    SelectedNative,
+    LegacyUsageGraph,
+}
 
-        let request = DefinitionLookupRequest {
-            file: file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(start_byte),
-            end_byte: Some(start_byte + "Duplicate".len()),
-        };
-        let definition = resolve_navigation_batch_with_source(
-            fixture.analyzer.analyzer(),
-            vec![request.clone()],
-            file.clone(),
-            Arc::from(source.clone()),
-            NavigationOperation::Definition,
-        )
-        .remove(0);
-        let large_batch_definition = resolve_navigation_batch_with_source(
-            fixture.analyzer.analyzer(),
-            vec![request.clone(); 1024],
-            file.clone(),
-            Arc::from(source.clone()),
-            NavigationOperation::Definition,
-        )
-        .remove(0);
-        let declaration = resolve_navigation_batch_with_source(
-            fixture.analyzer.analyzer(),
-            vec![request],
-            file,
-            Arc::from(source),
-            NavigationOperation::Declaration,
-        )
-        .remove(0);
-
-        assert_eq!(definition.status, DefinitionLookupStatus::Ambiguous);
-        assert_eq!(definition.targets.len(), 2);
-        assert_eq!(
-            large_batch_definition.status, definition.status,
-            "C++ navigation status must not depend on unrelated batch size"
-        );
-        assert_eq!(
-            large_batch_definition.targets, definition.targets,
-            "C++ navigation targets must not depend on unrelated batch size"
-        );
-        assert_eq!(declaration.status, DefinitionLookupStatus::Ambiguous);
-        assert_eq!(declaration.targets.len(), 2);
-        assert_eq!(analyzer.reconcile_candidate_scan_count_for_test(), 0);
+impl DefinitionBatchContext<'_, '_> {
+    #[doc(hidden)]
+    pub fn route(&self) -> DefinitionBatchRoute {
+        self.route
     }
 }
+
+pub use crate::analyzer::resolution::diagnostic_kinds::GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND;

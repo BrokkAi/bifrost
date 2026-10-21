@@ -293,7 +293,8 @@ impl RelationalDefinitionFrontier for ImmutableRecordingFrontier {
     }
 }
 
-pub(crate) enum RelationalItemFrontierOutcome<T> {
+#[doc(hidden)]
+pub enum RelationalItemFrontierOutcome<T> {
     Complete(Vec<T>),
     Cancelled(Vec<Option<T>>),
     Failed(crate::analyzer::RelationalBatchError),
@@ -422,19 +423,47 @@ fn resolve_relational_items_with_barriers<I, T>(
     frontier: &Arc<RecordingRelationalFrontier>,
     cancellation: &CancellationToken,
     items: &[I],
-    mut execute: impl FnMut(&[RelationalDefinitionRequest]) -> RelationalBatchOutcome,
+    execute: impl FnMut(&[RelationalDefinitionRequest]) -> RelationalBatchOutcome,
     evaluate: impl Fn(&I, Arc<dyn RelationalDefinitionFrontier>) -> T + Sync,
 ) -> RelationalItemFrontierOutcome<T>
 where
     I: Sync,
     T: Send,
 {
-    // Each evaluation builds parser/resolver memo state. Letting a 100+ core
-    // host run one item per worker multiplies allocator arenas and peak memory
-    // without increasing the amount of useful frontier work. Keep enough tasks
-    // to saturate ordinary development machines while bounding that transient
-    // state independently of host core count.
+    let groups: Vec<_> = items.iter().map(|item| vec![item]).collect();
+    resolve_relational_item_groups_with_barriers(
+        frontier,
+        cancellation,
+        &groups,
+        execute,
+        |items| {
+            items
+                .iter()
+                .map(|(item, frontier)| evaluate(item, frontier.clone()))
+                .collect()
+        },
+    )
+}
+
+/// Group the physical evaluation while each logical item records its own misses
+/// and publishes only after its own dependencies converge.
+fn resolve_relational_item_groups_with_barriers<I, T>(
+    frontier: &Arc<RecordingRelationalFrontier>,
+    cancellation: &CancellationToken,
+    groups: &[Vec<I>],
+    mut execute: impl FnMut(&[RelationalDefinitionRequest]) -> RelationalBatchOutcome,
+    evaluate: impl Fn(&[(&I, Arc<dyn RelationalDefinitionFrontier>)]) -> Vec<T> + Sync,
+) -> RelationalItemFrontierOutcome<T>
+where
+    I: Sync,
+    T: Send,
+{
     const MAX_PARALLEL_ITEM_EVALUATIONS: usize = 12;
+    let items: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(group, items)| items.iter().map(move |item| (group, item)))
+        .collect();
     let mut completed = std::iter::repeat_with(|| None)
         .take(items.len())
         .collect::<Vec<Option<T>>>();
@@ -455,20 +484,53 @@ where
         }
 
         let answers = frontier.answer_snapshot();
-        let chunk_len = active.len().div_ceil(MAX_PARALLEL_ITEM_EVALUATIONS).max(1);
-        let passes = active
+        let mut active_groups: Vec<Vec<usize>> = (0..groups.len()).map(|_| Vec::new()).collect();
+        for &index in &active {
+            active_groups[items[index].0].push(index);
+        }
+        active_groups.retain(|group| !group.is_empty());
+        let chunk_len = active_groups
+            .len()
+            .div_ceil(MAX_PARALLEL_ITEM_EVALUATIONS)
+            .max(1);
+        let passes = active_groups
             .par_chunks(chunk_len)
-            .flat_map_iter(|indices| {
-                indices.iter().map(|&index| {
-                    let item_frontier =
-                        Arc::new(ImmutableRecordingFrontier::new(Arc::clone(&answers)));
-                    let provisional = evaluate(&items[index], item_frontier.clone());
-                    (
-                        index,
-                        provisional,
-                        item_frontier.take_pending(),
-                        item_frontier.query_shape_counts(),
-                    )
+            .flat_map_iter(|groups| {
+                groups.iter().flat_map(|indices| {
+                    let frontiers: Vec<_> = indices
+                        .iter()
+                        .map(|_| Arc::new(ImmutableRecordingFrontier::new(Arc::clone(&answers))))
+                        .collect();
+                    let inputs: Vec<_> = indices
+                        .iter()
+                        .zip(&frontiers)
+                        .map(|(&index, frontier)| {
+                            (
+                                items[index].1,
+                                frontier.clone() as Arc<dyn RelationalDefinitionFrontier>,
+                            )
+                        })
+                        .collect();
+                    let values = evaluate(&inputs);
+                    assert_eq!(
+                        values.len(),
+                        indices.len(),
+                        "one result per logical frontier item"
+                    );
+                    indices
+                        .iter()
+                        .copied()
+                        .zip(values)
+                        .zip(frontiers)
+                        .map(|((index, provisional), frontier)| {
+                            (
+                                index,
+                                provisional,
+                                frontier.take_pending(),
+                                frontier.query_shape_counts(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
             })
             .collect::<Vec<_>>();
@@ -585,14 +647,16 @@ where
 pub(crate) type FrontierAnswers =
     Arc<HashMap<RelationalDefinitionQuestion, Arc<RelationalDefinitionValue>>>;
 
-pub(crate) struct RelationalFrontierSession<'a> {
+#[doc(hidden)]
+pub struct RelationalFrontierSession<'a> {
     analyzer: &'a dyn IAnalyzer,
     cancellation: &'a CancellationToken,
     frontier: Arc<RecordingRelationalFrontier>,
 }
 
 impl<'a> RelationalFrontierSession<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, cancellation: &'a CancellationToken) -> Self {
+    #[doc(hidden)]
+    pub fn new(analyzer: &'a dyn IAnalyzer, cancellation: &'a CancellationToken) -> Self {
         Self {
             analyzer,
             cancellation,
@@ -671,9 +735,34 @@ impl<'a> RelationalFrontierSession<'a> {
             evaluate,
         )
     }
+    /// Evaluate same-file targets together, replaying only the targets with misses.
+    #[doc(hidden)]
+    pub fn resolve_owned_item_groups<I, T>(
+        &self,
+        phase: &'static str,
+        groups: &[Vec<I>],
+        evaluate: impl Fn(&[(&I, Arc<dyn RelationalDefinitionFrontier>)]) -> Vec<T> + Sync,
+    ) -> RelationalItemFrontierOutcome<T>
+    where
+        I: Sync,
+        T: Send,
+    {
+        let _scope = crate::profiling::scope(format!("relational_item_frontier::{phase}"));
+        resolve_relational_item_groups_with_barriers(
+            &self.frontier,
+            self.cancellation,
+            groups,
+            |requests| {
+                self.analyzer
+                    .relational_definition_batch(requests, self.cancellation)
+            },
+            evaluate,
+        )
+    }
 }
 
-pub(crate) fn resolve_relational_frontier<T>(
+#[doc(hidden)]
+pub fn resolve_relational_frontier<T>(
     analyzer: &dyn IAnalyzer,
     cancellation: &CancellationToken,
     evaluate: impl FnMut(&dyn RelationalDefinitionFrontier) -> T,

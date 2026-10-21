@@ -236,7 +236,17 @@
           "minLength": 1
         },
         "policy_pack_root": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "policy_bundle_root": {
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "semantic_bundle_root": {
@@ -255,8 +265,31 @@
         "cache_reused",
         "receipt_path",
         "policy_pack_root",
+        "policy_bundle_root",
         "semantic_bundle_root",
         "receipt"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "policy_pack_root": {
+              "type": "string"
+            },
+            "policy_bundle_root": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "policy_pack_root": {
+              "type": "null"
+            },
+            "policy_bundle_root": {
+              "type": "string"
+            }
+          }
+        }
       ]
     }
   }

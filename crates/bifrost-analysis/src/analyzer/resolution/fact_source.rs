@@ -61,7 +61,8 @@ pub const MAX_FACT_ROWS_PER_PAGE: usize = MAX_TYPED_FACT_ROWS_PER_PAGE;
 
 /// Exact already-selected endpoints whose declaration access needs context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct DeclarationAccessRequest {
+#[doc(hidden)]
+pub struct DeclarationAccessRequest {
     pub reference: SemanticId,
     pub definition: SemanticId,
 }
@@ -76,7 +77,8 @@ pub enum DeclarationAccessDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeclarationAccessRow {
+#[doc(hidden)]
+pub struct DeclarationAccessRow {
     pub request: DeclarationAccessRequest,
     pub decision: DeclarationAccessDecision,
     pub activation_reason: Option<SemanticId>,
@@ -89,7 +91,8 @@ pub(crate) struct DeclarationAccessRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SubclassAccessContext {
+#[doc(hidden)]
+pub struct SubclassAccessContext {
     pub enclosing_templates: Vec<SemanticId>,
     pub declaration_template: SemanticId,
 }
@@ -97,7 +100,8 @@ pub(crate) struct SubclassAccessContext {
 /// A selected lowering-gap reason and the Rust declaration whose declaration
 /// site produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReasonOwnerRow {
+#[doc(hidden)]
+pub struct ReasonOwnerRow {
     pub reason: SemanticId,
     pub definition: SemanticId,
 }
@@ -258,7 +262,8 @@ pub struct NamedArgumentLabel {
 
 /// Immutable selected-context access policy, not a name resolver. Implementors
 /// authorize only supplied endpoint pairs using canonical selected source facts.
-pub(crate) trait SelectedDeclarationAccessSource: Send + Sync {
+#[doc(hidden)]
+pub trait SelectedDeclarationAccessSource: Send + Sync {
     fn identity(&self) -> SemanticId;
 
     /// Activation of an inverse target before any reference exists. Only
@@ -386,7 +391,8 @@ impl<'a, T> TypedFactPageVisitor<'a, T> {
         }
     }
 
-    pub(crate) fn with_maximum_rows(
+    #[doc(hidden)]
+    pub fn with_maximum_rows(
         callback: &'a mut dyn FnMut(&[T]) -> StoreResult<bool>,
         maximum_rows: usize,
     ) -> Self {
@@ -733,7 +739,8 @@ impl LoweredRustDeclarationAuthority {
 /// source identities; the selected semantic is attached later by the
 /// operation's final lowered artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RustReferenceContextSource {
+#[doc(hidden)]
+pub struct RustReferenceContextSource {
     source_site: ResolutionSiteId,
     source_occurrence: SourceOccurrenceId,
     module_context: SourceOccurrenceId,
@@ -2294,6 +2301,31 @@ impl JvmDeclarationAccessRules {
     }
 }
 
+/// JVM source imports spell nested types canonically (Outer.Inner). After
+/// package selection proves that prefix, the binary type is Outer$Inner.
+/// This converts the caller's type route; it never guesses a target
+/// language's facade, singleton, companion, or local-class projection.
+pub(crate) fn language_jvm_import_binary_owner(
+    language: Language,
+    package_segments: usize,
+    owner: &[&str],
+) -> Vec<String> {
+    if matches!(
+        language,
+        Language::Java | Language::Kotlin | Language::Scala
+    ) && package_segments < owner.len()
+    {
+        let mut result = owner[..package_segments]
+            .iter()
+            .map(|segment| (*segment).to_owned())
+            .collect::<Vec<_>>();
+        result.push(owner[package_segments..].join("$"));
+        result
+    } else {
+        owner.iter().map(|segment| (*segment).to_owned()).collect()
+    }
+}
+
 /// The declared-visibility rules selected for one JVM declaration language.
 pub(crate) const fn language_jvm_declaration_access_rules(
     language: Language,
@@ -2347,6 +2379,24 @@ pub(crate) const fn language_implicit_root_providers(
     }
 }
 
+/// Java package imports supply types, whereas Kotlin and Scala also import
+/// terms. A widened type/value reference must not invent a value provider.
+pub(crate) const fn language_implicit_root_providers_in_namespace(
+    language: Language,
+    namespace: ResolutionNamespace,
+) -> &'static [JvmImplicitRootProvider] {
+    if matches!(language, Language::Java)
+        && !matches!(
+            namespace,
+            ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
+        )
+    {
+        &[]
+    } else {
+        language_implicit_root_providers(language)
+    }
+}
+
 /// Whether call applicability may close an interface's implicit Object frontier.
 ///
 /// An interface with no superinterface implicitly declares the public methods
@@ -2356,6 +2406,22 @@ pub(crate) const fn language_implicit_root_providers(
 /// interop. Scala's interop remains conservative.
 pub(crate) const fn language_can_close_interface_object_frontier(language: Language) -> bool {
     matches!(language, Language::Java | Language::Kotlin)
+}
+
+/// Whether selected nominal metadata can denote an implicit root or an ancestor
+/// of one. This only excludes impossible targets; it never proves a subtype.
+/// Scala's root ancestry remains conservative for its entire root package.
+pub(crate) fn language_implicit_superclass_may_reach_type(
+    language: Language,
+    package: Option<&str>,
+    name: &str,
+) -> bool {
+    match language {
+        Language::Java => package == Some("java.lang") && name == "Object",
+        Language::Kotlin => package == Some("kotlin") && name == "Any",
+        Language::Scala => package == Some("scala"),
+        _ => false,
+    }
 }
 
 /// The identity namespace shared by declarations visible to one language.

@@ -4,199 +4,16 @@
 //! own analysis. This module does not establish artifact validity, source
 //! aliases, or execution.
 
-use std::convert::Infallible;
-
 use crate::CancellationToken;
-
-use super::csmi::{
-    CsmiCallableValuesPayload, CsmiCallableValuesRemapError, CsmiCallableValuesShape,
-    CsmiCallableValuesUnsupportedProjection, CsmiCoverageStatus, CsmiInputLocation,
-};
-use super::model::{
-    CallableValuesCoverage, CallableValuesFact, CallableValuesFamily, CallableValuesPayload,
-};
-
-#[derive(Debug, Clone, Copy)]
-pub struct CallableValuesQueryLimits {
-    /// Maximum facts and coverage rows examined by one query.
-    pub max_records: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CallableValuesGap {
-    Cancelled,
-    RecordBudgetExhausted { max_records: usize },
-    UnsupportedProjection(CsmiCallableValuesUnsupportedProjection),
-}
-
-#[derive(Debug)]
-pub struct CallableValuesQuery<'a> {
-    /// All matching records are retained as alternatives; no winner is chosen.
-    pub facts: Vec<&'a CallableValuesFact>,
-    /// Producer-declared coverage claims are retained independently by scope.
-    pub coverage_claims: Vec<&'a CallableValuesCoverage>,
-    /// Raw authored coverage is not execution evidence. This remains Unknown
-    /// until a consumer joins validated artifact and target-shape evidence.
-    pub executable_coverage: CsmiCoverageStatus,
-    pub gap: Option<CallableValuesGap>,
-}
-
-/// Caller-proven evidence for one callback observation. The type carries no
-/// boolean assertion of artifact validation; its producer owns that proof.
-#[derive(Debug, Clone, Copy)]
-pub struct CallableInvocationEvidence<'a> {
-    pub callback: &'a CsmiInputLocation,
-    pub target_shape: CsmiCallableValuesShape,
-}
-
-/// Find every returned-callable alternative for the exact native callable and
-/// result ordinal, alongside independently scoped coverage.
-pub fn returned_callable_targets<'a>(
-    payload: &'a CallableValuesPayload,
-    callable: &str,
-    result: u32,
-    limits: CallableValuesQueryLimits,
-    cancellation: &CancellationToken,
-) -> CallableValuesQuery<'a> {
-    query_returned_targets(payload, callable, result, limits, cancellation)
-}
-
-/// Match callback facts only when both the exact structured input location and
-/// the caller-supplied target shape agree. Unknown arguments remain on the
-/// returned fact unchanged; this query does not infer their values.
-pub fn callback_invocations<'a>(
-    payload: &'a CallableValuesPayload,
-    callable: &str,
-    evidence: CallableInvocationEvidence<'_>,
-    limits: CallableValuesQueryLimits,
-    cancellation: &CancellationToken,
-) -> CallableValuesQuery<'a> {
-    let mut result = CallableValuesQuery {
-        facts: Vec::new(),
-        coverage_claims: Vec::new(),
-        executable_coverage: CsmiCoverageStatus::Unknown,
-        gap: None,
-    };
-    let mut examined = 0;
-    if cancellation.is_cancelled() {
-        result.gap = Some(CallableValuesGap::Cancelled);
-        return result;
-    }
-    for fact in &payload.facts {
-        if cancellation.is_cancelled() {
-            result.gap = Some(CallableValuesGap::Cancelled);
-            break;
-        }
-        if examined == limits.max_records {
-            result.gap = Some(CallableValuesGap::RecordBudgetExhausted {
-                max_records: limits.max_records,
-            });
-            break;
-        }
-        examined += 1;
-        let CsmiCallableValuesPayload::CallbackInvocation {
-            callable: fact_callable,
-            callback,
-            shape,
-            ..
-        } = &fact.payload
-        else {
-            continue;
-        };
-        if fact_callable != callable || shape != &evidence.target_shape {
-            continue;
-        }
-        if let Err(CsmiCallableValuesRemapError::UnsupportedProjection(error)) =
-            validate_profile_locations(&fact.payload)
-        {
-            result.gap = Some(CallableValuesGap::UnsupportedProjection(error));
-            break;
-        }
-        if callback == evidence.callback {
-            result.facts.push(fact);
-        }
-    }
-    if result.gap.is_none() {
-        collect_coverage(
-            payload,
-            CallableValuesFamily::CallbackInvocations,
-            callable,
-            limits.max_records,
-            &mut examined,
-            cancellation,
-            &mut result,
-        );
-    }
-    result
-}
-
-fn query_returned_targets<'a>(
-    payload: &'a CallableValuesPayload,
-    callable: &str,
-    result_ordinal: u32,
-    limits: CallableValuesQueryLimits,
-    cancellation: &CancellationToken,
-) -> CallableValuesQuery<'a> {
-    let mut result = CallableValuesQuery {
-        facts: Vec::new(),
-        coverage_claims: Vec::new(),
-        executable_coverage: CsmiCoverageStatus::Unknown,
-        gap: None,
-    };
-    let mut examined = 0;
-    if cancellation.is_cancelled() {
-        result.gap = Some(CallableValuesGap::Cancelled);
-        return result;
-    }
-    for fact in &payload.facts {
-        if cancellation.is_cancelled() {
-            result.gap = Some(CallableValuesGap::Cancelled);
-            break;
-        }
-        if examined == limits.max_records {
-            result.gap = Some(CallableValuesGap::RecordBudgetExhausted {
-                max_records: limits.max_records,
-            });
-            break;
-        }
-        examined += 1;
-        if matches!(&fact.payload, CsmiCallableValuesPayload::ReturnedCallable {
-            callable: fact_callable, result: fact_result, ..
-        } if fact_callable == callable && *fact_result == result_ordinal)
-        {
-            result.facts.push(fact);
-        }
-    }
-    if result.gap.is_none() {
-        collect_coverage(
-            payload,
-            CallableValuesFamily::ReturnedCallables,
-            callable,
-            limits.max_records,
-            &mut examined,
-            cancellation,
-            &mut result,
-        );
-    }
-    result
-}
-
+use crate::analyzer::semantic_model::csmi::CsmiCoverageStatus;
+pub use brokk_bifrost_semantic::analyzer::semantic_model::callable_values::*;
 /// One demand-scoped SQL result joined to the exact active publishing shard.
 /// Catalog availability is not activation and authored coverage is not an
 /// observation of callback execution.
 #[derive(Debug)]
 pub struct ActivatedCallableValuesRows<'a> {
-    pub shard: &'a super::ActiveSemanticModelShard,
-    pub rows: super::CatalogCallableValuesQueryResult,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActivatedCallableValuesGap {
-    Cancelled,
-    RecordBudgetExhausted,
-    FactoryUnbound,
-    TargetArtifactMismatch,
-    Catalog(super::CatalogCallableValuesQueryGap),
+    pub shard: &'a crate::analyzer::semantic_model::ActiveSemanticModelShard,
+    pub rows: crate::analyzer::semantic_model::CatalogCallableValuesQueryResult,
 }
 
 #[derive(Debug)]
@@ -210,13 +27,13 @@ pub struct ActivatedCallableValuesQuery<'a> {
 /// The factory must belong to this activation and carry exact artifact proof.
 /// All selected publishing shards are consulted; competing contracts survive.
 pub fn activated_returned_callable_targets<'a>(
-    catalog: &super::SemanticPackCatalog,
-    active: &'a super::ResolvedActiveSemanticModels,
-    factory: &super::SemanticModelSymbol,
+    catalog: &crate::analyzer::semantic_model::SemanticPackCatalog,
+    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     result: u32,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, super::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
     let reader = catalog.runtime_source_reader();
     activated_returned_callable_targets_from_reader(
         &reader,
@@ -232,18 +49,18 @@ pub fn activated_returned_callable_targets<'a>(
 /// retained by native dispatch. The activation, publication, and exact
 /// artifact checks are identical to [`activated_returned_callable_targets`].
 pub fn activated_returned_callable_targets_from_reader<'a>(
-    reader: &super::CatalogRuntimeSourceReader,
-    active: &'a super::ResolvedActiveSemanticModels,
-    factory: &super::SemanticModelSymbol,
+    reader: &crate::analyzer::semantic_model::CatalogRuntimeSourceReader,
+    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     result: u32,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, super::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
     query_activated_callable_values(
         reader,
         active,
         factory,
-        super::CatalogCallableValuesQuestion::ReturnedCallable { result },
+        crate::analyzer::semantic_model::CatalogCallableValuesQuestion::ReturnedCallable { result },
         limits,
         cancellation,
     )
@@ -253,13 +70,13 @@ pub fn activated_returned_callable_targets_from_reader<'a>(
 /// and shape evidence. This does not promote a partial heap observation or a
 /// contract's May invocation into an observed invocation.
 pub fn activated_callback_invocations<'a>(
-    catalog: &super::SemanticPackCatalog,
-    active: &'a super::ResolvedActiveSemanticModels,
-    factory: &super::SemanticModelSymbol,
+    catalog: &crate::analyzer::semantic_model::SemanticPackCatalog,
+    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     evidence: CallableInvocationEvidence<'_>,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, super::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
     let reader = catalog.runtime_source_reader();
     activated_callback_invocations_from_reader(
         &reader,
@@ -276,18 +93,18 @@ pub fn activated_callback_invocations<'a>(
 /// evidence until the native observation consumer independently proves an
 /// actual invocation.
 pub fn activated_callback_invocations_from_reader<'a>(
-    reader: &super::CatalogRuntimeSourceReader,
-    active: &'a super::ResolvedActiveSemanticModels,
-    factory: &super::SemanticModelSymbol,
+    reader: &crate::analyzer::semantic_model::CatalogRuntimeSourceReader,
+    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     evidence: CallableInvocationEvidence<'_>,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, super::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
     query_activated_callable_values(
         reader,
         active,
         factory,
-        super::CatalogCallableValuesQuestion::CallbackInvocation {
+        crate::analyzer::semantic_model::CatalogCallableValuesQuestion::CallbackInvocation {
             callback: evidence.callback,
             shape: evidence.target_shape,
         },
@@ -296,14 +113,14 @@ pub fn activated_callback_invocations_from_reader<'a>(
     )
 }
 
-fn query_activated_callable_values<'a>(
-    reader: &super::CatalogRuntimeSourceReader,
-    active: &'a super::ResolvedActiveSemanticModels,
-    factory: &super::SemanticModelSymbol,
-    question: super::CatalogCallableValuesQuestion<'_>,
+pub(crate) fn query_activated_callable_values<'a>(
+    reader: &crate::analyzer::semantic_model::CatalogRuntimeSourceReader,
+    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    question: crate::analyzer::semantic_model::CatalogCallableValuesQuestion<'_>,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, super::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
     let mut result = ActivatedCallableValuesQuery {
         publications: Vec::new(),
         executable_coverage: CsmiCoverageStatus::Unknown,
@@ -321,7 +138,7 @@ fn query_activated_callable_values<'a>(
         .as_deref();
     if provenance.active_model_set_hash != active.active_model_set_hash()
         || provenance.ambiguous
-        || provenance.proof != super::SemanticModelProof::ExactArtifact
+        || provenance.proof != crate::analyzer::semantic_model::SemanticModelProof::ExactArtifact
         || artifact.is_none()
         || provenance.activation.status != "active"
     {
@@ -375,7 +192,7 @@ fn query_activated_callable_values<'a>(
         {
             continue;
         }
-        let request = super::CatalogCallableValuesQuery {
+        let request = crate::analyzer::semantic_model::CatalogCallableValuesQuery {
             manifest_digest: &shard.manifest.content_sha256,
             shard_id: shard.shard.shard_id(),
             callable: &provenance.record_id,
@@ -383,7 +200,7 @@ fn query_activated_callable_values<'a>(
         };
         let rows = reader.query_callable_values(
             &request,
-            super::CatalogCallableValuesQueryLimits {
+            crate::analyzer::semantic_model::CatalogCallableValuesQueryLimits {
                 max_records: remaining,
             },
             cancellation,
@@ -420,58 +237,64 @@ fn query_activated_callable_values<'a>(
     Ok(result)
 }
 
-fn callable_publication_matches(
-    shard: &super::ActiveSemanticModelShard,
-    factory: &super::SemanticModelSymbol,
+pub(crate) fn callable_publication_matches(
+    shard: &crate::analyzer::semantic_model::ActiveSemanticModelShard,
+    factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> bool {
     let provenance = &factory.provenance;
     shard.manifest.semantic_sha256 == provenance.pack_digest
         && shard.manifest.pack_id == provenance.pack_id
         && shard.manifest.version == provenance.pack_version
         && shard.source_id == provenance.activation.source_id
-        && super::overlay::matched_evidence(&shard.matched_evidence)
+        && crate::analyzer::semantic_model::overlay::matched_evidence(&shard.matched_evidence)
             == provenance.activation.matched_evidence
 }
 
-fn collect_coverage<'a>(
-    payload: &'a CallableValuesPayload,
-    family: CallableValuesFamily,
-    callable: &str,
-    max_records: usize,
-    examined: &mut usize,
-    cancellation: &CancellationToken,
-    result: &mut CallableValuesQuery<'a>,
-) {
-    for coverage in &payload.coverage {
-        if cancellation.is_cancelled() {
-            result.gap = Some(CallableValuesGap::Cancelled);
-            return;
-        }
-        if *examined == max_records {
-            result.gap = Some(CallableValuesGap::RecordBudgetExhausted { max_records });
-            return;
-        }
-        *examined += 1;
-        if coverage.family == family && coverage.callable == callable {
-            result.coverage_claims.push(coverage);
-        }
-    }
-}
-
-fn validate_profile_locations(
-    payload: &CsmiCallableValuesPayload,
-) -> Result<(), CsmiCallableValuesRemapError<Infallible>> {
-    let mut copy = payload.clone();
-    copy.remap_symbols(|symbol| Ok::<_, Infallible>(symbol.to_owned()))
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::semantic_model::csmi::{
-        CsmiCallableValuesArgument, CsmiCallableValuesModality, CsmiCallableValuesTiming,
-        CsmiInputBoundaryRoot, CsmiInputParameterRoot, CsmiInputPhase, CsmiParameterRootRole,
-    };
+pub(crate) mod tests {
+    use crate::analyzer::semantic_model::callable_values::go_extraction_support_21::*;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::CallableInvocationEvidence;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesCoverage;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesFact;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesFamily;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::CallableValuesGap;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesPayload;
+
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesPayload;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesShape;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesUnsupportedProjection;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCoverageStatus;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiInputLocation;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::callback_invocations;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::returned_callable_targets;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesArgument;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesModality;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesTiming;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiInputBoundaryRoot;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiInputParameterRoot;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiInputPhase;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiParameterRootRole;
 
     fn input(position: u32) -> CsmiInputLocation {
         CsmiInputLocation {
@@ -484,15 +307,36 @@ mod tests {
         }
     }
 
-    fn limits(max_records: usize) -> CallableValuesQueryLimits {
-        CallableValuesQueryLimits { max_records }
-    }
-
     #[test]
     fn activated_sql_contracts_require_current_factory_and_keep_coverage_unknown() {
-        use crate::analyzer::semantic_model::*;
-        use crate::analyzer::{AnalyzerConfig, Language};
+        use brokk_bifrost_analysis::analyzer::semantic_model::*;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::ActivatedCallableValuesGap;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesCoverage;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesFact;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesFamily;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::model::CallableValuesPayload;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::CallableValuesQueryLimits;
+
+        use brokk_bifrost_core::cancellation::CancellationToken;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesPayload;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCoverageStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::activated_returned_callable_targets;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::activated_returned_callable_targets_from_reader;
+
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+
         use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_core::analyzer::model::Language;
 
         let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(include_bytes!(
             "../../../testdata/semantic-model-packs/declarations-v1.json"
@@ -708,154 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn activated_sql_preserves_target_identity_from_another_selector_as_a_gap() {
-        use crate::analyzer::semantic_model::*;
-        use crate::analyzer::{AnalyzerConfig, Language};
-        use crate::inline_project::InlineTestProject;
-
-        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(include_bytes!(
-            "../../../testdata/semantic-model-packs/declarations-v1.json"
-        ))
-        .unwrap();
-        authored.schema_version = CALLABLE_VALUES_MIN_SCHEMA_VERSION;
-        authored.language = "go".to_owned();
-        authored.ecosystem = "go".to_owned();
-        authored.compatibility.bifrost = None;
-        authored.compatibility.toolchains.clear();
-        authored.shards[0].activation[0].package = Some(NameSelector {
-            name: "example.test/module/pkg".to_owned(),
-            version: None,
-        });
-        authored.shards[0].activation[0].targets.clear();
-        authored.shards[0].activation[0].configurations.clear();
-        let artifact_a = "a".repeat(64);
-        let artifact_b = "b".repeat(64);
-        authored.shards[0].activation[0].artifact_sha256 = Some(artifact_a.clone());
-        let mut other_selector = authored.shards[0].activation[0].clone();
-        other_selector.artifact_sha256 = Some(artifact_b.clone());
-        authored.shards[0].activation.push(other_selector);
-        let target_id = "go.literal.target".to_owned();
-        authored.shards[0].callable_values = Some(CallableValuesPayload {
-            facts: vec![CallableValuesFact {
-                payload: CsmiCallableValuesPayload::ReturnedCallable {
-                    callable: "member.widget.create".to_owned(),
-                    result: 0,
-                    target: target_id.clone(),
-                },
-                provenance: vec!["source-review".to_owned()],
-            }],
-            coverage: Vec::new(),
-            anonymous_callables: vec![crate::analyzer::semantic_model::AnonymousCallableIdentity {
-                id: target_id.clone(),
-                artifact_sha256: artifact_b,
-                package_identity: "example.test/module/pkg".to_owned(),
-                anchor: crate::analyzer::semantic_model::SourceAnchor {
-                    file: "callbacks.go".to_owned(),
-                    byte_range: crate::analyzer::semantic_model::SourceByteRange {
-                        start: 20,
-                        end: 50,
-                    },
-                    kind: crate::analyzer::semantic_model::SourceDeclarationKind::FunctionLiteral,
-                },
-                lexical_owner_chain: Vec::new(),
-                signature: crate::analyzer::semantic_model::SourceCallableShape {
-                    function_type: crate::analyzer::semantic_model::SourceTypeNode {
-                        file: "callbacks.go".to_owned(),
-                        byte_range: crate::analyzer::semantic_model::SourceByteRange {
-                            start: 20,
-                            end: 30,
-                        },
-                    },
-                    parameters: Vec::new(),
-                    results: Vec::new(),
-                    declaration_chain: Vec::new(),
-                },
-            }],
-        });
-        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let catalog = SemanticPackCatalog::open(
-            root.path(),
-            CatalogOpenMode::ReadWrite,
-            CatalogOptions::default(),
-        )
-        .unwrap();
-        catalog
-            .install(
-                &compiled,
-                &DurablePackSource {
-                    kind: DurablePackSourceKind::Installed,
-                    source_id: "fixture-go-publication".to_owned(),
-                },
-            )
-            .unwrap();
-        let cancellation = CancellationToken::new();
-        let active = match resolve_active_semantic_models(
-            &catalog,
-            &SemanticModelActivationRequest {
-                bifrost_version: semver::Version::new(0, 12, 0),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "go".to_owned(),
-                    ecosystem: "go".to_owned(),
-                    package: Some(CatalogCoordinate {
-                        name: "example.test/module/pkg".to_owned(),
-                        version: None,
-                    }),
-                    module: None,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: Some(artifact_a),
-                }],
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            &cancellation,
-        ) {
-            SemanticModelResolutionOutcome::Ready(active) => active,
-            other => panic!("fixture activation must finish: {other:?}"),
-        };
-        let project = InlineTestProject::with_language(Language::Go)
-            .file("probe.go", "package probe\n")
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let overlay =
-            SemanticModelOverlay::build(workspace.analyzer(), &active, &cancellation, 1 << 26)
-                .unwrap();
-        let factory = overlay
-            .symbols()
-            .iter()
-            .find(|symbol| symbol.provenance.record_id == "member.widget.create")
-            .expect("activated factory symbol");
-        let query = activated_returned_callable_targets(
-            &catalog,
-            &active,
-            factory,
-            0,
-            limits(64),
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(
-            query.gap,
-            Some(ActivatedCallableValuesGap::TargetArtifactMismatch)
-        );
-        assert_eq!(query.publications.len(), 1);
-        let row = &query.publications[0].rows.facts[0];
-        let foreign_target_artifact = "b".repeat(64);
-        assert_eq!(
-            row.anonymous_callable
-                .as_ref()
-                .map(|identity| identity.artifact_sha256.as_str()),
-            Some(foreign_target_artifact.as_str())
-        );
-        assert!(matches!(
-            &row.fact.payload,
-            CsmiCallableValuesPayload::ReturnedCallable { target, .. } if target == &target_id
-        ));
-    }
-
-    #[test]
     fn returned_targets_preserve_alternatives_and_scoped_coverage() {
         let payload = CallableValuesPayload {
             facts: ["target-a", "target-b"]
@@ -960,7 +656,7 @@ mod tests {
                     shape,
                     arguments: vec![CsmiCallableValuesArgument::Unknown {
                         limitation:
-                            crate::analyzer::semantic_model::csmi::CsmiCallableValuesLimitation {
+                            brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesLimitation {
                                 kind: "indeterminate".into(),
                                 diagnostic: None,
                             },
@@ -1019,11 +715,13 @@ mod tests {
         else {
             unreachable!()
         };
-        callback.projection = Some(crate::analyzer::semantic_model::csmi::CsmiProjection {
-            scheme: "unsupported.location".into(),
-            scheme_version: "0.1.0".into(),
-            steps: Vec::new(),
-        });
+        callback.projection = Some(
+            brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiProjection {
+                scheme: "unsupported.location".into(),
+                scheme_version: "0.1.0".into(),
+                steps: Vec::new(),
+            },
+        );
         let unsupported = callback_invocations(
             &unsupported,
             "handshake",
@@ -1041,5 +739,17 @@ mod tests {
                 CsmiCallableValuesUnsupportedProjection::Scheme(_)
             ))
         ));
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod go_extraction_support_21 {
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::callable_values::CallableValuesQueryLimits;
+
+    #[doc(hidden)]
+    pub fn limits(max_records: usize) -> CallableValuesQueryLimits {
+        CallableValuesQueryLimits { max_records }
     }
 }

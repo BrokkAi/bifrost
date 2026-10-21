@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use tree_sitter::Node;
 
-use super::get_definition::{go_imported_package_at_range, parse_tree_for_language};
+use super::get_definition::parse_tree_for_language;
 use super::get_type::{TypeLookupRequest, TypeLookupStatus, resolve_type_batch};
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::languages::language_support;
 use crate::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelSymbol,
     SemanticModelSymbolKind,
@@ -84,7 +85,7 @@ pub fn complete_members(
     let mut incomplete = outcome.status != TypeLookupStatus::Resolved || outcome.types.len() != 1;
     let go_import_path = (language_for_file(file) == Language::Go)
         .then(|| {
-            go_imported_package_at_range(
+            language_support(Language::Go)?.imported_package_at_range(
                 analyzer,
                 file,
                 source.as_str(),

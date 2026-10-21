@@ -44,16 +44,16 @@ use brokk_bifrost_analysis::analyzer::{
     DependencyPackEcosystem, FilesystemProject, Language, Project, ProjectFile, WorkspaceAnalyzer,
     WorkspaceFileListingCache,
 };
-use brokk_bifrost_analysis::diff_analysis::{
-    RevisionExport, RevisionWorkspace, changed_buffer_ranges, export_revision,
-    resolve_revision_subtree,
-};
 use brokk_bifrost_analysis::path_normalization::NormalizePath;
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
 use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
+use brokk_bifrost_tools::diff_analysis::{
+    RevisionExport, RevisionWorkspace, changed_buffer_ranges, export_revision,
+    resolve_revision_subtree,
+};
 
 use super::baseline::{
     PolicyBaselineDocument, PolicyBaselineEntryReview, PolicyBaselineMatchState,
@@ -545,6 +545,18 @@ impl PolicyEvaluationInput {
             source: source.into(),
             required_capabilities: Vec::new(),
             selection_provenance: None,
+        }
+    }
+
+    /// A policy source the caller named by ID outside the catalog, such as a
+    /// verified policy-bundle entry. Like a policy file, it declares no
+    /// catalog capabilities.
+    pub fn explicitly_selected(identity: PolicySourceIdentity, source: String) -> Self {
+        Self::Embedded {
+            identity,
+            source,
+            required_capabilities: Vec::new(),
+            selection_provenance: Some(PolicySelectionProvenance::ExplicitPolicyId),
         }
     }
 
@@ -1477,9 +1489,113 @@ pub(crate) fn ready_policy_semantic_model_snapshot(
         })
 }
 
+/// The policy capabilities this engine provides, sorted. A policy that
+/// requires any other capability is reported as not run, with the missing
+/// names, instead of running without the analysis it depends on. Open-pack
+/// acquisition does not reject a release for these names; it admits the
+/// release and leaves the decision to each policy.
+///
+/// Advertise a name only when an in-tree policy that requires it is exercised
+/// by the test suite through its catalog requirements. Retained policy packs,
+/// the `capability-admission` golden cases and focused catalog-selection
+/// regressions supply that evidence. One test checks every retained pack
+/// requirement against this list; another checks that every name here is
+/// required by one of those exercised policies.
+pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
+    "absent-member",
+    "actual-to-formal-binding",
+    "assignment-relations",
+    "binding-resolution",
+    "bounded-caller-reachability",
+    "branch-relations",
+    "call-argument-conversion",
+    "callable-signature",
+    "canonical-external-dispatch",
+    "class-set-type-flow",
+    "conditional-result-contracts",
+    "configuration-facts",
+    "control-flow",
+    "declaration-attributes",
+    "declaration-bounded-containment",
+    "declaration-selection-imports",
+    "declared-store-boundary",
+    "descendant-match",
+    "endpoint-categories",
+    "endpoint-set-imports",
+    "exact-call-target",
+    "exact-result-use",
+    "exact-value-identity",
+    "exception-hierarchy",
+    "exhaustive-effect-coverage",
+    "expression-kind-facts",
+    "external-api-identity",
+    "failure-edge-control",
+    "failure-handler-state",
+    "flow",
+    "generic-type-facts",
+    "guard-dominance",
+    "interprocedural-transfer",
+    "javadoc-facts",
+    "language-rule-facts",
+    "lexical-environment",
+    "literal-value-matching",
+    "local-value-flow",
+    "loop-relations",
+    "member-resolution",
+    "module-identity-declaration-selection",
+    "native-result-obligation",
+    "nilness-operations",
+    "normal-and-exceptional-exit",
+    "normalized-call",
+    "normalized-call-roles",
+    "operation-precondition-contracts",
+    "origin-shape-assertion",
+    "prepared-c-syntax",
+    "prepared-syntax",
+    "procedure-local-scalar-refinement",
+    "python-call-relations",
+    "python-cfg",
+    "python-class-hierarchy",
+    "python-declaration-models",
+    "python-import-cycles",
+    "python-import-site",
+    "python-syntax-diagnostics",
+    "reaching-binding-assertion",
+    "reaching-definitions",
+    "resolved-call-target",
+    "result-contract-failure-uses",
+    "result-contract-operation-uses",
+    "reviewed-csharp-bcl-result-obligation",
+    "reviewed-javascript-string-result-obligation",
+    "reviewed-jdk-result-obligation",
+    "reviewed-libc-result-obligation",
+    "reviewed-php-result-obligation",
+    "reviewed-python-builtin-result-obligation",
+    "reviewed-python-result-obligation",
+    "reviewed-ruby-core-result-obligation",
+    "reviewed-typescript-string-result-obligation",
+    "runtime-keyed-read",
+    "same-evaluation",
+    "scalar-state",
+    "scoped-callable-completeness",
+    "semantic-control-flow",
+    "semantic-guard-facts",
+    "semantic-model-declared-effects",
+    "semantic-model-provenance",
+    "statement-facts",
+    "statement-reachability",
+    "structural-match",
+    "taint",
+    "terminal-obligation",
+    "transitive-procedure-effects",
+    "type-hierarchy",
+    "typestate",
+    "value-origin-assertion",
+];
+
 enum PolicyCapabilityAvailability {
     Available,
-    Unavailable { reason: &'static str },
+    Unavailable { reason: String },
 }
 
 fn policy_capability_availability(
@@ -1495,7 +1611,12 @@ fn policy_capability_availability(
                 }) =>
         {
             PolicyCapabilityAvailability::Unavailable {
-                reason: "the active semantic snapshot does not publish a complete Python declaration surface",
+                reason: "the active semantic snapshot does not publish a complete Python declaration surface".to_owned(),
+            }
+        }
+        _ if ENGINE_POLICY_CAPABILITIES.binary_search(&label).is_err() => {
+            PolicyCapabilityAvailability::Unavailable {
+                reason: format!("this engine does not provide the `{label}` capability"),
             }
         }
         _ => PolicyCapabilityAvailability::Available,
@@ -3141,7 +3262,7 @@ fn evaluate_prepared_policy_inputs(
                         PolicyCapabilityAvailability::Unavailable { reason } => {
                             Some(UnavailablePolicyCapability {
                                 label: label.clone(),
-                                reason: reason.to_owned(),
+                                reason,
                             })
                         }
                     }
@@ -5722,6 +5843,16 @@ fn prepare_parsed_input(
             None,
             Vec::new(),
         )?)),
+        RqlpDocument::DeclarationSelection { .. } => {
+            Ok(InputOutcome::Diagnostic(report_diagnostic(
+                PolicyReportDiagnosticCode::NotExecutableEndpoint,
+                "a declaration-selection document is policy configuration, not an executable policy root"
+                    .to_string(),
+                Some(source),
+                None,
+                Vec::new(),
+            )?))
+        }
     }
 }
 
@@ -5878,10 +6009,17 @@ fn registry_diagnostic(
     source: PolicySourceIdentity,
     error: &PolicyRegistryError,
 ) -> Result<PolicyReportDiagnostic, PolicyCoordinatorError> {
-    if let PolicyRegistryError::EndpointSetImport { source, error } = error {
+    let registry_error = error;
+    if let PolicyRegistryError::EndpointSetImport { source, error }
+    | PolicyRegistryError::DeclarationSelectionImport { source, error } = error
+    {
+        let message = match registry_error {
+            PolicyRegistryError::DeclarationSelectionImport { .. } => registry_error.to_string(),
+            _ => error.to_string(),
+        };
         return report_diagnostic(
             PolicyReportDiagnosticCode::PolicyValidationFailed,
-            error.to_string(),
+            message,
             Some(source.clone()),
             Some(
                 PolicySourceRange::try_from(error.diagnostic.range.clone()).map_err(|error| {
@@ -6016,9 +6154,9 @@ fn dependency_source(
 
 fn selector_source(policy: &LoadedPolicy, origin: &SelectorOrigin) -> PolicySourceIdentity {
     match origin {
-        SelectorOrigin::Document { source } | SelectorOrigin::ReferencedFile { source, .. } => {
-            source.clone()
-        }
+        SelectorOrigin::Document { source }
+        | SelectorOrigin::ReferencedFile { source, .. }
+        | SelectorOrigin::DeclarationSelection { source, .. } => source.clone(),
         SelectorOrigin::Catalog { .. } => policy.source().clone(),
     }
 }

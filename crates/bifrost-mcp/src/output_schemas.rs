@@ -7,15 +7,15 @@
 //! tool-name-to-schema mapping in the codebase;
 //! `mcp_common::build_server_spec_with_hidden` is the only place that reads it.
 
-use brokk_bifrost_analysis::blast_radius::{BlastRadiusResult, MissingTestsResult};
-use brokk_bifrost_analysis::code_quality::{
+use brokk_bifrost_policy::BuiltInPolicyCatalogManifest;
+use brokk_bifrost_tools::blast_radius::{BlastRadiusResult, MissingTestsResult};
+use brokk_bifrost_tools::code_quality::{
     ReportStructuralCloneSmellsResult, ReportTestAssertionSmellsResult,
 };
-use brokk_bifrost_analysis::cyclomatic_complexity_diff::CyclomaticComplexityDiffResult;
-use brokk_bifrost_analysis::searchtools::{
+use brokk_bifrost_tools::cyclomatic_complexity_diff::CyclomaticComplexityDiffResult;
+use brokk_bifrost_tools::searchtools::{
     ActiveWorkspaceResult, GetDefinitionResult, SearchSymbolsResult,
 };
-use brokk_bifrost_policy::BuiltInPolicyCatalogManifest;
 use serde_json::Value;
 
 type OutputSchemaSource = fn() -> Value;

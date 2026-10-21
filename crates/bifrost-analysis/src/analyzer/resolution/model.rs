@@ -1,19 +1,30 @@
 //! Immutable algebra values for compositional name resolution.
 
 use std::collections::BTreeSet;
+
 use std::fmt;
+
 use std::hash::Hash;
 
 use brokk_bifrost_core::analyzer::Language;
-use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, write_lower_hex};
 
-use crate::analyzer::structural::{
-    BoundaryStatus, CandidateOutcome, PrecedenceTier, ResolutionCompletionKind,
-    ResolutionCompletionReasonKind, ResolutionWitnessKind,
-};
-use crate::hash::{HashMap, HashSet, set_with_capacity};
+use brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes;
+use brokk_bifrost_core::analyzer::canonical_hash::write_lower_hex;
 
-use super::completion_reasons::{CompletionReasonUnion, CompletionReasons};
+use crate::analyzer::structural::BoundaryStatus;
+use crate::analyzer::structural::CandidateOutcome;
+use crate::analyzer::structural::PrecedenceTier;
+use crate::analyzer::structural::ResolutionCompletionKind;
+use crate::analyzer::structural::ResolutionCompletionReasonKind;
+use crate::analyzer::structural::ResolutionWitnessKind;
+
+use crate::hash::HashMap;
+use crate::hash::HashSet;
+use crate::hash::set_with_capacity;
+
+use super::completion_reasons::CompletionReasonUnion;
+use super::completion_reasons::CompletionReasons;
+
 use super::never_cancelled;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +39,7 @@ pub(crate) enum BindingOrigin {
     SamePackage,
     StarImport,
     RootPackage,
+    DefaultImport,
 }
 
 /// Lower is stronger. Language-specific order is supplied here; path
@@ -40,10 +52,11 @@ pub(crate) const fn binding_origin_rank(language: Language, origin: BindingOrigi
             Origin::ExplicitImport => Some(1),
             Origin::WildcardImport | Origin::StarImport => Some(2),
             Origin::OtherCompilationUnitPackage => Some(3),
-            Origin::RootPackage => Some(4),
+            Origin::RootPackage | Origin::DefaultImport => Some(4),
             Origin::SingleTypeImport | Origin::OnDemandImport | Origin::SamePackage => None,
         },
         Language::Java => match origin {
+            Origin::DefaultImport => Some(4),
             Origin::RootPackage => None,
             Origin::LocalOrInherited => Some(0),
             Origin::SingleTypeImport | Origin::ExplicitImport => Some(1),
@@ -53,7 +66,7 @@ pub(crate) const fn binding_origin_rank(language: Language, origin: BindingOrigi
             Origin::OnDemandImport | Origin::WildcardImport | Origin::StarImport => Some(3),
         },
         Language::Kotlin => match origin {
-            Origin::RootPackage => None,
+            Origin::DefaultImport | Origin::RootPackage => Some(4),
             Origin::LocalOrInherited => Some(0),
             Origin::ExplicitImport => Some(1),
             Origin::SamePackage | Origin::SameCompilationUnitPackage => Some(2),
@@ -143,7 +156,7 @@ pub(crate) const CONTEXT_OPERATION_BASE: u64 = 1 << 60;
 pub(super) const FIXTURE_OPERATION_BASE: u64 = 1 << 59;
 
 macro_rules! numeric_id {
-    ($name:ident) => {
+    ($name:ident, $mounted_visibility:vis, $operation_number_visibility:vis, $fixture_visibility:vis, $coordinate_visibility:vis, $key_visibility:vis) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u64);
 
@@ -167,7 +180,8 @@ macro_rules! numeric_id {
 
             /// One identity a blob owns, at a mount ordinal and the catalog
             /// position that is its storage-local key.
-            pub(crate) fn local(ordinal: u32, local_key: u32) -> Self {
+            #[doc(hidden)]
+            $mounted_visibility fn local(ordinal: u32, local_key: u32) -> Self {
                 assert!(
                     ordinal < MOUNT_ORDINAL_LIMIT,
                     "a mount ordinal fits the 29 bits milestone 4's layout gives it: \
@@ -181,7 +195,8 @@ macro_rules! numeric_id {
 
             /// The mount this identity belongs to, or `None` when it belongs
             /// to no file.
-            pub(crate) fn ordinal(self) -> Option<u32> {
+            #[doc(hidden)]
+            $coordinate_visibility fn ordinal(self) -> Option<u32> {
                 match self.kind() {
                     ResolutionIdentityKind::Local => Some(
                         u32::try_from(self.payload() >> LOCAL_ORDINAL_SHIFT)
@@ -193,7 +208,8 @@ macro_rules! numeric_id {
 
             /// The catalog position this identity occupies in its mount, or
             /// `None` when it belongs to no file.
-            pub(crate) fn local_key(self) -> Option<u32> {
+            #[doc(hidden)]
+            $key_visibility fn local_key(self) -> Option<u32> {
                 match self.kind() {
                     ResolutionIdentityKind::Local => Some(
                         u32::try_from(self.payload() & LOCAL_KEY_MASK)
@@ -217,7 +233,8 @@ macro_rules! numeric_id {
             }
 
             /// One number this operation minted for itself.
-            pub(crate) fn operation_local(number: u64) -> Self {
+            #[doc(hidden)]
+            $mounted_visibility fn operation_local(number: u64) -> Self {
                 assert!(
                     number < CONTEXT_OPERATION_BASE,
                     "an operation's own identity number is below the selected \
@@ -228,7 +245,8 @@ macro_rules! numeric_id {
 
             /// One number a selected context minted, in the half of the
             /// `Operation` space that no operation can reach.
-            pub(crate) fn context_local(number: u64) -> Self {
+            #[doc(hidden)]
+            $operation_number_visibility fn context_local(number: u64) -> Self {
                 assert!(
                     number < CONTEXT_OPERATION_BASE,
                     "a selected context's identity number fits its half of the \
@@ -249,7 +267,8 @@ macro_rules! numeric_id {
 
             /// The number this identity carries when an operation or a context
             /// minted it.
-            pub(crate) fn operation_local_number(self) -> Option<u64> {
+            #[doc(hidden)]
+            $operation_number_visibility fn operation_local_number(self) -> Option<u64> {
                 matches!(self.kind(), ResolutionIdentityKind::Operation).then(|| self.payload())
             }
 
@@ -268,7 +287,8 @@ macro_rules! numeric_id {
             /// process, two labels cannot collide, and each fixture's
             /// `b"alpha"` stays readable where a bare counter would not.
             #[cfg(any(test, feature = "test-support"))]
-            pub(crate) fn for_test(label: impl AsRef<[u8]>) -> Self {
+            #[doc(hidden)]
+            $fixture_visibility fn for_test(label: impl AsRef<[u8]>) -> Self {
                 Self::operation_local(FIXTURE_OPERATION_BASE | test_label_number(label.as_ref()))
             }
         }
@@ -340,10 +360,10 @@ pub(super) fn fixture_label_digest(number: u64) -> Option<[u8; 32]> {
     )
 }
 
-numeric_id!(BindingNodeId);
-numeric_id!(PartialPathId);
-numeric_id!(SemanticId);
-numeric_id!(StackVariableId);
+numeric_id!(BindingNodeId, pub, pub(crate), pub, pub, pub);
+numeric_id!(PartialPathId, pub, pub, pub(crate), pub, pub(crate));
+numeric_id!(SemanticId, pub, pub, pub, pub, pub);
+numeric_id!(StackVariableId, pub, pub(crate), pub, pub, pub(crate));
 
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn fixture_number_label(number: u64) -> [u8; 8] {
@@ -399,7 +419,8 @@ impl fmt::Display for DerivationKey {
 pub struct BindingFragmentId(u32);
 
 impl BindingFragmentId {
-    pub(crate) fn at_ordinal(ordinal: u32) -> Self {
+    #[doc(hidden)]
+    pub fn at_ordinal(ordinal: u32) -> Self {
         assert!(
             ordinal < MOUNT_ORDINAL_LIMIT,
             "a mount ordinal fits the 29 bits milestone 4's layout gives it: {ordinal}"
@@ -415,7 +436,8 @@ impl BindingFragmentId {
     /// One mount ordinal for a fixture, minted from a label. See
     /// `SemanticId::for_test`.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn for_test(label: impl AsRef<[u8]>) -> Self {
+    #[doc(hidden)]
+    pub fn for_test(label: impl AsRef<[u8]>) -> Self {
         let ordinal = u32::try_from(test_label_number(label.as_ref()))
             .expect("a test binary mints fewer labels than u32 holds");
         assert!(
@@ -425,7 +447,8 @@ impl BindingFragmentId {
         Self(ordinal)
     }
 
-    pub(crate) const fn ordinal(self) -> u32 {
+    #[doc(hidden)]
+    pub const fn ordinal(self) -> u32 {
         self.0
     }
 }
@@ -453,7 +476,8 @@ impl SharedNameId {
     pub(crate) const PER_REQUEST_BASE: u32 = 1 << 31;
 
     /// One `resolution_identities.id`, as the writer minted it.
-    pub(crate) fn interned(id: i64) -> Self {
+    #[doc(hidden)]
+    pub fn interned(id: i64) -> Self {
         let id = u32::try_from(id)
             .unwrap_or_else(|_| panic!("an interned shared name id fits u32: {id}"));
         assert!(
@@ -472,13 +496,15 @@ impl SharedNameId {
         Self(id)
     }
 
-    pub(crate) const fn get(self) -> u32 {
+    #[doc(hidden)]
+    pub const fn get(self) -> u32 {
         self.0
     }
 
     /// Whether this id is a `resolution_identities` row and may therefore be
     /// written or compared across requests.
-    pub(crate) const fn is_interned(self) -> bool {
+    #[doc(hidden)]
+    pub const fn is_interned(self) -> bool {
         self.0 < Self::PER_REQUEST_BASE
     }
 }
@@ -503,7 +529,8 @@ impl BindingNodeId {
     /// content mounted at different workspace paths still meets at the same
     /// universal boundary. That is what the `Reserved` kind is for, and it is
     /// the only value in it.
-    pub(crate) fn universal_root() -> Self {
+    #[doc(hidden)]
+    pub fn universal_root() -> Self {
         Self::of_kind(
             ResolutionIdentityKind::Reserved,
             u64::try_from(Self::UNIVERSAL_ROOT_BOUNDARY_KEY)
@@ -520,13 +547,15 @@ impl SemanticId {
     }
 
     /// One shared name as the runtime semantic every mount meets it by.
-    pub(crate) fn shared_name(id: SharedNameId) -> Self {
+    #[doc(hidden)]
+    pub fn shared_name(id: SharedNameId) -> Self {
         Self::of_kind(ResolutionIdentityKind::Shared, u64::from(id.get()))
     }
 
     /// The shared name this runtime semantic carries, or `None` when it is not
     /// a shared name.
-    pub(crate) fn shared_name_id(self) -> Option<SharedNameId> {
+    #[doc(hidden)]
+    pub fn shared_name_id(self) -> Option<SharedNameId> {
         matches!(self.kind(), ResolutionIdentityKind::Shared).then(|| {
             SharedNameId(u32::try_from(self.payload()).expect("a shared name id fits u32"))
         })
@@ -589,7 +618,8 @@ impl AlphaRenaming {
 /// member relation identifies it as a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GoDefinitionNamespaces {
-    bits: u8,
+    #[doc(hidden)]
+    pub bits: u8,
     go_field: bool,
 }
 
@@ -630,20 +660,28 @@ impl GoDefinitionNamespaces {
     ) -> bool {
         use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
         assert!(!package_qualifier || namespace == ResolutionNamespace::TypeOrValue);
-        let requested = match namespace {
-            ResolutionNamespace::Type => 1,
-            ResolutionNamespace::Value => 2,
-            ResolutionNamespace::Callable => 4,
-            ResolutionNamespace::TypeOrValue => {
-                if package_qualifier {
-                    11
-                } else {
-                    3
-                }
-            }
-            _ => panic!("unsupported Go spelling namespace: {namespace:?}"),
-        };
-        self.bits & requested != 0
+        assert!(
+            matches!(
+                namespace,
+                ResolutionNamespace::Type
+                    | ResolutionNamespace::Value
+                    | ResolutionNamespace::Callable
+                    | ResolutionNamespace::TypeOrValue
+            ),
+            "unsupported Go spelling namespace: {namespace:?}"
+        );
+        (package_qualifier && self.includes_package())
+            || [
+                (ResolutionNamespace::Type, 1),
+                (ResolutionNamespace::Value, 2),
+                (ResolutionNamespace::Callable, 4),
+            ]
+            .into_iter()
+            .any(|(actual, bit)| {
+                self.bits & bit != 0
+                    && classify_binding_namespace(namespace, actual)
+                        == BindingCandidateAdmission::Target
+            })
     }
 }
 
@@ -654,6 +692,26 @@ impl GoDefinitionNamespaces {
 pub enum BindingCandidateAdmission {
     Target,
     WrongNamespaceBlocker,
+}
+
+/// Combined spelling demands admit either concrete namespace. A mismatched
+/// declaration remains a precedence blocker rather than disappearing.
+pub(crate) fn classify_binding_namespace(
+    requested: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+    actual: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+) -> BindingCandidateAdmission {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+    if requested == actual
+        || (requested == ResolutionNamespace::TypeOrValue
+            && matches!(
+                actual,
+                ResolutionNamespace::Type | ResolutionNamespace::Value
+            ))
+    {
+        BindingCandidateAdmission::Target
+    } else {
+        BindingCandidateAdmission::WrongNamespaceBlocker
+    }
 }
 
 /// Namespace admission shared by the full engine and keyed lexical shortcuts.
@@ -712,8 +770,10 @@ pub enum BindingNodeKind {
 /// A top-first fixed stack prefix followed by an optional remainder variable.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StackPattern<T> {
-    fixed: Box<[T]>,
-    tail: Option<StackVariableId>,
+    #[doc(hidden)]
+    pub fixed: Box<[T]>,
+    #[doc(hidden)]
+    pub tail: Option<StackVariableId>,
 }
 
 impl<T> StackPattern<T> {
@@ -758,8 +818,10 @@ impl<T: Clone> StackPattern<T> {
 /// different lexical scopes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PartialScopedSymbol {
-    symbol: SemanticId,
-    scopes: Option<StackPattern<BindingNodeId>>,
+    #[doc(hidden)]
+    pub symbol: SemanticId,
+    #[doc(hidden)]
+    pub scopes: Option<StackPattern<BindingNodeId>>,
 }
 
 impl PartialScopedSymbol {
@@ -1294,9 +1356,12 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EndpointSignature {
-    node: BindingNodeId,
-    symbols: SymbolStackPattern,
-    scopes: ScopeStackPattern,
+    #[doc(hidden)]
+    pub node: BindingNodeId,
+    #[doc(hidden)]
+    pub symbols: SymbolStackPattern,
+    #[doc(hidden)]
+    pub scopes: ScopeStackPattern,
 }
 
 impl EndpointSignature {
@@ -1762,14 +1827,7 @@ impl ResolutionCompletion {
     }
 
     pub fn incomplete(reasons: impl IntoIterator<Item = ResolutionIncompleteReason>) -> Self {
-        let mut reasons = reasons.into_iter().collect::<Vec<_>>();
-        reasons.sort_unstable();
-        reasons.dedup();
-        assert!(
-            !reasons.is_empty(),
-            "incomplete resolution requires a reason"
-        );
-        Self::Incomplete(CompletionReasons::canonical(reasons))
+        Self::Incomplete(CompletionReasons::from_reasons(reasons))
     }
 
     pub fn combine(&self, other: &Self) -> Self {
@@ -1807,7 +1865,8 @@ impl ResolutionCompletion {
         }
     }
 
-    pub(crate) fn contains_reason(&self, reason: ResolutionIncompleteReason) -> bool {
+    #[doc(hidden)]
+    pub fn contains_reason(&self, reason: ResolutionIncompleteReason) -> bool {
         matches!(self, Self::Incomplete(reasons) if reasons.contains(&reason))
     }
 
@@ -1889,9 +1948,12 @@ impl std::hash::Hash for ResolutionCompletion {
 /// Java and other reference-only languages can use zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResolutionTypeRef {
-    identity: SemanticId,
-    indirection: u32,
-    reference_indirection: u32,
+    #[doc(hidden)]
+    pub identity: SemanticId,
+    #[doc(hidden)]
+    pub indirection: u32,
+    #[doc(hidden)]
+    pub reference_indirection: u32,
 }
 
 impl ResolutionTypeRef {
@@ -2004,12 +2066,18 @@ pub(super) enum TypeTransferApplication {
 /// the rule and the evidence attached to an unrepresentable adjustment.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeTransferRule {
-    semantic: SemanticId,
-    target_slot: SemanticId,
-    indirection_delta: i64,
-    reference_indirection_delta: i64,
-    value_transform: TypeTransferValueTransform,
-    completion: ResolutionCompletion,
+    #[doc(hidden)]
+    pub semantic: SemanticId,
+    #[doc(hidden)]
+    pub target_slot: SemanticId,
+    #[doc(hidden)]
+    pub indirection_delta: i64,
+    #[doc(hidden)]
+    pub reference_indirection_delta: i64,
+    #[doc(hidden)]
+    pub value_transform: TypeTransferValueTransform,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
 }
 
 impl TypeTransferRule {
@@ -2171,10 +2239,14 @@ impl TypeTransferRule {
 /// The value alternatives at one point where binding hands work to type flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypedFrontierState {
-    unindexed_external: Box<[UnindexedExternalFrontier]>,
-    slot: SemanticId,
-    possible_values: Box<[ResolutionSlotValue]>,
-    completion: ResolutionCompletion,
+    #[doc(hidden)]
+    pub unindexed_external: Box<[UnindexedExternalFrontier]>,
+    #[doc(hidden)]
+    pub slot: SemanticId,
+    #[doc(hidden)]
+    pub possible_values: Box<[ResolutionSlotValue]>,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
 }
 
 impl TypedFrontierState {
@@ -2194,7 +2266,8 @@ impl TypedFrontierState {
         }
     }
 
-    pub(crate) fn unindexed_external(&self) -> &[UnindexedExternalFrontier] {
+    #[doc(hidden)]
+    pub fn unindexed_external(&self) -> &[UnindexedExternalFrontier] {
         &self.unindexed_external
     }
 
@@ -2260,7 +2333,8 @@ impl TypedFrontierState {
 /// A request-local external frontier with no authoritative package clause or
 /// nominal type. A member lookup is a structured recipe, not an inventory row.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct UnindexedExternalFrontier {
+#[doc(hidden)]
+pub struct UnindexedExternalFrontier {
     pub(crate) provider_path: std::sync::Arc<str>,
     /// A nameless provider row is evidence, not package-name authority.
     pub(crate) provider_package_id: Option<i64>,
@@ -2287,10 +2361,14 @@ pub(crate) struct NativeSelectionProvenance {
 /// Query-only trace annotations do not participate in semantic identity.
 #[derive(Debug, Clone)]
 pub struct ResolutionWitness {
-    reference: SemanticId,
-    target: SemanticId,
-    steps: Box<[WitnessStep]>,
-    completion: ResolutionCompletion,
+    #[doc(hidden)]
+    pub reference: SemanticId,
+    #[doc(hidden)]
+    pub target: SemanticId,
+    #[doc(hidden)]
+    pub steps: Box<[WitnessStep]>,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
     native_provenance: Option<Box<NativeSelectionProvenance>>,
 }
 
@@ -2438,9 +2516,12 @@ impl LookupAlternative {
 /// One point-resolution result. Ambiguity is a complete multi-target answer.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ResolutionAnswer {
-    targets: Box<[SemanticId]>,
-    witnesses: Box<[ResolutionWitness]>,
-    completion: ResolutionCompletion,
+    #[doc(hidden)]
+    pub targets: Box<[SemanticId]>,
+    #[doc(hidden)]
+    pub witnesses: Box<[ResolutionWitness]>,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
     // Query-owned ordered alternatives, strongest first. Transformations that
     // rebuild an answer must re-prove this structure; `new` deliberately omits it.
     lookup_decision: Option<Box<[LookupAlternative]>>,
@@ -2859,11 +2940,16 @@ fn alpha_variable_ordinal(
 
 #[derive(Debug, Clone)]
 pub struct PartialPath {
-    start: EndpointSignature,
-    end: EndpointSignature,
-    precedence: Box<[PrecedenceStep]>,
-    witness: Box<[WitnessStep]>,
-    completion: ResolutionCompletion,
+    #[doc(hidden)]
+    pub start: EndpointSignature,
+    #[doc(hidden)]
+    pub end: EndpointSignature,
+    #[doc(hidden)]
+    pub precedence: Box<[PrecedenceStep]>,
+    #[doc(hidden)]
+    pub witness: Box<[WitnessStep]>,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
     /// A root route head whose selected owner resolution continues later.
     owner_continued: bool,
     /// The source position at which a positional root import (Scala) takes
@@ -3482,7 +3568,8 @@ impl PartialPath {
             .or(next.native_import.as_ref())
             .cloned()
             .or_else(|| {
-                crate::analyzer::usages::get_definition::trace::native_rejection_projection_active()
+                crate::analyzer::resolution::resolution_diagnostics()
+                    .native_rejection_projection_active()
                     .then(|| self.native_import_route().map(Box::new))
                     .flatten()
             });
@@ -3625,7 +3712,11 @@ impl std::error::Error for PathCompositionError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::resolution::test_support::{endpoint, node, semantic};
+
+    use crate::analyzer::resolution::test_support::endpoint;
+    use crate::analyzer::resolution::test_support::node;
+    use crate::analyzer::resolution::test_support::semantic;
+
     use brokk_bifrost_test_macros::hardwon;
 
     fn variable(value: &str) -> StackVariableId {

@@ -25,10 +25,12 @@ use super::completion_reasons::{
 };
 use super::engine::{
     CANCELLATION_QUANTUM, CompletedBinding, CompletedPath, IncompleteTerminalPath,
-    ReferenceSearchAnswer, ResolutionQuery, SelectionAccessLookup, apply_type_transfer_rules,
-    cancelled_completion, classify_completed_binding, endpoint_is_balanced, identity_path,
+    ReferenceSearchAnswer, ResolutionQuery, apply_type_transfer_rules, cancelled_completion,
+    classify_completed_binding, endpoint_is_balanced, identity_path,
     select_paths_with_cancellation_evidence, select_paths_with_lazy_access,
+    select_paths_with_lazy_candidate_filter,
 };
+use super::fact_source::{DeclarationAccessDecision, SelectedTypedRow};
 use super::local_identity::{ResolutionSemanticIdentity, SelectedResolutionMountOrdinal};
 use super::model::{
     BindingFragmentId, BindingNodeId, DerivationKey, EndpointSignature, PartialPath, PartialPathId,
@@ -38,6 +40,46 @@ use super::model::{
 };
 use super::saturation::{CycleCompletenessCertifier, SaturationBranch, SaturationDecision};
 use super::selected_context::SelectedContextOverlay;
+use super::typed_fact_lowering::LoweredMemberOwnerProperty;
+
+/// Caller-owned membership reads for one endpoint classification.
+/// `None` means that the operation stopped without publishing a partial result.
+pub type ClassificationMemberOwnerReader<'a> = dyn FnMut(&[SemanticId]) -> StoreResult<Option<Vec<SelectedTypedRow<LoweredMemberOwnerProperty>>>>
+    + 'a;
+
+/// Access and membership reads borrow their operation only while invoked.
+pub(super) trait BatchOperationReadProvider {
+    fn selection_access(&mut self) -> Option<&mut dyn BatchSelectionAccess>;
+    fn member_owners_for_definitions(
+        &mut self,
+        definitions: &[SemanticId],
+    ) -> StoreResult<Option<Vec<SelectedTypedRow<LoweredMemberOwnerProperty>>>>;
+}
+
+pub(super) trait BatchSelectionAccess {
+    fn lookup(
+        &mut self,
+        reference: SemanticId,
+        definitions: &[SemanticId],
+    ) -> StoreResult<Option<Vec<DeclarationAccessDecision>>>;
+}
+
+pub(super) fn classify_operation_endpoints<S: BatchResolutionFragmentSource + ?Sized>(
+    source: &S,
+    nodes: &[BindingNodeId],
+    cancellation: &CancellationToken,
+    provider: Option<&mut dyn BatchOperationReadProvider>,
+) -> StoreResult<Option<Vec<BatchEndpointClassification>>> {
+    if let Some(provider) = provider {
+        source.classify_endpoint_nodes_with_member_owners(nodes, cancellation, &mut |definitions| {
+            provider.member_owners_for_definitions(definitions)
+        })
+    } else {
+        source
+            .classify_endpoint_nodes(nodes, cancellation)
+            .map(Some)
+    }
+}
 
 /// Hard upper bound on reference seeds sharing one lexical frame.
 pub const MAX_REFERENCE_SEEDS_PER_BATCH: usize = 256;
@@ -48,7 +90,8 @@ pub const MAX_REFERENCE_SEEDS_PER_BATCH: usize = 256;
 /// operation-local narrowing step. Keeping the relation bounded makes the
 /// later SQL shape explicit and prevents a selected workspace from becoming
 /// one unbounded request rowset.
-pub(crate) const MAX_REVERSE_TARGETS_PER_BATCH: usize = 64;
+#[doc(hidden)]
+pub const MAX_REVERSE_TARGETS_PER_BATCH: usize = 64;
 
 /// Hard upper bound on one immutable candidate-source relation read.
 ///
@@ -240,6 +283,7 @@ pub struct ReferenceLocalPathEvidence {
     prefix_local_definitions: Box<[SemanticId]>,
     prefix_scope_spellings: Box<[(u32, String)]>,
     scope_endpoints: Box<[u32]>,
+    lexical_scopes: Box<[(BindingNodeId, u32)]>,
     reaches_root: bool,
     reaches_package_root_scope: bool,
     local_bindings_certified: bool,
@@ -261,6 +305,7 @@ impl ReferenceLocalPathEvidence {
             prefix_local_definitions: prefix_local_definitions.into_boxed_slice(),
             prefix_scope_spellings: prefix_scope_spellings.into_boxed_slice(),
             scope_endpoints: scope_endpoints.into_boxed_slice(),
+            lexical_scopes: Box::new([]),
             reaches_root,
             reaches_package_root_scope,
             local_bindings_certified: true,
@@ -270,6 +315,15 @@ impl ReferenceLocalPathEvidence {
     pub(crate) fn with_local_bindings_certified(mut self, certified: bool) -> Self {
         self.local_bindings_certified = certified;
         self
+    }
+
+    pub(crate) fn with_lexical_scopes(mut self, scopes: Vec<(BindingNodeId, u32)>) -> Self {
+        self.lexical_scopes = scopes.into_boxed_slice();
+        self
+    }
+
+    pub(crate) fn lexical_scopes(&self) -> &[(BindingNodeId, u32)] {
+        &self.lexical_scopes
     }
 
     pub(crate) const fn local_bindings_certified(&self) -> bool {
@@ -317,7 +371,8 @@ impl BatchCandidateRequest {
     /// (`resolution_paths_forward`), so it applies this to what the seek
     /// offers, exactly as the in-heap index does. Living here rather than in
     /// `engine.rs` is what lets one predicate serve both sources.
-    pub(crate) fn admits_candidate(&self, offered: &EndpointSignature) -> bool {
+    #[doc(hidden)]
+    pub fn admits_candidate(&self, offered: &EndpointSignature) -> bool {
         super::engine::endpoint_admits_candidate(self.endpoint(), offered)
     }
 }
@@ -1090,7 +1145,8 @@ impl CandidatePathStore {
 /// fact operations still own separate candidate stores. Every map is bounded
 /// by the endpoints, nodes, references or owner frontiers that request touches.
 #[derive(Debug, Default)]
-pub(crate) struct ForwardCandidateArtifactCache {
+#[doc(hidden)]
+pub struct ForwardCandidateArtifactCache {
     endpoint_matches: HashMap<EndpointSignature, CachedForwardEndpointMatch>,
     endpoint_classifications: HashMap<BindingNodeId, BatchEndpointClassification>,
     unconditional_completion: Option<ResolutionCompletion>,
@@ -1104,12 +1160,13 @@ pub(crate) struct ForwardCandidateArtifactCache {
     /// Budget accounting shared by the type and member stages of one receiver
     /// query. The selected authority keeps unrelated frontiers distinct.
     expanded_owner_frontiers: HashSet<DemandedReferenceKey>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     cache_hits: std::cell::Cell<usize>,
 }
 
 impl ForwardCandidateArtifactCache {
-    pub(crate) fn reset_owner_expansions(&mut self) {
+    #[doc(hidden)]
+    pub fn reset_owner_expansions(&mut self) {
         self.expanded_owner_frontiers.clear();
     }
 
@@ -1121,13 +1178,14 @@ impl ForwardCandidateArtifactCache {
         self.expanded_owner_frontiers.insert(key);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_cache_hit(&self) {
         self.cache_hits.set(self.cache_hits.get() + 1);
     }
 
-    #[cfg(test)]
-    pub(crate) fn cache_hit_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn cache_hit_count(&self) -> usize {
         self.cache_hits.get()
     }
 
@@ -1176,7 +1234,7 @@ impl ForwardCandidateArtifactCache {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ForwardCandidateArtifactCache {
     pub(super) fn artifact_counts(
         &self,
@@ -2823,6 +2881,16 @@ pub trait BatchResolutionFragmentSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<BatchEndpointClassification>>;
 
+    /// Classify through operation-owned membership reads when available.
+    fn classify_endpoint_nodes_with_member_owners(
+        &self,
+        nodes: &[BindingNodeId],
+        cancellation: &CancellationToken,
+        _member_owners: &mut ClassificationMemberOwnerReader<'_>,
+    ) -> StoreResult<Option<Vec<BatchEndpointClassification>>> {
+        self.classify_endpoint_nodes(nodes, cancellation).map(Some)
+    }
+
     fn match_forward_candidates(
         &self,
         requests: &[BatchCandidateRequest],
@@ -3330,6 +3398,16 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<BatchEndpointClassification>> {
         self.base.classify_endpoint_nodes(nodes, cancellation)
+    }
+
+    fn classify_endpoint_nodes_with_member_owners(
+        &self,
+        nodes: &[BindingNodeId],
+        cancellation: &CancellationToken,
+        member_owners: &mut ClassificationMemberOwnerReader<'_>,
+    ) -> StoreResult<Option<Vec<BatchEndpointClassification>>> {
+        self.base
+            .classify_endpoint_nodes_with_member_owners(nodes, cancellation, member_owners)
     }
 
     fn match_forward_candidates(
@@ -4777,6 +4855,91 @@ fn materialize_reverse_candidate_pages(
     )
 }
 
+type EndpointClassificationRead = StoreResult<Option<Vec<BatchEndpointClassification>>>;
+
+impl SelectedContextOverlayFragmentSource<'_> {
+    fn classify_overlay_endpoints(
+        &self,
+        nodes: &[BindingNodeId],
+        cancellation: &CancellationToken,
+        classify: &mut dyn FnMut(&[BindingNodeId]) -> EndpointClassificationRead,
+    ) -> StoreResult<Option<Vec<BatchEndpointClassification>>> {
+        assert!(
+            nodes.len() <= MAX_SOURCE_ROWS_PER_BATCH,
+            "endpoint classification page has {} entries; maximum is {MAX_SOURCE_ROWS_PER_BATCH}",
+            nodes.len()
+        );
+        if cancellation.is_cancelled() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut work = 0_usize;
+        let mut requested = HashSet::default();
+        let mut delegated = Vec::with_capacity(nodes.len());
+        let mut staged = BTreeMap::new();
+        for &node in nodes {
+            if poll_overlay_work(cancellation, &mut work) {
+                return Ok(Some(staged.into_values().collect()));
+            }
+            if !requested.insert(node) {
+                return Err(StoreError::new(format!(
+                    "endpoint classification requests duplicate node {node}"
+                )));
+            }
+            if self.blueprint().boundary_nodes.binary_search(&node).is_ok() {
+                staged.insert(node, BatchEndpointClassification::new(node, None, None));
+            } else {
+                delegated.push(node);
+            }
+        }
+
+        let base_rows = if delegated.is_empty() || cancellation.is_cancelled() {
+            Vec::new()
+        } else {
+            let Some(rows) = classify(&delegated)? else {
+                return Ok(None);
+            };
+            rows
+        };
+        let delegated: HashSet<_> = delegated.into_iter().collect();
+        for row in base_rows {
+            if !delegated.contains(&row.node()) {
+                return Err(StoreError::new(format!(
+                    "base endpoint classification returned foreign node {}",
+                    row.node()
+                )));
+            }
+            if staged.insert(row.node(), row).is_some() {
+                return Err(StoreError::new(format!(
+                    "base endpoint classification returned duplicate node {}",
+                    row.node()
+                )));
+            }
+        }
+        if !cancellation.is_cancelled() && staged.len() != nodes.len() {
+            let missing: Vec<_> = nodes
+                .iter()
+                .copied()
+                .filter(|node| !staged.contains_key(node))
+                .collect();
+            return Err(StoreError::new(format!(
+                "base endpoint classification omitted requested nodes {missing:?}"
+            )));
+        }
+
+        let mut classified = Vec::with_capacity(staged.len());
+        for &node in nodes {
+            if poll_overlay_work(cancellation, &mut work) {
+                break;
+            }
+            if let Some(row) = staged.remove(&node) {
+                classified.push(row);
+            }
+        }
+        Ok(Some(classified))
+    }
+}
+
 impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> {
     fn identity_content_digest(
         &self,
@@ -4939,77 +5102,24 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
         nodes: &[BindingNodeId],
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<BatchEndpointClassification>> {
-        assert!(
-            nodes.len() <= MAX_SOURCE_ROWS_PER_BATCH,
-            "endpoint classification page has {} entries; maximum is {MAX_SOURCE_ROWS_PER_BATCH}",
-            nodes.len()
-        );
-        if cancellation.is_cancelled() {
-            return Ok(Vec::new());
-        }
-
-        let mut work = 0_usize;
-        let mut requested = HashSet::default();
-        let mut delegated = Vec::with_capacity(nodes.len());
-        let mut staged = BTreeMap::new();
-        for &node in nodes {
-            if poll_overlay_work(cancellation, &mut work) {
-                return Ok(staged.into_values().collect());
-            }
-            if !requested.insert(node) {
-                return Err(StoreError::new(format!(
-                    "endpoint classification requests duplicate node {node}"
-                )));
-            }
-            if self.blueprint().boundary_nodes.binary_search(&node).is_ok() {
-                staged.insert(node, BatchEndpointClassification::new(node, None, None));
-            } else {
-                delegated.push(node);
-            }
-        }
-
-        let base_rows = if delegated.is_empty() || cancellation.is_cancelled() {
-            Vec::new()
-        } else {
+        self.classify_overlay_endpoints(nodes, cancellation, &mut |nodes| {
             self.base
-                .classify_endpoint_nodes(&delegated, cancellation)?
-        };
-        let delegated: HashSet<_> = delegated.into_iter().collect();
-        for row in base_rows {
-            if !delegated.contains(&row.node()) {
-                return Err(StoreError::new(format!(
-                    "base endpoint classification returned foreign node {}",
-                    row.node()
-                )));
-            }
-            if staged.insert(row.node(), row).is_some() {
-                return Err(StoreError::new(format!(
-                    "base endpoint classification returned duplicate node {}",
-                    row.node()
-                )));
-            }
-        }
-        if !cancellation.is_cancelled() && staged.len() != nodes.len() {
-            let missing: Vec<_> = nodes
-                .iter()
-                .copied()
-                .filter(|node| !staged.contains_key(node))
-                .collect();
-            return Err(StoreError::new(format!(
-                "base endpoint classification omitted requested nodes {missing:?}"
-            )));
-        }
+                .classify_endpoint_nodes(nodes, cancellation)
+                .map(Some)
+        })
+        .map(Option::unwrap_or_default)
+    }
 
-        let mut classified = Vec::with_capacity(staged.len());
-        for &node in nodes {
-            if poll_overlay_work(cancellation, &mut work) {
-                break;
-            }
-            if let Some(row) = staged.remove(&node) {
-                classified.push(row);
-            }
-        }
-        Ok(classified)
+    fn classify_endpoint_nodes_with_member_owners(
+        &self,
+        nodes: &[BindingNodeId],
+        cancellation: &CancellationToken,
+        member_owners: &mut ClassificationMemberOwnerReader<'_>,
+    ) -> StoreResult<Option<Vec<BatchEndpointClassification>>> {
+        self.classify_overlay_endpoints(nodes, cancellation, &mut |nodes| {
+            self.base
+                .classify_endpoint_nodes_with_member_owners(nodes, cancellation, member_owners)
+        })
     }
 
     fn match_forward_candidates(
@@ -5560,6 +5670,7 @@ pub(super) struct DemandForwardBatchFrame {
     candidate_completion: OperationCandidateCompletionLedger,
     round: Option<DemandForwardRound>,
     terminal: bool,
+    allowed_targets: Option<HashSet<SemanticId>>,
 }
 
 struct DemandForwardRound {
@@ -5599,6 +5710,20 @@ pub(super) enum DemandForwardBatchPoll {
 }
 
 impl DemandForwardBatchFrame {
+    /// Restrict this query's eventual lexical selection without reconstructing
+    /// source precedence. Only the implicit-receiver overlay uses this filter;
+    /// its contextual declaration access still runs in the typed refinement.
+    pub(super) fn allow_only_targets(&mut self, targets: HashSet<SemanticId>) {
+        assert!(
+            !self.terminal,
+            "a terminal forward frame cannot be filtered"
+        );
+        assert!(
+            self.allowed_targets.replace(targets).is_none(),
+            "one query-local target filter"
+        );
+    }
+
     /// Preserve the ordinary root-batch admission schedule before suspension.
     pub(super) fn start_reference_batch<S: BatchResolutionFragmentSource + ?Sized>(
         engine: &BatchResolutionEngine<'_, S>,
@@ -5755,6 +5880,7 @@ impl DemandForwardBatchFrame {
                     accounted_hydrated_completions: HashSet::default(),
                     candidate_completion: OperationCandidateCompletionLedger::new(seed_count),
                     round: None,
+                    allowed_targets: None,
                     terminal: false,
                 }))
             }
@@ -5811,6 +5937,7 @@ impl DemandForwardBatchFrame {
             true,
             &mut self.initialized.completion_work,
             None,
+            None,
         )
         .expect("selection without a declaration access source is infallible")
     }
@@ -5841,7 +5968,7 @@ impl DemandForwardBatchFrame {
         artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        read_provider: Option<&mut dyn BatchOperationReadProvider>,
         readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandForwardBatchPoll> {
         assert!(!self.terminal, "a terminal forward frame cannot be resumed");
@@ -5850,7 +5977,7 @@ impl DemandForwardBatchFrame {
             artifact_cache,
             candidate_paths,
             cancellation,
-            access_lookup,
+            read_provider,
             readiness,
         );
         terminal_on_error(result, &mut self.terminal)
@@ -5862,20 +5989,27 @@ impl DemandForwardBatchFrame {
         mut artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
         cancellation: &CancellationToken,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        mut read_provider: Option<&mut dyn BatchOperationReadProvider>,
         readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
     ) -> StoreResult<DemandForwardBatchPoll> {
         if self.initialized.cancelled || cancellation.is_cancelled() {
             self.initialized.cancelled = true;
-            return self.finish(engine, cancellation, access_lookup, candidate_paths);
+            return self.finish(engine, cancellation, read_provider, candidate_paths);
         }
         if self.round.is_none() {
             if self.initialized.frontier.is_empty() {
-                return self.finish(engine, cancellation, access_lookup, candidate_paths);
+                return self.finish(engine, cancellation, read_provider, candidate_paths);
             }
-            self.round = self.prepare_round(engine, artifact_cache.as_deref_mut(), cancellation)?;
+            self.round = self.prepare_round(
+                engine,
+                artifact_cache.as_deref_mut(),
+                cancellation,
+                read_provider
+                    .as_mut()
+                    .map(|provider| &mut **provider as &mut dyn BatchOperationReadProvider),
+            )?;
             if self.initialized.cancelled {
-                return self.finish(engine, cancellation, access_lookup, candidate_paths);
+                return self.finish(engine, cancellation, read_provider, candidate_paths);
             }
             return Ok(DemandForwardBatchPoll::Continue);
         }
@@ -5884,12 +6018,12 @@ impl DemandForwardBatchFrame {
             let round = self.round.take().expect("the round is active");
             self.finish_round(engine, round, candidate_paths, cancellation)?;
             if self.initialized.cancelled || self.initialized.frontier.is_empty() {
-                return self.finish(engine, cancellation, access_lookup, candidate_paths);
+                return self.finish(engine, cancellation, read_provider, candidate_paths);
             }
             return Ok(DemandForwardBatchPoll::Continue);
         }
         if !self.fill_request_page(cancellation) {
-            return self.finish(engine, cancellation, access_lookup, candidate_paths);
+            return self.finish(engine, cancellation, read_provider, candidate_paths);
         }
         let round = self.round.as_ref().expect("the round is active");
         // This gate precedes the ENTIRE artifact read, including cache-hit
@@ -5897,14 +6031,14 @@ impl DemandForwardBatchFrame {
         let ready = readiness(&round.request_page)?;
         if cancellation.is_cancelled() {
             self.initialized.cancelled = true;
-            return self.finish(engine, cancellation, access_lookup, candidate_paths);
+            return self.finish(engine, cancellation, read_provider, candidate_paths);
         }
         if ready == DemandForwardReadiness::AwaitingDependencies {
             return Ok(DemandForwardBatchPoll::AwaitingDependencies);
         }
         self.read_page(engine, artifact_cache, cancellation)?;
         if self.initialized.cancelled {
-            return self.finish(engine, cancellation, access_lookup, candidate_paths);
+            return self.finish(engine, cancellation, read_provider, candidate_paths);
         }
         let round = self.round.as_mut().expect("read page retains its round");
         round.request_base += round.request_page.len();
@@ -6017,7 +6151,7 @@ impl DemandForwardBatchFrame {
         &mut self,
         engine: &BatchResolutionEngine<'_, S>,
         cancellation: &CancellationToken,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        read_provider: Option<&mut dyn BatchOperationReadProvider>,
         candidate_paths: &CandidatePathStore,
     ) -> StoreResult<DemandForwardBatchPoll> {
         if self.initialized.cancelled
@@ -6042,7 +6176,8 @@ impl DemandForwardBatchFrame {
                 cancellation,
                 self.initialized.cancelled,
                 self.initialized.completion_work,
-                access_lookup,
+                read_provider,
+                self.allowed_targets.as_ref(),
             )?,
         ))
     }
@@ -6052,6 +6187,7 @@ impl DemandForwardBatchFrame {
         engine: &BatchResolutionEngine<'_, S>,
         mut artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
         cancellation: &CancellationToken,
+        mut provider: Option<&mut dyn BatchOperationReadProvider>,
     ) -> StoreResult<Option<DemandForwardRound>> {
         let InitializedSeededBatch {
             metrics,
@@ -6119,7 +6255,7 @@ impl DemandForwardBatchFrame {
                         break;
                     }
                     if let Some(&classification) = cache.endpoint_classifications.get(&node) {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         cache.record_cache_hit();
                         assert!(
                             endpoint_definitions
@@ -6145,9 +6281,18 @@ impl DemandForwardBatchFrame {
                 return Ok(None);
             }
             for requested in missing.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
-                let classified = engine
-                    .source()
-                    .classify_endpoint_nodes(requested, cancellation)?;
+                let Some(classified) = classify_operation_endpoints(
+                    engine.source(),
+                    requested,
+                    cancellation,
+                    provider
+                        .as_mut()
+                        .map(|provider| &mut **provider as &mut dyn BatchOperationReadProvider),
+                )?
+                else {
+                    *cancelled = true;
+                    break;
+                };
                 if cancellation.is_cancelled() {
                     *cancelled = true;
                     break;
@@ -6766,10 +6911,35 @@ impl ExperimentalReverseBatchFrame {
     // Reborrow the same selected source/work session on every poll. Exclusive
     // source wrappers retain their own read caches; the readiness gate precedes
     // their complete reverse-candidate entry point, not just its visitor.
+    #[cfg(test)]
     pub(super) fn poll<S: BatchResolutionFragmentSource + ?Sized>(
         &mut self,
         engine: &mut BatchResolutionEngine<'_, S>,
         cancellation: &CancellationToken,
+        readiness: &mut impl FnMut(
+            ExperimentalReverseCandidatePage<'_>,
+        ) -> StoreResult<ExperimentalReverseReadiness>,
+    ) -> StoreResult<ExperimentalReverseBatchPoll> {
+        self.poll_with_reads(engine, cancellation, None, readiness)
+    }
+
+    pub(super) fn poll_with_member_owners<S: BatchResolutionFragmentSource + ?Sized>(
+        &mut self,
+        engine: &mut BatchResolutionEngine<'_, S>,
+        cancellation: &CancellationToken,
+        member_owners: &mut ClassificationMemberOwnerReader<'_>,
+        readiness: &mut impl FnMut(
+            ExperimentalReverseCandidatePage<'_>,
+        ) -> StoreResult<ExperimentalReverseReadiness>,
+    ) -> StoreResult<ExperimentalReverseBatchPoll> {
+        self.poll_with_reads(engine, cancellation, Some(member_owners), readiness)
+    }
+
+    fn poll_with_reads<S: BatchResolutionFragmentSource + ?Sized>(
+        &mut self,
+        engine: &mut BatchResolutionEngine<'_, S>,
+        cancellation: &CancellationToken,
+        member_owners: Option<&mut ClassificationMemberOwnerReader<'_>>,
         readiness: &mut impl FnMut(
             ExperimentalReverseCandidatePage<'_>,
         ) -> StoreResult<ExperimentalReverseReadiness>,
@@ -6779,7 +6949,7 @@ impl ExperimentalReverseBatchFrame {
             self.reverse_target, engine.reverse_target,
             "a reverse frame retains its exact target admission authority"
         );
-        let result = self.poll_active(engine, cancellation, readiness);
+        let result = self.poll_active(engine, cancellation, member_owners, readiness);
         terminal_on_error(result, &mut self.terminal)
     }
 
@@ -6787,6 +6957,7 @@ impl ExperimentalReverseBatchFrame {
         &mut self,
         engine: &mut BatchResolutionEngine<'_, S>,
         cancellation: &CancellationToken,
+        member_owners: Option<&mut ClassificationMemberOwnerReader<'_>>,
         readiness: &mut impl FnMut(
             ExperimentalReverseCandidatePage<'_>,
         ) -> StoreResult<ExperimentalReverseReadiness>,
@@ -6799,7 +6970,7 @@ impl ExperimentalReverseBatchFrame {
             if self.frontier.is_empty() {
                 return self.finish::<S>(cancellation);
             }
-            self.round = self.prepare_round(engine, cancellation)?;
+            self.round = self.prepare_round(engine, cancellation, member_owners)?;
             if self.finalization.cancelled {
                 return self.finish::<S>(cancellation);
             }
@@ -6893,6 +7064,7 @@ impl ExperimentalReverseBatchFrame {
         &mut self,
         engine: &BatchResolutionEngine<'_, S>,
         cancellation: &CancellationToken,
+        member_owners: Option<&mut ClassificationMemberOwnerReader<'_>>,
     ) -> StoreResult<Option<ExperimentalReverseRound>> {
         let ReverseCandidateFinalization {
             targets,
@@ -6910,18 +7082,21 @@ impl ExperimentalReverseBatchFrame {
         let lexical_frontier_ids_by_key = &mut self.lexical_frontier_ids_by_key;
         let frontier_observations = &mut self.frontier_observations;
         let current = std::mem::take(frontier);
-        engine.classify_reverse_frontiers(ReverseFrontierContext {
-            definitions,
-            current: &current,
-            endpoint_classifications,
-            frontiers,
-            frontier_ids_by_key,
-            lexical_frontiers,
-            lexical_frontier_ids_by_key,
-            cancellation,
-            observations: frontier_observations,
-            cancelled,
-        })?;
+        engine.classify_reverse_frontiers(
+            ReverseFrontierContext {
+                definitions,
+                current: &current,
+                endpoint_classifications,
+                frontiers,
+                frontier_ids_by_key,
+                lexical_frontiers,
+                lexical_frontier_ids_by_key,
+                cancellation,
+                observations: frontier_observations,
+                cancelled,
+            },
+            member_owners,
+        )?;
         if *cancelled {
             return Ok(None);
         }
@@ -8639,7 +8814,7 @@ pub(super) fn read_forward_candidate_artifacts<S: BatchResolutionFragmentSource 
         for (request_ordinal, request) in requests.iter().enumerate() {
             *cancelled |= poll_reverse_completion(cancellation, work);
             if let Some(cached) = cache.endpoint_matches.get(request.endpoint()) {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 cache.record_cache_hit();
                 // A cache hit is an already returned immutable source
                 // operand. Retain its entire branch box before any
@@ -9190,6 +9365,7 @@ pub(super) fn prefetch_endpoint_classifications<S: BatchResolutionFragmentSource
     nodes: &[BindingNodeId],
     cancellation: &CancellationToken,
     work: &mut usize,
+    member_owners: &mut ClassificationMemberOwnerReader<'_>,
 ) -> StoreResult<()> {
     let mut unclassified = BTreeSet::new();
     for &node in nodes {
@@ -9202,7 +9378,14 @@ pub(super) fn prefetch_endpoint_classifications<S: BatchResolutionFragmentSource
     }
     let missing = unclassified.into_iter().collect::<Vec<_>>();
     for requested in missing.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
-        let classified = source.classify_endpoint_nodes(requested, cancellation)?;
+        let Some(classified) = source.classify_endpoint_nodes_with_member_owners(
+            requested,
+            cancellation,
+            member_owners,
+        )?
+        else {
+            return Ok(());
+        };
         if cancellation.is_cancelled() {
             return Ok(());
         }
@@ -9502,6 +9685,7 @@ pub(super) fn read_endpoint_classification_artifacts<S: BatchResolutionFragmentS
     cancellation: &CancellationToken,
     work: &mut usize,
     cancelled: &mut bool,
+    member_owners: &mut ClassificationMemberOwnerReader<'_>,
 ) -> StoreResult<Vec<BatchEndpointClassification>> {
     assert!(
         requested.windows(2).all(|pair| pair[0] < pair[1]),
@@ -9512,7 +9696,7 @@ pub(super) fn read_endpoint_classification_artifacts<S: BatchResolutionFragmentS
     for &node in requested {
         *cancelled |= poll_reverse_completion(cancellation, work);
         if let Some(&classification) = cache.endpoint_classifications.get(&node) {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             cache.record_cache_hit();
             assert!(classifications.insert(node, classification).is_none());
         } else if !*cancelled {
@@ -9529,7 +9713,15 @@ pub(super) fn read_endpoint_classification_artifacts<S: BatchResolutionFragmentS
             *cancelled = true;
             break;
         }
-        let returned = source.classify_endpoint_nodes(chunk, cancellation)?;
+        let Some(returned) = source.classify_endpoint_nodes_with_member_owners(
+            chunk,
+            cancellation,
+            member_owners,
+        )?
+        else {
+            *cancelled = true;
+            break;
+        };
         if cancellation.is_cancelled() {
             *cancelled = true;
             break;
@@ -9748,7 +9940,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        read_provider: Option<&mut dyn BatchOperationReadProvider>,
     ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
         if cancellation.is_cancelled() {
             return Ok((
@@ -9794,7 +9986,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             cancellation,
             cache,
             candidate_paths,
-            access_lookup,
+            read_provider,
         )
     }
 
@@ -9867,14 +10059,14 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        read_provider: Option<&mut dyn BatchOperationReadProvider>,
     ) -> StoreResult<(ResolutionAnswer, ResolutionBatchMetrics)> {
         let batch = self.resolve_seeded_reference_requests_with_selection_access(
             std::slice::from_ref(request),
             cancellation,
             cache,
             candidate_paths,
-            access_lookup,
+            read_provider,
         )?;
         assert_eq!(
             batch.answers.len(),
@@ -9912,7 +10104,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        read_provider: Option<&mut dyn BatchOperationReadProvider>,
     ) -> StoreResult<ReferenceBatchAnswer> {
         let mut work = 0_usize;
         let (prepared, mut cancelled) =
@@ -9965,7 +10157,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             cancellation,
             cache,
             candidate_paths,
-            access_lookup,
+            read_provider,
         )
     }
 
@@ -9990,7 +10182,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         cancellation: &CancellationToken,
         cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        read_provider: Option<&mut dyn BatchOperationReadProvider>,
     ) -> StoreResult<ReferenceBatchAnswer> {
         let seeds = batch.into_seeds().into_vec();
         let seed_count = seeds.len();
@@ -10039,7 +10231,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             cancellation,
             cache,
             candidate_paths,
-            access_lookup,
+            read_provider,
         )
     }
 
@@ -10390,6 +10582,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_seeded_reference_batch(
         &self,
         seeds: Vec<SeedState>,
@@ -10397,7 +10590,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         cancellation: &CancellationToken,
         mut cancelled: bool,
         mut completion_work: usize,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        read_provider: Option<&mut dyn BatchOperationReadProvider>,
+        allowed_targets: Option<&HashSet<SemanticId>>,
     ) -> StoreResult<ReferenceBatchAnswer> {
         cancelled |= cancellation.is_cancelled();
         let universe_candidates = if cancelled {
@@ -10419,7 +10613,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             cancellation,
             cancelled,
             &mut completion_work,
-            access_lookup,
+            read_provider,
+            allowed_targets,
         )?;
         if !cancelled {
             for (reference, namespace) in universe_candidates {
@@ -10487,7 +10682,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         cancellation: &CancellationToken,
         mut artifact_cache: Option<&mut ForwardCandidateArtifactCache>,
         candidate_paths: &mut CandidatePathStore,
-        access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+        mut read_provider: Option<&mut dyn BatchOperationReadProvider>,
     ) -> StoreResult<ReferenceBatchAnswer> {
         let InitializedSeededBatch {
             mut metrics,
@@ -10562,7 +10757,7 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                             break;
                         }
                         if let Some(&classification) = cache.endpoint_classifications.get(&node) {
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "test-support"))]
                             cache.record_cache_hit();
                             assert!(
                                 endpoint_definitions
@@ -10588,9 +10783,18 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                     break;
                 }
                 for requested in missing.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
-                    let classified = self
-                        .source()
-                        .classify_endpoint_nodes(requested, cancellation)?;
+                    let Some(classified) = classify_operation_endpoints(
+                        self.source(),
+                        requested,
+                        cancellation,
+                        read_provider
+                            .as_mut()
+                            .map(|provider| &mut **provider as &mut dyn BatchOperationReadProvider),
+                    )?
+                    else {
+                        cancelled = true;
+                        break;
+                    };
                     if cancellation.is_cancelled() {
                         cancelled = true;
                         break;
@@ -11027,7 +11231,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             cancellation,
             cancelled,
             completion_work,
-            access_lookup,
+            read_provider,
+            None,
         )
     }
 
@@ -11333,7 +11538,11 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         Ok(answer)
     }
 
-    fn classify_reverse_frontiers(&self, context: ReverseFrontierContext<'_>) -> StoreResult<()> {
+    fn classify_reverse_frontiers(
+        &self,
+        context: ReverseFrontierContext<'_>,
+        mut member_owners: Option<&mut ClassificationMemberOwnerReader<'_>>,
+    ) -> StoreResult<()> {
         let ReverseFrontierContext {
             definitions,
             current,
@@ -11373,9 +11582,21 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             return Ok(());
         }
         for requested in to_classify.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
-            let classified = self
-                .source()
-                .classify_endpoint_nodes(requested, cancellation)?;
+            let classified = if let Some(reader) = member_owners.as_deref_mut() {
+                let Some(rows) = self.source().classify_endpoint_nodes_with_member_owners(
+                    requested,
+                    cancellation,
+                    reader,
+                )?
+                else {
+                    *cancelled = true;
+                    break;
+                };
+                rows
+            } else {
+                self.source()
+                    .classify_endpoint_nodes(requested, cancellation)?
+            };
             if cancellation.is_cancelled() {
                 *cancelled = true;
                 break;
@@ -11713,6 +11934,30 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
         exclusions: &mut ReverseCandidateGapExclusionPlan,
         cancellation: &CancellationToken,
     ) -> StoreResult<ReverseCandidateBatch> {
+        self.reverse_candidate_references_with_reads(definitions, exclusions, cancellation, None)
+    }
+
+    pub(super) fn reverse_candidate_references_with_member_owners(
+        &mut self,
+        definitions: &[(SemanticId, BindingNodeId)],
+        cancellation: &CancellationToken,
+        member_owners: &mut ClassificationMemberOwnerReader<'_>,
+    ) -> StoreResult<ReverseCandidateBatch> {
+        self.reverse_candidate_references_with_reads(
+            definitions,
+            &mut ReverseCandidateGapExclusionPlan::default(),
+            cancellation,
+            Some(member_owners),
+        )
+    }
+
+    fn reverse_candidate_references_with_reads(
+        &mut self,
+        definitions: &[(SemanticId, BindingNodeId)],
+        exclusions: &mut ReverseCandidateGapExclusionPlan,
+        cancellation: &CancellationToken,
+        mut member_owners: Option<&mut ClassificationMemberOwnerReader<'_>>,
+    ) -> StoreResult<ReverseCandidateBatch> {
         let InitializedReverseCandidateBatch {
             mut targets,
             mut frontier,
@@ -11742,18 +11987,23 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
             }
 
             let current = std::mem::take(&mut frontier);
-            self.classify_reverse_frontiers(ReverseFrontierContext {
-                definitions,
-                current: &current,
-                endpoint_classifications: &mut endpoint_classifications,
-                frontiers: &mut frontiers,
-                frontier_ids_by_key: &mut frontier_ids_by_key,
-                lexical_frontiers: &mut lexical_frontiers,
-                lexical_frontier_ids_by_key: &mut lexical_frontier_ids_by_key,
-                cancellation,
-                observations: &mut frontier_observations,
-                cancelled: &mut cancelled,
-            })?;
+            self.classify_reverse_frontiers(
+                ReverseFrontierContext {
+                    definitions,
+                    current: &current,
+                    endpoint_classifications: &mut endpoint_classifications,
+                    frontiers: &mut frontiers,
+                    frontier_ids_by_key: &mut frontier_ids_by_key,
+                    lexical_frontiers: &mut lexical_frontiers,
+                    lexical_frontier_ids_by_key: &mut lexical_frontier_ids_by_key,
+                    cancellation,
+                    observations: &mut frontier_observations,
+                    cancelled: &mut cancelled,
+                },
+                member_owners
+                    .as_mut()
+                    .map(|reader| &mut **reader as &mut ClassificationMemberOwnerReader<'_>),
+            )?;
             if cancelled {
                 break;
             }
@@ -12267,7 +12517,8 @@ fn select_seed_answers(
     cancellation: &CancellationToken,
     force_cancelled: bool,
     completion_work: &mut usize,
-    mut access_lookup: Option<&mut SelectionAccessLookup<'_>>,
+    mut read_provider: Option<&mut dyn BatchOperationReadProvider>,
+    allowed_targets: Option<&HashSet<SemanticId>>,
 ) -> StoreResult<ReferenceBatchAnswer> {
     let mut answers = Vec::with_capacity(seeds.len());
     let mut batch_completion = BatchCompletionLedger::default();
@@ -12282,7 +12533,32 @@ fn select_seed_answers(
             completion_work,
         );
         let reference = seed.reference;
-        let answer = if let Some(access_lookup) = access_lookup.as_deref_mut() {
+        let access = read_provider
+            .as_mut()
+            .and_then(|provider| provider.selection_access());
+        let answer = if let Some(allowed) = allowed_targets {
+            assert!(
+                access.is_none(),
+                "receiver overlay access is refined after selection"
+            );
+            select_paths_with_lazy_candidate_filter(
+                reference,
+                seed.completed,
+                seed.terminals,
+                completion,
+                observed_completion,
+                cancellation,
+                &mut |_, targets| {
+                    Ok(Some(
+                        targets
+                            .iter()
+                            .copied()
+                            .filter(|target| !allowed.contains(target))
+                            .collect(),
+                    ))
+                },
+            )?
+        } else if let Some(access) = access {
             select_paths_with_lazy_access(
                 reference,
                 seed.completed,
@@ -12290,7 +12566,7 @@ fn select_seed_answers(
                 completion,
                 observed_completion,
                 cancellation,
-                access_lookup,
+                &mut |reference, definitions| access.lookup(reference, definitions),
             )?
         } else {
             select_paths_with_cancellation_evidence(

@@ -1,6 +1,6 @@
 INSERT INTO cr_gaps
 SELECT 'unknown_activation', candidate.module_path || '::' || candidate.identifier,
-       json_object('member_blob', candidate.blob_id,
+       json_object('subject_level', 'binding', 'member_blob', candidate.blob_id,
                    'declaration_id', candidate.declaration_id,
                    'cfg_condition', candidate.cfg_condition)
 FROM cr_source_declarations AS candidate
@@ -12,7 +12,9 @@ UNION ALL
 SELECT 'unknown_activation', imports.module_path ||
        CASE WHEN imports.is_glob=1 OR imports.is_macro_use=1 THEN ''
             ELSE '::' || imports.bound_name END,
-       json_object('member_blob', imports.blob_id,
+       json_object('subject_level', CASE WHEN imports.is_glob=1 OR imports.is_macro_use=1
+                                       THEN 'module' ELSE 'binding' END,
+                   'member_blob', imports.blob_id,
                    'import_ordinal', imports.import_ordinal,
                    'cfg_condition', imports.cfg_condition)
 FROM cr_member_imports AS imports

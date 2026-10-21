@@ -568,7 +568,8 @@ pub(in crate::analyzer::store) fn typed_fragment_digest(
 
 /// Insert the borrowed fragment inside SP's transaction. The caller must roll
 /// back on false or error and must validate new-row authority before publication.
-pub(in crate::analyzer::store) fn insert_typed_fragment(
+#[doc(hidden)]
+pub fn insert_typed_fragment(
     connection: &Connection,
     producer_id: i64,
     host: SelectedResolutionMountOrdinal,
@@ -698,7 +699,8 @@ pub(super) fn visit_stage_rows<T>(
     page_stage_answer(&answer, cancellation, visitor, evidence)
 }
 
-pub(super) fn semantic_request_json(request: TypedFactRequest<'_, SemanticId>) -> String {
+#[doc(hidden)]
+pub fn semantic_request_json(request: TypedFactRequest<'_, SemanticId>) -> String {
     serde_json::to_string(
         &request
             .as_slice()
@@ -728,7 +730,9 @@ fn decode_frontier(row: &Row<'_>) -> Result<LoweredTypedFrontier> {
         None => frontier,
     })
 }
-fn decode_transfer(row: &Row<'_>) -> Result<LoweredTypeTransfer> {
+
+#[doc(hidden)]
+pub fn decode_transfer(row: &Row<'_>) -> Result<LoweredTypeTransfer> {
     let completion: Option<String> = row.get("completion_json")?;
     Ok(typed_rows::decode_type_transfer_fields(
         row_semantic(row, "source_slot")?,
@@ -741,7 +745,8 @@ fn decode_transfer(row: &Row<'_>) -> Result<LoweredTypeTransfer> {
         codec::decode_completion(completion.as_deref()),
     ))
 }
-fn decode_type_production(row: &Row<'_>) -> Result<LoweredTypeProduction> {
+#[doc(hidden)]
+pub fn decode_type_production(row: &Row<'_>) -> Result<LoweredTypeProduction> {
     Ok(LoweredTypeProduction {
         output: row_semantic(row, "output_slot")?,
         element: row_semantic(row, "element_slot")?,
@@ -852,7 +857,9 @@ fn decode_projection(row: &Row<'_>) -> Result<LoweredBindingProjection> {
         row.get("kind")?,
     ))
 }
-fn decode_declaration_type(row: &Row<'_>) -> Result<LoweredDeclarationTypeProperty> {
+
+#[doc(hidden)]
+pub fn decode_declaration_type(row: &Row<'_>) -> Result<LoweredDeclarationTypeProperty> {
     Ok(typed_rows::decode_declaration_type_fields(
         row_semantic(row, "definition")?,
         row_semantic(row, "slot")?,
@@ -965,7 +972,8 @@ pub(in crate::analyzer::store) fn visit_typed_frontier_pages(
     )
 }
 
-pub(in crate::analyzer::store) const VISIT_TYPE_TRANSFER_PAGES_FROM_SOURCES_SQL: &str = "SELECT fact.*,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_transfers fact ON fact.source_slot_key IS request.value->>0 AND fact.source_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+#[doc(hidden)]
+pub const VISIT_TYPE_TRANSFER_PAGES_FROM_SOURCES_SQL: &str = "SELECT fact.*,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_transfers fact ON fact.source_slot_key IS request.value->>0 AND fact.source_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
 pub(in crate::analyzer::store) fn visit_type_transfer_pages_from_sources(
     selection: &SelectedResolutionMountInventory<'_>,
@@ -1016,7 +1024,8 @@ fn visit_type_transfer_pages(
     )
 }
 
-pub(in crate::analyzer::store) const VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL: &str = "SELECT fact.*,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_transfers fact ON fact.target_slot_key IS request.value->>0 AND fact.target_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+#[doc(hidden)]
+pub const VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL: &str = "SELECT fact.*,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_transfers fact ON fact.target_slot_key IS request.value->>0 AND fact.target_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
 pub(in crate::analyzer::store) const VISIT_TYPE_PRODUCTION_PAGES_FOR_OUTPUTS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_productions fact ON fact.output_slot_key IS request.value->>0 AND fact.output_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
@@ -1684,9 +1693,10 @@ pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_gap_reasons
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "typed_tests.rs"]
-mod tests;
+#[doc(hidden)]
+pub mod tests;
 
 fn read_stage_rows<T>(
     selection: &SelectedResolutionMountInventory<'_>,
@@ -2140,3 +2150,8 @@ pub(in crate::analyzer::store) fn visit_gap_reason_provenance_pages_for_reasons(
         .collect::<Vec<_>>();
     page_stage_answer(&answer, cancellation, visitor, evidence)
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "typed_tests_go_support.rs"]
+pub mod typed_tests_go_support;

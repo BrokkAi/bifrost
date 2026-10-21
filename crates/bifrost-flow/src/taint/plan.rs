@@ -795,8 +795,16 @@ impl TaintAnalysisPlan {
                 .then_with(|| left.channel.cmp(&right.channel))
         });
         store_reads.sort_by(|left, right| {
-            left.source
-                .cmp(&right.source)
+            self.value_flow
+                .source(left.source)
+                .map(ValueFlowSourceSpec::key)
+                .cmp(
+                    &self
+                        .value_flow
+                        .source(right.source)
+                        .map(ValueFlowSourceSpec::key),
+                )
+                .then_with(|| left.source.cmp(&right.source))
                 .then_with(|| left.channel.cmp(&right.channel))
         });
         if store_writes

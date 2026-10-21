@@ -27,7 +27,8 @@ type StructuredMemberLookupKey = (Language, FqName, String);
 const LIMITED_LOOKUP_CACHE_MAX_ENTRIES: usize = 512;
 const LIMITED_LOOKUP_CACHE_MAX_ROWS: usize = 32;
 
-pub(crate) trait ForwardQueryProvider {
+#[doc(hidden)]
+pub trait ForwardQueryProvider {
     fn normalize_rendered_name(&self, fqn: &str) -> String;
     /// The structured name a rendered spelling addresses, when the language's
     /// own rendering rules disagree with the shared client-path splitter.
@@ -57,8 +58,6 @@ pub(crate) trait ForwardQueryProvider {
     /// Navigation candidates for a rendered name. Language adapters may admit
     /// source-spelling aliases beyond exact persisted identity.
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn forward_file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;
-    fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit>;
     fn forward_relational_name(&self, unit: &CodeUnit) -> RelationalName;
     fn forward_definition_candidate_identifiers(&self, rendered: &str) -> Vec<String>;
     fn forward_definition_sources_may_exist(&self) -> bool;
@@ -66,35 +65,22 @@ pub(crate) trait ForwardQueryProvider {
     fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool;
 }
 
+#[doc(hidden)]
+#[macro_export]
 macro_rules! impl_forward_query_provider {
     ($analyzer:ty) => {
-        impl crate::analyzer::ForwardQueryProvider for $analyzer {
+        impl $crate::analyzer::analyzer_definition_lookup::ForwardQueryProvider for $analyzer {
             fn normalize_rendered_name(&self, fqn: &str) -> String {
                 self.inner.normalize_rendered_name(fqn)
             }
 
-            fn forward_definition_fqn(&self, fqn: &str) -> Vec<crate::analyzer::CodeUnit> {
+            fn forward_definition_fqn(&self, fqn: &str) -> Vec<$crate::analyzer::CodeUnit> {
                 self.inner.forward_definition_fqn(fqn)
-            }
-
-            fn forward_file_identifier(
-                &self,
-                file: &crate::analyzer::ProjectFile,
-                identifier: &str,
-            ) -> Vec<crate::analyzer::CodeUnit> {
-                self.inner.forward_file_identifier(file, identifier)
-            }
-
-            fn forward_direct_children(
-                &self,
-                owner: &crate::analyzer::CodeUnit,
-            ) -> Vec<crate::analyzer::CodeUnit> {
-                self.inner.forward_direct_children(owner)
             }
 
             fn forward_relational_name(
                 &self,
-                unit: &crate::analyzer::CodeUnit,
+                unit: &$crate::analyzer::CodeUnit,
             ) -> brokk_bifrost_core::analyzer::RelationalName {
                 self.inner.relational_name_for_unit(unit)
             }
@@ -118,7 +104,8 @@ macro_rules! impl_forward_query_provider {
     };
 }
 
-pub(crate) use impl_forward_query_provider;
+#[doc(hidden)]
+pub use crate::impl_forward_query_provider;
 
 /// The memoized definition answers one request's lookups share.
 ///
@@ -138,7 +125,8 @@ pub(crate) use impl_forward_query_provider;
 /// than grow a second special case.
 #[derive(Debug, Default)]
 pub struct DefinitionLookupMemo {
-    fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
+    #[doc(hidden)]
+    pub fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     normalized_fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     identifier_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
     limited_fqn_cache: Mutex<HashMap<(Language, bool, String), Vec<CodeUnit>>>,
@@ -152,7 +140,8 @@ pub struct DefinitionLookupMemo {
 }
 
 impl DefinitionLookupMemo {
-    pub(crate) fn limited_fqn(
+    #[doc(hidden)]
+    pub fn limited_fqn(
         &self,
         language: Language,
         normalized: bool,
@@ -165,7 +154,8 @@ impl DefinitionLookupMemo {
             .cloned()
     }
 
-    pub(crate) fn remember_limited_fqn(
+    #[doc(hidden)]
+    pub fn remember_limited_fqn(
         &self,
         language: Language,
         normalized: bool,
@@ -185,7 +175,8 @@ impl DefinitionLookupMemo {
         }
     }
 
-    pub(crate) fn limited_identifier(
+    #[doc(hidden)]
+    pub fn limited_identifier(
         &self,
         language: Language,
         identifier: &str,
@@ -197,7 +188,8 @@ impl DefinitionLookupMemo {
             .cloned()
     }
 
-    pub(crate) fn remember_limited_identifier(
+    #[doc(hidden)]
+    pub fn remember_limited_identifier(
         &self,
         language: Language,
         identifier: &str,
@@ -231,7 +223,8 @@ pub struct AnalyzerDefinitionLookup<'a> {
     /// reports, and both kinds of analyzer can hand out the same memo.
     workspace_languages: OnceLock<Vec<Language>>,
     nonempty_workspace_languages: OnceLock<Vec<Language>>,
-    memo: Arc<DefinitionLookupMemo>,
+    #[doc(hidden)]
+    pub memo: Arc<DefinitionLookupMemo>,
     /// When set, every relational read is a frontier question instead of a
     /// synchronous store batch; see [`Self::on_frontier`].
     frontier: Option<Arc<dyn RelationalDefinitionFrontier>>,
@@ -278,7 +271,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         }
     }
 
-    pub(crate) fn set_language(&self, language: Language) {
+    #[doc(hidden)]
+    pub fn set_language(&self, language: Language) {
         *self
             .language
             .lock()
@@ -362,7 +356,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         })
     }
 
-    fn query_values(
+    #[doc(hidden)]
+    pub fn query_values(
         &self,
         language: Language,
         questions: Vec<(RelationalName, RelationalDefinitionQuery)>,
@@ -797,7 +792,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     /// what the point path would compute. A cancelled or failed batch
     /// memoizes nothing: every name stays unmemoized and the point path
     /// retries it with unchanged results.
-    pub(crate) fn prefetch_fqns(&self, fqns: &[String]) {
+    #[doc(hidden)]
+    pub fn prefetch_fqns(&self, fqns: &[String]) {
         for language in self.query_languages() {
             let missing: Vec<String> = {
                 let cache = self
@@ -910,7 +906,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     /// distinct names in a loop should prefetch them here first so each
     /// `fqn_for_language` / `fqn_in_language` call afterward is a cache hit
     /// instead of its own round trip.
-    pub(crate) fn prefetch_fqn_in_language(&self, language: Language, fqns: &[String]) {
+    #[doc(hidden)]
+    pub fn prefetch_fqn_in_language(&self, language: Language, fqns: &[String]) {
         let mut pending_fqns = Vec::new();
         {
             let cache = self
@@ -1412,9 +1409,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
 #[cfg(test)]
 mod definition_lookup_tests {
     use super::*;
-    use crate::analyzer::{RubyAnalyzer, TestProject};
     use brokk_bifrost_test_macros::hardwon;
-    use std::path::PathBuf;
 
     /// One lookup's interner calls on this thread, with the answer it produced.
     ///
@@ -1529,406 +1524,6 @@ mod definition_lookup_tests {
                 .identifier("Member")
                 .iter()
                 .any(|unit| unit.fq_name() == "app.Facade$.Nested$.Member")
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "#3140: empty language delegates multiplied definition lookups and masked later source updates"
-    )]
-    fn workspace_lookup_skips_empty_delegates_and_observes_their_first_source() {
-        use crate::analyzer::{AnalyzerDelegate, CppAnalyzer, MultiAnalyzer, ScalaAnalyzer};
-        use std::collections::{BTreeMap, BTreeSet};
-
-        let fixture = crate::inline_project::InlineTestProject::new()
-            .file("widget.cpp", "class Widget {};\n")
-            .build();
-        let analyzer = MultiAnalyzer::new(BTreeMap::from([
-            (
-                Language::Cpp,
-                AnalyzerDelegate::Cpp(CppAnalyzer::from_project(fixture.project().clone())),
-            ),
-            (
-                Language::Scala,
-                AnalyzerDelegate::Scala(ScalaAnalyzer::from_project(fixture.project().clone())),
-            ),
-        ]));
-        let scala_batches = |analyzer: &MultiAnalyzer| {
-            analyzer.delegates()[&Language::Scala]
-                .analyzer()
-                .test_hooks()
-                .relational_definition_batch_call_count_for_test()
-        };
-        let before = scala_batches(&analyzer);
-        {
-            let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::None);
-            assert_eq!(lookup.fqn("Widget").len(), 1);
-            assert!(lookup.fqn("Absent").is_empty());
-            assert_eq!(lookup.identifier("Widget").len(), 1);
-            assert_eq!(lookup.by_normalized_fqn("Widget").len(), 1);
-            assert!(!lookup.package_exists_in_any_language("absent"));
-            lookup.prefetch_fqns(&["AlsoAbsent".to_string()]);
-            assert!(lookup.fqn("AlsoAbsent").is_empty());
-        }
-        assert_eq!(
-            scala_batches(&analyzer) - before,
-            0,
-            "empty Scala must do no relational work for C++ workspace lookups"
-        );
-        // Reusing a lookup under a newly attached ledger must restore negative
-        // reads for empty languages, even after its pruned list was cached.
-        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::None);
-        assert!(lookup.identifier("Missing").is_empty());
-        {
-            let ledger = Arc::new(crate::analyzer::ReadLedger::new());
-            let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
-                &analyzer,
-                Arc::clone(&ledger),
-            );
-            assert!(lookup.identifier("LedgerMissing").is_empty());
-            assert!(scala_batches(&analyzer) > before);
-            assert!(!ledger.keys().is_empty());
-        }
-        drop(lookup);
-
-        // A scoped resolver must still see an exact target in another language.
-        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Scala);
-        assert_eq!(lookup.fqn_in_any_language("Widget").len(), 1);
-        assert!(lookup.fqn("Widget").is_empty());
-        drop(lookup);
-
-        let file = ProjectFile::new(fixture.root().to_path_buf(), "Added.scala");
-        file.write("package added\nclass Added\n").unwrap();
-        let updated = analyzer.update(&BTreeSet::from([file]));
-        let lookup = AnalyzerDefinitionLookup::new(&updated, Language::Cpp);
-        assert_eq!(lookup.fqn_in_any_language("added.Added").len(), 1);
-        assert!(lookup.package_exists_in_any_language("added"));
-        assert!(lookup.fqn("added.Added").is_empty());
-    }
-
-    #[test]
-    #[hardwon("#3078: an incomplete C++ lookup was cached as an authoritative empty result")]
-    fn cancelled_relational_lookup_does_not_memoize_an_empty_answer() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
-            .file("widget.rb", "class Widget\nend\n")
-            .build();
-        let analyzer = RubyAnalyzer::from_project(fixture.project().clone());
-        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Ruby);
-        let cancellation = crate::CancellationToken::new();
-        cancellation.cancel();
-        {
-            let _scope =
-                crate::analyzer::AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
-            assert!(lookup.fqn("Widget").is_empty());
-            assert!(
-                lookup
-                    .file_identifier(&fixture.file("widget.rb"), "Widget")
-                    .is_empty()
-            );
-        }
-
-        let recovered = lookup.fqn("Widget");
-        assert!(
-            recovered.iter().any(|unit| unit.fq_name() == "Widget"),
-            "{recovered:?}"
-        );
-        assert_eq!(
-            lookup.file_identifier(&fixture.file("widget.rb"), "Widget"),
-            recovered,
-            "a cancelled file-identifier read must be retried too"
-        );
-        assert!(lookup.memo.fqn_cache.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    #[hardwon("#3078: a failed C++ definition batch could poison later lookup answers")]
-    fn failed_relational_lookup_does_not_publish_later_memo_entries() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
-            .file("widget.rb", "class Widget\nend\n")
-            .build();
-        let analyzer = RubyAnalyzer::from_project(fixture.project().clone());
-        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Ruby);
-        // The store rejects an exact-name question with no name. This takes
-        // the real Failed batch path without relying on an I/O race.
-        assert!(
-            lookup
-                .query_values(
-                    Language::Ruby,
-                    vec![(
-                        RelationalName::stable(FqName::new()),
-                        RelationalDefinitionQuery::ExactName
-                    )]
-                )
-                .is_empty()
-        );
-        let recovered = lookup.fqn("Widget");
-        assert!(
-            recovered.iter().any(|unit| unit.fq_name() == "Widget"),
-            "{recovered:?}"
-        );
-        assert!(
-            lookup.memo.fqn_cache.lock().unwrap().is_empty(),
-            "a lookup that observed a failed batch must not publish memo entries"
-        );
-    }
-
-    /// Four Ruby files declaring one bare top-level method: two inside the
-    /// file set a test passes, one outside it, and one file that declares an
-    /// unrelated name only.
-    struct BareIdentifierProject {
-        _temp: tempfile::TempDir,
-        root: PathBuf,
-        analyzer: RubyAnalyzer,
-    }
-
-    impl BareIdentifierProject {
-        fn new() -> Self {
-            let temp = tempfile::tempdir().expect("create temp dir");
-            let root = temp.path().canonicalize().expect("canonicalize temp dir");
-            for (rel, contents) in [
-                ("lib/alpha.rb", "def shared_helper\n  1\nend\n"),
-                ("lib/beta.rb", "def shared_helper\n  2\nend\n"),
-                ("lib/gamma.rb", "def other_helper\n  3\nend\n"),
-                ("lib/delta.rb", "def shared_helper\n  4\nend\n"),
-            ] {
-                ProjectFile::new(root.clone(), rel)
-                    .write(contents)
-                    .unwrap_or_else(|err| panic!("write {rel}: {err}"));
-            }
-            let analyzer =
-                RubyAnalyzer::from_project(TestProject::new(root.clone(), Language::Ruby));
-            Self {
-                _temp: temp,
-                root,
-                analyzer,
-            }
-        }
-
-        fn file(&self, rel: &str) -> ProjectFile {
-            ProjectFile::new(self.root.clone(), rel)
-        }
-
-        fn lookup(&self) -> AnalyzerDefinitionLookup<'_> {
-            AnalyzerDefinitionLookup::new(&self.analyzer, Language::None)
-        }
-
-        /// What the `BoundedDefinitionLookup::file_identifier_in_files` trait
-        /// default computes: one file-scoped store read per file, published in
-        /// the canonical order.
-        fn per_file_union(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
-            let lookup = self.lookup();
-            let mut units = files
-                .iter()
-                .flat_map(|file| lookup.file_identifier(file, ident))
-                .collect::<Vec<_>>();
-            sort_units(&mut units);
-            units.dedup();
-            units
-        }
-
-        fn sources(units: &[CodeUnit]) -> Vec<String> {
-            units
-                .iter()
-                .map(|unit| crate::path_utils::rel_path_string(unit.source()))
-                .collect()
-        }
-    }
-
-    #[test]
-    #[hardwon("#2883: optimized bare-name lookup must preserve file-set membership and ordering")]
-    fn file_set_identifier_lookup_matches_the_per_file_union() {
-        let project = BareIdentifierProject::new();
-        let all_three = [
-            project.file("lib/alpha.rb"),
-            project.file("lib/beta.rb"),
-            project.file("lib/gamma.rb"),
-        ];
-
-        let overridden = project
-            .lookup()
-            .file_identifier_in_files(&all_three, "shared_helper");
-        assert_eq!(
-            overridden,
-            project.per_file_union(&all_three, "shared_helper"),
-            "the workspace-wide filter must publish exactly the trait default's set and order"
-        );
-        assert_eq!(
-            BareIdentifierProject::sources(&overridden),
-            vec!["lib/alpha.rb".to_string(), "lib/beta.rb".to_string()],
-            "lib/delta.rb declares the same identifier but is outside the file set"
-        );
-
-        let subset = [project.file("lib/alpha.rb"), project.file("lib/gamma.rb")];
-        let overridden_subset = project
-            .lookup()
-            .file_identifier_in_files(&subset, "shared_helper");
-        assert_eq!(
-            overridden_subset,
-            project.per_file_union(&subset, "shared_helper"),
-            "a subset must agree with the trait default over that same subset"
-        );
-        assert_eq!(
-            BareIdentifierProject::sources(&overridden_subset),
-            vec!["lib/alpha.rb".to_string()],
-            "dropping lib/beta.rb from the set must drop its declaration"
-        );
-    }
-
-    /// Cost pin for #2883: every lookup built under one request scope answers
-    /// from one memo, so the second lookup to ask for a name it already holds
-    /// costs no store read. Candidate discovery builds one lookup per candidate
-    /// file, which is why this is what the scan actually pays.
-    #[test]
-    #[hardwon(
-        "#2883: each candidate lookup repeated the same relational answer within one request"
-    )]
-    fn lookups_under_one_query_scope_share_one_definition_memo() {
-        let project = BareIdentifierProject::new();
-        let checkouts = || {
-            project
-                .analyzer
-                .relational_batch_reader_checkouts_for_test()
-        };
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&project.analyzer);
-
-        let before = checkouts();
-        let first = project.lookup().identifier("shared_helper");
-        let first_cost = checkouts() - before;
-        let second = project.lookup().identifier("shared_helper");
-        let second_cost = checkouts() - before - first_cost;
-
-        assert!(
-            first_cost > 0,
-            "the first lookup must actually ask the store"
-        );
-        assert_eq!(
-            second_cost, 0,
-            "a second lookup under the same scope must answer from the shared memo"
-        );
-        assert_eq!(
-            first, second,
-            "the shared memo must publish the answer the store read produced"
-        );
-    }
-
-    /// The counterpart: with no request scope open there is no shared memo, so
-    /// each lookup owns its own and pays its own store read. Ownership of the
-    /// memo is what changes, not what a lookup answers.
-    #[test]
-    #[hardwon("#2883: shared request memoization must not outlive the request scope")]
-    fn lookups_outside_a_query_scope_keep_their_own_definition_memo() {
-        let project = BareIdentifierProject::new();
-        let checkouts = || {
-            project
-                .analyzer
-                .relational_batch_reader_checkouts_for_test()
-        };
-
-        let before = checkouts();
-        let first = project.lookup().identifier("shared_helper");
-        let first_cost = checkouts() - before;
-        let second = project.lookup().identifier("shared_helper");
-        let second_cost = checkouts() - before - first_cost;
-
-        assert_eq!(
-            (first_cost, second_cost),
-            (1, 1),
-            "without a scope each lookup asks the store for itself"
-        );
-        assert_eq!(first, second);
-    }
-
-    /// Parity and cost pin for the batched name prefetch: after
-    /// `prefetch_fqns`, a point `fqn` ask costs no store read and answers
-    /// exactly what the unprefetched point path computed -- including the
-    /// name that resolves to nothing.
-    #[test]
-    #[hardwon("#2743: prefetched Ruby name answers still incurred one store read per visible file")]
-    fn prefetched_fqns_answer_from_the_shared_memo_without_store_reads() {
-        let project = BareIdentifierProject::new();
-        let names = vec!["shared_helper".to_string(), "no_such_name".to_string()];
-        let unprefetched: Vec<_> = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&project.analyzer);
-            names
-                .iter()
-                .map(|name| project.lookup().fqn(name))
-                .collect()
-        };
-
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&project.analyzer);
-        let checkouts = || {
-            project
-                .analyzer
-                .relational_batch_reader_checkouts_for_test()
-        };
-        project.lookup().prefetch_fqns(&names);
-        let before = checkouts();
-        let prefetched: Vec<_> = names
-            .iter()
-            .map(|name| project.lookup().fqn(name))
-            .collect();
-        assert_eq!(
-            checkouts() - before,
-            0,
-            "a prefetched name must answer from the shared memo"
-        );
-        assert_eq!(
-            prefetched, unprefetched,
-            "a memoized answer must equal the point path's"
-        );
-    }
-
-    /// Cost pin for #2743: what one bare identifier costs in store reads must
-    /// not grow with the size of the file set.
-    ///
-    /// The counter is the relational batch reader checkout, one per store
-    /// round trip. `EXPLAIN QUERY PLAN` is this repository's preferred pin for
-    /// the shape of one query; it cannot express how many queries a caller
-    /// issues, which is the whole defect here.
-    #[test]
-    #[hardwon("#2743: a bare Ruby method lookup paid one relational read for every visible file")]
-    fn file_set_identifier_lookup_cost_is_independent_of_the_file_count() {
-        let project = BareIdentifierProject::new();
-        let all_four = [
-            project.file("lib/alpha.rb"),
-            project.file("lib/beta.rb"),
-            project.file("lib/gamma.rb"),
-            project.file("lib/delta.rb"),
-        ];
-
-        let measure = |files: &[ProjectFile]| {
-            let before = project
-                .analyzer
-                .relational_batch_reader_checkouts_for_test();
-            project
-                .lookup()
-                .file_identifier_in_files(files, "shared_helper");
-            project
-                .analyzer
-                .relational_batch_reader_checkouts_for_test()
-                - before
-        };
-
-        let two_files = measure(&all_four[..2]);
-        let four_files = measure(&all_four);
-        assert_eq!(
-            (two_files, four_files),
-            (1, 1),
-            "the override asks the store once for this single-language file set, whatever its size"
-        );
-
-        let before = project
-            .analyzer
-            .relational_batch_reader_checkouts_for_test();
-        project.per_file_union(&all_four, "shared_helper");
-        let trait_default = project
-            .analyzer
-            .relational_batch_reader_checkouts_for_test()
-            - before;
-        assert_eq!(
-            trait_default,
-            four_files * all_four.len(),
-            "the trait default pays one store read per file, which is what the override removes"
         );
     }
 }

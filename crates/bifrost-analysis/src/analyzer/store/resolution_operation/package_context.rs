@@ -6,7 +6,8 @@ use crate::analyzer::resolution::{
 };
 use brokk_bifrost_core::analyzer::resolution_facts::{ResolutionNamespace, ResolutionSiteId};
 
-pub(crate) enum SelectedPackageRows<T> {
+#[doc(hidden)]
+pub enum SelectedPackageRows<T> {
     Ready(T),
     Cancelled,
 }
@@ -507,7 +508,8 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(SelectedPackageRows::Ready(result.into_values().collect()))
     }
 
-    pub(crate) fn selected_package_members_for_lookup(
+    #[doc(hidden)]
+    pub fn selected_package_members_for_lookup(
         &self,
         mount: SelectedResolutionMountOrdinal,
         lookup: SemanticId,
@@ -584,7 +586,8 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Read one mount's package members in two bounded passes, applying staged
     /// overlay authority by definition and namespace before grouping by lookup.
-    pub(crate) fn selected_package_members_by_lookup(
+    #[doc(hidden)]
+    pub fn selected_package_members_by_lookup(
         &self,
         mount: SelectedResolutionMountOrdinal,
         cancellation: &CancellationToken,

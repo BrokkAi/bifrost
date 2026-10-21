@@ -8,7 +8,8 @@ use crate::projection::{TaintOriginProjection, TaintPairProjection, TaintProject
 use crate::registry::PolicyRegistry;
 use crate::{CvssMetricValueToken, EvidenceRef};
 use brokk_bifrost_analysis::analyzer::Language;
-use brokk_bifrost_analysis::analyzer::{CppAnalyzer, ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_analysis::analyzer::{ProjectFile, TestProject};
+use brokk_bifrost_js_ts_analysis::TypescriptAnalyzer;
 use brokk_bifrost_rql::CodeQueryResultDetail;
 use brokk_bifrost_rql::structural::search::DetailedCodeQueryEvidence;
 use brokk_bifrost_rql::structural::search::{
@@ -2496,3 +2497,5 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
         }
     }
 }
+
+use brokk_bifrost_cpp_analysis::analyzer::CppAnalyzer;

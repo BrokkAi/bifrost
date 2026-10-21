@@ -45,7 +45,8 @@ pub(crate) const TYPE_IDENTITY_OBSERVATION_SITES_3_SQL: &str = "SELECT target_sl
 
 pub(crate) const CONTRACT_REFERENCE_SITES_SQL: &str = "SELECT reference_site FROM resolution_contract_references WHERE blob_id=?1 AND definition=?2 AND member_kind=?3 ORDER BY position";
 
-pub(crate) const QUALIFIED_ROUTE_REFERENCE_SITES_SQL: &str = "SELECT s.site FROM resolution_qualified_routes q JOIN resolution_sites s ON s.blob_id=q.blob_id AND s.site=q.reference AND s.role=0 WHERE q.blob_id=?1 AND q.source_lookup=?2 ORDER BY q.reference,q.precedence_ordinal";
+#[doc(hidden)]
+pub const QUALIFIED_ROUTE_REFERENCE_SITES_SQL: &str = "SELECT s.site FROM resolution_qualified_routes q JOIN resolution_sites s ON s.blob_id=q.blob_id AND s.site=q.reference AND s.role=0 WHERE q.blob_id=?1 AND q.source_lookup=?2 ORDER BY q.reference,q.precedence_ordinal";
 
 pub(crate) const READ_AUTHORITY_SQL: &str = "SELECT 1 FROM resolution_fragment_interiors WHERE blob_id=?1 AND lang=?2 AND semantic_language=?3 AND producer_epoch=?4 AND interior_digest=?5 AND publication_state='complete'";
 
@@ -61,13 +62,15 @@ pub(crate) const ENUMERATION_COMPLETION_SQL: &str = "SELECT g.reason FROM resolu
 pub(crate) const VISIT_MOUNT_REFERENCE_SEEDS_SQL: &str =
     "SELECT site FROM resolution_sites WHERE blob_id=?1 AND role=0 ORDER BY site";
 
-pub(crate) const ROOT_DEMAND_SHARED_SQL: &str = "SELECT s.site, (json_array_length(p.body,'$[4]')>3 AND NOT EXISTS(SELECT 1 FROM resolution_identities i WHERE i.id=-coalesce(json_extract(p.body,'$[4][1][0]'),json_extract(p.body,'$[4][1]')) AND i.namespace IS NOT NULL)) FROM resolution_paths p INDEXED BY resolution_paths_root_terminal JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 WHERE p.blob_id=?1 AND p.end_node=-1 AND json_array_length(p.body,'$[4]')>=3 AND p.root_terminal=?2 ORDER BY p.path";
+#[doc(hidden)]
+pub const ROOT_DEMAND_SHARED_SQL: &str = "SELECT s.site, (json_array_length(p.body,'$[4]')>3 AND NOT EXISTS(SELECT 1 FROM resolution_identities i WHERE i.id=-coalesce(json_extract(p.body,'$[4][1][0]'),json_extract(p.body,'$[4][1]')) AND i.namespace IS NOT NULL)) FROM resolution_paths p INDEXED BY resolution_paths_root_terminal JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 WHERE p.blob_id=?1 AND p.end_node=-1 AND json_array_length(p.body,'$[4]')>=3 AND p.root_terminal=?2 ORDER BY p.path";
 
 pub(crate) const IMPORTED_ROOT_DEMAND_SHARED_SQL: &str = "SELECT DISTINCT s.site FROM resolution_paths p INDEXED BY resolution_paths_root_terminal JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 JOIN resolution_identities head ON head.id=-coalesce(json_extract(p.body,'$[4][1][0]'),json_extract(p.body,'$[4][1]')) JOIN source_rust_import_targets imported ON imported.blob_id=p.blob_id AND imported.bound_name=head.spelling AND imported.is_glob=0 WHERE p.blob_id=?1 AND p.end_node=-1 AND json_array_length(p.body,'$[4]')>=3 AND p.root_terminal=?2 ORDER BY s.site";
 
 pub(crate) const ROOT_DEMAND_LOCAL_SQL: &str = "SELECT s.site, (json_array_length(p.body,'$[4]')>3 AND NOT EXISTS(SELECT 1 FROM resolution_identities i WHERE i.id=-coalesce(json_extract(p.body,'$[4][1][0]'),json_extract(p.body,'$[4][1]')) AND i.namespace IS NOT NULL)) FROM resolution_paths p INDEXED BY resolution_paths_root_local_terminal JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 WHERE p.blob_id=?1 AND p.end_node=-1 AND json_array_length(p.body,'$[4]')>=3 AND coalesce(json_extract(p.body,'$[4][#-1][0]'),json_extract(p.body,'$[4][#-1]'))=?2 ORDER BY p.path";
 
-pub(crate) const LOOKUP_REFERENCE_SHARED_SQL: &str = "SELECT s.site FROM resolution_paths p INDEXED BY resolution_paths_end_lookup_identity JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 WHERE p.blob_id=?1 AND p.end_lead_identity=?2 AND ?3 IS NULL ORDER BY p.path";
+#[doc(hidden)]
+pub const LOOKUP_REFERENCE_SHARED_SQL: &str = "SELECT s.site FROM resolution_paths p INDEXED BY resolution_paths_end_lookup_identity JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 WHERE p.blob_id=?1 AND p.end_lead_identity=?2 AND ?3 IS NULL ORDER BY p.path";
 
 pub(crate) const LOOKUP_REFERENCE_LOCAL_SQL: &str = "SELECT s.site FROM resolution_paths p INDEXED BY resolution_paths_end_lookup_local JOIN resolution_sites s ON s.blob_id=p.blob_id AND s.site=p.start_node AND s.role=0 WHERE p.blob_id=?1 AND p.end_lead_local=?2 AND ?3 IS NULL ORDER BY p.path";
 

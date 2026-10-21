@@ -18,39 +18,47 @@ pub mod call_conversion;
 pub mod call_relations;
 pub mod call_shape;
 pub mod callable_signature;
-pub(crate) mod candidates;
-pub(crate) mod common;
-pub mod cpp_graph;
-pub mod csharp_graph;
+#[doc(hidden)]
+pub mod candidates;
+#[doc(hidden)]
+pub mod common;
+
 pub mod effects;
-pub(crate) mod file_usage_graph;
-mod finder;
+#[doc(hidden)]
+pub mod file_usage_graph;
+#[doc(hidden)]
+pub mod finder;
 pub mod get_definition;
 pub mod get_type;
-pub(crate) mod go_graph;
-pub(crate) mod inverted_edges;
+
+#[doc(hidden)]
+pub mod inverted_edges;
 pub(crate) mod java_graph;
 pub(crate) mod java_usage_evidence_cache;
-pub(crate) mod js_ts_graph;
+
 pub(crate) mod kotlin_graph;
-#[cfg(test)]
-pub(crate) mod test_support;
-pub use cpp_graph::macro_lexical;
 pub mod member_completion;
 pub mod member_family;
 pub mod overload_selection;
 pub(crate) mod parsed_tree;
-pub(crate) mod php_graph;
+
 pub mod python_class_hierarchy;
-pub(crate) mod python_graph;
+
 pub mod receiver_query;
-pub(crate) mod receiver_sites;
-pub(crate) mod ruby_graph;
+#[doc(hidden)]
+pub mod receiver_sites;
+
 pub(crate) mod scala_graph;
 pub mod target_kind;
-mod traits;
-pub(crate) mod workspace_graph;
-pub(crate) mod workspace_graph_cache;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+#[doc(hidden)]
+pub mod traits;
+#[doc(hidden)]
+pub mod workspace_graph;
+#[doc(hidden)]
+pub mod workspace_graph_cache;
 
 // The language-blind half of this subsystem moved to `brokk-bifrost-core`: the
 // usage products (`model`), the graph outcome wrapper, the pure local-inference
@@ -59,10 +67,15 @@ pub(crate) mod workspace_graph_cache;
 // module keeps the visibility its `mod` declaration had here, except where every
 // item it holds was already crate-private, in which case the alias narrows to
 // `pub(crate)` rather than re-publishing core's promoted `pub` items.
-use brokk_bifrost_core::analyzer::usages::{local_inference, model};
-pub use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
+use brokk_bifrost_core::analyzer::usages::local_inference;
+use brokk_bifrost_core::analyzer::usages::model;
 
-pub(super) fn read_source(file: &crate::analyzer::ProjectFile) -> Result<String, String> {
+pub use brokk_bifrost_core::analyzer::usages::outcome;
+pub use brokk_bifrost_core::analyzer::usages::receiver_analysis;
+pub use brokk_bifrost_core::analyzer::usages::reference_site;
+
+#[doc(hidden)]
+pub fn read_source(file: &crate::analyzer::ProjectFile) -> Result<String, String> {
     file.read_to_string().map_err(|err| {
         format!(
             "failed to read `{}`: {err}",
@@ -82,7 +95,8 @@ pub(crate) fn range_for_span(
     )
 }
 
-pub(crate) const fn proof_rank(proof: crate::analyzer::usages::UsageProof) -> u8 {
+#[doc(hidden)]
+pub const fn proof_rank(proof: crate::analyzer::usages::UsageProof) -> u8 {
     match proof {
         crate::analyzer::usages::UsageProof::Proven => 0,
         crate::analyzer::usages::UsageProof::Unproven => 1,
@@ -118,59 +132,100 @@ pub(crate) fn test_unit(name: &str) -> crate::analyzer::CodeUnit {
 
 #[cfg(any(test, feature = "test-support"))]
 pub use call_relations::CallArgument;
-pub use call_relations::{
-    CallBindingCache, CallBindingStatus, CallRelationDiagnostic, CallRelationDiagnosticCode,
-    CallRelationLimits, CallRelationResult, CallSite, bind_call_site_arguments,
-};
-pub(crate) use call_relations::{
-    CallDispatchBoundaryKind, CallDispatchLookup, CallDispatchSession, CallDispatchTarget,
-    CallRelationWork, call_dispatch_equivalence_source,
-};
-pub use call_relations::{CallRelationService, is_call_relation_unit, nearest_call_relation_unit};
-pub use candidates::{
-    ExplicitCandidateProvider, FallbackCandidateProvider, ImportGraphCandidateProvider,
-    TextSearchCandidateProvider, default_provider,
-};
-pub use cpp_graph::CppUsageGraphStrategy;
-pub use csharp_graph::CSharpUsageGraphStrategy;
-pub use finder::{
-    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, ReferenceEngine, UsageFinder,
-    UsageQueryCompletion,
-};
-pub use go_graph::GoUsageGraphStrategy;
-pub use java_graph::JavaUsageGraphStrategy;
-pub use js_ts_graph::JsTsExportUsageGraphStrategy;
-pub use kotlin_graph::KotlinUsageGraphStrategy;
-pub use local_inference::{
-    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
-};
-pub use member_family::{
-    Admission, CSharpFamilyRules, ExternalMemberFamilyAnswer, ExternalMemberFamilyIncompleteReason,
-    ExternalMemberFamilyStatus, JavaFamilyRules, JvmExternalMemberIdentity, JvmReceiverSemantics,
-    MemberFacts, MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider, MemberFamilySupport,
-    NominalFamilyRules, ScalaFamilyRules, csharp_member_family, csharp_member_family_capability,
-    java_member_family, java_member_family_capability, member_family_id, member_family_support,
-    nominal_member_family, nominal_member_family_capability, scala_member_family,
-    scala_member_family_capability,
-};
-pub use model::{
-    CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
-    ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceGraphResult,
-    ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageAnalysisDiagnostic, UsageHit,
-    UsageHitKind, UsageHitSurface, UsageProof, UsageProofAuthority,
-};
-pub use php_graph::PhpUsageGraphStrategy;
-pub use python_graph::PythonExportUsageGraphStrategy;
-pub use ruby_graph::RubyUsageGraphStrategy;
-// Rust's strategy is the native one; there is no `rust_graph` module left to
-// re-export it from.
-pub use crate::analyzer::rust::RustNativeUsageStrategy;
-pub use scala_graph::ScalaUsageGraphStrategy;
-pub(crate) use traits::GraphUsageAnalyzer;
-pub(crate) use traits::PreparedUsageQuery;
-pub use traits::{CandidateFileProvider, UsageAnalyzer};
 
-use crate::analyzer::{CodeUnit, IAnalyzer};
+pub use call_relations::CallBindingCache;
+pub use call_relations::CallBindingStatus;
+pub use call_relations::CallRelationDiagnostic;
+pub use call_relations::CallRelationDiagnosticCode;
+pub use call_relations::CallRelationLimits;
+pub use call_relations::CallRelationResult;
+pub use call_relations::CallSite;
+pub use call_relations::bind_call_site_arguments;
+
+pub(crate) use call_relations::CallDispatchBoundaryKind;
+pub(crate) use call_relations::CallDispatchLookup;
+pub(crate) use call_relations::CallDispatchSession;
+pub(crate) use call_relations::CallDispatchTarget;
+pub(crate) use call_relations::call_dispatch_equivalence_source;
+
+pub use call_relations::CallRelationService;
+pub use call_relations::is_call_relation_unit;
+pub use call_relations::nearest_call_relation_unit;
+
+pub use candidates::ExplicitCandidateProvider;
+pub use candidates::FallbackCandidateProvider;
+pub use candidates::ImportGraphCandidateProvider;
+pub use candidates::TextSearchCandidateProvider;
+pub use candidates::default_provider;
+
+pub use finder::DEFAULT_MAX_FILES;
+pub use finder::DEFAULT_MAX_USAGES;
+pub use finder::QueryResult;
+pub use finder::ReferenceEngine;
+pub use finder::UsageFinder;
+pub use finder::UsageQueryCompletion;
+
+pub use kotlin_graph::KotlinUsageGraphStrategy;
+
+pub use local_inference::LocalBindingsSnapshot;
+pub use local_inference::LocalInferenceConfig;
+pub use local_inference::LocalInferenceEngine;
+pub use local_inference::SymbolResolution;
+
+pub use member_family::Admission;
+pub use member_family::CSharpFamilyRules;
+pub use member_family::ExternalMemberFamilyAnswer;
+pub use member_family::ExternalMemberFamilyIncompleteReason;
+pub use member_family::ExternalMemberFamilyStatus;
+pub use member_family::JavaFamilyRules;
+pub use member_family::JvmExternalMemberIdentity;
+pub use member_family::JvmReceiverSemantics;
+pub use member_family::MemberFacts;
+pub use member_family::MemberFamilyAnswer;
+pub use member_family::MemberFamilyEdge;
+pub use member_family::MemberFamilyProvider;
+pub use member_family::MemberFamilySupport;
+pub use member_family::NominalFamilyRules;
+pub use member_family::ScalaFamilyRules;
+pub use member_family::csharp_member_family;
+pub use member_family::csharp_member_family_capability;
+pub use member_family::java_member_family;
+pub use member_family::java_member_family_capability;
+pub use member_family::member_family_id;
+pub use member_family::member_family_support;
+pub use member_family::nominal_member_family;
+pub use member_family::nominal_member_family_capability;
+pub use member_family::scala_member_family;
+pub use member_family::scala_member_family_capability;
+
+pub use model::CONFIDENCE_THRESHOLD;
+pub use model::ExportEntry;
+pub use model::ExportIndex;
+pub use model::FuzzyResult;
+pub use model::ImportBinder;
+pub use model::ImportBinding;
+pub use model::ImportKind;
+pub use model::ReceiverTargetRef;
+pub use model::ReexportStar;
+pub use model::ReferenceCandidate;
+pub use model::ReferenceGraphResult;
+pub use model::ReferenceHit;
+pub use model::ReferenceKind;
+pub use model::ResolvedReceiverCandidate;
+pub use model::UsageAnalysisDiagnostic;
+pub use model::UsageHit;
+pub use model::UsageHitKind;
+pub use model::UsageHitSurface;
+pub use model::UsageProof;
+pub use model::UsageProofAuthority;
+
+pub(crate) use traits::GraphUsageAnalyzer;
+
+pub use traits::CandidateFileProvider;
+pub use traits::UsageAnalyzer;
+
+use crate::analyzer::CodeUnit;
+use crate::analyzer::IAnalyzer;
 
 /// Convenience equivalent to [`crate::analyzer::IAnalyzer::find_usages`] for callers that
 /// only hold a `&dyn IAnalyzer`.

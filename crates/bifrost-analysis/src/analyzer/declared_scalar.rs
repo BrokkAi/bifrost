@@ -28,7 +28,8 @@ pub enum DeclaredScalarType {
 
 /// Each parameter and local value of the procedure, whether it is a
 /// parameter, and the syntax node its source mapping names exactly.
-pub(crate) fn binding_nodes<'tree>(
+#[doc(hidden)]
+pub fn binding_nodes<'tree>(
     procedure: &ProcedureHandle,
     prepared: &'tree PreparedSyntaxTree,
 ) -> Vec<(ValueId, bool, Node<'tree>)> {
@@ -288,10 +289,8 @@ pub fn csharp_declared_scalar_types(
         .collect()
 }
 
-pub(crate) fn rust_scalar_type_from_type(
-    source: &str,
-    type_node: Node<'_>,
-) -> Option<DeclaredScalarType> {
+#[doc(hidden)]
+pub fn rust_scalar_type_from_type(source: &str, type_node: Node<'_>) -> Option<DeclaredScalarType> {
     if type_node.kind() != "primitive_type" {
         return None;
     }
@@ -313,10 +312,8 @@ pub(crate) fn rust_scalar_type_from_type(
     }
 }
 
-pub(crate) fn rust_scalar_type_from_literal(
-    source: &str,
-    node: Node<'_>,
-) -> Option<DeclaredScalarType> {
+#[doc(hidden)]
+pub fn rust_scalar_type_from_literal(source: &str, node: Node<'_>) -> Option<DeclaredScalarType> {
     match node.kind() {
         "boolean_literal" | "true" | "false" => Some(DeclaredScalarType::Boolean),
         "integer_literal" => {

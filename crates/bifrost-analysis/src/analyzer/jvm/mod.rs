@@ -7,14 +7,15 @@
 //! behaviour belongs in `crate::analyzer::{java, scala, kotlin}`.
 
 pub(crate) mod dependency_discovery;
-pub(crate) mod external;
+#[doc(hidden)]
+pub mod external;
 pub(crate) mod import_routes;
 pub(crate) mod java_artifact;
 pub(crate) mod jdk_artifact;
 pub(crate) mod jmod_artifact;
 pub(crate) mod kotlin_artifact;
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) mod native_points;
+#[doc(hidden)]
+pub mod native_points;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
 pub(crate) mod toolchains_document;
@@ -131,6 +132,118 @@ pub(crate) fn jdk_artifact_request(
             review_required: false,
         },
     }
+}
+
+/// Shared bounded source-JAR walk. Both full producers and the offline name
+/// generator consume these exact entries; extraction warnings never disappear.
+fn source_archive_entries(
+    artifact: &crate::analyzer::semantic_model::ExactArtifact,
+    extensions: &[&str],
+    diagnostic_prefix: &str,
+    max_locator_path_bytes: usize,
+    limits: &crate::analyzer::semantic_model::ArtifactProducerLimits,
+    cancellation: Option<&crate::CancellationToken>,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> Result<Vec<(String, String)>, Box<ArtifactProduction>> {
+    use java_artifact::{MAX_ARCHIVE_ENTRIES, MAX_SOURCE_ENTRY_BYTES, MAX_TOTAL_ARCHIVE_BYTES};
+    use std::io::{Cursor, Read};
+    let mut archive = zip::ZipArchive::new(Cursor::new(artifact.bytes()))
+        .map_err(|_| {
+            crate::analyzer::semantic_model::failed_artifact_production(
+                &format!("{diagnostic_prefix}.archive.invalid"),
+                "artifact is not a readable ZIP/JAR archive",
+                limits,
+            )
+        })
+        .map_err(Box::new)?;
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        diagnostics.warning(
+            "limit.archive_entries",
+            None,
+            format!("producer inspected at most {MAX_ARCHIVE_ENTRIES} archive entries"),
+        );
+    }
+    for index in 0..archive.len().min(MAX_ARCHIVE_ENTRIES) {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            return Err(Box::new(
+                crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "source archive production was cancelled",
+                    limits,
+                ),
+            ));
+        }
+        let Ok(mut entry) = archive.by_index(index) else {
+            diagnostics.warning(
+                format!("{diagnostic_prefix}.archive.entry"),
+                None,
+                format!("could not read archive entry at index {index}"),
+            );
+            continue;
+        };
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(error) => {
+                diagnostics.warning(
+                    format!("{diagnostic_prefix}.archive.entry_name"),
+                    None,
+                    format!("could not decode archive entry name at index {index}: {error}"),
+                );
+                continue;
+            }
+        };
+        if !extensions
+            .iter()
+            .any(|extension| name.ends_with(*extension))
+        {
+            continue;
+        }
+        if name.len() > max_locator_path_bytes {
+            diagnostics.warning(
+                "limit.locator_path",
+                None,
+                "source entry path exceeded the locator length limit",
+            );
+            continue;
+        }
+        let next_total = total_bytes.saturating_add(entry.size());
+        if entry.size() > MAX_SOURCE_ENTRY_BYTES || next_total > MAX_TOTAL_ARCHIVE_BYTES {
+            diagnostics.warning(
+                "limit.archive_bytes",
+                Some(name),
+                "archive entry exceeded the bounded source extraction budget",
+            );
+            continue;
+        }
+        total_bytes = next_total;
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        if entry
+            .by_ref()
+            .take(MAX_SOURCE_ENTRY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_SOURCE_ENTRY_BYTES
+        {
+            diagnostics.warning(
+                format!("{diagnostic_prefix}.archive.entry_read"),
+                Some(name),
+                "could not read bounded archive entry bytes",
+            );
+            continue;
+        }
+        match String::from_utf8(bytes) {
+            Ok(source) => entries.push((name, source)),
+            Err(_) => diagnostics.warning(
+                format!("{diagnostic_prefix}.source.encoding"),
+                Some(name),
+                "source entry is not valid UTF-8",
+            ),
+        }
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
 }
 
 pub(crate) fn parse_source_tree(
@@ -346,3 +459,129 @@ pub(crate) fn native_member_attribution(
         },
     }
 }
+
+pub(crate) mod dependency_packs {
+    use crate::analyzer::dependency_support::resolve_dependency_path as resolve_path;
+    use crate::analyzer::jvm::external::jdk_home_for_dependency;
+    use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
+    use crate::analyzer::semantic_model::{
+        DependencyDiscoveryOutcome, DependencyPackAdapter, DependencyPackLimits,
+        DependencyResolver, DependencyResolverBounds,
+    };
+    use crate::analyzer::store::StoreError;
+    use crate::analyzer::workspace::{
+        DependencyPackEcosystem, DependencyPackEcosystemOutcome,
+        build_tool_dependency_resolver_bounds,
+    };
+    use crate::analyzer::{AnalyzerConfig, Project};
+    use crate::analyzer::{
+        JvmDependencyDiscoveryMode, JvmDependencyPackAdapter,
+        resolve_jvm_semantic_pack_dependencies,
+    };
+    use crate::hash::HashMap;
+    use std::path::{Path, PathBuf};
+    pub(crate) struct JvmDependencyResolver;
+
+    impl DependencyResolver for JvmDependencyResolver {
+        fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+            &JvmDependencyPackAdapter
+        }
+
+        fn dependency_inputs(&self) -> &'static [&'static str] {
+            // `is_jvm_dependency_input` is the reader-side predicate for the same
+            // inputs; these are its base names.
+            &[
+                "pom.xml",
+                "settings.xml",
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "gradle.properties",
+                "gradle.lockfile",
+                "libs.versions.toml",
+                "gradle-wrapper.properties",
+            ]
+        }
+
+        fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
+            let discovery = &config.jvm.dependency_discovery;
+            let runs_tools = discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools;
+            build_tool_dependency_resolver_bounds(
+                runs_tools.then_some(discovery.timeout),
+                Some(crate::analyzer::jvm::MAX_BUILD_METADATA_BYTES as u64),
+            )
+        }
+
+        fn resolve(
+            &self,
+            config: &AnalyzerConfig,
+            project: &dyn Project,
+            limits: &DependencyPackLimits,
+            cancellation: Option<&crate::CancellationToken>,
+        ) -> DependencyDiscoveryOutcome {
+            resolve_jvm_semantic_pack_dependencies(&config.jvm, project, limits, cancellation)
+        }
+    }
+
+    /// Correlate a configured source toolchain with the exact pack produced from
+    /// that home's artifacts. Discovery IDs are run-local join keys; only the
+    /// prepared evidence's artifact digest authorizes later call applicability.
+    pub(crate) fn prepared_jdk_artifacts_for_source_bindings(
+        config: &AnalyzerConfig,
+        project_root: &Path,
+        outcomes: &[DependencyPackEcosystemOutcome],
+    ) -> Option<HashMap<PathBuf, SemanticModelActivationEvidence>> {
+        let jvm = outcomes
+            .iter()
+            .find(|outcome| outcome.ecosystem == DependencyPackEcosystem::Jvm)?;
+        let mut by_home = HashMap::default();
+        if let Some(preparation) = &jvm.preparation {
+            let prepared = preparation
+                .packs
+                .iter()
+                .map(|pack| (pack.dependency_id.as_str(), &pack.evidence))
+                .collect::<HashMap<_, _>>();
+            for dependency in &jvm.discovery.dependencies {
+                let (Some(home), Some(evidence)) = (
+                    jdk_home_for_dependency(dependency),
+                    prepared.get(dependency.id.as_str()),
+                ) else {
+                    continue;
+                };
+                if evidence.artifact_sha256.is_some() {
+                    by_home.insert(home.to_path_buf(), (*evidence).clone());
+                }
+            }
+        }
+        let mut selected = HashMap::default();
+        for binding in &config.jvm.standard_library_discovery.source_toolchains {
+            let candidate = resolve_path(project_root, binding.jdk_home());
+            if let Ok(home) = std::fs::canonicalize(candidate)
+                && let Some(evidence) = by_home.get(&home)
+            {
+                selected.insert(binding.jdk_home().to_path_buf(), evidence.clone());
+            }
+        }
+        Some(selected)
+    }
+
+    pub(crate) fn configure_dependency_workspace(
+        config: &mut AnalyzerConfig,
+        project_root: &Path,
+    ) -> Result<(), StoreError> {
+        for binding in
+            crate::analyzer::jvm::toolchains_document::load_source_toolchains(project_root)
+                .map_err(StoreError::new)?
+        {
+            let bindings = &mut config.jvm.standard_library_discovery.source_toolchains;
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_inventory_generator;

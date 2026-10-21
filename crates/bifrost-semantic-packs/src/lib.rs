@@ -14,6 +14,8 @@ pub mod release_bundle;
 #[cfg(feature = "release-tooling")]
 pub mod summary_foundry;
 
+#[cfg(test)]
+use brokk_bifrost_tools as _;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -613,6 +615,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use brokk_bifrost_analysis::analyzer::GoAnalyzerConfig;
+    use brokk_bifrost_analysis::analyzer::GoDependencyDiscoveryMode;
     use brokk_bifrost_analysis::analyzer::semantic_model::{
         CatalogOptions, CompiledConcurrencyEffect, CompiledCondWaiters,
         CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
@@ -637,9 +641,8 @@ mod tests {
         ModeledCallApplication, ModeledCallTargetCoverage, ModeledCallTargetOrigin,
         modeled_call_targets_for_shape,
     };
-    use brokk_bifrost_analysis::analyzer::{
-        GoAnalyzerConfig, GoDependencyDiscoveryMode, resolve_go_semantic_pack_dependencies,
-    };
+    use brokk_bifrost_go_analysis::analyzer::resolve_go_semantic_pack_dependencies;
+
     use brokk_bifrost_analysis::{AnalyzerConfig, CancellationToken, Language, WorkspaceAnalyzer};
     use brokk_bifrost_test_macros::hardwon;
 

@@ -19,8 +19,8 @@ use crate::analyzer::QueryScope;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::{
-    LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, StructuralSnapshotKey,
-    TreeSitterAnalyzer,
+    LanguageAdapter, PreparedSourceFailure, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree,
+    StructuralSnapshotKey, TreeSitterAnalyzer,
 };
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -319,7 +319,8 @@ impl StructuralPreparedSyntax {
         Arc::clone(&self.inner)
     }
 
-    pub(crate) fn into_inner(self) -> Arc<PreparedSyntaxTree> {
+    #[doc(hidden)]
+    pub fn into_inner(self) -> Arc<PreparedSyntaxTree> {
         self.inner
     }
 }
@@ -443,7 +444,8 @@ impl StructuralFactsCache {
         (Some(facts), outcome)
     }
 
-    pub(crate) fn get(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
+    #[doc(hidden)]
+    pub fn get(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
         self.cache.get(key)
     }
 
@@ -451,8 +453,9 @@ impl StructuralFactsCache {
         self.cache.insert(key, facts);
     }
 
-    #[cfg(test)]
-    pub(crate) fn take_for_heap_test(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn take_for_heap_test(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
         let facts = self.cache.get(key)?;
         let capacity = self
             .cache
@@ -728,7 +731,10 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         let snapshot = match self.source_snapshot_limited(file, max_source_bytes) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => return StructuralSourceLimitedOutcome::Unavailable,
-            Err(exceeded) => {
+            Err(PreparedSourceFailure::Refused(_)) => {
+                return StructuralSourceLimitedOutcome::Unavailable;
+            }
+            Err(PreparedSourceFailure::Exceeded(exceeded)) => {
                 return StructuralSourceLimitedOutcome::Exceeded {
                     minimum_source_bytes: exceeded.minimum_source_bytes(),
                 };
@@ -776,7 +782,8 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
                 }
             }
             PreparedSyntaxLimitedOutcome::Cancelled => StructuralSyntaxLimitedOutcome::Cancelled,
-            PreparedSyntaxLimitedOutcome::Unavailable => {
+            PreparedSyntaxLimitedOutcome::Unavailable
+            | PreparedSyntaxLimitedOutcome::Refused(_) => {
                 StructuralSyntaxLimitedOutcome::Unavailable
             }
         }
@@ -1138,16 +1145,10 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use crate::analyzer::{
-        AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, TestProject,
-        TypescriptAnalyzer, WorkspaceAnalyzer,
-    };
+
     use crate::compact_graph::CompactRows;
-    use crate::gitblob::test_repo::{commit_all, init_repo};
-    use crate::inline_project::InlineTestProject;
-    use brokk_bifrost_test_macros::hardwon;
-    use std::sync::Arc;
 
     fn empty_facts(source: &str) -> FileFacts {
         FileFacts::new(
@@ -1158,72 +1159,6 @@ mod tests {
             CompactRows::from_parts(vec![0], Vec::new()),
             Vec::new(),
         )
-    }
-
-    fn assert_limited_source_and_syntax_unavailable(
-        provider: &dyn StructuralFactProvider,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-    ) {
-        assert!(matches!(
-            provider.structural_source_limited(file, max_source_bytes, None),
-            StructuralSourceLimitedOutcome::Unavailable
-        ));
-        assert!(matches!(
-            provider.structural_syntax_limited(file, max_source_bytes, None),
-            StructuralSyntaxLimitedOutcome::Unavailable
-        ));
-    }
-
-    #[test]
-    fn structural_provider_fanout_refuses_foreign_files_before_reading_or_parsing() {
-        let sources = [
-            ("A.java", "class A {}\n", Language::Java),
-            ("a.go", "package a\nfunc run() {}\n", Language::Go),
-            ("A.kt", "class A\n", Language::Kotlin),
-            ("A.scala", "class A\n", Language::Scala),
-        ];
-        let mut project = InlineTestProject::new();
-        for (path, source, _) in sources {
-            project = project.file(path, source);
-        }
-        let fixture = project.build();
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            fixture.project_dyn(),
-            AnalyzerConfig::default(),
-        )
-        .expect("mixed-language workspace");
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        for provider in workspace.analyzer().structural_fact_providers() {
-            let before = provider.structural_extraction_count();
-            for (path, source, language) in sources {
-                if provider.structural_language() == language {
-                    continue;
-                }
-                let file = fixture.file(path);
-                assert!(provider.structural_source(&file).is_none());
-                assert!(provider.structural_facts(&file).is_none());
-                assert_limited_source_and_syntax_unavailable(provider, &file, 0);
-                assert!(matches!(
-                    provider.structural_facts_limited(&file, source, 0, None),
-                    StructuralFactsLimitedOutcome::Unavailable
-                ));
-                assert!(matches!(
-                    provider.structural_facts_limited(&file, source, 0, Some(&cancellation)),
-                    StructuralFactsLimitedOutcome::Cancelled
-                ));
-            }
-            assert_eq!(provider.structural_extraction_count(), before);
-            let (path, source, _) = sources
-                .iter()
-                .find(|(_, _, language)| *language == provider.structural_language())
-                .expect("provider has an owned fixture");
-            let facts = provider
-                .structural_facts(&fixture.file(path))
-                .expect("owning provider must still supply facts");
-            assert_eq!(facts.source(), *source);
-        }
     }
 
     #[test]
@@ -1279,377 +1214,9 @@ mod tests {
         assert_eq!(unavailable.hydration_count(), 0);
         assert_eq!(unavailable.extraction_count(), 1);
     }
-
-    #[test]
-    #[hardwon(
-        "fe65bfeaa292: a foreign provider parsed and published facts for files it did not own"
-    )]
-    fn a_provider_declines_a_file_of_another_language() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let own = ProjectFile::new(root.clone(), "app.ts");
-        own.write("export function demo(): void {}\n")
-            .expect("write source");
-        // A C header this grammar would mis-parse into a flat error tree.
-        // bcc's 4.8 MB vmlinux.h cost a Python provider minutes per
-        // definition lookup that way, and the facts it published were for a
-        // file it never indexed.
-        let foreign = ProjectFile::new(root.clone(), "vmlinux.h");
-        foreign
-            .write("struct s { int a; };\nenum e { E_A = 0, E_B = 1 };\n")
-            .expect("write source");
-        let analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-        let provider = analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("TypeScript structural provider");
-        let (own_facts, _) = provider.structural_facts_with_outcome(&own);
-        let own_facts = own_facts.expect("owning provider facts");
-        let own_extractions = provider.structural_extraction_count();
-        let (reused_facts, reused_outcome) = provider.structural_facts_with_outcome(&own);
-        let reused_facts = reused_facts.expect("reused owning provider facts");
-        assert!(Arc::ptr_eq(&reused_facts, &own_facts));
-        assert_eq!(reused_outcome, StructuralFactsCacheOutcome::MemoryHit);
-        assert!(provider.structural_facts(&foreign).is_none());
-        assert!(provider.structural_source(&foreign).is_none());
-        assert_limited_source_and_syntax_unavailable(provider, &foreign, usize::MAX);
-        assert_eq!(provider.structural_extraction_count(), own_extractions);
-    }
-
-    #[test]
-    fn limited_source_snapshot_rejects_oversized_input_before_fact_materialization() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root.clone(), "app.ts");
-        let source = "export function demo(): void {}\n";
-        file.write(source).expect("write source");
-        let analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-        let provider = analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("TypeScript structural provider");
-        let before = provider.structural_extraction_count();
-
-        assert!(matches!(
-            provider.structural_source_limited(&file, source.len() - 1, None),
-            StructuralSourceLimitedOutcome::Exceeded {
-                minimum_source_bytes
-            } if minimum_source_bytes >= source.len()
-        ));
-        assert_eq!(provider.structural_extraction_count(), before);
-
-        let StructuralSourceLimitedOutcome::Available(snapshot) =
-            provider.structural_source_limited(&file, source.len(), None)
-        else {
-            panic!("source should fit its exact byte budget");
-        };
-        assert_eq!(snapshot.as_ref(), source);
-        assert_eq!(provider.structural_extraction_count(), before);
-    }
-
-    #[test]
-    fn limited_materialization_stops_early_and_caches_only_complete_facts() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root.clone(), "app.ts");
-        file.write(
-            "class Service { run(): void {} }\n\
-             export function call(service: Service): void { service.run(); }\n",
-        )
-        .expect("write source");
-        let analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-        let provider = analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("TypeScript structural provider");
-        let source = provider.structural_source(&file).expect("source");
-        let before = provider.structural_extraction_count();
-        let hydrated_before = provider.structural_hydration_count();
-
-        let StructuralFactsLimitedOutcome::Exceeded { minimum_fact_nodes } =
-            provider.structural_facts_limited(&file, &source, 1, None)
-        else {
-            panic!("the canonical manifest must reject the insufficient budget");
-        };
-        assert!(minimum_fact_nodes > 1);
-        assert_eq!(provider.structural_extraction_count(), before);
-        assert_eq!(provider.structural_hydration_count(), hydrated_before);
-
-        let complete = provider.structural_facts_limited(&file, &source, usize::MAX, None);
-        let StructuralFactsLimitedOutcome::Available {
-            facts,
-            cache_outcome: StructuralFactsCacheOutcome::PersistedHydration,
-        } = complete
-        else {
-            panic!("expected complete hydration after the capped attempt");
-        };
-        assert!(facts.nodes().len() > 1);
-        assert_eq!(facts.work_item_count(), minimum_fact_nodes);
-        assert_eq!(provider.structural_extraction_count(), before);
-        assert_eq!(provider.structural_hydration_count(), hydrated_before + 1);
-
-        assert!(matches!(
-            provider.structural_facts_limited(&file, &source, 1, None),
-            StructuralFactsLimitedOutcome::Exceeded {
-                minimum_fact_nodes: cached_work_items
-            } if cached_work_items == minimum_fact_nodes
-        ));
-        let StructuralFactsLimitedOutcome::Available {
-            facts: cached,
-            cache_outcome: StructuralFactsCacheOutcome::MemoryHit,
-        } = provider.structural_facts_limited(&file, &source, usize::MAX, None)
-        else {
-            panic!("the complete retry must be cached");
-        };
-        assert!(Arc::ptr_eq(&facts, &cached));
-        assert_eq!(provider.structural_extraction_count(), before);
-        assert_eq!(provider.structural_hydration_count(), hydrated_before + 1);
-    }
-
-    const RUST_READY_SOURCE: &str =
-        "fn helper(value: i32) -> i32 { value + 1 }\nfn main() { helper(1); }\n";
-
-    #[test]
-    fn limited_materialization_caps_role_edges_before_caching() {
-        let arguments = std::iter::repeat_n("this", 256)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let source = format!(
-            "export function f(...args: unknown[]): void {{}}\n\
-             f({arguments});\n"
-        );
-
-        let measured_temp = tempfile::tempdir().expect("measured temp dir");
-        let measured_root = measured_temp.path().canonicalize().expect("measured root");
-        let measured_file = ProjectFile::new(measured_root.clone(), "app.ts");
-        measured_file.write(&source).expect("write measured source");
-        let measured_analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(measured_root, Language::TypeScript));
-        let measured_provider = measured_analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("measured TypeScript provider");
-        let StructuralFactsLimitedOutcome::Available {
-            facts: measured, ..
-        } = measured_provider.structural_facts_limited(&measured_file, &source, usize::MAX, None)
-        else {
-            panic!("unbounded measurement should complete");
-        };
-        assert!(
-            measured.role_count() > measured.nodes().len(),
-            "fixture must put most bounded work in raw-span role edges"
-        );
-        let cap = measured.work_item_count() - 1;
-        assert!(
-            measured.nodes().len() <= cap,
-            "the node arena alone must fit so the role cap is exercised"
-        );
-
-        let capped_temp = tempfile::tempdir().expect("capped temp dir");
-        let capped_root = capped_temp.path().canonicalize().expect("capped root");
-        let capped_file = ProjectFile::new(capped_root.clone(), "app.ts");
-        capped_file.write(&source).expect("write capped source");
-        let capped_analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(capped_root, Language::TypeScript));
-        let capped_provider = capped_analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("capped TypeScript provider");
-        let before = capped_provider.structural_extraction_count();
-        let hydrated_before = capped_provider.structural_hydration_count();
-        assert!(matches!(
-            capped_provider.structural_facts_limited(&capped_file, &source, cap, None),
-            StructuralFactsLimitedOutcome::Exceeded {
-                minimum_fact_nodes
-            } if minimum_fact_nodes == cap + 1
-        ));
-        assert_eq!(capped_provider.structural_extraction_count(), before);
-        assert_eq!(
-            capped_provider.structural_hydration_count(),
-            hydrated_before
-        );
-
-        let StructuralFactsLimitedOutcome::Available {
-            facts,
-            cache_outcome: StructuralFactsCacheOutcome::PersistedHydration,
-        } = capped_provider.structural_facts_limited(&capped_file, &source, usize::MAX, None)
-        else {
-            panic!("complete retry should materialize and cache every role edge");
-        };
-        assert_eq!(facts.work_item_count(), measured.work_item_count());
-        assert_eq!(capped_provider.structural_extraction_count(), before);
-        assert_eq!(
-            capped_provider.structural_hydration_count(),
-            hydrated_before + 1
-        );
-        assert!(matches!(
-            capped_provider.structural_facts_limited(&capped_file, &source, cap, None),
-            StructuralFactsLimitedOutcome::Exceeded {
-                minimum_fact_nodes
-            } if minimum_fact_nodes == measured.work_item_count()
-        ));
-        let StructuralFactsLimitedOutcome::Available {
-            facts: cached,
-            cache_outcome: StructuralFactsCacheOutcome::MemoryHit,
-        } = capped_provider.structural_facts_limited(&capped_file, &source, usize::MAX, None)
-        else {
-            panic!("the complete role projection must be cached");
-        };
-        assert!(Arc::ptr_eq(&facts, &cached));
-        assert_eq!(capped_provider.structural_extraction_count(), before);
-        assert_eq!(
-            capped_provider.structural_hydration_count(),
-            hydrated_before + 1
-        );
-    }
-
-    #[test]
-    fn ready_rust_bounded_reads_use_persisted_or_ephemeral_facts_without_extraction() {
-        for persisted in [false, true] {
-            let fixture = InlineTestProject::with_language(Language::Rust)
-                .file("src/lib.rs", RUST_READY_SOURCE)
-                .build();
-            if persisted {
-                let repository = init_repo(fixture.root());
-                commit_all(&repository, "ready Rust source");
-            }
-            let project: Arc<dyn Project> = fixture.project_dyn();
-            let workspace = if persisted {
-                WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-                    Arc::clone(&project),
-                    AnalyzerConfig::default(),
-                )
-                .expect("persisted Rust workspace should build")
-            } else {
-                WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-                    .expect("ephemeral Rust workspace should build")
-            };
-            let file = fixture.file("src/lib.rs");
-            let provider = workspace
-                .analyzer()
-                .structural_fact_providers()
-                .into_iter()
-                .next()
-                .expect("Rust structural provider");
-            let source = provider.structural_source(&file).expect("Rust source");
-            let before = provider.structural_extraction_count();
-
-            let StructuralFactsLimitedOutcome::Available {
-                facts,
-                cache_outcome,
-            } = provider.structural_facts_limited(&file, &source, usize::MAX, None)
-            else {
-                panic!("ready canonical Rust facts should satisfy an unbounded read");
-            };
-            assert_eq!(facts.source(), RUST_READY_SOURCE);
-            assert!(facts.work_item_count() > 0);
-            assert_ne!(cache_outcome, StructuralFactsCacheOutcome::Extracted);
-            assert_eq!(provider.structural_extraction_count(), before);
-        }
-    }
-
-    #[test]
-    fn dirty_rust_structural_cache_is_exact_source_keyed_across_a_b_a() {
-        let source_a = "fn same() {}\n";
-        let source_b = "fn same() {}\nfn extra() { same(); }\n";
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", source_a)
-            .build();
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            fixture.project_dyn(),
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral Rust workspace should build");
-        let file = fixture.file("src/lib.rs");
-        let base_provider = workspace
-            .analyzer()
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("Rust structural provider");
-        let (facts_a, _) = base_provider.structural_facts_with_outcome(&file);
-        let facts_a = facts_a.expect("initial source A facts");
-        assert_eq!(facts_a.source(), source_a);
-        let a_nodes = facts_a.nodes().len();
-        let before_b = base_provider.structural_extraction_count();
-
-        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
-        assert!(overlay.set(file.abs_path(), source_b.to_owned()));
-        let workspace_b = workspace.clone_with_project(Arc::clone(&overlay) as Arc<dyn Project>);
-        let provider_b = workspace_b
-            .analyzer()
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("Rust structural provider for source B");
-        let (facts_b, outcome_b) = provider_b.structural_facts_with_outcome(&file);
-        let facts_b = facts_b.expect("dirty source B facts");
-        assert_eq!(facts_b.source(), source_b);
-        assert!(facts_b.nodes().len() > a_nodes);
-        assert_eq!(outcome_b, StructuralFactsCacheOutcome::Extracted);
-        assert_eq!(provider_b.structural_extraction_count(), before_b + 1);
-        drop(workspace_b);
-
-        assert!(overlay.set(file.abs_path(), source_a.to_owned()));
-        let workspace_a = workspace.clone_with_project(overlay as Arc<dyn Project>);
-        let provider_a = workspace_a
-            .analyzer()
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("Rust structural provider for source A");
-        let (facts_again, outcome_again) = provider_a.structural_facts_with_outcome(&file);
-        let facts_again = facts_again.expect("source A facts after source B");
-        assert_eq!(facts_again.source(), source_a);
-        assert_eq!(facts_again.nodes().len(), a_nodes);
-        assert_ne!(outcome_again, StructuralFactsCacheOutcome::Extracted);
-        assert_eq!(provider_a.structural_extraction_count(), before_b + 1);
-    }
-
-    #[test]
-    fn bounded_rust_budget_and_cancellation_do_not_parse_a_ready_file() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", RUST_READY_SOURCE)
-            .build();
-        let repository = init_repo(fixture.root());
-        commit_all(&repository, "bounded Rust source");
-        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-            fixture.project_dyn(),
-            AnalyzerConfig::default(),
-        )
-        .expect("persisted Rust workspace should build");
-        let file = fixture.file("src/lib.rs");
-        let provider = workspace
-            .analyzer()
-            .structural_fact_providers()
-            .into_iter()
-            .next()
-            .expect("Rust structural provider");
-        let source = provider.structural_source(&file).expect("Rust source");
-        let before = provider.structural_extraction_count();
-
-        assert!(matches!(
-            provider.structural_facts_limited(&file, &source, 0, None),
-            StructuralFactsLimitedOutcome::Exceeded {
-                minimum_fact_nodes
-            } if minimum_fact_nodes > 0
-        ));
-        assert_eq!(provider.structural_extraction_count(), before);
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        assert!(matches!(
-            provider.structural_facts_limited(&file, &source, usize::MAX, Some(&cancellation)),
-            StructuralFactsLimitedOutcome::Cancelled
-        ));
-        assert_eq!(provider.structural_extraction_count(), before);
-    }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "provider/js_ts_tests_support.rs"]
+pub mod js_ts_tests_support;

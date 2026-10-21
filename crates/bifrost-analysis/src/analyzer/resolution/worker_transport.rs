@@ -22,7 +22,8 @@ use std::cell::RefCell;
 
 /// A checked answer must visit every identity when translating and preserve
 /// its stable locators, verdicts and other non-identity fields.
-pub(crate) trait WorkerAnswer: Sized + Send {
+#[doc(hidden)]
+pub trait WorkerAnswer: Sized + Send {
     fn translate(self, translation: &impl ResolutionIdentityTranslation) -> Self;
 }
 
@@ -63,7 +64,8 @@ impl<F: Fn(Key) -> Key> ResolutionIdentityTranslation for IdentityTranslation<F>
 }
 
 /// One answer's complete, query-local identity authority.
-pub(crate) struct TransportedAnswer<A> {
+#[doc(hidden)]
+pub struct TransportedAnswer<A> {
     answer: A,
     digests: Vec<(Key, [u8; 32])>,
 }
@@ -104,7 +106,8 @@ impl<A: WorkerAnswer> TransportedAnswer<A> {
 
     /// Stable locators supply any parent anchors. All other runtime numbers
     /// are freshly interned aliases; worker completion order transfers no ids.
-    pub(crate) fn reintern(
+    #[doc(hidden)]
+    pub fn reintern(
         self,
         selected: &SelectedResolutionOperation<'_, '_>,
         anchors: impl IntoIterator<Item = (Key, Key)>,
@@ -193,7 +196,8 @@ impl<A: WorkerAnswer> TransportedAnswer<A> {
 /// of the calling pool. Waiting here for work queued on this same bounded pool
 /// can starve its builder. Selected forward resolution uses operation-owned
 /// SQL reads and synchronous context construction, not whole-snapshot builders.
-pub(crate) fn run_selected_worker<'store, 'project, A: WorkerAnswer>(
+#[doc(hidden)]
+pub fn run_selected_worker<'store, 'project, A: WorkerAnswer>(
     store: &'store AnalyzerStore,
     input: &CapturedSelectedResolutionInput<'project>,
     cancellation: &CancellationToken,

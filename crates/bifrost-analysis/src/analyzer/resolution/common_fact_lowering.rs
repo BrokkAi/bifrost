@@ -53,6 +53,148 @@ pub(super) fn validate_scope_forest(
     }
 }
 
+pub(super) fn lookup_scope_parent(
+    scope: ResolutionScopeFact,
+    continuations: &crate::hash::HashMap<ResolutionScopeId, Option<ResolutionScopeId>>,
+) -> Option<ResolutionScopeId> {
+    if scope.inheritance
+        == brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeInheritance::Root
+    {
+        None
+    } else {
+        continuations
+            .get(&scope.id)
+            .copied()
+            .unwrap_or(scope.parent)
+    }
+}
+
+pub(super) fn validate_scope_continuations(
+    scopes: &crate::hash::HashMap<ResolutionScopeId, ResolutionScopeFact>,
+    continuations: &crate::hash::HashMap<ResolutionScopeId, Option<ResolutionScopeId>>,
+) {
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        ResolutionScopeInheritance, find_scope_in_chain,
+    };
+    for (&scope, &parent) in continuations {
+        let source = scopes.get(&scope).expect("continuation scope must exist");
+        if let Some(parent) = parent {
+            assert!(
+                source.inheritance != ResolutionScopeInheritance::Root,
+                "root scope cannot continue lookup: {source:?}"
+            );
+            assert!(
+                find_scope_in_chain(source.parent, |id| scopes[&id].parent, |id| id == parent)
+                    .is_some(),
+                "continuation must name a strict containment ancestor: {source:?}, {parent:?}"
+            );
+        }
+    }
+}
+
+/// Check the source proof for canonical slots and exact write attachments.
+/// These inputs are consumed in memory; only their ordinary lexical/typed
+/// effects are published. Runtime definition projection is a later consumer.
+pub(super) fn validate_binding_facts(facts: &FileResolutionFacts) {
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        ResolutionBinderKind, ResolutionSiteKind,
+    };
+    if facts.binding_slots.is_empty()
+        && facts.binding_events.is_empty()
+        && facts.binding_directives.is_empty()
+    {
+        return;
+    }
+    let sites = facts
+        .sites
+        .iter()
+        .map(|site| (site.id, site))
+        .collect::<HashMap<_, _>>();
+    let identifiers = facts
+        .identifiers
+        .iter()
+        .map(|identifier| (identifier.site, identifier))
+        .collect::<HashMap<_, _>>();
+    let binders = facts
+        .binders
+        .iter()
+        .map(|binder| (binder.declaration, binder.scope))
+        .collect::<HashMap<_, _>>();
+    let aliases = facts
+        .binders
+        .iter()
+        .filter_map(|binder| match binder.kind {
+            ResolutionBinderKind::Alias { target } => Some((binder.scope, target)),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut slots = std::collections::HashSet::new();
+    let mut keys = std::collections::HashSet::new();
+    for slot in &facts.binding_slots {
+        assert!(
+            slots.insert(slot.declaration),
+            "duplicate binding slot: {slot:?}"
+        );
+        let site = sites[&slot.declaration];
+        let identifier = identifiers[&slot.declaration];
+        assert_eq!(site.kind, ResolutionSiteKind::BindingSlotDeclaration);
+        assert_eq!(identifier.role, ResolutionIdentifierRole::Declaration);
+        assert_eq!(identifier.namespace, ResolutionNamespace::Value);
+        assert!(
+            keys.insert((site.scope, identifier.name, identifier.namespace)),
+            "duplicate slot identity: {slot:?}"
+        );
+        assert_eq!(
+            binders.get(&slot.declaration),
+            Some(&site.scope),
+            "slot needs a canonical binder: {slot:?}"
+        );
+    }
+    for (ordinal, event) in facts.binding_events.iter().enumerate() {
+        assert_eq!(
+            usize::try_from(event.ordinal).expect("event ordinal fits usize"),
+            ordinal
+        );
+        assert!(
+            slots.contains(&event.slot),
+            "event must target a canonical slot: {event:?}"
+        );
+        let slot = sites[&event.slot];
+        let target = sites[&event.target];
+        let identifier = identifiers[&event.target];
+        assert_eq!(target.kind, ResolutionSiteKind::ValueReference);
+        assert_eq!(identifier.role, ResolutionIdentifierRole::Reference);
+        assert_eq!(identifier.namespace, ResolutionNamespace::Value);
+        assert_eq!(identifier.name, identifiers[&event.slot].name);
+        if target.scope != slot.scope {
+            assert!(
+                aliases.contains(&(target.scope, event.slot)),
+                "redirected event needs an exact alias proof: {event:?}"
+            );
+        }
+        if let Some(authored) = event.authored_declaration {
+            assert_eq!(
+                identifiers[&authored].role,
+                ResolutionIdentifierRole::Declaration
+            );
+            assert_eq!(identifiers[&authored].name, identifier.name);
+        }
+    }
+    for directive in &facts.binding_directives {
+        let identifier = identifiers[&directive.reference];
+        assert_eq!(identifier.role, ResolutionIdentifierRole::Reference);
+        if let Some(target) = directive.target {
+            assert!(slots.contains(&target));
+            assert_eq!(identifiers[&target].name, identifier.name);
+        } else {
+            assert!(
+                facts.gaps.iter().any(|gap| gap.site == directive.reference),
+                "unresolved directive needs an explicit frontier: {directive:?}"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct LoweredAdditionalDefinitionNamespace {
     pub(crate) definition: SemanticId,
@@ -344,14 +486,19 @@ pub(crate) struct LoweredInvocationRole {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LoweredPackageObjectExport {
-    pub(crate) package_object: ResolutionSiteId,
-    pub(crate) package_scope: BindingNodeId,
-    pub(crate) member: ResolutionSiteId,
+#[doc(hidden)]
+pub struct LoweredPackageObjectExport {
+    #[doc(hidden)]
+    pub package_object: ResolutionSiteId,
+    #[doc(hidden)]
+    pub package_scope: BindingNodeId,
+    #[doc(hidden)]
+    pub member: ResolutionSiteId,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LoweredSharedLanguageFacts {
+#[doc(hidden)]
+pub struct LoweredSharedLanguageFacts {
     pub(crate) aliases: Vec<LoweredJvmAlias>,
     pub(crate) call_argument_lists: Vec<LoweredCallArgumentList>,
     pub(crate) call_arguments: Vec<LoweredCallArgument>,
@@ -362,31 +509,164 @@ pub(crate) struct LoweredSharedLanguageFacts {
     pub(crate) import_selectors: Vec<LoweredImportSelector>,
     pub(crate) singleton_relations: Vec<LoweredSingletonRelation>,
     pub(crate) invocation_roles: Vec<LoweredInvocationRole>,
-    pub(crate) package_object_exports: Vec<LoweredPackageObjectExport>,
+    #[doc(hidden)]
+    pub package_object_exports: Vec<LoweredPackageObjectExport>,
+}
+
+/// Blob-local import syntax, retained independently of observed lookup demands.
+/// Native site and scope numbers remain blob-local across mounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoweredRootImport {
+    pub(crate) fact: brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportFact,
+    pub(crate) kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportKind,
+    pub(crate) bound_name: Option<String>,
+    pub(crate) segments: Vec<(u32, String)>,
+    pub(crate) demands: Vec<(
+        ResolutionNamespace,
+        String,
+        Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportDemandTarget>,
+        Option<String>,
+    )>,
+}
+
+fn lower_root_imports(
+    facts: &FileResolutionFacts,
+    names: &BTreeMap<ResolutionNameId, &str>,
+) -> Vec<LoweredRootImport> {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportKind;
+    let references = facts
+        .identifiers
+        .iter()
+        .filter(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
+        .map(|identifier| (identifier.site, identifier))
+        .collect::<HashMap<_, _>>();
+    let mut kinds = HashMap::new();
+    for kind in &facts.root_import_kinds {
+        assert!(
+            kinds.insert(kind.import_site, kind.kind).is_none(),
+            "one kind per import: {kind:?}"
+        );
+    }
+    let mut targets = HashMap::new();
+    for target in &facts.root_import_demand_targets {
+        assert!(
+            targets
+                .insert(
+                    (target.import_site, target.namespace, target.name),
+                    target.target
+                )
+                .is_none(),
+            "at most one target per demand: {target:?}"
+        );
+    }
+    let mut demands_by_site = HashMap::<_, Vec<_>>::new();
+    for demand in &facts.root_import_demands {
+        demands_by_site
+            .entry(demand.import_site)
+            .or_default()
+            .push(demand);
+    }
+    let mut segments_by_site = HashMap::<_, Vec<_>>::new();
+    for segment in &facts.root_import_segments {
+        segments_by_site
+            .entry(segment.import_site)
+            .or_default()
+            .push((segment.position, names[&segment.name].to_owned()));
+    }
+    let mut routes = facts
+        .root_imports
+        .iter()
+        .map(|fact| {
+            let kind = kinds
+                .remove(&fact.site)
+                .expect("every root import has exactly one kind");
+            let mut demands = Vec::new();
+            let mut bound_name = None;
+            for demand in demands_by_site.remove(&fact.site).unwrap_or_default() {
+                let name = names[&demand.name].to_owned();
+                if kind == ResolutionRootImportKind::Named {
+                    if let Some(previous) = &bound_name {
+                        assert_eq!(
+                            previous, &name,
+                            "named route demands must share a name: {fact:?}"
+                        );
+                    } else {
+                        bound_name = Some(name.clone());
+                    }
+                }
+                let target = targets.remove(&(demand.import_site, demand.namespace, demand.name));
+                let target_name = match target {
+                    Some(brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportDemandTarget::NamedReference(site)) => {
+                        let reference = references.get(&site)
+                            .expect("named import target must be a positioned reference in the same file");
+                        Some(names[&reference.name].to_owned())
+                    }
+                    _ => None,
+                };
+                demands.push((demand.namespace, name, target, target_name));
+            }
+            demands.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            let mut segments = segments_by_site.remove(&fact.site).unwrap_or_default();
+            segments.sort_by_key(|s| s.0);
+            LoweredRootImport {
+                fact: *fact,
+                kind,
+                bound_name,
+                segments,
+                demands,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        kinds.is_empty(),
+        "kinds name unknown root imports: {kinds:?}"
+    );
+    assert!(
+        targets.is_empty(),
+        "targets name unknown demands: {targets:?}"
+    );
+    assert!(
+        demands_by_site.is_empty(),
+        "demands name unknown root imports: {demands_by_site:?}"
+    );
+    assert!(
+        segments_by_site.is_empty(),
+        "segments name unknown root imports: {segments_by_site:?}"
+    );
+    routes.sort_by_key(|r| r.fact.site);
+    routes
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LoweredCommonFacts {
+#[doc(hidden)]
+pub struct LoweredCommonFacts {
+    pub(crate) root_imports: Vec<LoweredRootImport>,
     pub(crate) additional_definition_namespaces: Vec<LoweredAdditionalDefinitionNamespace>,
     pub(crate) definition_unit_crosswalks: Vec<LoweredDefinitionUnitCrosswalk>,
-    pub(crate) deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
+    #[doc(hidden)]
+    pub deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
     pub(crate) declared_type_relations: Vec<LoweredDeclaredTypeRelation>,
     pub(crate) relation_members: Vec<LoweredRelationMember>,
     pub(crate) declared_root_routes: Vec<LoweredDeclaredRootRoute>,
     pub(crate) root_import_provenance: Vec<LoweredRootImportProvenance>,
-    pub(crate) package_references: Vec<LoweredPackageReference>,
-    pub(crate) package_members: Vec<LoweredPackageMember>,
+    #[doc(hidden)]
+    pub package_references: Vec<LoweredPackageReference>,
+    #[doc(hidden)]
+    pub package_members: Vec<LoweredPackageMember>,
     pub(crate) package_routes: Vec<LoweredPackageRoute>,
-    pub(crate) go_package_imports: Vec<LoweredGoPackageImport>,
+    #[doc(hidden)]
+    pub go_package_imports: Vec<LoweredGoPackageImport>,
     pub(crate) reference_lookup_identities: Vec<LoweredReferenceLookupIdentity>,
     pub(crate) rust_reverse_gap_candidates: Vec<LoweredRustReverseGapCandidate>,
     pub(crate) trait_implementations: Vec<LoweredTraitImplementation>,
-    pub(crate) shared_language: LoweredSharedLanguageFacts,
+    #[doc(hidden)]
+    pub shared_language: LoweredSharedLanguageFacts,
 }
 
 impl LoweredCommonFacts {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        root_imports: Vec<LoweredRootImport>,
         mut additional_definition_namespaces: Vec<LoweredAdditionalDefinitionNamespace>,
         mut definition_unit_crosswalks: Vec<LoweredDefinitionUnitCrosswalk>,
         mut deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
@@ -546,6 +826,7 @@ impl LoweredCommonFacts {
                 .all(|row| row.start_byte <= row.end_byte)
         );
         Self {
+            root_imports,
             additional_definition_namespaces,
             definition_unit_crosswalks,
             deferred_member_owners,
@@ -1410,6 +1691,18 @@ pub(crate) fn lower_common_resolution_facts(
                 .get(gap_site)
                 .unwrap_or_else(|| panic!("reverse inventory gap names unknown site {gap_site}"));
             let candidates = gap_candidates.entry(*gap_site).or_default();
+            if let Some(route) = facts.gaps.iter().find_map(|gap| {
+                (gap.site == *gap_site).then(|| gap.route()).flatten()
+            }) && let brokk_bifrost_core::analyzer::resolution_facts::ResolutionRouteGap::OmittedReference { terminal, namespace, .. } = route {
+                // The omitted route's terminal is stronger evidence than any
+                // other positioned identifiers retained inside its syntax.
+                // No known terminal keeps the wildcard nomination, not a list
+                // of unrelated arguments that would falsely close inventory.
+                if let Some(terminal) = terminal {
+                    candidates.insert((names[&terminal].to_owned(), namespace));
+                }
+                continue;
+            }
             assert!(
                 gap_span.start_byte <= gap_span.end_byte,
                 "unordered gap: {gap_span:?}"
@@ -1538,12 +1831,24 @@ pub(crate) fn lower_common_resolution_facts(
         .iter()
         .map(|route| (route.site, route))
         .collect::<HashMap<_, _>>();
+    let root_kinds = facts
+        .root_import_kinds
+        .iter()
+        .map(|kind| (kind.import_site, kind.kind))
+        .collect::<HashMap<_, _>>();
     let mut import_tokens = BTreeSet::new();
     let mut root_import_provenance = Vec::new();
     for demand in &facts.root_import_demands {
-        let Some(route) = routes_by_site.get(&demand.import_site) else {
-            // Languages without structured route facts make no route-kind claim.
-            continue;
+        let kind = if let Some(route) = routes_by_site.get(&demand.import_site) {
+            route.kind
+        } else {
+            use brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportKind;
+            match root_kinds.get(&demand.import_site).expect(
+                "every root import demand without an import route retains its root import kind",
+            ) {
+                ResolutionRootImportKind::Named => ResolutionImportRouteKind::Named,
+                ResolutionRootImportKind::Glob => ResolutionImportRouteKind::Star,
+            }
         };
         if !import_tokens.insert((demand.import_site, demand.namespace)) {
             continue;
@@ -1557,7 +1862,7 @@ pub(crate) fn lower_common_resolution_facts(
             source_site: demand.import_site,
             start_byte,
             end_byte,
-            kind: route.kind,
+            kind,
         });
     }
     let (package_references, package_members) =
@@ -1566,6 +1871,7 @@ pub(crate) fn lower_common_resolution_facts(
         super::fact_lowering::package::lower_import_metadata(identities, language, facts);
     let shared_language = lower_shared_language_facts(identities, facts, &names);
     LoweredCommonFacts::new(
+        lower_root_imports(facts, &names),
         additional_definition_namespaces,
         definition_unit_crosswalks,
         deferred_member_owners,
@@ -1754,9 +2060,11 @@ mod tests {
             gaps: gap_spans
                 .iter()
                 .enumerate()
-                .map(|(id, _)| ResolutionGapFact {
-                    site: ResolutionSiteId::new(id.try_into().unwrap()),
-                    kind: ResolutionGapKind::UnsupportedScopeOrBinder,
+                .map(|(id, _)| {
+                    ResolutionGapFact::new(
+                        ResolutionSiteId::new(id.try_into().unwrap()),
+                        ResolutionGapKind::UnsupportedScopeOrBinder,
+                    )
                 })
                 .collect(),
             ..FileResolutionFacts::default()
@@ -1890,10 +2198,10 @@ mod tests {
                     end_byte: 20,
                 },
             ],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::GeneratedItemSurface,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::GeneratedItemSurface,
+            )],
             reference_enumeration_gaps: vec![ResolutionReferenceEnumerationGapFact {
                 site: ResolutionSiteId::new(1),
                 kind: ResolutionGapKind::GeneratedItemSurface,

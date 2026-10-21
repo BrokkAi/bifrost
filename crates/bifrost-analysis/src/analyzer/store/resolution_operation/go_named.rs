@@ -11,7 +11,8 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum GoExternalPackageProvenance {
+#[doc(hidden)]
+pub enum GoExternalPackageProvenance {
     GoTool {
         provider_kind: String,
         module_path: Option<String>,
@@ -26,15 +27,21 @@ pub(crate) enum GoExternalPackageProvenance {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GoSelectedExternalImport {
-    pub(crate) source_spelling: String,
-    pub(crate) import_path: String,
-    pub(crate) package_name: String,
-    pub(crate) provenance: GoExternalPackageProvenance,
+#[doc(hidden)]
+pub struct GoSelectedExternalImport {
+    #[doc(hidden)]
+    pub source_spelling: String,
+    #[doc(hidden)]
+    pub import_path: String,
+    #[doc(hidden)]
+    pub package_name: String,
+    #[doc(hidden)]
+    pub provenance: GoExternalPackageProvenance,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct GoPackageStageUnit {
+#[doc(hidden)]
+pub struct GoPackageStageUnit {
     pub(crate) context_id: i64,
     pub(crate) package_id: i64,
     pub(crate) source_role: String,
@@ -46,11 +53,15 @@ pub(crate) enum GoPreparedContextKind {
 }
 
 #[derive(Clone)]
-pub(crate) struct GoDemandContext {
-    pub(crate) context_id: i64,
-    pub(crate) import_packages: HashMap<(SelectedResolutionMountOrdinal, SemanticId), i64>,
+#[doc(hidden)]
+pub struct GoDemandContext {
+    #[doc(hidden)]
+    pub context_id: i64,
+    #[doc(hidden)]
+    pub import_packages: HashMap<(SelectedResolutionMountOrdinal, SemanticId), i64>,
     pub(crate) context_completions: HashMap<SelectedResolutionMountOrdinal, ResolutionCompletion>,
-    pub(crate) modeled_imports:
+    #[doc(hidden)]
+    pub modeled_imports:
         HashMap<(SelectedResolutionMountOrdinal, SemanticId), GoSelectedExternalImport>,
 }
 
@@ -110,11 +121,34 @@ pub(crate) struct GoPreparedContextCacheKey {
 }
 
 #[derive(Clone)]
-pub(crate) struct GoPreparedImportContext {
-    pub(crate) context: SelectedResolutionContextSet,
-    pub(crate) demand: GoDemandContext,
+#[doc(hidden)]
+pub struct GoPreparedImportContext {
+    #[doc(hidden)]
+    pub context: SelectedResolutionContextSet,
+    #[doc(hidden)]
+    pub demand: GoDemandContext,
     pub(crate) package_inventory: GoPackageInventoryState,
+    // Validated paths belong to this request's SQL token. Snapshots explicitly
+    // discard this projection before crossing the request boundary.
+    pub(crate) blueprint: Option<std::sync::Arc<SelectedFactOperationBlueprint>>,
 }
+
+/// Exact preparation authority. Scope and staged content can change while an
+/// operation prepares more than one file; published context paths are not
+/// staged source content and do not change this identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct GoPreparedContextKey {
+    kind: GoPreparedContextKind,
+    context_id: i64,
+    caller_mount: SelectedResolutionMountOrdinal,
+    caller_path: String,
+    source_role: String,
+    scope: [u8; 32],
+    stage_epoch: (u64, u64),
+}
+
+pub(super) type GoPreparedContextMemo =
+    super::context_preparation::RequestContextMemo<GoPreparedContextKey, GoPreparedImportContext>;
 
 /// One bounded cache entry retains only shared names referenced by its file
 /// context. Numeric keys are snapshot-local and never installed in a request.
@@ -147,6 +181,7 @@ impl GoPreparedImportContext {
                 context,
                 demand: self.demand.clone(),
                 package_inventory: self.package_inventory.clone(),
+                blueprint: None,
             },
             shared_names,
         }))
@@ -172,18 +207,21 @@ impl GoPreparedImportContextSnapshot {
             context: context.with_identity_space(identities.clone()),
             demand: self.prepared.demand.clone(),
             package_inventory: self.prepared.package_inventory.clone(),
+            blueprint: None,
         })
     }
 }
 
-pub(crate) enum GoPreparedImportContextOutcome {
+#[doc(hidden)]
+pub enum GoPreparedImportContextOutcome {
     Ready(Box<GoPreparedImportContext>),
     Unavailable,
     Cancelled,
 }
 
 impl GoSelectedExternalImport {
-    pub(crate) fn has_authoritative_provenance(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_authoritative_provenance(&self) -> bool {
         match &self.provenance {
             GoExternalPackageProvenance::GoTool { provider_kind, .. } => {
                 matches!(provider_kind.as_str(), "standard" | "module")
@@ -351,7 +389,8 @@ LEFT JOIN main.source_imports i ON i.blob_id=mounted.blob_id
 // planner keeps the request list outermost; without that, it starts from the
 // context's packages and probes the list per package. The segment subquery
 // orders by `ordinal` on the primary key, which needs no sort.
-pub(in crate::analyzer::store) const GO_FILE_IMPORT_ROWS: &str = r#"
+#[doc(hidden)]
+pub const GO_FILE_IMPORT_ROWS: &str = r#"
 SELECT requested.value ->> 0, imports.source_spelling, imports.complete,
        json(imports.gaps), NULLIF(target.package_name,''), target.package_id,
        mounted.semantic_language
@@ -428,15 +467,17 @@ struct GoMountImportInputs {
 /// statement per batch and dropped with the operation. Its size is the number
 /// of files the request prepares, not the workspace.
 #[derive(Default)]
-pub(in crate::analyzer::store) struct GoImportInputCache {
+#[doc(hidden)]
+pub struct GoImportInputCache {
     mounts: HashMap<u32, GoMountImportInputs>,
     /// A captured absence must not fall through to a later publication.
     model_overlay: Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl GoImportInputCache {
-    pub(in crate::analyzer::store) fn is_empty(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
         self.mounts.is_empty()
     }
 }
@@ -495,7 +536,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Capture the caller's overlay rather than the language delegate's cache.
     /// A multi-language analyzer can activate models without populating its
     /// Go delegate. This authority lives only for the selected operation.
-    pub(crate) fn with_go_model_authority(
+    #[doc(hidden)]
+    pub fn with_go_model_authority(
         self,
         overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
     ) -> Self {
@@ -549,7 +591,8 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Return this caller's complete, source-less standard/dependency import
     /// targets. The vector is request-owned and bounded by this file's imports.
-    pub(crate) fn go_selected_external_imports(
+    #[doc(hidden)]
+    pub fn go_selected_external_imports(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -614,7 +657,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Return only exact unresolved import spellings from this selected
     /// source file. A caller may match these to a semantic model by exact
     /// import path; no path-derived package name is supplied here.
-    pub(crate) fn go_selected_unresolved_imports(
+    #[doc(hidden)]
+    pub fn go_selected_unresolved_imports(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -652,7 +696,8 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Prepare only this file's package and import context. Other Go files are
     /// admitted by the demand provider when resolution reaches their mounts.
-    pub(crate) fn go_file_import_context(
+    #[doc(hidden)]
+    pub fn go_file_import_context(
         &self,
         context_id: i64,
         path: &str,
@@ -787,7 +832,8 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(GraphFileSkipReason::Unplaced)
     }
 
-    pub(crate) fn go_package_stage_unit_for_path(
+    #[doc(hidden)]
+    pub fn go_package_stage_unit_for_path(
         &self,
         context_id: i64,
         path: &str,
@@ -823,7 +869,26 @@ impl SelectedResolutionOperation<'_, '_> {
         }))
     }
 
-    pub(super) fn go_file_import_context_with_member_cache(
+    pub(super) fn go_file_preparation_key(
+        &self,
+        context_id: i64,
+        caller_mount: SelectedResolutionMountOrdinal,
+        path: &str,
+        source_role: &str,
+    ) -> GoPreparedContextKey {
+        GoPreparedContextKey {
+            kind: GoPreparedContextKind::File,
+            context_id,
+            caller_mount,
+            caller_path: path.to_owned(),
+            source_role: source_role.to_owned(),
+            scope: self.ready.inventory.scope_identity(),
+            stage_epoch: self.ready.inventory.staged_read_epoch(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn go_file_import_context_with_member_cache(
         &self,
         context_id: i64,
         path: &str,
@@ -838,76 +903,81 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GoPreparedImportContextOutcome::Unavailable);
         };
         assert_eq!(source.semantic_language(), Language::Go);
-        let key = (
-            GoPreparedContextKind::File,
-            context_id,
-            source.ordinal(),
-            path.to_owned(),
-            source_role.to_owned(),
-        );
-        if let Some(context) = self.go_prepared_contexts.borrow().get(&key).cloned() {
-            self.record_go_package_inventory_state(&context.package_inventory);
-            return Ok(GoPreparedImportContextOutcome::Ready(Box::new(context)));
-        }
-        let Some(selection) = self.go_context_selection(context_id, source_role)? else {
-            return Ok(GoPreparedImportContextOutcome::Unavailable);
-        };
-        let cache_key = GoPreparedContextCacheKey {
-            kind: GoPreparedContextKind::File,
-            routing_digest: self.ready.inventory.routing_digest(),
-            publication: selection.identity.clone(),
-            caller_mount: source.ordinal(),
-            caller_path: path.to_owned(),
-            source_role: source_role.to_owned(),
-            derivation_version: super::super::go_package_context::DERIVATION_VERSION,
-            active_model_set_hash: self
-                .go_semantic_model_overlay()
-                .map(|overlay| overlay.active_model_set_hash().to_owned()),
-        };
-        if self.ready.context_identities.is_empty()
-            && let Some(cached) = self.ready.store.go_prepared_context_cache().get(&cache_key)
-        {
-            let context = cached
-                .restored_for_request(&self.ready.context_identities, &self.ready.shared_names())?;
-            self.record_go_package_inventory_state(&context.package_inventory);
-            self.go_prepared_contexts
-                .borrow_mut()
-                .insert(key, context.clone());
-            return Ok(GoPreparedImportContextOutcome::Ready(Box::new(context)));
-        }
-        // A cached file context is read only into an empty identity table (the
-        // lookup above). Its snapshot would also carry the request's other
-        // identities. Publish only a context built from an empty table.
-        let publishable = self.ready.context_identities.is_empty();
-        match self.go_import_binding_context_for_selection(
-            context_id,
-            path,
-            source_role,
-            &selection,
-            cancellation,
-            member_cache,
-        )? {
-            GoPreparedImportContextOutcome::Ready(context) => {
-                if publishable
-                    && let Some(snapshot) =
-                        context.cache_snapshot(&self.ready.lexical_source(), cancellation)?
-                {
-                    let cache_value = Arc::new(snapshot);
-                    self.ready
-                        .store
-                        .go_prepared_context_cache()
-                        .insert(cache_key, cache_value);
-                }
-                self.go_prepared_contexts
-                    .borrow_mut()
-                    .insert(key, (*context).clone());
-                Ok(GoPreparedImportContextOutcome::Ready(context))
+        let key = self.go_file_preparation_key(context_id, source.ordinal(), path, source_role);
+        // Keep non-ready outcomes outside the memo. Ordinary read admission
+        // retains a completed preparation even if cancellation prevents its
+        // optional cross-request snapshot at the end of the derivation.
+        let mut outcome = GoPreparedImportContextOutcome::Unavailable;
+        let mut inventory_recorded = false;
+        let prepared = self.go_prepared_contexts.read(key, |_| {
+            let Some(selection) = self.go_context_selection(context_id, source_role)? else {
+                return Ok(None);
+            };
+            let cache_key = GoPreparedContextCacheKey {
+                kind: GoPreparedContextKind::File,
+                routing_digest: self.ready.inventory.routing_digest(),
+                publication: selection.identity.clone(),
+                caller_mount: source.ordinal(),
+                caller_path: path.to_owned(),
+                source_role: source_role.to_owned(),
+                derivation_version: super::super::go_package_context::DERIVATION_VERSION,
+                active_model_set_hash: self
+                    .go_semantic_model_overlay()
+                    .map(|overlay| overlay.active_model_set_hash().to_owned()),
+            };
+            if self.ready.context_identities.is_empty()
+                && let Some(cached) = self.ready.store.go_prepared_context_cache().get(&cache_key)
+            {
+                return Ok(Some(cached.restored_for_request(
+                    &self.ready.context_identities,
+                    &self.ready.shared_names(),
+                )?));
             }
-            outcome => Ok(outcome),
+            // A cached file context is read only into an empty identity table
+            // (the lookup above). Its snapshot would also carry the request's
+            // other identities. Publish only a context built from an empty table.
+            let publishable = self.ready.context_identities.is_empty();
+            match self.go_import_binding_context_for_selection(
+                context_id,
+                path,
+                source_role,
+                &selection,
+                cancellation,
+                member_cache,
+            )? {
+                GoPreparedImportContextOutcome::Ready(context) => {
+                    // The derivation already observed its inventory certificate.
+                    // Memo and snapshot hits must replay it below instead.
+                    inventory_recorded = true;
+                    if publishable
+                        && let Some(snapshot) =
+                            context.cache_snapshot(&self.ready.lexical_source(), cancellation)?
+                    {
+                        let cache_value = Arc::new(snapshot);
+                        self.ready
+                            .store
+                            .go_prepared_context_cache()
+                            .insert(cache_key, cache_value);
+                    }
+                    Ok(Some(*context))
+                }
+                not_ready => {
+                    outcome = not_ready;
+                    Ok(None)
+                }
+            }
+        })?;
+        if let Some(context) = prepared {
+            if !inventory_recorded {
+                self.record_go_package_inventory_state(&context.package_inventory);
+            }
+            return Ok(GoPreparedImportContextOutcome::Ready(Box::new(context)));
         }
+        Ok(outcome)
     }
 
-    pub(crate) fn go_file_import_context_with_role(
+    #[doc(hidden)]
+    pub fn go_file_import_context_with_role(
         &self,
         context_id: i64,
         path: &str,
@@ -1116,7 +1186,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Bind explicit aliases and selected canonical package names in this file.
     /// Positioned prefixes are answered later by the demand-root provider.
     /// Package bindings never establish a nominal receiver type.
-    pub(crate) fn go_import_binding_context(
+    #[doc(hidden)]
+    pub fn go_import_binding_context(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -1323,13 +1394,15 @@ impl SelectedResolutionOperation<'_, '_> {
                 context,
                 demand,
                 package_inventory,
+                blueprint: None,
             },
         )))
     }
 
     /// Test-only oracle for the historical eager qualified-prefix compiler.
-    #[cfg(test)]
-    pub(crate) fn go_eager_import_binding_context(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn go_eager_import_binding_context(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -1374,7 +1447,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Authorize package exports only through definitions actually reached by
     /// the positioned lexical prefix. Local values and types remain blockers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn go_eager_qualified_import_context(
         &self,
         context: SelectedResolutionContextSet,

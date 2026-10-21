@@ -113,6 +113,7 @@ pub(crate) fn load_go_fact_files(
     let mut files: Vec<_> = files
         .into_iter()
         .filter(|file| language_for_file(file) == Language::Go)
+        .filter(|file| !source.workspace_paths.is_outside_selected_modules(file))
         .collect();
     files.sort();
     files.dedup();

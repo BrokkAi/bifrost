@@ -9,10 +9,12 @@ use std::fmt;
 use std::ops::Range;
 use std::str::FromStr;
 
+use brokk_bifrost_analysis::analyzer::Language;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::usages::UsageHitSurface;
 use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
+use brokk_bifrost_rql::query::QueryStep;
 use brokk_bifrost_rql::query::sexp::{
     QueryExprErrorOrigin, code_query_from_expr_with_scope, validate_policy_selector_expr,
 };
@@ -930,6 +932,7 @@ impl Decoder {
                 PolicyRecord::Policy,
                 PolicyRecord::Endpoint,
                 PolicyRecord::EndpointSetDocument,
+                PolicyRecord::DeclarationSelectionDocument,
             ],
             "top-level RQLP document",
         )? {
@@ -958,6 +961,16 @@ impl Decoder {
                 let schema = definition.schema_version;
                 (
                     RqlpDocument::EndpointSet {
+                        definition: Box::new(definition),
+                    },
+                    schema,
+                )
+            }
+            PolicyRecord::DeclarationSelectionDocument => {
+                let definition = self.decode_declaration_selection_document(expr)?;
+                let schema = definition.schema_version;
+                (
+                    RqlpDocument::DeclarationSelection {
                         definition: Box::new(definition),
                     },
                     schema,
@@ -1382,6 +1395,273 @@ impl Decoder {
         })
     }
 
+    /// Decode `(declaration-selection-document ...)` (#5931).
+    ///
+    /// The document is reviewed host configuration that a released policy
+    /// imports, so it admits only exact declaration selectors: inline
+    /// `enclosing-decl` over one function, method, or class with an exact
+    /// name, optionally inside one exactly named owner. Nothing is inferred
+    /// from a file, a comment, a name pattern, or an annotation, and a nested
+    /// file reference would resolve against the scanned checkout, so it is
+    /// rejected rather than followed.
+    fn decode_declaration_selection_document(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<DeclarationSelectionDocument, PolicySourceError> {
+        let context = DecodeContext::DECLARATION_SELECTION;
+        let fields =
+            RecordCursor::parse(expr, PolicyRecord::DeclarationSelectionDocument, context)?;
+        let version_expr = fields.get("schema-version");
+        let authored_version = version_expr
+            .map(|value| {
+                expect_u32(
+                    value,
+                    "declaration-selection document schema version",
+                    false,
+                )
+            })
+            .transpose()?;
+        let schema_version = resolve_policy_schema_version(authored_version).map_err(|error| {
+            source_error(
+                "unsupported-policy-schema-version",
+                version_expr.map_or_else(|| expr.range.clone(), |value| value.range.clone()),
+                error.to_string(),
+            )
+        })?;
+        let language_expr = fields.required("language");
+        let language = decode_declaration_selection_language(language_expr)?;
+        let mut selector_context = PolicySelectorContext {
+            languages: vec![language_expr.clone()],
+            ..PolicySelectorContext::default()
+        };
+        if let Some(version_expr) = fields.get("rql-schema-version") {
+            let version = expect_u32(version_expr, "RQL schema version", false)?;
+            resolve_rql_schema_version(Some(version)).map_err(|error| {
+                source_error(
+                    "unsupported-rql-schema-version",
+                    version_expr.range.clone(),
+                    error.to_string(),
+                )
+            })?;
+            selector_context.schema_version = Some((version, version_expr.range.clone()));
+        }
+        self.selector_context = selector_context;
+        let entries_expr = fields.required("declarations");
+        let entries = expect_vector(
+            entries_expr,
+            "declaration selectors",
+            0,
+            brokk_bifrost_rql::query::MAX_QUERY_BRANCHES,
+        )?;
+        if entries.is_empty() {
+            return Err(source_error(
+                "declaration-selection-empty",
+                entries_expr.range.clone(),
+                "no protected declarations configured: the declaration selection is empty",
+            ));
+        }
+        let mut declarations = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            if records_from_label(list_head(entry)?).any(|record| {
+                matches!(
+                    record,
+                    PolicyRecord::RqlFile
+                        | PolicyRecord::DeclarationSelectionFile
+                        | PolicyRecord::EndpointSetFile
+                )
+            }) {
+                return Err(source_error(
+                    "declaration-selection-nested-import",
+                    entry.range.clone(),
+                    "a declaration selection holds inline selectors only; a nested file reference would resolve against the scanned checkout",
+                ));
+            }
+            let PolicySelector::Inline { schema, query, .. } =
+                self.decode_selector(entry, context, &format!("/declarations/{index}"))?
+            else {
+                unreachable!("nested file references were rejected above");
+            };
+            validate_exact_declaration_selector(&query, language)
+                .map_err(|(code, message)| source_error(code, entry.range.clone(), message))?;
+            declarations.push((schema, query));
+        }
+        declarations
+            .sort_by_cached_key(|(_, query)| query.to_canonical_query_plan_json().to_string());
+        declarations.dedup_by(|(_, left), (_, right)| {
+            left.to_canonical_query_plan_json() == right.to_canonical_query_plan_json()
+        });
+        self.map("/schema_version", version_expr.unwrap_or(expr));
+        self.map("/language", language_expr);
+        self.map("/declarations", entries_expr);
+        Ok(DeclarationSelectionDocument {
+            schema_version,
+            language,
+            declarations,
+        })
+    }
+
+    /// Decode `(declaration-selection-file :path P :language L)` as a row
+    /// binding source. The document is read at activation; the binding is
+    /// typed now from the document contract's shape.
+    fn decode_declaration_selection_file(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<PolicySelector, PolicySourceError> {
+        let fields = RecordCursor::parse(
+            expr,
+            PolicyRecord::DeclarationSelectionFile,
+            DecodeContext::policy(PolicyAnalysisKind::Assertion),
+        )?;
+        if let Some(scope) = self
+            .selector_context
+            .languages
+            .first()
+            .or(self.selector_context.where_globs.first())
+        {
+            let mut diagnostic = source_error(
+                "declaration-selection-scope-conflict",
+                expr.range.clone(),
+                "an imported declaration selection is scoped by its own :language; analysis :languages and :where do not apply to it",
+            )
+            .diagnostic;
+            diagnostic.related.push(PolicySourceRelatedDiagnostic {
+                source: self.identity.clone(),
+                range: scope.range.clone(),
+                message: "analysis selector scope".to_string(),
+            });
+            return Err(PolicySourceError { diagnostic });
+        }
+        let path_expr = fields.required("path");
+        let raw_path = expect_string(
+            path_expr,
+            "declaration-selection document path",
+            MAX_DISPLAY_TEXT_BYTES,
+        )?;
+        let workspace_path = WorkspaceRelativePath::new(&raw_path).map_err(|error| {
+            source_error(
+                "invalid-workspace-path",
+                path_expr.range.clone(),
+                error.to_string(),
+            )
+        })?;
+        if !workspace_path.as_str().ends_with(".rqlp") {
+            return Err(source_error(
+                "invalid-declaration-selection-file-extension",
+                path_expr.range.clone(),
+                "declaration-selection-file path must end in `.rqlp`",
+            ));
+        }
+        let language_expr = fields.required("language");
+        let language = decode_declaration_selection_language(language_expr)?;
+        let schema = match &self.selector_context.schema_version {
+            Some((version, _)) => SchemaVersionResolution {
+                version: *version,
+                origin: SchemaVersionOrigin::Explicit,
+            },
+            None => resolve_rql_schema_version(None)
+                .expect("the compiled-in RQL schema lineage has a compatible head"),
+        };
+        let shape_expr =
+            parse_sexp_with_limits(DECLARATION_SELECTION_SHAPE, SexpParseLimits::default())
+                .ok()
+                .and_then(|parsed| parsed.expr)
+                .expect("the declaration-selection shape parses");
+        let shape = code_query_from_expr_with_scope(
+            &shape_expr,
+            schema,
+            std::slice::from_ref(language_expr),
+            &[],
+        )
+        .expect("the declaration-selection shape is a valid query in every language");
+        self.map(format!("{path}/path"), path_expr);
+        self.map(format!("{path}/language"), language_expr);
+        debug_assert!(self.selector_paths.insert(path.to_string()));
+        Ok(PolicySelector::DeclarationSelection(
+            DeclarationSelectionReference {
+                path: workspace_path,
+                language,
+                output: DeclarationSelectionOutput::Declarations,
+                shape,
+                range: expr.range.clone(),
+            },
+        ))
+    }
+
+    /// Decode `(procedure-effects-of :binding NAME)`: the procedure effects
+    /// of exactly the declarations an earlier binding selects. Deriving the
+    /// effect input from that binding, rather than restating its selection,
+    /// is what keeps the two from drifting apart.
+    fn decode_procedure_effects_of(
+        &mut self,
+        expr: &Expr,
+        earlier: &[RowBinding],
+        path: &str,
+    ) -> Result<PolicySelector, PolicySourceError> {
+        let fields = RecordCursor::parse(
+            expr,
+            PolicyRecord::ProcedureEffectsOf,
+            DecodeContext::policy(PolicyAnalysisKind::Assertion),
+        )?;
+        let binding_expr = fields.required("binding");
+        let name: RowBindingName = parse_identifier(binding_expr, "row binding name")?;
+        let binding = earlier
+            .iter()
+            .find(|binding| binding.name == name)
+            .ok_or_else(|| {
+                source_error(
+                    "unknown-row-binding",
+                    binding_expr.range.clone(),
+                    format!(
+                        "procedure-effects-of names `{name}`, which is not an earlier row binding"
+                    ),
+                )
+            })?;
+        let RowBindingSource::Query(selector) = &binding.source;
+        let derived = match selector {
+            PolicySelector::Inline {
+                schema,
+                query,
+                resolved_locators,
+            } => {
+                let mut query = query.clone();
+                query.plan.steps.push(QueryStep::ProcedureEffects);
+                query.validate_row_fields().map_err(|error| {
+                    source_error(
+                        "invalid-procedure-effects-input",
+                        binding_expr.range.clone(),
+                        format!("binding `{name}` cannot feed procedure-effects: {error}"),
+                    )
+                })?;
+                PolicySelector::Inline {
+                    schema: *schema,
+                    query,
+                    resolved_locators: resolved_locators.clone(),
+                }
+            }
+            PolicySelector::DeclarationSelection(reference)
+                if reference.output == DeclarationSelectionOutput::Declarations =>
+            {
+                let mut reference = reference.clone();
+                reference.output = DeclarationSelectionOutput::ProcedureEffects;
+                reference.shape.plan.steps.push(QueryStep::ProcedureEffects);
+                PolicySelector::DeclarationSelection(reference)
+            }
+            PolicySelector::DeclarationSelection(_) | PolicySelector::File { .. } => {
+                return Err(source_error(
+                    "invalid-procedure-effects-input",
+                    binding_expr.range.clone(),
+                    format!(
+                        "procedure-effects-of needs a binding over an inline rql query or a declaration-selection-file; `{name}` is neither"
+                    ),
+                ));
+            }
+        };
+        self.map(format!("{path}/binding"), binding_expr);
+        debug_assert!(self.selector_paths.insert(path.to_string()));
+        Ok(derived)
+    }
+
     fn decode_analysis(
         &mut self,
         expr: &Expr,
@@ -1523,7 +1803,10 @@ impl Decoder {
                 ],
                 "relational assertion plan entry",
             )? {
-                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry)?),
+                PolicyRecord::Bind => {
+                    let binding = self.decode_row_binding(entry, &bindings)?;
+                    bindings.push(binding);
+                }
                 PolicyRecord::Join => joins.push(decode_row_join(entry)?),
                 PolicyRecord::Group => groups.push(decode_row_group(entry)?),
                 PolicyRecord::RowAssert => assertions.push(decode_row_assertion(entry)?),
@@ -1576,19 +1859,30 @@ impl Decoder {
         })
     }
 
-    fn decode_row_binding(&mut self, expr: &Expr) -> Result<RowBinding, PolicySourceError> {
-        let fields = RecordCursor::parse(
-            expr,
-            PolicyRecord::Bind,
-            DecodeContext::policy(PolicyAnalysisKind::Assertion),
-        )?;
+    fn decode_row_binding(
+        &mut self,
+        expr: &Expr,
+        earlier: &[RowBinding],
+    ) -> Result<RowBinding, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Assertion);
+        let fields = RecordCursor::parse(expr, PolicyRecord::Bind, context)?;
         let name = parse_identifier(fields.required("name"), "row binding name")?;
         let selector_path = relational_binding_selector_path(&name);
-        let source = RowBindingSource::Query(self.decode_selector(
-            fields.required("query"),
-            DecodeContext::policy(PolicyAnalysisKind::Assertion),
-            &selector_path,
-        )?);
+        let query = fields.required("query");
+        let selector = match select_record(
+            query,
+            PolicyValueShape::RowBindingQuery.accepted_records(),
+            "row binding query",
+        )? {
+            PolicyRecord::DeclarationSelectionFile => {
+                self.decode_declaration_selection_file(query, &selector_path)?
+            }
+            PolicyRecord::ProcedureEffectsOf => {
+                self.decode_procedure_effects_of(query, earlier, &selector_path)?
+            }
+            _ => self.decode_selector(query, context, &selector_path)?,
+        };
+        let source = RowBindingSource::Query(selector);
         Ok(RowBinding {
             name,
             source,
@@ -4838,6 +5132,12 @@ impl DecodeContext {
         record: PolicyRecordContext::Ordinary,
     };
 
+    const DECLARATION_SELECTION: Self = Self {
+        document: RqlpDocumentKind::DeclarationSelection,
+        analysis: None,
+        record: PolicyRecordContext::Ordinary,
+    };
+
     const fn policy(analysis: PolicyAnalysisKind) -> Self {
         Self {
             document: RqlpDocumentKind::Policy,
@@ -5068,6 +5368,98 @@ fn expect_record_head(expr: &Expr, record: PolicyRecord) -> Result<&[Expr], Poli
         ));
     }
     Ok(expr.as_list().expect("list_head proved this is a list"))
+}
+
+/// A query of the declaration-selection document contract's exact form. It
+/// types a binding before activation and is never executed.
+const DECLARATION_SELECTION_SHAPE: &str =
+    r#"(enclosing-decl (function :name "declaration-selection"))"#;
+
+fn decode_declaration_selection_language(expr: &Expr) -> Result<Language, PolicySourceError> {
+    let label = expect_token(expr, "declaration-selection language")?;
+    let languages = expand_language_labels(&[label]).map_err(|error| {
+        source_error(
+            "invalid-language-label",
+            expr.range.clone(),
+            format!("unknown analyzer language `{label}`: {error}"),
+        )
+    })?;
+    let [language] = languages.as_slice() else {
+        return Err(source_error(
+            "declaration-selection-language",
+            expr.range.clone(),
+            format!(
+                "a declaration selection names one concrete language, not the family `{label}`"
+            ),
+        ));
+    };
+    Ok(*language)
+}
+
+/// Accept exactly `(enclosing-decl DECLARATION)` or `(enclosing-decl
+/// (inside-decl OWNER DECLARATION))`, where each pattern is a function,
+/// method, or class with an exact name and nothing else, scoped to the
+/// document's one language.
+///
+/// The check reads the canonical query projection, so every constraint a
+/// future RQL pattern field adds is rejected until it is admitted here.
+fn validate_exact_declaration_selector(
+    query: &brokk_bifrost_rql::structural::CodeQuery,
+    language: Language,
+) -> Result<(), (&'static str, String)> {
+    const NOT_EXACT: &str = "declaration-selection-not-exact";
+    let not_exact = |detail: &str| {
+        Err((
+            NOT_EXACT,
+            format!(
+                "a declaration selector must be `(enclosing-decl DECLARATION)` or `(enclosing-decl (inside-decl OWNER DECLARATION))` over a function, method, or class with an exact :name; {detail}"
+            ),
+        ))
+    };
+    let plan = query.to_canonical_query_plan_json();
+    let serde_json::Value::Object(plan) = plan else {
+        unreachable!("canonical query plans are JSON objects");
+    };
+    if plan.get("languages") != Some(&serde_json::json!([language.config_label()])) {
+        return Err((
+            "declaration-selection-wrong-language",
+            format!(
+                "a declaration selector must select only `{}` declarations",
+                language.config_label()
+            ),
+        ));
+    }
+    if !matches!(query.plan.steps.as_slice(), [QueryStep::EnclosingDecl]) {
+        return not_exact("this selector is not one enclosing-decl step");
+    }
+    for key in plan.keys() {
+        if !matches!(
+            key.as_str(),
+            "languages" | "match" | "inside_decl" | "steps" | "schema_version"
+        ) {
+            return not_exact(&format!("`{key}` is not an exact declaration constraint"));
+        }
+    }
+    let exact_pattern = |pattern: Option<&serde_json::Value>| {
+        let Some(serde_json::Value::Object(pattern)) = pattern else {
+            return false;
+        };
+        pattern.len() == 2
+            && matches!(
+                pattern.get("kind").and_then(serde_json::Value::as_str),
+                Some("function" | "method" | "class")
+            )
+            && pattern
+                .get("name")
+                .is_some_and(serde_json::Value::is_string)
+    };
+    if !exact_pattern(plan.get("match")) {
+        return not_exact("the declaration pattern carries another constraint or no exact name");
+    }
+    if plan.contains_key("inside_decl") && !exact_pattern(plan.get("inside_decl")) {
+        return not_exact("the owner pattern carries another constraint or no exact name");
+    }
+    Ok(())
 }
 
 fn select_record(

@@ -1,0 +1,2912 @@
+//! Selected Rust caller queries with demand-driven resolution and exact proofs.
+
+use crate::analyzer::rust::RustAnalyzer;
+
+use crate::analyzer::rust::selected_projection::RustSelectedReferenceFile;
+
+use crate::analyzer::rust::selected_projection::rust_selected_usage_kind;
+
+use brokk_bifrost_core::cancellation::CancellationToken;
+
+use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse_nomination::ReverseCandidateSet as RustReverseCandidateSet;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse_rows::RustReverseConfirmation;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::RustReverseRequest;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::SelectedRustReverseBatchOutcome;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::SelectedRustReverseQueries;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::SelectedRustTargetReferences;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse_rows::confirm_rust_reverse_references;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
+
+use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+
+use brokk_bifrost_analysis::analyzer::store::Result;
+
+use brokk_bifrost_analysis::analyzer::store::StoreError;
+
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
+
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeDerivationResult;
+
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason;
+
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeSite;
+
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdgeRow;
+
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::classify_owner_relation;
+
+use brokk_bifrost_core::analyzer::structural::edges::EdgeProvenance;
+
+use brokk_bifrost_core::analyzer::structural::edges::SiteClass;
+
+use brokk_bifrost_core::analyzer::usages::model::UsageProof;
+
+use brokk_bifrost_core::analyzer::model::CodeUnit;
+
+use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::hash::HashMap;
+
+use brokk_bifrost_core::hash::HashSet;
+
+#[derive(Debug)]
+pub enum RustSelectedReverseOutcome<T> {
+    Ready(T),
+    Unavailable(String),
+    Stale(String),
+    Cancelled,
+    StoreError(String),
+}
+
+/// Diagnostic work after selected context construction. This is not total
+/// operation work: topology, prefixes, SQL and file admission are not measured.
+/// Source paths record successful materialization, not failed read attempts.
+/// Target metrics cover returned answers; unfinished target evaluation is not
+/// represented by an invented zero-work answer.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RustSelectedReverseWork {
+    pub(crate) targets: Vec<(
+        CodeUnit,
+        brokk_bifrost_analysis::analyzer::resolution::fact_resolution::FactReverseResolutionMetrics,
+    )>,
+    pub(crate) definition_mount_reads: usize,
+    pub(crate) classification_sources: Vec<ProjectFile>,
+}
+
+pub trait RustSelectedReverseQueries {
+    /// The project's analysis generation, as this selected operation captured
+    /// it when it opened.
+    fn analysis_generation(&self) -> u64;
+
+    /// Enumerate each target's reverse candidates once, in target order. The
+    /// sets are plain data, so a caller may keep them past this selected
+    /// operation and hand them to `inverse_for_candidates` in a later one.
+    fn candidate_sets(
+        &mut self,
+        targets: &[CodeUnit],
+    ) -> Result<Option<Vec<RustReverseCandidateSet>>>;
+    fn rust_cfg_activation_for_caller_under_site_cfg(
+        &mut self,
+        caller: &std::path::Path,
+        condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(
+            brokk_bifrost_rust::selected_context::RustSelectedActivation,
+            bool,
+        )>,
+    >;
+    /// Query one frontier batch with the sets `candidate_sets` returned for
+    /// these targets. None is an operational stop, whose typed reason is
+    /// retained by the enclosing selected operation.
+    fn inverse_for_candidates(
+        &mut self,
+        targets: &[CodeUnit],
+        candidates: &[RustReverseCandidateSet],
+    ) -> Result<Option<Vec<EdgeDerivationResult>>>;
+
+    /// Enumerate and query one frontier batch, for a caller that holds no
+    /// prepared sets: each target's set is enumerated once, here.
+    fn inverse_for(&mut self, targets: &[CodeUnit]) -> Result<Option<Vec<EdgeDerivationResult>>> {
+        let Some(candidates) = self.candidate_sets(targets)? else {
+            return Ok(None);
+        };
+        self.inverse_for_candidates(targets, &candidates)
+    }
+
+    #[cfg(test)]
+    fn work_report(&self) -> RustSelectedReverseWork;
+
+    #[cfg(test)]
+    fn begin_sql_work_trace(&self);
+
+    #[cfg(test)]
+    fn finish_sql_work_trace(&self) -> (usize, usize);
+
+    fn incoming_calls_for(
+        &mut self,
+        targets: &[CodeUnit],
+        limits: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits,
+    ) -> Result<
+        Option<Vec<brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult>>,
+    >;
+}
+
+struct RustReverseProjection<'query, 'analyzer> {
+    rust: &'analyzer RustAnalyzer,
+    queries: &'query mut dyn SelectedRustReverseQueries,
+    cancellation: &'query CancellationToken,
+    generation: u64,
+    files: HashMap<ProjectFile, RustSelectedReferenceFile<'analyzer>>,
+    #[cfg(test)]
+    work: RustSelectedReverseWork,
+}
+
+impl RustSelectedReverseQueries for RustReverseProjection<'_, '_> {
+    fn analysis_generation(&self) -> u64 {
+        self.queries.analysis_generation()
+    }
+
+    fn candidate_sets(
+        &mut self,
+        targets: &[CodeUnit],
+    ) -> Result<Option<Vec<RustReverseCandidateSet>>> {
+        self.queries.candidate_sets(targets)
+    }
+    fn rust_cfg_activation_for_caller_under_site_cfg(
+        &mut self,
+        caller: &std::path::Path,
+        condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(
+            brokk_bifrost_rust::selected_context::RustSelectedActivation,
+            bool,
+        )>,
+    > {
+        self.queries
+            .rust_cfg_activation_for_caller_under_site_cfg(caller, condition, cancellation)
+    }
+    #[cfg(test)]
+    fn work_report(&self) -> RustSelectedReverseWork {
+        RustSelectedReverseWork {
+            definition_mount_reads: self.queries.definition_mount_read_count(),
+            ..self.work.clone()
+        }
+    }
+
+    #[cfg(test)]
+    fn begin_sql_work_trace(&self) {
+        self.queries.begin_sql_work_trace();
+    }
+
+    #[cfg(test)]
+    fn finish_sql_work_trace(&self) -> (usize, usize) {
+        self.queries.finish_sql_work_trace()
+    }
+
+    fn incoming_calls_for(
+        &mut self,
+        targets: &[CodeUnit],
+        limits: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits,
+    ) -> Result<
+        Option<Vec<brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult>>,
+    > {
+        let Some(candidates) = self.queries.candidate_sets(targets)? else {
+            return Ok(None);
+        };
+        let answers =
+            match self
+                .queries
+                .references_to(targets, &candidates, RustReverseRequest::CallSites)?
+            {
+                SelectedRustReverseBatchOutcome::Ready(answers) => answers,
+                SelectedRustReverseBatchOutcome::Unavailable(_)
+                | SelectedRustReverseBatchOutcome::Cancelled => return Ok(None),
+            };
+        let mut results = Vec::with_capacity(answers.len());
+        for answer in answers {
+            let target = answer.target.clone();
+            let mut references = Vec::new();
+            let rows = self.project_references(answer, |reference| references.push(reference))?;
+            let Some(result) =
+                crate::analyzer::rust::native_call_projection::project_rust_rich_call_relation(
+                    self.rust,
+                    &target,
+                    &rows,
+                    &references,
+                    self.queries,
+                    limits,
+                    self.cancellation,
+                )?
+            else {
+                return Ok(None);
+            };
+            results.push(result);
+        }
+        Ok(Some(results))
+    }
+
+    fn inverse_for_candidates(
+        &mut self,
+        targets: &[CodeUnit],
+        candidates: &[RustReverseCandidateSet],
+    ) -> Result<Option<Vec<EdgeDerivationResult>>> {
+        let answers =
+            match self
+                .queries
+                .references_to(targets, candidates, RustReverseRequest::References)?
+            {
+                SelectedRustReverseBatchOutcome::Ready(answers) => answers,
+                SelectedRustReverseBatchOutcome::Unavailable(_)
+                | SelectedRustReverseBatchOutcome::Cancelled => return Ok(None),
+            };
+        let mut results = Vec::with_capacity(answers.len());
+        for answer in answers {
+            if self.cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            results.push(self.project(answer)?);
+        }
+        // File classifiers belong to this frontier request, including their
+        // structural snapshots and interval indexes. Adaptive callers retain
+        // projected edges, not the classifiers of previous frontiers.
+        self.files = HashMap::default();
+        Ok(Some(results))
+    }
+}
+
+impl RustReverseProjection<'_, '_> {
+    fn project(&mut self, answer: SelectedRustTargetReferences) -> Result<EdgeDerivationResult> {
+        self.project_references(answer, |_| {})
+    }
+
+    fn project_references(
+        &mut self,
+        answer: SelectedRustTargetReferences,
+        mut retain_reference: impl FnMut(
+            brokk_bifrost_analysis::analyzer::resolution::model::SemanticId,
+        ),
+    ) -> Result<EdgeDerivationResult> {
+        #[cfg(test)]
+        self.work
+            .targets
+            .push((answer.target.clone(), answer.metrics));
+        debug_assert_eq!(
+            answer.metrics.published_reference_count(),
+            answer.search.source_sites().len(),
+            "reverse source projection must preserve every published reference"
+        );
+        let bindings = answer
+            .bindings
+            .iter()
+            .map(|binding| (binding.reference(), binding))
+            .collect::<HashMap<_, _>>();
+        let mut reasons = Vec::new();
+        // `InverseIndexResolutionIncomplete` says the site inventory may be
+        // missing sites; it does not say that an enumerated site is undecided.
+        // The search completion is exactly the inventory's gaps: a blob whose
+        // references could not be enumerated, a candidate site dropped by an
+        // owned forward rejection, a budget stop before every blob was
+        // confirmed. A site that was enumerated and attributed publishes its
+        // own doubt through its row's `proof`, so an incomplete binding on a
+        // retained site leaves the inventory complete and the site unproven.
+        if answer.search.completion() != &ResolutionCompletion::Complete {
+            reasons.push(EdgeIncompleteReason::InverseIndexResolutionIncomplete);
+            if matches!(
+                answer.search.completion(),
+                ResolutionCompletion::Incomplete(completion_reasons)
+                    if completion_reasons.iter().any(|reason| matches!(
+                        reason,
+                        crate::analyzer::resolution::ResolutionIncompleteReason::TimeBudgetExceeded(_)
+                    ))
+            ) {
+                reasons.push(EdgeIncompleteReason::TimeBudgetExceeded);
+            }
+        }
+        let mut edges = Vec::with_capacity(answer.search.source_sites().len());
+        for site in answer.search.source_sites() {
+            if self.cancellation.is_cancelled() {
+                break;
+            }
+            let binding = bindings.get(&site.reference()).ok_or_else(|| {
+                StoreError::new(format!(
+                    "selected reverse site {} has no forward binding evidence",
+                    site.reference()
+                ))
+            })?;
+            let Some(metadata) = site.metadata() else {
+                if !reasons.contains(&EdgeIncompleteReason::InverseIndexMetadataIncomplete) {
+                    reasons.push(EdgeIncompleteReason::InverseIndexMetadataIncomplete);
+                }
+                continue;
+            };
+            let enclosing = match site.enclosing() {
+                Some(owner) => owner.cloned(),
+                None => {
+                    if !reasons.contains(&EdgeIncompleteReason::InverseIndexMetadataIncomplete) {
+                        reasons.push(EdgeIncompleteReason::InverseIndexMetadataIncomplete);
+                    }
+                    None
+                }
+            };
+            if !self.files.contains_key(site.file()) {
+                let source = self.rust.indexed_source(site.file()).ok_or_else(|| {
+                    StoreError::new(format!(
+                        "selected Rust reverse site has no indexed source for {:?}",
+                        site.file()
+                    ))
+                })?;
+                #[cfg(test)]
+                self.work.classification_sources.push(site.file().clone());
+                self.files.insert(
+                    site.file().clone(),
+                    RustSelectedReferenceFile::new(self.rust, site.file(), &source),
+                );
+            }
+            let file = self
+                .files
+                .get(site.file())
+                .expect("selected reference file was installed");
+            let owner_relation =
+                classify_owner_relation(self.rust, enclosing.as_ref(), &answer.target);
+            let reference_kind = if binding.type_identity_observation() {
+                Some(brokk_bifrost_core::analyzer::usages::model::ReferenceKind::SelfTypeAlias)
+            } else {
+                file.classifier.as_ref().and_then(|classifier| {
+                    classifier.classify_reference_kind(
+                        metadata.start_byte(),
+                        metadata.end_byte(),
+                        &answer.target,
+                    )
+                })
+            };
+            let ast_id = file.classifier.as_ref().and_then(|classifier| {
+                classifier.ast_id(metadata.start_byte(), metadata.end_byte())
+            });
+            retain_reference(site.reference());
+            edges.push(ReferenceEdgeRow {
+                site: EdgeSite {
+                    file: site.file().clone(),
+                    range: file.range(metadata.start_byte(), metadata.end_byte()),
+                    ast_id,
+                    enclosing,
+                },
+                target: answer.target.clone(),
+                reference_kind,
+                proof: if (binding.definitions().len() == 1
+                    || (binding.type_bound_receiver() && !binding.definitions().is_empty()))
+                    && binding.completion() == &ResolutionCompletion::Complete
+                {
+                    UsageProof::Proven
+                } else {
+                    UsageProof::Unproven
+                },
+                ambiguous_candidate: false,
+                usage_kind: rust_selected_usage_kind(metadata, owner_relation, &answer.target),
+                site_class: SiteClass::UseSite,
+                owner_relation,
+                provenance: EdgeProvenance::Inverse,
+                generation: self.generation,
+            });
+        }
+        Ok(EdgeDerivationResult {
+            edges,
+            completeness: if reasons.is_empty() {
+                EdgeCompleteness::Complete
+            } else {
+                EdgeCompleteness::Incomplete { reasons }
+            },
+            provenance: EdgeProvenance::Inverse,
+            generation: self.generation,
+        })
+    }
+}
+
+/// Stage an adaptive reverse consumer inside one selected operation. The
+/// callback must return its staged result; only Ready authorizes its use.
+pub fn with_rust_selected_reverse_queries<T>(
+    rust: &RustAnalyzer,
+    cancellation: &CancellationToken,
+    run: impl FnOnce(&mut dyn RustSelectedReverseQueries) -> Result<T>,
+) -> RustSelectedReverseOutcome<T> {
+    with_rust_selected_reverse_reference_admission(
+        rust,
+        None,
+        cancellation,
+        |operation, root, locators| {
+            confirm_rust_reverse_references(operation, root, locators, cancellation)
+        },
+        run,
+    )
+}
+
+/// Bound result-site discovery to admitted files without removing definitions,
+/// imports, or receiver producers in the rest of the selected workspace.
+pub(crate) fn with_rust_selected_reverse_queries_in_files<T>(
+    rust: &RustAnalyzer,
+    admitted_files: &HashSet<ProjectFile>,
+    cancellation: &CancellationToken,
+    run: impl FnOnce(&mut dyn RustSelectedReverseQueries) -> Result<T>,
+) -> RustSelectedReverseOutcome<T> {
+    with_rust_selected_reverse_reference_admission(
+        rust,
+        Some(admitted_files),
+        cancellation,
+        |operation, root, locators| {
+            confirm_rust_reverse_references(operation, root, locators, cancellation)
+        },
+        run,
+    )
+}
+
+fn with_rust_selected_reverse_reference_admission<T>(
+    rust: &RustAnalyzer,
+    admitted_files: Option<&HashSet<ProjectFile>>,
+    cancellation: &CancellationToken,
+    confirm: impl for<'confirm_store, 'confirm_input> Fn(
+        &mut SelectedResolutionOperation<'confirm_store, 'confirm_input>,
+        &std::path::Path,
+        &[&brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator],
+    ) -> Result<RustReverseConfirmation>
+    + Sync,
+    run: impl FnOnce(&mut dyn RustSelectedReverseQueries) -> Result<T>,
+) -> RustSelectedReverseOutcome<T> {
+    let _timing = brokk_bifrost_core::profiling::scope("rust_selected::reverse_queries");
+    if cancellation.is_cancelled() {
+        return RustSelectedReverseOutcome::Cancelled;
+    }
+    // The in-memory store fallback serializes reads through its writer
+    // connection. A selected reverse operation retains that connection while
+    // it forward-confirms candidate sites; forward analysis can request
+    // structural facts from Rayon workers, which would otherwise wait on the
+    // connection held by their caller. Warm the bounded candidate set before
+    // opening the operation so those workers hit the analyzer's fact cache.
+    if rust.inner.analyzer_store().uses_single_connection_reads()
+        && let Some(files) = admitted_files
+    {
+        let providers = rust.structural_fact_providers();
+        for provider in providers {
+            for file in files {
+                if cancellation.is_cancelled() {
+                    return RustSelectedReverseOutcome::Cancelled;
+                }
+                let _ = provider.structural_facts(file);
+            }
+        }
+    }
+    let snapshots = rust.inner.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+    let (masks, content_mounts) = match rust
+        .inner
+        .selected_rust_resolution_overlay_inputs(snapshots.as_ref(), cancellation)
+    {
+        Ok(SelectedResolutionOverlayInputsOutcome::Ready {
+            masks,
+            content_mounts,
+        }) => (masks, content_mounts),
+        Ok(SelectedResolutionOverlayInputsOutcome::Unavailable(reason)) => {
+            return RustSelectedReverseOutcome::Unavailable(format!("{reason:?}"));
+        }
+        Ok(SelectedResolutionOverlayInputsOutcome::Stale(reason)) => {
+            return RustSelectedReverseOutcome::Stale(format!("{reason:?}"));
+        }
+        Ok(SelectedResolutionOverlayInputsOutcome::Cancelled) => {
+            return RustSelectedReverseOutcome::Cancelled;
+        }
+        Err(error) => return RustSelectedReverseOutcome::StoreError(error.to_string()),
+    };
+    let input = SelectedResolutionOperationInput::new(
+        rust.inner.project(),
+        rust.inner.workspace_id(),
+        snapshots.as_ref(),
+        &languages,
+        &masks,
+    )
+    .with_content_mounts(content_mounts);
+    let open_timing = brokk_bifrost_core::profiling::scope("rust_selected::reverse_open");
+    let operation = match rust
+        .inner
+        .analyzer_store()
+        .open_selected_resolution_operation(input, cancellation)
+    {
+        Ok(SelectedResolutionOperationOpenOutcome::Ready(operation)) => *operation,
+        Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason)) => {
+            return RustSelectedReverseOutcome::Unavailable(format!("{reason:?}"));
+        }
+        Ok(SelectedResolutionOperationOpenOutcome::Stale(reason)) => {
+            return RustSelectedReverseOutcome::Stale(format!("{reason:?}"));
+        }
+        Ok(SelectedResolutionOperationOpenOutcome::Cancelled) => {
+            return RustSelectedReverseOutcome::Cancelled;
+        }
+        Err(error) => return RustSelectedReverseOutcome::StoreError(error.to_string()),
+    };
+    drop(open_timing);
+    let _query_timing =
+        brokk_bifrost_core::profiling::scope("rust_selected::reverse_frontier_queries");
+    let generation = rust.inner.project().analysis_generation();
+    let query = |queries: &mut dyn SelectedRustReverseQueries| {
+        run(&mut RustReverseProjection {
+            rust,
+            queries,
+            cancellation,
+            generation,
+            files: HashMap::default(),
+            #[cfg(test)]
+            work: RustSelectedReverseWork::default(),
+        })
+    };
+    let result =
+        operation.with_rust_row_reverse_queries(admitted_files, cancellation, confirm, query);
+    match result {
+        Ok(SelectedResolutionOperationOutcome::Native(value)) => {
+            RustSelectedReverseOutcome::Ready(value)
+        }
+        Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => {
+            RustSelectedReverseOutcome::Unavailable(format!("{reason:?}"))
+        }
+        Ok(SelectedResolutionOperationOutcome::Stale(reason)) => {
+            RustSelectedReverseOutcome::Stale(format!("{reason:?}"))
+        }
+        Ok(SelectedResolutionOperationOutcome::Cancelled(_)) => {
+            RustSelectedReverseOutcome::Cancelled
+        }
+        Err(error) => RustSelectedReverseOutcome::StoreError(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::analyzer::rust::selected_reverse::*;
+
+    use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::reset_selected_fact_operation_construction_count_for_test;
+
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::selected_fact_operation_construction_count_for_test;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn reverse_domain_keeps_shared_root_authorities_without_candidate_hits() {
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname='dual'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='src/shared.rs'\n[[bin]]\nname='dual-cli'\npath='src/shared.rs'\n")
+            .file("src/shared.rs", "mod unused; pub fn target() {} fn main() {}")
+            .file("src/unused.rs", "pub fn unrelated() {}")
+            .build();
+        let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                analyzer.analyzer(),
+            )
+            .unwrap();
+        let snapshots = rust.inner.selected_workspace_snapshots();
+        let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+        let input = SelectedResolutionOperationInput::new(
+            rust.inner.project(),
+            rust.inner.workspace_id(),
+            snapshots.as_ref(),
+            &languages,
+            &[],
+        );
+        let cancellation = CancellationToken::new();
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = rust
+            .inner
+            .analyzer_store()
+            .open_selected_resolution_operation(input, &cancellation)
+            .unwrap()
+        else {
+            panic!("the fixture has one current selected workspace");
+        };
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse_rows::assert_shared_reverse_domain_for_test(
+            &operation,
+        );
+    }
+
+    type ReverseStoreContextFactory = fn(
+        &dyn brokk_bifrost_core::analyzer::project::Project,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::AnalyzerStoreContext,
+    >;
+
+    #[test]
+    fn reverse_macro_generated_callers_equal_across_worker_counts() {
+        check_reverse_macro_generated_callers(
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::scoped_store_context,
+        );
+    }
+
+    #[test]
+    #[ignore = "finds real bug: #6018 writer-only projection re-enters the selected operation's writer"]
+    #[hardwon("#6018: writer-only macro confirmation recursively acquires the selected writer")]
+    fn reverse_macro_generated_callers_equal_across_worker_counts_writer_only() {
+        check_reverse_macro_generated_callers(
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test,
+        );
+    }
+
+    fn check_reverse_macro_generated_callers(comparison_store: ReverseStoreContextFactory) {
+        let mut builder = InlineTestProject::with_language(Language::Rust).file(
+            "Cargo.toml",
+            "[package]\nname='parallel_reverse'\nversion='0.1.0'\nedition='2024'\n",
+        );
+        let mut root = "pub fn target() {}\n".to_owned();
+        for index in 0..12 {
+            root.push_str(&format!("mod caller_{index};\n"));
+            builder = builder.file(
+                format!("src/caller_{index}.rs"),
+                format!(
+                    "macro_rules! caller {{ ($name:ident) => {{ pub fn $name() {{ crate::target(); }} }}; }}\ncaller!(generated_{index});\npub fn direct_{index}() {{ crate::target(); }}\n"
+                ),
+            );
+        }
+        let fixture = builder.file("src/lib.rs", root).build();
+        let project = fixture.project_dyn();
+        let context = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::scoped_store_context(
+            project.as_ref(),
+        )
+        .expect("disk store for independent confirmation readers");
+        let rust = RustAnalyzer::new_with_config_store_context(
+            project,
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .expect("build selected Rust fixture");
+        assert!(!rust.inner.analyzer_store().uses_single_connection_reads());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .expect("fixture target");
+        let admitted = rust.analyzed_files().into_iter().collect::<HashSet<_>>();
+        let run = |rust: &RustAnalyzer, width, cancellation: CancellationToken| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap()
+                .install(|| {
+                    assert_eq!(rayon::current_num_threads(), width);
+                    let outcome = with_rust_selected_reverse_reference_admission(
+                        rust,
+                        Some(&admitted),
+                        &cancellation,
+                        |operation, root, locators| {
+                            confirm_rust_reverse_references(
+                                operation,
+                                root,
+                                locators,
+                                &cancellation,
+                            )
+                        },
+                        |queries| {
+                            let answers = queries.inverse_for(std::slice::from_ref(&target))?;
+                            Ok((answers, queries.work_report()))
+                        },
+                    );
+                    let RustSelectedReverseOutcome::Ready((Some(mut answers), work)) = outcome
+                    else {
+                        panic!("macro caller reverse query did not complete: {outcome:?}");
+                    };
+                    assert_eq!(answers.len(), 1);
+                    let answer = answers.pop().expect("one target");
+                    (answer.edges, answer.completeness, work)
+                })
+        };
+        let sequential = run(&rust, 1, CancellationToken::new());
+        let parallel = run(&rust, 4, CancellationToken::new());
+        assert!(
+            sequential.0.len() >= 12,
+            "each generated caller must be retained: {sequential:?}"
+        );
+        assert_eq!(sequential, parallel);
+        let comparison_context = comparison_store(fixture.project_dyn().as_ref()).unwrap();
+        let comparison = RustAnalyzer::new_with_config_store_context(
+            fixture.project_dyn(),
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            comparison_context,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sequential, run(&comparison, 1, CancellationToken::new()));
+        assert_eq!(sequential, run(&comparison, 4, CancellationToken::new()));
+        // Force the rich incoming projection to recheck each retained binding,
+        // rather than allowing the initial complete reverse proof to skip it.
+        let incoming = |rust: &RustAnalyzer, width| {
+            rayon::ThreadPoolBuilder::new().num_threads(width).build().unwrap().install(|| {
+                let cancellation = CancellationToken::new();
+                let confirmed_files = std::sync::Mutex::new(HashSet::default());
+                let rechecks = std::sync::atomic::AtomicUsize::new(0);
+                let outcome = with_rust_selected_reverse_reference_admission(
+                    rust, Some(&admitted), &cancellation,
+                    |operation, root, locators| {
+                        let initial = confirmed_files.lock().unwrap().insert(locators[0].relative_path().to_owned());
+                        let mut confirmation = confirm_rust_reverse_references(operation, root, locators, &cancellation)?;
+                        if initial && let RustReverseConfirmation::Ready(answers) = &mut confirmation {
+                            for answer in answers.iter_mut().flat_map(|report| report.answers_mut()) {
+                                if answer.definitions.contains(&target)
+                                    && let Some(&definition) = answer.resolution.binding().targets().first()
+                                {
+                                    answer.resolution.combine_binding_completion(&ResolutionCompletion::incomplete([
+                                        brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
+                                    ]));
+                                }
+                            }
+                        } else if !initial {
+                            rechecks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(confirmation)
+                    },
+                    |queries| queries.incoming_calls_for(std::slice::from_ref(&target), brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits {
+                        max_files: 32, max_source_bytes: 64 * 1024, max_candidates: 128,
+                    }),
+                );
+                let RustSelectedReverseOutcome::Ready(Some(mut answers)) = outcome else {
+                    panic!("rich incoming recheck did not complete: {outcome:?}");
+                };
+                assert_eq!(answers.len(), 1);
+                let answer = answers.pop().unwrap();
+                assert!(rechecks.load(std::sync::atomic::Ordering::Relaxed) >= 12, "each direct caller must be rechecked");
+                (answer.sites, answer.truncated, answer.cancelled, answer.diagnostics, answer.proof_authority,
+                    answer.work.scanned_files, answer.work.scanned_source_bytes, answer.work.examined_candidates)
+            })
+        };
+        let sequential_incoming = incoming(&rust, 1);
+        assert!(
+            sequential_incoming.0.len() >= 12,
+            "each caller must remain in rich incoming results"
+        );
+        assert_eq!(sequential_incoming, incoming(&rust, 4));
+        assert_eq!(sequential_incoming, incoming(&comparison, 1));
+        assert_eq!(sequential_incoming, incoming(&comparison, 4));
+        let interrupted = run(
+            &rust,
+            4,
+            CancellationToken::soft_deadline_after_checks_for_test(4),
+        );
+        assert!(matches!(
+            &interrupted.1,
+            EdgeCompleteness::Incomplete { reasons }
+                if reasons.contains(&EdgeIncompleteReason::TimeBudgetExceeded)
+        ));
+        assert!(
+            interrupted.0.iter().all(|edge| sequential.0.contains(edge)),
+            "an interrupted parallel query retains only proved full-query edges: {interrupted:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#4926: a budget-bound binding recheck dropped an incoming call site instead of keeping it unproven"
+    )]
+    fn incoming_call_recheck_keeps_budget_stopped_sites_unproven() {
+        check_incoming_call_recheck(
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::scoped_store_context,
+        );
+    }
+
+    #[test]
+    #[ignore = "finds real bug: #6018 writer-only projection re-enters the selected operation's writer"]
+    #[hardwon("#6018: writer-only incoming projection recursively acquires the selected writer")]
+    fn incoming_call_recheck_keeps_budget_stopped_sites_unproven_writer_only() {
+        check_incoming_call_recheck(
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test,
+        );
+    }
+
+    fn check_incoming_call_recheck(comparison_store: ReverseStoreContextFactory) {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::ReferenceOmission;
+
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse_rows::RustReverseConfirmation;
+
+        use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticCode;
+
+        use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits;
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname='recheck'\nversion='0.1.0'\nedition='2024'\n")
+            .file("src/lib.rs", "mod first; mod second; mod third; pub struct Engine; impl Engine { pub fn run(&self) {} }\n")
+            .file("src/first.rs", "pub fn first(e: &crate::Engine) { e.run(); }\n")
+            .file("src/second.rs", "pub fn second(e: &crate::Engine) { e.run(); }\n")
+            .file("src/third.rs", "pub fn third(e: &crate::Engine) { e.run(); }\n")
+            .build();
+        let comparison_context = comparison_store(fixture.project_dyn().as_ref()).unwrap();
+        let comparison = RustAnalyzer::new_with_config_store_context(
+            fixture.project_dyn(),
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            comparison_context,
+            None,
+        )
+        .unwrap();
+        let context = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::scoped_store_context(
+            fixture.project_dyn().as_ref(),
+        )
+        .unwrap();
+        let reader = RustAnalyzer::new_with_config_store_context(
+            fixture.project_dyn(),
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .unwrap();
+        assert!(!reader.inner.analyzer_store().uses_single_connection_reads());
+        let admitted = reader.analyzed_files().into_iter().collect::<HashSet<_>>();
+        let run = |rust: &RustAnalyzer| {
+            let target = rust
+                .declarations(&fixture.file("src/lib.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "run")
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let mut results = Vec::new();
+            for (omitted_file, omission) in [
+                (None, None),
+                (
+                    Some("src/second.rs"),
+                    Some(ReferenceOmission::ReceiverBudget(
+                        ReceiverBudgetLimit::ScopeNodes,
+                    )),
+                ),
+                (
+                    Some("src/third.rs"),
+                    Some(ReferenceOmission::TimeBudgetExceeded),
+                ),
+            ] {
+                let initially_confirmed_files = std::sync::Mutex::new(HashSet::default());
+                let outcome = with_rust_selected_reverse_reference_admission(
+                    rust,
+                    Some(&admitted),
+                    &cancellation,
+                    |operation, root, locators| {
+                        let file = locators[0].relative_path();
+                        let initial = initially_confirmed_files
+                            .lock()
+                            .expect("test confirmation set is not poisoned")
+                            .insert(file.to_owned());
+                        if !initial && omitted_file == Some(file) {
+                            return Ok(match omission.unwrap() {
+                                ReferenceOmission::ReceiverBudget(limit) => {
+                                    RustReverseConfirmation::Bounded(limit)
+                                }
+                                ReferenceOmission::TimeBudgetExceeded => {
+                                    RustReverseConfirmation::TimeStopped
+                                }
+                            });
+                        }
+                        let mut confirmation = confirm_rust_reverse_references(
+                            operation,
+                            root,
+                            locators,
+                            &cancellation,
+                        )?;
+                        if initial
+                            && let RustReverseConfirmation::Ready(answers) = &mut confirmation
+                        {
+                            // Keep type-prefix evidence available for nomination, but
+                            // require a rich recheck for each method binding.
+                            for answer in answers.iter_mut().flat_map(|report| report.answers_mut())
+                            {
+                                if answer.definitions.contains(&target) {
+                                    let definition = answer.resolution.binding().targets()[0];
+                                    answer.resolution.combine_binding_completion(
+                                    &ResolutionCompletion::incomplete([
+                                        brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason::ReceiverBudgetExhausted(definition),
+                                    ]),
+                                );
+                                }
+                            }
+                        }
+                        Ok(confirmation)
+                    },
+                    |queries| {
+                        queries.incoming_calls_for(
+                            std::slice::from_ref(&target),
+                            CallRelationLimits {
+                                max_files: 16,
+                                max_source_bytes: 64 * 1024,
+                                max_candidates: 64,
+                            },
+                        )
+                    },
+                );
+                let RustSelectedReverseOutcome::Ready(Some(mut answers)) = outcome else {
+                    panic!("incoming projection did not complete: {outcome:?}");
+                };
+                assert_eq!(answers.len(), 1);
+                results.push(answers.remove(0));
+            }
+            let fingerprints = results
+                .iter()
+                .map(|answer| {
+                    (
+                        answer.sites.clone(),
+                        answer.truncated,
+                        answer.cancelled,
+                        answer.diagnostics.clone(),
+                        answer.proof_authority,
+                        answer.work.scanned_files,
+                        answer.work.scanned_source_bytes,
+                        answer.work.examined_candidates,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let time_bounded = results.pop().unwrap();
+            let bounded = results.pop().unwrap();
+            let complete = results.pop().unwrap();
+            assert_eq!(complete.sites.len(), 3, "{complete:?}");
+            assert!(!complete.truncated, "{complete:?}");
+            assert_eq!(bounded.sites.len(), 3, "{bounded:?}");
+            assert!(bounded.truncated, "{bounded:?}");
+            assert_eq!(time_bounded.sites.len(), 3, "{time_bounded:?}");
+            assert!(time_bounded.truncated, "{time_bounded:?}");
+            assert_eq!(bounded.work.scanned_files, complete.work.scanned_files);
+            assert_eq!(
+                bounded.work.scanned_source_bytes,
+                complete.work.scanned_source_bytes
+            );
+            assert_eq!(
+                bounded.work.examined_candidates,
+                complete.work.examined_candidates
+            );
+            for (result, file, lane, expected_count) in [
+                (&bounded, "src/second.rs", "scope_nodes", Some(1)),
+                (&time_bounded, "src/third.rs", "time_budget", None),
+            ] {
+                let stopped_file = fixture.file(file);
+                let stopped_site = result
+                    .sites
+                    .iter()
+                    .find(|site| site.file == stopped_file)
+                    .unwrap();
+                assert_eq!(stopped_site.proof, UsageProof::Unproven, "{result:?}");
+                let diagnostic = result
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| {
+                        diagnostic.code == CallRelationDiagnosticCode::BudgetExhausted
+                            && diagnostic.message.contains(lane)
+                    })
+                    .unwrap_or_else(|| panic!("{result:?}"));
+                let count = diagnostic
+                    .message
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                assert!(count > 0, "{diagnostic:?}");
+                if let Some(expected_count) = expected_count {
+                    assert_eq!(count, expected_count, "{diagnostic:?}");
+                }
+                assert_eq!(diagnostic.context, target.fq_name());
+                assert!(diagnostic.reason_kind.is_none(), "{diagnostic:?}");
+                assert!(
+                    !result.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+                            && diagnostic.reason_kind.as_deref() == Some("time_budget")
+                    }),
+                    "{result:?}"
+                );
+                assert_eq!(result.sites, complete.sites);
+            }
+            fingerprints
+        };
+        let expected = run(&reader);
+        for width in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap()
+                .install(|| {
+                    assert_eq!(expected, run(&comparison));
+                });
+        }
+    }
+
+    /// The files a target's candidate set names, or None when the target has
+    /// no selected definition.
+    fn candidate_files_of(
+        queries: &mut dyn RustSelectedReverseQueries,
+        target: &CodeUnit,
+    ) -> Result<Option<HashSet<ProjectFile>>> {
+        Ok(queries
+            .candidate_sets(std::slice::from_ref(target))?
+            .map(|sets| sets[0].files(target.source().root(), target).collect()))
+    }
+
+    #[test]
+    #[hardwon("#4488: a rejected Cargo target's temporary member gap leaked into inverse coverage")]
+    fn reverse_excludes_a_proven_other_root_member_without_inheriting_its_gap() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='member_views'\nversion='0.1.0'\nedition='2024'\n",
+            )
+            .file("src/lib.rs", "mod model; mod implementation; mod consumer;\n")
+            .file("src/model.rs", "pub struct Engine;\n")
+            .file(
+                "src/implementation.rs",
+                "use crate::model::Engine; impl Engine { pub(crate) fn run() -> Self { Self } }\n",
+            )
+            .file(
+                "src/consumer.rs",
+                "use crate::model::Engine; pub fn caller() { let _ = Engine::run(); }\n",
+            )
+            .file(
+                "src/main.rs",
+                "struct Engine; impl Engine { fn run() -> Self { Self } } fn main() { let _ = Engine::run(); }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/implementation.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "run")
+            .unwrap();
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&[target])
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].edges.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].edges[0].site.file, fixture.file("src/consumer.rs"));
+        assert_eq!(rows[0].edges[0].proof, UsageProof::Proven, "{rows:?}");
+        assert_eq!(rows[0].completeness, EdgeCompleteness::Complete, "{rows:?}");
+    }
+
+    #[test]
+    #[hardwon("#4488: one complete Cargo view must not close another root's unresolved route")]
+    fn reverse_qualified_route_preserves_each_cargo_root_completion() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='root_views'\nversion='0.1.0'\nedition='2024'\n",
+            )
+            .file(
+                "src/lib.rs",
+                "mod shared; mod route { pub use crate::shared::{target, Target}; }\n",
+            )
+            .file(
+                "src/main.rs",
+                "mod shared; mod route { pub use absent::{target, Target}; } fn main() {}\n",
+            )
+            .file(
+                "src/shared.rs",
+                "pub fn target() {} #[derive(Default)] pub struct Target; pub fn caller() { crate::route::target(); let _ = crate::route::Target::default(); }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let targets = ["target", "Target"].map(|name| {
+            rust.declarations(&fixture.file("src/shared.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == name)
+                .unwrap()
+        });
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&targets)
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(
+                row.edges.iter().any(|edge| {
+                    edge.site.file == fixture.file("src/shared.rs")
+                        && edge.proof == UsageProof::Proven
+                }),
+                "the library view's proven call/type prefix remains visible: {row:?}"
+            );
+            assert!(
+                matches!(row.completeness, EdgeCompleteness::Incomplete { .. }),
+                "the unresolved binary route cannot become complete: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_usages_retained_bytes_are_independent_of_workspace_size() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::heap_pin_bytes;
+        // Repeat with warm process state: fixed first-use allocations in the
+        // first small fixture must not hide retention in the larger fixture.
+        let measurements = [4, 32, 4, 32].map(|files| {
+            let mut builder = InlineTestProject::with_language(Language::Rust).file(
+                "Cargo.toml",
+                "[package]\nname='heap'\nversion='0.1.0'\nedition='2021'\n",
+            );
+            let mut root = "pub fn target() {} pub fn caller() { target(); }\n".to_owned();
+            for index in 0..files {
+                root.push_str(&format!("mod decoy{index};\n"));
+                builder = builder.file(
+                    format!("src/decoy{index}.rs"),
+                    format!("pub fn unrelated{index}() {{}}\n"),
+                );
+            }
+            let fixture = builder.file("src/lib.rs", root).build();
+            let rust = RustAnalyzer::new(fixture.project_dyn());
+            let target = rust
+                .declarations(&fixture.file("src/lib.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "target")
+                .unwrap();
+            // Account for the existing explicitly capped shared-name cache.
+            let shared_names = rust
+                .inner
+                .analyzer_store()
+                .resolution_shared_name_cache()
+                .clone();
+            let root_file = fixture.file("src/lib.rs");
+            let structural_key = rust
+                .inner
+                .structural_snapshot_key(&root_file, &rust.indexed_source(&root_file).unwrap())
+                .unwrap();
+            let outcome =
+                with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                    assert!(
+                        rust.inner.structural_cache().get(&structural_key).is_none(),
+                        "only newly cached facts may be subtracted from request growth"
+                    );
+                    let shared_names_before = shared_names.allocated_bytes();
+                    let before = heap_pin_bytes();
+                    let rows = queries.inverse_for(&[target])?;
+                    assert!(
+                        rows.as_ref().is_some_and(|rows| rows[0].edges.len() == 1),
+                        "{rows:?}"
+                    );
+                    drop(rows);
+                    Ok((
+                        heap_pin_bytes() - before,
+                        heap_pin_bytes(),
+                        brokk_bifrost_analysis::analyzer::store::reader_eviction_bytes_for_test(),
+                        shared_names.allocated_bytes() - shared_names_before,
+                    ))
+                });
+            let RustSelectedReverseOutcome::Ready((
+                request_growth,
+                before_drop,
+                eviction_before_drop,
+                cache_growth,
+            )) = outcome
+            else {
+                panic!("{outcome:?}")
+            };
+            let cache_release =
+                brokk_bifrost_analysis::analyzer::store::reader_eviction_bytes_for_test()
+                    - eviction_before_drop;
+            let total_release = before_drop - heap_pin_bytes();
+            let structural_facts = rust
+                .inner
+                .structural_cache()
+                .take_for_heap_test(&structural_key)
+                .expect("reverse classification caches the root file's structural facts");
+            assert_eq!(
+                std::sync::Arc::strong_count(&structural_facts),
+                1,
+                "the completed request must release its structural snapshot"
+            );
+            let before_structural_drop = heap_pin_bytes();
+            drop(structural_facts);
+            let structural_release = before_structural_drop - heap_pin_bytes();
+            assert!(structural_release > 0);
+            // ReaderPool::checkin evicts the idle point reader with this same
+            // selection. That shared cache is not owned by the outer request.
+            // Count its actual destructor releases separately, using the same
+            // allocator counter, rather than attributing them to this request.
+            (
+                files,
+                request_growth,
+                total_release - cache_release,
+                cache_release,
+                cache_growth,
+                structural_release,
+            )
+        });
+        eprintln!(
+            "reverse Rust bytes (files, request growth, request-owned releases, shared reader eviction releases, shared-name cache growth, structural cache entry releases): {measurements:?}"
+        );
+        // This fixture also enlarges the queried root file with module
+        // declarations. Its decoded FileFacts remain in the existing bounded
+        // structural cache, not in the request's identity inventory. Subtract
+        // their actual destructor releases after capturing the original heap,
+        // just as shared-name growth and reader eviction are attributed above.
+        let retained_outside = measurements.map(|row| row.1 - row.4 - row.5 - row.2);
+        // Pin the live heap as well as what survives request disposal. The
+        // existing bounded caches are the only retained structures allowed to
+        // grow with the workspace. Both allowances are a measurement floor, not
+        // a capacity. These byte counts come from the thread-local allocation
+        // counter, and `retained_outside` subtracts bounded-cache and request
+        // releases that the same counter measured, so several KiB move between
+        // runs and platforms even when no request reserves anything: at sha
+        // 8a11695c58 the 32-file warm measurement was 116595 on Windows and
+        // 116531 on Linux, while the 4-file warm measurement was 106229 on the
+        // failing Windows run and 115859 on a passing Linux run. A 4 KiB
+        // retained bound sat below that floor and failed on Windows at
+        // equivalent code (issue #5096). The historical defect these
+        // comparisons guard against retained about 5.5 MiB per selected mount,
+        // so 16 KiB still detects it while matching the retained-bytes
+        // allowance the point-latency check already uses.
+        let outside_cache = measurements.map(|row| row.1 - row.4 - row.5);
+        for [small, large] in [[0, 1], [2, 3]] {
+            assert!(
+                retained_outside[large] <= retained_outside[small] + 16 * 1024,
+                "workspace growth must not retain inventory with cold or warm process state: {retained_outside:?} from {measurements:?}"
+            );
+            let files_added = measurements[large].0 - measurements[small].0;
+            assert!(
+                outside_cache[large] <= outside_cache[small] + 32 * 1024,
+                "a reverse request's live heap outside the capped caches must not grow with {files_added} unrelated files: {measurements:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("1a622657f200: reverse seed evidence scanned unrelated mounts")]
+    fn reverse_request_sql_work_is_bounded_by_target_rows() {
+        let measurements = [4, 32].map(|files| {
+            let mut builder = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[workspace]\nmembers=['api','client']\nresolver='2'\n",
+                )
+                .file(
+                    "api/Cargo.toml",
+                    "[package]\nname='api'\nversion='0.1.0'\nedition='2021'\n",
+                )
+                .file(
+                    "api/src/lib.rs",
+                    "#[macro_export]\nmacro_rules! target { () => { () }; }\n",
+                )
+                .file(
+                    "client/Cargo.toml",
+                    "[package]\nname='client'\nversion='0.1.0'\nedition='2021'\n[dependencies]\napi={path='../api'}\n",
+                )
+                .file(
+                    "client/src/lib.rs",
+                    "use api::target;\npub fn caller() { target!(); }\n",
+                );
+            for index in 0..files {
+                builder = builder.file(
+                    format!("isolated/unrelated{index}.rs"),
+                    format!("pub fn decoy{index}() {{}}\n"),
+                );
+            }
+            let fixture = builder.build();
+            let rust = RustAnalyzer::new(fixture.project_dyn());
+            let target = rust
+                .declarations(&fixture.file("api/src/lib.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "target" && unit.is_macro())
+                .expect("target declaration");
+            let result =
+                with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                    queries.begin_sql_work_trace();
+                    let rows = queries.inverse_for(&[target])?;
+                    let sql_work = queries.finish_sql_work_trace();
+                    assert!(
+                        rows.as_ref().is_some_and(|rows| rows[0].edges.len() == 2),
+                        "{rows:?}"
+                    );
+                    Ok(sql_work)
+                });
+            let RustSelectedReverseOutcome::Ready(sql_work) = result else {
+                panic!("{result:?}")
+            };
+            (files, sql_work.0, sql_work.1)
+        });
+        eprintln!("reverse request SQL work (files, statements, rows): {measurements:?}");
+        assert_eq!(
+            measurements[0].2, measurements[1].2,
+            "unrelated inventory must not add reverse rows: {measurements:?}"
+        );
+        // Statements are exact too. They were not: while the interior was the
+        // only candidate-coverage reader, `lazy_candidate_completion` asked
+        // every selected mount whether its candidates were complete before any
+        // request read a match, which cost one statement and one produced
+        // interior per unrelated file. The direction's unconditional box now
+        // comes from `resolution_candidate_gap_headers` in one indexed query,
+        // so an unrelated file adds neither.
+        assert_eq!(
+            measurements[0].1, measurements[1].1,
+            "unrelated inventory must not add reverse statements: {measurements:?}"
+        );
+    }
+
+    fn assert_target_call_point_status(
+        rust: &RustAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        expected: brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus,
+    ) {
+        use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+
+        use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut pending = vec![tree.root_node()];
+        let mut calls = 0;
+        while let Some(node) = pending.pop() {
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+            if node.kind() != "call_expression" {
+                continue;
+            }
+            let function = node.child_by_field_name("function").unwrap();
+            if function.utf8_text(source.as_bytes()).unwrap() != "target" {
+                continue;
+            }
+            calls += 1;
+            let site = ResolvedReferenceSite {
+                path: brokk_bifrost_core::path_utils::rel_path_string(file),
+                text: "target".to_owned(),
+                range: brokk_bifrost_core::analyzer::model::Range {
+                    start_byte: function.start_byte(),
+                    end_byte: function.end_byte(),
+                    start_line: function.start_position().row,
+                    end_line: function.end_position().row,
+                },
+                focus_start_byte: function.start_byte(),
+                focus_end_byte: function.end_byte(),
+            };
+            let result = crate::analyzer::rust::native_points::resolve_rust_definition_bounded(
+                BoundedReceiverQuery {
+                    analyzer: rust,
+                    file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: Default::default(),
+                    cancellation: None,
+                },
+            );
+            let BoundedResolution::Complete { value, .. } = result else {
+                panic!("native point operation must finish: {result:?}");
+            };
+            assert_eq!(value.status, expected, "{source}: {value:?}");
+        }
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    #[hardwon("#3769+24c13e0a6f11: field-only overlay facts left stale method-usage candidates")]
+    fn issue_3769_overlay_replaces_stale_field_with_call_and_back() {
+        use brokk_bifrost_core::analyzer::structural::edges::EdgeAxis;
+
+        use brokk_bifrost_core::analyzer::usages::model::ReferenceKind;
+        use std::sync::Arc;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"field_method_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod caller;\npub struct Widget { pub name: u8 }\nimpl Widget { pub fn name(&self) {} }\n",
+            )
+            .file(
+                "src/caller.rs",
+                "use crate::Widget;\npub fn caller(widget: Widget) { let _field = widget.name; }\n",
+            )
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let target = disk
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "name" && unit.is_function())
+            .expect("the inherent method declaration");
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        let caller = fixture.file("src/caller.rs");
+        let files = HashSet::from_iter([caller.clone()]);
+
+        assert!(overlay.set(
+            caller.abs_path(),
+            "use crate::Widget;\npub fn caller(widget: Widget) { let _field = widget.name; widget.name(); }\n"
+                .to_owned(),
+        ));
+        let prepared = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            prepared
+                .declarations(&caller)
+                .iter()
+                .any(|unit| unit.identifier() == "caller"),
+            "prepared declarations trigger the overlay update"
+        );
+        let method_reverse = with_rust_selected_reverse_queries_in_files(
+            &prepared,
+            &files,
+            &CancellationToken::new(),
+            |queries| {
+                let candidates = candidate_files_of(queries, &target)?;
+                let rows = queries.inverse_for(std::slice::from_ref(&target))?;
+                Ok((candidates, rows, queries.work_report()))
+            },
+        );
+        let RustSelectedReverseOutcome::Ready((Some(candidates), Some(rows), work)) =
+            method_reverse
+        else {
+            panic!("the fresh overlay call must be indexed: {method_reverse:?}");
+        };
+        assert!(candidates.contains(&caller), "{candidates:?}");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].edges.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].edges[0].reference_kind,
+            Some(ReferenceKind::MethodCall),
+            "the stale persisted field cannot erase the fresh method call: {rows:?}"
+        );
+        assert!(rows[0].edges[0].proof == UsageProof::Proven, "{rows:?}");
+        assert!(rows[0].covers(EdgeAxis::InverseProjection), "{rows:?}");
+        let metrics = &work
+            .targets
+            .iter()
+            .find(|(measured_target, _)| measured_target == &target)
+            .expect("target reverse-work metrics")
+            .1;
+        assert_eq!(metrics.full_fact_evaluation_count(), 1, "{metrics:?}");
+
+        assert!(
+            overlay.set(
+                caller.abs_path(),
+                "use crate::Widget;\npub fn caller(widget: Widget) { let _field = widget.name; }\n"
+                    .to_owned(),
+            )
+        );
+        let prepared = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            prepared
+                .declarations(&caller)
+                .iter()
+                .any(|unit| unit.identifier() == "caller"),
+            "prepared declarations trigger the updated field-only overlay"
+        );
+        let field_reverse = with_rust_selected_reverse_queries_in_files(
+            &prepared,
+            &files,
+            &CancellationToken::new(),
+            |queries| {
+                let candidates = candidate_files_of(queries, &target)?;
+                let rows = queries.inverse_for(std::slice::from_ref(&target))?;
+                Ok((candidates, rows, queries.work_report()))
+            },
+        );
+        let RustSelectedReverseOutcome::Ready((Some(candidates), Some(rows), work)) = field_reverse
+        else {
+            panic!("the fresh overlay field must be indexed: {field_reverse:?}");
+        };
+        assert!(candidates.contains(&caller), "{candidates:?}");
+        assert!(rows[0].edges.is_empty(), "{rows:?}");
+        assert!(rows[0].covers(EdgeAxis::InverseProjection), "{rows:?}");
+        let metrics = &work
+            .targets
+            .iter()
+            .find(|(measured_target, _)| measured_target == &target)
+            .expect("target reverse-work metrics")
+            .1;
+        assert_eq!(
+            metrics.full_fact_evaluation_count(),
+            0,
+            "the new ordinary field requires no forward confirmation: {metrics:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("72ea5aebc651: preserve import proofs across unrelated item-macro uncertainty")]
+    fn scoped_reverse_import_sites_keep_proof_with_an_unrelated_item_macro() {
+        use brokk_bifrost_core::analyzer::structural::edges::EdgeAxis;
+
+        use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
+
+        for hidden_source in ["pub fn noise() {}", "unknown_macro!();"] {
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", "[package]\nname = \"scoped_import\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+                .file("src/lib.rs", "pub mod api; pub mod hidden; use crate::api::target; pub fn caller() { target(); }")
+                .file("src/api.rs", "pub fn target() {}")
+                .file("src/hidden.rs", hidden_source)
+                .build();
+            let rust = RustAnalyzer::new(fixture.project_dyn());
+            assert_target_call_point_status(
+                &rust,
+                &fixture.file("src/lib.rs"),
+                "pub mod api; pub mod hidden; use crate::api::target; pub fn caller() { target(); }",
+                brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Resolved,
+            );
+            let target = rust
+                .declarations(&fixture.file("src/api.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "target")
+                .unwrap();
+            let admitted = HashSet::from_iter([fixture.file("src/lib.rs")]);
+            let result = with_rust_selected_reverse_queries_in_files(
+                &rust,
+                &admitted,
+                &CancellationToken::new(),
+                |queries| queries.inverse_for(std::slice::from_ref(&target)),
+            );
+            let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+                panic!("scoped import lookup must be available: {result:?}");
+            };
+            assert!(
+                rows[0].covers(EdgeAxis::InverseProjection),
+                "{hidden_source}: {rows:?}"
+            );
+            assert_eq!(rows[0].edges.len(), 2, "{rows:?}");
+            assert!(
+                rows[0]
+                    .edges
+                    .iter()
+                    .all(|edge| edge.proof == UsageProof::Proven),
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows[0]
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.usage_kind == UsageHitKind::Import)
+                    .count(),
+                1,
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "72ea5aebc651: localize unknown binder uncertainty without losing declaration imports"
+    )]
+    fn macro_scope_uncertainty_survives_imports_of_its_declarations() {
+        use brokk_bifrost_core::analyzer::structural::edges::EdgeAxis;
+
+        for import in ["use crate::api::target;", "use crate::api::*;"] {
+            let caller_source = format!("pub mod api; {import} pub fn caller() {{ target(); }}");
+            // src/api.rs holds a macro whose token tree has a group that
+            // cannot be enumerated, so its own reference inventory may be
+            // missing a site and the answer is incomplete.
+            let api_source = "pub fn target() {} unknown_macro!(=>); pub fn inside() { target(); }";
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[package]\nname = \"macro_scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                )
+                .file("src/lib.rs", &caller_source)
+                .file("src/api.rs", api_source)
+                .build();
+            let rust = RustAnalyzer::new(fixture.project_dyn());
+            for (path, source) in [
+                ("src/lib.rs", caller_source.as_str()),
+                ("src/api.rs", api_source),
+            ] {
+                // The call's forward answer is exact: an item the unknown
+                // macro expands to cannot declare a second `target` in `api`
+                // without a duplicate-definition error, and the caller's
+                // import (named or glob) reaches the declared one. The
+                // uncertainty is the reverse one checked below: the unparseable
+                // argument group may contain a reference to `target`.
+                assert_target_call_point_status(
+                    &rust,
+                    &fixture.file(path),
+                    source,
+                    brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Resolved,
+                );
+            }
+            let target = rust
+                .declarations(&fixture.file("src/api.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "target")
+                .unwrap();
+            // The macro's uncertainty is the reverse inventory's, not the
+            // proof of the sites that exist. `src/api.rs` holds the macro,
+            // whose token tree has a group that could not be enumerated, so
+            // its own reference enumeration may be missing a site and the
+            // answer is incomplete. `src/lib.rs` holds no macro: both of its
+            // sites are enumerated, so its inventory is complete. Each site
+            // that exists is proven: the expansion cannot declare a second
+            // `target` for it to bind instead.
+            for (admitted_file, enumeration_complete) in
+                [("src/lib.rs", true), ("src/api.rs", false)]
+            {
+                let admitted = HashSet::from_iter([fixture.file(admitted_file)]);
+                let result = with_rust_selected_reverse_queries_in_files(
+                    &rust,
+                    &admitted,
+                    &CancellationToken::new(),
+                    |queries| queries.inverse_for(std::slice::from_ref(&target)),
+                );
+                let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+                    panic!("macro scope lookup must retain its boundary: {result:?}");
+                };
+                assert_eq!(
+                    rows[0].covers(EdgeAxis::InverseProjection),
+                    enumeration_complete,
+                    "{import} in {admitted_file}: {rows:?}"
+                );
+                assert!(!rows[0].edges.is_empty(), "{rows:?}");
+                assert!(
+                    rows[0]
+                        .edges
+                        .iter()
+                        .all(|edge| edge.proof == UsageProof::Proven),
+                    "{import} in {admitted_file}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#3769+24c13e0a6f11: proven field references were confirmed as method candidates")]
+    fn issue_3769_method_usage_scan_skips_field_only_blobs_and_keeps_method_values() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"field_method_usage\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod calls;\npub mod fields;\npub struct Widget { pub name: fn() }\nimpl Widget { pub fn name(&self) {} }\n",
+            )
+            .file(
+                "src/fields.rs",
+                // `(widget.name)()` leaves a parenthesized computed callee.
+                // `lower_call_reference_result` sends that callee through
+                // `add_local_gap(UnsupportedExpression)`, preserving an
+                // enumeration gap even though the inner field reference is
+                // independently proved to be a field.
+                "use crate::Widget;\npub fn field_only(widget: Widget) {\n    let _field = widget.name;\n    (widget.name)();\n}\n",
+            )
+            .file(
+                "src/calls.rs",
+                "use crate::Widget;\npub fn method_sites(widget: Widget) {\n    widget.name();\n    let _method = Widget::name;\n}\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "name" && unit.is_function())
+            .expect("the inherent method declaration");
+
+        // The field-only blob is still in the candidate inventory. It must be
+        // removed before point confirmation, while its file remains part of
+        // the selected inventory assembled before the filter.
+        let reverse =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                let candidates = candidate_files_of(queries, &target)?;
+                let rows = queries.inverse_for(std::slice::from_ref(&target))?;
+                Ok((candidates, rows, queries.work_report()))
+            });
+        let RustSelectedReverseOutcome::Ready((Some(candidates), Some(rows), work)) = reverse
+        else {
+            panic!("selected method reverse lookup must be available: {reverse:?}");
+        };
+        assert!(
+            candidates.contains(&fixture.file("src/fields.rs")),
+            "the field-only blob must be a reverse candidate before filtering: {candidates:?}"
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            !rows[0].covers(
+                brokk_bifrost_core::analyzer::structural::edges::EdgeAxis::InverseProjection
+            ),
+            "the callable-field enumeration gap is preserved: {rows:?}"
+        );
+        assert_eq!(rows[0].edges.len(), 2, "{rows:?}");
+        let metrics = &work
+            .targets
+            .iter()
+            .find(|(measured_target, _)| measured_target == &target)
+            .expect("target reverse-work metrics")
+            .1;
+        assert_eq!(
+            metrics.full_fact_evaluation_count(),
+            1,
+            "only the blob with method-shaped references needs confirmation: {metrics:?}"
+        );
+
+        let admitted = rust
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let scan = crate::analyzer::rust::native_usages::find_native_usages(
+            &rust,
+            std::slice::from_ref(&target),
+            &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(&admitted),
+            10,
+        );
+        let brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome::Resolved(
+            scan_result @ brokk_bifrost_core::analyzer::usages::model::FuzzyResult::Incomplete {
+                ..
+            },
+        ) = scan
+        else {
+            panic!("the callable-field inventory gap must remain visible: {scan:?}");
+        };
+        let hits = scan_result.all_hits();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.snippet.contains("widget.name();")),
+            "the real receiver call remains a hit: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|hit| hit.snippet.contains("Widget::name")),
+            "the qualified method value remains a hit: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| !hit.snippet.contains("(widget.name)()")
+                    && !hit.snippet.contains("let _field = widget.name;")),
+            "ordinary and callable fields are not method usages: {hits:?}"
+        );
+
+        let field = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "name" && unit.is_field())
+            .expect("the same-named field declaration");
+        let field_scan = crate::analyzer::rust::native_usages::find_native_usages(
+            &rust,
+            std::slice::from_ref(&field),
+            &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(&admitted),
+            10,
+        );
+        let brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome::Resolved(
+            field_result @ brokk_bifrost_core::analyzer::usages::model::FuzzyResult::Incomplete {
+                ..
+            },
+        ) = field_scan
+        else {
+            panic!("the field target keeps the same inventory gap: {field_scan:?}");
+        };
+        let field_hits = field_result.all_hits();
+        assert_eq!(field_hits.len(), 2, "{field_hits:?}");
+        assert!(
+            field_hits
+                .iter()
+                .any(|hit| hit.snippet.contains("let _field = widget.name;")),
+            "ordinary field reads remain field usages: {field_hits:?}"
+        );
+        assert!(
+            field_hits
+                .iter()
+                .any(|hit| hit.snippet.contains("(widget.name)();")),
+            "callable field reads remain field usages: {field_hits:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#3769+24c13e0a6f11: field filtering dropped trait-qualified method values")]
+    fn issue_3769_trait_qualified_method_value_is_retained() {
+        use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+
+        use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"trait_method_value\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod caller;\npub trait Named { fn label(&self); }\npub struct Widget;\nimpl Named for Widget { fn label(&self) {} }\n",
+            )
+            .file(
+                "src/caller.rs",
+                "use crate::{Named, Widget};\npub fn method_value() { let _method = <Widget as Named>::label; }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let targets = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .filter(|unit| unit.identifier() == "label" && unit.is_function())
+            .collect::<Vec<_>>();
+        assert!(
+            !targets.is_empty(),
+            "the trait and impl method declarations exist"
+        );
+        let admitted = rust
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let scan = crate::analyzer::rust::native_usages::find_native_usages(
+            &rust,
+            &targets,
+            &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(&admitted),
+            10,
+        );
+        let GraphUsageOutcome::Resolved(scan_result @ FuzzyResult::Success { .. }) = scan else {
+            panic!("a trait-qualified method value is a complete usage: {scan:?}");
+        };
+        assert!(
+            scan_result
+                .all_hits()
+                .iter()
+                .any(|hit| hit.snippet.contains("<Widget as Named>::label")),
+            "the trait-qualified method value remains a hit: {scan_result:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#3769+24c13e0a6f11: filtering the final field locator erased file uncertainty")]
+    fn issue_3769_excluded_field_locator_preserves_authored_attribute_inventory() {
+        use brokk_bifrost_core::analyzer::structural::edges::EdgeAxis;
+
+        use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+
+        use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
+
+        let label = "unknown attribute";
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"field_inventory_gap\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod fields;\npub struct Widget { pub name: u8 }\nimpl Widget { pub fn name(&self) {} }\n",
+            )
+            .file(
+                "src/fields.rs",
+                "use crate::Widget;\n#[unknown_attribute]\npub struct MayBeTransformed;\npub fn field_only(widget: Widget) { let _field = widget.name; }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "name" && unit.is_function())
+            .expect("the inherent method declaration");
+        let reverse =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                let candidates = candidate_files_of(queries, &target)?;
+                let rows = queries.inverse_for(std::slice::from_ref(&target))?;
+                Ok((candidates, rows, queries.work_report()))
+            });
+        let RustSelectedReverseOutcome::Ready((Some(candidates), Some(rows), work)) = reverse
+        else {
+            panic!("{label}: selected reverse query must be available: {reverse:?}");
+        };
+        assert!(
+            candidates.contains(&fixture.file("src/fields.rs")),
+            "{label}: the excluded field is the file's last target-name candidate: {candidates:?}"
+        );
+        let metrics = &work
+            .targets
+            .iter()
+            .find(|(measured_target, _)| measured_target == &target)
+            .expect("target reverse-work metrics")
+            .1;
+        assert_eq!(
+            metrics.full_fact_evaluation_count(),
+            0,
+            "{label}: the final field locator needs no forward confirmation: {metrics:?}"
+        );
+        assert!(rows[0].edges.is_empty(), "{label}: {rows:?}");
+        assert!(
+            rows[0].covers(EdgeAxis::InverseProjection),
+            "{label}: attributes retain the authored reference inventory: {rows:?}"
+        );
+
+        let admitted = rust
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let scan = crate::analyzer::rust::native_usages::find_native_usages(
+            &rust,
+            std::slice::from_ref(&target),
+            &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(&admitted),
+            10,
+        );
+        let GraphUsageOutcome::Resolved(FuzzyResult::Success { .. }) = scan else {
+            panic!(
+                "{label}: excluding the final locator preserves the authored inventory: {scan:?}"
+            );
+        };
+    }
+
+    #[test]
+    #[hardwon("#3769+24c13e0a6f11: unknown macro arguments lost method-scan uncertainty")]
+    fn issue_3769_unknown_macro_uncertainty_survives_field_shaped_arguments() {
+        use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+
+        use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"field_macro_uncertainty\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod caller;\npub struct Widget { pub name: fn() }\nimpl Widget { pub fn name(&self) {} }\n",
+            )
+            .file(
+                "src/caller.rs",
+                "use crate::Widget;\npub fn caller(widget: Widget) { unknown_macro!(widget.name); }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "name" && unit.is_function())
+            .expect("the inherent method declaration");
+        let reverse =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                let rows = queries.inverse_for(std::slice::from_ref(&target))?;
+                Ok((rows, queries.work_report()))
+            });
+        let RustSelectedReverseOutcome::Ready((Some(_rows), work)) = reverse else {
+            panic!("unknown macro reverse lookup must be available: {reverse:?}");
+        };
+        let metrics = &work
+            .targets
+            .iter()
+            .find(|(measured_target, _)| measured_target == &target)
+            .expect("the guessed macro site must be measured")
+            .1;
+        assert_eq!(
+            metrics.issued_reference_seed_count(),
+            1,
+            "the parseable macro argument is the only candidate site in its blob: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.full_fact_evaluation_count(),
+            1,
+            "the guessed field-shaped macro site must reach confirmation: {metrics:?}"
+        );
+        let admitted = rust
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let scan = crate::analyzer::rust::native_usages::find_native_usages(
+            &rust,
+            std::slice::from_ref(&target),
+            &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(&admitted),
+            10,
+        );
+        let GraphUsageOutcome::Resolved(FuzzyResult::Incomplete { .. }) = scan else {
+            panic!("unknown macro arguments must keep method usage coverage uncertain: {scan:?}");
+        };
+    }
+
+    #[test]
+    #[hardwon("#3769+24c13e0a6f11: unresolved receiver fields left false method-scan doubt")]
+    fn issue_3769_unresolved_receiver_field_does_not_leave_method_doubt() {
+        use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+
+        use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"unresolved_receiver_field\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod caller;\npub struct Widget;\nimpl Widget { pub fn name(&self) {} }\n",
+            )
+            .file(
+                "src/caller.rs",
+                "pub fn caller<T>(value: T) { let _field = value.name; }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "name" && unit.is_function())
+            .expect("the inherent method declaration");
+        let reverse =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                let candidates = candidate_files_of(queries, &target)?;
+                let rows = queries.inverse_for(std::slice::from_ref(&target))?;
+                Ok((candidates, rows, queries.work_report()))
+            });
+        let RustSelectedReverseOutcome::Ready((Some(candidates), Some(rows), work)) = reverse
+        else {
+            panic!("generic receiver reverse lookup must be available: {reverse:?}");
+        };
+        assert!(
+            candidates.contains(&fixture.file("src/caller.rs")),
+            "the unresolved receiver field is nominated before filtering: {candidates:?}"
+        );
+        assert!(rows[0].edges.is_empty(), "{rows:?}");
+        assert!(
+            rows[0].covers(
+                brokk_bifrost_core::analyzer::structural::edges::EdgeAxis::InverseProjection
+            ),
+            "{rows:?}"
+        );
+        let metrics = &work
+            .targets
+            .iter()
+            .find(|(measured_target, _)| measured_target == &target)
+            .expect("target reverse-work metrics")
+            .1;
+        assert_eq!(
+            metrics.full_fact_evaluation_count(),
+            0,
+            "a structurally ordinary field with an unresolved receiver does not need method confirmation: {metrics:?}"
+        );
+
+        let admitted = rust
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let scan = crate::analyzer::rust::native_usages::find_native_usages(
+            &rust,
+            std::slice::from_ref(&target),
+            &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(&admitted),
+            10,
+        );
+        let GraphUsageOutcome::Resolved(scan_result @ FuzzyResult::Success { .. }) = scan else {
+            panic!("the excluded field must not leave unresolved method doubt: {scan:?}");
+        };
+        assert!(scan_result.all_hits().is_empty(), "{scan_result:?}");
+    }
+
+    #[test]
+    #[hardwon("#3769+24c13e0a6f11: field filtering hid a malformed method-scan scope")]
+    fn issue_3769_malformed_method_scope_remains_incomplete_after_field_exclusion() {
+        use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+
+        use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"field_malformed_scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod caller;\npub struct Widget { pub name: fn() }\nimpl Widget { pub fn name(&self) {} }\n",
+            )
+            .file(
+                "src/caller.rs",
+                "use crate::Widget;\npub fn caller(widget: Widget) {\n    let _field = widget.name;\n    let broken = ;\n    widget.name();\n}\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "name" && unit.is_function())
+            .expect("the inherent method declaration");
+        let admitted = rust
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let scan = crate::analyzer::rust::native_usages::find_native_usages(
+            &rust,
+            std::slice::from_ref(&target),
+            &brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope::new(&admitted),
+            10,
+        );
+        assert!(
+            matches!(
+                &scan,
+                GraphUsageOutcome::Resolved(FuzzyResult::Incomplete { .. })
+            ),
+            "field exclusion must not turn a recovered Rust scope into complete evidence: {scan:?}"
+        );
+    }
+
+    /// B2. Reverse confirmation costs one point request per candidate blob,
+    /// whatever the number of candidate sites in it.
+    ///
+    /// Every site of a file needs the same macro frontier, crate context,
+    /// demand inventory and blueprint, and a point request is what builds
+    /// them. Confirming site by site rebuilt all of it per site and opened a
+    /// selected resolution operation each time; on the Bifrost corpus the
+    /// reverse frontiers that completed took 22 to 543 seconds each and the
+    /// query never finished.
+    #[test]
+    #[hardwon("713bf24e9381: confirm reverse candidates once per blob rather than once per site")]
+    fn reverse_confirmation_costs_one_demand_per_candidate_blob() {
+        let measure = |calls: usize| {
+            let mut caller = String::from("use crate::target;\n");
+            for index in 0..calls {
+                caller.push_str(&format!("pub fn call_{index}() {{ target(); }}\n"));
+            }
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[package]\nname = \"blob-demand\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                )
+                .file("src/lib.rs", "pub mod caller;\npub fn target() {}\n")
+                .file("src/caller.rs", &caller)
+                .build();
+            let rust = RustAnalyzer::new(fixture.project_dyn());
+            let target = rust
+                .declarations(&fixture.file("src/lib.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "target")
+                .expect("the target declaration");
+            // The counter is thread-local. Keep dispatch and confirmation
+            // on this pool's sole worker so it observes every point demand.
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap()
+                .install(|| {
+                    reset_selected_fact_operation_construction_count_for_test();
+                    let result = with_rust_selected_reverse_queries(
+                        &rust,
+                        &CancellationToken::new(),
+                        |queries| queries.inverse_for(&[target]),
+                    );
+                    let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+                        panic!("reverse must be ready: {result:?}");
+                    };
+                    (
+                        rows[0].edges.len(),
+                        selected_fact_operation_construction_count_for_test(),
+                    )
+                })
+        };
+        let one = measure(1);
+        let many = measure(8);
+        eprintln!("reverse confirmation (edges, point operations): {one:?} then {many:?}");
+        // The import is a usage too, so a file with n calls has n + 1 sites.
+        assert_eq!(one.0, 2, "one call and its import: {one:?}");
+        assert_eq!(many.0, 9, "eight calls and their import: {many:?}");
+        assert_eq!(
+            one.1, many.1,
+            "eight candidate sites in one blob cost what one costs: {one:?} then {many:?}"
+        );
+        assert!(one.1 > 0, "the fixture must confirm something: {one:?}");
+    }
+
+    #[test]
+    fn reverse_bare_module_paths_obey_lexical_type_shadowing() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"prefix\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "pub mod provider;\nuse crate::provider::api;\npub fn caller() { api::target(); }\npub fn shadow<api>() { api::target(); }\n")
+            .file("src/provider.rs", "pub mod api { pub fn target() {} }\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/provider.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target" && unit.owner_identifier() == Some("api"))
+            .unwrap();
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&[target])
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("native module-prefix lookup must be available: {result:?}");
+        };
+        assert_eq!(rows[0].edges.len(), 1, "{rows:?}");
+        let edge = &rows[0].edges[0];
+        assert_eq!(edge.site.enclosing.as_ref().unwrap().short_name(), "caller");
+        assert_eq!(edge.proof, UsageProof::Proven, "{edge:?}");
+    }
+
+    #[test]
+    fn reverse_private_inherent_methods_use_canonical_requester_modules() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"private-member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                concat!(
+                    "pub mod model {\n",
+                    "    pub struct Service;\n",
+                    "    impl Service {\n",
+                    "        fn target(&self) {}\n",
+                    "        pub fn inside(&self) { self.target(); }\n",
+                    "    }\n",
+                    "    pub mod child {\n",
+                    "        pub fn descendant(value: crate::model::Service) { value.target(); }\n",
+                    "    }\n",
+                    "}\n",
+                    "pub fn outside(value: crate::model::Service) { value.target(); }\n",
+                ),
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .expect("private inherent method declaration");
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&[target])
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("private member reverse lookup must be available: {result:?}");
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let edges = &rows[0].edges;
+        let owners = edges
+            .iter()
+            .map(|edge| {
+                assert_eq!(edge.proof, UsageProof::Proven, "{edge:?}");
+                edge.site
+                    .enclosing
+                    .as_ref()
+                    .expect("callable-owned reference")
+                    .identifier()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            owners,
+            std::collections::BTreeSet::from(["descendant", "inside"]),
+            "{rows:?}"
+        );
+        assert_eq!(edges.len(), 2, "{rows:?}");
+    }
+
+    #[test]
+    fn reverse_edges_preserve_ambiguity_outside_the_queried_target() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"ambiguous\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "pub mod left;\npub mod right;\nuse crate::left::*;\nuse crate::right::*;\npub fn caller() { target(); }\n")
+            .file("src/left.rs", "pub fn target() {}\n")
+            .file("src/right.rs", "pub fn target() {}\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/left.rs"))
+            .into_iter()
+            .find(|unit| unit.short_name() == "target")
+            .unwrap();
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(std::slice::from_ref(&target))
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("ambiguous lookup must retain a native candidate: {result:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].edges.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].edges[0].target, target);
+        assert_eq!(rows[0].edges[0].proof, UsageProof::Unproven);
+    }
+
+    #[test]
+    #[hardwon(
+        "#4488: a known trait member call with an unknown receiver must remain unproven inventory"
+    )]
+    fn reverse_known_trait_member_call_with_unknown_receiver_is_unproven() {
+        use brokk_bifrost_core::analyzer::usages::model::ReferenceKind;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"unknown_receiver\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub trait Store { fn get(&self); }\npub fn caller<S>(store: &S) { store.get(); }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("Store.get"))
+            .expect("Store.get declaration");
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(std::slice::from_ref(&target))
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("known trait member reverse lookup must be available: {result:?}");
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].edges.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].completeness, EdgeCompleteness::Complete, "{rows:?}");
+        let edge = &rows[0].edges[0];
+        assert_eq!(edge.target, target, "{edge:?}");
+        assert_eq!(edge.site.file, fixture.file("src/lib.rs"), "{edge:?}");
+        assert_eq!(edge.site.enclosing.as_ref().unwrap().identifier(), "caller");
+        assert_eq!(
+            edge.reference_kind,
+            Some(ReferenceKind::MethodCall),
+            "{edge:?}"
+        );
+        assert_eq!(edge.proof, UsageProof::Unproven, "{edge:?}");
+    }
+
+    #[test]
+    fn reverse_late_cancellation_discards_staged_frontiers_and_retries() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"cancel\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn target() {}\npub fn caller() { target(); }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.short_name() == "target")
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let cancelled = with_rust_selected_reverse_queries(&rust, &cancellation, |queries| {
+            let rows = queries
+                .inverse_for(std::slice::from_ref(&target))?
+                .expect("first query");
+            assert!(!rows[0].edges.is_empty());
+            cancellation.cancel();
+            Ok(rows)
+        });
+        assert!(
+            matches!(cancelled, RustSelectedReverseOutcome::Cancelled),
+            "{cancelled:?}"
+        );
+        let retry =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(std::slice::from_ref(&target))
+            });
+        assert!(
+            matches!(retry, RustSelectedReverseOutcome::Ready(Some(ref rows)) if rows[0].edges.len() == 1),
+            "{retry:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "d2b44f3dec2b: Rust selected reverse must retain complete binding for same_package_bin owners"
+    )]
+    fn reverse_crate_point_same_package_bin() {
+        assert_crate_point(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='import_model_weights'\nversion='0.1.0'\nedition='2021'\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "pub mod inference; pub use inference::infer;\n",
+                ),
+                ("src/inference.rs", "pub fn infer() {}\n"),
+                (
+                    "src/bin/safetensors.rs",
+                    "use import_model_weights::infer;\nfn main() { infer(); }\n",
+                ),
+            ],
+            "src/bin/safetensors.rs",
+            45,
+            "infer",
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "d2b44f3dec2b: Rust selected reverse must retain complete binding for explicit_bench owners"
+    )]
+    fn reverse_crate_point_explicit_bench() {
+        assert_crate_point(
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers=['crates/*']\nresolver='3'\n[workspace.package]\nedition='2024'\n",
+                ),
+                (
+                    "crates/parser-dep/Cargo.toml",
+                    "[package]\nname='parser-dep'\nversion='0.1.0'\nedition.workspace=true\n",
+                ),
+                (
+                    "crates/parser-dep/src/lib.rs",
+                    "pub mod decoder { pub struct Encoding; }\n",
+                ),
+                (
+                    "crates/benches/Cargo.toml",
+                    "[package]\nname='benches'\nversion='0.1.0'\nedition.workspace=true\n[dev-dependencies]\nparser_dep={package='parser-dep',path='../parser-dep'}\n[[bench]]\nname='routes'\nharness=false\n",
+                ),
+                (
+                    "crates/benches/benches/routes.rs",
+                    "fn exercise(_: ::parser_dep::decoder::Encoding) {}\n",
+                ),
+            ],
+            "crates/benches/benches/routes.rs",
+            38,
+            "Encoding",
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "d2b44f3dec2b: Rust selected reverse must retain complete binding for imported_impl_owner owners"
+    )]
+    fn reverse_crate_point_imported_impl_owner() {
+        assert_crate_point(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='imported-impl'\nversion='0.1.0'\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "pub mod model; mod implementation; mod consumer;\n",
+                ),
+                ("src/model.rs", "pub struct Builder;\n"),
+                (
+                    "src/implementation.rs",
+                    "use crate::model::Builder;\nimpl Builder { pub(crate) fn build() -> Self { Self } }\n",
+                ),
+                (
+                    "src/consumer.rs",
+                    "use crate::model::Builder;\nfn call() { let _ = Builder::build(); }\n",
+                ),
+                (
+                    "src/main.rs",
+                    "struct Builder; impl Builder { fn build() -> Self { Self } }\nfn call() { let _ = Builder::build(); }\n",
+                ),
+            ],
+            "src/consumer.rs",
+            56,
+            "build",
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "d2b44f3dec2b: Rust selected reverse must retain complete binding for alias_owner owners"
+    )]
+    fn reverse_crate_point_alias_owner() {
+        assert_crate_point(
+            &[
+                (
+                    "src/lib.rs",
+                    "pub struct Foo; impl Foo { pub fn new() -> Self { Self } }\npub type Alias = Foo; mod consumer;\n",
+                ),
+                (
+                    "src/consumer.rs",
+                    "use crate::Alias;\nfn call() { let _ = Alias::new(); }\n",
+                ),
+                (
+                    "src/main.rs",
+                    "struct Other; impl Other { fn new() -> Self { Self } }\ntype Alias = Other; fn decoy() { let _ = Alias::new(); }\n",
+                ),
+            ],
+            "src/consumer.rs",
+            45,
+            "new",
+        );
+    }
+
+    #[test]
+    fn reverse_mixed_module_and_type_prefixes_retain_both_targets() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"mixed-prefix\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod modules;\npub mod types;\nuse crate::modules::Api;\nuse crate::types::Api;\npub fn caller() { Api::target(); }\n",
+            )
+            .file("src/modules.rs", "pub mod Api { pub fn target() {} }\n")
+            .file(
+                "src/types.rs",
+                "pub struct Api;\nimpl Api { pub fn target() {} }\n",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        // This deliberately models the structured ambiguous-prefix workload;
+        // the duplicate import is allowed in the analyzer's facts even though
+        // rustc would reject the program as an ordinary source build.
+        let module_target = rust
+            .declarations(&fixture.file("src/modules.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target" && unit.owner_identifier() == Some("Api"))
+            .expect("module target declaration");
+        let type_target = rust
+            .declarations(&fixture.file("src/types.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target" && unit.owner_identifier() == Some("Api"))
+            .expect("inherent type target declaration");
+
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&[module_target.clone(), type_target.clone()])
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("mixed module/type prefix lookup must be available: {result:?}");
+        };
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let edges = rows.iter().flat_map(|row| &row.edges).collect::<Vec<_>>();
+        assert_eq!(edges.len(), 2, "{rows:?}");
+        let targets = edges
+            .iter()
+            .map(|edge| edge.target.clone())
+            .collect::<Vec<_>>();
+        assert!(targets.contains(&module_target), "{targets:?}");
+        assert!(targets.contains(&type_target), "{targets:?}");
+        for edge in edges {
+            assert_eq!(edge.proof, UsageProof::Unproven, "{edge:?}");
+            assert_eq!(edge.site.enclosing.as_ref().unwrap().identifier(), "caller");
+        }
+    }
+
+    #[test]
+    fn reverse_inherent_methods_keep_resolved_owner_identity() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"inherent\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "pub mod unrelated;\npub struct Widget;\npub struct Other;\nimpl Widget { pub fn alpha(&self) {} }\nimpl Widget { pub fn beta(&self) {} }\nimpl Other { pub fn alpha(&self) {} }\npub fn caller(widget: Widget) { widget.alpha(); widget.beta(); }\n")
+            .file("src/unrelated.rs", "pub fn unrelated() {}\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let declarations = rust.declarations(&fixture.file("src/lib.rs"));
+        let methods = declarations
+            .iter()
+            .filter(|unit| matches!(unit.identifier(), "alpha" | "beta"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(methods.len(), 3, "{declarations:?}");
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&methods)
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("inherent reverse lookup must be available: {result:?}");
+        };
+        let edges = rows.iter().flat_map(|row| &row.edges).collect::<Vec<_>>();
+        assert_eq!(edges.len(), 2, "{rows:?}");
+        for edge in edges {
+            assert_eq!(edge.proof, UsageProof::Proven, "{edge:?}");
+            assert_eq!(edge.site.enclosing.as_ref().unwrap().short_name(), "caller");
+        }
+    }
+
+    #[test]
+    #[hardwon("#4488: a proven qualified route retained its coarse inverse inventory gap")]
+    fn scoped_reverse_keeps_foreign_reexports_and_excludes_other_source_inventory() {
+        use brokk_bifrost_core::analyzer::structural::edges::EdgeAxis;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"scoped_reverse\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod provider; pub mod barrel; pub mod caller; pub mod excluded;",
+            )
+            .file("src/provider.rs", "pub fn target() {}")
+            .file("src/barrel.rs", "pub use crate::provider::target;")
+            .file(
+                "src/caller.rs",
+                "pub fn caller() { crate::barrel::target(); }",
+            )
+            .file(
+                "src/excluded.rs",
+                // A module mount keeps the token tree unenumerable; a bare `unknown_macro!()`
+                // no longer leaves the reference inventory incomplete.
+                "pub fn excluded() { crate::provider::target(); unknown_macro! { mod generated; } }",
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/provider.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .unwrap();
+        for (files, expected_edges, complete) in [
+            (HashSet::from_iter([fixture.file("src/caller.rs")]), 1, true),
+            (
+                HashSet::from_iter([fixture.file("src/excluded.rs")]),
+                1,
+                false,
+            ),
+            (HashSet::default(), 0, true),
+        ] {
+            let result = with_rust_selected_reverse_queries_in_files(
+                &rust,
+                &files,
+                &CancellationToken::new(),
+                |queries| queries.inverse_for(std::slice::from_ref(&target)),
+            );
+            let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+                panic!("scoped reverse lookup must be available: {result:?}");
+            };
+            assert_eq!(rows[0].edges.len(), expected_edges, "{rows:?}");
+            assert_eq!(
+                rows[0].covers(EdgeAxis::InverseProjection),
+                complete,
+                "{rows:?}"
+            );
+            assert!(
+                rows[0].edges.iter().all(|edge| {
+                    files.contains(&edge.site.file) && edge.proof == UsageProof::Proven
+                }),
+                "{rows:?}"
+            );
+        }
+
+        let files = HashSet::from_iter([fixture.file("src/caller.rs")]);
+        let cancellation = CancellationToken::new();
+        let cancelled =
+            with_rust_selected_reverse_queries_in_files(&rust, &files, &cancellation, |queries| {
+                let rows = queries.inverse_for(std::slice::from_ref(&target))?;
+                cancellation.cancel();
+                Ok(rows)
+            });
+        assert!(
+            matches!(cancelled, RustSelectedReverseOutcome::Cancelled),
+            "{cancelled:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#3828: a scoped reverse query closed inventory across an unexpanded macro frontier")]
+    fn scoped_reverse_uses_prepared_overlay_reference_inventory() {
+        use brokk_bifrost_core::analyzer::structural::edges::EdgeAxis;
+        use std::sync::Arc;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"scoped_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub mod caller; pub fn target() {}")
+            .file("src/caller.rs", "pub fn caller() { crate::target(); }")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let target = disk
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .unwrap();
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("src/caller.rs").abs_path(),
+            "pub fn caller() {}".to_owned()
+        ));
+        let prepared = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            prepared
+                .declarations(&fixture.file("src/caller.rs"))
+                .iter()
+                .any(|unit| unit.identifier() == "caller")
+        );
+        let files = HashSet::from_iter([fixture.file("src/caller.rs")]);
+        let result = with_rust_selected_reverse_queries_in_files(
+            &prepared,
+            &files,
+            &CancellationToken::new(),
+            |queries| queries.inverse_for(std::slice::from_ref(&target)),
+        );
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+            panic!("prepared overlay must be selected: {result:?}");
+        };
+        assert!(rows[0].edges.is_empty(), "{rows:?}");
+        assert!(rows[0].covers(EdgeAxis::InverseProjection), "{rows:?}");
+
+        assert!(overlay.set(
+            fixture.file("src/caller.rs").abs_path(),
+            // A module mount keeps the token tree unenumerable; a bare `unknown_macro!()`
+            // no longer leaves the reference inventory incomplete.
+            "pub fn caller() { unknown_macro! { mod generated; } }".to_owned(),
+        ));
+        let prepared = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            prepared
+                .declarations(&fixture.file("src/caller.rs"))
+                .iter()
+                .any(|unit| unit.identifier() == "caller")
+        );
+        for (files, complete) in [(files, false), (HashSet::default(), true)] {
+            let result = with_rust_selected_reverse_queries_in_files(
+                &prepared,
+                &files,
+                &CancellationToken::new(),
+                |queries| queries.inverse_for(std::slice::from_ref(&target)),
+            );
+            let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+                panic!("prepared overlay must be selected: {result:?}");
+            };
+            assert!(rows[0].edges.is_empty(), "{rows:?}");
+            assert_eq!(
+                rows[0].covers(EdgeAxis::InverseProjection),
+                complete,
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("4a6e672b7308: renamed generic owners lost transfer-owned Rust Self usages")]
+    fn self_type_observations_follow_renamed_generic_owners_with_exact_proof() {
+        use brokk_bifrost_core::analyzer::usages::model::ReferenceKind;
+
+        let source = "pub mod types { pub struct Service<T> { pub value: T } }\n\
+use types::Service as Renamed;\n\
+impl<T> Renamed<T> {\n\
+    fn new(value: T) -> Self { Self { value } }\n\
+    fn pass(value: Self) -> Self { Self::new(value.value) }\n\
+}\n\
+struct Other;\n\
+impl Other { fn new() -> Self { loop {} } }\n\
+trait Abstract { fn unknown() -> Self; }\n";
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", source)
+            .build();
+        // Reopening exercises persisted observation rows as well as fresh lowering.
+        for _ in 0..2 {
+            let rust = RustAnalyzer::new(fixture.project_dyn());
+            let target = rust
+                .declarations(&fixture.file("src/lib.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "Service")
+                .unwrap();
+            let result =
+                with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                    queries.inverse_for(std::slice::from_ref(&target))
+                });
+            let RustSelectedReverseOutcome::Ready(Some(rows)) = result else {
+                panic!("transfer observations must be available: {result:?}");
+            };
+            let self_hits = rows[0]
+                .edges
+                .iter()
+                .filter(|edge| {
+                    &source[edge.site.range.start_byte..edge.site.range.end_byte] == "Self"
+                })
+                .collect::<Vec<_>>();
+            let mut lines = self_hits
+                .iter()
+                .map(|edge| edge.site.range.start_line)
+                .collect::<Vec<_>>();
+            lines.sort_unstable();
+            assert_eq!(lines, vec![4, 4, 5, 5, 5], "{rows:?}");
+            assert!(
+                self_hits.iter().all(|edge| edge.proof == UsageProof::Proven
+                    && edge.reference_kind == Some(ReferenceKind::SelfTypeAlias)),
+                "{self_hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_missing_reverse_target_cannot_authorize_a_staged_result() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"missing\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub fn target() {}\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let missing = CodeUnit::file_scope(fixture.file("src/lib.rs"));
+        let result =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                assert!(queries.inverse_for(&[missing])?.is_none());
+                Ok("must not publish")
+            });
+        assert!(
+            matches!(result, RustSelectedReverseOutcome::Unavailable(_)),
+            "{result:?}"
+        );
+    }
+
+    fn assert_crate_point(files: &[(&str, &str)], caller: &str, start: usize, name: &str) {
+        let mut builder = InlineTestProject::with_language(Language::Rust);
+        for (path, source) in files {
+            builder = builder.file(*path, *source);
+        }
+        let fixture = builder.build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        assert!(!rust.declarations(&fixture.file(caller)).is_empty());
+        let locator = brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator::for_reference_range(
+            "rust",
+            caller,
+            start,
+            start + name.len(),
+        );
+        let cancellation = CancellationToken::new();
+        let snapshots = rust.inner.selected_workspace_snapshots();
+        let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+        let (masks, content_mounts) = match rust
+            .inner
+            .selected_rust_resolution_overlay_inputs(snapshots.as_ref(), &cancellation)
+            .unwrap()
+        {
+            SelectedResolutionOverlayInputsOutcome::Ready {
+                masks,
+                content_mounts,
+            } => (masks, content_mounts),
+            other => panic!("selected Rust operation inputs: {other:?}"),
+        };
+        let input = SelectedResolutionOperationInput::new(
+            rust.inner.project(),
+            rust.inner.workspace_id(),
+            snapshots.as_ref(),
+            &languages,
+            &masks,
+        )
+        .with_content_mounts(content_mounts);
+        let mut operation = match rust
+            .inner
+            .analyzer_store()
+            .open_selected_resolution_operation(input, &cancellation)
+            .unwrap()
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("selected Rust operation: {other:?}"),
+        };
+        // Production confirmation obtains FILE_CRATES through
+        // rust_crate_container_sources and merges rust_crate_context for every key.
+        let confirmation = confirm_rust_reverse_references(
+            &mut operation,
+            std::path::Path::new(caller),
+            &[&locator],
+            &cancellation,
+        )
+        .unwrap();
+        let brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse_rows::RustReverseConfirmation::Ready(
+            mut answers,
+        ) = confirmation
+        else {
+            panic!("point confirmation");
+        };
+        let answers = answers.remove(0).into_answers().collect::<Vec<_>>();
+        assert!(!answers.is_empty());
+        for answer in answers {
+            eprintln!(
+                "crate point {caller}:{start}: definitions={:?}, binding={:?}, enumeration={:?}, inventory_details={:?}",
+                answer.definitions,
+                answer.resolution.binding(),
+                answer.enumeration,
+                answer.inventory_details,
+            );
+            assert_eq!(answer.definitions.len(), 1, "exact physical point target");
+            assert_eq!(
+                answer.resolution.binding().completion(),
+                &ResolutionCompletion::Complete,
+                "crate-key point must completely confirm the reverse candidate"
+            );
+        }
+    }
+}

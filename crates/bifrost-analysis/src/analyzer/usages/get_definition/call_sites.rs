@@ -1,16 +1,25 @@
-use tree_sitter::{Node, Tree};
+use tree_sitter::Node;
+use tree_sitter::Tree;
 
 use crate::analyzer::reference_candidates::reference_candidate_requires_point_lookup;
-use crate::analyzer::scala::case_block_is_partial_function;
-use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
+
+use crate::analyzer::structural::FileFacts;
+use crate::analyzer::structural::NormalizedKind;
+use crate::analyzer::structural::Role;
+
 use crate::analyzer::usages::range_for_span;
-use crate::analyzer::{Language, ProjectFile, Range};
+
+use crate::analyzer::Language;
+use crate::analyzer::ProjectFile;
+use crate::analyzer::Range;
+
 use brokk_bifrost_core::analyzer::usages::reference_site::node_range;
 
-use super::{
-    parse_tree_for_language, ruby_is_call_method_identifier, scala::scala_postfix_method_node,
-};
+use super::parse_tree_for_language;
+
 use crate::analyzer::common::language_for_file;
+
+use brokk_bifrost_ruby::graph::syntax::is_call_method_identifier as ruby_is_call_method_identifier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallSignatureContext {
@@ -27,20 +36,31 @@ pub enum CallSyntaxKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CallArgumentSyntax {
-    pub(crate) range: Range,
-    pub(crate) name: Option<String>,
-    pub(crate) position: Option<usize>,
-    pub(crate) spread: bool,
+#[doc(hidden)]
+pub struct CallArgumentSyntax {
+    #[doc(hidden)]
+    pub range: Range,
+    #[doc(hidden)]
+    pub name: Option<String>,
+    #[doc(hidden)]
+    pub position: Option<usize>,
+    #[doc(hidden)]
+    pub spread: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CallSiteSyntax {
-    pub(crate) range: Range,
-    pub(crate) callee_range: Range,
-    pub(crate) receiver: Option<Range>,
-    pub(crate) arguments: Vec<CallArgumentSyntax>,
-    pub(crate) kind: CallSyntaxKind,
+#[doc(hidden)]
+pub struct CallSiteSyntax {
+    #[doc(hidden)]
+    pub range: Range,
+    #[doc(hidden)]
+    pub callee_range: Range,
+    #[doc(hidden)]
+    pub receiver: Option<Range>,
+    #[doc(hidden)]
+    pub arguments: Vec<CallArgumentSyntax>,
+    #[doc(hidden)]
+    pub kind: CallSyntaxKind,
 }
 
 /// Structured result of mapping one exact whole-call span to its dispatch
@@ -62,7 +82,8 @@ pub(crate) enum ExactCallReferenceGap {
     CallOfValue,
 }
 
-pub(crate) fn call_reference_ranges_in_tree(
+#[doc(hidden)]
+pub fn call_reference_ranges_in_tree(
     tree: &Tree,
     language: Language,
     search_range: &Range,
@@ -80,8 +101,9 @@ pub(crate) fn call_reference_ranges_in_tree(
 /// calls have different exact spans even when a cursor-based lookup would land
 /// inside both.  Callee selection remains tree-sitter-structured through the
 /// language's named fields and call-reference predicate.
-#[cfg(test)]
-fn call_reference_range_for_call(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn call_reference_range_for_call(
     tree: &Tree,
     language: Language,
     call_span: &Range,
@@ -145,7 +167,8 @@ pub(crate) fn exact_call_reference_for_call(
 /// Map a reverse site's whole-call span or exact callee span to the same
 /// cache key used by forward dispatch. An arbitrary operand inside a call
 /// cannot qualify: the site's range must equal the call or its callee leaf.
-pub(crate) fn exact_call_reference_for_reverse_site(
+#[doc(hidden)]
+pub fn exact_call_reference_for_reverse_site(
     tree: &Tree,
     language: Language,
     site: &Range,
@@ -225,7 +248,8 @@ pub(crate) fn range_is_call_keyword_label(
         })
 }
 
-pub(crate) fn call_site_syntax_for_reference(
+#[doc(hidden)]
+pub fn call_site_syntax_for_reference(
     facts: &FileFacts,
     start_byte: usize,
     end_byte: usize,
@@ -339,7 +363,8 @@ fn call_signature_context_for_node(
     byte_offset: usize,
 ) -> Option<CallSignatureContext> {
     if language == Language::Scala
-        && let Some(context) = scala_call_signature_context_for_node(node, byte_offset)
+        && let Some(context) = crate::analyzer::languages::language_support(language)
+            .and_then(|support| support.definition_call_signature_context(node, byte_offset))
     {
         return Some(context);
     }
@@ -372,7 +397,8 @@ fn call_signature_context_for_node(
     })
 }
 
-fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
+#[doc(hidden)]
+pub fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
     match language {
         Language::Java => matches!(
             node.kind(),
@@ -407,37 +433,8 @@ fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
     }
 }
 
-fn scala_call_signature_context_for_node(
-    node: Node<'_>,
-    byte_offset: usize,
-) -> Option<CallSignatureContext> {
-    match node.kind() {
-        "infix_expression" => {
-            let operator = node.child_by_field_name("operator")?;
-            let right = node.child_by_field_name("right")?;
-            if byte_offset < right.start_byte() || byte_offset > right.end_byte() {
-                return None;
-            }
-            Some(CallSignatureContext {
-                callee_range: node_range(operator),
-                active_parameter: 0,
-            })
-        }
-        "postfix_expression" => {
-            let method = scala_postfix_method_node(node)?;
-            if byte_offset < method.start_byte() || byte_offset > method.end_byte() {
-                return None;
-            }
-            Some(CallSignatureContext {
-                callee_range: node_range(method),
-                active_parameter: 0,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<Node<'tree>> {
+#[doc(hidden)]
+pub fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<Node<'tree>> {
     match language {
         Language::Rust if node.kind() == "macro_invocation" => node.child_by_field_name("macro"),
         Language::Java => node
@@ -458,9 +455,10 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
                 .or_else(|| first_named_child_not_arguments(node, language)),
             _ => None,
         },
-        Language::Scala => scala_callee_node_for_call(node),
+        Language::Scala => crate::analyzer::languages::language_support(Language::Scala)?
+            .definition_call_callee(node),
         Language::Kotlin => {
-            crate::analyzer::languages::language_support(language)?.call_callee_node(node)
+            crate::analyzer::languages::language_knowledge(language)?.call_callee_node(node)
         }
         Language::Ruby => node.child_by_field_name("method"),
         _ => node
@@ -478,7 +476,7 @@ fn arguments_node_for_call(node: Node<'_>, language: Language) -> Option<Node<'_
 fn argument_nodes_for_call(node: Node<'_>, language: Language) -> Vec<Node<'_>> {
     // A language whose argument list neither the field lookup nor the shared child-kind
     // list below can reach answers here instead, and its answer is the whole answer.
-    if let Some(nodes) = crate::analyzer::languages::language_support(language)
+    if let Some(nodes) = crate::analyzer::languages::language_knowledge(language)
         .and_then(|support| support.call_argument_nodes(node))
     {
         return nodes;
@@ -516,18 +514,7 @@ fn first_named_child_not_arguments(node: Node<'_>, language: Language) -> Option
         .find(|child| Some(*child) != arguments)
 }
 
-fn scala_callee_node_for_call(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "call_expression" => node.child_by_field_name("function"),
-        "instance_expression" => scala_constructor_type_node(node),
-        "infix_expression" | "postfix_expression" => {
-            brokk_bifrost_jvm::scala::structural::scala_call_function_node(node)
-        }
-        _ => None,
-    }
-}
-
-fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     let arguments = node.child_by_field_name("arguments");
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|child| {
@@ -535,12 +522,13 @@ fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         node = match node.kind() {
             "identifier" | "operator_identifier" | "type_identifier" => return Some(node),
             "call_expression" | "infix_expression" | "postfix_expression" => {
-                scala_callee_node_for_call(node)?
+                crate::analyzer::languages::language_support(Language::Scala)?
+                    .definition_call_callee(node)?
             }
             "instance_expression" => scala_constructor_type_node(node)?,
             "generic_function" | "generic_type" => node
@@ -598,7 +586,8 @@ fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
 }
 
 /// Exact dispatch and structural call facts share the same callee spine.
-fn terminal_callee_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+#[doc(hidden)]
+pub fn terminal_callee_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
     use brokk_bifrost_core::analyzer::structural::adapter_helpers::terminal_callee_leaf as follow_spine;
     let hook = match language {
         Language::Cpp => brokk_bifrost_cpp::structural::callee_spine_step,
@@ -713,9 +702,8 @@ fn is_nested_callable_node(node: Node<'_>, language: Language, search_range: &Ra
     if node.start_byte() <= search_range.start_byte || node.end_byte() >= search_range.end_byte {
         return false;
     }
-    if language == Language::Scala
-        && (node.kind() == "given_definition"
-            || (node.kind() == "case_block" && case_block_is_partial_function(node)))
+    if crate::analyzer::languages::language_support(language)
+        .is_some_and(|support| support.definition_nested_callable(node))
     {
         return true;
     }
@@ -776,18 +764,10 @@ fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
         return false;
     }
     match language {
-        Language::Java => java_call_reference_candidate(node),
-        Language::Go => go_call_reference_candidate(node),
-        Language::Cpp => cpp_call_reference_candidate(node),
-        Language::JavaScript | Language::TypeScript => jsts_call_reference_candidate(node),
-        Language::Python => python_call_reference_candidate(node),
-        Language::Rust => rust_call_reference_candidate(node),
-        Language::Php => php_call_reference_candidate(node),
-        Language::Scala => scala_call_reference_candidate(node),
-        Language::CSharp => csharp_call_reference_candidate(node),
-        Language::Ruby => ruby_call_reference_candidate(node),
+        // #4452: Kotlin stays on its held definition route.
         Language::Kotlin => super::kotlin::kotlin_call_reference_candidate(node),
-        Language::None => false,
+        _ => crate::analyzer::languages::language_support(language)
+            .is_some_and(|support| support.definition_call_reference_candidate(node)),
     }
 }
 
@@ -849,185 +829,7 @@ fn cpp_explicit_operator_name(call: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn java_call_reference_candidate(node: Node<'_>) -> bool {
-    enclosing_call_reference_candidate(
-        node,
-        |parent, current| {
-            (parent.kind() == "method_invocation"
-                && parent.child_by_field_name("name") == Some(current))
-                || (parent.kind() == "object_creation_expression"
-                    && parent.child_by_field_name("type") == Some(current))
-        },
-        |parent| matches!(parent.kind(), "scoped_type_identifier" | "generic_type"),
-    )
-}
-
-fn go_call_reference_candidate(node: Node<'_>) -> bool {
-    match node.parent() {
-        Some(parent)
-            if parent.kind() == "call_expression"
-                && parent.child_by_field_name("function") == Some(node) =>
-        {
-            true
-        }
-        Some(parent)
-            if parent.kind() == "selector_expression"
-                && parent.child_by_field_name("field") == Some(node) =>
-        {
-            parent.parent().is_some_and(|grandparent| {
-                grandparent.kind() == "call_expression"
-                    && grandparent.child_by_field_name("function") == Some(parent)
-            })
-        }
-        _ => false,
-    }
-}
-
-fn cpp_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut ancestor = node.parent();
-    while let Some(current) = ancestor {
-        if is_call_expression_node(current, Language::Cpp) {
-            return callee_node_for_call(current, Language::Cpp)
-                .and_then(|callee| terminal_callee_leaf(callee, Language::Cpp))
-                == Some(node);
-        }
-        ancestor = current.parent();
-    }
-    false
-}
-
-fn jsts_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "call_expression" if parent.child_by_field_name("function") == Some(current) => {
-                return true;
-            }
-            "new_expression"
-                if parent.child_by_field_name("function") == Some(current)
-                    || parent.child_by_field_name("constructor") == Some(current) =>
-            {
-                return true;
-            }
-            "member_expression"
-            | "subscript_expression"
-            | "identifier"
-            | "property_identifier"
-            | "nested_identifier"
-            | "qualified_identifier" => current = parent,
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn python_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "call" if parent.child_by_field_name("function") == Some(current) => return true,
-            "attribute" if parent.child_by_field_name("attribute") == Some(current) => {
-                current = parent;
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn rust_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "macro_invocation" if parent.child_by_field_name("macro") == Some(current) => {
-                return true;
-            }
-            "call_expression" if parent.child_by_field_name("function") == Some(current) => {
-                return true;
-            }
-            "scoped_identifier" | "field_expression" => current = parent,
-            "generic_function" if parent.child_by_field_name("function") == Some(current) => {
-                current = parent;
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn php_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "function_call_expression"
-            | "member_call_expression"
-            | "nullsafe_member_call_expression"
-            | "scoped_call_expression"
-            | "object_creation_expression"
-                if callee_node_for_call(parent, Language::Php) == Some(current) =>
-            {
-                return true;
-            }
-            "function_call_expression"
-            | "member_call_expression"
-            | "nullsafe_member_call_expression"
-            | "scoped_call_expression"
-            | "object_creation_expression" => return false,
-            "member_access_expression"
-            | "nullsafe_member_access_expression"
-            | "scoped_property_access_expression"
-            | "qualified_name"
-            | "namespace_name" => current = parent,
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn scala_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if is_call_expression_node(parent, Language::Scala)
-            && scala_callee_node_for_call(parent).and_then(scala_terminal_callee_leaf) == Some(node)
-        {
-            return true;
-        }
-        current = parent;
-    }
-    false
-}
-
-fn csharp_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if (parent.kind() == "invocation_expression"
-            && parent.child_by_field_name("function") == Some(current))
-            || (parent.kind() == "object_creation_expression"
-                && parent.child_by_field_name("type") == Some(current))
-        {
-            return true;
-        }
-        // Only the member name dispatches a C# member-access call. The
-        // receiver is also nested under this node, but it is a value/type
-        // reference and resolving it as a call candidate creates a spurious
-        // unresolved outgoing relation.
-        if parent.kind() == "member_access_expression"
-            && parent.child_by_field_name("name") == Some(current)
-        {
-            current = parent;
-            continue;
-        }
-        if parent.kind() == "qualified_name" && parent.child_by_field_name("name") == Some(current)
-        {
-            current = parent;
-            continue;
-        }
-        return false;
-    }
-    false
-}
-
-fn enclosing_call_reference_candidate<'tree>(
+pub(crate) fn enclosing_call_reference_candidate<'tree>(
     node: Node<'tree>,
     is_call_target: impl Fn(Node<'tree>, Node<'tree>) -> bool,
     is_transparent_wrapper: impl Fn(Node<'tree>) -> bool,
@@ -1046,24 +848,8 @@ fn enclosing_call_reference_candidate<'tree>(
     false
 }
 
-fn ruby_call_reference_candidate(node: Node<'_>) -> bool {
-    if ruby_bare_call_identifier(node) {
-        return true;
-    }
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "call" if parent.child_by_field_name("method") == Some(current) => return true,
-            "scope_resolution" if parent.child_by_field_name("name") == Some(current) => {
-                current = parent;
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn ruby_bare_call_identifier(node: Node<'_>) -> bool {
+#[doc(hidden)]
+pub fn ruby_bare_call_identifier(node: Node<'_>) -> bool {
     node.kind() == "identifier"
         && node
             .parent()
@@ -1084,22 +870,25 @@ fn ruby_exact_bare_call_identifier(node: Node<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
+    use super::test_support::*;
 
-    use super::{
-        ExactCallReference, ExactCallReferenceGap, call_reference_range_for_call,
-        call_reference_ranges_in_tree, call_signature_context, call_site_syntax_for_reference,
-        exact_call_reference_for_call,
-    };
+    use crate::analyzer::usages::get_definition::call_sites::cpp_test_support::*;
 
-    use crate::analyzer::ruby::structural::RUBY_STRUCTURAL_SPEC;
+    use super::ExactCallReference;
+    use super::ExactCallReferenceGap;
+    use super::call_reference_range_for_call;
+    use super::call_reference_ranges_in_tree;
+    use super::call_signature_context;
+    use super::call_site_syntax_for_reference;
+    use super::exact_call_reference_for_call;
+
+    use crate::analyzer::Language;
+
     use crate::analyzer::structural::extract::extract_file_facts;
-    use crate::analyzer::usages::get_definition::parse_tree_for_language;
-    use crate::analyzer::{Language, ProjectFile, Range};
 
-    fn file(name: &str) -> ProjectFile {
-        ProjectFile::new(env::temp_dir().join("bifrost-signature-help"), name)
-    }
+    use crate::analyzer::usages::get_definition::parse_tree_for_language;
+
+    use brokk_bifrost_ruby::structural::RUBY_STRUCTURAL_SPEC;
 
     fn offset_after(source: &str, needle: &str) -> usize {
         source.find(needle).expect("needle exists") + needle.len()
@@ -1120,10 +909,6 @@ mod tests {
             callee
         );
         assert_eq!(context.active_parameter, active_parameter);
-    }
-
-    fn byte_range(source: &str, needle: &str) -> Range {
-        crate::analyzer::usages::test_support::byte_range(source, needle)
     }
 
     fn assert_nested_call_reference_names(path: &str, language: Language, source: &str) {
@@ -1173,25 +958,6 @@ mod tests {
         assert_eq!(&source[make.start_byte..make.end_byte], "make");
     }
 
-    const CPP_CALL_SITE_SOURCE: &str = r#"
-namespace ns {
-template <typename T> void make(T) {}
-template <typename T> struct Box {};
-struct Widget {
-  template <typename T> void run(T) {}
-  Widget& operator+(int) { return *this; }
-  ~Widget() {}
-};
-}
-void caller(ns::Widget& receiver) {
-  ns::make<int>(1);
-  receiver.run<int>(1);
-  new ns::Box<int>();
-  receiver.operator+(1);
-  receiver.~Widget();
-}
-"#;
-
     #[test]
     fn exact_cpp_call_spans_follow_only_the_terminal_callable_spine() {
         let source = CPP_CALL_SITE_SOURCE;
@@ -1213,25 +979,6 @@ void caller(ns::Widget& receiver) {
                 "wrong exact C++ callee for `{call}`"
             );
         }
-    }
-
-    #[test]
-    fn cpp_call_candidates_exclude_receivers_qualifiers_and_template_arguments() {
-        let source = CPP_CALL_SITE_SOURCE;
-        let file = file("calls.cpp");
-        let tree = parse_tree_for_language(&file, Language::Cpp, source).expect("C++ syntax tree");
-        let body = byte_range(
-            source,
-            "void caller(ns::Widget& receiver) {\n  ns::make<int>(1);\n  receiver.run<int>(1);\n  new ns::Box<int>();\n  receiver.operator+(1);\n  receiver.~Widget();\n}",
-        );
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Cpp, &body, 20);
-        let names = references
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["make", "run", "Box", "operator+", "~Widget"]);
     }
 
     #[test]
@@ -1322,39 +1069,6 @@ object Calls {
     }
 
     #[test]
-    fn exact_php_nullsafe_call_span_uses_the_named_method_field() {
-        let source = "<?php\nclass Service { public function run(): void {} }\nfunction caller(Service $service): void { $service?->run(); }\n";
-        let file = file("nested.php");
-        let tree = parse_tree_for_language(&file, Language::Php, source).expect("PHP syntax tree");
-
-        let run = call_reference_range_for_call(
-            &tree,
-            Language::Php,
-            &byte_range(source, "$service?->run()"),
-        )
-        .expect("nullsafe method reference");
-
-        assert_eq!(&source[run.start_byte..run.end_byte], "run");
-    }
-
-    #[test]
-    fn php_nullsafe_receiver_properties_are_not_outgoing_call_candidates() {
-        let source =
-            "<?php\nfunction caller(Holder $holder): void { $holder?->service?->run(); }\n";
-        let file = file("nested.php");
-        let tree = parse_tree_for_language(&file, Language::Php, source).expect("PHP syntax tree");
-        let call = byte_range(source, "$holder?->service?->run()");
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Php, &call, 10);
-        let names = references
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["run"]);
-    }
-
-    #[test]
     fn exact_ruby_call_spans_use_the_terminal_callee_for_every_ordinary_form() {
         let source = r#"def caller(service)
   bare_target
@@ -1438,73 +1152,6 @@ end
             Some(ExactCallReference::Unsupported(
                 ExactCallReferenceGap::RubyCallableObject
             ))
-        );
-    }
-
-    #[test]
-    fn ruby_outgoing_candidates_stop_at_nested_execution_boundaries() {
-        let outer = r#"class Outer
-  setup()
-  around() do
-    nested_block()
-  end
-
-  class Nested
-    nested_class()
-  end
-
-  class << self
-    nested_singleton()
-  end
-
-  BEGIN { begin_only() }
-  END { end_only() }
-
-  local_value = 1
-  consume(local_value)
-  finish()
-end"#;
-        let source = format!("{outer}\n");
-        let file = file("boundaries.rb");
-        let tree =
-            parse_tree_for_language(&file, Language::Ruby, &source).expect("Ruby syntax tree");
-
-        let names_in = |range: Range| {
-            call_reference_ranges_in_tree(&tree, Language::Ruby, &range, 20)
-                .into_iter()
-                .map(|range| source[range.start_byte..range.end_byte].to_string())
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            names_in(byte_range(&source, outer)),
-            vec!["setup", "around", "consume", "finish"]
-        );
-        assert_eq!(
-            names_in(byte_range(&source, "do\n    nested_block()\n  end")),
-            vec!["nested_block"]
-        );
-        assert_eq!(
-            names_in(byte_range(
-                &source,
-                "class Nested\n    nested_class()\n  end"
-            )),
-            vec!["nested_class"]
-        );
-        assert_eq!(
-            names_in(byte_range(
-                &source,
-                "class << self\n    nested_singleton()\n  end"
-            )),
-            vec!["nested_singleton"]
-        );
-        assert_eq!(
-            names_in(byte_range(&source, "BEGIN { begin_only() }")),
-            vec!["begin_only"]
-        );
-        assert_eq!(
-            names_in(byte_range(&source, "END { end_only() }")),
-            vec!["end_only"]
         );
     }
 
@@ -1749,3 +1396,11 @@ end"#;
         assert_eq!(context.active_parameter, 0);
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod cpp_test_support;

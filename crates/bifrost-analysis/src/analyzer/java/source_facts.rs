@@ -1,12 +1,25 @@
 use super::JavaAdapter;
+use super::source_storage::JavaSourceStorage;
 use crate::analyzer::store::GenerationId;
 use crate::analyzer::{Language, ProjectFile, QueryReadIncomplete, TreeSitterAnalyzer};
 use crate::hash::HashMap;
 use git2::Oid;
 use std::sync::Arc;
 
-impl TreeSitterAnalyzer<JavaAdapter> {
-    pub(crate) fn canonical_java_source_facts(
+#[doc(hidden)]
+pub trait JavaSourceFacts {
+    fn canonical_java_source_facts(
+        &self,
+        file: &ProjectFile,
+        cache: &moka::sync::Cache<
+            (GenerationId, Oid, ProjectFile),
+            Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
+        >,
+    ) -> Option<Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>>;
+}
+
+impl JavaSourceFacts for TreeSitterAnalyzer<JavaAdapter> {
+    fn canonical_java_source_facts(
         &self,
         file: &ProjectFile,
         cache: &moka::sync::Cache<

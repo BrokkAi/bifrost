@@ -185,7 +185,7 @@ running host. `bifrost --version` prints each selected pack's ID, version, and
 policy count and the catalog SHA-256. Pack release versions are independent
 of the engine version.
 
-Setting `BIFROST_OPEN_POLICY_PACK_ROOT` to a directory of extracted packs
+Setting `BIFROST_POLICY_PACK_ROOT` to a directory of extracted packs
 supplies the catalog for every policy surface: `--list-policies`,
 `--version`, `bifrost scan`, default runs, built-in selectors, and MCP. Each
 subdirectory is one pack with a `manifest.json` and its `policies/*.rqlp`
@@ -587,35 +587,76 @@ annotation. It comes from two reviewed artifacts:
 
 - a semantic model that declares the effect `bifrost.network_io` on the exact
   API identity; and
-- a declaration-selection block inside the policy that names the exact
-  declarations the repository reviewed.
+- a declaration-selection document that names the exact declarations the
+  repository reviewed.
 
-When this external pack is selected, its policies have activation `default`,
-so `bifrost --root . --policy` and `bifrost scan` run them. Their template
-selection block is empty: it selects
-`(except (enclosing-decl (function)) (enclosing-decl (function)))`. Each
-policy checks no protected declaration until you configure a copy. That empty
-selection does not certify a network boundary in your application.
-`--policy-id bifrost.effects.<language>.selected-boundary-no-network-io` also
-runs the selected template, with its empty selection.
+The policy does not contain its selection. It imports the document at a
+reserved workspace path, `.bifrost/effect-boundaries/<language>-network-io.rqlp`,
+so the released policy ID runs unchanged for every repository:
+
+```lisp
+(bind :name selected
+  :query (declaration-selection-file
+    :path ".bifrost/effect-boundaries/javascript-network-io.rqlp"
+    :language javascript))
+(bind :name effect
+  :query (procedure-effects-of :binding selected))
+```
+
+Both bindings read the one document: `procedure-effects-of` takes the
+procedure effects of exactly the declarations `selected` binds, so the
+selection and the effect input cannot drift apart.
+
+The document holds exact declaration selectors only. Each entry is an inline
+`(enclosing-decl DECLARATION)` or `(enclosing-decl (inside-decl OWNER
+DECLARATION))`, where each pattern is a `function`, `method`, or `class` with
+an exact `:name` and no other constraint. A document lists at most 16
+declarations. This one selects the JavaScript fixture's `total`:
+
+<!-- policy-doc-test:rqlp:tests/fixtures/golden/declaration-selection-import/javascript/selection.rqlp -->
+```lisp
+;; The reviewed selection a host writes for the javascript fixture trees: the
+;; one boundary the network-effect fixtures protect.
+(declaration-selection-document
+  :schema-version 1
+  :language javascript
+  :declarations [
+    (rql (enclosing-decl (function :name "total")))])
+```
+
+The policies are opt-in: they run only when `--policy-id` names them, never in
+`bifrost --root . --policy` or `bifrost scan`. A selected policy whose
+document is missing, empty, malformed, of another document kind, or of
+another language does not run. The report carries a `policy-validation-failed`
+diagnostic whose message names the cause, such as
+`declaration-selection-unavailable` ("no protected declarations configured"),
+`declaration-selection-empty`, `declaration-selection-not-exact`,
+`declaration-selection-nested-import`, `declaration-selection-wrong-document`,
+or `declaration-selection-wrong-language`. An unconfigured policy is never a
+clean result. The document rejects nested file references (`rql-file`,
+`declaration-selection-file`, `endpoint-set-file`), because they would resolve
+against the scanned checkout.
+
+The run's `policy_hash` covers the imported declarations, not their spelling:
+reordering entries or editing comments keeps it, and selecting another
+declaration changes it. The policy ID, and its catalog `authored_hash`, stay
+those of the released rule.
 
 To configure the obligation:
 
-1. Copy the policy source from the exact selected external release. Its
-   authoring path in Bifrost-packs is
-   `rules/bifrost.effects/policies/<language>/selected-boundary-no-network-io.rqlp`;
-   the `path` field of `bifrost --list-policies` gives the path inside the
-   installed pack. Retain its license, notices, and source/release identity.
-2. Replace both `(except ...)` expressions with the exact declaration you
-   protect, for example
-   `(enclosing-decl (inside-decl (class :name "PriceCalculator") (method :name "total")))`.
-3. Give the copy its own `:id`. If the copy keeps the shipped ID and runs
-   beside the selected external pack, both definitions are excluded with
-   `duplicate-policy-id`.
-4. Put the language's reviewed model under `.bifrost/semantic-models/`. Go
+1. Write the selection document to
+   `.bifrost/effect-boundaries/<language>-network-io.rqlp`.
+2. Put the language's reviewed model under `.bifrost/semantic-models/`. Go
    needs no file.
-5. Run the copy: `bifrost --root . --policy-file policies/my-boundary.rqlp
-   --fail-on error`.
+3. Run the released policy:
+   `bifrost --root . --policy-id bifrost.effects.<language>.selected-boundary-no-network-io --fail-on error`.
+
+A host that scans repositories it does not trust owns both reserved paths: it
+deletes whatever the checkout holds there and writes its own reviewed
+selection and model bytes before the run. Without the reviewed model, a
+selected declaration that reaches the API leaves the effect set open, so the
+run is inconclusive (exit 2) with an `absence-requires-exhaustive-coverage`
+obligation; it is never clean.
 
 | Language | Modeled API and written arity | Model to install |
 | --- | --- | --- |
@@ -624,6 +665,7 @@ To configure the obligation:
 | Java, Kotlin, Scala | `java.net.URL.openConnection()`, arity 0 | `semantic-packs/web-network/jvm/bifrost.web-network-jvm.json`, one model for all three |
 | JavaScript | `globalThis.fetch` | `semantic-packs/web-network/javascript/bifrost.web-network-javascript.json` |
 | TypeScript | `globalThis.fetch` | `semantic-packs/web-network/typescript/bifrost.web-network-typescript.json` |
+| PHP | the cURL builtin `curl_exec`, arity 1 | `semantic-packs/web-network/php/bifrost.web-network-php.json` |
 | Python | `urllib.request.urlopen` | `semantic-packs/web-network/python/bifrost.web-network-python.json` |
 | Ruby | `Net::HTTP.get`, arity 1, and `request` on a `Net::HTTP.new` result | `semantic-packs/web-network/ruby/bifrost.web-network-ruby.json` |
 | Rust | `std::net::TcpStream::connect`, arity 1 | `semantic-packs/web-network/rust/bifrost.web-network-rust.json` |
@@ -669,14 +711,21 @@ How each language binds its modeled API:
   deferred callbacks and other arities keep the absence claim open. Parameter
   and explicitly typed local receivers bind; field and property receivers do
   not yet.
+- **PHP.** `curl_exec($handle)` binds the global builtin through PHP's own
+  function lookup: an unqualified call tries the caller's namespace first, so
+  a workspace function such as `App\curl_exec` wins and carries no effect,
+  while `\curl_exec($handle)` names the builtin directly. The same model gives
+  `curl_init` with one argument a reviewed effect-free summary. Other arities
+  keep the absence claim open.
 - **Go.** The Go import binder expands the call's `http` qualifier to the
   `net/http` import path, so the identity never rests on the spelling `Get`.
 
 In every language, a helper the analyzer cannot expand leaves the absence claim
 open rather than clean.
 
-This is an example configured copy of the JavaScript policy. It selects a
-module-level function named `total`:
+A repository that authors its own policy may still inline its selection.
+This repository-owned JavaScript policy selects a module-level function named
+`total`:
 
 <!-- policy-doc-test:rqlp:tests/fixtures/network-effect-boundary/policies/javascript.rqlp -->
 ```lisp
@@ -1510,15 +1559,24 @@ containment is fixed.
 `(assert-value-origin :id ID :at CAPTURE :role ROLE :established inside|outside
 :relative-to CAPTURE2)` asks the same shape of question about the value rather
 than the binder: it requires the value read at the captured reference to be
-*established* inside, or outside, a second captured node. Two origins establish
-a value and the requirement is over their union -- the declaring scope of the
-binding in effect at the reference, and any assignment whose left operand
-reaches that same binding. That second half is what separates a receiver
-declared before a loop and overwritten on every pass, which is a fresh value
-each iteration, from one that is genuinely re-used unchanged; in languages where
-an assignment writes a binding instead of introducing one, `assert-binding-scope`
-cannot see the difference. The join to an assignment is binding identity, never
-the spelled name, so a write to a shadowing namesake exempts nothing.
+*established* inside, or outside, a second captured node. The requirement is
+over the union of the binding's lexical declaring scope,
+explicit assignment targets, and loop-target occurrences already classified as
+`loop_variable` bindings by the language adapter. An establishment target's
+original source position is compared with the captured region; its `binding-of`
+answer is compared with the receiver's selected binding. The lexical owning
+scope is separate: a Python loop target can establish a value inside a loop
+while remaining a local of the enclosing function. Repeated binding tokens and
+assignments join by canonical binding identity, never the spelled name, so a
+write to a shadowing namesake exempts nothing. An outer loop's target does not
+establish a value inside an inner loop merely because both use the same binding.
+
+This is supported lexical establishment evidence, not an exhaustive analysis of
+iteration writes or arbitrary receiver mutation. For example, existing-variable
+iteration targets need not introduce a `loop_variable` binding in every language.
+Missing or conflicting canonical binding evidence for a discovered target, an
+incomplete inventory, row limits and cancellation cannot prove an outside origin. The predicate does not
+prove that a deferred body executes or that collection contents are unchanged.
 
 `(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past
 external_declared_unindexed|external_unknown)` forbids a `name_only_fallback`

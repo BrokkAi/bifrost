@@ -1,7 +1,6 @@
 //! Analyzer-owned bounded receiver queries for structural traversal.
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
 use crate::analyzer::languages::{
     BoundedReceiverQuery, LanguageSupport, ReceiverFactContext, StructuralReceiverResolver,
     language_support,
@@ -24,13 +23,13 @@ use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, CSHARP_INDEXER_MEMBER_NAME, DefinitionLookupOutcome, DefinitionLookupStatus,
+    BoundedResolution, DefinitionLookupOutcome, DefinitionLookupStatus,
     java::{JavaResolutionSession, resolve_java_bounded},
     parse_tree_for_language, resolve_reference_site_with_line_starts,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
-    resolve_js_ts_type_bounded, semantic_model_lookup_type,
+    semantic_model_lookup_type,
 };
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
@@ -49,11 +48,11 @@ use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, DispatchExtensibility, IAnalyzer, Language, ProjectFile,
     Range, WorkspaceAnalyzer,
 };
-use crate::analyzer::{GoAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::path_utils::rel_path_string;
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_csharp::syntax::CSHARP_INDEXER_MEMBER_NAME;
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -248,10 +247,11 @@ pub struct ReceiverQueryService<'a> {
     definitions: AnalyzerDefinitionLookup<'a>,
     prepared_files: RefCell<HashMap<ProjectFile, PreparedReceiverFile>>,
     prepared_java_files: RefCell<HashMap<ProjectFile, PreparedJavaReceiverFile>>,
-    prepared_structural_files: RefCell<HashMap<ProjectFile, PreparedStructuralReceiverFile>>,
-    /// Selected Go point state belongs to this service's one RQL/policy
+    #[doc(hidden)]
+    pub prepared_structural_files: RefCell<HashMap<ProjectFile, PreparedStructuralReceiverFile>>,
+    /// Language-owned point state belongs to this service's one RQL/policy
     /// request and grows only for source files that request touches.
-    native_go_points: RefCell<Option<Box<GoNativePointRequest<'a>>>>,
+    receiver_request: RefCell<Option<Box<dyn crate::analyzer::languages::ReceiverRequest + 'a>>>,
 }
 
 struct PreparedReceiverFile {
@@ -260,14 +260,16 @@ struct PreparedReceiverFile {
     facts: ReceiverFileFacts,
 }
 
-struct PreparedStructuralReceiverFile {
+#[doc(hidden)]
+pub struct PreparedStructuralReceiverFile {
     facts: Arc<FileFacts>,
     sites: ReceiverSiteIndex,
     syntax: Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>,
 }
 
 impl PreparedStructuralReceiverFile {
-    fn matches(&self, facts: &Arc<FileFacts>) -> bool {
+    #[doc(hidden)]
+    pub fn matches(&self, facts: &Arc<FileFacts>) -> bool {
         Arc::ptr_eq(&self.facts, facts)
             && self.sites.source() == facts.source()
             && self.syntax.source() == facts.source()
@@ -297,7 +299,8 @@ impl PreparedJavaReceiverFile {
     }
 }
 
-enum SemanticReceiverGate {
+#[doc(hidden)]
+pub enum SemanticReceiverGate {
     Bypassed {
         work: ReceiverAnalysisWork,
     },
@@ -317,7 +320,8 @@ enum SemanticReceiverGate {
 }
 
 impl SemanticReceiverGate {
-    fn work(&self) -> ReceiverAnalysisWork {
+    #[doc(hidden)]
+    pub fn work(&self) -> ReceiverAnalysisWork {
         match self {
             Self::Bypassed { work }
             | Self::Available { work, .. }
@@ -326,7 +330,8 @@ impl SemanticReceiverGate {
         }
     }
 
-    fn exceeded_limit(&self) -> Option<ReceiverBudgetLimit> {
+    #[doc(hidden)]
+    pub fn exceeded_limit(&self) -> Option<ReceiverBudgetLimit> {
         match self {
             Self::Exceeded { limit, .. } => Some(*limit),
             Self::Bypassed { .. } | Self::Available { .. } | Self::Unavailable { .. } => None,
@@ -335,7 +340,8 @@ impl SemanticReceiverGate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticReceiverEvidence {
+#[doc(hidden)]
+pub enum SemanticReceiverEvidence {
     ExhaustiveComplete,
     Incomplete {
         coverage: CandidateCoverage,
@@ -345,7 +351,8 @@ enum SemanticReceiverEvidence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticReceiverIncompleteness {
+#[doc(hidden)]
+pub enum SemanticReceiverIncompleteness {
     /// The retained candidates are individually proven and complete, but a
     /// globally incomplete adapter capability keeps the candidate set open.
     GlobalCapabilitiesWithProvenCandidates,
@@ -393,7 +400,8 @@ impl SemanticReceiverEvidence {
         evidence
     }
 
-    const fn supports_precise(self) -> bool {
+    #[doc(hidden)]
+    pub const fn supports_precise(self) -> bool {
         matches!(self, Self::ExhaustiveComplete)
     }
 
@@ -429,13 +437,15 @@ impl SemanticReceiverEvidence {
 /// the compatibility provider. Setup consumes the same scope capacity as the
 /// two analysis phases even though it remains separately visible in reports.
 #[derive(Debug, Clone, Copy)]
-struct ReceiverWorkLedger {
+#[doc(hidden)]
+pub struct ReceiverWorkLedger {
     budget: ReceiverAnalysisBudget,
     work: ReceiverAnalysisWork,
 }
 
 impl ReceiverWorkLedger {
-    fn new(budget: ReceiverAnalysisBudget) -> Self {
+    #[doc(hidden)]
+    pub fn new(budget: ReceiverAnalysisBudget) -> Self {
         Self {
             budget,
             work: ReceiverAnalysisWork::default(),
@@ -520,7 +530,8 @@ fn combined_receiver_work(
     }
 }
 
-enum CompatibilityOutcome<T> {
+#[doc(hidden)]
+pub enum CompatibilityOutcome<T> {
     Complete(T),
     Exceeded(ReceiverBudgetLimit),
 }
@@ -597,7 +608,7 @@ impl<'a> ReceiverQueryService<'a> {
             prepared_files: RefCell::new(HashMap::default()),
             prepared_java_files: RefCell::new(HashMap::default()),
             prepared_structural_files: RefCell::new(HashMap::default()),
-            native_go_points: RefCell::new(None),
+            receiver_request: RefCell::new(None),
         }
     }
 
@@ -611,21 +622,14 @@ impl<'a> ReceiverQueryService<'a> {
             return resolver.resolve_type_bounded(query);
         }
         {
-            let mut request = self.native_go_points.borrow_mut();
+            let mut request = self.receiver_request.borrow_mut();
             if request.is_none()
-                && let Some(go) = resolve_analyzer::<GoAnalyzer>(self.analyzer)
+                && let Some(support) = language_support(language)
             {
                 let cancellation = query.cancellation.cloned().unwrap_or_default();
-                if let Ok(GoNativePointRequestOpen::Ready(opened)) = GoNativePointRequest::open(
-                    go,
-                    self.analyzer.semantic_model_overlay(),
-                    &cancellation,
-                ) {
-                    *request = Some(opened);
-                }
+                *request = support.open_receiver_request(self.analyzer, &cancellation);
             }
             if let Some(request) = request.as_mut() {
-                request.begin_receiver_query(query.file);
                 return request.resolve_type(query);
             }
         }
@@ -642,30 +646,15 @@ impl<'a> ReceiverQueryService<'a> {
             return resolver.resolve_definition_bounded(query);
         }
         {
-            let mut request = self.native_go_points.borrow_mut();
+            let mut request = self.receiver_request.borrow_mut();
             if request.is_none()
-                && let Some(go) = resolve_analyzer::<GoAnalyzer>(self.analyzer)
+                && let Some(support) = language_support(language)
             {
                 let cancellation = query.cancellation.cloned().unwrap_or_default();
-                if let Ok(GoNativePointRequestOpen::Ready(opened)) = GoNativePointRequest::open(
-                    go,
-                    self.analyzer.semantic_model_overlay(),
-                    &cancellation,
-                ) {
-                    *request = Some(opened);
-                }
+                *request = support.open_receiver_request(self.analyzer, &cancellation);
             }
             if let Some(request) = request.as_mut() {
-                return match request.resolve_definition_with_evidence(query) {
-                    BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
-                        value: value.outcome,
-                        work,
-                    },
-                    BoundedResolution::Exceeded { limit, work } => {
-                        BoundedResolution::Exceeded { limit, work }
-                    }
-                    BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
-                };
+                return request.resolve_definition(query);
             }
         }
         resolver.resolve_definition_bounded(query)
@@ -966,17 +955,22 @@ impl<'a> ReceiverQueryService<'a> {
                     }
                     let reference_site =
                         structural_reference_site(file, source, node_range(receiver));
-                    let resolution = resolve_js_ts_type_bounded(
-                        self.analyzer,
-                        &self.definitions,
-                        file,
-                        language,
-                        source,
-                        Some(tree),
-                        &reference_site,
-                        ledger.remaining_budget(),
-                        cancellation,
-                    );
+                    let resolution = language_support(language)
+                        .expect("JS/TS receiver language support")
+                        .bounded_type_resolution(
+                            &self.definitions,
+                            language,
+                            BoundedReceiverQuery {
+                                analyzer: self.analyzer,
+                                file,
+                                source,
+                                tree: Some(tree),
+                                site: &reference_site,
+                                budget: ledger.remaining_budget(),
+                                cancellation,
+                            },
+                        )
+                        .expect("JS/TS supports bounded type resolution");
                     let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
                         CompatibilityOutcome::Complete(outcome) => Some(outcome),
                         CompatibilityOutcome::Exceeded(limit) => {
@@ -1118,17 +1112,22 @@ impl<'a> ReceiverQueryService<'a> {
                     .expect("validated member expression remains supported by its provider");
                 let reference_site =
                     structural_reference_site(file, source, member_report.receiver_range);
-                let resolution = resolve_js_ts_type_bounded(
-                    self.analyzer,
-                    &self.definitions,
-                    file,
-                    language,
-                    source,
-                    Some(tree),
-                    &reference_site,
-                    ledger.remaining_budget(),
-                    cancellation,
-                );
+                let resolution = language_support(language)
+                    .expect("JS/TS receiver language support")
+                    .bounded_type_resolution(
+                        &self.definitions,
+                        language,
+                        BoundedReceiverQuery {
+                            analyzer: self.analyzer,
+                            file,
+                            source,
+                            tree: Some(tree),
+                            site: &reference_site,
+                            budget: ledger.remaining_budget(),
+                            cancellation,
+                        },
+                    )
+                    .expect("JS/TS supports bounded type resolution");
                 let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
                     CompatibilityOutcome::Complete(outcome) => outcome,
                     CompatibilityOutcome::Exceeded(limit) => {
@@ -1194,7 +1193,8 @@ impl<'a> ReceiverQueryService<'a> {
         Ok(report)
     }
 
-    fn semantic_receiver_gate(
+    #[doc(hidden)]
+    pub fn semantic_receiver_gate(
         &self,
         file: &ProjectFile,
         range: Range,
@@ -2510,8 +2510,9 @@ impl<'a> ReceiverQueryService<'a> {
         })
     }
 
-    #[cfg(test)]
-    fn prepared_file_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn prepared_file_count(&self) -> usize {
         self.prepared_files.borrow().len()
             + self.prepared_java_files.borrow().len()
             + self.prepared_structural_files.borrow().len()
@@ -2574,7 +2575,8 @@ fn structural_receiver_unsupported_reason(
     }
 }
 
-fn structural_member_dispatch_supports_precise(
+#[doc(hidden)]
+pub fn structural_member_dispatch_supports_precise(
     analyzer: &dyn IAnalyzer,
     language: Language,
     analysis: &ReceiverQueryAnalysis,
@@ -2983,7 +2985,8 @@ fn neutral_unknown(analysis: &mut ReceiverQueryAnalysis) {
     }
 }
 
-fn neutral_incomplete(analysis: &mut ReceiverQueryAnalysis) {
+#[doc(hidden)]
+pub fn neutral_incomplete(analysis: &mut ReceiverQueryAnalysis) {
     match analysis {
         ReceiverQueryAnalysis::Values(outcome) => downgrade_precise(outcome),
         ReceiverQueryAnalysis::MemberTargets(outcome) => downgrade_precise(outcome),
@@ -3044,17 +3047,22 @@ fn replace_with_neutral_exceeded<T>(
 }
 
 #[derive(Debug)]
-struct ReceiverSemanticBridge {
-    budget: SemanticBudget,
+#[doc(hidden)]
+pub struct ReceiverSemanticBridge {
+    #[doc(hidden)]
+    pub budget: SemanticBudget,
     oracle_limits: OracleLimits,
     call_context_disabled: bool,
 }
 
 impl ReceiverSemanticBridge {
-    const SCOPE_DIMENSIONS: usize = 11;
-    const SUMMARY_DIMENSIONS: usize = 3;
+    #[doc(hidden)]
+    pub const SCOPE_DIMENSIONS: usize = 11;
+    #[doc(hidden)]
+    pub const SUMMARY_DIMENSIONS: usize = 3;
 
-    fn new(receiver: ReceiverAnalysisBudget) -> Result<Self, ReceiverBudgetLimit> {
+    #[doc(hidden)]
+    pub fn new(receiver: ReceiverAnalysisBudget) -> Result<Self, ReceiverBudgetLimit> {
         if receiver.max_scope_nodes < Self::SCOPE_DIMENSIONS {
             return Err(ReceiverBudgetLimit::ScopeNodes);
         }
@@ -3132,7 +3140,8 @@ impl ReceiverSemanticBridge {
         })
     }
 
-    fn oracle<'workspace>(
+    #[doc(hidden)]
+    pub fn oracle<'workspace>(
         &self,
         workspace: &'workspace WorkspaceAnalyzer,
     ) -> WorkspaceSemanticOracle<'workspace> {
@@ -3489,7 +3498,8 @@ fn points_to_contains_call_result(
     Ok(false)
 }
 
-fn code_unit_ranges_bounded(
+#[doc(hidden)]
+pub fn code_unit_ranges_bounded(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     cancellation: Option<&CancellationToken>,
@@ -3565,8 +3575,8 @@ fn java_factory_name_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn structural_factory_name_node(language: Language, node: Node<'_>) -> Option<Node<'_>> {
-    if let Some(name) =
-        language_support(language).and_then(|support| support.factory_name_node(node))
+    if let Some(name) = crate::analyzer::languages::language_knowledge(language)
+        .and_then(|support| support.factory_name_node(node))
     {
         return Some(name);
     }
@@ -4576,5 +4586,10 @@ fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), Recei
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
 #[cfg(test)]
-mod tests;
+#[doc(hidden)]
+pub mod tests;

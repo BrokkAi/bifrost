@@ -533,7 +533,7 @@ CREATE INDEX IF NOT EXISTS temp.selected_resolution_stage_recipe_key ON selected
         sql.push_str("CREATE UNIQUE INDEX IF NOT EXISTS temp.selected_resolution_stage_observation_reference ON selected_resolution_stage_type_frontiers(COALESCE(identity_reference_key,-1),COALESCE(identity_reference_shared,-1),host_ordinal) WHERE identity_reference_node IS NOT NULL;\n");
         sql
     };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(9, sql.capacity());
         sql
     })

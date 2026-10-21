@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 use super::field_metadata::{field_sites, FieldSite};
-use super::language_rules::LanguageRuleMatches;
+use super::language_rules::{LanguageRuleMatches, UndecidedSite};
 
 const KNOWN_CHECKED_JDK_TYPES: &[&str] = &[
     "ClassNotFoundException",
@@ -102,7 +102,8 @@ pub(super) fn matches_for_file(
         return LanguageRuleMatches::default();
     };
     let fields = field_sites(analyzer, file);
-    let mut ranges = match rule {
+    let mut undecided = Vec::new();
+    let ranges = match rule {
         JavaRule::NonFinalImmutableField => {
             non_final_immutable_fields(&tree, source, &fields)
         }
@@ -113,23 +114,77 @@ pub(super) fn matches_for_file(
         JavaRule::EnumIdentifier => named_declarations(&tree, source, "enum"),
         JavaRule::ConstructorTypo => constructor_typos(&tree, source),
         JavaRule::RawConstructorInvocation => {
-            raw_constructor_invocations(analyzer, file, source, &tree)
+            raw_constructor_invocations(analyzer, file, source, &tree, &mut undecided)
         }
-        JavaRule::RawReturnType => raw_return_types(analyzer, file, source, &tree),
-        JavaRule::RawVariable => raw_variables(analyzer, file, source, &tree),
-        JavaRule::TypeBoundExtendsFinal => type_bounds_extending_final(analyzer, file, source, &tree),
-        JavaRule::TypeVariableHidesType => type_variables_hiding_types(analyzer, file, source, &tree),
+        JavaRule::RawReturnType => {
+            raw_return_types(analyzer, file, source, &tree, &mut undecided)
+        }
+        JavaRule::RawVariable => raw_variables(analyzer, file, source, &tree, &mut undecided),
+        JavaRule::TypeBoundExtendsFinal => {
+            type_bounds_extending_final(analyzer, file, source, &tree, &mut undecided)
+        }
+        JavaRule::TypeVariableHidesType => {
+            type_variables_hiding_types(analyzer, file, source, &tree, &mut undecided)
+        }
         JavaRule::InconsistentJavadocThrows
         | JavaRule::UnknownJavadocParameter
         | JavaRule::UndocumentedException
         | JavaRule::UndocumentedFunction
         | JavaRule::UndocumentedParameter
         | JavaRule::UndocumentedReturnValue
-        | JavaRule::UndocumentedType => javadoc_matches(analyzer, file, source, &tree, rule),
+        | JavaRule::UndocumentedType => {
+            javadoc_matches(analyzer, file, source, &tree, rule, &mut undecided)
+        }
     };
-    ranges.sort_unstable();
-    ranges.dedup();
-    LanguageRuleMatches::from_ranges(ranges)
+    LanguageRuleMatches::decided(
+        ranges,
+        undecided,
+        Language::Java.config_label(),
+        rule.label(),
+        file,
+    )
+}
+
+/// Whether a Java relation holds at one site. `Undecided` carries the reason
+/// the analyzer could not answer, which becomes an incomplete diagnostic
+/// instead of a clean negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Holds,
+    Fails,
+    Undecided(&'static str),
+}
+
+impl Decision {
+    fn from_bool(holds: bool) -> Self {
+        if holds { Self::Holds } else { Self::Fails }
+    }
+
+    /// Both relations must hold; `next` is consulted only when `self` does
+    /// not already fail.
+    fn and(self, next: impl FnOnce() -> Self) -> Self {
+        match self {
+            Self::Fails => Self::Fails,
+            Self::Holds => next(),
+            Self::Undecided(reason) => match next() {
+                Self::Fails => Self::Fails,
+                Self::Holds | Self::Undecided(_) => Self::Undecided(reason),
+            },
+        }
+    }
+}
+
+fn record_decision(
+    decision: Decision,
+    range: Range,
+    ranges: &mut Vec<Range>,
+    undecided: &mut Vec<UndecidedSite>,
+) {
+    match decision {
+        Decision::Holds => ranges.push(range),
+        Decision::Fails => {}
+        Decision::Undecided(reason) => undecided.push(UndecidedSite::at(range, reason)),
+    }
 }
 
 fn javadoc_matches(
@@ -138,6 +193,7 @@ fn javadoc_matches(
     source: &str,
     tree: &Tree,
     rule: JavaRule,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
     let sites = declaration_sites(analyzer, file);
     let source: Arc<str> = Arc::from(source.to_owned());
@@ -154,26 +210,29 @@ fn javadoc_matches(
                     ranges.push(node_range(node));
                 }
             }
-            JavaRule::UndocumentedParameter if is_parameter(node) => {
-                if undocumented_parameter(analyzer, &sites, node, &source) {
-                    ranges.push(node_range(node));
-                }
-            }
+            JavaRule::UndocumentedParameter if is_parameter(node) => record_decision(
+                undocumented_parameter(analyzer, &sites, node, &source),
+                node_range(node),
+                &mut ranges,
+                undecided,
+            ),
             JavaRule::UnknownJavadocParameter
             | JavaRule::UndocumentedException
             | JavaRule::UndocumentedFunction
             | JavaRule::UndocumentedReturnValue
             | JavaRule::InconsistentJavadocThrows
-                if is_callable(node)
-                    && callable_rule_matches(analyzer, &sites, node, &source, rule) =>
+                if is_callable(node) =>
             {
-                ranges.push(node_range(node));
+                record_decision(
+                    callable_rule_matches(analyzer, &sites, node, &source, rule),
+                    node_range(node),
+                    &mut ranges,
+                    undecided,
+                );
             }
             _ => {}
         }
     }
-    ranges.sort_unstable();
-    ranges.dedup();
     ranges
 }
 
@@ -586,17 +645,24 @@ fn raw_constructor_invocations(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
-    descendants(tree.root_node())
-        .into_iter()
-        .filter(|node| node.kind() == "object_creation_expression")
-        .filter_map(|node| {
-            let ty = node.child_by_field_name("type")?;
-            let named = raw_named_type(ty)?;
-            is_generic_declaration(analyzer, file, source, tree, named)
-                .then(|| node_range(node))
-        })
-        .collect()
+    let mut ranges = Vec::new();
+    for node in descendants(tree.root_node()) {
+        if node.kind() != "object_creation_expression" {
+            continue;
+        }
+        let Some(named) = node.child_by_field_name("type").and_then(raw_named_type) else {
+            continue;
+        };
+        record_decision(
+            is_generic_declaration(analyzer, file, source, tree, named),
+            node_range(node),
+            &mut ranges,
+            undecided,
+        );
+    }
+    ranges
 }
 
 fn raw_return_types(
@@ -604,17 +670,24 @@ fn raw_return_types(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
-    descendants(tree.root_node())
-        .into_iter()
-        .filter(|node| node.kind() == "method_declaration")
-        .filter_map(|method| {
-            let ty = method.child_by_field_name("type")?;
-            let named = raw_named_type(ty)?;
-            is_generic_declaration(analyzer, file, source, tree, named)
-                .then(|| node_range(method))
-        })
-        .collect()
+    let mut ranges = Vec::new();
+    for method in descendants(tree.root_node()) {
+        if method.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(named) = method.child_by_field_name("type").and_then(raw_named_type) else {
+            continue;
+        };
+        record_decision(
+            is_generic_declaration(analyzer, file, source, tree, named),
+            node_range(method),
+            &mut ranges,
+            undecided,
+        );
+    }
+    ranges
 }
 
 fn raw_variables(
@@ -622,40 +695,43 @@ fn raw_variables(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
     let mut ranges = Vec::new();
     for node in descendants(tree.root_node()) {
         match node.kind() {
             "formal_parameter" | "spread_parameter" => {
-                let Some(ty) = node.child_by_field_name("type") else {
+                let Some(named) = node.child_by_field_name("type").and_then(raw_named_type)
+                else {
                     continue;
                 };
-                let Some(named) = raw_named_type(ty) else {
-                    continue;
-                };
-                if is_generic_declaration(analyzer, file, source, tree, named) {
-                    ranges.push(node_range(node));
-                }
+                record_decision(
+                    is_generic_declaration(analyzer, file, source, tree, named),
+                    node_range(node),
+                    &mut ranges,
+                    undecided,
+                );
             }
             "field_declaration" | "local_variable_declaration" => {
-                let Some(ty) = node.child_by_field_name("type") else {
+                let Some(named) = node.child_by_field_name("type").and_then(raw_named_type)
+                else {
                     continue;
                 };
-                let Some(named) = raw_named_type(ty) else {
-                    continue;
-                };
-                if !is_generic_declaration(analyzer, file, source, tree, named) {
-                    continue;
-                }
                 // Java's normalized structural surface currently emits a
                 // variable declarator as an assignment only when it has an
                 // initializer.  Keep the language relation exact to that
                 // surface; uninitialized fields/locals remain unrepresented
                 // until a declaration fact is added to the shared vocabulary.
-                for declarator in direct_variable_declarators(node) {
-                    if declarator.child_by_field_name("value").is_some() {
-                        ranges.push(node_range(declarator));
-                    }
+                let declarators = direct_variable_declarators(node)
+                    .into_iter()
+                    .filter(|declarator| declarator.child_by_field_name("value").is_some())
+                    .collect::<Vec<_>>();
+                if declarators.is_empty() {
+                    continue;
+                }
+                let decision = is_generic_declaration(analyzer, file, source, tree, named);
+                for declarator in declarators {
+                    record_decision(decision, node_range(declarator), &mut ranges, undecided);
                 }
             }
             _ => {}
@@ -669,14 +745,18 @@ fn type_bounds_extending_final(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
     let mut ranges = Vec::new();
     for node in descendants(tree.root_node()) {
         if node.kind() == "type_parameter" {
             for bound in type_parameter_bounds(node) {
-                if bound_is_final(analyzer, file, source, tree, bound) {
-                    ranges.push(node_range(node));
-                }
+                record_decision(
+                    bound_is_final(analyzer, file, source, tree, bound),
+                    node_range(node),
+                    &mut ranges,
+                    undecided,
+                );
             }
         } else if node.kind() == "wildcard" || node.kind() == "wildcard_type" {
             if !has_extends_operator(node) {
@@ -688,9 +768,12 @@ fn type_bounds_extending_final(
             else {
                 continue;
             };
-            if bound_is_final(analyzer, file, source, tree, bound) {
-                ranges.push(node_range(node));
-            }
+            record_decision(
+                bound_is_final(analyzer, file, source, tree, bound),
+                node_range(node),
+                &mut ranges,
+                undecided,
+            );
         }
     }
     ranges
@@ -701,22 +784,37 @@ fn type_variables_hiding_types(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
-    descendants(tree.root_node())
-        .into_iter()
-        .filter(|node| node.kind() == "type_parameter")
-        .filter_map(|parameter| {
-            let name_node = parameter_name_node(parameter)?;
-            let visible = resolve_type_declaration(analyzer, file, source, tree, name_node);
-            matches!(visible, TypeResolution::Known(_)).then(|| node_range(parameter))
-        })
-        .collect()
+    let mut ranges = Vec::new();
+    for parameter in descendants(tree.root_node()) {
+        if parameter.kind() != "type_parameter" {
+            continue;
+        }
+        let Some(name_node) = parameter_name_node(parameter) else {
+            continue;
+        };
+        let decision = match resolve_type_declaration(analyzer, file, source, tree, name_node) {
+            // An import that names the type proves it is visible even when
+            // its declaration is not indexed.
+            TypeResolution::Known(_) | TypeResolution::NotIndexed(_) => Decision::Holds,
+            TypeResolution::Absent => Decision::Fails,
+            TypeResolution::Unknown(reason) => Decision::Undecided(reason),
+        };
+        record_decision(decision, node_range(parameter), &mut ranges, undecided);
+    }
+    ranges
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeResolution {
     Known(TypeDeclaration),
-    Unknown,
+    /// An import or a qualified name names the type, but nothing indexed
+    /// declares it.
+    NotIndexed(&'static str),
+    /// Every scope that can declare the name was searched and none does.
+    Absent,
+    Unknown(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -731,11 +829,22 @@ fn is_generic_declaration(
     source: &str,
     tree: &Tree,
     type_node: Node<'_>,
-) -> bool {
-    matches!(
-        resolve_type_declaration(analyzer, file, source, tree, type_node),
-        TypeResolution::Known(TypeDeclaration { arity: Some(arity), .. }) if arity > 0
-    )
+) -> Decision {
+    if names_type_variable_in_scope(type_node, source) {
+        return Decision::Fails;
+    }
+    match resolve_type_declaration(analyzer, file, source, tree, type_node) {
+        TypeResolution::Known(TypeDeclaration { arity: Some(arity), .. }) => {
+            Decision::from_bool(arity > 0)
+        }
+        TypeResolution::Known(TypeDeclaration { arity: None, .. }) => {
+            Decision::Undecided("the type parameters of the declared type are not recorded")
+        }
+        TypeResolution::Absent => Decision::Undecided("no declaration of the type is visible"),
+        TypeResolution::NotIndexed(reason) | TypeResolution::Unknown(reason) => {
+            Decision::Undecided(reason)
+        }
+    }
 }
 
 fn bound_is_final(
@@ -744,16 +853,57 @@ fn bound_is_final(
     source: &str,
     tree: &Tree,
     bound: Node<'_>,
-) -> bool {
+) -> Decision {
     let Some(bound) = nominal_type_node(bound) else {
-        return false;
+        return Decision::Fails;
     };
-    matches!(
-        resolve_type_declaration(analyzer, file, source, tree, bound),
-        TypeResolution::Known(TypeDeclaration { finality: Some(true), .. })
-    )
+    if names_type_variable_in_scope(bound, source) {
+        return Decision::Fails;
+    }
+    match resolve_type_declaration(analyzer, file, source, tree, bound) {
+        TypeResolution::Known(TypeDeclaration { finality: Some(finality), .. }) => {
+            Decision::from_bool(finality)
+        }
+        TypeResolution::Known(TypeDeclaration { finality: None, .. }) => {
+            Decision::Undecided("the finality of the bound type is not recorded")
+        }
+        TypeResolution::Absent => Decision::Undecided("no declaration of the bound type is visible"),
+        TypeResolution::NotIndexed(reason) | TypeResolution::Unknown(reason) => {
+            Decision::Undecided(reason)
+        }
+    }
 }
 
+/// Whether a simple type name refers to a type parameter declared by an
+/// enclosing type or callable. Such a name is a type variable, never a raw or
+/// final class type, so it needs no declaration lookup.
+fn names_type_variable_in_scope(type_node: Node<'_>, source: &str) -> bool {
+    if !matches!(type_node.kind(), "type_identifier" | "identifier") {
+        return false;
+    }
+    let Some(name) = node_text(source, type_node) else {
+        return false;
+    };
+    let mut current = type_node.parent();
+    while let Some(ancestor) = current {
+        let declares_name = named_children(ancestor)
+            .into_iter()
+            .filter(|child| child.kind() == "type_parameters")
+            .flat_map(named_children)
+            .filter(|parameter| parameter.kind() == "type_parameter")
+            .filter_map(parameter_name_node)
+            .any(|parameter| node_text(source, parameter) == Some(name));
+        if declares_name {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+/// Resolve a written Java type name to its declaration by the JLS scope
+/// order: declarations in this file, single-type imports, the package, then
+/// on-demand imports together with `java.lang`.
 fn resolve_type_declaration(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -762,14 +912,12 @@ fn resolve_type_declaration(
     type_node: Node<'_>,
 ) -> TypeResolution {
     let Some(type_node) = nominal_type_node(type_node) else {
-        return TypeResolution::Unknown;
+        return TypeResolution::Unknown("the type has no nominal name");
     };
-    let Some(components) = type_name_components(type_node, source) else {
-        return TypeResolution::Unknown;
+    let Some(components) = type_name_components(type_node, source).filter(|parts| !parts.is_empty())
+    else {
+        return TypeResolution::Unknown("the type name has no identifier components");
     };
-    if components.is_empty() {
-        return TypeResolution::Unknown;
-    }
 
     let source_candidates = analyzer
         .get_declarations(file)
@@ -777,103 +925,204 @@ fn resolve_type_declaration(
         .filter(|unit| unit.is_class())
         .filter(|unit| unit_name_matches(unit, &components))
         .collect::<Vec<_>>();
-    if source_candidates.len() > 1 {
-        return TypeResolution::Unknown;
-    }
-    if let Some(unit) = source_candidates.first() {
-        return source_declaration_fact(analyzer, file, tree, source, unit);
+    match source_candidates.as_slice() {
+        [] => {}
+        [unit] => {
+            return TypeResolution::Known(source_declaration_fact(analyzer, file, tree, source, unit));
+        }
+        _ => return TypeResolution::Unknown("more than one declaration in the file matches the type"),
     }
 
-    let mut qualified_names = imported_type_names(tree, source)
-        .into_iter()
-        .filter(|(simple, _)| components.len() == 1 && simple == &components[0])
-        .map(|(_, qualified)| qualified)
-        .collect::<Vec<_>>();
     if components.len() > 1 {
-        qualified_names.push(components.join("."));
+        return match lookup_qualified_type(analyzer, file, tree, source, &components.join(".")) {
+            TypeResolution::Absent => TypeResolution::NotIndexed("the qualified type is not indexed"),
+            resolved => resolved,
+        };
+    }
+    let name = &components[0];
+    let imports = java_imports(tree, source);
+    let single_type = imports
+        .iter()
+        .filter(|import| !import.on_demand && import.components.last() == Some(name))
+        .map(|import| import.components.join("."))
+        .collect::<Vec<_>>();
+    if !single_type.is_empty() {
+        return match lookup_type_group(analyzer, file, tree, source, &single_type) {
+            TypeResolution::Absent => TypeResolution::NotIndexed("the imported type is not indexed"),
+            resolved => resolved,
+        };
+    }
+    let package = package_name(tree, source);
+    let same_package = if package.is_empty() {
+        name.clone()
     } else {
-        let package = package_name(tree, source);
-        if !package.is_empty() {
-            qualified_names.push(format!("{package}.{}", components[0]));
-        }
-        qualified_names.push(format!("java.lang.{}", components[0]));
+        format!("{package}.{name}")
+    };
+    match lookup_qualified_type(analyzer, file, tree, source, &same_package) {
+        TypeResolution::Absent => {}
+        resolved => return resolved,
     }
-    qualified_names.sort();
-    qualified_names.dedup();
-
-    let mut resolved = Vec::new();
-    for qualified in qualified_names {
-        let definitions = analyzer
-            .definitions(&qualified)
-            .filter(|unit| unit.is_class())
-            .collect::<Vec<_>>();
-        if definitions.len() > 1 {
-            return TypeResolution::Unknown;
+    let mut implicit = imports
+        .iter()
+        .filter(|import| import.on_demand && !import.is_static)
+        .map(|import| format!("{}.{name}", import.components.join(".")))
+        .collect::<Vec<_>>();
+    implicit.push(format!("java.lang.{name}"));
+    match lookup_type_group(analyzer, file, tree, source, &implicit) {
+        TypeResolution::Absent if imports.iter().any(|import| import.on_demand) => {
+            TypeResolution::Unknown("an on-demand import may declare the type")
         }
-        if let Some(unit) = definitions.first() {
-            resolved.push(source_declaration_fact(analyzer, file, tree, source, unit));
-            continue;
+        TypeResolution::Absent if !java_lang_indexed(analyzer, file, tree, source) => {
+            TypeResolution::Unknown("java.lang is not indexed, so it may declare the type")
         }
-        if let Some(models) = analyzer.active_semantic_models() {
-            let matches = models.types_named(&qualified);
-            if matches.records.len() == 1 {
-                let record = matches.records[0].record;
-                resolved.push(TypeResolution::Known(TypeDeclaration {
-                    arity: Some(record.type_parameters.len()),
-                    // The Java model's `is_sealed` field is the existing
-                    // declaration finality bit: Java artifact producers set
-                    // it for final or sealed declarations.  A sealed-only
-                    // declaration is conservatively treated as unresolved by
-                    // the final-bound rule below unless it is also final in
-                    // source; this field remains useful for JDK final types.
-                    finality: Some(record.is_sealed),
-                }));
-            }
-        }
-    }
-    match resolved.as_slice() {
-        [TypeResolution::Known(fact)] => TypeResolution::Known(*fact),
-        _ => TypeResolution::Unknown,
+        resolved => resolved,
     }
 }
 
+/// Resolve names that share one scope level: more than one hit is an
+/// ambiguity, not a choice.
+fn lookup_type_group(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    tree: &Tree,
+    source: &str,
+    qualified_names: &[String],
+) -> TypeResolution {
+    let mut found = Vec::new();
+    for qualified in qualified_names {
+        match lookup_qualified_type(analyzer, file, tree, source, qualified) {
+            TypeResolution::Known(fact) => found.push(fact),
+            TypeResolution::Absent => {}
+            unresolved @ (TypeResolution::NotIndexed(_) | TypeResolution::Unknown(_)) => {
+                return unresolved;
+            }
+        }
+    }
+    match found.as_slice() {
+        [] => TypeResolution::Absent,
+        [fact] => TypeResolution::Known(*fact),
+        _ => TypeResolution::Unknown("more than one visible declaration matches the type"),
+    }
+}
+
+fn lookup_qualified_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    tree: &Tree,
+    source: &str,
+    qualified: &str,
+) -> TypeResolution {
+    let definitions = analyzer
+        .definitions(qualified)
+        .filter(|unit| unit.is_class())
+        .collect::<Vec<_>>();
+    match definitions.as_slice() {
+        [] => {}
+        [unit] => {
+            return TypeResolution::Known(source_declaration_fact(analyzer, file, tree, source, unit));
+        }
+        _ => return TypeResolution::Unknown("more than one indexed declaration matches the type"),
+    }
+    let Some(models) = analyzer.active_semantic_models() else {
+        return TypeResolution::Absent;
+    };
+    match models.types_named(qualified).records.as_slice() {
+        [] => TypeResolution::Absent,
+        [matched] => TypeResolution::Known(TypeDeclaration {
+            arity: Some(matched.record.type_parameters.len()),
+            // The Java model's `is_sealed` field is the existing
+            // declaration finality bit: Java artifact producers set
+            // it for final or sealed declarations.  A sealed-only
+            // declaration is conservatively treated as unresolved by
+            // the final-bound rule below unless it is also final in
+            // source; this field remains useful for JDK final types.
+            finality: Some(matched.record.is_sealed),
+        }),
+        _ => TypeResolution::Unknown("more than one semantic-model type matches the type"),
+    }
+}
+
+/// Whether a lookup in `java.lang` can answer: without an indexed JDK or a
+/// semantic model for it, a name absent elsewhere may still be a `java.lang`
+/// type.
+fn java_lang_indexed(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    tree: &Tree,
+    source: &str,
+) -> bool {
+    matches!(
+        lookup_qualified_type(analyzer, file, tree, source, "java.lang.Object"),
+        TypeResolution::Known(_)
+    )
+}
+
+/// Facts about a class declaration, read from its declaring file's syntax
+/// tree, which is `tree` when the class is declared in `file`.
 fn source_declaration_fact(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     tree: &Tree,
     source: &str,
-    unit: &brokk_bifrost_core::analyzer::CodeUnit,
-) -> TypeResolution {
-    let metadata = analyzer.signature_metadata(unit);
-    let metadata = metadata.first().filter(|entry| entry.type_parameters_recorded());
+    unit: &CodeUnit,
+) -> TypeDeclaration {
+    let metadata_arity = analyzer
+        .signature_metadata(unit)
+        .first()
+        .filter(|entry| entry.type_parameters_recorded())
+        .map(|entry| entry.type_parameters().len());
+    let ranges = analyzer.ranges_of(unit);
+    if unit.source() == file {
+        return declaration_fact_in_tree(tree, source, unit, &ranges, metadata_arity);
+    }
+    let declaring = unit.source();
+    let declaring_source = (language_for_file(declaring) == Language::Java)
+        .then(|| analyzer.indexed_source(declaring))
+        .flatten();
+    let declaring_tree = declaring_source.as_deref().and_then(|declaring_source| {
+        parse_tree_for_language(declaring, Language::Java, declaring_source)
+    });
+    match (declaring_source.as_deref(), declaring_tree.as_ref()) {
+        (Some(declaring_source), Some(declaring_tree)) => {
+            declaration_fact_in_tree(declaring_tree, declaring_source, unit, &ranges, metadata_arity)
+        }
+        _ => TypeDeclaration {
+            arity: metadata_arity,
+            finality: None,
+        },
+    }
+}
+
+fn declaration_fact_in_tree(
+    tree: &Tree,
+    source: &str,
+    unit: &CodeUnit,
+    ranges: &[Range],
+    metadata_arity: Option<usize>,
+) -> TypeDeclaration {
     let declaration_nodes = descendants(tree.root_node())
         .into_iter()
         .filter(|node| is_type_declaration_node(*node))
         .collect::<Vec<_>>();
-    let ranges = analyzer.ranges_of(unit);
     let declaration_node = declaration_nodes
         .iter()
         .copied()
         .find(|node| ranges.iter().any(|range| *range == node_range(*node)))
         .or_else(|| {
-            (unit.source() == file).then(|| {
-                let named = declaration_nodes
-                    .iter()
-                    .copied()
-                    .filter(|node| {
-                        node.child_by_field_name("name")
-                            .and_then(|name| java_owned_text(name, source))
-                            .is_some_and(|name| name == unit.terminal_name())
-                    })
-                    .collect::<Vec<_>>();
-                (named.len() == 1).then(|| named[0])
-            })?
+            let named = declaration_nodes
+                .iter()
+                .copied()
+                .filter(|node| {
+                    node.child_by_field_name("name")
+                        .and_then(|name| java_owned_text(name, source))
+                        .is_some_and(|name| name == unit.terminal_name())
+                })
+                .collect::<Vec<_>>();
+            (named.len() == 1).then(|| named[0])
         });
-    let arity = metadata
-        .map(|entry| entry.type_parameters().len())
-        .or_else(|| declaration_node.map(|node| declared_type_parameter_count(node)));
+    let arity = metadata_arity.or_else(|| declaration_node.map(declared_type_parameter_count));
     let finality = declaration_node.map(|node| declaration_is_final(node, source));
-    TypeResolution::Known(TypeDeclaration { arity, finality })
+    TypeDeclaration { arity, finality }
 }
 
 fn raw_named_type(node: Node<'_>) -> Option<Node<'_>> {
@@ -949,26 +1198,30 @@ fn unit_name_matches(unit: &brokk_bifrost_core::analyzer::CodeUnit, components: 
     segments.ends_with(components)
 }
 
-fn imported_type_names(tree: &Tree, source: &str) -> Vec<(String, String)> {
+struct JavaImport {
+    components: Vec<String>,
+    is_static: bool,
+    on_demand: bool,
+}
+
+fn java_imports(tree: &Tree, source: &str) -> Vec<JavaImport> {
     descendants(tree.root_node())
         .into_iter()
         .filter(|node| node.kind() == "import_declaration")
         .filter_map(|node| {
-            if descendants(node)
-                .into_iter()
-                .any(|child| child.kind() == "static" || child.kind() == "asterisk")
-            {
-                return None;
-            }
-            let path = named_children(node).into_iter().find(|child| {
+            let mut cursor = node.walk();
+            let tokens = node.children(&mut cursor).collect::<Vec<_>>();
+            let path = tokens.iter().copied().find(|child| {
                 matches!(
                     child.kind(),
                     "identifier" | "type_identifier" | "scoped_identifier" | "scoped_type_identifier"
                 )
             })?;
-            let parts = type_name_components(path, source)?;
-            let simple = parts.last()?.clone();
-            Some((simple, parts.join(".")))
+            Some(JavaImport {
+                components: type_name_components(path, source)?,
+                is_static: tokens.iter().any(|child| child.kind() == "static"),
+                on_demand: tokens.iter().any(|child| child.kind() == "asterisk"),
+            })
         })
         .collect()
 }
@@ -1158,49 +1411,41 @@ fn callable_rule_matches(
     callable: Node<'_>,
     source: &str,
     rule: JavaRule,
-) -> bool {
+) -> Decision {
     let Some(site) = site_for(sites, callable) else {
-        return false;
+        return Decision::Fails;
     };
-    if rule != JavaRule::UnknownJavadocParameter
-        && !callable_is_eligible(analyzer, site, callable, source)
-    {
-        return false;
+    if rule == JavaRule::UnknownJavadocParameter {
+        if site.unit.is_synthetic() {
+            return Decision::Fails;
+        }
+        return Decision::from_bool(documentation(callable, source).is_some_and(|documentation| {
+            documentation.complete && unknown_parameter_tag(callable, &documentation, source)
+        }));
     }
-    if rule == JavaRule::UnknownJavadocParameter && site.unit.is_synthetic() {
-        return false;
-    }
-    let Some(documentation) = documentation(callable, source) else {
-        return rule == JavaRule::UndocumentedFunction;
+    let documented = match documentation(callable, source) {
+        None => Decision::from_bool(rule == JavaRule::UndocumentedFunction),
+        Some(documentation) if !documentation.complete => Decision::Fails,
+        Some(documentation) => match rule {
+            JavaRule::UndocumentedFunction => Decision::from_bool(!documentation.acceptable_text),
+            JavaRule::UndocumentedReturnValue => Decision::from_bool(
+                is_non_void_method(callable)
+                    && !documentation.tags.iter().any(|tag| {
+                        tag.kind == JavadocTagKind::Return && tag.acceptable
+                    }),
+            ),
+            JavaRule::UndocumentedException => {
+                undocumented_exception(analyzer, site, callable, &documentation, source)
+            }
+            JavaRule::InconsistentJavadocThrows => {
+                inconsistent_throws(analyzer, site, callable, &documentation, source)
+            }
+            _ => Decision::Fails,
+        },
     };
-    if !documentation.complete {
-        return false;
-    }
-    match rule {
-        JavaRule::UndocumentedFunction => !documentation.acceptable_text,
-        JavaRule::UnknownJavadocParameter => {
-            unknown_parameter_tag(callable, &documentation, source)
-        }
-        JavaRule::UndocumentedParameter => false,
-        JavaRule::UndocumentedReturnValue => {
-            is_non_void_method(callable)
-                && !documentation.tags.iter().any(|tag| {
-                    tag.kind == JavadocTagKind::Return && tag.acceptable
-                })
-        }
-        JavaRule::UndocumentedException => undocumented_exception(
-            analyzer,
-            site,
-            callable,
-            &documentation,
-            source,
-        ),
-        JavaRule::InconsistentJavadocThrows => {
-            inconsistent_throws(analyzer, site, callable, &documentation, source)
-        }
-        JavaRule::UndocumentedType => false,
-        _ => false,
-    }
+    // Eligibility asks for the method family, which can be unproven; consult
+    // it only for a callable whose documentation would otherwise match.
+    documented.and(|| callable_is_eligible(analyzer, site, callable, source))
 }
 
 fn undocumented_parameter(
@@ -1208,30 +1453,28 @@ fn undocumented_parameter(
     sites: &[DeclarationSite],
     parameter: Node<'_>,
     source: &str,
-) -> bool {
+) -> Decision {
     let Some(callable) = enclosing_callable(parameter) else {
-        return false;
+        return Decision::Fails;
     };
     let Some(site) = site_for(sites, callable) else {
-        return false;
+        return Decision::Fails;
     };
-    if !callable_is_eligible(analyzer, site, callable, source) {
-        return false;
-    }
     let Some(documentation) = documentation(callable, source) else {
-        return false;
+        return Decision::Fails;
     };
     if !documentation.complete {
-        return false;
+        return Decision::Fails;
     }
     let Some(name) = parameter_name(parameter, source) else {
-        return false;
+        return Decision::Fails;
     };
-    !documentation.tags.iter().any(|tag| {
+    Decision::from_bool(!documentation.tags.iter().any(|tag| {
         tag.kind == JavadocTagKind::Param
             && tag.name.as_deref() == Some(name.as_str())
             && tag.acceptable
-    })
+    }))
+    .and(|| callable_is_eligible(analyzer, site, callable, source))
 }
 
 fn unknown_parameter_tag(
@@ -1291,27 +1534,28 @@ fn undocumented_exception(
     callable: Node<'_>,
     documentation: &JavadocBlockFacts,
     source: &str,
-) -> bool {
-    let declared = declared_throws(callable, source);
-    if declared.is_empty() {
-        return false;
-    }
-    for (type_node, name) in declared {
-        let status = exception_status(analyzer, site.unit.source(), source, type_node, &name);
-        if status == ExceptionStatus::Unknown {
-            return false;
+) -> Decision {
+    let mut unclassified = false;
+    for (type_node, name) in declared_throws(callable, source) {
+        let documented = documentation.tags.iter().any(|tag| {
+            tag.kind == JavadocTagKind::Throws
+                && tag.terminal_name.as_deref() == type_terminal(&name)
+                && tag.acceptable
+        });
+        if documented {
+            continue;
         }
-        if status == ExceptionStatus::Checked
-            && !documentation.tags.iter().any(|tag| {
-                tag.kind == JavadocTagKind::Throws
-                    && tag.terminal_name.as_deref() == type_terminal(&name)
-                    && tag.acceptable
-            })
-        {
-            return true;
+        match exception_status(analyzer, site.unit.source(), source, type_node, &name) {
+            ExceptionStatus::Checked => return Decision::Holds,
+            ExceptionStatus::Unchecked => {}
+            ExceptionStatus::Unknown => unclassified = true,
         }
     }
-    false
+    if unclassified {
+        Decision::Undecided("an undocumented declared exception is not classified as checked or unchecked")
+    } else {
+        Decision::Fails
+    }
 }
 
 fn inconsistent_throws(
@@ -1320,36 +1564,56 @@ fn inconsistent_throws(
     callable: Node<'_>,
     documentation: &JavadocBlockFacts,
     source: &str,
-) -> bool {
+) -> Decision {
     let declared = declared_throws(callable, source);
-    let mut statuses = Vec::new();
-    for (type_node, name) in &declared {
-        let status = exception_status(analyzer, site.unit.source(), source, *type_node, name);
-        if status == ExceptionStatus::Unknown {
-            return false;
-        }
-        statuses.push((name.as_str(), status));
-    }
-    documentation.tags.iter().any(|tag| {
+    let statuses = declared
+        .iter()
+        .map(|(type_node, name)| {
+            let status = exception_status(analyzer, site.unit.source(), source, *type_node, name);
+            (name.as_str(), status)
+        })
+        .collect::<Vec<_>>();
+    let declares_checked = statuses
+        .iter()
+        .any(|(_, status)| *status == ExceptionStatus::Checked);
+    let declares_unclassified = statuses
+        .iter()
+        .any(|(_, status)| *status == ExceptionStatus::Unknown);
+    let mut outcome = Decision::Fails;
+    for tag in &documentation.tags {
         if tag.kind != JavadocTagKind::Throws {
-            return false;
+            continue;
         }
         let Some(tag_name) = tag.terminal_name.as_deref() else {
-            return false;
+            continue;
         };
         if known_unchecked(tag_name) {
-            return false;
+            continue;
         }
-        if !known_checked(tag_name) && !statuses.iter().any(|(_, status)| *status == ExceptionStatus::Checked) {
-            return false;
+        if !known_checked(tag_name) && !declares_checked {
+            // The tagged type is neither a known JDK type nor comparable to
+            // a declared checked exception, so its own classification
+            // decides the relation and nothing here supplies it.
+            outcome = Decision::Undecided(
+                "a documented exception is not classified as checked or unchecked",
+            );
+            continue;
         }
-        !statuses
-            .iter()
-            .any(|(declared_name, status)| {
-                *status == ExceptionStatus::Checked
-                    && type_names_possible(declared_name, tag_name)
-            })
-    })
+        let consistent = statuses.iter().any(|(declared_name, status)| {
+            *status == ExceptionStatus::Checked && type_names_possible(declared_name, tag_name)
+        });
+        if consistent {
+            continue;
+        }
+        if declares_unclassified {
+            outcome = Decision::Undecided(
+                "a declared exception is not classified as checked or unchecked",
+            );
+            continue;
+        }
+        return Decision::Holds;
+    }
+    outcome
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1444,29 +1708,29 @@ fn callable_is_eligible(
     site: &DeclarationSite,
     callable: Node<'_>,
     source: &str,
-) -> bool {
+) -> Decision {
     if !is_public(site) || is_generated(site, callable, source) {
-        return false;
+        return Decision::Fails;
     }
     if is_getter_or_setter(callable, source) {
-        return false;
+        return Decision::Fails;
     }
     let Some(provider) = analyzer.member_family_provider() else {
-        return false;
+        return Decision::Undecided("no method-family provider can rule out an override");
     };
     let family = provider.member_family(&site.unit, None);
     if !matches!(
         family.outcome,
         MemberFamilyOutcome::Proven | MemberFamilyOutcome::NoFamily
     ) {
-        return false;
+        return Decision::Undecided("the method family is not proven, so an override is not ruled out");
     }
-    !family.edges.iter().any(|edge| {
+    Decision::from_bool(!family.edges.iter().any(|edge| {
         matches!(
             edge.relation,
             MethodFamilyRelation::Overrides | MethodFamilyRelation::Implements
         )
-    })
+    }))
 }
 
 fn is_public(site: &DeclarationSite) -> bool {

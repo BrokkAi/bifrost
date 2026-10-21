@@ -1,3 +1,5 @@
+use crate::analyzer::java::source_storage::JavaSourceStorage;
+use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 #[test]
 fn java_source_reader_rejects_corrupt_type_edges_without_panicking() {
     let fixture = InlineTestProject::with_language(Language::Java)
@@ -109,7 +111,7 @@ fn java_source_lookup_seeks_populated_publications_before_and_after_statistics()
 use crate::analyzer::Language;
 use crate::analyzer::java::JavaAdapter;
 use crate::analyzer::store::AnalyzerStore;
-use crate::analyzer::store::tests::{oid_for, parse_state};
+use crate::analyzer::store::test_support::{oid_for, parse_state};
 use crate::inline_project::InlineTestProject;
 
 const SOURCE: &str = r#"package example;

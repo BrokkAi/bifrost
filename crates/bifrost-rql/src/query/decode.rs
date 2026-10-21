@@ -4950,7 +4950,7 @@ pub(super) fn validate_dependency_evidence_filter(
     }
     for (index, range) in filter.version_ranges.iter().enumerate() {
         let error = if filter.ecosystems == ["npm"] {
-            brokk_bifrost_analysis::analyzer::dependency_evidence::NpmVersionRange::parse(range)
+            brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange::parse(range)
                 .err()
                 .map(|e| e.to_string())
         } else {

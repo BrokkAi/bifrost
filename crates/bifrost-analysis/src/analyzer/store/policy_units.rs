@@ -313,7 +313,7 @@ pub struct LoadedPolicyEvaluationPolicy {
 const UNIT_COLUMNS: &str = "units.unit_id, units.policy_semantic_hash, units.family, \
      units.partition_kind, units.seed_rel_path, units.seed_blob_oid, units.partition_digest, \
      units.lang, units.configuration_fingerprint, units.active_model_set_hash, \
-     units.engine_epoch, units.product_kind, units.product, units.read_set_digest, \
+     units.engine_epoch, units.product_kind, json(units.product), units.read_set_digest, \
      units.content_identity";
 
 impl AnalyzerStore {
@@ -771,7 +771,7 @@ fn write_unit(
            published_at, content_identity
          ) VALUES(
            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'complete',
-           'exhaustive', ?12, ?13, ?14, ?15, ?16
+           'exhaustive', ?12, jsonb(?13), ?14, ?15, ?16
          )",
         params![
             key.policy_semantic_hash,
@@ -1290,6 +1290,39 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#5113: policy replay mixed traversal and resident census in one persisted total")]
+    fn policy_budget_replay_numbers_are_sql_readable_jsonb() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let accounting = crate::analyzer::semantic::SemanticBudgetReplay {
+            cumulative: crate::analyzer::semantic::SemanticWork {
+                events: 21,
+                ..Default::default()
+            },
+            performed: crate::analyzer::semantic::SemanticWork {
+                events: 15,
+                ..Default::default()
+            },
+            root_work_peak: crate::analyzer::semantic::SemanticWork {
+                events: 8,
+                ..Default::default()
+            },
+            retained: crate::analyzer::semantic::SemanticWork {
+                events: 6,
+                ..Default::default()
+            },
+        };
+        let mut unit = unit_row("src/Main.java", vec![]);
+        unit.product = serde_json::json!({"semantic": accounting}).to_string();
+        store.publish_policy_units(vec![unit]).unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let observed: (String, i64, i64, i64) = conn.query_row(
+            "SELECT typeof(product), json_extract(product, '$.semantic.cumulative.events'), json_extract(product, '$.semantic.root_work_peak.events'), json_extract(product, '$.semantic.retained.events') FROM policy_units", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(observed, ("blob".into(), 21, 8, 6));
+    }
+
+    #[test]
     fn a_unit_published_twice_keeps_one_row_and_the_second_product() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
@@ -1305,7 +1338,9 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1, "one key names one unit");
         let product: String = conn
-            .query_row("SELECT product FROM policy_units", [], |row| row.get(0))
+            .query_row("SELECT json(product) FROM policy_units", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(product, "{\"rows\":[1]}");
     }

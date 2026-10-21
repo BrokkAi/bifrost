@@ -211,7 +211,7 @@ impl CancellationToken {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(remaining) = &self.soft_deadline_after_checks {
             let previous = remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .unwrap_or(0);
@@ -240,7 +240,7 @@ impl CancellationToken {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(remaining) = &self.timeout_after_checks {
             let previous = remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .unwrap_or(0);
@@ -252,7 +252,7 @@ impl CancellationToken {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(remaining) = &self.cancel_after_checks {
             let previous = remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .unwrap_or(0);

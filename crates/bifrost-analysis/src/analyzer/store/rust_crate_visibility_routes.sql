@@ -16,7 +16,7 @@ WITH RECURSIVE routes(module_path, visibility, target_module_path, position) AS 
  CROSS JOIN json_each(cr_visibility_segments(route.visibility)) AS segment ON segment.key=route.position
  LEFT JOIN cr_members AS member ON member.module_path=route.target_module_path AND member.placement<>'include'
  LEFT JOIN cr_members AS child ON child.module_path=route.target_module_path || '::' || segment.value
- WHERE route.position<64 AND ((segment.value='crate' AND route.position=0)
+ WHERE ((segment.value='crate' AND route.position=0)
     OR segment.value='self' OR (segment.value='super' AND member.parent_module_path IS NOT NULL)
     OR child.module_path IS NOT NULL)
 )

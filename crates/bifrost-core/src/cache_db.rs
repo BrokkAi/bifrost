@@ -75,7 +75,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 125;
 /// distinguishes nominal and receiver projection outputs on qualified routes.
 /// Once #2771 lands, this floor must not advance for compatible migrations.
 const FIRST_NATIVE_CACHE_VERSION: i64 = 125;
-const CURRENT_MIGRATION_VERSION: i64 = 188;
+const CURRENT_MIGRATION_VERSION: i64 = 196;
 const _: () = assert!(CURRENT_MIGRATION_VERSION >= FIRST_NATIVE_CACHE_VERSION);
 pub const OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
@@ -348,6 +348,38 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 188,
         sql: include_str!("../migrations/cache/0188-declaration-access-boundaries.sql"),
     },
+    CacheMigration {
+        version: 189,
+        sql: include_str!("../migrations/cache/0189-root-import-publication.sql"),
+    },
+    CacheMigration {
+        version: 190,
+        sql: include_str!("../migrations/cache/0190-shared-summary-placements.sql"),
+    },
+    CacheMigration {
+        version: 191,
+        sql: include_str!("../migrations/cache/0191-policy-semantic-replay-jsonb.sql"),
+    },
+    CacheMigration {
+        version: 192,
+        sql: include_str!("../migrations/cache/0192-rust-macro-input-name.sql"),
+    },
+    CacheMigration {
+        version: 193,
+        sql: include_str!("../migrations/cache/0193-class-set-owner-storage-identity.sql"),
+    },
+    CacheMigration {
+        version: 194,
+        sql: include_str!("../migrations/cache/0194-rust-canonical-binding-targets.sql"),
+    },
+    CacheMigration {
+        version: 195,
+        sql: include_str!("../migrations/cache/0195-rust-binding-authority.sql"),
+    },
+    CacheMigration {
+        version: 196,
+        sql: include_str!("../migrations/cache/0196-python-environment-summaries.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -373,8 +405,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    232, 204, 74, 32, 172, 126, 19, 78, 136, 146, 50, 102, 33, 198, 24, 230, 14, 234, 234, 89, 97,
-    108, 23, 204, 162, 213, 112, 145, 207, 145, 252, 171,
+    162, 114, 100, 17, 99, 253, 219, 162, 248, 104, 142, 228, 31, 11, 212, 158, 243, 24, 82, 14,
+    228, 23, 134, 175, 109, 249, 253, 18, 37, 200, 77, 185,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -4451,6 +4483,165 @@ mod tests {
     }
 
     #[test]
+    fn shared_summary_placement_migration_and_foreign_keys() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 190)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let header = "INSERT INTO resolution_unit_summaries(summary_id, lang, unit_kind, unit_key, summary_digest, producer_epoch, derivation_version, complete, publication_state) VALUES(?1,?2,?3,zeroblob(32),?4,'test',1,0,'building')";
+        conn.execute(
+            header,
+            rusqlite::params![1, "go", "go_package", [1u8; 32].as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            header,
+            rusqlite::params![2, "rust", "rust_crate", [2u8; 32].as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,'rust',0)",
+            [seeded_oid("shared-summary-member")],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO resolution_unit_summary_members VALUES(2,0,?1,'src/lib.rs','declared')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO rust_resolution_unit_summary_containers VALUES(2,'crate','module','root');
+            INSERT INTO rust_resolution_unit_summary_placements VALUES(2,'crate',0,'declared',0,NULL,NULL);
+            INSERT INTO rust_resolution_unit_summary_root_routes(summary_id,member_ordinal,module_path,route_key,reference_source_site,target_unit_key,target_module_path,target_name) VALUES(2,0,'crate',1,1,zeroblob(32),'crate','Item');").unwrap();
+        conn.pragma_update(
+            None,
+            "user_version",
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .rfind(|migration| migration.version < 190)
+                .unwrap()
+                .version,
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT group_concat(lang) FROM resolution_unit_summaries",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "go"
+        );
+        for old in [
+            "rust_resolution_unit_summary_containers",
+            "rust_resolution_unit_summary_placements",
+            "rust_resolution_unit_summary_dependency_names",
+        ] {
+            assert!(
+                !conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+                        [old],
+                        |row| row.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        }
+        conn.execute(
+            header,
+            rusqlite::params![2, "rust", "rust_crate", [2u8; 32].as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_unit_summary_members VALUES(2,0,?1,'src/lib.rs','declared')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO resolution_unit_summary_containers VALUES(2,'',NULL);
+            INSERT INTO resolution_unit_summary_placements VALUES(2,'',0,0);
+            INSERT INTO rust_resolution_unit_summary_container_attributes(summary_id,container_path,kind) VALUES(2,'','module');
+            INSERT INTO rust_resolution_unit_summary_placement_attributes(summary_id,container_path,member_ordinal,placement,source_kind) VALUES(2,'',0,'root','declared');
+            INSERT INTO resolution_unit_summary_dependencies VALUES(2,0,zeroblob(32),zeroblob(32),'external',NULL);
+            INSERT INTO rust_resolution_unit_summary_root_routes(summary_id,member_ordinal,module_path,route_key,reference_source_site,target_unit_key,target_module_path,target_name) VALUES(2,0,'crate',1,1,zeroblob(32),'crate','Item');
+            INSERT INTO resolution_unit_summary_dependency_names VALUES(2,'normal','first',0),(2,'normal','alias',0),(2,'dev','first',NULL);").unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT module_path FROM rust_unit_summary_containers WHERE summary_id=2",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "crate"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_placements VALUES(2,'missing',0,0)",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_placements VALUES(2,'',1,0)",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_containers VALUES(2,'child',NULL)",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_dependency_names VALUES(2,'normal','first',1)",
+                []
+            )
+            .is_err()
+        );
+        conn.execute(
+            "DELETE FROM resolution_unit_summary_containers WHERE summary_id=2",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "resolution_unit_summary_placements",
+            "rust_resolution_unit_summary_container_attributes",
+            "rust_resolution_unit_summary_placement_attributes",
+            "rust_resolution_unit_summary_root_routes",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        conn.execute(
+            "DELETE FROM resolution_unit_summaries WHERE summary_id=2",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summary_dependency_names",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
     fn executable_scope_owner_migration_preserves_children_and_scope_kinds() {
         let mut conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS
@@ -4539,6 +4730,282 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5141: semantic language was incorrectly constrained to the owner blob dialect"
+    )]
+    fn class_set_storage_identity_migration_preserves_owned_rows_and_constraints() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 193)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 192).unwrap();
+        let blob_id = insert_visibility_blob_fixture(&conn, "class-set-owner-migration", None, 1);
+        conn.execute_batch(&format!(
+            "INSERT INTO class_set_root_result_generations VALUES(
+               41, 'java', zeroblob(32), zeroblob(32), zeroblob(32),
+               zeroblob(32), zeroblob(32), 1, 0);
+             INSERT INTO class_set_finding_free_root_results VALUES(
+               42, 41, zeroblob(32), 'Owner.java', {blob_id}, 'java',
+               'complete', 0, 1, 17, zeroblob(32), 0);
+             INSERT INTO class_set_finding_free_root_rows(
+               result_id, row_ordinal, rel_path, start_byte, start_line,
+               start_byte_column, end_byte, end_line, end_byte_column,
+               member, atom_kind, class_name, class_set_status
+             ) VALUES(42, 0, 'Owner.java', 0, 0, 0, 1, 0, 1,
+                      'member', 'workspace', 'Owner', 'known');
+             INSERT INTO class_set_procedure_surfaces(
+               surface_id, surface_digest, procedure_lineage, owner_rel_path,
+               owner_blob_id, lang, artifact_public_identity, artifact_content_identity,
+               schema_version, local_structure_digest, behavior_read_digest,
+               carrier_semantics_digest, direct_calls_digest, call_count, binding_count,
+               entered_count, lexical_child_count, read_count, completion, published_at,
+               exact_behavior_digest, exact_provenance_digest
+             ) VALUES(43, zeroblob(32), zeroblob(32), 'Owner.java', {blob_id}, 'java',
+                      zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32),
+                      zeroblob(32), zeroblob(32), 0, 0, 0, 1, 0, 'complete', 0,
+                      zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_procedure_surface_lexical_children VALUES(
+               43, 0, zeroblob(32), 'Owner.java', 'java',
+               zeroblob(32), zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_summaries(
+               summary_id, lookup_digest, procedure_lineage, owner_rel_path, owner_blob_id,
+               lang, artifact_public_identity, artifact_content_identity, schema_version,
+               semantics_digest, context_digest, behavior_read_digest, dependency_digest,
+               carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count,
+               exit_count, reached_count, dependency_count, read_count, charge_count,
+               completion, budget_mode, output_digest, content_digest, published_at,
+               root_surface_digest, direct_calls_digest
+             ) VALUES(44, zeroblob(32), zeroblob(32), 'Owner.java', {blob_id}, 'java',
+                      zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32),
+                      zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32),
+                      0, 1, 1, 0, 0, 0, 1, 'complete', 'exhaustive',
+                      zeroblob(32), zeroblob(32), 0, zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_summary_charges VALUES(44, 'fact', 1);"
+        ))
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        for (table, key, id) in [
+            ("class_set_finding_free_root_results", "result_id", 42),
+            ("class_set_procedure_surfaces", "surface_id", 43),
+            ("class_set_summaries", "summary_id", 44),
+        ] {
+            let owner: (i64, String) = conn
+                .query_row(
+                    &format!("SELECT owner_blob_id, lang FROM {table} WHERE {key} = ?1"),
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(owner, (blob_id, "java".into()));
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT payload_text_bytes FROM class_set_finding_free_root_results WHERE result_id = 42",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            21
+        );
+        for table in [
+            "class_set_finding_free_root_rows",
+            "class_set_procedure_surface_lexical_children",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                1
+            );
+        }
+        assert!(
+            conn.execute(
+                "UPDATE class_set_summaries SET root_surface_digest = NULL",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE class_set_summaries SET direct_calls_digest = NULL",
+                []
+            )
+            .is_err()
+        );
+
+        // A dialect-specific physical owner must coexist with a coarse semantic
+        // language. The root generation still enforces its semantic language.
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'typescript:ts', 0)",
+            [seeded_oid("class-set-typescript-owner")],
+        )
+        .unwrap();
+        let ts_blob_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE class_set_procedure_surfaces SET owner_blob_id = ?1, lang = 'typescript'",
+            [ts_blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE class_set_summaries SET owner_blob_id = ?1, lang = 'typescript'",
+            [ts_blob_id],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE class_set_finding_free_root_results SET owner_blob_id = ?1, lang = 'typescript'",
+                [ts_blob_id],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE class_set_root_result_generations SET lang = 'typescript'",
+            [],
+        )
+        .expect_err("a live result must keep its generation language");
+        conn.execute_batch(
+            "DELETE FROM class_set_finding_free_root_results;
+             UPDATE class_set_root_result_generations SET lang = 'typescript';",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_results VALUES(
+               42, 41, zeroblob(32), 'subject.ts', ?1, 'typescript',
+               'complete', 0, 0, 13, zeroblob(32), 0)",
+            [ts_blob_id],
+        )
+        .unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
+        validate_foreign_keys(&conn).unwrap();
+        conn.execute("DELETE FROM blobs WHERE id = ?1", [ts_blob_id])
+            .unwrap();
+        for table in [
+            "class_set_finding_free_root_results",
+            "class_set_finding_free_root_rows",
+            "class_set_procedure_surfaces",
+            "class_set_procedure_surface_lexical_children",
+            "class_set_summaries",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+        }
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
+    fn python_environment_migration_preserves_existing_summary_family() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 196) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        for (id, lang, kind, path, profile) in [
+            (71, "rust", "rust_crate", "src/lib.rs", [0u8; 32]),
+            (93, "go", "go_package", "main.go", [9u8; 32]),
+        ] {
+            conn.execute(
+                "INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(?1,?2,?3,0)",
+                rusqlite::params![id, seeded_oid(lang), lang],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,member_count,output_digest,publication_state) VALUES(?1,?2,?3,?4,?4,'preserved',3,1,1,?4,'complete')",
+                rusqlite::params![id,lang,kind,[id as u8;32].as_slice()]).unwrap();
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_members VALUES(?1,0,?1,?2,'source')",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,profile_digest,valid_from,valid_until,summary_id) VALUES(?1,?2,4,?3,?4,7,NULL,?5)",
+                rusqlite::params!["w".repeat(64),lang,[id as u8;32].as_slice(),profile.as_slice(),id]).unwrap();
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_containers VALUES(?1,'',NULL)",
+                [id],
+            )
+            .unwrap();
+        }
+        // Exercise the transitive FK to versions, a generated column, and rowid tables.
+        conn.execute_batch("INSERT INTO rust_crate_topologies VALUES(17,zeroblob(32),zeroblob(32),'preserved','lib','example','2021','std',jsonb('[]'),1,zeroblob(32),'complete');
+            INSERT INTO rust_resolution_unit_summary_contexts VALUES(71,'lib','example','2021','std',jsonb('[]'),1,0);
+            INSERT INTO rust_resolution_unit_summary_container_attributes(summary_id,container_path,kind) VALUES(71,'','module');
+            INSERT INTO rust_resolution_unit_summary_binding_completeness VALUES(71,0,1,'complete','');").unwrap();
+        conn.execute("INSERT INTO rust_resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,valid_from,summary_id,topology_id) VALUES(?1,'rust',4,?2,7,71,17)",
+            rusqlite::params!["w".repeat(64),[71u8;32].as_slice()]).unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        // Compare every old relation, including generated values and implicit rowids.
+        let tables = conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+            .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let read = |connection: &Connection, name: &str, definition: &str| {
+            let fields = if definition.contains("WITHOUT ROWID") {
+                "*"
+            } else {
+                "rowid,*"
+            };
+            let mut statement = connection
+                .prepare(&format!("SELECT {fields} FROM {name} ORDER BY 1,2"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before: Vec<_> = tables
+            .iter()
+            .map(|(name, sql)| read(&conn, name, sql))
+            .collect();
+        let indexes = conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name").unwrap()
+            .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        // Normal migrate() owns the transaction; no FK-disable window is needed.
+        conn.pragma_update(None, "user_version", 195).unwrap();
+        migrate(&mut conn).unwrap();
+        for ((name, sql), expected) in tables.iter().zip(before) {
+            assert_eq!(
+                read(&conn, name, sql),
+                expected,
+                "changed rows or ids in {name}"
+            );
+        }
+        for (name, expected) in indexes {
+            let actual: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                    [&name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "changed index {name}");
+        }
+        validate_foreign_keys(&conn).unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
+        // Exactly the approved new kind and profile authority are admitted.
+        conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,publication_state) VALUES(101,'python','python_environment',zeroblob(32),?1,'native',1,0,'building')", [[101u8;32].as_slice()]).unwrap();
+        conn.execute("INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,profile_digest,valid_from,summary_id) VALUES(?1,'python',4,zeroblob(32),?2,7,101)",rusqlite::params!["w".repeat(64),[5u8;32].as_slice()]).unwrap();
+        for lang in ["rust", "java", "kotlin", "scala"] {
+            assert!(conn.execute("INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,profile_digest,valid_from,summary_id) VALUES(?1,?2,4,zeroblob(32),?3,7,101)",rusqlite::params!["w".repeat(64),lang,[5u8;32].as_slice()]).is_err());
+        }
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
     fn current_schema_digest_matches_the_baseline_chain() {
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS {
@@ -4548,6 +5015,67 @@ mod tests {
             schema_object_definitions_sha256(&conn).unwrap(),
             CURRENT_SCHEMA_OBJECTS_SHA256
         );
+    }
+
+    #[test]
+    fn root_import_publication_migration_applies_to_fresh_and_188_stores() {
+        let fresh = open_in_memory_cache();
+        let mut upgraded = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version <= 188) {
+            upgraded.execute_batch(migration.sql).unwrap();
+        }
+        upgraded.pragma_update(None, "user_version", 188).unwrap();
+        migrate(&mut upgraded).unwrap();
+        for conn in [&fresh, &upgraded] {
+            for table in [
+                "resolution_root_imports",
+                "resolution_root_import_segments",
+                "resolution_root_import_demands",
+            ] {
+                assert!(table_exists(conn, table).unwrap(), "missing {table}");
+                let fks = conn
+                    .prepare(&format!("PRAGMA foreign_key_list({table})"))
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(2)?, row.get::<_, String>(6)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    fks,
+                    vec![(
+                        "resolution_fragment_interiors".to_owned(),
+                        "CASCADE".to_owned()
+                    )]
+                );
+            }
+            assert!(current_schema_is_valid(conn).unwrap());
+            conn.pragma_update(None, "foreign_keys", false).unwrap();
+            let insert = "INSERT INTO resolution_root_import_demands
+                (blob_id, import_site, namespace, name, target_kind, target_reference, target_name)
+                VALUES(-1, 1, 1, 'bound', ?1, ?2, ?3)";
+            for (kind, reference, name) in [
+                (None, None, None),
+                (Some("same_name_glob"), None, None),
+                (Some("named_reference"), Some(2), Some("source")),
+            ] {
+                conn.execute(insert, rusqlite::params![kind, reference, name])
+                    .unwrap();
+                conn.execute(
+                    "DELETE FROM resolution_root_import_demands WHERE blob_id=-1",
+                    [],
+                )
+                .unwrap();
+            }
+            for name in [None, Some("")] {
+                assert!(
+                    conn.execute(insert, rusqlite::params!["named_reference", 2, name])
+                        .is_err()
+                );
+            }
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+        }
     }
 
     #[test]
@@ -5881,7 +6409,7 @@ mod tests {
                'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
-               'complete', 'exhaustive', 'rows', '{\"rows\":[]}',
+               'complete', 'exhaustive', 'rows', jsonb('{\"rows\":[]}'),
                zeroblob(32), 100
              );",
         )
@@ -5903,7 +6431,7 @@ mod tests {
                    'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                    'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                    'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
-                   'complete', 'exhaustive', 'rows', '{}', zeroblob(32), 100
+                   'complete', 'exhaustive', 'rows', jsonb('{}'), zeroblob(32), 100
                  )",
                 [],
             )
@@ -5952,7 +6480,7 @@ mod tests {
                        'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                        'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                        'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
-                       'complete', 'exhaustive', ?3, '{}', zeroblob(32), 100
+                       'complete', 'exhaustive', ?3, jsonb('{}'), zeroblob(32), 100
                      )",
                     rusqlite::params![partition_kind, partition_digest, product_kind],
                 )
@@ -5985,7 +6513,7 @@ mod tests {
                'bb11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                'cc11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
                'dd11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee',
-               'complete', 'exhaustive', 'rows', '{\"rows\":[]}', zeroblob(32), 100
+               'complete', 'exhaustive', 'rows', jsonb('{\"rows\":[]}'), zeroblob(32), 100
              )",
             [],
         )
@@ -5997,10 +6525,13 @@ mod tests {
             .unwrap_err();
         assert!(bounded.to_string().contains("CHECK constraint failed"));
 
-        // A product must be JSON, because that is the only thing a reader can
-        // do with the one column SQL does not inspect.
+        // A product must be strict JSONB so replay accounting stays readable
+        // through SQL's JSON functions.
         let opaque_product = conn
-            .execute("UPDATE policy_units SET product = 'not json'", [])
+            .execute(
+                "UPDATE policy_units SET product = CAST('not json' AS BLOB)",
+                [],
+            )
             .unwrap_err();
         assert!(
             opaque_product

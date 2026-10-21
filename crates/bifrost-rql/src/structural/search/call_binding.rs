@@ -1670,6 +1670,7 @@ mod authored_override_residual_tests {
     #[test]
     fn only_unknown_or_unproven_answers_can_carry_the_contract_residual() {
         let answer = |outcome| DispatchSiteAnswer {
+            coverage_reasons: Vec::new(),
             outcome,
             coverage: crate::analyzer::semantic::CandidateCoverage::Open,
             call_site_count: 1,

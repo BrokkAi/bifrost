@@ -2170,10 +2170,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                 .is_some_and(|visibility| *visibility != DeclaredVisibility::Public)
                 && visibility_gaps.insert(site)
             {
-                native.facts.gaps.push(brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapFact {
-                    site,
-                    kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedVisibility,
-                });
+                native.facts.gaps.push(brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapFact::new(site, brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedVisibility));
             }
         }
         // Macro item reparses append their imports while the primary tree is
@@ -3483,6 +3480,28 @@ pub(crate) fn rust_item_macro_invocation_name<'a>(
 ) -> Option<&'a str> {
     rust_unqualified_macro_invocation_name(node, source)
         .or_else(|| crate::cfg_if::is_cfg_if(node, source).then_some("cfg_if::cfg_if"))
+}
+
+/// The invocation path as written for any macro invocation, qualified or not.
+///
+/// Item-macro consumers keep using [`rust_item_macro_invocation_name`], which
+/// deliberately admits only unqualified spellings and `cfg_if!`. Expression
+/// macros such as `log::warn!` still need their written path so completeness
+/// can bound what the invocation may expand to.
+pub fn rust_macro_invocation_path_name(node: Node<'_>, source: &str) -> Option<String> {
+    let macro_node = node.child_by_field_name("macro")?;
+    let segments = crate::graph_support::rust_path_segments(macro_node)?;
+    let mut name = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            name.push_str("::");
+        }
+        let spelling = rust_node_text(*segment, source).trim();
+        name.push_str(
+            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(spelling),
+        );
+    }
+    (!name.is_empty()).then_some(name)
 }
 
 pub fn rust_unqualified_macro_invocation_name<'a>(

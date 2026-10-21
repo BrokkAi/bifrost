@@ -13,6 +13,7 @@ use crate::analyzer::store::resolution_operation::java_reverse_rows::{
 use crate::analyzer::store::resolution_operation::{
     SelectedResolutionContextMetrics, SelectedResolutionOperationInput,
     SelectedResolutionOperationOpenOutcome, SelectedResolutionOperationOutcome,
+    selected_reverse_reference_file, selected_reverse_reference_owner,
 };
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
@@ -21,14 +22,11 @@ use crate::analyzer::structural::EdgeProvenance;
 use crate::analyzer::structural::SiteClass;
 use crate::analyzer::structural::reference_edges::{
     EdgeCompleteness, EdgeDerivationResult, EdgeIncompleteReason, EdgeSite, ReferenceEdgeRow,
-    ReferenceSiteClassifier,
+    SelectedReferenceFileProjection,
 };
 use crate::analyzer::usages::{UsageHitKind, UsageProof};
-use crate::analyzer::{
-    CodeUnit, CodeUnitIndex, IAnalyzer, Language, ProjectFile, Range, resolve_analyzer,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashMap;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionCallableReceiverOrigin, ResolutionSiteKind,
 };
@@ -71,7 +69,7 @@ pub fn java_selected_inverse_for(
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> JavaSelectedReverseOutcome<EdgeDerivationResult> {
-    match java_selected_inverse_detailed_for(java, target, cancellation) {
+    match java_selected_inverse_detailed_for(java, java, target, cancellation) {
         JavaSelectedReverseOutcome::Ready(answer) => {
             JavaSelectedReverseOutcome::Ready(answer.edges)
         }
@@ -87,17 +85,19 @@ pub fn java_selected_inverse_for(
 }
 
 pub(super) fn java_selected_inverse_detailed_for(
+    analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> JavaSelectedReverseOutcome<JavaSelectedInverseResolution> {
-    match java_selected_inverse_for_inner(java, target, cancellation) {
+    match java_selected_inverse_for_inner(analyzer, java, target, cancellation) {
         Ok(outcome) => outcome,
         Err(error) => JavaSelectedReverseOutcome::StoreError(error.to_string()),
     }
 }
 
 fn java_selected_inverse_for_inner(
+    analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     target: &CodeUnit,
     cancellation: &CancellationToken,
@@ -208,7 +208,8 @@ fn java_selected_inverse_for_inner(
             "Java selected reverse query crossed an analyzer generation".into(),
         ));
     }
-    let answer = project_confirmed_references(java, target, generation, confirmed, cancellation)?;
+    let answer =
+        project_confirmed_references(analyzer, java, target, generation, confirmed, cancellation)?;
     if java.inner.project().analysis_generation() != generation {
         return Ok(JavaSelectedReverseOutcome::Stale(
             "Java selected reverse projection crossed an analyzer generation".into(),
@@ -218,6 +219,7 @@ fn java_selected_inverse_for_inner(
 }
 
 fn project_confirmed_references(
+    analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     target: &CodeUnit,
     generation: u64,
@@ -239,7 +241,7 @@ fn project_confirmed_references(
         reasons.push(EdgeIncompleteReason::InverseIndexResolutionIncomplete);
     }
 
-    let mut files = HashMap::<ProjectFile, JavaSelectedReferenceFile<'_>>::default();
+    let mut files = HashMap::<ProjectFile, SelectedReferenceFileProjection<'_>>::default();
     let mut edges = Vec::new();
     let mut binding_target_counts = HashMap::default();
     for reference in confirmed.references {
@@ -263,38 +265,16 @@ fn project_confirmed_references(
             reference.locator.relative_path(),
         );
         if !files.contains_key(&file) {
-            let Some(source) = java.indexed_source(&file) else {
-                return Err(StoreError::new(format!(
-                    "selected Java reference has no indexed source: {file}"
-                )));
-            };
-            if !java
-                .inner
-                .source_matches_selected_native_content(&file, &source)
-            {
-                return Err(StoreError::new(format!(
-                    "selected Java reference source changed before projection: {file}"
-                )));
-            }
             files.insert(
                 file.clone(),
-                JavaSelectedReferenceFile::new(java, &file, &source),
+                selected_reverse_reference_file(analyzer, java, &file)?,
             );
         }
         let projected_file = files
             .get(&file)
-            .expect("selected Java source was projected");
-        let owner = reference.owner;
-        if answer
-            .reference_owner()
-            .is_some_and(|owner| owner.is_some())
-            && owner.is_none()
-        {
-            push_reason(
-                &mut reasons,
-                EdgeIncompleteReason::InverseIndexMetadataIncomplete,
-            );
-        }
+            .expect("selected caller source was projected");
+        let owner = selected_reverse_reference_owner(projected_file, reference.owner)?;
+        let projected_file = &projected_file.state;
         let reference_kind = projected_file.classifier.as_ref().and_then(|classifier| {
             classifier.classify_reference_kind(metadata.start_byte(), metadata.end_byte(), target)
         });
@@ -377,41 +357,12 @@ fn push_reason(reasons: &mut Vec<EdgeIncompleteReason>, reason: EdgeIncompleteRe
     }
 }
 
-struct JavaSelectedReferenceFile<'analyzer> {
-    source_len: usize,
-    line_starts: Box<[usize]>,
-    classifier: Option<ReferenceSiteClassifier<'analyzer>>,
-}
-
-impl<'analyzer> JavaSelectedReferenceFile<'analyzer> {
-    fn new(java: &'analyzer JavaAnalyzer, file: &ProjectFile, source: &str) -> Self {
-        Self {
-            source_len: source.len(),
-            line_starts: compute_line_starts(source).into_boxed_slice(),
-            classifier: ReferenceSiteClassifier::new(java, file),
-        }
-    }
-
-    fn range(&self, start_byte: usize, end_byte: usize) -> Range {
-        assert!(
-            start_byte <= end_byte && end_byte <= self.source_len,
-            "selected Java reference range must fit indexed source: {start_byte}..{end_byte} of {}",
-            self.source_len,
-        );
-        Range {
-            start_byte,
-            end_byte,
-            start_line: find_line_index_for_offset(&self.line_starts, start_byte) + 1,
-            end_line: find_line_index_for_offset(&self.line_starts, end_byte.saturating_sub(1)) + 1,
-        }
-    }
-}
-
 /// Generation-bound lazy facade. It retains the analyzer, not an inverse map;
 /// candidates and projected references live only for one target request.
 pub struct JavaNativeSelectedReferenceIndex {
     generation: u64,
     java: Box<JavaAnalyzer>,
+    projection_analyzer: Box<dyn IAnalyzer>,
     cancellation: CancellationToken,
 }
 
@@ -429,8 +380,13 @@ impl crate::analyzer::structural::reference_edges::SelectedInverseReferenceIndex
                 EdgeIncompleteReason::InverseIndexResolutionIncomplete,
             );
         }
-        match java_selected_inverse_for(&self.java, target, &self.cancellation) {
-            JavaSelectedReverseOutcome::Ready(answer) => answer,
+        match java_selected_inverse_detailed_for(
+            self.projection_analyzer.as_ref(),
+            &self.java,
+            target,
+            &self.cancellation,
+        ) {
+            JavaSelectedReverseOutcome::Ready(answer) => answer.edges,
             JavaSelectedReverseOutcome::Unavailable(detail) => {
                 eprintln!("selected Java inverse query unavailable: {detail}");
                 incomplete_inverse(
@@ -502,6 +458,13 @@ impl crate::analyzer::structural::reference_edges::SelectedInverseReferenceProvi
         SelectedInverseIndexOutcome::Ready(Arc::new(JavaNativeSelectedReferenceIndex {
             generation: java.inner.project().analysis_generation(),
             java: Box::new(java.clone()),
+            projection_analyzer: if let Some(multi) =
+                (analyzer as &dyn std::any::Any).downcast_ref::<crate::analyzer::MultiAnalyzer>()
+            {
+                Box::new(multi.clone())
+            } else {
+                Box::new(java.clone())
+            },
             cancellation: token,
         }))
     }

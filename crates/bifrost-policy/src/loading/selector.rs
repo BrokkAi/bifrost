@@ -143,6 +143,12 @@ pub(crate) fn resolve_parsed_selector(
                 referenced: Some(referenced),
             })
         }
+        PolicySelector::DeclarationSelection(reference) => {
+            unreachable!(
+                "the registry resolves declaration-selection imports itself, not `{}`",
+                reference.path
+            )
+        }
     }
 }
 

@@ -1,24 +1,21 @@
 use crate::analyzer::common::{language_for_file, workspace_language_for_file};
-use crate::analyzer::jvm::realm_builder::jvm_source_realm;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    AdditionalFileDependencies, AnalyzerConfig, AnalyzerStoreContext, BuildProgress,
-    CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, DefinitionLanguageScope, ExceptionHandlingAnalysis, ExceptionSmellWeights,
-    FileDependencyFacts, ForwardQueryProvider, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, ImportReachability, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language,
-    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, QueryReadIncomplete, Range,
-    RelationalBatchError, RelationalBatchOutcome, RelationalDefinitionRequest,
-    RelationalDefinitionResult, RelationalDefinitionValue, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata,
-    SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
+    AdditionalFileDependencies, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell,
+    CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo, DefinitionLanguageScope,
+    ExceptionHandlingAnalysis, ExceptionSmellWeights, FileDependencyFacts, ForwardQueryProvider,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, ImportReachability, Language, Project,
+    ProjectFile, QueryReadIncomplete, Range, RelationalBatchError, RelationalBatchOutcome,
+    RelationalDefinitionRequest, RelationalDefinitionResult, RelationalDefinitionValue,
+    SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
+    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,223 +39,127 @@ pub fn resolve_analyzer<T: Any>(analyzer: &dyn IAnalyzer) -> Option<&T> {
     multi
         .delegates()
         .values()
-        .find_map(|delegate| (delegate.analyzer() as &dyn Any).downcast_ref::<T>())
+        .find_map(|delegate| delegate.as_any().downcast_ref::<T>())
 }
 
-pub(crate) fn forward_query_provider<T: Any + ForwardQueryProvider>(
+#[doc(hidden)]
+pub fn forward_query_provider<T: Any + ForwardQueryProvider>(
     analyzer: &dyn IAnalyzer,
 ) -> Option<&dyn ForwardQueryProvider> {
     resolve_analyzer::<T>(analyzer).map(|value| value as _)
 }
 
-// One delegate exists per language in a workspace, so the variants' size
-// difference (the analyzers' per-file memo caches) costs nothing worth a Box.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone)]
-pub enum AnalyzerDelegate {
-    Java(JavaAnalyzer),
-    CSharp(CSharpAnalyzer),
-    Cpp(CppAnalyzer),
-    Go(GoAnalyzer),
-    JavaScript(JavascriptAnalyzer),
-    Php(PhpAnalyzer),
-    Python(PythonAnalyzer),
-    TypeScript(TypescriptAnalyzer),
-    Rust(RustAnalyzer),
-    Scala(ScalaAnalyzer),
-    Ruby(RubyAnalyzer),
-    Kotlin(KotlinAnalyzer),
-}
-
-impl AnalyzerDelegate {
-    pub(crate) fn analyzer(&self) -> &dyn IAnalyzer {
-        match self {
-            Self::Java(analyzer) => analyzer,
-            Self::CSharp(analyzer) => analyzer,
-            Self::Cpp(analyzer) => analyzer,
-            Self::Go(analyzer) => analyzer,
-            Self::JavaScript(analyzer) => analyzer,
-            Self::Php(analyzer) => analyzer,
-            Self::Python(analyzer) => analyzer,
-            Self::TypeScript(analyzer) => analyzer,
-            Self::Rust(analyzer) => analyzer,
-            Self::Scala(analyzer) => analyzer,
-            Self::Ruby(analyzer) => analyzer,
-            Self::Kotlin(analyzer) => analyzer,
-        }
-    }
-
-    pub(crate) fn program_semantics_provider(
+/// A language analyzer and the capabilities exposed to the workspace dispatcher.
+pub trait LanguageAnalyzer:
+    IAnalyzer + crate::analyzer::semantic::ProgramSemanticsProvider + Any + Send + Sync
+{
+    fn analyzer(&self) -> &dyn IAnalyzer;
+    fn program_semantics_provider(
         &self,
-    ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
-        match self {
-            Self::Java(analyzer) => analyzer,
-            Self::CSharp(analyzer) => analyzer,
-            Self::Cpp(analyzer) => analyzer,
-            Self::Go(analyzer) => analyzer,
-            Self::JavaScript(analyzer) => analyzer,
-            Self::Php(analyzer) => analyzer,
-            Self::Python(analyzer) => analyzer,
-            Self::TypeScript(analyzer) => analyzer,
-            Self::Rust(analyzer) => analyzer,
-            Self::Scala(analyzer) => analyzer,
-            Self::Ruby(analyzer) => analyzer,
-            Self::Kotlin(analyzer) => analyzer,
-        }
-    }
-
-    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        match self {
-            Self::Java(analyzer) => Self::Java(analyzer.clone_with_project(project)),
-            Self::CSharp(analyzer) => Self::CSharp(analyzer.clone_with_project(project)),
-            Self::Cpp(analyzer) => Self::Cpp(analyzer.clone_with_project(project)),
-            Self::Go(analyzer) => Self::Go(analyzer.clone_with_project(project)),
-            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.clone_with_project(project)),
-            Self::Php(analyzer) => Self::Php(analyzer.clone_with_project(project)),
-            Self::Python(analyzer) => Self::Python(analyzer.clone_with_project(project)),
-            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.clone_with_project(project)),
-            Self::Rust(analyzer) => Self::Rust(analyzer.clone_with_project(project)),
-            Self::Scala(analyzer) => Self::Scala(analyzer.clone_with_project(project)),
-            Self::Ruby(analyzer) => Self::Ruby(analyzer.clone_with_project(project)),
-            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.clone_with_project(project)),
-        }
-    }
-
-    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
-        match self {
-            Self::Java(analyzer) => Self::Java(analyzer.clone_for_index_warm(project)),
-            Self::CSharp(analyzer) => Self::CSharp(analyzer.clone_for_index_warm(project)),
-            Self::Cpp(analyzer) => Self::Cpp(analyzer.clone_with_project(project)),
-            Self::Go(analyzer) => Self::Go(analyzer.clone_with_project(project)),
-            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.clone_with_project(project)),
-            Self::Php(analyzer) => Self::Php(analyzer.clone_with_project(project)),
-            Self::Python(analyzer) => Self::Python(analyzer.clone_with_project(project)),
-            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.clone_with_project(project)),
-            Self::Rust(analyzer) => Self::Rust(analyzer.clone_for_index_warm(project)),
-            Self::Scala(analyzer) => Self::Scala(analyzer.clone_for_index_warm(project)),
-            Self::Ruby(analyzer) => Self::Ruby(analyzer.clone_with_project(project)),
-            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.clone_for_index_warm(project)),
-        }
-    }
-
-    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
-        match self {
-            Self::Java(analyzer) => Some(analyzer),
-            Self::CSharp(analyzer) => Some(analyzer),
-            Self::Cpp(analyzer) => Some(analyzer),
-            Self::Go(analyzer) => Some(analyzer),
-            Self::JavaScript(analyzer) => Some(analyzer),
-            Self::Php(analyzer) => analyzer.import_analysis_provider(),
-            Self::Python(analyzer) => Some(analyzer),
-            Self::TypeScript(analyzer) => Some(analyzer),
-            Self::Rust(analyzer) => Some(analyzer),
-            Self::Scala(analyzer) => analyzer.import_analysis_provider(),
-            Self::Ruby(analyzer) => Some(analyzer),
-            Self::Kotlin(analyzer) => Some(analyzer),
-        }
-    }
-
-    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
-        match self {
-            Self::Java(analyzer) => Some(analyzer),
-            Self::CSharp(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::Cpp(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::Go(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::JavaScript(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::Php(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::Python(analyzer) => Some(analyzer),
-            Self::TypeScript(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::Rust(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::Scala(analyzer) => analyzer.type_hierarchy_provider(),
-            Self::Ruby(analyzer) => Some(analyzer),
-            Self::Kotlin(analyzer) => analyzer.type_hierarchy_provider(),
-        }
-    }
-
-    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
-        match self {
-            Self::Java(analyzer) => analyzer.type_alias_provider(),
-            Self::CSharp(analyzer) => analyzer.type_alias_provider(),
-            Self::Cpp(analyzer) => analyzer.type_alias_provider(),
-            Self::Go(analyzer) => analyzer.type_alias_provider(),
-            Self::JavaScript(analyzer) => analyzer.type_alias_provider(),
-            Self::Php(analyzer) => analyzer.type_alias_provider(),
-            Self::Python(analyzer) => analyzer.type_alias_provider(),
-            Self::TypeScript(analyzer) => analyzer.type_alias_provider(),
-            Self::Rust(analyzer) => analyzer.type_alias_provider(),
-            Self::Scala(analyzer) => analyzer.type_alias_provider(),
-            Self::Ruby(analyzer) => analyzer.type_alias_provider(),
-            Self::Kotlin(analyzer) => analyzer.type_alias_provider(),
-        }
-    }
-
-    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
-        match self {
-            Self::Java(analyzer) => Some(analyzer),
-            Self::CSharp(analyzer) => Some(analyzer),
-            Self::Cpp(analyzer) => analyzer.test_detection_provider(),
-            Self::Go(analyzer) => Some(analyzer),
-            Self::JavaScript(analyzer) => Some(analyzer),
-            Self::Php(analyzer) => Some(analyzer),
-            Self::Python(analyzer) => Some(analyzer),
-            Self::TypeScript(analyzer) => Some(analyzer),
-            Self::Rust(analyzer) => Some(analyzer),
-            Self::Scala(analyzer) => Some(analyzer),
-            Self::Ruby(analyzer) => Some(analyzer),
-            Self::Kotlin(analyzer) => Some(analyzer),
-        }
-    }
-
-    pub(crate) fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        match self {
-            Self::Java(analyzer) => Self::Java(analyzer.update(changed_files)),
-            Self::CSharp(analyzer) => Self::CSharp(analyzer.update(changed_files)),
-            Self::Cpp(analyzer) => Self::Cpp(analyzer.update(changed_files)),
-            Self::Go(analyzer) => Self::Go(analyzer.update(changed_files)),
-            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.update(changed_files)),
-            Self::Php(analyzer) => Self::Php(analyzer.update(changed_files)),
-            Self::Python(analyzer) => Self::Python(analyzer.update(changed_files)),
-            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.update(changed_files)),
-            Self::Rust(analyzer) => Self::Rust(analyzer.update(changed_files)),
-            Self::Scala(analyzer) => Self::Scala(analyzer.update(changed_files)),
-            Self::Ruby(analyzer) => Self::Ruby(analyzer.update(changed_files)),
-            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.update(changed_files)),
-        }
-    }
-
+    ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider;
+    fn clone_with_project(&self, project: Arc<dyn Project>) -> Box<dyn LanguageAnalyzer>;
+    fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Box<dyn LanguageAnalyzer>;
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider>;
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider>;
+    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider>;
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider>;
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Box<dyn LanguageAnalyzer>;
     fn should_receive_changed_file(&self, language: Language, file: &ProjectFile) -> bool {
         language_for_file(file) == language
             || self.analyzer().is_analyzed(file)
             || is_language_configuration_input(language, file)
     }
+    fn update_all_with_progress(
+        &self,
+        progress: Option<BuildProgress>,
+    ) -> Box<dyn LanguageAnalyzer>;
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn clone_box(&self) -> Box<dyn LanguageAnalyzer>;
+}
+
+/// One language analyzer owned by a workspace.
+pub struct AnalyzerDelegate {
+    inner: Box<dyn LanguageAnalyzer>,
+}
+
+impl Clone for AnalyzerDelegate {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone_box(),
+        }
+    }
+}
+
+impl AnalyzerDelegate {
+    pub fn new(analyzer: impl LanguageAnalyzer + 'static) -> Self {
+        Self {
+            inner: Box::new(analyzer),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn analyzer(&self) -> &dyn IAnalyzer {
+        LanguageAnalyzer::analyzer(self.inner.as_ref())
+    }
+
+    pub(crate) fn program_semantics_provider(
+        &self,
+    ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
+        LanguageAnalyzer::program_semantics_provider(self.inner.as_ref())
+    }
+
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        Self {
+            inner: LanguageAnalyzer::clone_with_project(self.inner.as_ref(), project),
+        }
+    }
+
+    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        Self {
+            inner: LanguageAnalyzer::clone_for_index_warm(self.inner.as_ref(), project),
+        }
+    }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        LanguageAnalyzer::import_analysis_provider(self.inner.as_ref())
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
+        LanguageAnalyzer::type_hierarchy_provider(self.inner.as_ref())
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        LanguageAnalyzer::type_alias_provider(self.inner.as_ref())
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        LanguageAnalyzer::test_detection_provider(self.inner.as_ref())
+    }
+
+    pub(crate) fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        Self {
+            inner: LanguageAnalyzer::update(self.inner.as_ref(), changed_files),
+        }
+    }
+
+    fn should_receive_changed_file(&self, language: Language, file: &ProjectFile) -> bool {
+        LanguageAnalyzer::should_receive_changed_file(self.inner.as_ref(), language, file)
+    }
 
     pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
-        match self {
-            Self::Java(analyzer) => Self::Java(analyzer.update_all_with_progress(progress)),
-            Self::CSharp(analyzer) => Self::CSharp(analyzer.update_all_with_progress(progress)),
-            Self::Cpp(analyzer) => Self::Cpp(analyzer.update_all_with_progress(progress)),
-            Self::Go(analyzer) => Self::Go(analyzer.update_all_with_progress(progress)),
-            Self::JavaScript(analyzer) => {
-                Self::JavaScript(analyzer.update_all_with_progress(progress))
-            }
-            Self::Php(analyzer) => Self::Php(analyzer.update_all_with_progress(progress)),
-            Self::Python(analyzer) => Self::Python(analyzer.update_all_with_progress(progress)),
-            Self::TypeScript(analyzer) => {
-                Self::TypeScript(analyzer.update_all_with_progress(progress))
-            }
-            Self::Rust(analyzer) => Self::Rust(analyzer.update_all_with_progress(progress)),
-            Self::Scala(analyzer) => Self::Scala(analyzer.update_all_with_progress(progress)),
-            Self::Ruby(analyzer) => Self::Ruby(analyzer.update_all_with_progress(progress)),
-            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.update_all_with_progress(progress)),
+        Self {
+            inner: LanguageAnalyzer::update_all_with_progress(self.inner.as_ref(), progress),
         }
+    }
+
+    pub fn as_any(&self) -> &dyn std::any::Any {
+        LanguageAnalyzer::as_any(self.inner.as_ref())
     }
 }
 
 /// Construct the concrete analyzer serving `language`.
 ///
-/// Assembly-layer code: this is the one place outside the registry allowed to name
-/// concrete per-language analyzer types, because concrete storage and construction is
-/// what [`AnalyzerDelegate`] is for.
+/// The language support owns concrete construction; the workspace owns liveness.
 pub(crate) fn build_language_delegate(
     language: Language,
     project: Arc<dyn Project>,
@@ -271,31 +172,9 @@ pub(crate) fn build_language_delegate(
     // delegates share the store and generation identities.
     store_context.live_paths =
         Arc::new(crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation());
-    macro_rules! build_delegate {
-        ($variant:ident, $analyzer:ty) => {
-            AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
-                project,
-                config,
-                store_context,
-                progress,
-            )?)
-        };
-    }
-    Ok(match language {
-        Language::Java => build_delegate!(Java, JavaAnalyzer),
-        Language::Go => build_delegate!(Go, GoAnalyzer),
-        Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
-        Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
-        Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
-        Language::Python => build_delegate!(Python, PythonAnalyzer),
-        Language::Rust => build_delegate!(Rust, RustAnalyzer),
-        Language::Php => build_delegate!(Php, PhpAnalyzer),
-        Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
-        Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
-        Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
-        Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
-        Language::None => unreachable!("Language::None is filtered before delegate build"),
-    })
+    crate::analyzer::languages::language_support(language)
+        .expect("Language::None is filtered before delegate build")
+        .build_analyzer(project, config, store_context, progress)
 }
 
 /// Construction state retained by a workspace so an incremental update can
@@ -309,11 +188,12 @@ pub(crate) fn build_language_delegate(
 /// progress callback is deliberately absent: it belongs to that one build and
 /// must neither be retained nor receive later incremental-work notifications.
 #[derive(Clone)]
-pub(crate) struct WorkspaceBuildContext {
+#[doc(hidden)]
+pub struct WorkspaceBuildContext {
     project: Arc<dyn Project>,
     config: AnalyzerConfig,
     store_context: AnalyzerStoreContext,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     startup_oid_batches: Option<Arc<AtomicUsize>>,
     requested_languages: Option<BTreeSet<Language>>,
 }
@@ -329,7 +209,7 @@ impl WorkspaceBuildContext {
             project,
             config,
             store_context,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             startup_oid_batches: None,
             requested_languages: requested_languages.filter(|languages| !languages.is_empty()),
         }
@@ -341,7 +221,8 @@ impl WorkspaceBuildContext {
         context
     }
 
-    pub(crate) fn project(&self) -> &Arc<dyn Project> {
+    #[doc(hidden)]
+    pub fn project(&self) -> &Arc<dyn Project> {
         &self.project
     }
 
@@ -541,7 +422,7 @@ impl WorkspaceBuildContext {
             )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_startup_oid_batch_counter_for_test(
         mut self,
         counter: Option<Arc<AtomicUsize>>,
@@ -550,7 +431,7 @@ impl WorkspaceBuildContext {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn startup_oid_batch_count_for_test(&self) -> usize {
         self.startup_oid_batches
             .as_ref()
@@ -624,41 +505,8 @@ impl WorkspaceBuildContext {
 /// language's delegate, and the MCP file watcher watches every directory that
 /// holds one, so both sides must agree on this one predicate.
 pub fn is_language_configuration_input(language: Language, file: &ProjectFile) -> bool {
-    match language {
-        Language::Java | Language::Scala | Language::Kotlin => {
-            crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
-        }
-        Language::CSharp => crate::analyzer::csharp::is_csharp_dependency_input(file),
-        Language::Cpp => brokk_bifrost_cpp::compile_context::is_cpp_compile_context_input(file),
-        Language::JavaScript | Language::TypeScript => is_js_ts_config_file(file),
-        Language::Go => is_go_module_manifest(file),
-        Language::Rust => crate::analyzer::rust::is_cargo_evidence_input(file),
-        Language::Python => crate::analyzer::languages::language_support(language)
-            .is_some_and(|support| support.is_configuration_input_path(file.rel_path())),
-        Language::Php | Language::Ruby | Language::None => false,
-    }
-}
-
-fn is_js_ts_config_file(file: &ProjectFile) -> bool {
-    matches!(
-        file.rel_path().file_name().and_then(|name| name.to_str()),
-        Some(
-            "tsconfig.json"
-                | "jsconfig.json"
-                | "package.json"
-                | "package-lock.json"
-                | "npm-shrinkwrap.json"
-                | "pnpm-lock.yaml"
-                | "yarn.lock"
-        )
-    )
-}
-
-fn is_go_module_manifest(file: &ProjectFile) -> bool {
-    matches!(
-        file.rel_path().file_name().and_then(|name| name.to_str()),
-        Some("go.mod" | "go.sum")
-    )
+    crate::analyzer::languages::language_support(language)
+        .is_some_and(|support| support.is_configuration_input(file))
 }
 
 fn group_files_by_language(
@@ -690,7 +538,8 @@ where
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
     build_context: Option<Arc<WorkspaceBuildContext>>,
-    snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
+    #[doc(hidden)]
+    pub snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
     derived_layer_budget_bytes: u64,
     query_contexts: Mutex<Vec<Arc<crate::analyzer::AnalyzerQueryContext>>>,
     /// How many of the open query contexts carry a read ledger. Tracks
@@ -846,13 +695,6 @@ impl MultiAnalyzer {
         self.snapshot_caches = Arc::new(caches);
         self
     }
-    pub fn with_java(java: JavaAnalyzer) -> Self {
-        Self::new(BTreeMap::from([(
-            Language::Java,
-            AnalyzerDelegate::Java(java),
-        )]))
-    }
-
     pub fn delegates(&self) -> &BTreeMap<Language, AnalyzerDelegate> {
         &self.delegates
     }
@@ -861,7 +703,8 @@ impl MultiAnalyzer {
         self.build_context.clone()
     }
 
-    pub(crate) fn build_context(&self) -> Option<&WorkspaceBuildContext> {
+    #[doc(hidden)]
+    pub fn build_context(&self) -> Option<&WorkspaceBuildContext> {
         self.build_context.as_deref()
     }
 
@@ -950,11 +793,8 @@ impl MultiAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         let delegate = self.delegate_for_file(file)?;
-        let scope = AnalyzerQueryScope::new(delegate.analyzer());
-        match delegate {
-            AnalyzerDelegate::Rust(rust) => rust.prepared_syntax(scope.token(), file),
-            _ => None,
-        }
+        crate::analyzer::languages::language_support(language_for_file(file))?
+            .prepared_syntax_for_test(delegate, file)
     }
 
     fn delegate_for_procedure(
@@ -995,25 +835,6 @@ impl MultiAnalyzer {
 
     fn delegate_for_code_unit(&self, code_unit: &CodeUnit) -> Option<&AnalyzerDelegate> {
         self.delegate_for_file(code_unit.source())
-    }
-
-    /// The Kotlin delegate, together with a view of the whole JVM source realm,
-    /// when this workspace has Kotlin alongside at least one other JVM
-    /// language.
-    ///
-    /// A Kotlin analyzer only indexes `.kt` files, so on its own it cannot see
-    /// that the interface a Kotlin class implements is declared in a Java file
-    /// next door. `MultiAnalyzer` is the only place that holds every delegate,
-    /// so it is where the realm view is constructed. `None` means the widening
-    /// would add nothing and the delegate's own answer already stands.
-    fn kotlin_realm(&self) -> Option<(&KotlinAnalyzer, JvmSourceRealm<'_>)> {
-        let Some(AnalyzerDelegate::Kotlin(kotlin)) = self.delegates.get(&Language::Kotlin) else {
-            return None;
-        };
-        let realm = jvm_source_realm(self);
-        realm
-            .has_peers_of(Language::Kotlin)
-            .then_some((kotlin, realm))
     }
 
     /// Union one lookup's answer across every delegate.
@@ -1068,7 +889,7 @@ impl MultiAnalyzer {
         }
     }
 
-    fn member_family_provider_for_code_unit(
+    pub(crate) fn member_family_provider_for_code_unit(
         &self,
         member: &CodeUnit,
     ) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
@@ -1113,12 +934,10 @@ impl ImportAnalysisProvider for MultiAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        // A Kotlin file can import a Java or Scala declaration from the same
-        // workspace, and only the multi-analyzer can see both sides.
-        if language_for_file(file) == Language::Kotlin
-            && let Some((kotlin, realm)) = self.kotlin_realm()
+        if let Some(imports) = crate::analyzer::languages::language_support(language_for_file(file))
+            .and_then(|support| support.workspace_imported_code_units(self, token, file))
         {
-            return kotlin.imported_code_units_in_realm(token, file, Some(&realm));
+            return imports;
         }
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
@@ -1398,13 +1217,11 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        // A Kotlin class can extend a Java class or implement a Scala trait
-        // declared in the same workspace; resolving that needs every JVM
-        // delegate, which only the multi-analyzer holds.
-        if language_for_file(code_unit.source()) == Language::Kotlin
-            && let Some((kotlin, realm)) = self.kotlin_realm()
+        if let Some(ancestors) =
+            crate::analyzer::languages::language_support(language_for_file(code_unit.source()))
+                .and_then(|support| support.workspace_direct_ancestors(self, token, code_unit))
         {
-            return kotlin.direct_ancestors_in_realm(token, code_unit, Some(&realm));
+            return ancestors;
         }
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
@@ -1425,11 +1242,13 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     ) -> Option<Vec<CodeUnit>> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        if language_for_file(code_unit.source()) == Language::Kotlin
-            && let Some((kotlin, realm)) = self.kotlin_realm()
+        if let Some(ancestors) =
+            crate::analyzer::languages::language_support(language_for_file(code_unit.source()))
+                .and_then(|support| {
+                    support.workspace_direct_ancestors_within(self, token, code_unit, scope)
+                })
         {
-            return (!scope.cancellation().is_cancelled())
-                .then(|| kotlin.direct_ancestors_in_realm(token, code_unit, Some(&realm)));
+            return ancestors;
         }
         match self
             .delegate_for_code_unit(code_unit)
@@ -1454,33 +1273,12 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             Some(provider) => provider.get_direct_descendants_within(code_unit, scope)?,
             None => HashSet::default(),
         };
-        // Kotlin subclasses of a Java or Scala type are invisible to that
-        // language's own descendant index, which only walks its own
-        // declarations. Kotlin's realm-aware index does resolve across the
-        // realm, so folding it in is what makes `Api`'s Kotlin implementors
-        // show up.
-        //
-        // The reverse direction — Java and Scala subclasses of a *Kotlin* type
-        // — is still missing, and cannot be fixed here. Each language's
-        // descendant index is the inverse of its own ancestor resolution, and
-        // Java's and Scala's resolve a spelled supertype against their own
-        // declarations only; folding their indexes in for a Kotlin unit would
-        // fold in indexes that never saw the Kotlin declaration in the first
-        // place. Closing it means giving those two hierarchy resolvers the
-        // realm-aware existence predicate Kotlin's already has (`realm_type_exists`
-        // / `realm_type_by_fqn` in `kotlin/hierarchy.rs`) — a change to those
-        // analyzers, not to this dispatch. Issue #1239 made *usage* resolution
-        // realm-aware in both directions; hierarchy resolution is a separate
-        // seam and remains one-directional.
-        if language_for_file(code_unit.source()) != Language::Kotlin
-            && let Some((kotlin, realm)) = self.kotlin_realm()
-        {
-            descendants.extend(kotlin.direct_descendants_in_realm(
-                token,
-                code_unit,
-                Some(&realm),
-                scope,
-            )?);
+        for language in self.languages() {
+            let support = crate::analyzer::languages::language_support(language)
+                .expect("registered delegate has language support");
+            descendants.extend(
+                support.workspace_additional_direct_descendants(self, token, code_unit, scope)?,
+            );
         }
         if IAnalyzer::read_ledger_attached(self) {
             // Descendants are a cross-file answer: a subclass added in a file
@@ -1521,18 +1319,13 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         &self,
         member: &CodeUnit,
     ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
-        match language_for_file(member.source()) {
-            Language::Java => crate::analyzer::usages::java_member_family_capability(self, member),
-            Language::Scala => {
-                crate::analyzer::usages::scala_member_family_capability(self, member)
-            }
-            _ => self
-                .member_family_provider_for_code_unit(member)
-                .map(|provider| provider.member_family_capability(member))
-                .unwrap_or(
-                    crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported,
-                ),
-        }
+        crate::analyzer::languages::language_support(language_for_file(member.source()))
+            .map(|support| support.workspace_member_family_capability(self, member))
+            .unwrap_or_else(|| {
+                self.member_family_provider_for_code_unit(member)
+                    .map(|provider| provider.member_family_capability(member))
+                    .unwrap_or(crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported)
+            })
     }
 
     fn member_family(
@@ -1540,18 +1333,13 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         member: &CodeUnit,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        match language_for_file(member.source()) {
-            Language::Java => {
-                crate::analyzer::usages::java_member_family(self, self, member, cancellation)
-            }
-            Language::Scala => {
-                crate::analyzer::usages::scala_member_family(self, self, member, cancellation)
-            }
-            _ => self
-                .member_family_provider_for_code_unit(member)
-                .map(|provider| provider.member_family(member, cancellation))
-                .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer),
-        }
+        crate::analyzer::languages::language_support(language_for_file(member.source()))
+            .map(|support| support.workspace_member_family(self, member, cancellation))
+            .unwrap_or_else(|| {
+                self.member_family_provider_for_code_unit(member)
+                    .map(|provider| provider.member_family(member, cancellation))
+                    .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer)
+            })
     }
 
     fn external_member_family(
@@ -1567,58 +1355,11 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         // declarations, a Kotlin class can extend a Java class (and the
         // reverse), and a Scala class can extend either, so no arm may prove
         // the boundary from one analyzer's tree alone (#3452, #3453, #3454).
-        if identity.language() == Language::Kotlin {
-            if let Some(language) = [Language::Java, Language::Scala]
-                .into_iter()
-                .find(|language| self.languages().contains(language))
-            {
-                return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
-                    crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
-                        language,
-                    ),
-                    0,
-                );
-            }
-            let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(self) else {
-                return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
-            };
-            return kotlin.resolve_external_member_family(self, identity, max_visits, cancellation);
-        }
-        if identity.language() == Language::Scala {
-            if let Some(language) = [Language::Java, Language::Kotlin]
-                .into_iter()
-                .find(|language| self.languages().contains(language))
-            {
-                return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
-                    crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
-                        language,
-                    ),
-                    0,
-                );
-            }
-            let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(self) else {
-                return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
-            };
-            return scala.resolve_external_member_family(self, identity, max_visits, cancellation);
-        }
-        if identity.language() != Language::Java {
-            return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
-        }
-        if let Some(language) = [Language::Kotlin, Language::Scala]
-            .into_iter()
-            .find(|language| self.languages().contains(language))
-        {
-            return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
-                crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
-                    language,
-                ),
-                0,
-            );
-        }
-        let Some(java) = resolve_analyzer::<JavaAnalyzer>(self) else {
-            return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
-        };
-        java.resolve_external_member_family(self, identity, max_visits, cancellation)
+        crate::analyzer::languages::language_support(identity.language())
+            .map(|support| {
+                support.workspace_external_member_family(self, identity, max_visits, cancellation)
+            })
+            .unwrap_or_else(crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported)
     }
 }
 
@@ -2673,142 +2414,14 @@ impl IAnalyzer for MultiAnalyzer {
     ) -> crate::analyzer::SemanticDiagnosticReport {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        // JVM diagnostics must see the same
-        // wider JVM source realm its import and hierarchy resolution do:
-        // otherwise a type declared in a Java or Scala sibling file would be
-        // misreported as unrecognized. Only `MultiAnalyzer` can construct
-        // that realm view (see `kotlin_realm`), so this is the one place the
-        // widening happens rather than inside `KotlinAnalyzer` itself.
-        if language_for_file(file) == Language::Kotlin
-            && self.delegates.contains_key(&Language::Kotlin)
-        {
-            // Every Kotlin file routes here, not only one with Java or Scala
-            // peers: the realm widens *resolution*, but the active dependency
-            // model that decides whether a miss is provable is published on the
-            // dispatcher either way. Falling through to the delegate for a
-            // Kotlin-only workspace would read its empty overlay and suppress
-            // every unknown name.
-            //
-            // `self`, not the Kotlin delegate, for the same reason -- plus the
-            // enclosing-declaration lookup, which crosses languages. The shim
-            // downcasts to the Kotlin analyzer itself.
-            let realm = self.kotlin_realm().map(|(_, realm)| realm);
-            return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
-                self,
-                token,
-                file,
-                source,
-                realm.as_ref(),
-            );
-        }
-        if language_for_file(file) == Language::Java && self.delegates.contains_key(&Language::Java)
-        {
-            return crate::analyzer::java::diagnostics::collect_java_semantic_diagnostics(
-                self, token, file, source,
-            );
-        }
-        // Scala's own ladder is delegate-resident, but the active dependency
-        // model it must not claim absence past is published on the dispatcher.
-        if language_for_file(file) == Language::Scala
-            && self.delegates.contains_key(&Language::Scala)
-        {
-            return crate::analyzer::scala::diagnostics::collect_scala_semantic_diagnostics(
-                self, file, source,
-            );
-        }
-        // Go classifies references that leave the workspace against the
-        // activated exact API packs (#1623), and the semantic-model overlay
-        // and the retained Go module graph belong to the dispatching analyzer,
-        // not to the delegate. Passing `self` is what lets a Go file's import
-        // of an indexed module resolve instead of reporting nothing known.
-        if language_for_file(file) == Language::Go && self.delegates.contains_key(&Language::Go) {
-            return crate::analyzer::go::diagnostics::collect_go_semantic_diagnostics(
-                self, token, file, source,
-            );
-        }
-        // Python's environment proof lives on the analyzer a host activated
-        // packs against, which is this composite one and not the delegate. A
-        // request routed straight to the delegate would see no overlay and no
-        // discovery evidence, and would report every external import as an
-        // unknown boundary.
-        if language_for_file(file) == Language::Python
-            && self.delegates.contains_key(&Language::Python)
-        {
-            return crate::analyzer::python::diagnostics::collect_python_semantic_diagnostics(
-                self, token, file, source,
-            );
-        }
-        // PHP's proof ladder reads the semantic-model overlay and the retained
-        // Composer discovery evidence, and only the dispatching analyzer holds
-        // them. Delegating to the `PhpAnalyzer` would hand the collector a view
-        // with no indexed dependencies, so every vendor symbol would look
-        // unknown even with an active pack.
-        if language_for_file(file) == Language::Php && self.delegates.contains_key(&Language::Php) {
-            return crate::analyzer::php::diagnostics::collect_php_semantic_diagnostics(
-                self, file, source,
-            );
-        }
-        // JS/TS diagnostics judge external imports against the activated npm
-        // declaration surface and the retained npm discovery evidence (#1620).
-        // Both hang off the analyzer that owns the workspace snapshot, which is
-        // this one: a delegate passed on its own carries no snapshot caches and
-        // would report every npm import as an unknown boundary.
         let language = language_for_file(file);
-        if language == Language::JavaScript && self.delegates.contains_key(&Language::JavaScript) {
-            return crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics(
-                self, file, source,
-            );
-        }
-        if language == Language::TypeScript && self.delegates.contains_key(&Language::TypeScript) {
-            return crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics(
-                self, file, source,
-            );
-        }
-        // Rust classifies paths that leave the workspace against the activated
-        // exact Cargo API packs (#1625), and the semantic-model overlay and the
-        // retained Cargo dependency evidence belong to the dispatching
-        // analyzer, not to the delegate. Passing `self` is what lets a path
-        // into an indexed dependency resolve instead of reporting nothing
-        // known.
-        if language_for_file(file) == Language::Rust && self.delegates.contains_key(&Language::Rust)
-        {
-            return crate::analyzer::rust::diagnostics::collect_rust_semantic_diagnostics(
-                self, file, source,
-            );
-        }
-        // Ruby classifies a constant that leaves the visible require closure
-        // against the activated exact gem API packs (#1624), and both the
-        // semantic-model overlay and the retained Gemfile.lock discovery
-        // evidence belong to the dispatching analyzer, not to the delegate.
-        // Passing `self` is what lets a gem's indexed constant resolve instead
-        // of reporting an unknown boundary.
-        if language_for_file(file) == Language::Ruby && self.delegates.contains_key(&Language::Ruby)
-        {
-            return crate::analyzer::ruby::diagnostics::collect_ruby_semantic_diagnostics(
-                self, file, source,
-            );
-        }
-        // C# reads the retained dependency-discovery evidence that refines an
-        // unindexed assembly boundary, and a host publishes that on the
-        // analyzer it ran discovery against, which is this composite one.
-        // Delegating to the `CSharpAnalyzer` would hand the collector no
-        // evidence at all, so every miss past a `using` would report the
-        // weakest boundary even where the build declares the assembly.
-        if language_for_file(file) == Language::CSharp
-            && self.delegates.contains_key(&Language::CSharp)
-        {
-            return crate::analyzer::csharp::diagnostics::collect_csharp_semantic_diagnostics(
-                self, token, file, source,
-            );
-        }
-        if language_for_file(file) == Language::Cpp
-            && self.delegates.contains_key(&Language::Cpp)
-            && let Some(cpp) =
-                crate::analyzer::resolve_analyzer::<crate::analyzer::CppAnalyzer>(self)
-        {
-            let report =
-                brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(cpp, file, source);
-            return crate::analyzer::semantic_model::degrade_pack_gap_absences(self, report);
+        if self.delegates.contains_key(&language) {
+            let support = crate::analyzer::languages::language_support(language)
+                .expect("registered delegate has language support");
+            if let Some(report) = support.workspace_semantic_diagnostics(self, token, file, source)
+            {
+                return report;
+            }
         }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
@@ -3764,373 +3377,8 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::FileSetProject;
-    use brokk_bifrost_core::analyzer::{RelationalDefinitionQuery, RelationalName};
+mod tests {}
 
-    /// A two-language workspace on disk, as a `MultiAnalyzer` over real
-    /// per-language delegates.  The merged definition view is only meaningful
-    /// over delegates that actually hold declarations.
-    fn two_language_analyzer() -> (tempfile::TempDir, MultiAnalyzer) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/App.java"),
-            "package app;\npublic class App {}\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub struct Widget;\n").unwrap();
-        std::fs::write(root.join("README.md"), "docs\n").unwrap();
-        let project = FileSetProject::new(
-            root,
-            [
-                std::path::PathBuf::from("src/App.java"),
-                std::path::PathBuf::from("src/lib.rs"),
-                std::path::PathBuf::from("README.md"),
-            ],
-        );
-        let delegates = BTreeMap::from([
-            (
-                Language::Java,
-                AnalyzerDelegate::Java(JavaAnalyzer::from_project(project.clone())),
-            ),
-            (
-                Language::Rust,
-                AnalyzerDelegate::Rust(RustAnalyzer::from_project(project)),
-            ),
-        ]);
-        (temp, MultiAnalyzer::new(delegates))
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn update_with_only_irrelevant_files_retains_snapshot_caches() {
-        let (_temp, analyzer) = two_language_analyzer();
-        analyzer
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
-
-        let readme = ProjectFile::new(analyzer.project().root().to_path_buf(), "README.md");
-        let updated = analyzer.update(&BTreeSet::from([readme]));
-
-        assert_eq!(
-            updated.test_hooks().full_declaration_scan_count_for_test(),
-            0
-        );
-        assert!(
-            Arc::ptr_eq(&analyzer.snapshot_caches, &updated.snapshot_caches),
-            "an update touching no analyzed file must keep the workspace derived-layer caches"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn update_touching_an_analyzed_file_carries_the_content_keyed_caches_forward() {
-        let (_temp, analyzer) = two_language_analyzer();
-        let source = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/App.java");
-        let updated = analyzer.update(&BTreeSet::from([source]));
-
-        // The container is new because the semantic-model publication inside it
-        // is snapshot-scoped, but the two content-keyed caches ride the update
-        // (#2449): a value keyed by content an edit did not touch stays exact.
-        assert!(!Arc::ptr_eq(
-            &analyzer.snapshot_caches,
-            &updated.snapshot_caches
-        ));
-        assert!(std::ptr::eq(
-            analyzer.snapshot_caches.derived_layers(),
-            updated.snapshot_caches.derived_layers()
-        ));
-        assert!(std::ptr::eq(
-            analyzer.snapshot_caches.usage_graphs(),
-            updated.snapshot_caches.usage_graphs()
-        ));
-    }
-
-    fn ecosystem_identity(
-        analyzer: &MultiAnalyzer,
-        ecosystem: crate::analyzer::usages::workspace_graph::UsageEcosystem,
-    ) -> crate::analyzer::content_identity::WorkspaceContentIdentity {
-        analyzer
-            .workspace_content_identities()
-            .expect("a two-language analyzer states its content identities")
-            .scope(|language| {
-                crate::analyzer::usages::workspace_graph::UsageEcosystem::of(language) == ecosystem
-            })
-            .unwrap_or_else(|| panic!("no analyzed content for {ecosystem:?}"))
-    }
-
-    fn usage_graph_key(
-        analyzer: &MultiAnalyzer,
-        ecosystem: crate::analyzer::usages::workspace_graph::UsageEcosystem,
-    ) -> crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheKey {
-        crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheKey::new(
-            crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphKind::Exact,
-            [ecosystem],
-            ecosystem_identity(analyzer, ecosystem),
-        )
-    }
-
-    fn acquire_usage_graph(
-        analyzer: &MultiAnalyzer,
-        ecosystem: crate::analyzer::usages::workspace_graph::UsageEcosystem,
-    ) -> crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheLifecycle {
-        use crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingGraph;
-        use crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheBuildOutcome;
-        let acquisition = analyzer.snapshot_caches.usage_graphs().acquire(
-            usage_graph_key(analyzer, ecosystem),
-            &crate::cancellation::CancellationToken::default(),
-            || {
-                WorkspaceUsageGraphCacheBuildOutcome::Complete(WorkspaceUsageRankingGraph {
-                    nodes: Vec::new(),
-                    edges: Vec::new(),
-                    node_indices_by_file: crate::hash::HashMap::default(),
-                    resolved_ecosystems: vec![ecosystem],
-                })
-            },
-            || true,
-        );
-        crate::analyzer::usages::workspace_graph_cache::ready_graph(acquisition).1
-    }
-
-    /// Milestone J (#2449) case (a): a usage graph is scoped to its ecosystems,
-    /// so an edit to a language outside them must leave it reusable. Before the
-    /// caches were content-keyed, the whole cache was minted fresh on every
-    /// update and this graph was rebuilt for a file it does not contain.
-    #[test]
-    fn an_edit_to_one_language_keeps_another_ecosystems_usage_graph() {
-        use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-        use crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheLifecycle;
-
-        let (_temp, analyzer) = two_language_analyzer();
-        assert_eq!(
-            WorkspaceUsageGraphCacheLifecycle::Built,
-            acquire_usage_graph(&analyzer, UsageEcosystem::Rust)
-        );
-        assert_eq!(
-            WorkspaceUsageGraphCacheLifecycle::Built,
-            acquire_usage_graph(&analyzer, UsageEcosystem::Jvm)
-        );
-
-        let java = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/App.java");
-        std::fs::write(
-            java.abs_path(),
-            "package app;\npublic class App { void added() {} }\n",
-        )
-        .unwrap();
-        let updated = analyzer.update(&BTreeSet::from([java]));
-
-        assert_eq!(
-            ecosystem_identity(&analyzer, UsageEcosystem::Rust),
-            ecosystem_identity(&updated, UsageEcosystem::Rust),
-            "a Java edit must not move the Rust content identity"
-        );
-        assert_ne!(
-            ecosystem_identity(&analyzer, UsageEcosystem::Jvm),
-            ecosystem_identity(&updated, UsageEcosystem::Jvm),
-            "a Java edit must move the JVM content identity"
-        );
-        assert_eq!(
-            WorkspaceUsageGraphCacheLifecycle::Hit,
-            acquire_usage_graph(&updated, UsageEcosystem::Rust),
-            "the Rust usage graph must survive an edit to a Java file"
-        );
-        assert_eq!(
-            WorkspaceUsageGraphCacheLifecycle::Built,
-            acquire_usage_graph(&updated, UsageEcosystem::Jvm),
-            "the JVM usage graph must be rebuilt for the edited Java content"
-        );
-    }
-
-    /// Milestone J (#2449) case (b): an update that rewrites a file with the
-    /// same bytes changes no content identity, so every content-keyed cache
-    /// answers from what it already holds.
-    #[test]
-    fn a_no_op_update_reuses_every_content_keyed_workspace_cache() {
-        use crate::analyzer::structural::derived_cache::{
-            DerivedLayerAcquisition, DerivedLayerBuildMetrics, DerivedLayerBuildOutcome,
-            DerivedLayerRequest,
-        };
-        use crate::analyzer::structural::index::StructuralIndexAcquisition;
-        use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-        use crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheLifecycle;
-        use crate::cancellation::CancellationToken;
-
-        let (_temp, analyzer) = two_language_analyzer();
-        let request = DerivedLayerRequest::complete_direct_import_topology();
-        let cancellation = CancellationToken::default();
-
-        let acquire_layer = |analyzer: &MultiAnalyzer| {
-            let content = analyzer
-                .workspace_content_identity()
-                .expect("a two-language analyzer states a whole-workspace identity");
-            let acquisition = analyzer.snapshot_caches.derived_layers().acquire(
-                request,
-                content,
-                &cancellation,
-                || DerivedLayerBuildOutcome::Unavailable {
-                    reason: "the test does not need a real topology".to_string(),
-                    over_budget: false,
-                    rejection_scope: None,
-                    metrics: DerivedLayerBuildMetrics::default(),
-                },
-                || true,
-            );
-            matches!(acquisition, DerivedLayerAcquisition::Unavailable { .. })
-        };
-        let structural_lifecycle = |analyzer: &MultiAnalyzer| {
-            let providers = analyzer.structural_fact_providers();
-            let provider = providers
-                .iter()
-                .find(|provider| provider.structural_language() == Language::Java)
-                .expect("the Java delegate is a structural provider");
-            let cache = provider
-                .snapshot_structural_index_cache()
-                .expect("a built-in provider owns a snapshot index cache");
-            match cache.inner().acquire(*provider, &cancellation) {
-                StructuralIndexAcquisition::Ready { lifecycle, .. } => lifecycle,
-                other => panic!(
-                    "the structural index must be acquirable: {}",
-                    match other {
-                        StructuralIndexAcquisition::Unavailable { reason, .. } =>
-                            reason.to_string(),
-                        _ => "cancelled".to_string(),
-                    }
-                ),
-            }
-        };
-
-        assert!(acquire_layer(&analyzer));
-        assert_eq!(
-            WorkspaceUsageGraphCacheLifecycle::Built,
-            acquire_usage_graph(&analyzer, UsageEcosystem::Jvm)
-        );
-        assert_eq!(
-            crate::analyzer::structural::index::StructuralIndexLifecycle::Built,
-            structural_lifecycle(&analyzer)
-        );
-
-        // Rewrite the same bytes: the file's blob identity is unchanged, so no
-        // content identity moves even though the analyzer reconciled the file.
-        let java = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/App.java");
-        let source = std::fs::read_to_string(java.abs_path()).unwrap();
-        std::fs::write(java.abs_path(), source).unwrap();
-        let updated = analyzer.update(&BTreeSet::from([java]));
-
-        assert_eq!(
-            analyzer.workspace_content_identity(),
-            updated.workspace_content_identity(),
-            "a no-op update must not move the workspace content identity"
-        );
-        assert!(acquire_layer(&updated));
-        assert_eq!(
-            WorkspaceUsageGraphCacheLifecycle::Hit,
-            acquire_usage_graph(&updated, UsageEcosystem::Jvm)
-        );
-        assert_eq!(
-            crate::analyzer::structural::index::StructuralIndexLifecycle::Hit,
-            structural_lifecycle(&updated)
-        );
-        let (retained, _) = updated.snapshot_caches.usage_graphs().verdicts().totals();
-        assert!(
-            retained >= 1,
-            "the reuse must be recorded as a retention verdict"
-        );
-    }
-
-    /// Milestone J (#2449) case (c): a real content change rotates exactly the
-    /// identity of the language whose content moved, and the cache records the
-    /// typed rebuild verdict rather than silently missing.
-    #[test]
-    fn a_real_content_change_rotates_the_affected_identity() {
-        use crate::analyzer::invalidation::ArtifactVerdict;
-
-        let (_temp, analyzer) = two_language_analyzer();
-        let before = analyzer
-            .workspace_content_identities()
-            .expect("content identities");
-        assert_eq!(2, before.entries().len());
-
-        let rust = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/lib.rs");
-        std::fs::write(rust.abs_path(), "pub struct Widget;\npub struct Gauge;\n").unwrap();
-        let updated = analyzer.update(&BTreeSet::from([rust]));
-        let after = updated
-            .workspace_content_identities()
-            .expect("content identities");
-
-        assert_ne!(
-            before.language(Language::Rust),
-            after.language(Language::Rust)
-        );
-        assert_eq!(
-            before.language(Language::Java),
-            after.language(Language::Java)
-        );
-        assert_ne!(before.whole_workspace(), after.whole_workspace());
-
-        use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-        acquire_usage_graph(&analyzer, UsageEcosystem::Rust);
-        acquire_usage_graph(&updated, UsageEcosystem::Rust);
-        let verdicts = updated.snapshot_caches.usage_graphs().verdicts().recent();
-        assert!(
-            verdicts.iter().any(|verdict| matches!(
-                verdict,
-                ArtifactVerdict::Invalidated(
-                    crate::analyzer::invalidation::InvalidationReason::NoRetainedArtifact { .. }
-                )
-            )),
-            "the rebuild after a content change must be recorded: {verdicts:?}"
-        );
-    }
-
-    #[test]
-    fn relational_workspace_batch_merges_language_projections() {
-        let (_temp, analyzer) = two_language_analyzer();
-        let root = analyzer.project().root().to_path_buf();
-        let java_file = ProjectFile::new(root.clone(), "src/App.java");
-        let rust_file = ProjectFile::new(root, "src/lib.rs");
-        let java = analyzer
-            .declarations(&java_file)
-            .into_iter()
-            .find(CodeUnit::is_class)
-            .expect("Java class declaration");
-        let rust = analyzer
-            .declarations(&rust_file)
-            .into_iter()
-            .find(CodeUnit::is_class)
-            .expect("Rust struct declaration");
-        let requests = [
-            RelationalDefinitionRequest {
-                ordinal: 9,
-                language_scope: DefinitionLanguageScope::Workspace,
-                name: RelationalName::stable(java.fq().clone()),
-                query: RelationalDefinitionQuery::ExactName,
-            },
-            RelationalDefinitionRequest {
-                ordinal: 4,
-                language_scope: DefinitionLanguageScope::Workspace,
-                name: RelationalName::stable(rust.fq().clone()),
-                query: RelationalDefinitionQuery::ExactName,
-            },
-        ];
-
-        let RelationalBatchOutcome::Complete(results) =
-            analyzer.relational_definition_batch(&requests, &crate::CancellationToken::new())
-        else {
-            panic!("mixed relational batch should complete");
-        };
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].ordinal, 9);
-        assert_eq!(results[1].ordinal, 4);
-        assert_eq!(
-            results[0].value,
-            RelationalDefinitionValue::Definitions(vec![java])
-        );
-        assert_eq!(
-            results[1].value,
-            RelationalDefinitionValue::Definitions(vec![rust])
-        );
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;

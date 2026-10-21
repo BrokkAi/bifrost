@@ -1977,6 +1977,10 @@ fn terminal_identifier(node: Node<'_>, source: &str) -> Option<String> {
 pub(super) struct JavaSourceDeclarationIndex {
     pub(super) package_name: String,
     pub(super) type_names: Vec<String>,
+    #[cfg(test)]
+    pub(super) top_level_names: Vec<String>,
+    #[cfg(test)]
+    pub(super) recovered: bool,
 }
 
 pub(super) fn source_declaration_index(source: &str) -> Option<JavaSourceDeclarationIndex> {
@@ -1984,6 +1988,8 @@ pub(super) fn source_declaration_index(source: &str) -> Option<JavaSourceDeclara
     let root = tree.root_node();
     let package_name = determine_package_name(root, source);
     let mut result = Vec::new();
+    #[cfg(test)]
+    let mut top_level_names = Vec::new();
     let mut stack = Vec::new();
     for index in (0..root.named_child_count()).rev() {
         if let Some(node) = root.named_child(index)
@@ -1997,6 +2003,10 @@ pub(super) fn source_declaration_index(source: &str) -> Option<JavaSourceDeclara
             continue;
         };
         let simple = node_text(name_node, source).trim();
+        #[cfg(test)]
+        if parent.is_none() {
+            top_level_names.push(simple.to_owned());
+        }
         let nested = parent
             .as_deref()
             .map(|parent| format!("{parent}.{simple}"))
@@ -2019,6 +2029,10 @@ pub(super) fn source_declaration_index(source: &str) -> Option<JavaSourceDeclara
     Some(JavaSourceDeclarationIndex {
         package_name,
         type_names: result,
+        #[cfg(test)]
+        top_level_names,
+        #[cfg(test)]
+        recovered: root.has_error(),
     })
 }
 

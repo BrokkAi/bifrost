@@ -1,73 +1,59 @@
+// Preserve explicit engine visibility when an overlay shadows a public glob.
+#![allow(hidden_glob_reexports)]
+
 //! Workspace-backed implementations of the language-neutral semantic oracles.
 
-mod common;
-mod conversions;
-mod dispatch;
-mod heap;
-mod runtime_values;
-mod rust;
+pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::*;
+pub(crate) mod conversions;
+#[doc(hidden)]
+pub mod dispatch;
+#[doc(hidden)]
+pub mod heap;
+#[doc(hidden)]
+pub mod runtime_values;
+
 pub(crate) use runtime_values::{RuntimeSyntaxCache, runtime_syntax_cache};
-mod source;
+#[doc(hidden)]
+pub mod source;
 pub use runtime_values::{
     RuntimeAccessKey, RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadKeyKind,
     RuntimeKeyedReadResult, RuntimeReadLimitation, RuntimeReadSourceOrigin,
 };
-mod value_flow;
-pub(crate) use common::{Interruption, WorkStager};
-pub(crate) use value_flow::project_procedure_relations;
-pub(crate) use value_flow::{LocalStoreBases, RelationProjectionHost, StrongUpdateStop};
-
+#[doc(hidden)]
+pub mod value_flow;
+use crate::analyzer::languages::{SavedDefaultArgumentSafety, language_support};
+use crate::analyzer::semantic::{DispatchHints, OracleLimits};
+use crate::analyzer::semantic::{FormalParameterPassingMode, ProcedureHandle};
+use crate::analyzer::semantic_model::{
+    ActiveSemanticModelSnapshot, ResolvedActiveSemanticModels, SemanticModelOverlay,
+};
+use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
 #[doc(hidden)]
 pub use dispatch::PreparedWorkspaceDispatchPool;
 pub use dispatch::procedures_for_definition_with_limits;
-#[cfg(test)]
-pub(super) use dispatch::retain_dispatch_candidate;
 pub(super) use dispatch::semantic_locator_work;
 pub use dispatch::{
     PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus, procedures_for_source_ranges,
     procedures_in_artifact,
 };
 pub(crate) use dispatch::{
-    attach_dispatch_provenance, dispatch_result_work, scoped_call_dispatch_gap,
-    scoped_procedure_dispatch_gap,
-};
-pub(crate) use dispatch::{
     exact_call_range, exact_source_for_procedure, external_constant_field_read_discharges_gap,
-    inert_drop_glue_discharges_gap, python_workspace_module_member_mutation_free,
-    residual_conversion_discharges_gap,
+    inert_drop_glue_discharges_gap, residual_conversion_discharges_gap,
 };
-// Policy lowering consumes this intentionally Rust-specific semantic API.
-pub use rust::{RustStdBuiltinCall, RustStdBuiltinTransfer, rust_std_builtin_call};
 #[doc(hidden)]
 pub use source::PreparedSourceDispatchSession;
-// Read-set verification replays dispatch on the head workspace and must fold
-// the answer with the same helper the recording used, never a second copy.
 #[doc(hidden)]
 pub use source::one_call_dispatch_answer_digest;
 pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
 pub(crate) use source::{dispatch_answer_digest, procedure_dispatch_question};
-// The value-flow plan re-applies these relevance rules when it decides
-// whether a snapshot's residual openness was refined by its own complete
-// call resolutions (#1952).
+use std::fmt;
+use std::sync::Arc;
 pub use value_flow::{
     GapOpenness, ProcedureOpenness, abort_paths_run_user_code, abort_paths_run_user_code_bounded,
     allocation_call_is_dischargeable, call_target_refinement_call, classify_gap_openness,
     constructor_call_gap_is_discharged, gap_impacts_value_flow, implicit_abort_gap_is_discharged,
     value_flow_capabilities_are_open,
 };
-
-use std::fmt;
-use std::sync::Arc;
-
-use crate::analyzer::languages::{SavedDefaultArgumentSafety, language_support};
-use crate::analyzer::semantic::{FormalParameterPassingMode, ProcedureHandle};
-use crate::analyzer::semantic_model::{
-    ActiveSemanticModelSnapshot, ResolvedActiveSemanticModels, SemanticModelOverlay,
-};
-use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
-
-use super::{DispatchHints, OracleLimits};
-
 /// Workspace semantic oracles bound to one immutable analyzer generation.
 #[derive(Clone)]
 pub struct WorkspaceSemanticOracle<'a> {
@@ -76,9 +62,9 @@ pub struct WorkspaceSemanticOracle<'a> {
     runtime_syntax: runtime_values::RuntimeSyntaxCache,
     runtime_write_footprints: runtime_values::WorkspaceRuntimeWriteFootprintCache,
     // Completed incoming bindings live only as long as this query provider.
-    incoming_actuals: Arc<
-        std::sync::Mutex<crate::hash::HashMap<heap::IncomingActualKey, heap::IncomingActualSet>>,
-    >,
+    #[doc(hidden)]
+    pub incoming_actuals: Arc<IncomingActualCache>,
+    dispatch_materialization_ns: Arc<std::sync::atomic::AtomicU64>,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
@@ -88,6 +74,20 @@ pub struct WorkspaceSemanticOracle<'a> {
 }
 
 impl<'a> WorkspaceSemanticOracle<'a> {
+    fn dispatch_materialization_timer(&self) -> DispatchMaterializationTimer {
+        DispatchMaterializationTimer {
+            nanos: Arc::clone(&self.dispatch_materialization_ns),
+            started: crate::profiling::enabled().then(std::time::Instant::now),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn dispatch_materialization_seconds(&self) -> f64 {
+        self.dispatch_materialization_ns
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1e9
+    }
+
     /// Admit reverse caller sites under their languages' selected build
     /// configurations. Unknown activity retains today's exploration behavior.
     /// The answers and language set live only for this caller query.
@@ -118,7 +118,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         Ok(compiled)
     }
 
-    pub(crate) fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
+    #[doc(hidden)]
+    pub fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
         Self::with_limits(workspace, OracleLimits::default())
     }
 
@@ -175,10 +176,12 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         dispatch_hints: DispatchHints,
     ) -> Self {
+        let incoming_actuals = Arc::new(IncomingActualCache::default());
         Self {
             workspace,
             runtime_reads: runtime_values::runtime_read_cache(),
-            incoming_actuals: Arc::default(),
+            dispatch_materialization_ns: Arc::clone(&incoming_actuals.dispatch_materialization_ns),
+            incoming_actuals,
             runtime_syntax: workspace
                 .analyzer()
                 .snapshot_caches()
@@ -191,8 +194,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             active_semantic_model_snapshot,
             dispatch_hints: Arc::new(dispatch_hints),
             python_saved_default_safety: language_support(Language::Python)
-                .expect("Python support is registered")
-                .saved_default_argument_safety(workspace.analyzer()),
+                .and_then(|support| support.saved_default_argument_safety(workspace.analyzer())),
         }
     }
 
@@ -229,9 +231,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         }
     }
 
-    pub(crate) fn active_semantic_model_snapshot(
-        &self,
-    ) -> Option<Arc<ActiveSemanticModelSnapshot>> {
+    #[doc(hidden)]
+    pub fn active_semantic_model_snapshot(&self) -> Option<Arc<ActiveSemanticModelSnapshot>> {
         self.active_semantic_model_snapshot.as_ref().map(Arc::clone)
     }
 
@@ -263,3 +264,6 @@ impl fmt::Debug for WorkspaceSemanticOracle<'_> {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use value_flow::project_procedure_relations;

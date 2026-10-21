@@ -13,22 +13,23 @@
 //! coverage gaps alongside affirmative graph rows. It is not an arena or a
 //! cache.
 
-pub(crate) mod package;
+#[doc(hidden)]
+pub mod package;
 
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     FileResolutionFacts, PositionedIdentifierFact, ResolutionAdditionalDefinitionNamespaceFact,
-    ResolutionBinderFact, ResolutionBinderKind, ResolutionCallFact,
-    ResolutionCallableReceiverOrigin, ResolutionEngineRuleKind, ResolutionGapKind,
-    ResolutionIdentifierRole, ResolutionImportRouteFact, ResolutionImportRouteKind,
-    ResolutionImportRouteSegmentFact, ResolutionMemberKind, ResolutionNameId, ResolutionNamespace,
-    ResolutionRootExportFact, ResolutionRootImportAnchor, ResolutionRootImportDemandFact,
-    ResolutionRootImportDemandTarget, ResolutionRootImportFact, ResolutionRootImportKind,
-    ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
-    ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
-    ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
-    ResolutionSiteKind, ResolutionTypeSlotId,
+    ResolutionBinaryOwnerRoute, ResolutionBinderFact, ResolutionBinderKind, ResolutionCallFact,
+    ResolutionCallableReceiverOrigin, ResolutionEngineRuleKind, ResolutionGapFact,
+    ResolutionGapKind, ResolutionIdentifierRole, ResolutionImportRouteFact,
+    ResolutionImportRouteKind, ResolutionImportRouteSegmentFact, ResolutionMemberKind,
+    ResolutionNameId, ResolutionNamespace, ResolutionRootExportFact, ResolutionRootImportAnchor,
+    ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget, ResolutionRootImportFact,
+    ResolutionRootImportKind, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
+    ResolutionRootReferenceSegmentFact, ResolutionRouteGap, ResolutionRouteOwner,
+    ResolutionScopeFact, ResolutionScopeId, ResolutionScopeInheritance, ResolutionScopeKind,
+    ResolutionSiteFact, ResolutionSiteId, ResolutionSiteKind, ResolutionTypeSlotId,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     BoundaryStatus, HoistingClass, ResolutionCompletionReasonKind, ResolutionGapOriginKind,
@@ -582,7 +583,8 @@ impl LoweredResolutionFragment {
         )
     }
 
-    pub(crate) fn selected_include_continuation(
+    #[doc(hidden)]
+    pub fn selected_include_continuation(
         fragment: BindingFragmentId,
         boundary: BindingNodeId,
         path: PartialPathId,
@@ -620,7 +622,8 @@ impl LoweredResolutionFragment {
         )
     }
 
-    pub(crate) fn selected_macro_head_bridge(
+    #[doc(hidden)]
+    pub fn selected_macro_head_bridge(
         fragment: BindingFragmentId,
         reference: SemanticId,
         node: BindingNodeId,
@@ -1127,11 +1130,7 @@ fn lower_scope_timelines_and_paths(
         // only authority on which of its scopes are roots
         // (`ResolutionScopeInheritance`), and the lowering reads the flag
         // without asking which language wrote it.
-        if let Some(parent) = timeline
-            .fact
-            .parent
-            .filter(|_| timeline.fact.inheritance == ResolutionScopeInheritance::Lexical)
-        {
+        if let Some(parent) = index.lookup_scope_parent(timeline.fact.id) {
             let parent_timeline = timelines
                 .get(&parent)
                 .expect("validated scope parent has a timeline");
@@ -1181,7 +1180,8 @@ fn lower_scope_timelines_and_paths(
 /// may reuse one fragment ordinal while lowering different facts. Nothing
 /// here exists outside tests or the test-support feature.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod fixture_names {
+#[doc(hidden)]
+pub mod fixture_names {
     use super::super::local_identity::ResolutionIdentityCatalog;
     use super::*;
     use crate::hash::HashMap;
@@ -1193,7 +1193,8 @@ pub(crate) mod fixture_names {
         static SELECTED_CONTENT: RefCell<HashMap<u32, [u8; 32]>> = RefCell::new(HashMap::default());
     }
 
-    pub(crate) fn record_selected(catalog: &ResolutionIdentityCatalog, content: [u8; 32]) {
+    #[doc(hidden)]
+    pub fn record_selected(catalog: &ResolutionIdentityCatalog, content: [u8; 32]) {
         record(catalog);
         SELECTED_CONTENT.with(|contents| {
             contents
@@ -1208,7 +1209,8 @@ pub(crate) mod fixture_names {
             .or_else(|| super::super::model::fixture_label_digest(u64::from(ordinal)))
     }
 
-    pub(crate) fn record(catalog: &ResolutionIdentityCatalog) {
+    #[doc(hidden)]
+    pub fn record(catalog: &ResolutionIdentityCatalog) {
         SELECTED_CONTENT.with(|contents| {
             contents.borrow_mut().remove(&catalog.fragment().ordinal());
         });
@@ -1343,7 +1345,8 @@ pub(crate) mod fixture_names {
     /// catalog. Every artifact the fixture built came through
     /// [`super::lower_for_test`], so every catalog it needs is in the table
     /// above, indexed by the mount the identity names itself.
-    pub(crate) struct FixtureRootImportAnchors;
+    #[doc(hidden)]
+    pub struct FixtureRootImportAnchors;
 
     impl super::super::selected_context::SelectedRootImportAnchors for FixtureRootImportAnchors {
         fn anchor_of(
@@ -1377,30 +1380,25 @@ pub(crate) mod fixture_names {
         mounted_site_semantic(fragment, site)
     }
 
-    pub(crate) fn reference_semantic(
-        fragment: BindingFragmentId,
-        site: ResolutionSiteId,
-    ) -> SemanticId {
+    #[doc(hidden)]
+    pub fn reference_semantic(fragment: BindingFragmentId, site: ResolutionSiteId) -> SemanticId {
         mounted_site_semantic(fragment, site)
     }
 
-    pub(crate) fn definition_node(
-        fragment: BindingFragmentId,
-        site: ResolutionSiteId,
-    ) -> BindingNodeId {
+    #[doc(hidden)]
+    pub fn definition_node(fragment: BindingFragmentId, site: ResolutionSiteId) -> BindingNodeId {
         mounted_site_node(fragment, site)
     }
 
-    pub(crate) fn reference_node(
-        fragment: BindingFragmentId,
-        site: ResolutionSiteId,
-    ) -> BindingNodeId {
+    #[doc(hidden)]
+    pub fn reference_node(fragment: BindingFragmentId, site: ResolutionSiteId) -> BindingNodeId {
         mounted_site_node(fragment, site)
     }
 
     macro_rules! fixture_name {
-        ($name:ident, $identity:path, $of:ident, $result:ty $(, $argument:ident : $type:ty)*) => {
-            pub(crate) fn $name(
+        ($visibility:vis $name:ident, $identity:path, $of:ident, $result:ty $(, $argument:ident : $type:ty)*) => {
+            #[doc(hidden)]
+            $visibility fn $name(
                 fragment: BindingFragmentId
                 $(, $argument: $type)*
             ) -> $result {
@@ -1409,57 +1407,57 @@ pub(crate) mod fixture_names {
         };
     }
 
-    fixture_name!(scope_head_node, scope_head_node_identity, node_of, BindingNodeId,
+    fixture_name!(pub scope_head_node, scope_head_node_identity, node_of, BindingNodeId,
         scope: ResolutionScopeId);
-    fixture_name!(checkpoint_node, super::checkpoint_node_identity, node_of, BindingNodeId,
+    fixture_name!(pub(crate) checkpoint_node, super::checkpoint_node_identity, node_of, BindingNodeId,
         scope: ResolutionScopeId, position: usize);
-    fixture_name!(gap_sink_node, super::gap_sink_node_identity, node_of, BindingNodeId,
+    fixture_name!(pub(crate) gap_sink_node, super::gap_sink_node_identity, node_of, BindingNodeId,
         site: ResolutionSiteId, role: &[u8]);
-    fixture_name!(structured_import_gap_sink_node, super::structured_import_gap_sink_node_identity,
+    fixture_name!(pub(crate) structured_import_gap_sink_node, super::structured_import_gap_sink_node_identity,
         node_of, BindingNodeId, site: ResolutionSiteId, namespace: ResolutionNamespace);
 
-    fixture_name!(type_slot_semantic, super::type_slot_semantic_identity, semantic_of, SemanticId,
+    fixture_name!(pub(crate) type_slot_semantic, super::type_slot_semantic_identity, semantic_of, SemanticId,
         slot: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotId);
-    fixture_name!(site_type_frontier_semantic, super::site_type_frontier_semantic_identity,
+    fixture_name!(pub site_type_frontier_semantic, super::site_type_frontier_semantic_identity,
         semantic_of, SemanticId, site: ResolutionSiteId);
-    fixture_name!(gap_reason_semantic, super::gap_reason_semantic_identity, semantic_of, SemanticId,
+    fixture_name!(pub(crate) gap_reason_semantic, super::gap_reason_semantic_identity, semantic_of, SemanticId,
         site: ResolutionSiteId, origin: LoweringGapOrigin);
-    fixture_name!(root_export_token, root_export_token_identity, semantic_of, SemanticId,
+    fixture_name!(pub root_export_token, root_export_token_identity, semantic_of, SemanticId,
         scope: ResolutionScopeId, namespace: ResolutionNamespace);
-    fixture_name!(root_import_token, root_import_token_identity, semantic_of, SemanticId,
+    fixture_name!(pub root_import_token, root_import_token_identity, semantic_of, SemanticId,
         site: ResolutionSiteId, namespace: ResolutionNamespace);
-    fixture_name!(root_reference_token, root_reference_token_identity, semantic_of, SemanticId,
+    fixture_name!(pub root_reference_token, root_reference_token_identity, semantic_of, SemanticId,
         site: ResolutionSiteId, namespace: ResolutionNamespace);
-    fixture_name!(root_import_anchor_semantic, root_import_anchor_semantic_identity, semantic_of,
+    fixture_name!(pub root_import_anchor_semantic, root_import_anchor_semantic_identity, semantic_of,
         SemanticId,
         anchor: brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportAnchor);
-    fixture_name!(scope_choice, super::scope_choice_identity, semantic_of, SemanticId,
+    fixture_name!(pub scope_choice, super::scope_choice_identity, semantic_of, SemanticId,
         scope: ResolutionScopeId, namespace: ResolutionNamespace);
-    fixture_name!(hierarchy_choice, super::hierarchy_choice_identity, semantic_of, SemanticId,
+    fixture_name!(pub(crate) hierarchy_choice, super::hierarchy_choice_identity, semantic_of, SemanticId,
         scope: ResolutionScopeId, namespace: ResolutionNamespace);
-    fixture_name!(checkpoint_choice, super::checkpoint_choice_identity, semantic_of, SemanticId,
+    fixture_name!(pub(crate) checkpoint_choice, super::checkpoint_choice_identity, semantic_of, SemanticId,
         scope: ResolutionScopeId, position: usize, namespace: ResolutionNamespace);
 
-    fixture_name!(binder_path_id, super::binder_path_identity, path_of, PartialPathId,
+    fixture_name!(pub(crate) binder_path_id, super::binder_path_identity, path_of, PartialPathId,
         site: ResolutionSiteId);
-    fixture_name!(hierarchy_gap_path_id, super::hierarchy_gap_path_identity, path_of,
+    fixture_name!(pub(crate) hierarchy_gap_path_id, super::hierarchy_gap_path_identity, path_of,
         PartialPathId, site: ResolutionSiteId, owner: ResolutionSiteId);
-    fixture_name!(additional_binder_path_id, super::additional_binder_path_identity, path_of,
+    fixture_name!(pub additional_binder_path_id, super::additional_binder_path_identity, path_of,
         PartialPathId, site: ResolutionSiteId, namespace: ResolutionNamespace);
-    fixture_name!(placement_gap_path_id, super::placement_gap_path_identity, path_of,
+    fixture_name!(pub(crate) placement_gap_path_id, super::placement_gap_path_identity, path_of,
         PartialPathId, site: ResolutionSiteId, scope: ResolutionScopeId);
-    fixture_name!(root_export_path_id, super::root_export_path_identity, path_of, PartialPathId,
+    fixture_name!(pub(crate) root_export_path_id, super::root_export_path_identity, path_of, PartialPathId,
         scope: ResolutionScopeId, declaration: ResolutionSiteId, namespace: ResolutionNamespace);
-    fixture_name!(root_import_path_id, super::root_import_path_identity, path_of, PartialPathId,
+    fixture_name!(pub(crate) root_import_path_id, super::root_import_path_identity, path_of, PartialPathId,
         site: ResolutionSiteId, namespace: ResolutionNamespace,
         name: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameId);
-    fixture_name!(root_reference_path_id, super::root_reference_path_identity, path_of,
+    fixture_name!(pub(crate) root_reference_path_id, super::root_reference_path_identity, path_of,
         PartialPathId, site: ResolutionSiteId, namespace: ResolutionNamespace);
-    fixture_name!(parent_path_id, super::parent_path_identity, path_of, PartialPathId,
+    fixture_name!(pub(crate) parent_path_id, super::parent_path_identity, path_of, PartialPathId,
         scope: ResolutionScopeId);
-    fixture_name!(missing_binder_path_id, super::missing_binder_path_identity, path_of,
+    fixture_name!(pub(crate) missing_binder_path_id, super::missing_binder_path_identity, path_of,
         PartialPathId, site: ResolutionSiteId);
-    fixture_name!(reference_path_id, super::reference_path_identity, path_of, PartialPathId,
+    fixture_name!(pub(crate) reference_path_id, super::reference_path_identity, path_of, PartialPathId,
         site: ResolutionSiteId, namespace: ResolutionNamespace);
 }
 
@@ -1472,7 +1470,8 @@ pub(crate) mod fixture_names {
 /// file, which is what `lower_file_resolution_facts` made easy and what gave
 /// two catalogs that agree only on the sites.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn lower_lexical_for_test(
+#[doc(hidden)]
+pub fn lower_lexical_for_test(
     fragment: BindingFragmentId,
     language: Language,
     facts: &FileResolutionFacts,
@@ -1519,7 +1518,8 @@ pub(crate) fn lower_lexical_for_test(
 /// other identity. One lowering, one catalog, and the catalog is how a fixture
 /// names a position.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn lower_for_test(
+#[doc(hidden)]
+pub fn lower_for_test(
     fragment: BindingFragmentId,
     language: Language,
     facts: &FileResolutionFacts,
@@ -1642,6 +1642,13 @@ pub(super) fn lower_file_resolution_facts_with_identities(
     let mut activation_positions: HashMap<ResolutionScopeId, Vec<usize>> = HashMap::default();
     let mut activation_ends: HashMap<ResolutionScopeId, HashSet<usize>> = HashMap::default();
     let mut declarations_with_binders = HashSet::default();
+    let alias_sites = facts
+        .binders
+        .iter()
+        .filter_map(|binder| {
+            matches!(binder.kind, ResolutionBinderKind::Alias { .. }).then_some(binder.declaration)
+        })
+        .collect::<HashSet<_>>();
     for binder in &facts.binders {
         let scope = index.scope(binder.scope);
         let declaration = index.site(binder.declaration);
@@ -1655,7 +1662,30 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                 && binder.activation_end <= scope.end_byte,
             "binder activation must be contained by its scope: {binder:?}, {scope:?}"
         );
-        let identifier = index.declaration_identifier(binder.declaration);
+        let identifier = if let ResolutionBinderKind::Alias { target } = binder.kind {
+            assert!(
+                !alias_sites.contains(&target),
+                "an alias target must not be an alias binder: {binder:?}"
+            );
+            // This lookup asserts both fragment membership and declaration role.
+            let target_identifier = index.declaration_identifier(target);
+            let alias = index.identifier(binder.declaration);
+            assert_eq!(declaration.kind, ResolutionSiteKind::AliasBinding);
+            assert_eq!(alias.role, ResolutionIdentifierRole::Alias);
+            assert_eq!(
+                index.name(alias.name),
+                index.name(target_identifier.name),
+                "alias and target must spell the same name"
+            );
+            assert_eq!(
+                alias.namespace, target_identifier.namespace,
+                "alias and target must occupy the same namespace"
+            );
+            assert!(alias.qualifier.is_none(), "an alias is unqualified");
+            alias
+        } else {
+            index.declaration_identifier(binder.declaration)
+        };
         assert!(
             binder_namespace_is_declared(facts, *binder, identifier.namespace),
             "binder kind and declaration namespace disagree: {binder:?}, {identifier:?}"
@@ -1719,13 +1749,8 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             continue;
         };
         let scope = index.scope(import.root_scope);
-        assert!(
-            matches!(
-                language,
-                Language::Java | Language::Kotlin | Language::Scala
-            ),
-            "only languages whose imports bind from their position publish one: {import:?}"
-        );
+        // Position is producer-owned activation syntax, independent of language.
+
         assert!(
             scope.start_byte <= position && position <= scope.end_byte,
             "a positioned import takes effect inside its root scope: {import:?}, {scope:?}"
@@ -1755,8 +1780,16 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             "a route-owned module is a Type module declaration with no binder: {identifier:?}"
         );
     }
+    let slot_authored_declarations = facts
+        .binding_events
+        .iter()
+        .filter_map(|event| event.authored_declaration)
+        .collect::<HashSet<_>>();
     for identifier in &facts.identifiers {
         if identifier.role == ResolutionIdentifierRole::Declaration
+            // A canonical slot owns the lexical route; its authored callable
+            // or type declaration is a source/value origin, not another binder.
+            && !slot_authored_declarations.contains(&identifier.site)
             && !declarations_with_binders.contains(&identifier.site)
             // An explicit member owner supplies a non-lexical binding route.
             // Missing lexical authority is a gap only for declarations that
@@ -1863,6 +1896,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
     for identifier in index.identifiers_sorted() {
         let site = index.site(identifier.site);
         let (role, semantic, node, kind) = match identifier.role {
+            ResolutionIdentifierRole::Alias => continue,
             ResolutionIdentifierRole::Reference => {
                 let semantic = identities.source_reference_semantic(identifier.site);
                 let node = identities.source_reference_node(identifier.site);
@@ -1930,7 +1964,19 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         nodes.push((node, kind));
     }
 
-    let reasons_by_site = gap_reasons_by_site(identities, &gap_sources);
+    // Alias uncertainty cannot weaken the authored source declaration or its
+    // ordinary type. It belongs to the separate JVM alias surface.
+    let source_gap_sources = gap_sources
+        .iter()
+        .copied()
+        .filter(|source| {
+            source.origin != LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute)
+                || !index.route_gaps_by_site.get(&source.site).into_iter().flatten().any(|route| {
+                    matches!(*route, ResolutionRouteGap::UnknownAlias { owner, .. } if !matches!(owner, ResolutionRouteOwner::DeclarationAccess(_)))
+                })
+        })
+        .collect::<Vec<_>>();
+    let reasons_by_site = gap_reasons_by_site(identities, &source_gap_sources);
     let mut forward_gap_endpoints = HashMap::default();
     let owner_references = facts
         .lexical_owner_references
@@ -2165,6 +2211,8 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         .iter()
         .map(|binder| binder.fact.declaration)
         .collect::<HashSet<_>>();
+    let mut routed_binder_sites = HashSet::default();
+    let mut alias_gap_endpoints = Vec::new();
     for binder in supported_binders {
         let timeline = timelines
             .get(&binder.fact.scope)
@@ -2179,8 +2227,12 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                 checkpoint.node
             }
         };
+        let target = match binder.fact.kind {
+            ResolutionBinderKind::Alias { target } => target,
+            _ => binder.fact.declaration,
+        };
         let (_definition, definition_node) = semantic_by_site
-            .get(&(binder.fact.declaration, LoweredSemanticRole::Definition))
+            .get(&(target, LoweredSemanticRole::Definition))
             .copied()
             .expect("binder declaration has a definition semantic");
         let mut gap_endpoints = vec![checkpoint];
@@ -2195,19 +2247,38 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             }).map(|snapshot| snapshot.node));
         }
         assert!(
-            forward_gap_endpoints
-                .insert(binder.fact.declaration, gap_endpoints)
-                .is_none(),
-            "one supported binder route per declaration is required"
+            routed_binder_sites.insert(binder.fact.declaration),
+            "one supported binder route per declaration or alias site is required"
         );
+        if target == binder.fact.declaration {
+            assert!(
+                forward_gap_endpoints
+                    .insert(target, gap_endpoints)
+                    .is_none()
+            );
+        } else {
+            alias_gap_endpoints.push((target, gap_endpoints));
+        }
+        let binding_completion = completion_for_site(
+            &reasons_by_site,
+            binder.fact.declaration,
+            lexical_declaration_gap,
+        );
+        let binding_completion = if target != binder.fact.declaration {
+            binding_completion.combine(&completion_for_site(
+                &reasons_by_site,
+                target,
+                lexical_declaration_gap,
+            ))
+        } else {
+            binding_completion
+        };
         let primary_namespace = effective_declaration_namespace(binder.identifier.namespace);
-        let value_alias = index
-            .value_aliased_callables
-            .contains(&binder.fact.declaration);
+        let value_alias = index.value_aliased_callables.contains(&target);
         let namespaces = std::iter::once(primary_namespace)
             .chain(
                 index
-                    .additional_definition_namespaces(binder.fact.declaration)
+                    .additional_definition_namespaces(target)
                     .iter()
                     .map(|fact| fact.namespace)
                     .filter(|namespace| *namespace != primary_namespace),
@@ -2257,11 +2328,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                         binder_precedence(identities, language, timeline, &binder, choice_namespace)
                     },
                     [WitnessStep::Node(definition_node)],
-                    completion_for_site(
-                        &reasons_by_site,
-                        binder.fact.declaration,
-                        lexical_declaration_gap,
-                    ),
+                    binding_completion.clone(),
                 ),
             ));
             let activation_start = match binder.activation {
@@ -2294,11 +2361,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                         closed_endpoint(definition_node, []),
                         precedence,
                         [WitnessStep::Node(definition_node)],
-                        completion_for_site(
-                            &reasons_by_site,
-                            binder.fact.declaration,
-                            lexical_declaration_gap,
-                        ),
+                        binding_completion.clone(),
                     ),
                 ));
             }
@@ -2348,7 +2411,21 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         ));
     }
 
-    lower_root_import_paths(identities, language, &index, &timelines, &mut paths);
+    for (target, endpoints) in alias_gap_endpoints {
+        forward_gap_endpoints
+            .entry(target)
+            .or_default()
+            .extend(endpoints);
+    }
+    lower_root_import_paths(
+        identities,
+        language,
+        &index,
+        &reasons_by_site,
+        &timelines,
+        &mut nodes,
+        &mut paths,
+    );
     lower_root_reference_paths(
         identities,
         language,
@@ -2513,6 +2590,32 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         );
     }
 
+    let mut alias_surfaces = facts
+        .gaps
+        .iter()
+        .flat_map(|gap| match gap.route() {
+            Some(ResolutionRouteGap::UnknownAlias {
+                owner,
+                binary_owner,
+                kind,
+                ..
+            }) if !matches!(owner, ResolutionRouteOwner::DeclarationAccess(_)) => {
+                alias_gap_namespaces(kind)
+                    .iter()
+                    .map(|&namespace| {
+                        alias_route_surface_node_identity(&binary_owner, &index, namespace)
+                    })
+                    .collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    alias_surfaces.sort_unstable_by_key(|identity| identity.digest());
+    alias_surfaces.dedup();
+    for surface in alias_surfaces {
+        nodes.push((identities.node(surface), BindingNodeKind::Scope));
+    }
+
     let mut gaps = lower_coverage_gaps(
         identities,
         language,
@@ -2566,7 +2669,9 @@ fn lower_root_import_paths(
     identities: &mut ResolutionIdentityCatalogBuilder,
     language: Language,
     index: &FactIndex<'_>,
+    reasons_by_site: &HashMap<ResolutionSiteId, Vec<(LoweringGapOrigin, SemanticId)>>,
     timelines: &HashMap<ResolutionScopeId, ScopeTimeline>,
+    nodes: &mut Vec<(BindingNodeId, BindingNodeKind)>,
     paths: &mut Vec<(PartialPathId, PartialPath)>,
 ) {
     for import in &index.root_imports {
@@ -2597,6 +2702,22 @@ fn lower_root_import_paths(
         let structured_bound_name = index
             .structured_import(import.fact.site)
             .and_then(|route| route.bound_name);
+        let open_destination = index.structured_import(import.fact.site).is_some()
+            && index
+                .route_gaps_by_site
+                .get(&import.fact.site)
+                .into_iter()
+                .flatten()
+                .any(|route| {
+                    matches!(
+                        route,
+                        ResolutionRouteGap::UnknownBinder {
+                            may_publish: false,
+                            ..
+                        }
+                    )
+                });
+        let mut gap_namespaces = HashSet::default();
         for demand in &import.demands {
             // The route traverses the imported source name, but its local
             // endpoint is selected by the name bound in the importing scope.
@@ -2645,6 +2766,50 @@ fn lower_root_import_paths(
             let activation = import.fact.position.map(|position| {
                 u32::try_from(position).expect("a root import position fits a source offset")
             });
+            // A structured wildcard has a known route, not an unknown
+            // binder at the scope head. Its destination can only compete at
+            // this import's rank. Keep each demanded name and namespace on
+            // the same branch so a nearer declaration can discharge it.
+            if open_destination && !import.named {
+                let sink = identities.node(structured_import_gap_sink_node_identity(
+                    import.fact.site,
+                    demand.namespace,
+                ));
+                if gap_namespaces.insert(demand.namespace) {
+                    nodes.push((sink, BindingNodeKind::Scope));
+                }
+                let gap_id = identities.path(ResolutionPathIdentity::new(local_digest(
+                    b"bifrost-resolution-root-import-destination-gap-path:v1",
+                    &[(
+                        "route",
+                        &root_import_path_identity(import.fact.site, demand.namespace, route_name)
+                            .digest(),
+                    )],
+                )));
+                let reason = identities.semantic(gap_reason_semantic_identity(
+                    import.fact.site,
+                    LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
+                ));
+                paths.push((
+                    gap_id,
+                    PartialPath::new(
+                        symbol_open_endpoint(start, [lookup], tail),
+                        symbol_open_endpoint(sink, [lookup], tail),
+                        root_import_precedence(
+                            identities,
+                            language,
+                            import,
+                            choice,
+                            demand.namespace,
+                        ),
+                        [WitnessStep::Node(sink)],
+                        ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                        ]),
+                    )
+                    .with_root_import_activation(activation),
+                ));
+            }
             paths.push((
                 id,
                 PartialPath::new(
@@ -2656,7 +2821,10 @@ fn lower_root_import_paths(
                     ),
                     root_import_precedence(identities, language, import, choice, demand.namespace),
                     witness.clone(),
-                    ResolutionCompletion::Complete,
+                    completion_for_site(reasons_by_site, import.fact.site, |origin| {
+                        origin
+                            == LoweringGapOrigin::Extracted(ResolutionGapKind::UnprovenActivation)
+                    }),
                 )
                 .with_root_import_activation(activation),
             ));
@@ -2685,7 +2853,12 @@ fn lower_root_import_paths(
                                 demand.namespace,
                             ),
                             witness.clone(),
-                            ResolutionCompletion::Complete,
+                            completion_for_site(reasons_by_site, import.fact.site, |origin| {
+                                origin
+                                    == LoweringGapOrigin::Extracted(
+                                        ResolutionGapKind::UnprovenActivation,
+                                    )
+                            }),
                         ),
                     ));
                 }
@@ -3004,6 +3177,80 @@ fn root_scope_gap_reasons(
     scope_reasons
 }
 
+/// A missing binder has the same namespace aliases as an affirmative one.
+/// Unknown namespaces include macros and constructors; known Scala callables
+/// also bind in Value through the existing language hook.
+fn binder_gap_namespaces(
+    language: Language,
+    namespace: Option<ResolutionNamespace>,
+) -> impl Iterator<Item = ResolutionNamespace> {
+    namespace
+        .into_iter()
+        .flat_map(|namespace| {
+            lookup_routes(namespace)
+                .iter()
+                .map(|&(_, namespace)| namespace)
+        })
+        .chain(
+            namespace
+                .is_none()
+                .then_some(EFFECTIVE_NAMESPACES)
+                .into_iter()
+                .flatten(),
+        )
+        .chain(
+            (namespace == Some(ResolutionNamespace::Callable)
+                && language_callables_occupy_value_namespace(language))
+            .then_some(ResolutionNamespace::Value),
+        )
+}
+
+/// Exact export and package bridges bypass lexical scope checkpoints. Carry
+/// only publishing binder uncertainty for the exported name and namespace.
+fn route_publication_completion(
+    identities: &mut ResolutionIdentityCatalogBuilder,
+    language: Language,
+    index: &FactIndex<'_>,
+    scope: ResolutionScopeId,
+    name: ResolutionNameId,
+    namespace: ResolutionNamespace,
+) -> ResolutionCompletion {
+    let reasons = index
+        .publishing_route_gaps_by_scope
+        .get(&scope)
+        .into_iter()
+        .flatten()
+        .filter_map(|gap| {
+            let ResolutionRouteGap::UnknownBinder {
+                scope: binding_scope,
+                name: binding_name,
+                namespace: binding_namespace,
+                may_publish: true,
+            } = gap.route().expect("publishing index contains route gaps")
+            else {
+                unreachable!("publishing index contains only publishing binder gaps");
+            };
+            debug_assert_eq!(binding_scope, scope);
+            (binding_name.is_none_or(|bound| bound == name)
+                && binder_gap_namespaces(language, binding_namespace)
+                    .any(|effective| effective == namespace))
+            .then(|| {
+                ResolutionIncompleteReason::UnsupportedSemantic(identities.semantic(
+                    gap_reason_semantic_identity(
+                        gap.site,
+                        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
+                    ),
+                ))
+            })
+        })
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        ResolutionCompletion::Complete
+    } else {
+        ResolutionCompletion::incomplete(reasons)
+    }
+}
+
 fn lower_root_export_paths(
     identities: &mut ResolutionIdentityCatalogBuilder,
     language: Language,
@@ -3035,6 +3282,14 @@ fn lower_root_export_paths(
             .map_or(ResolutionCompletion::Complete, |reasons| {
                 ResolutionCompletion::incomplete(reasons.iter().copied())
             });
+        let completion = completion.combine(&route_publication_completion(
+            identities,
+            language,
+            index,
+            index.site(export.declaration).scope,
+            identifier.name,
+            export.namespace,
+        ));
         paths.push((
             id,
             PartialPath::new(
@@ -3055,11 +3310,14 @@ fn lower_root_export_paths(
     }
 }
 
-struct FactIndex<'facts> {
+#[doc(hidden)]
+pub struct FactIndex<'facts> {
+    scope_continuations: HashMap<ResolutionScopeId, Option<ResolutionScopeId>>,
     names: HashMap<ResolutionNameId, &'facts str>,
     scopes: HashMap<ResolutionScopeId, ResolutionScopeFact>,
     sites: HashMap<ResolutionSiteId, ResolutionSiteFact>,
-    identifiers_by_site: HashMap<ResolutionSiteId, Vec<&'facts PositionedIdentifierFact>>,
+    #[doc(hidden)]
+    pub identifiers_by_site: HashMap<ResolutionSiteId, Vec<&'facts PositionedIdentifierFact>>,
     additional_definition_namespaces_by_declaration:
         HashMap<ResolutionSiteId, Vec<ResolutionAdditionalDefinitionNamespaceFact>>,
     /// Callable declarations that a Value lookup also reaches
@@ -3080,6 +3338,10 @@ struct FactIndex<'facts> {
     root_imports: Vec<IndexedRootImport>,
     root_references: Vec<IndexedRootReference>,
     root_exports: Vec<ResolutionRootExportFact>,
+    // Both indexes belong to this immutable file's lowering and are dropped
+    // with it. Repeated point/export reads must not rescan all ordinary gaps.
+    route_gaps_by_site: HashMap<ResolutionSiteId, Vec<ResolutionRouteGap>>,
+    publishing_route_gaps_by_scope: HashMap<ResolutionScopeId, Vec<&'facts ResolutionGapFact>>,
 }
 
 #[derive(Clone, Copy)]
@@ -3553,7 +3815,35 @@ impl<'facts> FactIndex<'facts> {
         root_references
     }
 
-    fn new(language: Language, facts: &'facts FileResolutionFacts) -> Self {
+    #[doc(hidden)]
+    pub fn new(language: Language, facts: &'facts FileResolutionFacts) -> Self {
+        let mut route_gaps_by_site: HashMap<_, Vec<_>> = HashMap::default();
+        let mut publishing_route_gaps_by_scope: HashMap<_, Vec<_>> = HashMap::default();
+        for gap in &facts.gaps {
+            assert_eq!(
+                gap.kind == ResolutionGapKind::UnsupportedRoute,
+                gap.route().is_some(),
+                "only route gaps carry required classified coordinates"
+            );
+            if let Some(route) = gap.route() {
+                route_gaps_by_site
+                    .entry(gap.site)
+                    .or_default()
+                    .push(route.clone());
+                if let ResolutionRouteGap::UnknownBinder {
+                    scope,
+                    may_publish: true,
+                    ..
+                } = route
+                {
+                    publishing_route_gaps_by_scope
+                        .entry(scope)
+                        .or_default()
+                        .push(gap);
+                }
+            }
+        }
+
         let mut names = HashMap::default();
         for name in &facts.names {
             assert!(
@@ -4083,7 +4373,19 @@ impl<'facts> FactIndex<'facts> {
         root_exports.sort_unstable_by_key(|export| {
             (export.root_scope, export.declaration, export.namespace)
         });
+        let mut scope_continuations = HashMap::default();
+        for continuation in &facts.scope_continuations {
+            assert!(
+                scope_continuations
+                    .insert(continuation.scope, continuation.parent)
+                    .is_none(),
+                "duplicate scope continuation: {continuation:?}"
+            );
+        }
         Self {
+            scope_continuations,
+            route_gaps_by_site,
+            publishing_route_gaps_by_scope,
             names,
             scopes,
             sites,
@@ -4107,9 +4409,21 @@ impl<'facts> FactIndex<'facts> {
 
     fn validate_scope_forest(&self) {
         super::common_fact_lowering::validate_scope_forest(&self.scopes);
+        super::common_fact_lowering::validate_scope_continuations(
+            &self.scopes,
+            &self.scope_continuations,
+        );
     }
 
-    fn name(&self, id: ResolutionNameId) -> &str {
+    fn lookup_scope_parent(&self, scope: ResolutionScopeId) -> Option<ResolutionScopeId> {
+        super::common_fact_lowering::lookup_scope_parent(
+            self.scope(scope),
+            &self.scope_continuations,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn name(&self, id: ResolutionNameId) -> &str {
         required_resolution_name(&self.names, id)
     }
 
@@ -4339,9 +4653,8 @@ const fn root_prefix_rule(language: Language) -> Option<RootPrefixRule> {
     }
 }
 
-pub(super) fn lookup_routes(
-    namespace: ResolutionNamespace,
-) -> &'static [(u32, ResolutionNamespace)] {
+#[doc(hidden)]
+pub fn lookup_routes(namespace: ResolutionNamespace) -> &'static [(u32, ResolutionNamespace)] {
     match namespace {
         ResolutionNamespace::TypeOrValue => &[
             (0, ResolutionNamespace::Value),
@@ -4361,7 +4674,8 @@ pub(super) fn lookup_routes(
 /// whose types can be called also searches the Type namespace: the lookup that
 /// lands on a type is interpreted by `type_in_call_position` when the call is
 /// resolved.
-pub(super) fn lexical_lookup_routes(
+#[doc(hidden)]
+pub fn lexical_lookup_routes(
     language: Language,
     namespace: ResolutionNamespace,
 ) -> &'static [(u32, ResolutionNamespace)] {
@@ -4383,7 +4697,7 @@ pub(super) fn call_target_lookup_routes(
     is_call_target: bool,
 ) -> Option<&'static [(u32, ResolutionNamespace)]> {
     is_call_target.then_some(())?;
-    crate::analyzer::languages::language_support(language)?.call_target_lookup_routes()
+    crate::analyzer::languages::language_knowledge(language)?.call_target_lookup_routes()
 }
 
 /// Namespace authority for a ranked family, shared by all of its routes.
@@ -4479,7 +4793,8 @@ pub(super) fn go_spelling_precedence(
     vec![identities.register_go_spelling_choice(precedence_step(semantic, ordinal), authority)]
 }
 
-fn go_spelling_choice_identity(
+#[doc(hidden)]
+pub fn go_spelling_choice_identity(
     scope: ResolutionScopeId,
     activation_start: Option<usize>,
 ) -> ResolutionSemanticIdentity {
@@ -4633,7 +4948,9 @@ fn binder_precedence(
         )];
     }
     let mut precedence = if timeline.fact.kind == ResolutionScopeKind::TypeBody
-        && binder.fact.kind == ResolutionBinderKind::Callable
+        && (binder.fact.kind == ResolutionBinderKind::Callable
+            || (matches!(binder.fact.kind, ResolutionBinderKind::Alias { .. })
+                && binder.identifier.namespace == ResolutionNamespace::Callable))
     {
         // Direct methods tie the unresolved hierarchy stage (overloads may be
         // inherited), but both beat an enclosing lexical method. Fields,
@@ -4710,28 +5027,13 @@ fn lexical_declaration_gap(origin: LoweringGapOrigin) -> bool {
         && lexical_gap(origin)
 }
 
-fn blocks_fragment(origin: LoweringGapOrigin) -> bool {
-    match origin {
-        LoweringGapOrigin::QualifiedReference
-        | LoweringGapOrigin::UnsupportedActivation(_)
-        | LoweringGapOrigin::MissingBinder
-        | LoweringGapOrigin::ExternalPreludeBoundary => false,
-        LoweringGapOrigin::Extracted(kind) => matches!(
-            kind,
-            ResolutionGapKind::UnsupportedRoute
-                | ResolutionGapKind::UnsupportedScopeOrBinder
-                | ResolutionGapKind::MalformedSyntax
-        ),
-    }
-}
-
 /// Result slots whose declared types do not depend on invocation validity.
 /// This set belongs to one immutable file's lowering and is never retained.
 pub(super) fn applicability_independent_result_slots(
     language: Language,
     facts: &FileResolutionFacts,
 ) -> HashSet<ResolutionTypeSlotId> {
-    if !crate::analyzer::languages::language_support(language)
+    if !crate::analyzer::languages::language_knowledge(language)
         .is_some_and(|support| support.callable_result_is_applicability_independent())
     {
         return HashSet::default();
@@ -5021,6 +5323,262 @@ fn lower_external_prelude_boundary_gaps(
     output
 }
 
+/// Binary owners are supplied by producers. These fixed-width endpoint keys
+/// never encode or infer a language's binary naming conventions.
+pub(crate) fn alias_surface_node_identity<'a>(
+    owner: impl IntoIterator<Item = &'a str>,
+    namespace: ResolutionNamespace,
+) -> ResolutionNodeIdentity {
+    let mut hash = CanonicalHasher::new(b"bifrost-jvm-alias-owner-surface:v1");
+    hash.field("namespace", namespace.identity_label().as_bytes());
+    for segment in owner {
+        hash.field("segment", segment.as_bytes());
+    }
+    ResolutionNodeIdentity::new(hash.finish())
+}
+
+pub(crate) fn alias_prefix_surface_node_identity<'a>(
+    prefix: impl IntoIterator<Item = &'a str>,
+    namespace: ResolutionNamespace,
+) -> ResolutionNodeIdentity {
+    let mut hash = CanonicalHasher::new(b"bifrost-jvm-alias-owner-prefix-surface:v1");
+    hash.field("namespace", namespace.identity_label().as_bytes());
+    for segment in prefix {
+        hash.field("segment", segment.as_bytes());
+    }
+    ResolutionNodeIdentity::new(hash.finish())
+}
+
+pub(crate) fn alias_lookup_surface_node_identities(
+    owner: &[impl AsRef<str>],
+    namespace: ResolutionNamespace,
+) -> Vec<ResolutionNodeIdentity> {
+    let mut identities = Vec::with_capacity(owner.len() + 2);
+    identities.push(alias_surface_node_identity(
+        owner.iter().map(AsRef::as_ref),
+        namespace,
+    ));
+    identities.extend((0..=owner.len()).map(|length| {
+        alias_prefix_surface_node_identity(owner[..length].iter().map(AsRef::as_ref), namespace)
+    }));
+    identities
+}
+
+fn alias_gap_namespaces(
+    kind: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionJvmAliasKind>,
+) -> &'static [ResolutionNamespace] {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionJvmAliasKind;
+    match kind {
+        Some(
+            ResolutionJvmAliasKind::Field
+            | ResolutionJvmAliasKind::CompanionObject
+            | ResolutionJvmAliasKind::SingletonInstance,
+        ) => &[ResolutionNamespace::Value],
+        Some(ResolutionJvmAliasKind::Constructor) => &[ResolutionNamespace::Constructor],
+        Some(_) => &[ResolutionNamespace::Callable],
+        None => &[
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Value,
+            ResolutionNamespace::Callable,
+            ResolutionNamespace::Constructor,
+        ],
+    }
+}
+
+fn alias_route_surface_node_identity(
+    route: &ResolutionBinaryOwnerRoute,
+    index: &FactIndex<'_>,
+    namespace: ResolutionNamespace,
+) -> ResolutionNodeIdentity {
+    // Every class-d fact must carry a binary route, including access-only
+    // provenance. Validate it here before constructing any coverage frontier.
+    match route {
+        ResolutionBinaryOwnerRoute::Exact(segments) => {
+            assert!(
+                !segments.is_empty(),
+                "an exact JVM binary owner needs a name"
+            );
+            alias_surface_node_identity(segments.iter().map(|&name| index.name(name)), namespace)
+        }
+        ResolutionBinaryOwnerRoute::UnknownWithin { scope, prefix } => {
+            index.scope(*scope);
+            alias_prefix_surface_node_identity(
+                prefix.iter().map(|&name| index.name(name)),
+                namespace,
+            )
+        }
+    }
+}
+
+fn classified_route_frontiers(
+    identities: &mut ResolutionIdentityCatalogBuilder,
+    language: Language,
+    route: ResolutionRouteGap,
+    index: &FactIndex<'_>,
+    semantics: &HashMap<(ResolutionSiteId, LoweredSemanticRole), (SemanticId, BindingNodeId)>,
+    forward_gap_endpoints: &HashMap<ResolutionSiteId, Vec<BindingNodeId>>,
+) -> Vec<LoweringCoverageFrontier> {
+    let mut frontiers = Vec::new();
+    let namespaces = EFFECTIVE_NAMESPACES;
+    match route {
+        ResolutionRouteGap::OmittedReference {
+            scope,
+            terminal,
+            namespace,
+        } => {
+            if let Some(terminal) = terminal {
+                for &namespace in namespace
+                    .as_ref()
+                    .map(std::slice::from_ref)
+                    .unwrap_or(&namespaces)
+                {
+                    for &(_, namespace) in lookup_routes(namespace) {
+                        let lookup =
+                            identities.lookup_semantic(language, namespace, index.name(terminal));
+                        for endpoint in [
+                            identities.source_scope_node(scope),
+                            BindingNodeId::universal_root(),
+                        ] {
+                            frontiers.push(LoweringCoverageFrontier::Candidate {
+                                direction: LoweredCandidateDirection::Reverse,
+                                endpoint,
+                                lookup: Some(lookup),
+                            });
+                        }
+                    }
+                }
+            } else {
+                frontiers.push(LoweringCoverageFrontier::CandidateInventory {
+                    direction: LoweredCandidateDirection::Reverse,
+                });
+            }
+        }
+        ResolutionRouteGap::UnknownBinder {
+            scope,
+            name,
+            namespace,
+            may_publish,
+        } => {
+            let mut endpoints = vec![identities.source_scope_node(scope)];
+            if may_publish
+                && let Some(owner) = index.scope(scope).owner
+                && let Some(&(_, definition)) =
+                    semantics.get(&(owner, LoweredSemanticRole::Definition))
+            {
+                endpoints.push(definition);
+            }
+            for endpoint in endpoints {
+                if let Some(name) = name {
+                    for namespace in binder_gap_namespaces(language, namespace) {
+                        frontiers.push(LoweringCoverageFrontier::Candidate {
+                            direction: LoweredCandidateDirection::Forward,
+                            endpoint,
+                            lookup: Some(identities.lookup_semantic(
+                                language,
+                                namespace,
+                                index.name(name),
+                            )),
+                        });
+                    }
+                } else {
+                    frontiers.push(LoweringCoverageFrontier::Candidate {
+                        direction: LoweredCandidateDirection::Forward,
+                        endpoint,
+                        lookup: None,
+                    });
+                }
+            }
+            // Exact export bridges may bypass lexical scope checkpoints.
+            if may_publish {
+                for (&(site, role), &(_, endpoint)) in semantics {
+                    if role == LoweredSemanticRole::Definition && index.site(site).scope == scope {
+                        frontiers.push(LoweringCoverageFrontier::Candidate {
+                            direction: LoweredCandidateDirection::Reverse,
+                            endpoint,
+                            lookup: None,
+                        });
+                    }
+                }
+            }
+        }
+        ResolutionRouteGap::UnknownPlacement => {
+            assert_eq!(
+                route,
+                ResolutionRouteGap::UnknownPlacement,
+                "only unknown package placement may create Fragment coverage"
+            );
+            // #5658: milestone 2b slice 7's JVM containers and placements
+            // replace this with Unplaced admission. Delete Fragment and its
+            // readers once that admission preserves the local evidence.
+            frontiers.push(LoweringCoverageFrontier::Fragment);
+            frontiers.push(LoweringCoverageFrontier::CandidateInventory {
+                direction: LoweredCandidateDirection::Reverse,
+            });
+        }
+        ResolutionRouteGap::UnknownAlias {
+            owner,
+            binary_owner,
+            name,
+            kind,
+        } => {
+            // Required even on access-only facts; validate before constructing
+            // either a source-access or a binary-alias frontier.
+            alias_route_surface_node_identity(&binary_owner, index, ResolutionNamespace::Callable);
+            if let ResolutionRouteOwner::DeclarationAccess(owner) = owner {
+                // The source binder is exact; only using this declaration's
+                // access contract remains open. Keep its own binder-path
+                // evidence and owner surface, never its whole lexical scope.
+                let endpoint = identities.source_definition_node(owner);
+                let identifier = index.declaration_identifier(owner);
+                frontiers.push(LoweringCoverageFrontier::Candidate {
+                    direction: LoweredCandidateDirection::Forward,
+                    endpoint,
+                    lookup: None,
+                });
+                // Reuse the actual binder/member checkpoints, including
+                // deferred member routes, rather than widening the scope.
+                for &endpoint in forward_gap_endpoints.get(&owner).into_iter().flatten() {
+                    for namespace in binder_gap_namespaces(language, Some(identifier.namespace)) {
+                        frontiers.push(LoweringCoverageFrontier::Candidate {
+                            direction: LoweredCandidateDirection::Forward,
+                            endpoint,
+                            lookup: Some(identities.lookup_semantic(
+                                language,
+                                namespace,
+                                index.name(identifier.name),
+                            )),
+                        });
+                    }
+                }
+                frontiers.push(LoweringCoverageFrontier::Candidate {
+                    direction: LoweredCandidateDirection::Reverse,
+                    endpoint,
+                    lookup: None,
+                });
+                return frontiers;
+            }
+            // A wildcard member name still has the known alias namespace.
+            // Distinct endpoints prevent a missing getter/method from opening
+            // a proven type identity on the same binary owner.
+            for &namespace in alias_gap_namespaces(kind) {
+                let endpoint = identities.node(alias_route_surface_node_identity(
+                    &binary_owner,
+                    index,
+                    namespace,
+                ));
+                frontiers.push(LoweringCoverageFrontier::Candidate {
+                    direction: LoweredCandidateDirection::Forward,
+                    endpoint,
+                    lookup: name.map(|name| {
+                        identities.lookup_semantic(Language::Java, namespace, index.name(name))
+                    }),
+                });
+            }
+        }
+    }
+    frontiers
+}
+
 fn lower_coverage_gaps(
     identities: &mut ResolutionIdentityCatalogBuilder,
     language: Language,
@@ -5060,17 +5618,81 @@ fn lower_coverage_gaps(
             });
             continue;
         }
-        if source.origin == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute)
-            && index.structured_import(source.site).is_some()
-        {
+        if source.origin == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute) {
+            let routes = index
+                .route_gaps_by_site
+                .get(&source.site)
+                .expect("point route gap has classified producer facts");
             let mut frontiers = Vec::new();
-            if sources.point.contains(&source) {
-                frontiers.push(LoweringCoverageFrontier::CandidateInventory {
-                    direction: LoweredCandidateDirection::Reverse,
-                });
-            }
-            if sources.enumeration.contains(&source) {
-                frontiers.push(LoweringCoverageFrontier::Enumeration);
+            for route in routes {
+                // Exact import routes carry destination obligations on
+                // ranked paths. Only genuinely unknown binders open a scope.
+                if matches!(
+                    route,
+                    ResolutionRouteGap::UnknownBinder {
+                        may_publish: false,
+                        ..
+                    }
+                ) && let Some(import) = index.structured_import(source.site)
+                {
+                    let namespaces = if import.bound_name.is_some() {
+                        single_import_namespaces(import.kind)
+                            .iter()
+                            .copied()
+                            .collect::<HashSet<_>>()
+                    } else {
+                        index
+                            .root_imports
+                            .iter()
+                            .filter(|root| root.fact.site == source.site)
+                            .flat_map(|root| root.demands.iter().map(|demand| demand.namespace))
+                            .collect::<HashSet<_>>()
+                    };
+                    for namespace in namespaces {
+                        frontiers.push(LoweringCoverageFrontier::Candidate {
+                            direction: LoweredCandidateDirection::Forward,
+                            endpoint: identities.node(structured_import_gap_sink_node_identity(
+                                source.site,
+                                namespace,
+                            )),
+                            lookup: None,
+                        });
+                    }
+                } else {
+                    frontiers.extend(classified_route_frontiers(
+                        identities,
+                        language,
+                        route.clone(),
+                        index,
+                        semantics,
+                        forward_gap_endpoints,
+                    ));
+                }
+                if sources.enumeration.contains(&source)
+                    || matches!(
+                        route,
+                        ResolutionRouteGap::OmittedReference { .. }
+                            | ResolutionRouteGap::UnknownPlacement
+                    )
+                {
+                    frontiers.push(LoweringCoverageFrontier::Enumeration);
+                }
+                if sources.enumeration.contains(&source)
+                    && matches!(route, ResolutionRouteGap::UnknownBinder { .. })
+                {
+                    frontiers.push(LoweringCoverageFrontier::CandidateInventory {
+                        direction: LoweredCandidateDirection::Reverse,
+                    });
+                }
+                if let Some(slots) = index.type_slots_by_site.get(&source.site)
+                    && !matches!(route, ResolutionRouteGap::UnknownAlias { .. })
+                {
+                    for &slot in slots {
+                        frontiers.push(LoweringCoverageFrontier::Type {
+                            frontier: identities.semantic(type_slot_semantic_identity(slot)),
+                        });
+                    }
+                }
             }
             frontiers.sort_unstable();
             frontiers.dedup();
@@ -5100,7 +5722,7 @@ fn lower_coverage_gaps(
             && (!sources.deferred_members.contains(&source.site)
                 || forward_gap_endpoints.contains_key(&source.site));
         if source.origin == LoweringGapOrigin::Extracted(ResolutionGapKind::GeneratedItemSurface)
-            && crate::analyzer::languages::language_support(language)
+            && crate::analyzer::languages::language_knowledge(language)
                 .is_some_and(|support| support.generated_items_cannot_shadow_bindings())
         {
             // Expansion may add a new name in this lexical scope. Carry the
@@ -5169,8 +5791,6 @@ fn lower_coverage_gaps(
                     lookup: None,
                 });
             }
-        } else if blocks_fragment(source.origin) && !is_positioned_reference {
-            frontiers.push(LoweringCoverageFrontier::Fragment);
         }
         if sources.enumeration.contains(&source) {
             frontiers.push(LoweringCoverageFrontier::Enumeration);
@@ -5547,10 +6167,8 @@ pub(crate) fn mounted_site_semantic(
 
 /// The runtime node one mount gives the site numbered `site`. See
 /// [`mounted_site_semantic`].
-pub(crate) fn mounted_site_node(
-    fragment: BindingFragmentId,
-    site: ResolutionSiteId,
-) -> BindingNodeId {
+#[doc(hidden)]
+pub fn mounted_site_node(fragment: BindingFragmentId, site: ResolutionSiteId) -> BindingNodeId {
     BindingNodeId::local(fragment.ordinal(), site_catalog_position(site))
 }
 
@@ -5606,7 +6224,8 @@ pub(super) fn site_type_frontier_semantic_identity(
     ))
 }
 
-pub(crate) fn lookup_semantic(
+#[doc(hidden)]
+pub fn lookup_semantic(
     names: &dyn super::local_identity::SharedNameInterner,
     language: Language,
     namespace: ResolutionNamespace,
@@ -5630,7 +6249,8 @@ pub(crate) fn root_import_anchor_semantic(
     identities.semantic(root_import_anchor_semantic_identity(anchor))
 }
 
-pub(crate) fn root_import_anchor_semantic_identity(
+#[doc(hidden)]
+pub fn root_import_anchor_semantic_identity(
     anchor: ResolutionRootImportAnchor,
 ) -> ResolutionSemanticIdentity {
     let label = match anchor {
@@ -5653,7 +6273,8 @@ pub(crate) fn root_import_anchor_for_identity(
     .find(|anchor| root_import_anchor_semantic_identity(*anchor) == *identity)
 }
 
-pub(crate) fn root_import_token_identity(
+#[doc(hidden)]
+pub fn root_import_token_identity(
     site: ResolutionSiteId,
     namespace: ResolutionNamespace,
 ) -> ResolutionSemanticIdentity {
@@ -5701,7 +6322,8 @@ pub(crate) fn root_export_token(
     identities.semantic(root_export_token_identity(root_scope, namespace))
 }
 
-pub(crate) fn root_export_token_identity(
+#[doc(hidden)]
+pub fn root_export_token_identity(
     root_scope: ResolutionScopeId,
     namespace: ResolutionNamespace,
 ) -> ResolutionSemanticIdentity {
@@ -6053,7 +6675,8 @@ pub(crate) fn root_reference_path_id(
     identities.path(root_reference_path_identity(site, namespace))
 }
 
-pub(crate) fn root_reference_path_identity(
+#[doc(hidden)]
+pub fn root_reference_path_identity(
     site: ResolutionSiteId,
     namespace: ResolutionNamespace,
 ) -> ResolutionPathIdentity {
@@ -6604,6 +7227,8 @@ const fn candidate_direction_label(direction: LoweredCandidateDirection) -> &'st
 
 #[cfg(test)]
 mod tests {
+    use crate::analyzer::resolution::fact_lowering::go_global_support_0::*;
+
     use super::fixture_names::{
         additional_binder_path_id, binder_path_id, checkpoint_choice, gap_reason_semantic,
         hierarchy_choice, hierarchy_gap_path_id, missing_binder_path_id, parent_path_id,
@@ -6619,8 +7244,9 @@ mod tests {
         ResolutionCallableReceiverOriginFact, ResolutionGapFact, ResolutionIdentifierRole,
         ResolutionMemberAccess, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
         ResolutionNameFact, ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact,
-        ResolutionScopeKind, ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
-        ResolutionTypeSlotFact, ResolutionTypeSlotRole,
+        ResolutionRootImportKindFact, ResolutionScopeKind, ResolutionSiteKind,
+        ResolutionSupertypeFact, ResolutionSupertypeKind, ResolutionTypeSlotFact,
+        ResolutionTypeSlotRole,
     };
 
     use crate::CancellationToken;
@@ -6634,107 +7260,6 @@ mod tests {
     use super::super::lower_resolution_facts_with_identity_catalog;
     use super::super::positioned_identifier_for_test as identifier;
     use super::*;
-
-    fn fragment() -> BindingFragmentId {
-        BindingFragmentId::for_test(b"fact-lowering-test-fragment")
-    }
-
-    fn root_route_facts() -> FileResolutionFacts {
-        let root_scope = ResolutionScopeId::new(1);
-        let import_site = ResolutionSiteId::new(0);
-        let declaration = ResolutionSiteId::new(1);
-        let reference = ResolutionSiteId::new(2);
-        FileResolutionFacts {
-            names: ["example.com", "repo", "dep", "Item"]
-                .into_iter()
-                .enumerate()
-                .map(|(index, spelling)| ResolutionNameFact {
-                    id: ResolutionNameId::try_from_index(index)
-                        .expect("root-route fixture name count fits u32"),
-                    spelling: spelling.to_owned(),
-                })
-                .collect(),
-            scopes: vec![
-                scope(0, None, 0, 100),
-                ResolutionScopeFact {
-                    id: root_scope,
-                    parent: Some(ResolutionScopeId::new(0)),
-                    owner: None,
-                    kind: ResolutionScopeKind::Package,
-                    inheritance: ResolutionScopeInheritance::Lexical,
-                    start_byte: 0,
-                    end_byte: 100,
-                },
-            ],
-            sites: vec![
-                site(0, 1, ResolutionSiteKind::ImportDeclaration, 1),
-                site(1, 1, ResolutionSiteKind::TypeDeclaration, 10),
-                site(2, 1, ResolutionSiteKind::TypeReference, 20),
-            ],
-            identifiers: vec![
-                PositionedIdentifierFact {
-                    site: declaration,
-                    name: ResolutionNameId::new(3),
-                    role: ResolutionIdentifierRole::Declaration,
-                    namespace: ResolutionNamespace::Type,
-                    qualifier: None,
-                },
-                PositionedIdentifierFact {
-                    site: reference,
-                    name: ResolutionNameId::new(3),
-                    role: ResolutionIdentifierRole::Reference,
-                    namespace: ResolutionNamespace::Type,
-                    qualifier: None,
-                },
-            ],
-            binders: vec![ResolutionBinderFact {
-                declaration,
-                scope: root_scope,
-                kind: ResolutionBinderKind::Type,
-                hoisting: HoistingClass::ScopeWide,
-                activation_start: 0,
-                activation_end: 100,
-            }],
-            root_imports: vec![ResolutionRootImportFact {
-                site: import_site,
-                root_scope,
-                anchor: ResolutionRootImportAnchor::Lexical,
-                position: None,
-            }],
-            root_import_segments: (0..3)
-                .map(|position| ResolutionRootImportSegmentFact {
-                    import_site,
-                    position,
-                    name: ResolutionNameId::new(position),
-                })
-                .collect(),
-            root_import_demands: vec![ResolutionRootImportDemandFact {
-                import_site,
-                namespace: ResolutionNamespace::Type,
-                name: ResolutionNameId::new(3),
-            }],
-            root_references: vec![ResolutionRootReferenceFact {
-                reference,
-                root_scope,
-                anchor: ResolutionRootImportAnchor::Absolute,
-                prefix_reference: None,
-                owner_continued: false,
-            }],
-            root_reference_segments: (0..3)
-                .map(|position| ResolutionRootReferenceSegmentFact {
-                    reference,
-                    position,
-                    name: ResolutionNameId::new(position),
-                })
-                .collect(),
-            root_exports: vec![ResolutionRootExportFact {
-                root_scope,
-                declaration,
-                namespace: ResolutionNamespace::Type,
-            }],
-            ..FileResolutionFacts::default()
-        }
-    }
 
     #[test]
     fn kotlin_named_and_star_imports_have_their_language_precedence_tiers() {
@@ -6769,506 +7294,11 @@ mod tests {
     }
 
     #[test]
-    fn root_routes_are_source_owned_anchored_and_remount_provisional_to_final() {
-        let facts = root_route_facts();
-        let provisional = BindingFragmentId::for_test(b"root-route-provisional");
-        let final_fragment = BindingFragmentId::for_test(b"root-route-final");
-        let provisional_artifact =
-            crate::analyzer::resolution::lower_for_test(provisional, Language::Go, &facts);
-        let final_artifact =
-            crate::analyzer::resolution::lower_for_test(final_fragment, Language::Go, &facts);
-        let provisional_again =
-            crate::analyzer::resolution::lower_for_test(provisional, Language::Go, &facts);
-        let final_again =
-            crate::analyzer::resolution::lower_for_test(final_fragment, Language::Go, &facts);
-        let assert_same_artifact =
-            |left: &super::super::LoweredResolutionFactsWithIdentityCatalog,
-             right: &super::super::LoweredResolutionFactsWithIdentityCatalog| {
-                assert_eq!(left.lexical(), right.lexical());
-                assert_eq!(left.typed(), right.typed());
-                assert_eq!(left.identities(), right.identities());
-            };
-        assert_same_artifact(&provisional_artifact, &provisional_again);
-        assert_same_artifact(&final_artifact, &final_again);
-
-        let import_site = ResolutionSiteId::new(0);
-        let root_scope = ResolutionScopeId::new(1);
-        let reference = ResolutionSiteId::new(2);
-        let namespace = ResolutionNamespace::Type;
-        let expected_shared_route = ["example.com", "repo", "dep"].map(|spelling| {
-            lookup_semantic(
-                crate::analyzer::resolution::test_shared_names(),
-                Language::Go,
-                namespace,
-                spelling,
-            )
-        });
-        let expected_lookup = lookup_semantic(
-            crate::analyzer::resolution::test_shared_names(),
-            Language::Go,
-            namespace,
-            "Item",
-        );
-
-        let inspect = |artifact: &super::super::LoweredResolutionFactsWithIdentityCatalog,
-                       mounted_fragment| {
-            let import_token = root_import_token(mounted_fragment, import_site, namespace);
-            let export_token = root_export_token(mounted_fragment, root_scope, namespace);
-            let (import_id, import_path) = artifact
-                .lexical()
-                .paths()
-                .iter()
-                .find_map(|(id, path)| {
-                    path.end()
-                        .symbols()
-                        .fixed()
-                        .iter()
-                        .any(|symbol| symbol.symbol() == import_token)
-                        .then_some((*id, path))
-                })
-                .expect("source-owned root import path");
-            let (export_id, export_path) = artifact
-                .lexical()
-                .paths()
-                .iter()
-                .find_map(|(id, path)| {
-                    path.start()
-                        .symbols()
-                        .fixed()
-                        .iter()
-                        .any(|symbol| symbol.symbol() == export_token)
-                        .then_some((*id, path))
-                })
-                .expect("source-owned root export path");
-
-            assert_eq!(
-                import_path.start().node(),
-                scope_head_node(mounted_fragment, root_scope)
-            );
-            assert_eq!(
-                import_path
-                    .start()
-                    .symbols()
-                    .fixed()
-                    .iter()
-                    .map(|symbol| symbol.symbol())
-                    .collect::<Vec<_>>(),
-                [expected_lookup]
-            );
-            assert_eq!(import_path.end().node(), BindingNodeId::universal_root());
-            let mut expected_import_root = vec![root_import_anchor_semantic(
-                mounted_fragment,
-                ResolutionRootImportAnchor::Lexical,
-            )];
-            expected_import_root.extend(expected_shared_route);
-            expected_import_root.extend([import_token, expected_lookup]);
-            assert_eq!(
-                import_path
-                    .end()
-                    .symbols()
-                    .fixed()
-                    .iter()
-                    .map(|symbol| symbol.symbol())
-                    .collect::<Vec<_>>(),
-                expected_import_root
-            );
-            assert_eq!(
-                import_path.start().symbols().tail(),
-                import_path.end().symbols().tail()
-            );
-            assert_eq!(import_path.precedence().len(), 1);
-            assert_eq!(
-                import_path.precedence()[0],
-                PrecedenceStep {
-                    tier: PrecedenceTier::LexicalBinding,
-                    ordinal: 0,
-                    semantic: artifact
-                        .identities()
-                        .semantic_for_identity(go_spelling_choice_identity(root_scope, None))
-                        .expect("Go dot import uses its lexical spelling choice"),
-                }
-            );
-            assert_eq!(
-                import_path.witness(),
-                [WitnessStep::Node(BindingNodeId::universal_root())]
-            );
-            assert_eq!(import_path.completion(), &ResolutionCompletion::Complete);
-
-            assert_eq!(export_path.start().node(), BindingNodeId::universal_root());
-            assert_eq!(
-                export_path
-                    .start()
-                    .symbols()
-                    .fixed()
-                    .iter()
-                    .map(|symbol| symbol.symbol())
-                    .collect::<Vec<_>>(),
-                [expected_lookup, export_token]
-            );
-            assert!(export_path.end().symbols().fixed().is_empty());
-            assert_eq!(
-                export_path.start().symbols().tail(),
-                export_path.end().symbols().tail()
-            );
-            assert_eq!(export_path.precedence().len(), 1);
-            assert_eq!(
-                export_path.precedence()[0].tier,
-                PrecedenceTier::PackageOrModule
-            );
-            assert_eq!(export_path.precedence()[0].semantic, export_token);
-            assert_eq!(
-                export_path.witness(),
-                [WitnessStep::Node(export_path.end().node())]
-            );
-            assert_eq!(export_path.completion(), &ResolutionCompletion::Complete);
-
-            let reference_token = root_reference_token(mounted_fragment, reference, namespace);
-            let mut reference_paths = artifact.lexical().paths().iter().filter_map(|(_, path)| {
-                (path.start().node() == reference_node(mounted_fragment, reference)).then_some(path)
-            });
-            let reference_path = reference_paths
-                .next()
-                .expect("source-owned direct root reference path");
-            assert!(
-                reference_paths.next().is_none(),
-                "a direct root reference must not retain a lexical decoy route"
-            );
-            assert_eq!(
-                reference_path.start().node(),
-                reference_node(mounted_fragment, reference)
-            );
-            assert!(reference_path.start().symbols().fixed().is_empty());
-            assert!(reference_path.start().symbols().tail().is_none());
-            let mut expected_reference_root = vec![root_import_anchor_semantic(
-                mounted_fragment,
-                ResolutionRootImportAnchor::Absolute,
-            )];
-            expected_reference_root.extend(expected_shared_route);
-            expected_reference_root.extend([reference_token, expected_lookup]);
-            assert_eq!(
-                reference_path
-                    .end()
-                    .symbols()
-                    .fixed()
-                    .iter()
-                    .map(|symbol| symbol.symbol())
-                    .collect::<Vec<_>>(),
-                expected_reference_root
-            );
-            assert!(reference_path.end().symbols().tail().is_none());
-            assert_eq!(
-                reference_path.precedence(),
-                [PrecedenceStep {
-                    tier: PrecedenceTier::PackageOrModule,
-                    ordinal: 0,
-                    semantic: scope_choice(mounted_fragment, root_scope, namespace),
-                }]
-            );
-            assert_eq!(
-                reference_path.witness(),
-                [
-                    WitnessStep::Node(scope_head_node(mounted_fragment, root_scope)),
-                    WitnessStep::Node(BindingNodeId::universal_root()),
-                ]
-            );
-            assert_eq!(reference_path.completion(), &ResolutionCompletion::Complete);
-            assert_eq!(
-                artifact
-                    .lexical()
-                    .semantics()
-                    .iter()
-                    .find(|semantic| semantic.site() == reference)
-                    .and_then(|semantic| semantic.site_metadata())
-                    .map(|metadata| metadata.unqualified()),
-                Some(false)
-            );
-
-            let catalog = artifact.identities();
-            assert_eq!(
-                catalog
-                    .semantic_identity(import_token)
-                    .expect("root-import token identity")
-                    .space(),
-                ResolutionSemanticIdentitySpace::FragmentLocal
-            );
-            assert_eq!(
-                catalog
-                    .semantic_identity(export_token)
-                    .expect("root-export token identity")
-                    .space(),
-                ResolutionSemanticIdentitySpace::FragmentLocal
-            );
-            assert_eq!(
-                catalog
-                    .semantic_identity(reference_token)
-                    .expect("root-reference token identity")
-                    .space(),
-                ResolutionSemanticIdentitySpace::FragmentLocal
-            );
-            assert_eq!(
-                catalog
-                    .semantic_identity(import_path.end().symbols().fixed()[0].symbol())
-                    .expect("root-import anchor identity")
-                    .space(),
-                ResolutionSemanticIdentitySpace::FragmentLocal,
-            );
-            for root_first in [
-                import_path.end().symbols().fixed()[1].symbol(),
-                export_path.start().symbols().fixed()[0].symbol(),
-            ] {
-                assert_eq!(
-                    catalog
-                        .semantic_identity(root_first)
-                        .expect("root-leading lookup identity")
-                        .space(),
-                    ResolutionSemanticIdentitySpace::Shared,
-                    "indexed root endpoints must lead with a Shared lookup semantic"
-                );
-            }
-            let import_identity = catalog
-                .path_identity(import_id)
-                .expect("dense root-import path identity");
-            let export_identity = catalog
-                .path_identity(export_id)
-                .expect("dense root-export path identity");
-            assert_ne!(import_identity, export_identity);
-            assert!(artifact.lexical().nodes().iter().all(|(node, kind)| {
-                *node != BindingNodeId::universal_root() && *kind != BindingNodeKind::Root
-            }));
-            (import_token, export_token, import_id, export_id)
-        };
-
-        let provisional_rows = inspect(&provisional_artifact, provisional);
-        let final_rows = inspect(&final_artifact, final_fragment);
-        assert_ne!(provisional_rows, final_rows);
-        assert_eq!(
-            root_import_token_identity(import_site, namespace),
-            provisional_artifact
-                .identities()
-                .semantic_identity(provisional_rows.0)
-                .expect("provisional root-import token identity")
-        );
-        assert_eq!(
-            root_import_token_identity(import_site, namespace),
-            final_artifact
-                .identities()
-                .semantic_identity(final_rows.0)
-                .expect("final root-import token identity")
-        );
-
-        let mut rebaser = MountRebaser::new();
-        let ordinal = SelectedResolutionMountOrdinal::new(final_fragment.ordinal());
-        let mount = rebaser.register_mount(ordinal);
-        assert!(rebaser.register_identity_catalog(
-            ordinal,
-            final_artifact.identities(),
-            &CancellationToken::new(),
-        ));
-        let SelectedSemanticProvenance::FragmentLocal(provenance) = rebaser
-            .registered_semantic_provenance(final_rows.0)
-            .expect("mounted root-import token provenance")
-        else {
-            panic!("root-import token lost fragment-local provenance")
-        };
-        assert_eq!(provenance.mount(), mount);
-        assert_eq!(
-            provenance.identity(),
-            root_import_token_identity(import_site, namespace)
-        );
-        assert_eq!(
-            rebaser.registered_semantic_provenance(expected_shared_route[0]),
-            Some(SelectedSemanticProvenance::Shared(
-                ResolutionLookupSemanticRecipe::new(Language::Go, namespace, "example.com")
-                    .identity(crate::analyzer::resolution::test_shared_names()),
-            ))
-        );
-
-        let provisional_import_token = provisional_rows.0;
-        let final_import_path = final_artifact
-            .lexical()
-            .paths()
-            .iter()
-            .find_map(|(id, path)| (id == &final_rows.2).then_some(path))
-            .expect("final root-import path");
-        assert!(
-            final_import_path
-                .end()
-                .symbols()
-                .fixed()
-                .iter()
-                .all(|symbol| symbol.symbol() != provisional_import_token),
-            "final lowering must not retain a provisional mounted token"
-        );
-
-        let mut permuted = facts.clone();
-        permuted.root_import_segments.reverse();
-        permuted.root_import_demands.reverse();
-        permuted.root_exports.reverse();
-        let permuted =
-            crate::analyzer::resolution::lower_for_test(final_fragment, Language::Go, &permuted);
-        assert_same_artifact(&final_artifact, &permuted);
-    }
-
-    #[test]
-    fn root_route_fact_index_rejects_sparse_ambiguous_or_unowned_rows() {
-        let rejected = |mutate: fn(&mut FileResolutionFacts)| {
-            let mut facts = root_route_facts();
-            mutate(&mut facts);
-            std::panic::catch_unwind(|| {
-                let _ = crate::analyzer::resolution::lower_lexical_for_test(
-                    fragment(),
-                    Language::Go,
-                    &facts,
-                )
-                .0;
-            })
-            .is_err()
-        };
-
-        assert!(rejected(|facts| {
-            facts.root_import_segments[1].position = 3;
-        }));
-        assert!(rejected(|facts| {
-            facts.root_import_demands[0].namespace = ResolutionNamespace::TypeOrValue;
-        }));
-        assert!(rejected(|facts| {
-            facts.root_import_segments[0].import_site = ResolutionSiteId::new(99);
-        }));
-        assert!(rejected(|facts| {
-            facts.root_reference_segments[1].position = 3;
-        }));
-        assert!(rejected(|facts| {
-            facts.root_references[0].root_scope = ResolutionScopeId::new(99);
-        }));
-        assert!(rejected(|facts| {
-            facts.root_reference_segments[0].reference = ResolutionSiteId::new(99);
-        }));
-        assert!(rejected(|facts| {
-            facts
-                .identifiers
-                .iter_mut()
-                .find(|identifier| identifier.site == ResolutionSiteId::new(2))
-                .expect("root reference fixture identifier")
-                .role = ResolutionIdentifierRole::Declaration;
-        }));
-        assert!(rejected(|facts| {
-            facts.binders[0].hoisting = HoistingClass::SourceOrder;
-        }));
-    }
-
-    #[test]
-    fn go_root_reference_lowers_both_type_or_value_routes() {
-        let facts = root_route_facts();
-        let mut ambiguous_facts = facts.clone();
-        ambiguous_facts.names.push(ResolutionNameFact {
-            id: ResolutionNameId::new(4),
-            spelling: "model".to_owned(),
-        });
-        ambiguous_facts
-            .sites
-            .push(site(3, 1, ResolutionSiteKind::ValueReference, 30));
-        ambiguous_facts.identifiers.push(PositionedIdentifierFact {
-            site: ResolutionSiteId::new(3),
-            name: ResolutionNameId::new(4),
-            role: ResolutionIdentifierRole::Reference,
-            namespace: ResolutionNamespace::TypeOrValue,
-            qualifier: None,
-        });
-        ambiguous_facts.root_references[0].anchor = ResolutionRootImportAnchor::Lexical;
-        ambiguous_facts.root_references[0].prefix_reference = Some(ResolutionSiteId::new(3));
-        ambiguous_facts.root_reference_segments = vec![ResolutionRootReferenceSegmentFact {
-            reference: ResolutionSiteId::new(2),
-            position: 0,
-            name: ResolutionNameId::new(4),
-        }];
-        ambiguous_facts
-            .identifiers
-            .iter_mut()
-            .find(|identifier| identifier.site == ResolutionSiteId::new(2))
-            .expect("root reference fixture identifier")
-            .namespace = ResolutionNamespace::TypeOrValue;
-        let (ambiguous, identities) = crate::analyzer::resolution::lower_lexical_for_test(
-            fragment(),
-            Language::Go,
-            &ambiguous_facts,
-        );
-        for namespace in [ResolutionNamespace::Value, ResolutionNamespace::Type] {
-            let identity = root_reference_path_identity(ResolutionSiteId::new(2), namespace);
-            assert!(
-                ambiguous
-                    .paths()
-                    .iter()
-                    .any(|(path, _)| { identities.path_identity(*path) == Some(identity) }),
-                "Go root terminal keeps its {namespace:?} route"
-            );
-        }
-        let mut qualified_ambiguous_facts = ambiguous_facts.clone();
-        qualified_ambiguous_facts
-            .identifiers
-            .iter_mut()
-            .find(|identifier| identifier.site == ResolutionSiteId::new(2))
-            .expect("Go root terminal")
-            .qualifier = Some(ResolutionTypeSlotId::new(0));
-        qualified_ambiguous_facts
-            .type_slots
-            .push(ResolutionTypeSlotFact {
-                id: ResolutionTypeSlotId::new(0),
-                site: ResolutionSiteId::new(2),
-                role: ResolutionTypeSlotRole::Receiver,
-            });
-        let (qualified_ambiguous, _) = crate::analyzer::resolution::lower_lexical_for_test(
-            fragment(),
-            Language::Go,
-            &qualified_ambiguous_facts,
-        );
-        assert!(
-            !qualified_ambiguous.gaps().iter().any(|gap| {
-                gap.site() == ResolutionSiteId::new(2)
-                    && gap.origin() == LoweringGapOrigin::QualifiedReference
-            }),
-            "a Go type-or-value root terminal is resolved by the selected root route"
-        );
-        let anchors = super::super::selected_context::CatalogRootImportAnchors::new(&identities);
-        let reference_halves = ambiguous
-            .paths()
-            .iter()
-            .filter_map(|(path, partial)| {
-                super::super::selected_context::classify_selected_root_path_half(
-                    &anchors,
-                    super::super::batch::CandidatePathIdentity::new(fragment(), *path),
-                    partial,
-                    &crate::CancellationToken::default(),
-                )
-                .expect("catalog answers its own root import anchors")
-            })
-            .filter_map(|half| match half {
-                super::super::selected_context::SelectedRootPathHalf::Reference {
-                    prefix_reference: Some(_),
-                    route,
-                    ..
-                } => Some(route),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(reference_halves.len(), 2);
-        assert!(reference_halves.iter().all(|route| route.is_empty()));
-        assert!(
-            std::panic::catch_unwind(|| {
-                let _ = crate::analyzer::resolution::lower_lexical_for_test(
-                    fragment(),
-                    Language::Java,
-                    &ambiguous_facts,
-                );
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
     fn selected_java_single_import_preserves_its_unresolved_route_gap() {
         let mut facts = root_route_facts();
         let import_site = ResolutionSiteId::new(0);
         let name = ResolutionNameId::new(3);
+        facts.root_import_kinds[0].kind = ResolutionRootImportKind::Named;
         facts.import_routes.push(ResolutionImportRouteFact {
             site: import_site,
             root_scope: ResolutionScopeId::new(1),
@@ -7282,10 +7312,15 @@ mod tests {
                 name: ResolutionNameId::new(ordinal),
             }
         }));
-        facts.gaps.push(ResolutionGapFact {
-            site: import_site,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        });
+        facts.gaps.push(ResolutionGapFact::unsupported_route(
+            import_site,
+            ResolutionRouteGap::UnknownBinder {
+                scope: ResolutionScopeId::new(1),
+                name: Some(name),
+                namespace: Some(ResolutionNamespace::Type),
+                may_publish: false,
+            },
+        ));
 
         let (lowered, identities) =
             crate::analyzer::resolution::lower_lexical_for_test(fragment(), Language::Java, &facts);
@@ -7324,16 +7359,6 @@ mod tests {
             unresolved_gap.completion(),
             ResolutionCompletion::Incomplete(_)
         ));
-    }
-
-    #[test]
-    fn root_import_accepts_an_owned_package_attachment_scope() {
-        let mut facts = root_route_facts();
-        facts.scopes[1].owner = Some(ResolutionSiteId::new(1));
-
-        let lowered =
-            crate::analyzer::resolution::lower_lexical_for_test(fragment(), Language::Go, &facts).0;
-        assert!(!lowered.paths().is_empty());
     }
 
     #[test]
@@ -7386,42 +7411,6 @@ mod tests {
             lowered[0].0.at_ordinal(fragments[0].ordinal()),
             lowered[1].0.at_ordinal(fragments[1].ordinal())
         );
-    }
-
-    fn scope(
-        id: u32,
-        parent: Option<u32>,
-        start_byte: usize,
-        end_byte: usize,
-    ) -> ResolutionScopeFact {
-        ResolutionScopeFact {
-            id: ResolutionScopeId::new(id),
-            parent: parent.map(ResolutionScopeId::new),
-            owner: None,
-            kind: if parent.is_none() {
-                ResolutionScopeKind::CompilationUnit
-            } else {
-                ResolutionScopeKind::Block
-            },
-            inheritance: ResolutionScopeInheritance::Lexical,
-            start_byte,
-            end_byte,
-        }
-    }
-
-    fn site(
-        id: u32,
-        scope: u32,
-        kind: ResolutionSiteKind,
-        start_byte: usize,
-    ) -> ResolutionSiteFact {
-        ResolutionSiteFact {
-            id: ResolutionSiteId::new(id),
-            scope: ResolutionScopeId::new(scope),
-            kind,
-            start_byte,
-            end_byte: start_byte + 1,
-        }
     }
 
     #[test]
@@ -7809,18 +7798,6 @@ mod tests {
         assert_eq!(broad, expected);
     }
 
-    fn semantic(
-        lowered: &LoweredResolutionFragment,
-        site: u32,
-        role: LoweredSemanticRole,
-    ) -> SemanticId {
-        super::super::test_support::lowered_semantic_at(
-            lowered.semantics(),
-            ResolutionSiteId::new(site),
-            role,
-        )
-    }
-
     fn resolve(
         lowered: LoweredResolutionFragment,
         reference_site: u32,
@@ -7835,18 +7812,6 @@ mod tests {
         ResolutionEngine::new(&source)
             .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
             .expect("resolution")
-    }
-
-    fn resolve_with_coverage(
-        lowered: LoweredResolutionFragment,
-        reference_site: u32,
-    ) -> super::super::model::ResolutionAnswer {
-        let reference = semantic(&lowered, reference_site, LoweredSemanticRole::Reference);
-        let source =
-            super::super::engine::PreloadedFragmentSource::from_lowered_fragments([lowered]);
-        BatchResolutionEngine::new(&source)
-            .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
-            .expect("resolution with normalized coverage")
     }
 
     #[test]
@@ -7911,10 +7876,10 @@ mod tests {
                 access: ResolutionMemberAccess::Instance,
                 qualifier_compatibility: ResolutionMemberQualifierCompatibility::RuntimeOrType,
             }],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(1),
-                kind: ResolutionGapKind::UnsupportedCallApplicability,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(1),
+                ResolutionGapKind::UnsupportedCallApplicability,
+            )],
             ..FileResolutionFacts::default()
         };
         let (lowered, catalog) =
@@ -7986,10 +7951,10 @@ mod tests {
                 0,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(2),
-                kind: ResolutionGapKind::UnsupportedScopeOrBinder,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(2),
+                ResolutionGapKind::UnsupportedScopeOrBinder,
+            )],
             ..FileResolutionFacts::default()
         };
         let lowered =
@@ -8086,10 +8051,10 @@ mod tests {
                     290,
                 ),
             ],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(1),
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(1),
+                ResolutionGapKind::UnsupportedHierarchyTraversal,
+            )],
             ..FileResolutionFacts::default()
         }
     }
@@ -8248,10 +8213,10 @@ mod tests {
                     100,
                 ),
             ],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(4),
-                kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(4),
+                ResolutionGapKind::UnsupportedPlacementBoundary,
+            )],
             ..FileResolutionFacts::default()
         };
         let lowered =
@@ -8336,6 +8301,321 @@ mod tests {
         assert_eq!(answer.targets(), &[local]);
         assert!(!answer.targets().contains(&field));
         assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+    }
+
+    fn alias_scope_facts() -> FileResolutionFacts {
+        let mut facts = FileResolutionFacts {
+            names: vec![ResolutionNameFact {
+                id: ResolutionNameId::new(0),
+                spelling: "x".into(),
+            }],
+            scopes: vec![
+                scope(0, None, 0, 400),
+                scope(1, Some(0), 10, 100),
+                scope(2, Some(0), 110, 250),
+                scope(3, Some(2), 150, 200),
+                scope(4, Some(0), 260, 390),
+            ],
+            ..FileResolutionFacts::default()
+        };
+        for (id, scope_id, kind, position, role) in [
+            (
+                0,
+                1,
+                ResolutionSiteKind::ValueDeclaration,
+                20,
+                ResolutionIdentifierRole::Declaration,
+            ),
+            (
+                1,
+                2,
+                ResolutionSiteKind::AliasBinding,
+                120,
+                ResolutionIdentifierRole::Alias,
+            ),
+            (
+                2,
+                2,
+                ResolutionSiteKind::ValueReference,
+                130,
+                ResolutionIdentifierRole::Reference,
+            ),
+            (
+                3,
+                1,
+                ResolutionSiteKind::ValueReference,
+                30,
+                ResolutionIdentifierRole::Reference,
+            ),
+            (
+                4,
+                3,
+                ResolutionSiteKind::ValueReference,
+                170,
+                ResolutionIdentifierRole::Reference,
+            ),
+            (
+                5,
+                4,
+                ResolutionSiteKind::ValueReference,
+                280,
+                ResolutionIdentifierRole::Reference,
+            ),
+            (
+                6,
+                3,
+                ResolutionSiteKind::ValueDeclaration,
+                160,
+                ResolutionIdentifierRole::Declaration,
+            ),
+        ] {
+            facts.sites.push(site(id, scope_id, kind, position));
+            facts
+                .identifiers
+                .push(identifier(id, 0, role, ResolutionNamespace::Value));
+        }
+        for (id, scope_id, kind, start, end) in [
+            (0, 1, ResolutionBinderKind::Parameter, 10, 100),
+            (
+                1,
+                2,
+                ResolutionBinderKind::Alias {
+                    target: ResolutionSiteId::new(0),
+                },
+                110,
+                250,
+            ),
+            (6, 3, ResolutionBinderKind::Parameter, 150, 200),
+        ] {
+            facts.binders.push(binder(
+                id,
+                scope_id,
+                kind,
+                HoistingClass::ScopeWide,
+                start,
+                end,
+            ));
+        }
+        facts
+    }
+
+    #[test]
+    fn alias_scopes_preserve_canonical_lookup_shadowing_and_inventory() {
+        let facts = alias_scope_facts();
+        let (lowered, _) =
+            crate::analyzer::resolution::lower_lexical_for_test(fragment(), Language::Java, &facts);
+        let target = semantic(&lowered, 0, LoweredSemanticRole::Definition);
+        let nested = semantic(&lowered, 6, LoweredSemanticRole::Definition);
+        // This is the declaration inventory consumed by publication and the
+        // native declaration bridge: the alias has no semantic or node.
+        let definitions = lowered
+            .semantics()
+            .iter()
+            .filter(|site| site.role() == LoweredSemanticRole::Definition)
+            .map(|site| site.site())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            definitions,
+            [ResolutionSiteId::new(0), ResolutionSiteId::new(6)]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+        assert!(
+            lowered
+                .semantics()
+                .iter()
+                .all(|site| site.site() != ResolutionSiteId::new(1))
+        );
+        for (reference, expected) in [
+            (2, vec![target]),
+            (3, vec![target]),
+            (4, vec![nested]),
+            (5, vec![]),
+        ] {
+            let answer = resolve_with_coverage(lowered.clone(), reference);
+            assert_eq!(answer.targets(), expected, "reference {reference}");
+            assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+        }
+        let alias_reference = semantic(&lowered, 2, LoweredSemanticRole::Reference);
+        let own_reference = semantic(&lowered, 3, LoweredSemanticRole::Reference);
+        let source =
+            super::super::engine::PreloadedFragmentSource::from_lowered_fragments([lowered]);
+        let reverse = BatchResolutionEngine::new(&source)
+            .references_to(target, &CancellationToken::new())
+            .expect("alias reverse lookup");
+        assert_eq!(
+            reverse.references().iter().copied().collect::<HashSet<_>>(),
+            [alias_reference, own_reference]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+        assert_eq!(reverse.completion(), &ResolutionCompletion::Complete);
+
+        let mut tied = facts;
+        tied.sites
+            .push(site(7, 2, ResolutionSiteKind::ValueDeclaration, 140));
+        tied.identifiers.push(identifier(
+            7,
+            0,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+        ));
+        tied.binders.push(binder(
+            7,
+            2,
+            ResolutionBinderKind::Local,
+            HoistingClass::ScopeWide,
+            110,
+            250,
+        ));
+        let (lowered, _) =
+            crate::analyzer::resolution::lower_lexical_for_test(fragment(), Language::Java, &tied);
+        let same_scope = semantic(&lowered, 7, LoweredSemanticRole::Definition);
+        let target = semantic(&lowered, 0, LoweredSemanticRole::Definition);
+        let answer = resolve_with_coverage(lowered, 2);
+        assert_eq!(
+            answer.targets().iter().copied().collect::<HashSet<_>>(),
+            [target, same_scope].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5909: typed binder validation treated alias binding sites as declarations"
+    )]
+    fn alias_reference_preserves_the_targets_declared_type_through_full_lowering() {
+        use crate::analyzer::resolution::test_support::{slot, transfer};
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole,
+            DeclarationTypeSlotFact, IntrinsicTypeKind, IntrinsicTypeSeedFact,
+            ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
+        };
+
+        let mut facts = alias_scope_facts();
+        facts.names.push(ResolutionNameFact {
+            id: ResolutionNameId::new(1),
+            spelling: "int".into(),
+        });
+        facts
+            .sites
+            .push(site(7, 1, ResolutionSiteKind::TypeReference, 21));
+        facts.type_slots = vec![
+            slot(0, 7, ResolutionTypeSlotRole::TargetTypeIdentity),
+            slot(1, 0, ResolutionTypeSlotRole::DeclaredValue),
+            slot(2, 2, ResolutionTypeSlotRole::ExpressionValue),
+        ];
+        facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+            output: ResolutionTypeSlotId::new(0),
+            name: ResolutionNameId::new(1),
+            kind: IntrinsicTypeKind::Primitive,
+            indirection: 0,
+        });
+        facts.type_transfers.push(transfer(
+            0,
+            1,
+            ResolutionTypeTransferKind::DeclaredType,
+            0,
+            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+        ));
+        facts.declaration_type_slots.push(DeclarationTypeSlotFact {
+            declaration: ResolutionSiteId::new(0),
+            slot: ResolutionTypeSlotId::new(1),
+            role: DeclarationTypeRole::Value,
+        });
+        facts.binding_projections.push(BindingProjectionFact {
+            reference: ResolutionSiteId::new(2),
+            output: ResolutionTypeSlotId::new(2),
+            kind: BindingProjectionKind::TargetDeclaredValueType,
+        });
+        let lowered =
+            crate::analyzer::resolution::lower_for_test(fragment(), Language::Java, &facts);
+        let target = semantic(lowered.lexical(), 0, LoweredSemanticRole::Definition);
+        let reference = semantic(lowered.lexical(), 2, LoweredSemanticRole::Reference);
+        assert_eq!(lowered.typed().declaration_types().len(), 1);
+        assert_eq!(lowered.typed().declaration_types()[0].definition(), target);
+        let expected_type = lowered.typed().intrinsic_seeds()[0]
+            .frontier()
+            .possible_values()[0]
+            .ty()
+            .identity();
+        let source =
+            crate::analyzer::resolution::PreloadedFactResolutionService::from_lowered_fragments(
+                [lowered.lexical().clone()],
+                [lowered.typed().clone()],
+            );
+        let answer = source
+            .resolve_reference(reference, &CancellationToken::new())
+            .expect("resolve declared type through an alias");
+        assert_eq!(answer.binding().targets(), &[target]);
+        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+        assert_eq!(answer.projected_frontiers().len(), 1);
+        let frontier = &answer.projected_frontiers()[0];
+        assert_eq!(frontier.completion(), &ResolutionCompletion::Complete);
+        assert_eq!(frontier.possible_values().len(), 1);
+        assert_eq!(frontier.possible_values()[0].ty().identity(), expected_type);
+    }
+
+    #[test]
+    fn alias_lowering_rejects_invalid_targets_names_and_scopes() {
+        type InvalidFact = (&'static str, fn(&mut FileResolutionFacts));
+        let invalid: &[InvalidFact] = &[
+            ("unknown target", |facts| {
+                facts.binders[1].kind = ResolutionBinderKind::Alias {
+                    target: ResolutionSiteId::new(99),
+                }
+            }),
+            ("reference target", |facts| {
+                facts.binders[1].kind = ResolutionBinderKind::Alias {
+                    target: ResolutionSiteId::new(3),
+                }
+            }),
+            ("alias chain", |facts| {
+                facts.binders[1].kind = ResolutionBinderKind::Alias {
+                    target: ResolutionSiteId::new(1),
+                }
+            }),
+            ("renamed alias", |facts| {
+                facts.names.push(ResolutionNameFact {
+                    id: ResolutionNameId::new(1),
+                    spelling: "y".into(),
+                });
+                facts.identifiers[1].name = ResolutionNameId::new(1);
+            }),
+            ("different namespace", |facts| {
+                facts.identifiers[1].namespace = ResolutionNamespace::Type
+            }),
+            ("qualified alias", |facts| {
+                facts.identifiers[1].qualifier = Some(ResolutionTypeSlotId::new(0))
+            }),
+            ("non-alias identifier", |facts| {
+                facts.identifiers[1].role = ResolutionIdentifierRole::Declaration
+            }),
+            ("non-alias site", |facts| {
+                facts.sites[1].kind = ResolutionSiteKind::ValueDeclaration
+            }),
+            ("wrong alias scope", |facts| {
+                facts.sites[1].scope = ResolutionScopeId::new(0)
+            }),
+            ("ordinary cross-scope binder", |facts| {
+                facts.sites[0].scope = ResolutionScopeId::new(0)
+            }),
+        ];
+        for &(description, mutate) in invalid {
+            let mut facts = alias_scope_facts();
+            mutate(&mut facts);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    crate::analyzer::resolution::lower_lexical_for_test(
+                        fragment(),
+                        Language::Java,
+                        &facts,
+                    )
+                })
+                .is_err(),
+                "accepted {description}"
+            );
+        }
     }
 
     #[test]
@@ -8769,10 +9049,10 @@ mod tests {
                 2,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(2),
-                kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(2),
+                ResolutionGapKind::UnsupportedPlacementBoundary,
+            )],
             ..FileResolutionFacts::default()
         };
         let expected =
@@ -8804,14 +9084,8 @@ mod tests {
                 site(1, 0, ResolutionSiteKind::UnsupportedDeclaration, 40),
             ],
             gaps: vec![
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(0),
-                    kind: member_scope,
-                },
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(1),
-                    kind: generated_surface,
-                },
+                ResolutionGapFact::new(ResolutionSiteId::new(0), member_scope),
+                ResolutionGapFact::new(ResolutionSiteId::new(1), generated_surface),
             ],
             ..FileResolutionFacts::default()
         };
@@ -8850,14 +9124,14 @@ mod tests {
     }
 
     #[test]
-    fn route_gap_without_affirmative_rows_retains_fragment_and_enumeration_gaps() {
+    fn unknown_placement_without_affirmative_rows_retains_fragment_and_enumeration_gaps() {
         let facts = FileResolutionFacts {
             scopes: vec![scope(0, None, 0, 100)],
             sites: vec![site(0, 0, ResolutionSiteKind::UnsupportedRoute, 20)],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedRoute,
-            }],
+            gaps: vec![ResolutionGapFact::unsupported_route(
+                ResolutionSiteId::new(0),
+                ResolutionRouteGap::UnknownPlacement,
+            )],
             reference_enumeration_gaps: vec![ResolutionReferenceEnumerationGapFact {
                 site: ResolutionSiteId::new(0),
                 kind: ResolutionGapKind::UnsupportedRoute,
@@ -8895,10 +9169,10 @@ mod tests {
         let facts = FileResolutionFacts {
             scopes: vec![scope(0, None, 0, 100)],
             sites: vec![site(0, 0, ResolutionSiteKind::UnsupportedExpression, 20)],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedExpression,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::UnsupportedExpression,
+            )],
             reference_enumeration_gaps: vec![ResolutionReferenceEnumerationGapFact {
                 site: ResolutionSiteId::new(0),
                 kind: ResolutionGapKind::UnsupportedExpression,
@@ -8971,10 +9245,10 @@ mod tests {
                 0,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(2),
-                kind: ResolutionGapKind::UnsupportedMemberScope,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(2),
+                ResolutionGapKind::UnsupportedMemberScope,
+            )],
             reference_enumeration_gaps: vec![ResolutionReferenceEnumerationGapFact {
                 site: ResolutionSiteId::new(2),
                 kind: ResolutionGapKind::UnsupportedMemberScope,
@@ -9033,10 +9307,10 @@ mod tests {
         let facts = FileResolutionFacts {
             scopes: vec![scope(0, None, 0, 100)],
             sites: vec![site(0, 0, ResolutionSiteKind::UnsupportedExpression, 20)],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedTypeSyntax,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::UnsupportedTypeSyntax,
+            )],
             reference_enumeration_gaps: vec![ResolutionReferenceEnumerationGapFact {
                 site: ResolutionSiteId::new(0),
                 kind: ResolutionGapKind::UnsupportedTypeSyntax,
@@ -9078,10 +9352,10 @@ mod tests {
                 ResolutionIdentifierRole::Reference,
                 ResolutionNamespace::Value,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedExpression,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::UnsupportedExpression,
+            )],
             ..FileResolutionFacts::default()
         };
         let lowered =
@@ -9116,50 +9390,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_expression_type_is_a_type_frontier_not_an_inventory_gap() {
-        let facts = FileResolutionFacts {
-            scopes: vec![scope(0, None, 0, 100)],
-            sites: vec![site(0, 0, ResolutionSiteKind::UnsupportedExpression, 20)],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedExpressionType,
-            }],
-            ..FileResolutionFacts::default()
-        };
-        let lowered =
-            crate::analyzer::resolution::lower_lexical_for_test(fragment(), Language::Go, &facts).0;
-        assert!(!lowered.gaps().iter().any(|gap| {
-            matches!(
-                gap.frontier(),
-                LoweringCoverageFrontier::Enumeration
-                    | LoweringCoverageFrontier::CandidateInventory {
-                        direction: LoweredCandidateDirection::Reverse,
-                    }
-            )
-        }));
-        assert!(lowered.gaps().iter().any(|gap| {
-            gap.origin()
-                == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedExpressionType)
-                && gap.frontier()
-                    == LoweringCoverageFrontier::Type {
-                        frontier: site_type_frontier_semantic(fragment(), ResolutionSiteId::new(0)),
-                    }
-        }));
-        assert_eq!(
-            LoweringGapOrigin::from_kind(ResolutionGapOriginKind::UnsupportedExpressionType).kind(),
-            ResolutionGapOriginKind::UnsupportedExpressionType
-        );
-    }
-
-    #[test]
     fn reference_enumeration_gap_is_independent_of_point_resolution_gaps() {
         let facts = FileResolutionFacts {
             scopes: vec![scope(0, None, 0, 100)],
             sites: vec![site(0, 0, ResolutionSiteKind::UnsupportedExpression, 20)],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedExpression,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::UnsupportedExpression,
+            )],
             reference_enumeration_gaps: vec![ResolutionReferenceEnumerationGapFact {
                 site: ResolutionSiteId::new(0),
                 kind: ResolutionGapKind::UnsupportedTypeSyntax,
@@ -9202,10 +9440,7 @@ mod tests {
         let facts = FileResolutionFacts {
             scopes: vec![scope(0, None, 0, 100)],
             sites: vec![site(0, 0, ResolutionSiteKind::UnsupportedExpression, 20)],
-            gaps: vec![ResolutionGapFact {
-                site: row.site,
-                kind: row.kind,
-            }],
+            gaps: vec![ResolutionGapFact::new(row.site, row.kind)],
             reference_enumeration_gaps: vec![row, row],
             ..FileResolutionFacts::default()
         };
@@ -9248,10 +9483,10 @@ mod tests {
                 0,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedVisibility,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::UnsupportedVisibility,
+            )],
             ..FileResolutionFacts::default()
         };
         let lowered =
@@ -9304,10 +9539,10 @@ mod tests {
                 0,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(1),
-                kind: ResolutionGapKind::UnsupportedImplicitReceiver,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(1),
+                ResolutionGapKind::UnsupportedImplicitReceiver,
+            )],
             ..FileResolutionFacts::default()
         };
         let lowered =
@@ -9466,128 +9701,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_call_applicability_is_local_across_point_reverse_and_broad_reads() {
-        let facts = FileResolutionFacts {
-            names: vec![ResolutionNameFact {
-                id: ResolutionNameId::new(0),
-                spelling: "call".into(),
-            }],
-            scopes: vec![scope(0, None, 0, 100)],
-            sites: vec![
-                site(0, 0, ResolutionSiteKind::CallableDeclaration, 1),
-                site(1, 0, ResolutionSiteKind::CallableReference, 20),
-                site(2, 0, ResolutionSiteKind::Call, 20),
-            ],
-            identifiers: vec![
-                identifier(
-                    0,
-                    0,
-                    ResolutionIdentifierRole::Declaration,
-                    ResolutionNamespace::Callable,
-                ),
-                identifier(
-                    1,
-                    0,
-                    ResolutionIdentifierRole::Reference,
-                    ResolutionNamespace::Callable,
-                ),
-            ],
-            binders: vec![binder(
-                0,
-                0,
-                ResolutionBinderKind::Callable,
-                HoistingClass::ScopeWide,
-                0,
-                100,
-            )],
-            type_slots: vec![ResolutionTypeSlotFact {
-                id: ResolutionTypeSlotId::new(0),
-                site: ResolutionSiteId::new(2),
-                role: ResolutionTypeSlotRole::CallResult,
-            }],
-            calls: vec![ResolutionCallFact {
-                call: ResolutionSiteId::new(2),
-                callee: ResolutionSiteId::new(1),
-                receiver: None,
-                result: ResolutionTypeSlotId::new(0),
-                extra_result_slots: Vec::new(),
-                explicit_type_argument_count: 0,
-            }],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(1),
-                kind: ResolutionGapKind::UnsupportedCallApplicability,
-            }],
-            ..FileResolutionFacts::default()
-        };
-        let lowered =
-            crate::analyzer::resolution::lower_lexical_for_test(fragment(), Language::Java, &facts)
-                .0;
-        assert!(!lowered.gaps().iter().any(|gap| {
-            matches!(
-                gap.frontier(),
-                LoweringCoverageFrontier::Fragment
-                    | LoweringCoverageFrontier::Enumeration
-                    | LoweringCoverageFrontier::CandidateInventory { .. }
-            )
-        }));
-        let definition = semantic(&lowered, 0, LoweredSemanticRole::Definition);
-        let point = resolve_with_coverage(lowered.clone(), 1);
-        assert_eq!(point.targets(), &[definition]);
-        assert!(matches!(
-            point.completion(),
-            ResolutionCompletion::Incomplete(_)
-        ));
-
-        let source =
-            super::super::engine::PreloadedFragmentSource::from_lowered_fragments([lowered]);
-        let reverse = BatchResolutionEngine::new(&source)
-            .references_to(definition, &CancellationToken::new())
-            .expect("reverse callable lookup");
-        assert_eq!(reverse.references().len(), 1);
-        assert!(matches!(
-            reverse.completion(),
-            ResolutionCompletion::Incomplete(_)
-        ));
-        let broad = BatchResolutionEngine::new(&source)
-            .stream_all_reference_batches(8, &CancellationToken::new(), &mut |_| Ok(()))
-            .expect("broad callable lookup");
-        assert!(matches!(
-            broad.completion(),
-            ResolutionCompletion::Incomplete(_)
-        ));
-
-        let mut go_facts = facts.clone();
-        go_facts.engine_rule_eligibilities.push(
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionEngineRuleEligibilityFact {
-                site: ResolutionSiteId::new(2),
-                rule: ResolutionEngineRuleKind::ArgumentIndependentBinding,
-            },
-        );
-        let go_lowered = crate::analyzer::resolution::lower_lexical_for_test(
-            fragment(),
-            Language::Go,
-            &go_facts,
-        )
-        .0;
-        assert!(!go_lowered.gaps().iter().any(|gap| {
-            gap.origin()
-                == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability)
-                && matches!(gap.frontier(), LoweringCoverageFrontier::Reference { .. })
-        }));
-        let go_definition = semantic(&go_lowered, 0, LoweredSemanticRole::Definition);
-        let go_point = resolve_with_coverage(go_lowered.clone(), 1);
-        assert_eq!(go_point.targets(), &[go_definition]);
-        assert_eq!(go_point.completion(), &ResolutionCompletion::Complete);
-        let go_source =
-            super::super::engine::PreloadedFragmentSource::from_lowered_fragments([go_lowered]);
-        let go_reverse = BatchResolutionEngine::new(&go_source)
-            .references_to(go_definition, &CancellationToken::new())
-            .expect("Go reverse callable lookup");
-        assert_eq!(go_reverse.references().len(), 1);
-        assert_eq!(go_reverse.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
     fn placement_boundary_keeps_cross_fragment_negative_incomplete_and_local_target_usable() {
         let declaration_fragment = BindingFragmentId::for_test(b"placement-declaration");
         let reference_fragment = BindingFragmentId::for_test(b"placement-reference");
@@ -9615,10 +9728,10 @@ mod tests {
                 0,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(1),
-                kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(1),
+                ResolutionGapKind::UnsupportedPlacementBoundary,
+            )],
             ..FileResolutionFacts::default()
         };
         let reference_facts = FileResolutionFacts {
@@ -9634,10 +9747,10 @@ mod tests {
                 ResolutionIdentifierRole::Reference,
                 ResolutionNamespace::Type,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(1),
-                kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(1),
+                ResolutionGapKind::UnsupportedPlacementBoundary,
+            )],
             ..FileResolutionFacts::default()
         };
         let declaration = crate::analyzer::resolution::lower_lexical_for_test(
@@ -9797,10 +9910,10 @@ mod tests {
                 site(0, 0, ResolutionSiteKind::ModuleDeclaration, 5),
                 site(1, 1, ResolutionSiteKind::UnsupportedRoute, 20),
             ],
-            gaps: vec![ResolutionGapFact {
-                site: boundary,
-                kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                boundary,
+                ResolutionGapKind::UnsupportedPlacementBoundary,
+            )],
             ..FileResolutionFacts::default()
         };
 
@@ -9878,10 +9991,10 @@ mod tests {
                 0,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::UnsupportedHierarchyTraversal,
+            )],
             ..FileResolutionFacts::default()
         };
         let lowered =
@@ -10006,10 +10119,10 @@ mod tests {
                 supertype_slot: ResolutionTypeSlotId::new(0),
                 kind,
             }],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(2),
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(2),
+                ResolutionGapKind::UnsupportedHierarchyTraversal,
+            )],
             ..FileResolutionFacts::default()
         };
         if include_enclosing_target {
@@ -10238,14 +10351,14 @@ mod tests {
                 },
             ],
             gaps: vec![
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(1),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(2),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
+                ResolutionGapFact::new(
+                    ResolutionSiteId::new(1),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                ),
+                ResolutionGapFact::new(
+                    ResolutionSiteId::new(2),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                ),
             ],
             ..FileResolutionFacts::default()
         };
@@ -10383,10 +10496,10 @@ mod tests {
                 0,
                 100,
             )],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(0),
+                ResolutionGapKind::UnsupportedHierarchyTraversal,
+            )],
             ..FileResolutionFacts::default()
         };
         let base = crate::analyzer::resolution::lower_lexical_for_test(
@@ -10652,10 +10765,10 @@ mod tests {
                 site: ResolutionSiteId::new(2),
                 role: ResolutionTypeSlotRole::ExpressionValue,
             }],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(2),
-                kind: ResolutionGapKind::AmbiguousNumericLiteral,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(2),
+                ResolutionGapKind::AmbiguousNumericLiteral,
+            )],
             ..FileResolutionFacts::default()
         };
         let lowered =
@@ -10767,14 +10880,14 @@ mod tests {
                 kind: ResolutionSupertypeKind::Superclass,
             }],
             gaps: vec![
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(2),
-                    kind: ResolutionGapKind::ImplicitConstructor,
-                },
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(3),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
+                ResolutionGapFact::new(
+                    ResolutionSiteId::new(2),
+                    ResolutionGapKind::ImplicitConstructor,
+                ),
+                ResolutionGapFact::new(
+                    ResolutionSiteId::new(3),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                ),
             ],
             ..FileResolutionFacts::default()
         };
@@ -10835,5 +10948,207 @@ mod tests {
             .expect("resolution");
         assert_eq!(answer.targets(), &[target]);
         assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod go_global_support_0 {
+    use crate::CancellationToken;
+    use crate::analyzer::resolution::batch::{
+        BatchResolutionEngine, BatchResolutionFragmentSource,
+    };
+    use crate::analyzer::resolution::engine::{ResolutionEngine, ResolutionQuery};
+    use crate::analyzer::resolution::fact_lowering::fixture_names::{
+        additional_binder_path_id, binder_path_id, checkpoint_choice, gap_reason_semantic,
+        hierarchy_choice, hierarchy_gap_path_id, missing_binder_path_id, parent_path_id,
+        placement_gap_path_id, reference_node, root_export_token, root_import_anchor_semantic,
+        root_import_token, root_reference_token, scope_choice, scope_head_node,
+        site_type_frontier_semantic, type_slot_semantic,
+    };
+    use crate::analyzer::resolution::fact_lowering::*;
+    use crate::analyzer::resolution::local_identity::{
+        MountRebaser, ResolutionSemanticIdentitySpace, SelectedResolutionMountOrdinal,
+        SelectedSemanticProvenance,
+    };
+    use crate::analyzer::resolution::lower_resolution_facts_with_identity_catalog;
+    use crate::analyzer::resolution::positioned_identifier_for_test as identifier;
+    use crate::analyzer::resolution::test_support::binder;
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        PositionedIdentifierFact, ResolutionAdditionalDefinitionNamespaceFact,
+        ResolutionBinderFact, ResolutionBinderKind, ResolutionCallFact,
+        ResolutionCallableReceiverOriginFact, ResolutionGapFact, ResolutionIdentifierRole,
+        ResolutionMemberAccess, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
+        ResolutionNameFact, ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact,
+        ResolutionRootImportKindFact, ResolutionScopeKind, ResolutionSiteKind,
+        ResolutionSupertypeFact, ResolutionSupertypeKind, ResolutionTypeSlotFact,
+        ResolutionTypeSlotRole,
+    };
+    #[doc(hidden)]
+    pub fn fragment() -> BindingFragmentId {
+        BindingFragmentId::for_test(b"fact-lowering-test-fragment")
+    }
+    #[doc(hidden)]
+    pub fn root_route_facts() -> FileResolutionFacts {
+        let root_scope = ResolutionScopeId::new(1);
+        let import_site = ResolutionSiteId::new(0);
+        let declaration = ResolutionSiteId::new(1);
+        let reference = ResolutionSiteId::new(2);
+        FileResolutionFacts {
+            names: ["example.com", "repo", "dep", "Item"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, spelling)| ResolutionNameFact {
+                    id: ResolutionNameId::try_from_index(index)
+                        .expect("root-route fixture name count fits u32"),
+                    spelling: spelling.to_owned(),
+                })
+                .collect(),
+            scopes: vec![
+                scope(0, None, 0, 100),
+                ResolutionScopeFact {
+                    id: root_scope,
+                    parent: Some(ResolutionScopeId::new(0)),
+                    owner: None,
+                    kind: ResolutionScopeKind::Package,
+                    inheritance: ResolutionScopeInheritance::Lexical,
+                    start_byte: 0,
+                    end_byte: 100,
+                },
+            ],
+            sites: vec![
+                site(0, 1, ResolutionSiteKind::ImportDeclaration, 1),
+                site(1, 1, ResolutionSiteKind::TypeDeclaration, 10),
+                site(2, 1, ResolutionSiteKind::TypeReference, 20),
+            ],
+            identifiers: vec![
+                PositionedIdentifierFact {
+                    site: declaration,
+                    name: ResolutionNameId::new(3),
+                    role: ResolutionIdentifierRole::Declaration,
+                    namespace: ResolutionNamespace::Type,
+                    qualifier: None,
+                },
+                PositionedIdentifierFact {
+                    site: reference,
+                    name: ResolutionNameId::new(3),
+                    role: ResolutionIdentifierRole::Reference,
+                    namespace: ResolutionNamespace::Type,
+                    qualifier: None,
+                },
+            ],
+            binders: vec![ResolutionBinderFact {
+                declaration,
+                scope: root_scope,
+                kind: ResolutionBinderKind::Type,
+                hoisting: HoistingClass::ScopeWide,
+                activation_start: 0,
+                activation_end: 100,
+            }],
+            root_imports: vec![ResolutionRootImportFact {
+                site: import_site,
+                root_scope,
+                anchor: ResolutionRootImportAnchor::Lexical,
+                position: None,
+            }],
+            root_import_kinds: vec![ResolutionRootImportKindFact {
+                import_site,
+                kind: ResolutionRootImportKind::Glob,
+            }],
+            root_import_segments: (0..3)
+                .map(|position| ResolutionRootImportSegmentFact {
+                    import_site,
+                    position,
+                    name: ResolutionNameId::new(position),
+                })
+                .collect(),
+            root_import_demands: vec![ResolutionRootImportDemandFact {
+                import_site,
+                namespace: ResolutionNamespace::Type,
+                name: ResolutionNameId::new(3),
+            }],
+            root_references: vec![ResolutionRootReferenceFact {
+                reference,
+                root_scope,
+                anchor: ResolutionRootImportAnchor::Absolute,
+                prefix_reference: None,
+                owner_continued: false,
+            }],
+            root_reference_segments: (0..3)
+                .map(|position| ResolutionRootReferenceSegmentFact {
+                    reference,
+                    position,
+                    name: ResolutionNameId::new(position),
+                })
+                .collect(),
+            root_exports: vec![ResolutionRootExportFact {
+                root_scope,
+                declaration,
+                namespace: ResolutionNamespace::Type,
+            }],
+            ..FileResolutionFacts::default()
+        }
+    }
+    #[doc(hidden)]
+    pub fn scope(
+        id: u32,
+        parent: Option<u32>,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> ResolutionScopeFact {
+        ResolutionScopeFact {
+            id: ResolutionScopeId::new(id),
+            parent: parent.map(ResolutionScopeId::new),
+            owner: None,
+            kind: if parent.is_none() {
+                ResolutionScopeKind::CompilationUnit
+            } else {
+                ResolutionScopeKind::Block
+            },
+            inheritance: ResolutionScopeInheritance::Lexical,
+            start_byte,
+            end_byte,
+        }
+    }
+    #[doc(hidden)]
+    pub fn site(
+        id: u32,
+        scope: u32,
+        kind: ResolutionSiteKind,
+        start_byte: usize,
+    ) -> ResolutionSiteFact {
+        ResolutionSiteFact {
+            id: ResolutionSiteId::new(id),
+            scope: ResolutionScopeId::new(scope),
+            kind,
+            start_byte,
+            end_byte: start_byte + 1,
+        }
+    }
+    #[doc(hidden)]
+    pub fn semantic(
+        lowered: &LoweredResolutionFragment,
+        site: u32,
+        role: LoweredSemanticRole,
+    ) -> SemanticId {
+        crate::analyzer::resolution::test_support::lowered_semantic_at(
+            lowered.semantics(),
+            ResolutionSiteId::new(site),
+            role,
+        )
+    }
+    #[doc(hidden)]
+    pub fn resolve_with_coverage(
+        lowered: LoweredResolutionFragment,
+        reference_site: u32,
+    ) -> crate::analyzer::resolution::model::ResolutionAnswer {
+        let reference = semantic(&lowered, reference_site, LoweredSemanticRole::Reference);
+        let source =
+            crate::analyzer::resolution::engine::PreloadedFragmentSource::from_lowered_fragments([
+                lowered,
+            ]);
+        BatchResolutionEngine::new(&source)
+            .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
+            .expect("resolution with normalized coverage")
     }
 }

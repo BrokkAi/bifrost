@@ -24,8 +24,9 @@ use crate::profiling;
 pub struct IndexWarmer {
     state: Mutex<IndexWarmerState>,
     idle: Condvar,
-    #[cfg(test)]
-    panic_before_next_warm: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub panic_before_next_warm: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -43,7 +44,7 @@ impl IndexWarmer {
         Arc::new(Self {
             state: Mutex::new(IndexWarmerState::default()),
             idle: Condvar::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             panic_before_next_warm: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -75,7 +76,7 @@ impl IndexWarmer {
             let mut next = Some(snapshot);
             while let Some(current) = next.take() {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     if warmer
                         .panic_before_next_warm
                         .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -154,13 +155,12 @@ impl IndexWarmer {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexWarmer, spawn_index_warm};
-    use crate::analyzer::AnalyzerConfig;
-    use crate::inline_project::InlineTestProject;
-    use brokk_bifrost_test_macros::hardwon;
+
+    use super::spawn_index_warm;
+
     use rayon::prelude::*;
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, mpsc};
+
+    use std::sync::mpsc;
     use std::time::Duration;
 
     #[test]
@@ -188,37 +188,6 @@ mod tests {
                 .iter()
                 .all(|name| name.starts_with("bifrost-index-build-")),
             "nested warm parallelism escaped to non-build workers: {worker_names:?}"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "c5c11b710c78: a background warm panic left the index warmer permanently unavailable"
-    )]
-    fn background_warm_panic_resets_for_the_next_schedule() {
-        let project = InlineTestProject::new()
-            .file(
-                "src/lib.rs",
-                "pub trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
-            )
-            .build();
-        let snapshot = Arc::new(project.workspace_analyzer(AnalyzerConfig::default()));
-        assert!(!snapshot.query_indexes_warm());
-
-        let warmer = IndexWarmer::new();
-        warmer.panic_before_next_warm.store(true, Ordering::Release);
-        warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
-        assert!(
-            !snapshot.query_indexes_warm(),
-            "a failed warm must not publish a completed lazy index"
-        );
-
-        warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
-        assert!(
-            snapshot.query_indexes_warm(),
-            "the next schedule must retry and publish the lazy index"
         );
     }
 }

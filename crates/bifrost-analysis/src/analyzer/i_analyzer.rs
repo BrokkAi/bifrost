@@ -83,54 +83,64 @@ pub enum PersistedImportDirection {
 /// analyzer wrapper to its generic `TreeSitterAnalyzer`. Keeping the forwarding
 /// body singular prevents one language from silently retaining a different
 /// point/batch contract during the migration.
+#[doc(hidden)]
+#[macro_export]
 macro_rules! forward_relational_definition_batch {
     () => {
         fn relational_definition_batch(
             &self,
-            requests: &[crate::analyzer::RelationalDefinitionRequest],
-            cancellation: &crate::CancellationToken,
-        ) -> crate::analyzer::RelationalBatchOutcome {
-            crate::analyzer::RelationalDefinitionLookup::batch(&self.inner, requests, cancellation)
+            requests: &[$crate::analyzer::definition_lookup::RelationalDefinitionRequest],
+            cancellation: &$crate::CancellationToken,
+        ) -> $crate::analyzer::definition_lookup::RelationalBatchOutcome {
+            $crate::analyzer::definition_lookup::RelationalDefinitionLookup::batch(
+                &self.inner,
+                requests,
+                cancellation,
+            )
         }
 
         fn source_file_inventory(
             &self,
-        ) -> crate::analyzer::QueryBatch<crate::analyzer::ProjectFile> {
+        ) -> $crate::analyzer::QueryBatch<$crate::analyzer::ProjectFile> {
             self.inner.source_file_inventory()
         }
 
         fn workspace_declarations_with_primary_ranges(
             &self,
-            cancellation: &crate::CancellationToken,
-        ) -> Option<Vec<(crate::analyzer::CodeUnit, Option<crate::analyzer::Range>)>> {
+            cancellation: &$crate::CancellationToken,
+        ) -> Option<Vec<($crate::analyzer::CodeUnit, Option<$crate::analyzer::Range>)>> {
             self.inner
                 .workspace_declarations_with_primary_ranges(cancellation)
         }
 
-        fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
+        fn active_query_cancellation(&self) -> Option<$crate::CancellationToken> {
             self.inner.active_query_cancellation()
         }
 
         fn active_query_semantic_model_overlay(
             &self,
-        ) -> Option<Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        ) -> Option<Option<std::sync::Arc<$crate::analyzer::semantic_model::SemanticModelOverlay>>>
+        {
             self.inner.active_query_semantic_model_overlay()
         }
 
         fn active_query_semantic_model_snapshot(
             &self,
         ) -> Option<
-            Option<std::sync::Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+            Option<std::sync::Arc<$crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
         > {
             self.inner.active_query_semantic_model_snapshot()
         }
     };
 }
 
-pub(crate) use forward_relational_definition_batch;
+#[doc(hidden)]
+pub use crate::forward_relational_definition_batch;
 
 /// Forward the two Git-identity invalidation operations from a public language
 /// wrapper to its generic `TreeSitterAnalyzer`.
+#[doc(hidden)]
+#[macro_export]
 macro_rules! forward_file_identity_invalidation {
     () => {
         fn invalidate_cached_file_identities(&self) {
@@ -139,7 +149,7 @@ macro_rules! forward_file_identity_invalidation {
 
         fn invalidate_cached_file_identities_for(
             &self,
-            changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
+            changed_files: &std::collections::BTreeSet<$crate::analyzer::ProjectFile>,
         ) {
             self.inner
                 .invalidate_cached_file_identities_for(changed_files);
@@ -147,7 +157,8 @@ macro_rules! forward_file_identity_invalidation {
     };
 }
 
-pub(crate) use forward_file_identity_invalidation;
+#[doc(hidden)]
+pub use crate::forward_file_identity_invalidation;
 
 #[derive(Debug, Clone)]
 enum CompiledSymbolPatterns {
@@ -745,7 +756,8 @@ pub struct AnalyzerBuildTierAccess {
 }
 
 impl AnalyzerBuildTierAccess {
-    pub(crate) fn new_active() -> Self {
+    #[doc(hidden)]
+    pub fn new_active() -> Self {
         Self {
             active: std::sync::atomic::AtomicBool::new(true),
             tier_accesses: Default::default(),
@@ -834,7 +846,8 @@ fn tier_access_count_from(
 #[derive(Default)]
 pub struct AnalyzerSnapshotCaches {
     derived_layers: Arc<crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache>,
-    usage_graphs:
+    #[doc(hidden)]
+    pub usage_graphs:
         Arc<crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache>,
     java_usage_evidence:
         Arc<crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache>,
@@ -893,7 +906,8 @@ impl AnalyzerSnapshotCaches {
         &self.derived_layers
     }
 
-    pub(crate) fn usage_graphs(
+    #[doc(hidden)]
+    pub fn usage_graphs(
         &self,
     ) -> &crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache {
         &self.usage_graphs
@@ -935,7 +949,7 @@ impl AnalyzerSnapshotCaches {
         self.semantic_models.snapshot()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[crate::analyzer::Language],
@@ -1256,7 +1270,8 @@ pub(crate) fn record_query_incomplete_on_active_contexts(
 }
 
 /// Enumerate source identities independently of persisted parse-product readiness.
-pub(crate) fn project_source_file_inventory(
+#[doc(hidden)]
+pub fn project_source_file_inventory(
     analyzer: &(impl IAnalyzer + ?Sized),
 ) -> QueryBatch<ProjectFile> {
     let project = analyzer.project();
@@ -2460,7 +2475,8 @@ pub(crate) fn increment_test_hook_counter(counter: &AtomicUsize) {
     counter.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
-pub(crate) fn reset_test_hook_counter(counter: &AtomicUsize) {
+#[doc(hidden)]
+pub fn reset_test_hook_counter(counter: &AtomicUsize) {
     counter.store(0, AtomicOrdering::Relaxed);
 }
 
@@ -2815,10 +2831,8 @@ impl<'a> AnalyzerQueryScope<'a> {
 /// memoization is active, which is exactly what the syntax accessors demand.
 impl QueryScope for AnalyzerQueryScope<'_> {}
 
-pub(crate) fn with_query_scope<R>(
-    analyzer: &dyn IAnalyzer,
-    query: impl FnOnce(QueryToken<'_>) -> R,
-) -> R {
+#[doc(hidden)]
+pub fn with_query_scope<R>(analyzer: &dyn IAnalyzer, query: impl FnOnce(QueryToken<'_>) -> R) -> R {
     let scope = AnalyzerQueryScope::new(analyzer);
     query(scope.token())
 }
@@ -2890,7 +2904,8 @@ pub(crate) fn capture_usage_lookup_reads<T>(
 /// Callers must publish the subset their own replayable answer does not
 /// subsume. This helper is crate-private so only analyzer funnels, which own
 /// that result contract, can establish such a boundary.
-pub(crate) fn capture_nested_reads<T>(
+#[doc(hidden)]
+pub fn capture_nested_reads<T>(
     analyzer: &dyn IAnalyzer,
     read: impl FnOnce() -> T,
 ) -> (T, Vec<crate::analyzer::read_ledger::ReadKey>) {
@@ -2925,7 +2940,8 @@ fn capture_with_read_ledger_scope<T>(
 }
 
 /// Replay all dependencies of a completed query into its current caller.
-pub(crate) fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::ReadLedger) {
+#[doc(hidden)]
+pub fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::ReadLedger) {
     for key in reads.keys() {
         analyzer.record_read(key);
     }
@@ -3314,13 +3330,15 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
 
 #[cfg(test)]
 mod read_ledger_scope_tests {
-    use super::{
-        AnalyzerQueryContext, AnalyzerQueryScope, capture_nested_reads, capture_query_reads,
-        record_read_on_active_ledgers, record_unattributed_on_active_ledgers,
-    };
+
+    use super::AnalyzerQueryContext;
+
+    use super::record_read_on_active_ledgers;
+
+    use super::record_unattributed_on_active_ledgers;
     use crate::analyzer::read_ledger::{ReadKey, ReadLedger};
     use crate::analyzer::semantic::ids::StableDigest;
-    use brokk_bifrost_test_macros::hardwon;
+
     use std::sync::Arc;
 
     #[test]
@@ -3351,43 +3369,6 @@ mod read_ledger_scope_tests {
         assert_eq!(concurrent.unattributed_reads(), 1);
         assert_eq!(captured.keys(), vec![key]);
         assert_eq!(captured.unattributed_reads(), 1);
-    }
-
-    #[test]
-    #[hardwon("#2586: shared policy subject scans double-charged nested read ledgers")]
-    fn query_capture_preserves_nested_funnel_attribution_without_double_charging() {
-        let project = crate::inline_project::InlineTestProject::with_language(
-            crate::analyzer::Language::Rust,
-        )
-        .file("lib.rs", "fn work() {}")
-        .build();
-        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
-        let analyzer = workspace.analyzer();
-        let other = Arc::new(ReadLedger::new());
-        let enclosing = Arc::new(ReadLedger::new());
-        let _other_scope = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&other));
-        let _enclosing_scope =
-            AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&enclosing));
-        let internal = ReadKey::Configuration(StableDigest::sha256(b"implementation"));
-        let published = ReadKey::Configuration(StableDigest::sha256(b"replayable answer"));
-        let (answer, captured) = capture_query_reads(analyzer, || {
-            capture_nested_reads(analyzer, || {
-                analyzer.record_read(internal.clone());
-                analyzer.record_unattributed_read();
-            });
-            analyzer.record_read(published.clone());
-            analyzer.record_unattributed_read();
-            42
-        });
-        assert_eq!(answer, 42);
-        assert_eq!(captured.keys(), vec![published.clone()]);
-        assert_eq!(enclosing.keys(), vec![published.clone()]);
-        assert_eq!(captured.unattributed_reads(), 1);
-        assert_eq!(enclosing.unattributed_reads(), 1);
-        let mut expected = vec![internal, published];
-        expected.sort();
-        assert_eq!(other.keys(), expected);
-        assert_eq!(other.unattributed_reads(), 2);
     }
 }
 

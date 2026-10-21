@@ -55,6 +55,7 @@ pub(in crate::analyzer::store) fn visit_rust_reference_context_pages(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "rust_context_tests.rs"]
-mod tests;
+#[doc(hidden)]
+pub mod tests;

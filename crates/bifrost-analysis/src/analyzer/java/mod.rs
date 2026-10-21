@@ -1,5 +1,7 @@
-mod adapter;
+#[doc(hidden)]
+pub mod adapter;
 mod annotation;
+use self::source_facts::JavaSourceFacts;
 pub use annotation::{
     JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, resolve_java_annotation_type,
 };
@@ -29,7 +31,8 @@ pub(super) mod native_usages;
 #[cfg(any(test, feature = "test-support"))]
 pub(super) mod selected_reverse;
 mod semantic;
-mod source_facts;
+#[doc(hidden)]
+pub mod source_facts;
 pub(crate) mod source_publication;
 pub(crate) mod source_storage;
 mod structural;
@@ -210,7 +213,8 @@ impl JavaAnalyzer {
         )
     }
 
-    pub(crate) fn new_with_config_store_context(
+    #[doc(hidden)]
+    pub fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
@@ -1287,52 +1291,205 @@ fn statement_nested_procedure(node: tree_sitter::Node<'_>) -> bool {
     )
 }
 
+impl crate::analyzer::multi_analyzer::LanguageAnalyzer for JavaAnalyzer {
+    fn analyzer(&self) -> &dyn IAnalyzer {
+        self
+    }
+
+    fn program_semantics_provider(
+        &self,
+    ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
+        self
+    }
+
+    fn clone_with_project(
+        &self,
+        project: Arc<dyn Project>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(JavaAnalyzer::clone_with_project(self, project))
+    }
+
+    fn clone_for_index_warm(
+        &self,
+        project: Arc<dyn Project>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(JavaAnalyzer::clone_for_index_warm(self, project))
+    }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn crate::analyzer::TypeHierarchyProvider> {
+        Some(self)
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn crate::analyzer::TypeAliasProvider> {
+        IAnalyzer::type_alias_provider(self)
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        Some(self)
+    }
+
+    fn update(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(IAnalyzer::update(self, changed_files))
+    }
+
+    fn update_all_with_progress(
+        &self,
+        progress: Option<BuildProgress>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(JavaAnalyzer::update_all_with_progress(self, progress))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(Clone::clone(self))
+    }
+}
+
 pub(crate) struct JavaSupport;
 
 impl LanguageSupport for JavaSupport {
-    fn numeric_promotion(&self, operands: &[Option<&str>]) -> Option<&'static str> {
-        // JLS 5.6.1/5.6.2: unbox, then promote byte/short/char to int;
-        // otherwise double, float and long dominate in that order.
-        // JLS 15.22.2 also admits the all-boolean bitwise case.
-        let mut rank = 0;
-        let mut booleans = 0;
-        for operand in operands {
-            let next = match (*operand)? {
-                "byte"
-                | "short"
-                | "char"
-                | "int"
-                | "java.lang.Byte"
-                | "java.lang.Short"
-                | "java.lang.Character"
-                | "java.lang.Integer" => 1,
-                "long" | "java.lang.Long" => 2,
-                "float" | "java.lang.Float" => 3,
-                "double" | "java.lang.Double" => 4,
-                "boolean" | "java.lang.Boolean" => {
-                    booleans += 1;
-                    continue;
-                }
-                _ => return None,
-            };
-            rank = rank.max(next);
-        }
-        if booleans != 0 {
-            return (booleans == operands.len()).then_some("boolean");
-        }
-        match rank {
-            1 => Some("int"),
-            2 => Some("long"),
-            3 => Some("float"),
-            4 => Some("double"),
-            _ => None,
-        }
+    #[cfg(any(test, feature = "test-support"))]
+    fn probe_assignment_value(
+        &self,
+        query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+        _request: &brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest,
+        _cancellation: &crate::CancellationToken,
+    ) -> Result<
+        Option<
+            crate::analyzer::usages::get_definition::BoundedResolution<
+                crate::analyzer::native_points::NativeAssignmentValueProbe,
+            >,
+        >,
+        String,
+    > {
+        use crate::analyzer::native_points::probe_jvm_assignment_value;
+        use crate::analyzer::resolve_analyzer;
+        let analyzer = query.analyzer;
+
+        Ok(Some(probe_jvm_assignment_value(
+            resolve_analyzer::<crate::analyzer::JavaAnalyzer>(analyzer)
+                .ok_or("assignment-value probe has no Java analyzer")?
+                .inner(),
+            query,
+        )))
     }
 
-    fn string_concatenation_operand(&self, operands: &[Option<&str>]) -> Option<usize> {
-        operands
-            .iter()
-            .position(|operand| *operand == Some("java.lang.String"))
+    #[cfg(any(test, feature = "test-support"))]
+    fn selected_reverse_reference_file<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+        _target_analyzer: &'a dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> crate::analyzer::store::Result<
+        crate::analyzer::structural::reference_edges::SelectedReferenceFileProjection<'a>,
+    > {
+        let caller = resolve_analyzer::<JavaAnalyzer>(analyzer).ok_or_else(|| {
+            crate::analyzer::store::StoreError::new(format!(
+                "selected reverse caller analyzer is unavailable: {file}"
+            ))
+        })?;
+        crate::analyzer::structural::reference_edges::SelectedReferenceFileProjection::new(
+            caller,
+            analyzer,
+            file,
+            |source| {
+                caller
+                    .inner
+                    .source_matches_selected_native_content(file, source)
+            },
+        )
+    }
+
+    fn build_model_provider(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::topology::BuildModelProvider> {
+        Some(&crate::analyzer::jvm::topology::JVM_BUILD_MODEL)
+    }
+
+    fn workspace_external_member_family(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        identity: &brokk_bifrost_jvm::realm::JvmExternalMemberIdentity,
+        max_visits: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
+        if let Some(language) = [Language::Kotlin, Language::Scala]
+            .into_iter()
+            .find(|language| workspace.languages().contains(language))
+        {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
+                crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
+                    language,
+                ),
+                0,
+            );
+        }
+        let Some(java) = crate::analyzer::resolve_analyzer::<JavaAnalyzer>(workspace) else {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
+        };
+        java.resolve_external_member_family(workspace, identity, max_visits, cancellation)
+    }
+
+    fn workspace_semantic_diagnostics(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<crate::analyzer::SemanticDiagnosticReport> {
+        Some(diagnostics::collect_java_semantic_diagnostics(
+            workspace, token, file, source,
+        ))
+    }
+
+    fn knowledge(
+        &self,
+    ) -> &'static dyn brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge {
+        &brokk_bifrost_jvm::JavaKnowledge
+    }
+
+    fn build_analyzer(
+        &self,
+        project: Arc<dyn crate::analyzer::Project>,
+        config: crate::analyzer::AnalyzerConfig,
+        store_context: crate::analyzer::AnalyzerStoreContext,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Result<crate::analyzer::multi_analyzer::AnalyzerDelegate, crate::analyzer::store::StoreError>
+    {
+        Ok(crate::analyzer::multi_analyzer::AnalyzerDelegate::new(
+            JavaAnalyzer::new_with_config_store_context(project, config, store_context, progress)?,
+        ))
+    }
+
+    fn is_configuration_input(&self, file: &ProjectFile) -> bool {
+        crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
+    }
+
+    fn workspace_member_family_capability(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        crate::analyzer::usages::java_member_family_capability(workspace, member)
+    }
+
+    fn workspace_member_family(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        member: &CodeUnit,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::java_member_family(workspace, workspace, member, cancellation)
     }
 
     fn native_member_attribution(
@@ -1343,7 +1500,6 @@ impl LanguageSupport for JavaSupport {
         Some(crate::analyzer::jvm::native_member_attribution(context))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn native_non_reference_site(&self, node: tree_sitter::Node<'_>) -> bool {
         node.parent().is_some_and(|parent| {
             parent.child_by_field_name("name") == Some(node)
@@ -1376,10 +1532,6 @@ impl LanguageSupport for JavaSupport {
 
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
         crate::analyzer::jvm::is_jvm_configuration_input_path(path)
-    }
-
-    fn language(&self) -> Language {
-        Language::Java
     }
 
     fn explicit_import_model_target(
@@ -1524,12 +1676,135 @@ impl LanguageSupport for JavaSupport {
         UsageEcosystem::Jvm
     }
 
+    fn dependency_pack_resolver(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::semantic_model::DependencyResolver> {
+        Some(&crate::analyzer::jvm::dependency_packs::JvmDependencyResolver)
+    }
+
+    fn is_file_dependency_input(&self, path: &std::path::Path) -> bool {
+        crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input_path(path)
+    }
+
+    fn configure_dependency_workspace(
+        &self,
+        config: &mut crate::analyzer::AnalyzerConfig,
+        project_root: &std::path::Path,
+    ) -> Result<(), crate::analyzer::store::StoreError> {
+        crate::analyzer::jvm::dependency_packs::configure_dependency_workspace(config, project_root)
+    }
+
+    fn dependency_source_artifacts(
+        &self,
+        config: &crate::analyzer::AnalyzerConfig,
+        project_root: &std::path::Path,
+        outcomes: &[crate::analyzer::workspace::DependencyPackEcosystemOutcome],
+    ) -> Option<
+        crate::hash::HashMap<
+            std::path::PathBuf,
+            crate::analyzer::semantic_model::SemanticModelActivationEvidence,
+        >,
+    > {
+        crate::analyzer::jvm::dependency_packs::prepared_jdk_artifacts_for_source_bindings(
+            config,
+            project_root,
+            outcomes,
+        )
+    }
+
     fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
         &JAVA_USAGE_STRATEGY
     }
 
+    fn bounded_type_resolution(
+        &self,
+        definitions: &crate::analyzer::AnalyzerDefinitionLookup<'_>,
+        language: Language,
+        query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> Option<
+        crate::analyzer::usages::get_definition::BoundedResolution<
+            crate::analyzer::usages::get_type::TypeLookupOutcome,
+        >,
+    > {
+        definitions.set_language(language);
+        let session = crate::analyzer::usages::get_definition::java::JavaResolutionSession::bounded(
+            definitions,
+            query.budget,
+            None,
+        );
+        Some(
+            crate::analyzer::usages::get_type::java::resolve_java_type_bounded(
+                query.analyzer,
+                &session,
+                query.file,
+                query.source,
+                query.tree,
+                query.site,
+            ),
+        )
+    }
+
     fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
         crate::analyzer::languages::LanguageGraphBackend::Legacy(&JavaEdgePass)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn trial_definition(
+        &self,
+        query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> Option<crate::analyzer::usages::get_definition::DefinitionResolution> {
+        crate::analyzer::usages::get_definition::java::trial_definition(query)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_definition_dispatch<'a>(
+        &self,
+        analyzer: &'a dyn crate::analyzer::IAnalyzer,
+        token: crate::analyzer::QueryToken<'_>,
+        context: &mut crate::analyzer::usages::get_definition::DefinitionBatchContext<'a, '_>,
+        request: &crate::analyzer::usages::get_definition::DefinitionLookupRequest,
+        source: &std::sync::Arc<str>,
+        tree: &Option<tree_sitter::Tree>,
+        site: &crate::analyzer::usages::get_definition::ResolvedReferenceSite,
+        operation: Option<crate::navigation::NavigationOperation>,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+        go_session: Option<&crate::analyzer::usages::get_definition::ResolutionSession>,
+    ) -> std::ops::ControlFlow<
+        crate::analyzer::usages::get_definition::DefinitionResolution,
+        crate::analyzer::usages::get_definition::DefinitionResolution,
+    > {
+        crate::analyzer::usages::get_definition::java::resolve_definition_dispatch(
+            analyzer,
+            token,
+            context,
+            request,
+            source,
+            tree,
+            site,
+            operation,
+            cancellation,
+            go_session,
+        )
+    }
+
+    fn definition_call_reference_candidate(&self, node: tree_sitter::Node<'_>) -> bool {
+        crate::analyzer::usages::get_definition::java::java_call_reference_candidate(node)
+    }
+
+    fn definition_boundary_evidence(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        token: crate::analyzer::QueryToken<'_>,
+        file: &crate::analyzer::ProjectFile,
+        name: &str,
+    ) -> Option<(
+        crate::analyzer::structural::resolution::BoundaryStatus,
+        Option<String>,
+    )> {
+        use crate::analyzer::{JavaAnalyzer, resolve_analyzer};
+        resolve_analyzer::<JavaAnalyzer>(analyzer).map(|java| {
+            java.external_boundary_evidence(token, analyzer.semantic_model_overlay(), file, name)
+        })
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1537,18 +1812,6 @@ impl LanguageSupport for JavaSupport {
             strategy: Some(&JAVA_USAGE_STRATEGY),
             bulk: Some(&JavaDeadCodeBulk),
         }
-    }
-
-    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
-        tree_sitter_java::LANGUAGE.into()
-    }
-
-    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC
-    }
-
-    fn highlight_query(&self) -> Option<&'static str> {
-        Some(tree_sitter_java::HIGHLIGHTS_QUERY)
     }
 }
 

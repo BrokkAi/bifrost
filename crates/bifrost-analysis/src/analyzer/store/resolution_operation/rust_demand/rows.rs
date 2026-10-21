@@ -1,24 +1,24 @@
 //! One endpoint's finite crate-row plan. Nothing here is retained by a selection.
-use super::super::rust_crate_context::{self as sql, Module};
-use super::super::rust_crate_rows::{RustCrateDeclaration, RustCrateExport, RustCrateRows};
-use super::super::rust_prefix::{RustQualifiedPrefix, resolve_rust_type_prefix};
-use super::super::*;
-use crate::analyzer::resolution::{
-    BatchCandidateRequest, EndpointSignature, FactResolutionAnswer, StackPattern, mounted_site_node,
+use super::super::demand_closure::{
+    ClosureTag, ExportHydration, HalfBoundary, HalfObservation, PlacementFacts, PlacementStart,
+    RouteLocation, StartSelection, WalkCursor,
 };
+use super::super::rust_crate_context::{self as sql, Module};
+use super::super::rust_crate_rows::{RustCrateDeclaration, RustCrateRows};
+use super::super::rust_prefix::resolve_rust_type_prefix;
+use super::super::*;
+use crate::analyzer::resolution::DemandReferenceKey;
+use crate::analyzer::resolution::{FactResolutionAnswer, mounted_site_node};
 use crate::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION;
 use rusqlite::{OptionalExtension, params};
 
-pub(crate) struct RowRootPlan {
-    pub(crate) halves: Vec<SelectedRootPathHalf>,
-    pub(crate) prefixes: Vec<RustQualifiedPrefix>,
-    pub(crate) completion: ResolutionCompletion,
-}
+pub(crate) type RowRootPlan = super::super::demand_closure::RootFrame;
 
 pub(super) struct EndpointRows<'a, 'store, 'input> {
     pub(super) ready: &'a ReadySelectedResolution<'store, 'input>,
     pub(super) base: &'a dyn BatchResolutionFragmentSource,
     pub(super) cancellation: &'a CancellationToken,
+    pub(super) session: &'a ResolutionSession,
     pub(super) topologies: &'a [i64],
 }
 
@@ -27,30 +27,66 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
         SelectedMountTable::new(&self.ready.inventory)
     }
 
-    /// The canonical lookup recipe one sealed demand names, or `None` when
-    /// reading it was cancelled.
-    ///
-    /// A cancelled read used to be reported as a store error, and the point
-    /// entry turns a store error into an unavailable answer rather than a
-    /// cancelled one. Nothing reached it until the cancellation checks a
-    /// per-mount identity-catalog walk used to consume went away.
-    fn recipe(
+    /// Read one certified owner at a time; shared code schedules the lexical
+    /// chain. These recursive module-target projections remain temporary
+    /// private authorities until the context producer publishes direct rows.
+    fn route_starts(
         &self,
-        fragment: BindingFragmentId,
-        semantic: SemanticId,
-    ) -> Result<Option<ResolutionLookupSemanticRecipe>> {
-        let source = self.ready.lexical_source();
-        let request = SelectedLookupRecipeRequest { fragment, semantic };
-        let SelectedLookupRecipeReadOutcome::Ready(rows) =
-            source.lookup_semantic_recipes(&[request], self.cancellation, None)?
-        else {
-            return Ok(None);
-        };
-        rows.into_vec()
-            .pop()
-            .flatten()
-            .map(Some)
-            .ok_or_else(|| StoreError::corrupt("sealed demand has no lookup recipe"))
+        module: &Module,
+        scope: ResolutionScopeId,
+        name: &str,
+    ) -> Result<StartSelection> {
+        let conn = self.ready.inventory.connection();
+        // A source prefix with a selected dependency root already has a
+        // certified start outside the requester's lexical owner. Its proof
+        // must not inherit that owner's unrelated open module inventory.
+        // Likewise, structural module anchors never look up a lexical binder.
+        if sql::is_module_anchor(name) {
+            let recipe = ResolutionLookupSemanticRecipe::new(
+                Language::Rust,
+                ResolutionNamespace::Type,
+                name,
+            );
+            return Ok(StartSelection {
+                locations: vec![RouteLocation::Container {
+                    unit: module.topology,
+                    container: module.path.clone(),
+                }],
+                scopes: Vec::new(),
+                blocks_fallback: true,
+                head: Some(recipe),
+                lexical: None,
+            });
+        }
+        let dependencies = conn
+            .prepare_cached(sql::DEPENDENCY.as_str())?
+            .query_map(
+                params![module.topology, name, RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                |row| Ok((row.get::<_, i64>(0)?, "crate".to_owned())),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !dependencies.is_empty() {
+            return Ok(super::super::demand_closure::LexicalRouteStarts {
+                locations: dependencies,
+                scopes: Vec::new(),
+                blocks_fallback: true,
+            }
+            .into());
+        }
+        Ok(StartSelection {
+            locations: Vec::new(),
+            scopes: Vec::new(),
+            blocks_fallback: false,
+            head: None,
+            lexical: Some(super::super::demand_closure::LexicalStartRequest {
+                scope,
+                lookup: ResolutionLookupSemanticRecipe::new(
+                    Language::Rust,
+                    ResolutionNamespace::Type,
+                    name,
+                ),
+            }),
+        })
     }
 
     /// The module placements a root half of `fragment` is asked in, and the
@@ -100,200 +136,125 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
         target: (i64, String, String),
         demand: &ResolutionLookupSemanticRecipe,
         completion: &ResolutionCompletion,
-    ) -> Result<
-        Option<(
-            Vec<(
-                SelectedRootPathHalf,
-                ResolutionLookupSemanticRecipe,
-                ResolutionCompletion,
-            )>,
-            ResolutionCompletion,
-        )>,
-    > {
+    ) -> Result<Option<ExportHydration>> {
         let rows = RustCrateRows { ready: self.ready };
-        let mut bridges = Vec::new();
-        let mut path_completions = Vec::new();
-        let mut exports = rows.crate_exports(
+        // An admitted alias endpoint can coexist with an open or ambiguous
+        // source binding. Finding its declaration does not close that source.
+        let binding_inventory = rows.crate_binding_inventory(
             module,
             target.0,
             &target.1,
             sql::namespace(demand.namespace()),
             &target.2,
         )?;
+        let completion = completion.combine(&binding_inventory.completion);
+        let mut exports = rows.crate_exports_from_inventory(
+            module,
+            target.0,
+            &target.1,
+            sql::namespace(demand.namespace()),
+            &target.2,
+            &binding_inventory,
+        )?;
         exports.sort_unstable();
         exports.dedup();
-        let mut cancelled = false;
-        let mut definitions = Vec::new();
-        let mut unstaged = ResolutionCompletion::Complete;
-        for RustCrateExport {
-            blob,
-            declaration,
-            mount: ordinal,
-            ..
-        } in exports
-        {
-            let mount = self.mount_table().mount_by_ordinal(ordinal)?;
-            match declaration {
-                // Crate rows name ordinary declaration sites; the selected
-                // reader validates their catalog authority before reading
-                // candidate paths. This source site belongs to the actual
-                // selected content.
-                RustCrateDeclaration::Site(site) => {
-                    let semantic = crate::analyzer::resolution::mounted_site_semantic(
-                        mount.fragment(),
-                        ResolutionSiteId::new(site),
-                    );
-                    let Some(node) = self
-                        .base
-                        .lookup_definition_node(semantic, self.cancellation)?
-                    else {
-                        // The row proves the name is declared here; the file's
-                        // lowering withheld the declaration, so this is not an
-                        // absence.
-                        unstaged = unstaged.combine(
-                            &super::super::rust_crate_context::unlowered_export_declaration(
-                                &self.ready.context_identities,
-                                mount.persisted_relative_path(),
-                                site,
-                            ),
-                        );
-                        continue;
-                    };
-                    assert_eq!(
-                        node,
-                        mounted_site_node(mount.fragment(), ResolutionSiteId::new(site))
-                    );
-                    definitions.push(node);
-                }
-                // An item the crate declared for a decided passthrough
-                // invocation is defined by the invoking file's capsule, which
-                // lowered the item at the byte range where replay declared
-                // its name. The request staged that capsule when a name its
-                // files spell is the item's. One that did not -- a re-export
-                // chain renamed the item on the way -- finds no staged
-                // definition, and says so: the module's export inventory is
-                // closed, so an empty answer here would read as an absence. A
-                // module item never has a capsule definition (see
-                // `MACRO_ITEM_NAME_RANGE`); the crate route steps through it
-                // by `MACRO_ITEM_MODULE`, and a reference to the module
-                // itself answers incomplete the same way.
+        use super::super::demand_closure::{ExportDeclaration, export_definitions};
+        enum MissingDeclaration {
+            Unlowered {
+                path: String,
+                site: u32,
+            },
+            Unstaged {
+                blob: i64,
+                declaration: i64,
+                module: bool,
+            },
+        }
+        let declarations = exports.into_iter().map(|export| {
+            let mount = self.mount_table().mount_by_ordinal(export.mount)?;
+            Ok(match export.declaration {
+                RustCrateDeclaration::Site(site) => (
+                    ExportDeclaration::SelectedSite {
+                        semantic: crate::analyzer::resolution::mounted_site_semantic(
+                            mount.fragment(),
+                            ResolutionSiteId::new(site),
+                        ),
+                        node: mounted_site_node(mount.fragment(), ResolutionSiteId::new(site)),
+                    },
+                    MissingDeclaration::Unlowered {
+                        path: mount.persisted_relative_path().to_owned(),
+                        site,
+                    },
+                ),
                 RustCrateDeclaration::MacroItem(declaration) => {
                     let (start, end, module) = self
                         .ready
                         .inventory
                         .connection()
                         .prepare_cached(sql::MACRO_ITEM_NAME_RANGE)?
-                        .query_row(params![blob, declaration], |row| {
+                        .query_row(params![export.blob, declaration], |row| {
                             Ok((
                                 row.get::<_, usize>(0)?,
                                 row.get::<_, usize>(1)?,
                                 row.get::<_, bool>(2)?,
                             ))
                         })?;
-                    let Some(staged) = self.ready.lexical_source().stage_definitions_at_range(
-                        ordinal,
-                        start,
-                        end,
-                        self.cancellation,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    if staged.is_empty() {
-                        unstaged = unstaged.combine(&sql::unstaged_macro_item(
-                            &self.ready.context_identities,
-                            blob,
+                    (
+                        ExportDeclaration::GeneratedRange {
+                            mount: export.mount,
+                            start,
+                            end,
+                        },
+                        MissingDeclaration::Unstaged {
+                            blob: export.blob,
                             declaration,
                             module,
-                        ));
-                    }
-                    definitions.extend(staged.into_iter().map(|(_, node)| node));
+                        },
+                    )
                 }
-            }
-        }
-        for node in definitions {
-            let endpoint =
-                EndpointSignature::new(node, StackPattern::closed([]), StackPattern::closed([]));
-            let anchors = self.ready.lexical_source();
-            self.base.visit_reverse_candidate_match_pages(
-                &[BatchCandidateRequest::new(0, endpoint)],
-                self.cancellation,
-                &mut |page| {
-                    let ids = page.iter().map(|row| row.candidate()).collect::<Vec<_>>();
-                    for (id, path) in self.base.hydrate_candidate_paths(&ids, self.cancellation)? {
-                        let Some(
-                            export_half @ SelectedRootPathHalf::Export {
-                                demand: export_demand,
-                                ..
-                            },
-                        ) = classify_selected_root_path_half(
-                            &anchors,
-                            id,
+            })
+        });
+        let Some((definitions, unstaged)) = export_definitions(
+            self.session,
+            self.ready,
+            self.base,
+            self.cancellation,
+            declarations,
+            |missing| {
+                Ok(match missing {
+                    MissingDeclaration::Unlowered { path, site } => {
+                        sql::unlowered_export_declaration(
+                            &self.ready.context_identities,
                             &path,
-                            self.cancellation,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let Some(target_demand) = self.recipe(id.fragment(), export_demand)? else {
-                            cancelled = true;
-                            return Ok(false);
-                        };
-                        if target_demand.namespace() != demand.namespace() {
-                            continue;
-                        }
-                        path_completions.push(path.completion().clone());
-                        bridges.push((export_half, target_demand, completion.clone()));
+                            site,
+                        )
                     }
-                    Ok(!self.cancellation.is_cancelled())
-                },
-            )?;
-            if cancelled {
-                return Ok(None);
-            }
-        }
-        // Close both export and path evidence in one query-owned SQL batch.
-        // Keep the caller's completion separate, as the former closure did.
-        let mut completions = Vec::with_capacity(bridges.len() * 2);
-        for ((half, _, _), path) in bridges.iter().zip(path_completions) {
-            let SelectedRootPathHalf::Export {
-                incomplete_reasons, ..
-            } = half
-            else {
-                unreachable!("export query collects export halves");
-            };
-            completions.push(if incomplete_reasons.is_empty() {
-                ResolutionCompletion::Complete
-            } else {
-                ResolutionCompletion::incomplete(incomplete_reasons.iter().copied())
-            });
-            completions.push(path);
-        }
-        let Some(closed) = self
-            .ready
-            .lexical_source()
-            .close_completions(&completions, self.cancellation)?
+                    MissingDeclaration::Unstaged {
+                        blob,
+                        declaration,
+                        module,
+                    } => sql::unstaged_macro_item(
+                        &self.ready.context_identities,
+                        blob,
+                        declaration,
+                        module,
+                    ),
+                })
+            },
+        )?
         else {
             return Ok(None);
         };
-        let mut closed = closed.into_iter();
-        for (half, _, evidence) in &mut bridges {
-            let SelectedRootPathHalf::Export {
-                incomplete_reasons, ..
-            } = half
-            else {
-                unreachable!("export query collects export halves");
-            };
-            *incomplete_reasons = match closed.next().expect("export completion") {
-                ResolutionCompletion::Complete => Box::new([]),
-                ResolutionCompletion::Incomplete(reasons) => reasons.iter().copied().collect(),
-            };
-            *evidence = evidence
-                .combine(&closed.next().expect("path completion"))
-                .combine(&unstaged);
-        }
-        assert!(closed.next().is_none());
-        Ok(Some((bridges, unstaged)))
+        super::super::demand_closure::hydrate_exports(
+            self.session,
+            self.ready,
+            self.base,
+            self.cancellation,
+            definitions,
+            demand.namespace(),
+            &completion,
+            unstaged,
+        )
     }
 }
 
@@ -320,7 +281,7 @@ pub(super) const REVERSE_EXPORTED_NAMES: &str = "WITH RECURSIVE names(topology_i
  CROSS JOIN code_units AS unit ON unit.blob_id=mapping.blob_id AND unit.unit_key=mapping.unit_key
  CROSS JOIN source_rust_declaration_properties AS properties
   ON properties.blob_id=authority.blob_id AND properties.declaration_id=authority.declaration
- CROSS JOIN selected_rust_module_placements AS placement
+ CROSS JOIN selected_rust_container_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=placement.topology_id
@@ -371,961 +332,1086 @@ pub(super) const REVERSE_EXPORTED_NAMES: &str = "WITH RECURSIVE names(topology_i
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=imports.summary_id
 ) SELECT DISTINCT namespace, name FROM names";
 
-impl EndpointRows<'_, '_, '_> {
-    /// Close one endpoint plan's root bridges, or `None` when the read was
-    /// cancelled part way.
-    pub(super) fn close(
-        &self,
-        plan: &RowRootPlan,
-        inputs: &[(SemanticId, &FactResolutionAnswer)],
-    ) -> Result<Option<Vec<SelectedRootBridgeDescriptor>>> {
+pub(crate) struct RustHalfRows<'a, 'store, 'input> {
+    rows: EndpointRows<'a, 'store, 'input>,
+    source: &'a super::super::demand_closure::SourceHalf,
+    plan: &'a RowRootPlan,
+    scope_ordinals: &'a crate::analyzer::store::resolution_lexical::NodeSourceScopes,
+    lexical: &'a dyn super::super::demand_closure::HalfSource,
+    modules: Vec<Module>,
+    resolved: Option<super::super::rust_prefix::RustQualifiedPrefixResolution>,
+    source_completion: ResolutionCompletion,
+    known_prefix: bool,
+    import_root_name: Option<String>,
+    root_names_a_workspace_crate: bool,
+    external_root_bindings: Vec<SemanticId>,
+    external_type_import_scopes: Vec<(i64, u32)>,
+    prefix_spelling: Option<String>,
+    prefix_kind: super::super::rust_crate_context::RoutePrefixKind,
+    local_type_prefix_is_decided: bool,
+    prefix_scope: BindingNodeId,
+    placed_topologies: Vec<i64>,
+    prefix_has_no_placements: bool,
+    fallback_name: Option<String>,
+}
+impl<'a, 'store, 'input> EndpointRows<'a, 'store, 'input> {
+    pub(super) fn half(
+        self,
+        source: &'a super::super::demand_closure::SourceHalf,
+        plan: &'a RowRootPlan,
+        scope_ordinals: &'a crate::analyzer::store::resolution_lexical::NodeSourceScopes,
+        lexical: &'a dyn super::super::demand_closure::HalfSource,
+        inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+    ) -> Result<RustHalfRows<'a, 'store, 'input>> {
         let conn = self.ready.inventory.connection();
-        let lexical = self.ready.lexical_source();
-        let rows = RustCrateRows { ready: self.ready };
-        let Some(scope_ordinals) = lexical.node_scope_ordinals(
-            plan.halves
+        let identity = source.identity;
+        let scope = source.scope;
+        let prefix = source.prefix;
+        let prefix_scope_head = source.prefix_scope_head;
+        let route = &source.route;
+        let demand = &source.demand;
+        let resolved = prefix.map(|prefix| {
+            let (_, answer) = inputs
                 .iter()
-                .filter_map(|half| match half {
-                    SelectedRootPathHalf::Import {
-                        source_scope_head, ..
-                    }
-                    | SelectedRootPathHalf::Reference {
-                        source_scope_head, ..
-                    } => Some(*source_scope_head),
-                    SelectedRootPathHalf::Export { .. } => None,
-                })
-                .chain(plan.halves.iter().filter_map(|half| match half {
-                    SelectedRootPathHalf::Reference {
-                        lexical_scope_head: Some(scope_head),
-                        ..
-                    } => Some(*scope_head),
-                    _ => None,
-                })),
-            self.cancellation,
-        )?
-        else {
-            return Ok(None);
+                .find(|(reference, _)| *reference == DemandReferenceKey::caller(prefix))
+                .expect("scheduler supplies every prefix");
+            resolve_rust_type_prefix(answer)
+        });
+        // Placements are alternative justifications for one canonical
+        // export. Close their evidence before issuing its immutable cell.
+        let mut pending_completion = ResolutionCompletion::Complete;
+        let mut known_prefix = false;
+        // An import half with no route segments names the path root
+        // itself: `use serde as s;` and `use serde::{self as s};` bind `s`
+        // to the crate that `serde` names, which in Rust 2018 is an entry
+        // of the extern prelude. The half's own stack spells the demand,
+        // which an alias renames, so the root's spelling is the import
+        // fact's target name, the same relation the import-gap join below
+        // reads. A route with segments already carries the root in
+        // `route[0]`.
+        let import_root_name = None;
+        // Both are the half's, not one module placement's. A file this
+        // fragment's modules place more than once asks the route-head
+        // question once per placement, and only the placement whose
+        // topology declares the dependency can bind the root; claiming the
+        // boundary per placement said a workspace crate left the
+        // workspace. The graph route's copy of this guard says the same
+        // thing (`rust_crate_context.rs`), and the two must not drift.
+        let root_names_a_workspace_crate = false;
+        let external_root_bindings = Vec::new();
+        let external_type_import_scopes = Vec::new();
+        let prefix_spelling = if let Some(prefix) = prefix {
+            self.ready
+                .rust_prefix_spellings(&self.ready.lexical_source(), &[prefix], self.cancellation)?
+                .remove(&prefix)
+        } else {
+            None
         };
-        let mut descriptors = Vec::new();
-        for half in &plan.halves {
-            let (
-                identity,
-                scope,
-                token,
-                demand_id,
-                route_ids,
-                anchor,
-                anchor_semantic,
-                prefix,
-                prefix_scope_head,
-            ) = match half {
-                SelectedRootPathHalf::Import {
-                    identity,
-                    source_scope_head,
-                    token,
-                    demand,
-                    route,
-                    anchor,
-                    anchor_semantic,
-                    ..
-                } => (
-                    *identity,
-                    *source_scope_head,
-                    *token,
-                    *demand,
-                    route,
-                    *anchor,
-                    *anchor_semantic,
-                    None,
-                    None,
-                ),
-                SelectedRootPathHalf::Reference {
-                    identity,
-                    source_scope_head,
-                    token,
-                    demand,
-                    route,
-                    anchor,
-                    anchor_semantic,
-                    prefix_reference,
-                    lexical_scope_head,
-                    ..
-                } => (
-                    *identity,
-                    *source_scope_head,
-                    *token,
-                    *demand,
-                    route,
-                    *anchor,
-                    *anchor_semantic,
-                    *prefix_reference,
-                    *lexical_scope_head,
-                ),
-                _ => unreachable!("one source endpoint plan contains only source halves"),
-            };
-            let Some(demand) = self.recipe(identity.fragment(), demand_id)? else {
-                return Ok(None);
-            };
-            let Some(route) = route_ids
-                .iter()
-                .map(|id| self.recipe(identity.fragment(), *id))
-                .collect::<Result<Option<Vec<_>>>>()?
-            else {
-                return Ok(None);
-            };
-            let is_import = matches!(half, SelectedRootPathHalf::Import { .. });
-            let resolved = prefix.map(|prefix| {
-                let (_, answer) = inputs
-                    .iter()
-                    .find(|(reference, _)| *reference == prefix)
-                    .expect("scheduler supplies every prefix");
-                resolve_rust_type_prefix(answer)
-            });
-            // Placements are alternative justifications for one canonical
-            // export. Close their evidence before issuing its immutable cell.
-            let mut authorities: HashMap<
-                _,
-                (
-                    SelectedRootPathHalf,
-                    ResolutionLookupSemanticRecipe,
-                    ResolutionCompletion,
-                ),
-            > = HashMap::default();
-            let mut pending_completion = ResolutionCompletion::Complete;
-            let mut known_prefix = false;
-            // An import half with no route segments names the path root
-            // itself: `use serde as s;` and `use serde::{self as s};` bind `s`
-            // to the crate that `serde` names, which in Rust 2018 is an entry
-            // of the extern prelude. The half's own stack spells the demand,
-            // which an alias renames, so the root's spelling is the import
-            // fact's target name, the same relation the import-gap join below
-            // reads. A route with segments already carries the root in
-            // `route[0]`.
-            let mut import_root_name = None;
-            // Both are the half's, not one module placement's. A file this
-            // fragment's modules place more than once asks the route-head
-            // question once per placement, and only the placement whose
-            // topology declares the dependency can bind the root; claiming the
-            // boundary per placement said a workspace crate left the
-            // workspace. The graph route's copy of this guard says the same
-            // thing (`rust_crate_context.rs`), and the two must not drift.
-            let mut route_reached_a_target = false;
-            let mut root_names_a_workspace_crate = false;
-            let mut external_root_bindings = Vec::new();
-            let mut external_type_import_scopes = Vec::new();
-            let mut answered_placements = 0_usize;
-            let mut member_bridges = Vec::new();
-            let prefix_spelling = if let Some(prefix) = prefix {
-                self.ready
-                    .rust_prefix_spellings(
-                        &self.ready.lexical_source(),
-                        &[prefix],
-                        self.cancellation,
+        let prefix_kind = if prefix.is_some() && route.is_empty() {
+            let resolved = resolved.as_ref().expect("a prefix has a resolution");
+            super::super::rust_crate_context::route_prefix_kind(
+                self.ready,
+                prefix_spelling.as_deref(),
+                &resolved.targets,
+                &resolved.completion,
+            )?
+        } else {
+            super::super::rust_crate_context::RoutePrefixKind::Other
+        };
+        let local_type_prefix_is_decided = if route.is_empty() {
+            prefix_kind == super::super::rust_crate_context::RoutePrefixKind::BlockLocalType
+        } else {
+            match &resolved {
+                Some(resolved) => {
+                    super::super::rust_crate_context::block_local_type_prefix_binding_is_decided(
+                        self.ready,
+                        &resolved.targets,
+                        &resolved.completion,
                     )?
-                    .remove(&prefix)
-            } else {
-                None
-            };
-            let prefix_kind = if prefix.is_some() && route.is_empty() {
-                let resolved = resolved.as_ref().expect("a prefix has a resolution");
-                super::super::rust_crate_context::route_prefix_kind(
-                    self.ready,
-                    prefix_spelling.as_deref(),
-                    &resolved.targets,
-                    &resolved.completion,
-                )?
-            } else {
-                super::super::rust_crate_context::RoutePrefixKind::Other
-            };
-            let local_type_prefix_is_decided = if route.is_empty() {
-                prefix_kind == super::super::rust_crate_context::RoutePrefixKind::BlockLocalType
-            } else {
-                match &resolved {
-                    Some(resolved) => {
-                        super::super::rust_crate_context::block_local_type_prefix_binding_is_decided(
-                            self.ready,
-                            &resolved.targets,
-                            &resolved.completion,
-                        )?
-                    }
-                    None => false,
                 }
-            };
-            let (modules, outside_request) = self.modules(identity.fragment())?;
-            pending_completion = pending_completion.combine(&outside_request);
-            let prefix_scope = prefix_scope_head
-                .filter(|scope_head| {
-                    scope_ordinals
-                        .get(scope_head)
-                        .expect("prefix lexical scope was batched")
-                        .is_some()
-                })
-                .unwrap_or(scope);
-            let route_has_type_prefix = prefix_kind.is_type();
-            if prefix.is_some() || route.is_empty() {
-                let prefix_mount = prefix.and_then(|prefix| prefix.ordinal()).or(self
-                    .mount_table()
-                    .mount_for_fragment(identity.fragment())?
-                    .map(|mount| mount.ordinal().get()));
-                let generated_surface =
-                    super::super::rust_crate_context::generated_surface_prefix_boundary(
-                        conn,
-                        &self.ready.context_identities,
-                        &modules,
-                        prefix_mount,
-                        Some(prefix_spelling.as_deref().unwrap_or(demand.spelling())),
-                        &route,
-                    )?;
-                if generated_surface != ResolutionCompletion::Complete {
-                    known_prefix = true;
-                    pending_completion = pending_completion.combine(&generated_surface);
-                }
+                None => false,
             }
-            let placed_topologies = modules
-                .iter()
-                .map(|module| module.topology)
-                .collect::<Vec<_>>();
-            for module in &modules {
-                if !is_import
-                    && !lexical.node_is_scope_head_in(
-                        &scope_ordinals,
-                        scope,
-                        module.fragment,
-                        module.scope,
-                    )
+        };
+        let (modules, outside_request) = self.modules(identity.fragment())?;
+        pending_completion = pending_completion.combine(&outside_request);
+        let prefix_scope = prefix_scope_head
+            .filter(|scope_head| {
+                scope_ordinals
+                    .get(scope_head)
+                    .expect("prefix lexical scope was batched")
+                    .is_some()
+            })
+            .unwrap_or(scope);
+        if prefix.is_some() || route.is_empty() {
+            let prefix_mount = prefix.and_then(|prefix| prefix.ordinal()).or(self
+                .mount_table()
+                .mount_for_fragment(identity.fragment())?
+                .map(|mount| mount.ordinal().get()));
+            let generated_surface =
+                super::super::rust_crate_context::generated_surface_prefix_boundary(
+                    conn,
+                    &self.ready.context_identities,
+                    &modules,
+                    prefix_mount,
+                    Some(prefix_spelling.as_deref().unwrap_or(demand.spelling())),
+                    route,
+                )?;
+            if generated_surface != ResolutionCompletion::Complete {
+                known_prefix = true;
+                pending_completion = pending_completion.combine(&generated_surface);
+            }
+        }
+        let placed_topologies = modules
+            .iter()
+            .map(|module| module.topology)
+            .collect::<Vec<_>>();
+        Ok(RustHalfRows {
+            rows: self,
+            source,
+            plan,
+            scope_ordinals,
+            lexical,
+            modules,
+            resolved,
+            source_completion: pending_completion,
+            known_prefix,
+            import_root_name,
+            root_names_a_workspace_crate,
+            external_root_bindings,
+            external_type_import_scopes,
+            prefix_spelling,
+            prefix_kind,
+            local_type_prefix_is_decided,
+            prefix_scope,
+            placed_topologies,
+            prefix_has_no_placements: false,
+            fallback_name: None,
+        })
+    }
+}
+impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
+    type Placement = Module;
+    type Target = (i64, String, String);
+    type Member = (i64, u32, String);
+    fn placements(&mut self) -> Vec<Module> {
+        std::mem::take(&mut self.modules)
+    }
+    fn prefix_has_targets(&self) -> bool {
+        self.resolved
+            .as_ref()
+            .is_some_and(|resolved| !resolved.targets.is_empty())
+    }
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+    fn initial_completion(&self) -> ResolutionCompletion {
+        self.source_completion.clone()
+    }
+    fn placement(&self, module: &Module, tag: ClosureTag) -> Option<PlacementFacts<Self::Target>> {
+        if !self.source.is_import
+            && !self.lexical.node_is_scope_head_in(
+                self.scope_ordinals,
+                self.source.scope,
+                module.fragment,
+                module.scope,
+            )
+        {
+            return None;
+        }
+        Some(PlacementFacts {
+            tag,
+            completion: module.overlay_completion.combine(&self.plan.completion),
+            targets: Vec::new(),
+            members: Vec::new(),
+        })
+    }
+    fn root_starts(
+        &mut self,
+        module: &Module,
+        facts: &mut PlacementFacts<Self::Target>,
+    ) -> Result<Vec<PlacementStart<Self::Member>>> {
+        let conn = self.rows.ready.inventory.connection();
+        let lexical = self.lexical;
+        let demand = &self.source.demand;
+        let route = &self.source.route;
+        let mut starts = Vec::new();
+        if let Some(resolved) = &self.resolved {
+            if !self.local_type_prefix_is_decided {
+                facts.completion = facts.completion.combine(&resolved.completion);
+            }
+            let mut prefix_starts = Vec::new();
+            for target in &resolved.targets {
+                if self
+                    .rows
+                    .base
+                    .lookup_definition_node(*target, self.rows.cancellation)?
+                    .is_none()
                 {
                     continue;
                 }
-                let mut targets = Vec::new();
-                let mut completion = module.overlay_completion.combine(&plan.completion);
-                if let Some(resolved) = &resolved {
-                    if !local_type_prefix_is_decided {
-                        completion = completion.combine(&resolved.completion);
-                    }
-                    let mut prefix_starts = Vec::new();
-                    for target in &resolved.targets {
-                        if self
-                            .base
-                            .lookup_definition_node(*target, self.cancellation)?
-                            .is_none()
-                        {
-                            continue;
-                        }
-                        let Some(
-                            crate::analyzer::resolution::SelectedSemanticProvenance::FragmentLocal(
-                                provenance,
-                            ),
-                        ) = lexical.semantic_provenance(*target, self.cancellation)?
-                        else {
-                            continue;
-                        };
-                        let starts = conn
-                            .prepare_cached(PREFIX_MODULES)?
-                            .query_map(
-                                params![
-                                    provenance.mount().ordinal().get(),
-                                    provenance.local_key().get(),
-                                    module.topology
-                                ],
-                                |row| {
-                                    Ok((
-                                        row.get::<_, i64>(0)?,
-                                        row.get::<_, Option<String>>(1)?,
-                                        row.get::<_, i64>(2)?,
-                                        row.get::<_, u32>(3)?,
-                                        row.get::<_, String>(4)?,
-                                    ))
-                                },
-                            )?
-                            .collect::<rusqlite::Result<Vec<_>>>()?;
-                        prefix_starts.extend(starts);
-                    }
-                    known_prefix |= !prefix_starts.is_empty();
-                    let prefix_has_no_placements = prefix_starts.is_empty();
-                    if prefix_starts
-                        .iter()
-                        .any(|(_, path, _, _, _)| path.is_some())
-                        && prefix_starts
-                            .iter()
-                            .any(|(_, path, _, _, _)| path.is_none())
-                    {
-                        let rel_path = self
-                            .mount_table()
-                            .mount_for_fragment(identity.fragment())?
-                            .map(|mount| mount.persisted_relative_path().to_owned());
-                        let prefix_spelling = self
-                            .ready
-                            .rust_prefix_spellings(
-                                &self.ready.lexical_source(),
-                                &[prefix.expect("a mixed prefix exists")],
-                                self.cancellation,
-                            )?
-                            .into_values()
-                            .next();
-                        completion =
-                            completion.combine(&super::super::rust_crate_context::route_dead_end(
-                                &self.ready.context_identities,
-                                super::super::rust_crate_context::RouteDeadEnd::MixedRoutePrefix,
-                                rel_path.as_deref(),
-                                prefix_spelling.as_deref(),
-                                None,
-                                &route,
-                                &demand,
-                            ));
-                    }
-                    for (id, path, subject_blob, subject_site, subject_path) in prefix_starts {
-                        let Some(path) = path else {
-                            // The prefix named a declaration that is not a
-                            // module, so the module walk has no continuation.
-                            // With nothing left of the route the demand is a
-                            // member of that declaration, and a trait it
-                            // implements can declare it. The bridge's start
-                            // stack is the reference's, so an empty route is
-                            // the condition and not a convenience: a half that
-                            // still carries segments spells a different stack.
-                            if route.is_empty() {
-                                member_bridges.extend(rows.crate_trait_member_bridges(
-                                    &self.mount_table(),
-                                    module,
-                                    identity.fragment(),
-                                    token,
-                                    anchor,
-                                    anchor_semantic,
-                                    prefix.expect("a resolved prefix names its reference"),
-                                    &demand,
-                                    subject_blob,
-                                    subject_site,
-                                    &subject_path,
-                                    &completion,
-                                    self.cancellation,
-                                )?);
-                            }
-                            continue;
-                        };
-                        for (id, path) in rows.crate_route(
-                            module,
-                            id,
-                            path,
-                            &route[route.len().min(1)..],
-                            ResolutionRootImportAnchor::Lexical,
-                            &mut completion,
-                            self.cancellation,
-                        )? {
-                            targets.push((id, path, demand.spelling().to_owned()));
-                        }
-                    }
-                    // A selected Cargo route is useful even when unrelated
-                    // lexical facts keep this prefix open. Keep the lexical
-                    // completion below, but do not let it hide an exact
-                    // dependency or re-export placement.
-                    if (prefix_has_no_placements && !route_has_type_prefix)
-                        || anchor == ResolutionRootImportAnchor::Absolute
-                    {
-                        let mut starts = Vec::new();
-                        if anchor == ResolutionRootImportAnchor::Absolute {
-                            starts.push((module.topology, "crate".to_owned()));
-                        } else {
-                            let prefix = prefix.expect("resolved prefix");
-                            let names = self.ready.rust_prefix_spellings(
-                                &self.ready.lexical_source(),
-                                &[prefix],
-                                self.cancellation,
-                            )?;
-                            if let Some(name) = names.get(&prefix) {
-                                root_names_a_workspace_crate |= conn
-                                    .prepare_cached(sql::DEPENDENCY.as_str())?
-                                    .exists(params![
-                                        module.topology,
-                                        name,
-                                        RUST_UNIT_SUMMARY_DERIVATION_VERSION
-                                    ])?;
-                                let mut prefix_import_scopes = rows
-                                    .module_import_scopes(module.blob, module.scope.get())?
-                                    .into_iter()
-                                    .filter(|raw| {
-                                        ResolutionScopeId::new(*raw) == module.scope
-                                            || lexical.node_is_scope_head_in(
-                                                &scope_ordinals,
-                                                prefix_scope,
-                                                module.fragment,
-                                                ResolutionScopeId::new(*raw),
-                                            )
-                                    })
-                                    .collect::<Vec<_>>();
-                                prefix_import_scopes.push(module.scope.get());
-                                prefix_import_scopes.sort_unstable();
-                                prefix_import_scopes.dedup();
-                                for binder_scope in &prefix_import_scopes {
-                                    starts.extend(sql::route_prefix_module_starts(
-                                        conn,
-                                        module,
-                                        name,
-                                        *binder_scope,
-                                    )?);
-                                }
-                                // A module an item macro declares in this module
-                                // has no lexical binder, so the prefix found
-                                // nothing lexically; the crate row places it.
-                                for row in conn.prepare_cached(sql::NAMED_MACRO_MODULE)?.query_map(
-                                    params![module.topology, module.path, name],
-                                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                                )? {
-                                    starts.push(row?);
-                                }
-                                if starts.is_empty() {
-                                    let mut details = Vec::new();
-                                    for binder_scope in &prefix_import_scopes {
-                                        details.extend(super::super::rust_crate_context::macro_gated_import_route_details(
-                                            conn,
-                                            module,
-                                            name,
-                                            *binder_scope,
-                                        )?);
-                                    }
-                                    if details.is_empty() && module.unmounted {
-                                        details.extend(
-                                            super::super::rust_crate_context::macro_gated_unmounted_file_details(
-                                                conn,
-                                                &module.rel_path,
-                                            )?,
-                                        );
-                                    }
-                                    if !details.is_empty() {
-                                        known_prefix = true;
-                                        completion = completion.combine(
-                                            &super::super::rust_crate_context::macro_gated_route_boundary(
-                                                &self.ready.context_identities,
-                                                &details,
-                                            ),
-                                        );
-                                    } else if module.unmounted {
-                                        let details = super::super::rust_crate_context::
-                                            inactive_cfg_unmounted_file_details(
-                                                conn,
-                                                &module.rel_path,
-                                            )?;
-                                        if !details.is_empty() {
-                                            known_prefix = true;
-                                            completion = completion.combine(
-                                                &super::super::rust_crate_context::
-                                                    inactive_cfg_route_boundary(
-                                                        &self.ready.context_identities,
-                                                        &details,
-                                                    ),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        known_prefix |= !starts.is_empty();
-                        for (id, path) in starts {
-                            for (id, path) in rows.crate_route(
-                                module,
-                                id,
-                                path,
-                                &route,
-                                anchor,
-                                &mut completion,
-                                self.cancellation,
-                            )? {
-                                targets.push((id, path, demand.spelling().to_owned()));
-                            }
-                        }
-                    }
-                } else if is_import {
-                    let mut matched_scope = false;
-                    for raw in (RustCrateRows { ready: self.ready })
-                        .module_import_scopes(module.blob, module.scope.get())?
-                    {
-                        if self.cancellation.is_cancelled() {
-                            return Ok(None);
-                        }
-                        if !lexical.node_is_scope_head_in(
-                            &scope_ordinals,
-                            scope,
-                            module.fragment,
-                            ResolutionScopeId::new(raw),
-                        ) {
-                            continue;
-                        }
-                        matched_scope = true;
-                        if demand.namespace() == ResolutionNamespace::Type {
-                            external_type_import_scopes.push((module.blob, raw));
-                        }
-                        if route.is_empty() && import_root_name.is_none() {
-                            import_root_name = conn
-                                .prepare_cached(sql::IMPORT_ROOT_NAME)?
-                                .query_row(params![module.blob, raw, demand.spelling()], |row| {
-                                    row.get::<_, String>(0)
-                                })
-                                .optional()?;
-                        }
-                        for row in conn.prepare_cached(sql::NAMED)?.query_map(
-                            params![
-                                module.topology,
-                                module.path,
-                                module.blob,
-                                raw,
-                                demand.spelling(),
-                                sql::namespace(demand.namespace()),
-                                if module.overlay_completion == ResolutionCompletion::Complete {
-                                    module.selected_blob
-                                } else {
-                                    module.blob
-                                }
-                            ],
-                            |row| {
-                                Ok((
-                                    row.get::<_, Vec<u8>>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                ))
-                            },
-                        )? {
-                            let (key, path, name) = row?;
-                            match sql::selected_crate_topology(conn, &key)? {
-                                Some(id) => targets.push((id, path, name)),
-                                None => {
-                                    completion =
-                                        completion.combine(&sql::unselected_target_boundary(
-                                            &self.ready.context_identities,
-                                            &key,
-                                        ));
-                                }
-                            }
-                        }
-                        for row in conn.prepare_cached(sql::GLOBS)?.query_map(
-                            params![module.topology, module.path, module.blob, raw],
-                            |row| {
-                                Ok((
-                                    row.get::<_, Vec<u8>>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                ))
-                            },
-                        )? {
-                            let (key, path, segments) = row?;
-                            let segments: Vec<String> = serde_json::from_str(&segments)
-                                .map_err(|error| StoreError::corrupt(error.to_string()))?;
-                            if !segments
-                                .iter()
-                                .map(String::as_str)
-                                .eq(route.iter().map(|recipe| recipe.spelling()))
-                            {
-                                continue;
-                            }
-                            match sql::selected_crate_topology(conn, &key)? {
-                                Some(id) => {
-                                    targets.push((id, path, demand.spelling().to_owned()));
-                                }
-                                None => {
-                                    completion =
-                                        completion.combine(&sql::unselected_target_boundary(
-                                            &self.ready.context_identities,
-                                            &key,
-                                        ));
-                                }
-                            }
-                        }
-                    }
-                    if !matched_scope && completion == ResolutionCompletion::Complete {
-                        continue;
-                    }
+                let Some(crate::analyzer::resolution::SelectedSemanticProvenance::FragmentLocal(
+                    provenance,
+                )) = lexical.semantic_provenance(*target, self.rows.cancellation)?
+                else {
+                    continue;
+                };
+                let starts = conn
+                    .prepare_cached(PREFIX_MODULES)?
+                    .query_map(
+                        params![
+                            provenance.mount().ordinal().get(),
+                            provenance.local_key().get(),
+                            module.topology
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, u32>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                prefix_starts.extend(starts);
+            }
+            self.known_prefix |= !prefix_starts.is_empty();
+            self.prefix_has_no_placements = prefix_starts.is_empty();
+            if prefix_starts
+                .iter()
+                .any(|(_, path, _, _, _)| path.is_some())
+                && prefix_starts
+                    .iter()
+                    .any(|(_, path, _, _, _)| path.is_none())
+            {
+                let rel_path = self
+                    .rows
+                    .mount_table()
+                    .mount_for_fragment(self.source.identity.fragment())?
+                    .map(|mount| mount.persisted_relative_path().to_owned());
+                let prefix_spelling = self
+                    .rows
+                    .ready
+                    .rust_prefix_spellings(
+                        &self.rows.ready.lexical_source(),
+                        &[self.source.prefix.expect("a mixed prefix exists")],
+                        self.rows.cancellation,
+                    )?
+                    .into_values()
+                    .next();
+                facts.completion =
+                    facts
+                        .completion
+                        .combine(&super::super::rust_crate_context::route_dead_end(
+                            &self.rows.ready.context_identities,
+                            super::super::rust_crate_context::RouteDeadEnd::MixedRoutePrefix,
+                            rel_path.as_deref(),
+                            prefix_spelling.as_deref(),
+                            None,
+                            route,
+                            demand,
+                        ));
+            }
+            for (id, path, subject_blob, subject_site, subject_path) in prefix_starts {
+                if let Some(path) = path {
+                    starts.push(PlacementStart::Route {
+                        cursor: WalkCursor::container(facts.tag, id, path, route.len().min(1)),
+                        anchor: ResolutionRootImportAnchor::Lexical,
+                    });
+                } else if route.is_empty() {
+                    starts.push(PlacementStart::Member((
+                        subject_blob,
+                        subject_site,
+                        subject_path,
+                    )));
                 }
-                let in_module_scope = lexical.node_is_scope_head_in(
-                    &scope_ordinals,
-                    scope,
-                    module.fragment,
-                    module.scope,
-                );
-                if is_import && targets.is_empty() && prefix.is_none() && in_module_scope {
-                    completion = completion
-                        .combine(&rows.crate_import_inventory_completion(module, &demand)?);
-                }
-                // An import with no route segments binds the path root itself,
-                // so the module it is written in is not a place to look:
-                // `use serde as s;` does not bind whatever `serde` names
-                // inside the current module. Walking an empty route from that
-                // module would answer it with the module, which is why the
-                // walk below is not this half's continuation. The extern
-                // prelude decides that root.
-                if targets.is_empty()
-                    && prefix.is_none()
-                    && !(is_import && route.is_empty())
-                    && in_module_scope
+            }
+        }
+        Ok(starts)
+    }
+    fn route_rules<'a>(
+        &'a self,
+        module: &'a Module,
+        anchor: ResolutionRootImportAnchor,
+        route: &'a [ResolutionLookupSemanticRecipe],
+    ) -> impl super::super::demand_closure::RouteRules<ClosureTag> + 'a {
+        super::super::rust_crate_rows::RustRouteRules {
+            rows: RustCrateRows {
+                ready: self.rows.ready,
+            },
+            requester: module,
+            anchor,
+            route,
+        }
+    }
+    fn route_target(&self, location: RouteLocation) -> Self::Target {
+        let RouteLocation::Container { unit, container } = location else {
+            unreachable!("Rust module route returns a container")
+        };
+        (unit, container, self.source.demand.spelling().to_owned())
+    }
+    fn target_location(&self, target: &Self::Target) -> RouteLocation {
+        RouteLocation::Container {
+            unit: target.0,
+            container: target.1.clone(),
+        }
+    }
+    fn member_bridges(
+        &self,
+        module: &Module,
+        (blob, site, path): Self::Member,
+        completion: &ResolutionCompletion,
+    ) -> Result<Vec<SelectedRootBridgeDescriptor>> {
+        RustCrateRows {
+            ready: self.rows.ready,
+        }
+        .crate_trait_member_bridges(
+            &self.rows.mount_table(),
+            module,
+            self.source.identity.fragment(),
+            self.source.token,
+            self.source.anchor,
+            self.source.anchor_semantic,
+            self.source
+                .prefix
+                .expect("a member start has a resolved prefix"),
+            &self.source.demand,
+            blob,
+            site,
+            &path,
+            completion,
+            self.rows.cancellation,
+        )
+    }
+    fn prefix_selection(
+        &mut self,
+        module: &Module,
+        _facts: &mut PlacementFacts<Self::Target>,
+    ) -> Result<Option<StartSelection>> {
+        if self.resolved.is_none()
+            || !((self.prefix_has_no_placements && !self.prefix_kind.is_type())
+                || self.source.anchor == ResolutionRootImportAnchor::Absolute)
+        {
+            return Ok(None);
+        }
+        self.fallback_name = None;
+        if self.source.anchor == ResolutionRootImportAnchor::Absolute {
+            return Ok(Some(StartSelection {
+                locations: vec![RouteLocation::Container {
+                    unit: module.topology,
+                    container: "crate".to_owned(),
+                }],
+                scopes: Vec::new(),
+                blocks_fallback: true,
+                head: None,
+                lexical: None,
+            }));
+        }
+        let prefix = self.source.prefix.expect("resolved prefix");
+        let names = self.rows.ready.rust_prefix_spellings(
+            &self.rows.ready.lexical_source(),
+            &[prefix],
+            self.rows.cancellation,
+        )?;
+        let Some(name) = names.get(&prefix) else {
+            return Ok(None);
+        };
+        self.fallback_name = Some(name.clone());
+        self.root_names_a_workspace_crate |= self
+            .rows
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(sql::DEPENDENCY.as_str())?
+            .exists(params![
+                module.topology,
+                name,
+                RUST_UNIT_SUMMARY_DERIVATION_VERSION
+            ])?;
+        let scope = self
+            .scope_ordinals
+            .get(&self.prefix_scope)
+            .copied()
+            .flatten()
+            .filter(|(fragment, _)| *fragment == module.fragment)
+            .map_or(module.scope, |(_, scope)| scope);
+        Ok(Some(self.rows.route_starts(module, scope, name)?))
+    }
+    fn prefix_starts(
+        &mut self,
+        module: &Module,
+        mut selected: StartSelection,
+        facts: &mut PlacementFacts<Self::Target>,
+    ) -> Result<Vec<PlacementStart<Self::Member>>> {
+        let conn = self.rows.ready.inventory.connection();
+        let mut starts = Vec::new();
+        let name = self.fallback_name.clone();
+        if let Some(name) = name.as_deref() {
+            let blocks_fallback = selected.blocks_fallback;
+            let prefix_import_scopes = std::mem::take(&mut selected.scopes);
+            starts.extend(selected.into_containers());
+            if !blocks_fallback {
+                // A module an item macro declares in this module
+                // has no lexical binder, so the prefix found
+                // nothing lexically; the crate row places it.
+                for row in conn
+                    .prepare_cached(sql::NAMED_MACRO_MODULE)?
+                    .query_map(params![module.topology, module.path, name], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
                 {
-                    for (id, path) in rows.crate_route(
-                        module,
-                        module.topology,
-                        module.path.clone(),
-                        &route,
-                        anchor,
-                        &mut completion,
-                        self.cancellation,
-                    )? {
-                        targets.push((id, path, demand.spelling().to_owned()));
-                    }
+                    starts.push(row?);
                 }
-                // A lexical route head can be a selected module import even
-                // when the source resolver published no semantic target for
-                // that path segment. Start the remaining route at the
-                // persisted module binding, as the type-prefix path above
-                // does for an authored prefix.
-                if targets.is_empty()
-                    && prefix.is_none()
-                    && anchor == ResolutionRootImportAnchor::Lexical
-                    && let Some(root) = route.first()
-                {
-                    let mut import_scopes = rows
-                        .module_import_scopes(module.blob, module.scope.get())?
-                        .into_iter()
-                        .filter(|raw| {
-                            ResolutionScopeId::new(*raw) == module.scope
-                                || lexical.node_is_scope_head_in(
-                                    &scope_ordinals,
-                                    scope,
-                                    module.fragment,
-                                    ResolutionScopeId::new(*raw),
-                                )
-                        })
-                        .collect::<Vec<_>>();
-                    import_scopes.push(module.scope.get());
-                    import_scopes.sort_unstable();
-                    import_scopes.dedup();
-                    let mut starts = Vec::new();
-                    for binder_scope in import_scopes {
-                        starts.extend(sql::route_prefix_module_starts(
+            }
+            if starts.is_empty() {
+                let mut details = Vec::new();
+                for binder_scope in &prefix_import_scopes {
+                    details.extend(
+                        super::super::rust_crate_context::macro_gated_import_route_details(
                             conn,
                             module,
-                            root.spelling(),
-                            binder_scope,
-                        )?);
-                    }
-                    for (topology, path) in starts {
-                        for (id, path) in rows.crate_route(
-                            module,
-                            topology,
-                            path,
-                            &route[1..],
-                            ResolutionRootImportAnchor::Lexical,
-                            &mut completion,
-                            self.cancellation,
-                        )? {
-                            targets.push((id, path, demand.spelling().to_owned()));
-                        }
-                    }
-                }
-                // A single-segment `use` names the path root alone. Nothing
-                // in this workspace can bind it unless the root names a crate
-                // the Cargo graph resolved, so the extern prelude is the whole
-                // answer: a hit means the root is a workspace crate, and that
-                // this workspace publishes no export for a crate root is its
-                // own business, not a boundary. One placement that names the
-                // crate settles it for the half, because the half asks about
-                // the workspace and a placement answers for one topology.
-                if route.is_empty()
-                    && let Some(name) = import_root_name.as_deref()
-                {
-                    root_names_a_workspace_crate |= conn
-                        .prepare_cached(sql::DEPENDENCY.as_str())?
-                        .exists(params![
-                            module.topology,
                             name,
-                            RUST_UNIT_SUMMARY_DERIVATION_VERSION
-                        ])?;
+                            *binder_scope,
+                        )?,
+                    );
                 }
-                // A qualified reference can stop at a module import whose
-                // source is unindexed. Keep that original binding identity,
-                // just as the ordinary export lookup does, rather than naming
-                // the reference token as a fresh external type or subject.
-                if !is_import
-                    && prefix.is_none()
-                    && targets.is_empty()
-                    && let Some(root) = route.first()
+                if details.is_empty() && module.unmounted {
+                    details.extend(
+                        super::super::rust_crate_context::macro_gated_unmounted_file_details(
+                            conn,
+                            &module.rel_path,
+                        )?,
+                    );
+                }
+                if !details.is_empty() {
+                    self.known_prefix = true;
+                    facts.completion = facts.completion.combine(
+                        &super::super::rust_crate_context::macro_gated_route_boundary(
+                            &self.rows.ready.context_identities,
+                            &details,
+                        ),
+                    );
+                } else if module.unmounted {
+                    let details =
+                        super::super::rust_crate_context::inactive_cfg_unmounted_file_details(
+                            conn,
+                            &module.rel_path,
+                        )?;
+                    if !details.is_empty() {
+                        self.known_prefix = true;
+                        facts.completion = facts.completion.combine(
+                            &super::super::rust_crate_context::inactive_cfg_route_boundary(
+                                &self.rows.ready.context_identities,
+                                &details,
+                            ),
+                        );
+                    }
+                }
+            }
+        } else {
+            starts.extend(selected.into_containers());
+        }
+        self.known_prefix |= !starts.is_empty();
+        Ok(starts
+            .into_iter()
+            .map(|(id, path)| PlacementStart::Route {
+                cursor: WalkCursor::container(facts.tag, id, path, 0),
+                anchor: self.source.anchor,
+            })
+            .collect())
+    }
+    fn import_targets(
+        &mut self,
+        module: &Module,
+        facts: &mut PlacementFacts<Self::Target>,
+    ) -> Result<Option<bool>> {
+        let conn = self.rows.ready.inventory.connection();
+        let lexical = self.lexical;
+        let demand = &self.source.demand;
+        let route = &self.source.route;
+        if self.resolved.is_some() || !self.source.is_import {
+            return Ok(Some(true));
+        }
+        let mut matched_scope = false;
+        for raw in (RustCrateRows {
+            ready: self.rows.ready,
+        })
+        .module_import_scopes(module.blob, module.scope.get())?
+        {
+            if self.rows.cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if !lexical.node_is_scope_head_in(
+                self.scope_ordinals,
+                self.source.scope,
+                module.fragment,
+                ResolutionScopeId::new(raw),
+            ) {
+                continue;
+            }
+            matched_scope = true;
+            if demand.namespace() == ResolutionNamespace::Type {
+                self.external_type_import_scopes.push((module.blob, raw));
+            }
+            if route.is_empty() && self.import_root_name.is_none() {
+                self.import_root_name = conn
+                    .prepare_cached(sql::IMPORT_ROOT_NAME)?
+                    .query_row(params![module.blob, raw, demand.spelling()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()?;
+            }
+            for row in conn.prepare_cached(sql::NAMED)?.query_map(
+                params![
+                    module.topology,
+                    module.path,
+                    module.blob,
+                    raw,
+                    demand.spelling(),
+                    sql::namespace(demand.namespace()),
+                    if module.overlay_completion == ResolutionCompletion::Complete {
+                        module.selected_blob
+                    } else {
+                        module.blob
+                    }
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )? {
+                let (key, path, name) = row?;
+                match sql::selected_crate_topology(conn, &key)? {
+                    Some(id) => facts.targets.push((id, path, name)),
+                    None => {
+                        facts.completion =
+                            facts.completion.combine(&sql::unselected_target_boundary(
+                                &self.rows.ready.context_identities,
+                                &key,
+                            ));
+                    }
+                }
+            }
+            for row in conn.prepare_cached(sql::GLOBS)?.query_map(
+                params![module.topology, module.path, module.blob, raw],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )? {
+                let (key, path, segments) = row?;
+                let segments: Vec<String> = serde_json::from_str(&segments)
+                    .map_err(|error| StoreError::corrupt(error.to_string()))?;
+                if !segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(route.iter().map(|recipe| recipe.spelling()))
                 {
-                    external_root_bindings.extend(rows.crate_external_bindings(
-                        module,
+                    continue;
+                }
+                match sql::selected_crate_topology(conn, &key)? {
+                    Some(id) => {
+                        facts.targets.push((id, path, demand.spelling().to_owned()));
+                    }
+                    None => {
+                        facts.completion =
+                            facts.completion.combine(&sql::unselected_target_boundary(
+                                &self.rows.ready.context_identities,
+                                &key,
+                            ));
+                    }
+                }
+            }
+        }
+        if !matched_scope && facts.completion == ResolutionCompletion::Complete {
+            return Ok(Some(false));
+        }
+        Ok(Some(true))
+    }
+    fn canonical_targets(
+        &self,
+        module: &Module,
+        facts: &mut PlacementFacts<Self::Target>,
+    ) -> Result<Option<Vec<Self::Target>>> {
+        let lexical = self.lexical;
+        let rows = RustCrateRows {
+            ready: self.rows.ready,
+        };
+        let demand = &self.source.demand;
+        let in_module_scope = lexical.node_is_scope_head_in(
+            self.scope_ordinals,
+            self.source.scope,
+            module.fragment,
+            module.scope,
+        );
+        let mut binding_targets = None;
+        if self.source.is_import
+            && self.source.prefix.is_none()
+            && let Some((fragment, owner_scope)) = self
+                .scope_ordinals
+                .get(&self.source.scope)
+                .copied()
+                .flatten()
+            && fragment == module.fragment
+        {
+            let inventory = if in_module_scope {
+                rows.crate_import_inventory(module, demand)?
+            } else {
+                rows.crate_owner_import_inventory(
+                    module,
+                    demand,
+                    module.selected_blob,
+                    owner_scope.get(),
+                )?
+            };
+            facts.completion = facts.completion.combine(&inventory.completion);
+            binding_targets = inventory.targets;
+        }
+        Ok(binding_targets)
+    }
+    fn module_starts(
+        &self,
+        module: &Module,
+        facts: &PlacementFacts<Self::Target>,
+    ) -> Vec<PlacementStart<Self::Member>> {
+        if facts.targets.is_empty()
+            && self.source.prefix.is_none()
+            && !(self.source.is_import && self.source.route.is_empty())
+            && self.lexical.node_is_scope_head_in(
+                self.scope_ordinals,
+                self.source.scope,
+                module.fragment,
+                module.scope,
+            )
+        {
+            vec![PlacementStart::Route {
+                cursor: WalkCursor::container(facts.tag, module.topology, module.path.clone(), 0),
+                anchor: self.source.anchor,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+    fn lexical_parent(
+        &self,
+        module: &Module,
+        scope: ResolutionScopeId,
+    ) -> Result<Option<ResolutionScopeId>> {
+        self.rows.ready.lexical_source().lookup_scope_parent(
+            module.fragment,
+            scope,
+            self.rows.cancellation,
+        )
+    }
+    fn lexical_tier(
+        &self,
+        module: &Module,
+        scope: ResolutionScopeId,
+        lookup: &ResolutionLookupSemanticRecipe,
+    ) -> Result<super::super::demand_closure::LexicalStartTier> {
+        use super::super::demand_closure::RouteEdgeTier;
+        let conn = self.rows.ready.inventory.connection();
+        let rows = RustCrateRows {
+            ready: self.rows.ready,
+        };
+        let name = lookup.spelling();
+        let module_level = scope == module.scope;
+        let inventory = if module_level {
+            rows.crate_binding_inventory(module, module.topology, &module.path, "type", name)?
+        } else {
+            rows.crate_owner_binding_inventory(
+                module.topology,
+                &module.path,
+                module.selected_blob,
+                scope.get(),
+                "type",
+                name,
+            )?
+        };
+        let mut tier = RouteEdgeTier {
+            coverage: inventory.completion.clone(),
+            blocks_fallback: inventory.targets.is_some()
+                || inventory.completion != ResolutionCompletion::Complete,
+            ..RouteEdgeTier::default()
+        };
+        let has_exact_set = inventory.targets.is_some();
+        let bindings = if let Some(targets) = inventory.targets {
+            targets
+        } else {
+            conn.prepare_cached(sql::IMPORT_MODULE_PREFIX_STARTS)?
+                .query_map(
+                    params![
                         module.topology,
-                        &module.path,
-                        demand.namespace(),
-                        root.spelling(),
-                    )?);
+                        module.path,
+                        module.blob,
+                        scope.get(),
+                        name,
+                        "type",
+                        module.selected_blob
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let has_named_binding = !bindings.is_empty();
+        tier.blocks_fallback |= has_named_binding;
+        for (topology, path, target_name) in bindings {
+            tier.edges.extend(
+                sql::published_module_starts(
+                    conn,
+                    topology,
+                    &path,
+                    &target_name,
+                    module.topology,
+                    &module.path,
+                )?
+                .into_iter()
+                .map(|(unit, container)| RouteLocation::Container { unit, container }),
+            );
+        }
+        let head = (module_level && !has_exact_set && !has_named_binding).then(|| {
+            (
+                RouteLocation::Container {
+                    unit: module.topology,
+                    container: module.path.clone(),
+                },
+                lookup.clone(),
+            )
+        });
+        Ok(super::super::demand_closure::LexicalStartTier { tier, head })
+    }
+    fn lexical_selection(
+        &self,
+        module: &Module,
+        facts: &mut PlacementFacts<Self::Target>,
+    ) -> Result<Option<StartSelection>> {
+        if !(facts.targets.is_empty()
+            && self.source.prefix.is_none()
+            && self.source.anchor == ResolutionRootImportAnchor::Lexical)
+        {
+            return Ok(None);
+        }
+        let Some(root) = self.source.route.first() else {
+            return Ok(None);
+        };
+        let start_scope = self
+            .scope_ordinals
+            .get(&self.source.scope)
+            .copied()
+            .flatten()
+            .filter(|(fragment, _)| *fragment == module.fragment)
+            .map_or(module.scope, |(_, owner_scope)| owner_scope);
+        let selected = self
+            .rows
+            .route_starts(module, start_scope, root.spelling())?;
+        Ok(Some(selected))
+    }
+    fn lexical_starts(
+        &self,
+        selected: StartSelection,
+        facts: &PlacementFacts<Self::Target>,
+    ) -> Vec<PlacementStart<Self::Member>> {
+        selected
+            .locations
+            .into_iter()
+            .map(|location| PlacementStart::Route {
+                cursor: WalkCursor {
+                    tag: facts.tag,
+                    location,
+                    consumed_prefix_segments: 1,
+                    start_step: 1,
+                    namespace: ResolutionNamespace::Type,
+                },
+                anchor: ResolutionRootImportAnchor::Lexical,
+            })
+            .collect()
+    }
+    fn observe_targets(
+        &mut self,
+        module: &Module,
+        facts: &PlacementFacts<Self::Target>,
+    ) -> Result<()> {
+        let conn = self.rows.ready.inventory.connection();
+        let rows = RustCrateRows {
+            ready: self.rows.ready,
+        };
+        let demand = &self.source.demand;
+        let route = &self.source.route;
+        // A single-segment `use` names the path root alone. Nothing
+        // in this workspace can bind it unless the root names a crate
+        // the Cargo graph resolved, so the extern prelude is the whole
+        // answer: a hit means the root is a workspace crate, and that
+        // this workspace publishes no export for a crate root is its
+        // own business, not a boundary. One placement that names the
+        // crate settles it for the half, because the half asks about
+        // the workspace and a placement answers for one topology.
+        if route.is_empty()
+            && let Some(name) = self.import_root_name.as_deref()
+        {
+            self.root_names_a_workspace_crate |= conn
+                .prepare_cached(sql::DEPENDENCY.as_str())?
+                .exists(params![
+                    module.topology,
+                    name,
+                    RUST_UNIT_SUMMARY_DERIVATION_VERSION
+                ])?;
+        }
+        // A qualified reference can stop at a module import whose
+        // source is unindexed. Keep that original binding identity,
+        // just as the ordinary export lookup does, rather than naming
+        // the reference token as a fresh external type or subject.
+        if !self.source.is_import
+            && self.source.prefix.is_none()
+            && facts.targets.is_empty()
+            && let Some(root) = route.first()
+        {
+            self.external_root_bindings
+                .extend(rows.crate_external_bindings(
+                    module,
+                    module.topology,
+                    &module.path,
+                    demand.namespace(),
+                    root.spelling(),
+                )?);
+        }
+        Ok(())
+    }
+    fn select_targets(&self, targets: &mut Vec<Self::Target>) -> Result<()> {
+        if sql::is_module_anchor(self.source.demand.spelling()) {
+            *targets = RustCrateRows {
+                ready: self.rows.ready,
+            }
+            .anchor_declaration_targets(std::mem::take(targets))?;
+        }
+        Ok(())
+    }
+    fn exports(
+        &self,
+        module: &Module,
+        target: Self::Target,
+        completion: &ResolutionCompletion,
+    ) -> Result<Option<ExportHydration>> {
+        self.rows
+            .exports(module, target, &self.source.demand, completion)
+    }
+    fn empty_target(&self, module: &Module, target: &Self::Target) -> Result<ResolutionCompletion> {
+        let rows = RustCrateRows {
+            ready: self.rows.ready,
+        };
+        let demand = &self.source.demand;
+        let mut inventory = rows.crate_inventory_completion(
+            module,
+            target.0,
+            &target.1,
+            sql::namespace(demand.namespace()),
+            &target.2,
+        )?;
+        let bindings = rows.crate_external_bindings(
+            module,
+            target.0,
+            &target.1,
+            demand.namespace(),
+            &target.2,
+        )?;
+        if !bindings.is_empty() {
+            inventory = ResolutionCompletion::incomplete(bindings.into_iter().map(|semantic| {
+                ResolutionIncompleteReason::OpenBoundary {
+                    semantic,
+                    status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
                 }
-                // An anchor names the module its own route step reached, so
-                // its target is that module's declaration rather than an
-                // export inside it.
-                if sql::is_module_anchor(demand.spelling()) {
-                    targets = rows.anchor_declaration_targets(targets)?;
+            }));
+        }
+        Ok(inventory)
+    }
+    fn empty_placement(
+        &mut self,
+        facts: &PlacementFacts<Self::Target>,
+        observation: &mut HalfObservation,
+    ) -> Result<()> {
+        let conn = self.rows.ready.inventory.connection();
+        if let Some(resolved) = &self.resolved {
+            let generated_surface =
+                super::super::rust_crate_context::generated_item_surface_boundary(
+                    conn,
+                    &self.rows.ready.context_identities,
+                    &resolved.targets,
+                )?;
+            if generated_surface != ResolutionCompletion::Complete {
+                self.known_prefix = true;
+                observation.completion = observation.completion.combine(&generated_surface);
+            }
+        }
+        observation.completion = observation.completion.combine(&facts.completion);
+        Ok(())
+    }
+    fn boundary(&mut self, observation: &HalfObservation) -> Result<Option<HalfBoundary>> {
+        let conn = self.rows.ready.inventory.connection();
+        let rows = RustCrateRows {
+            ready: self.rows.ready,
+        };
+        let demand = &self.source.demand;
+        let route = &self.source.route;
+        let mut pending_completion = observation.completion.clone();
+        let mut associations = Vec::new();
+        // A path whose first segment names no module this workspace
+        // compiles has left the workspace, and that is a boundary, not
+        // a decided negative. Which segment carries the question
+        // depends on the half's shape: an anchored or multi-segment
+        // route carries it in `route`, while a bare two-segment path
+        // carries it as the prefix reference, whose lexical lookup and
+        // whose Cargo dependency lookup both came back empty. A
+        // single-segment `use` carries it as the import's own root
+        // name.
+        //
+        // Both sides used to be left out. The prefix shape claimed
+        // nothing at all, so `ext_crate::Widget` answered a complete
+        // absence, and a reference took `UnsupportedSemantic`, which
+        // names no boundary and can only ever read as "incomplete for
+        // an unstated reason". The import arm has claimed the boundary
+        // since lane T added the row; an import and a reference are
+        // asking the same question about the same root.
+        //
+        // The question is about the route head and the workspace, so
+        // the half owns it and no single module placement can answer
+        // it. A file compiled into more than one topology asks it once
+        // per placement, and only the placement whose topology
+        // declares the dependency binds the root; claiming the
+        // boundary per placement said a workspace crate had left the
+        // workspace.
+        let root_name = match route.first() {
+            Some(segment) => Some(segment.spelling()),
+            None => self.import_root_name.as_deref(),
+        };
+        // `Self` or a type parameter heading a path to one of its
+        // members (`Self::check`, `T::one`) is a type and not a
+        // module: the typed member route answers the member through
+        // the enclosing impl or trait, or through the parameter's
+        // bounds. The crate route has nothing to continue through,
+        // and neither a boundary nor a negative to claim: `Self` binds
+        // no name, so its lookup comes back empty, but that is not a
+        // root that left the workspace. Claiming either made the
+        // answer incomplete, or an import boundary, even where the
+        // typed route found the member.
+        let type_prefix = !self.known_prefix
+            && self.prefix_kind == super::super::rust_crate_context::RoutePrefixKind::MemberType;
+        if type_prefix {
+            pending_completion = pending_completion.combine(
+                &self
+                    .resolved
+                    .as_ref()
+                    .expect("a prefix has a resolution")
+                    .completion,
+            );
+        }
+        // A half whose fragment places no module was never asked,
+        // and an unasked question has no boundary to claim.
+        // A prefix an import anchored in this crate binds names a
+        // module of this crate, so a route that found nothing did not
+        // leave the workspace: no boundary. It is not a decided
+        // absence either, because the crate rows cannot yet prove
+        // every such walk closed (items declared through macros or
+        // re-exported from other crates), so it stays the dead end.
+        let bound_in_the_crate = match (self.source.prefix, self.resolved.as_ref()) {
+            (Some(prefix), Some(resolved)) if !self.known_prefix => {
+                super::super::rust_crate_context::prefix_bound_in_the_crate(
+                    self.rows.ready,
+                    prefix,
+                    resolved,
+                    self.rows.cancellation,
+                )?
+            }
+            _ => false,
+        };
+        let external_root = !observation.answered_placements.is_empty()
+            && !observation.route_reached_a_target
+            && !self.root_names_a_workspace_crate
+            && match self.source.prefix {
+                None => root_name.is_some_and(|name| !sql::is_module_anchor(name)),
+                Some(_) => {
+                    !self.known_prefix
+                        && !bound_in_the_crate
+                        && !type_prefix
+                        && !self.local_type_prefix_is_decided
+                        && self.resolved.as_ref().is_some_and(|resolved| {
+                            super::super::rust_crate_context::prefix_left_the_indexed_workspace(
+                                self.rows.ready,
+                                resolved,
+                            )
+                        })
                 }
-                route_reached_a_target |= !targets.is_empty();
-                let before = authorities.len();
-                for target in targets {
-                    let Some((exports, unstaged)) =
-                        self.exports(module, target.clone(), &demand, &completion)?
+            };
+        if external_root {
+            if self.source.is_import && !self.external_type_import_scopes.is_empty() {
+                let mut import_paths = Vec::new();
+                for &(blob, scope) in &self.external_type_import_scopes {
+                    let Some(paths) = rows.external_type_import_paths_for_binding(
+                        blob,
+                        scope,
+                        demand.spelling(),
+                        self.rows.cancellation,
+                    )?
                     else {
                         return Ok(None);
                     };
-                    if exports.is_empty() {
-                        // With every module the walk reached closed, the
-                        // empty answer is a proved absence, which the route
-                        // reads as the external boundary when nothing binds
-                        // the name. One open module withholds that proof. The
-                        // walk can still find the name as an import whose path
-                        // leaves the workspace, such as a glob reaching
-                        // `pub use std::sync::Arc;`: that is the answer, the
-                        // boundary, and a found name is not reopened by
-                        // another module's open inventory, the same as a
-                        // found declaration.
-                        let mut inventory = rows.crate_inventory_completion(
-                            module,
-                            target.0,
-                            &target.1,
-                            sql::namespace(demand.namespace()),
-                            &target.2,
-                        )?;
-                        let bindings = rows.crate_external_bindings(
-                            module,
-                            target.0,
-                            &target.1,
-                            demand.namespace(),
-                            &target.2,
-                        )?;
-                        if !bindings.is_empty() {
-                            inventory = ResolutionCompletion::incomplete(bindings.into_iter().map(|semantic|
-                                ResolutionIncompleteReason::OpenBoundary {
-                                    semantic,
-                                    status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
-                                }
-                            ));
-                        }
-                        pending_completion =
-                            pending_completion.combine(&inventory).combine(&unstaged);
-                    }
-                    for (export, target_demand, evidence) in exports {
-                        let SelectedRootPathHalf::Export {
-                            identity,
-                            token,
-                            demand,
-                            definition,
-                            ..
-                        } = &export
-                        else {
-                            unreachable!("export query returns sealed exports");
-                        };
-                        let key = (identity.fragment(), *token, *demand, *definition);
-                        match authorities.entry(key) {
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert((export, target_demand, evidence));
-                            }
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                let previous = &mut entry.get_mut().2;
-                                *previous = if *previous == ResolutionCompletion::Complete
-                                    || evidence == ResolutionCompletion::Complete
-                                {
-                                    ResolutionCompletion::Complete
-                                } else {
-                                    previous.combine(&evidence)
-                                };
-                            }
-                        }
-                    }
+                    import_paths.extend(paths);
                 }
-                answered_placements += 1;
-                if authorities.len() == before {
-                    if let Some(resolved) = &resolved {
-                        let generated_surface =
-                            super::super::rust_crate_context::generated_item_surface_boundary(
-                                conn,
-                                &self.ready.context_identities,
-                                &resolved.targets,
-                            )?;
-                        if generated_surface != ResolutionCompletion::Complete {
-                            known_prefix = true;
-                            pending_completion = pending_completion.combine(&generated_surface);
-                        }
-                    }
-                    pending_completion = pending_completion.combine(&completion);
-                }
+                associations.push(
+                    super::super::demand_closure::ContextAssociation::ExternalTypeImport {
+                        boundary: self.source.token,
+                        paths: import_paths,
+                    },
+                );
             }
-            for (export_half, target_demand, evidence) in authorities.values() {
-                let SelectedRootPathHalf::Export {
-                    identity: export_identity,
-                    token: export_token,
-                    ..
-                } = export_half
-                else {
-                    unreachable!("export query returns sealed exports");
-                };
-                let descriptor = if let Some(prefix) = prefix {
-                    SelectedRootBridgeDescriptor::from_selected_path_tokens_with_prefix(
-                        identity.fragment(),
-                        Language::Rust,
-                        token,
-                        anchor,
-                        anchor_semantic,
-                        export_identity.fragment(),
-                        Language::Rust,
-                        *export_token,
-                        prefix,
-                        route.to_vec(),
-                        demand.clone(),
-                        target_demand.clone(),
-                        evidence.clone(),
-                    )
-                } else {
-                    SelectedRootBridgeDescriptor::from_selected_path_tokens(
-                        identity.fragment(),
-                        Language::Rust,
-                        token,
-                        anchor,
-                        anchor_semantic,
-                        export_identity.fragment(),
-                        Language::Rust,
-                        *export_token,
-                        route.to_vec(),
-                        demand.clone(),
-                        target_demand.clone(),
-                        evidence.clone(),
-                    )
-                };
-                descriptors
-                    .push(descriptor.with_selected_export(&self.ready.shared_names(), export_half));
+            if self.external_root_bindings.is_empty() {
+                self.external_root_bindings.push(self.source.token);
             }
-            let published_member_bridge = !member_bridges.is_empty();
-            descriptors.append(&mut member_bridges);
-            if authorities.is_empty() && !published_member_bridge {
-                // A path whose first segment names no module this workspace
-                // compiles has left the workspace, and that is a boundary, not
-                // a decided negative. Which segment carries the question
-                // depends on the half's shape: an anchored or multi-segment
-                // route carries it in `route`, while a bare two-segment path
-                // carries it as the prefix reference, whose lexical lookup and
-                // whose Cargo dependency lookup both came back empty. A
-                // single-segment `use` carries it as the import's own root
-                // name.
-                //
-                // Both sides used to be left out. The prefix shape claimed
-                // nothing at all, so `ext_crate::Widget` answered a complete
-                // absence, and a reference took `UnsupportedSemantic`, which
-                // names no boundary and can only ever read as "incomplete for
-                // an unstated reason". The import arm has claimed the boundary
-                // since lane T added the row; an import and a reference are
-                // asking the same question about the same root.
-                //
-                // The question is about the route head and the workspace, so
-                // the half owns it and no single module placement can answer
-                // it. A file compiled into more than one topology asks it once
-                // per placement, and only the placement whose topology
-                // declares the dependency binds the root; claiming the
-                // boundary per placement said a workspace crate had left the
-                // workspace.
-                let root_name = match route.first() {
-                    Some(segment) => Some(segment.spelling()),
-                    None => import_root_name.as_deref(),
-                };
-                // `Self` or a type parameter heading a path to one of its
-                // members (`Self::check`, `T::one`) is a type and not a
-                // module: the typed member route answers the member through
-                // the enclosing impl or trait, or through the parameter's
-                // bounds. The crate route has nothing to continue through,
-                // and neither a boundary nor a negative to claim: `Self` binds
-                // no name, so its lookup comes back empty, but that is not a
-                // root that left the workspace. Claiming either made the
-                // answer incomplete, or an import boundary, even where the
-                // typed route found the member.
-                let type_prefix = !known_prefix
-                    && prefix_kind == super::super::rust_crate_context::RoutePrefixKind::MemberType;
-                if type_prefix {
-                    pending_completion = pending_completion.combine(
-                        &resolved
-                            .as_ref()
-                            .expect("a prefix has a resolution")
-                            .completion,
+            pending_completion = pending_completion.combine(&ResolutionCompletion::incomplete(
+                self.external_root_bindings.iter().copied().map(|semantic| {
+                    ResolutionIncompleteReason::OpenBoundary {
+                        semantic,
+                        status:
+                            crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                    }
+                }),
+            ));
+        }
+        // An unqualified name no scope binds falls through to the
+        // crate's implicit prelude (the producer's route-less root
+        // reference). When that prelude supplies the name, it is an
+        // item of the unindexed std or core crate: an open boundary
+        // naming the prelude, never a proved absence.
+        if !self.source.is_import
+            && self.source.prefix.is_none()
+            && route.is_empty()
+            && !external_root
+        {
+            for &topology in &self.placed_topologies {
+                if let Some(boundary) = sql::prelude_boundary(
+                    conn,
+                    &self.rows.ready.context_identities,
+                    topology,
+                    demand,
+                )? {
+                    associations.push(
+                        super::super::demand_closure::ContextAssociation::PreludeReference {
+                            reference: self.source.token,
+                            boundary,
+                        },
                     );
-                }
-                // A half whose fragment places no module was never asked,
-                // and an unasked question has no boundary to claim.
-                // A prefix an import anchored in this crate binds names a
-                // module of this crate, so a route that found nothing did not
-                // leave the workspace: no boundary. It is not a decided
-                // absence either, because the crate rows cannot yet prove
-                // every such walk closed (items declared through macros or
-                // re-exported from other crates), so it stays the dead end.
-                let bound_in_the_crate = match (prefix, resolved.as_ref()) {
-                    (Some(prefix), Some(resolved)) if !known_prefix => {
-                        super::super::rust_crate_context::prefix_bound_in_the_crate(
-                            self.ready,
-                            prefix,
-                            resolved,
-                            self.cancellation,
-                        )?
-                    }
-                    _ => false,
-                };
-                let external_root = answered_placements > 0
-                    && !route_reached_a_target
-                    && !root_names_a_workspace_crate
-                    && match prefix {
-                        None => root_name.is_some_and(|name| !sql::is_module_anchor(name)),
-                        Some(_) => !known_prefix
-                            && !bound_in_the_crate
-                            && !type_prefix
-                            && !local_type_prefix_is_decided
-                            && resolved.as_ref().is_some_and(|resolved| {
-                                super::super::rust_crate_context::prefix_left_the_indexed_workspace(
-                                    self.ready, resolved,
-                                )
-                            }),
-                    };
-                if external_root {
-                    if is_import && !external_type_import_scopes.is_empty() {
-                        let mut import_paths = Vec::new();
-                        for (blob, scope) in external_type_import_scopes {
-                            let Some(paths) = rows.external_type_import_paths_for_binding(
-                                blob,
-                                scope,
-                                demand.spelling(),
-                                self.cancellation,
-                            )?
-                            else {
-                                return Ok(None);
-                            };
-                            import_paths.extend(paths);
-                        }
-                        self.ready
-                            .context_identities
-                            .record_rust_external_type_import_paths(token, import_paths);
-                    }
-                    if external_root_bindings.is_empty() {
-                        external_root_bindings.push(token);
-                    }
                     pending_completion = pending_completion.combine(
-                        &ResolutionCompletion::incomplete(external_root_bindings.into_iter().map(|semantic|
-                            ResolutionIncompleteReason::OpenBoundary {
-                                semantic,
-                                status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
-                            }
-                        )),
-                    );
-                }
-                // An unqualified name no scope binds falls through to the
-                // crate's implicit prelude (the producer's route-less root
-                // reference). When that prelude supplies the name, it is an
-                // item of the unindexed std or core crate: an open boundary
-                // naming the prelude, never a proved absence.
-                if !is_import && prefix.is_none() && route.is_empty() && !external_root {
-                    for &topology in &placed_topologies {
-                        if let Some(boundary) = sql::prelude_boundary(
-                            conn,
-                            &self.ready.context_identities,
-                            topology,
-                            &demand,
-                        )? {
-                            self.ready
-                                .context_identities
-                                .record_rust_prelude_reference(token, boundary);
-                            pending_completion = pending_completion.combine(
                                 &ResolutionCompletion::incomplete([
                                     ResolutionIncompleteReason::OpenBoundary {
                                         semantic: boundary,
@@ -1333,75 +1419,61 @@ impl EndpointRows<'_, '_, '_> {
                                     },
                                 ]),
                             );
-                            break;
-                        }
-                    }
-                }
-                // A boundary is the answer to this question. When the claim
-                // above named `ExternalDeclaredUnindexed` for this token, the
-                // route has already said the name left the workspace, and the
-                // prefix is the segment that took it there. Restating both as
-                // coarse reasons asks the same question twice and defeats the
-                // all-boundary predicate in `rust/native_points.rs`, which is
-                // why `ext_crate::Widget` answered `incomplete` instead of
-                // `unresolvable_import_boundary`. The coarse reason is
-                // discharged here, beside the claim, so no consumer has to
-                // match reason kinds against semantics.
-                let claimed_boundary =
-                    pending_completion.contains_reason(ResolutionIncompleteReason::OpenBoundary {
-                        semantic: token,
-                        status:
-                            crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
-                    });
-                if let Some(prefix) = prefix
-                    && !known_prefix
-                    && !claimed_boundary
-                    && !type_prefix
-                {
-                    let rel_path = self
-                        .mount_table()
-                        .mount_for_fragment(identity.fragment())?
-                        .map(|mount| mount.persisted_relative_path().to_owned());
-                    let prefix_class = super::super::rust_crate_context::classify_route_prefix(
-                        self.ready,
-                        rel_path.as_deref(),
-                        prefix_spelling.as_deref(),
-                        resolved.as_ref().expect("a prefix has a resolution"),
-                        prefix.ordinal(),
-                        route.is_empty(),
-                        self.cancellation,
-                    )?;
-                    if prefix_class
-                        != super::super::rust_crate_context::RoutePrefixClass::OpenInventory
-                    {
-                        pending_completion =
-                            pending_completion
-                                .combine(&super::super::rust_crate_context::route_dead_end(
-                                &self.ready.context_identities,
-                                super::super::rust_crate_context::RouteDeadEnd::UnplacedRoutePrefix,
-                                rel_path.as_deref(),
-                                prefix_spelling.as_deref(),
-                                Some(prefix_class),
-                                &route,
-                                &demand,
-                            ));
-                    }
-                }
-                if pending_completion != ResolutionCompletion::Complete {
-                    descriptors.push(sql::deadend(
-                        identity.fragment(),
-                        token,
-                        anchor,
-                        anchor_semantic,
-                        prefix,
-                        &route,
-                        &demand,
-                        pending_completion,
-                    ));
+                    break;
                 }
             }
         }
-        Ok(Some(descriptors))
+        // A boundary is the answer to this question. When the claim
+        // above named `ExternalDeclaredUnindexed` for this token, the
+        // route has already said the name left the workspace, and the
+        // prefix is the segment that took it there. Restating both as
+        // coarse reasons asks the same question twice and defeats the
+        // all-boundary predicate in `rust/native_points.rs`, which is
+        // why `ext_crate::Widget` answered `incomplete` instead of
+        // `unresolvable_import_boundary`. The coarse reason is
+        // discharged here, beside the claim, so no consumer has to
+        // match reason kinds against semantics.
+        let claimed_boundary =
+            pending_completion.contains_reason(ResolutionIncompleteReason::OpenBoundary {
+                semantic: self.source.token,
+                status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+            });
+        if let Some(prefix) = self.source.prefix
+            && !self.known_prefix
+            && !claimed_boundary
+            && !type_prefix
+        {
+            let rel_path = self
+                .rows
+                .mount_table()
+                .mount_for_fragment(self.source.identity.fragment())?
+                .map(|mount| mount.persisted_relative_path().to_owned());
+            let prefix_class = super::super::rust_crate_context::classify_route_prefix(
+                self.rows.ready,
+                rel_path.as_deref(),
+                self.prefix_spelling.as_deref(),
+                self.resolved.as_ref().expect("a prefix has a resolution"),
+                prefix.ordinal(),
+                route.is_empty(),
+                self.rows.cancellation,
+            )?;
+            if prefix_class != super::super::rust_crate_context::RoutePrefixClass::OpenInventory {
+                pending_completion =
+                    pending_completion.combine(&super::super::rust_crate_context::route_dead_end(
+                        &self.rows.ready.context_identities,
+                        super::super::rust_crate_context::RouteDeadEnd::UnplacedRoutePrefix,
+                        rel_path.as_deref(),
+                        self.prefix_spelling.as_deref(),
+                        Some(prefix_class),
+                        route,
+                        demand,
+                    ));
+            }
+        }
+        Ok(Some(HalfBoundary {
+            completion: pending_completion,
+            associations,
+        }))
     }
 }
 
@@ -1414,7 +1486,7 @@ pub(super) const PREFIX_MODULES: &str =
   ON dependency.summary_id=graph.summary_id
  CROSS JOIN selected_rust_unit_summaries AS target
   ON target.unit_key=dependency.dependency_unit_key
-) SELECT placement.topology_id, modules.module_path, authority.blob_id, authority.source_site,
+) SELECT placement.topology_id, modules.container_path, authority.blob_id, authority.source_site,
  mount.persisted_relative_path
  FROM selected_resolution_mounts AS mount
  CROSS JOIN resolution_rust_declaration_authorities AS authority
@@ -1422,17 +1494,18 @@ pub(super) const PREFIX_MODULES: &str =
  CROSS JOIN source_declaration_units AS mapping
   ON mapping.blob_id=authority.blob_id AND mapping.declaration_id=authority.declaration
  CROSS JOIN code_units AS unit ON unit.blob_id=mapping.blob_id AND unit.unit_key=mapping.unit_key
- CROSS JOIN selected_rust_module_placements AS placement
+ CROSS JOIN selected_rust_container_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=placement.topology_id
- LEFT JOIN main.rust_resolution_unit_summary_containers AS modules
+ LEFT JOIN main.resolution_unit_summary_containers AS modules
   ON modules.summary_id=owner.summary_id
-  AND modules.module_path=placement.container_path || '::' || unit.identifier
+  AND modules.container_path=placement.container_path || '::' || unit.identifier
  WHERE mount.mount_ordinal=?1 AND placement.topology_id IN (SELECT topology_id FROM graph)";
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
+#[doc(hidden)]
+pub fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
     vec![
         (
             "rust_point_demand_modules",

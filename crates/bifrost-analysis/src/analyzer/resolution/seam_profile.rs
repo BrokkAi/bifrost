@@ -46,48 +46,96 @@
 //! counts behind. The digest reads the last `totals` line.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+use std::time::Duration;
+use std::time::Instant;
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 
 use crate::CancellationToken;
+
 use crate::analyzer::store::Result as StoreResult;
+
 use crate::hash::HashSet;
 
 use super::LoweredTypeProduction;
-use super::batch::{
-    BatchCandidateCompletionOutcome, BatchCandidateMatch, BatchCandidateOutcome,
-    BatchCandidateRequest, BatchDefinitionNode, BatchEndpointClassification,
-    BatchResolutionFragmentSource, CandidatePathIdentity, ReferenceLocalPathEvidence,
-    ReferenceSeed, ReferenceSeedBatch, ReferenceSeedReadOutcome, ReverseCandidateGapExclusionPlan,
-    ReverseReferenceSeedRequest,
-};
+
+use super::batch::BatchCandidateCompletionOutcome;
+use super::batch::BatchCandidateMatch;
+use super::batch::BatchCandidateOutcome;
+use super::batch::BatchCandidateRequest;
+use super::batch::BatchDefinitionNode;
+use super::batch::BatchEndpointClassification;
+use super::batch::BatchResolutionFragmentSource;
+use super::batch::CandidatePathIdentity;
+use super::batch::ReferenceLocalPathEvidence;
+use super::batch::ReferenceSeed;
+use super::batch::ReferenceSeedBatch;
+use super::batch::ReferenceSeedReadOutcome;
+use super::batch::ReverseCandidateGapExclusionPlan;
+use super::batch::ReverseReferenceSeedRequest;
+
 use super::common_fact_lowering::LoweredDeferredMemberOwner;
+
 use super::engine::ResolutionQuery;
-use super::fact_source::{
-    CompanionTypeRelation, DeclarationAccessDecision, DeferredMemberOwnerLookupName,
-    FactPageVisitor, FactReadOutcome, LoweredIntrinsicTypeDescriptor,
-    LoweredRustDeclarationAuthority, LoweredRustReferenceContext, NamedArgumentLabelRead,
-    QualifiedRouteSlotLookup, RustImplementedTraits, SelectedGapReasonProvenance,
-    SelectedQualifiedRoute, SelectedTypeFrontierCompletion, SelectedTypedFactSource,
-    SelectedTypedRow, TypedFactPageVisitor, TypedFactReadOutcome, TypedFactRequest,
-};
+
+use super::fact_source::CompanionTypeRelation;
+use super::fact_source::DeclarationAccessDecision;
+use super::fact_source::DeferredMemberOwnerLookupName;
+use super::fact_source::FactPageVisitor;
+use super::fact_source::FactReadOutcome;
+use super::fact_source::LoweredIntrinsicTypeDescriptor;
+use super::fact_source::LoweredRustDeclarationAuthority;
+use super::fact_source::LoweredRustReferenceContext;
+use super::fact_source::NamedArgumentLabelRead;
+use super::fact_source::QualifiedRouteSlotLookup;
+use super::fact_source::RustImplementedTraits;
+use super::fact_source::SelectedGapReasonProvenance;
+use super::fact_source::SelectedQualifiedRoute;
+use super::fact_source::SelectedTypeFrontierCompletion;
+use super::fact_source::SelectedTypedFactSource;
+use super::fact_source::SelectedTypedRow;
+use super::fact_source::TypedFactPageVisitor;
+use super::fact_source::TypedFactReadOutcome;
+use super::fact_source::TypedFactRequest;
+
 use super::local_identity::SelectedResolutionMountOrdinal;
-use super::model::{
-    BindingFragmentId, BindingNodeId, PartialPath, ResolutionCompletion, SemanticId,
-    TypeTransferRule,
-};
-use super::typed_fact_lowering::{
-    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
-    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
-    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
-    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
-    LoweredMemberScopeProperty, LoweredSupertypeProperty, LoweredTypeArgument,
-    LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFrontier, LoweredUnderlyingType,
-};
+
+use super::model::BindingFragmentId;
+use super::model::BindingNodeId;
+use super::model::PartialPath;
+use super::model::ResolutionCompletion;
+use super::model::SemanticId;
+use super::model::TypeTransferRule;
+
+use super::typed_fact_lowering::LoweredBindingProjection;
+use super::typed_fact_lowering::LoweredCallApplicabilityObligation;
+use super::typed_fact_lowering::LoweredCallableSignatureProperty;
+use super::typed_fact_lowering::LoweredConstructionRequirementProperty;
+use super::typed_fact_lowering::LoweredDeclarationTypeProperty;
+use super::typed_fact_lowering::LoweredDeclarationVisibilityProperty;
+use super::typed_fact_lowering::LoweredDeclaredTypeArgument;
+use super::typed_fact_lowering::LoweredDefinitionPropertyGap;
+use super::typed_fact_lowering::LoweredGenericFormal;
+use super::typed_fact_lowering::LoweredGenericFormalDefault;
+use super::typed_fact_lowering::LoweredGenericTypeAliasParameter;
+use super::typed_fact_lowering::LoweredIntrinsicSeed;
+use super::typed_fact_lowering::LoweredMemberOwnerProperty;
+use super::typed_fact_lowering::LoweredMemberScopeProperty;
+use super::typed_fact_lowering::LoweredSupertypeProperty;
+use super::typed_fact_lowering::LoweredTypeArgument;
+use super::typed_fact_lowering::LoweredTypeComponent;
+use super::typed_fact_lowering::LoweredTypeTransfer;
+use super::typed_fact_lowering::LoweredTypedFrontier;
+use super::typed_fact_lowering::LoweredUnderlyingType;
 
 /// Names the JSON-lines output file. Unset means no instrument at all.
 pub const PROFILE_PATH_ENV: &str = "BIFROST_SEAM_PROFILE";
@@ -152,6 +200,7 @@ seam_methods! {
     VisitReferenceSeedBatches => "visit_reference_seed_batches", "BatchResolutionFragmentSource";
     VisitReferenceSeedBatchesInFragments => "visit_reference_seed_batches_in_fragments", "BatchResolutionFragmentSource";
     ClassifyEndpointNodes => "classify_endpoint_nodes", "BatchResolutionFragmentSource";
+    ClassifyEndpointNodesWithMemberOwners => "classify_endpoint_nodes_with_member_owners", "BatchResolutionFragmentSource";
     ScopeOwnersForHeads => "scope_owners_for_heads", "BatchResolutionFragmentSource";
     MatchForwardCandidates => "match_forward_candidates", "BatchResolutionFragmentSource";
     VisitForwardCandidateMatchPages => "visit_forward_candidate_match_pages", "BatchResolutionFragmentSource";
@@ -297,7 +346,8 @@ struct RenamePhaseCounters {
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
-pub(crate) enum GoRenamePhase {
+#[doc(hidden)]
+pub enum GoRenamePhase {
     CandidateEnumeration,
     Confirmation,
     CaptureCheck,
@@ -330,11 +380,13 @@ struct OpenGoRenamePhase {
 }
 
 /// Phase timer for native Go rename, inert unless the existing seam profile is on.
-pub(crate) struct GoRenamePhaseScope {
+#[doc(hidden)]
+pub struct GoRenamePhaseScope {
     inner: Option<OpenGoRenamePhase>,
 }
 
-pub(crate) fn go_rename_phase(phase: GoRenamePhase) -> GoRenamePhaseScope {
+#[doc(hidden)]
+pub fn go_rename_phase(phase: GoRenamePhase) -> GoRenamePhaseScope {
     let Some(profile) = profile() else {
         return GoRenamePhaseScope { inner: None };
     };
@@ -1130,8 +1182,10 @@ where
     }
 
     counted!(
-        reference_seed(query: ResolutionQuery, cancellation: &CancellationToken)
-            -> StoreResult<Option<ReferenceSeed>>,
+        reference_seed(
+            query: ResolutionQuery,
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Option<ReferenceSeed>>,
         ReferenceSeed,
         keys = 1,
         rows = |seed| usize::from(seed.is_some())
@@ -1148,24 +1202,30 @@ where
     );
 
     counted!(
-        lookup_reference_seeds(queries: &[ResolutionQuery], cancellation: &CancellationToken)
-            -> StoreResult<ReferenceSeedReadOutcome>,
+        lookup_reference_seeds(
+            queries: &[ResolutionQuery],
+            cancellation: &CancellationToken,
+        ) -> StoreResult<ReferenceSeedReadOutcome>,
         LookupReferenceSeeds,
         keys = queries.len(),
         rows = |outcome| outcome.rows().len()
     );
 
     counted!(
-        lookup_definition_node(definition: SemanticId, cancellation: &CancellationToken)
-            -> StoreResult<Option<BindingNodeId>>,
+        lookup_definition_node(
+            definition: SemanticId,
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Option<BindingNodeId>>,
         LookupDefinitionNode,
         keys = 1,
         rows = |node| usize::from(node.is_some())
     );
 
     counted!(
-        lookup_definition_nodes(definitions: &[SemanticId], cancellation: &CancellationToken)
-            -> StoreResult<Vec<BatchDefinitionNode>>,
+        lookup_definition_nodes(
+            definitions: &[SemanticId],
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Vec<BatchDefinitionNode>>,
         LookupDefinitionNodes,
         keys = definitions.len(),
         rows = |nodes| nodes.len()
@@ -1223,19 +1283,36 @@ where
     }
 
     counted!(
-        scope_owners_for_heads(heads: &[BindingNodeId], cancellation: &CancellationToken)
-            -> StoreResult<Vec<LoweredMemberScopeProperty>>,
+        scope_owners_for_heads(
+            heads: &[BindingNodeId],
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Vec<LoweredMemberScopeProperty>>,
         ScopeOwnersForHeads,
         keys = heads.len(),
         rows = |rows| rows.len()
     );
 
     counted!(
-        classify_endpoint_nodes(nodes: &[BindingNodeId], cancellation: &CancellationToken)
-            -> StoreResult<Vec<BatchEndpointClassification>>,
+        classify_endpoint_nodes(
+            nodes: &[BindingNodeId],
+            cancellation: &CancellationToken,
+        ) -> StoreResult<Vec<BatchEndpointClassification>>,
         ClassifyEndpointNodes,
         keys = nodes.len(),
         rows = |rows| rows.len()
+    );
+
+    counted!(
+        classify_endpoint_nodes_with_member_owners(
+            nodes: &[BindingNodeId],
+            cancellation: &CancellationToken,
+            member_owners: &mut super::batch::ClassificationMemberOwnerReader<'_>,
+        ) -> StoreResult<
+            Option<Vec<BatchEndpointClassification>>,
+        >,
+        ClassifyEndpointNodesWithMemberOwners,
+        keys = nodes.len(),
+        rows = |rows| rows.as_ref().map_or(0, Vec::len)
     );
 
     counted!(
@@ -2159,7 +2236,7 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 33, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(batch.len(), 34, "BatchResolutionFragmentSource: {batch:?}");
         assert_eq!(typed.len(), 79, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
@@ -2179,7 +2256,7 @@ mod tests {
             declared, forwarded,
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
-        assert_eq!(METHOD_COUNT, 112);
+        assert_eq!(METHOD_COUNT, 113);
     }
 
     /// The instrument is off unless the variable names a file, and nothing in

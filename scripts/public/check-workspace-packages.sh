@@ -121,9 +121,10 @@ require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/identifiers.sc
 require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/imports.scm
 require_archive_file brokk-bifrost-rust resources/treesitter/rust/definitions.scm
 require_archive_file brokk-bifrost-rust resources/treesitter/rust/imports.scm
-require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
-require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0011-native-compatibility.sql
+require_archive_file brokk-bifrost-semantic migrations/semantic-pack-catalog/0001-current-baseline.sql
+require_archive_file brokk-bifrost-semantic migrations/semantic-pack-catalog/0011-native-compatibility.sql
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
+require_archive_file brokk-bifrost-tools src/lib.rs
 require_archive_file brokk-bifrost-policy src/lib.rs
 policy_archive_files=$(tar -tzf "$(archive_for brokk-bifrost-policy)" | sed 's@^[^/]*/@@')
 if grep -Eq '^policy-packs/' <<<"$policy_archive_files"; then
@@ -213,7 +214,7 @@ semantic_model_schema_versions=$(node --input-type=module <<'EOF'
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-const model = readFileSync("crates/bifrost-analysis/src/analyzer/semantic_model/model.rs", "utf8");
+const model = readFileSync("crates/bifrost-semantic/src/analyzer/semantic_model/model.rs", "utf8");
 const declaration = model.match(/pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &\[u32\]\s*=\s*&\[([\d,\s]+)\];/u);
 assert(declaration, "cannot read SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS");
 const versions = JSON.parse(`[${declaration[1].replace(/,\s*$/u, "")}]`);
@@ -243,6 +244,13 @@ for package in "${packages[@]}"; do
 done
 
 readonly consumer="$temporary/consumer"
+# Patch every unpacked implementation crate, derived from the shared release
+# inventory: a hand-written list missed the #4452 split crates.
+consumer_patches=""
+for package in "${RELEASE_CRATES[@]}"; do
+  [[ "$package" == "$RELEASE_CRATE_FACADE" ]] && continue
+  consumer_patches+="$package = { path = \"$unpacked/$package-$version\" }"$'\n'
+done
 mkdir -p "$consumer/src"
 cat > "$consumer/Cargo.toml" <<EOF
 [package]
@@ -258,23 +266,7 @@ brokk-bifrost = { path = "$unpacked/brokk-bifrost-$version" }
 full = ["brokk-bifrost/python"]
 
 [patch.crates-io]
-brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
-brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
-brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
-brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
-brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
-brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
-brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
-brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
-brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
-brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
-brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
-brokk-bifrost-flow = { path = "$unpacked/brokk-bifrost-flow-$version" }
-brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
-brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
-brokk-bifrost-semantic-packs = { path = "$unpacked/brokk-bifrost-semantic-packs-$version" }
-brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }
-brokk-bifrost-mcp = { path = "$unpacked/brokk-bifrost-mcp-$version" }
+$consumer_patches
 EOF
 cat > "$consumer/src/main.rs" <<'EOF'
 use brokk_bifrost::analyzer::usages::get_definition::{
@@ -346,16 +338,7 @@ publish = false
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 
 [patch.crates-io]
-brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
-brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
-brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
-brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
-brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
-brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
-brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
-brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
-brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
-brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
+$consumer_patches
 EOF
 cat > "$analysis_consumer/src/main.rs" <<'EOF'
 fn main() {
@@ -378,20 +361,7 @@ publish = false
 brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }
 
 [patch.crates-io]
-brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
-brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
-brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
-brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
-brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
-brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
-brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
-brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
-brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
-brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
-brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
-brokk-bifrost-flow = { path = "$unpacked/brokk-bifrost-flow-$version" }
-brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
-brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
+$consumer_patches
 EOF
 cat > "$extension_consumer/src/main.rs" <<'EOF'
 use brokk_bifrost_runtime::extension::{

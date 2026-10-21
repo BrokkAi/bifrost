@@ -20,7 +20,8 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ScalaAdapter;
+#[doc(hidden)]
+pub struct ScalaAdapter;
 
 impl LanguageAdapter for ScalaAdapter {
     fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {

@@ -21,32 +21,72 @@
 //! generation it was derived in so a comparison can refuse to relate rows
 //! from two different snapshots.
 
-use super::edges::{EdgeAxis, EdgeProvenance, OwnerRelation, SiteClass};
-use super::facts::{FileFacts, Span};
-use super::kinds::{NormalizedKind, Role};
+use super::edges::EdgeAxis;
+use super::edges::EdgeProvenance;
+use super::edges::OwnerRelation;
+use super::edges::SiteClass;
+
+use super::facts::FileFacts;
+use super::facts::Span;
+
+use super::kinds::NormalizedKind;
+use super::kinds::Role;
+
 use super::lexical_environment::environment_for_file;
-use super::occurrence_rows::{
-    OccurrenceCompleteness, OccurrenceFileResult, OccurrenceRow, OccurrenceTarget,
-    OccurrencesCancelled, ast_id, occurrences_for_file, occurrences_for_file_at_lines,
-};
-use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
+
+use super::occurrence_rows::OccurrenceCompleteness;
+use super::occurrence_rows::OccurrenceFileResult;
+use super::occurrence_rows::OccurrenceRow;
+use super::occurrence_rows::OccurrenceTarget;
+use super::occurrence_rows::OccurrencesCancelled;
+use super::occurrence_rows::ast_id;
+use super::occurrence_rows::occurrences_for_file;
+use super::occurrence_rows::occurrences_for_file_at_lines;
+
+use super::occurrences::ALL_OCCURRENCE_ROLES;
+use super::occurrences::OccurrenceClass;
+use super::occurrences::OccurrenceRole;
+
 use super::resolution::EnvironmentAxis;
+
 use crate::analyzer::canonical_hash::CanonicalHasher;
+
 use crate::analyzer::semantic::ContentIdentity;
+
 use crate::analyzer::semantic::ids::StableDigest;
+
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-use crate::analyzer::usages::{
-    FuzzyResult, ReferenceEngine, ReferenceHit, ReferenceKind, UsageHit, UsageHitKind,
-    UsageHitSurface, UsageProof, UsageQueryCompletion,
-};
-use crate::analyzer::{
-    CodeUnit, DeclarationId, FqName, IAnalyzer, Language, ProjectFile, Range, TypeHierarchyProvider,
-};
+
+use crate::analyzer::usages::FuzzyResult;
+use crate::analyzer::usages::ReferenceEngine;
+use crate::analyzer::usages::ReferenceHit;
+use crate::analyzer::usages::ReferenceKind;
+use crate::analyzer::usages::UsageHit;
+use crate::analyzer::usages::UsageHitKind;
+
+use crate::analyzer::usages::UsageProof;
+use crate::analyzer::usages::UsageQueryCompletion;
+
+use crate::analyzer::CodeUnit;
+
+use crate::analyzer::FqName;
+use crate::analyzer::IAnalyzer;
+
+use crate::analyzer::ProjectFile;
+use crate::analyzer::Range;
+use crate::analyzer::TypeHierarchyProvider;
+
 use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
+
+use crate::hash::HashMap;
+use crate::hash::HashSet;
+
 use crate::path_utils::rel_path_string;
+
 use crate::text_utils::compute_line_starts;
+
 use rayon::prelude::*;
+
 use std::sync::Arc;
 
 /// The file a scan unit reads: a bare file scans whole, a file with demanded
@@ -355,7 +395,8 @@ struct NearestDeclaration {
 /// file-sized pass. Later target lookups use interval indexes for the selected
 /// call/field site and nearest containing fact, plus precomputed declaration
 /// and assignment ancestry. No lookup scans or sorts the file's node arena.
-pub(crate) struct ReferenceSiteClassifier<'analyzer> {
+#[doc(hidden)]
+pub struct ReferenceSiteClassifier<'analyzer> {
     analyzer: &'analyzer dyn IAnalyzer,
     facts: Arc<FileFacts>,
     named_accesses: ContainingSpanIndex<u32>,
@@ -366,18 +407,33 @@ pub(crate) struct ReferenceSiteClassifier<'analyzer> {
 }
 
 /// Source-derived state shared by selected reference file wrappers.
-pub(crate) struct SelectedReferenceFileState<'analyzer> {
-    pub(crate) source_len: usize,
-    pub(crate) line_starts: Box<[usize]>,
-    pub(crate) classifier: Option<ReferenceSiteClassifier<'analyzer>>,
+#[doc(hidden)]
+pub struct SelectedReferenceFileState<'analyzer> {
+    #[doc(hidden)]
+    pub source_len: usize,
+    #[doc(hidden)]
+    pub line_starts: Box<[usize]>,
+    #[doc(hidden)]
+    pub classifier: Option<ReferenceSiteClassifier<'analyzer>>,
 }
 
 impl<'analyzer> SelectedReferenceFileState<'analyzer> {
-    pub(crate) fn new(
-        analyzer: &'analyzer dyn IAnalyzer,
-        file: &ProjectFile,
-        source: &str,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn range(&self, start_byte: usize, end_byte: usize) -> Range {
+        assert!(
+            start_byte <= end_byte && end_byte <= self.source_len,
+            "selected reference range must fit indexed source: {start_byte}..{end_byte} of {}",
+            self.source_len,
+        );
+        brokk_bifrost_core::analyzer::semantic_diagnostics::range_for_byte_span(
+            &self.line_starts,
+            start_byte,
+            end_byte,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new(analyzer: &'analyzer dyn IAnalyzer, file: &ProjectFile, source: &str) -> Self {
         Self {
             source_len: source.len(),
             line_starts: compute_line_starts(source).into_boxed_slice(),
@@ -386,10 +442,53 @@ impl<'analyzer> SelectedReferenceFileState<'analyzer> {
     }
 }
 
+/// One request-local caller projection. Admission and facts belong to the same
+/// analyzer; the source is retained for usage snippets as well as line ranges.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct SelectedReferenceFileProjection<'a> {
+    pub(crate) file: ProjectFile,
+    pub(crate) source: String,
+    pub(crate) state: SelectedReferenceFileState<'a>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<'a> SelectedReferenceFileProjection<'a> {
+    pub(crate) fn new(
+        analyzer: &'a dyn IAnalyzer,
+        context_analyzer: &'a dyn IAnalyzer,
+        file: &ProjectFile,
+        matches_selected: impl FnOnce(&str) -> bool,
+    ) -> crate::analyzer::store::Result<Self> {
+        let source = analyzer.indexed_source(file).ok_or_else(|| {
+            crate::analyzer::store::StoreError::new(format!(
+                "selected reverse reference has no indexed source: {file}"
+            ))
+        })?;
+        if !matches_selected(&source) {
+            return Err(crate::analyzer::store::StoreError::new(format!(
+                "selected reverse reference source changed before projection: {file}"
+            )));
+        }
+        let mut state = SelectedReferenceFileState::new(analyzer, file, &source);
+        if let Some(classifier) = state.classifier.as_mut() {
+            // Facts belong to the caller, while target-owner lookup must still
+            // see the whole selected workspace for cross-language static uses.
+            classifier.analyzer = context_analyzer;
+        }
+        Ok(Self {
+            state,
+            source,
+            file: file.clone(),
+        })
+    }
+}
+
 impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
     /// Build the classifier from the analyzer's one facts snapshot for `file`.
     /// Returns `None` when the file has no structural adapter or facts.
-    pub(crate) fn new(analyzer: &'analyzer dyn IAnalyzer, file: &ProjectFile) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn new(analyzer: &'analyzer dyn IAnalyzer, file: &ProjectFile) -> Option<Self> {
         let language = crate::analyzer::common::language_for_file(file);
         let facts = analyzer
             .structural_fact_providers()
@@ -464,7 +563,8 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
     }
 
     /// Classify one exact source range against its resolved declaration.
-    pub(crate) fn classify_reference_kind(
+    #[doc(hidden)]
+    pub fn classify_reference_kind(
         &self,
         start_byte: usize,
         end_byte: usize,
@@ -574,7 +674,8 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
     /// Exact content-scoped AST identity for an identifier at this byte range.
     /// `None` means the structural snapshot has no identifier with that exact
     /// range; this method never guesses from containment or source text.
-    pub(crate) fn ast_id(&self, start_byte: usize, end_byte: usize) -> Option<String> {
+    #[doc(hidden)]
+    pub fn ast_id(&self, start_byte: usize, end_byte: usize) -> Option<String> {
         self.site_identities.ast_id_for_bytes(start_byte, end_byte)
     }
 
@@ -700,243 +801,6 @@ fn classify_reference_kind_scan_oracle(
         }
     }
     target.is_class().then_some(ReferenceKind::TypeReference)
-}
-
-/// The site end of an edge: where in the workspace the reference is spelled.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeSite {
-    pub file: ProjectFile,
-    pub range: Range,
-    /// The content-scoped AST identity of the site token, present exactly when
-    /// the producer can address the token as a facts-arena node. Occurrence-row
-    /// forward edges carry it directly; native fact and inverse rows may still
-    /// be addressed exactly by file plus byte range while their AST join is
-    /// unavailable.
-    /// Never fabricated: `None` means the site is addressed by `file` plus
-    /// byte range over the same content, which is exact, not heuristic.
-    pub ast_id: Option<String>,
-    /// The declaration lexically enclosing the site, when known.
-    pub enclosing: Option<CodeUnit>,
-}
-
-/// One canonical reference edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReferenceEdgeRow {
-    pub site: EdgeSite,
-    pub target: CodeUnit,
-    /// Typed source-level classification, absent when no producer could state
-    /// one. Absence is "unclassified", never a kind.
-    pub reference_kind: Option<ReferenceKind>,
-    pub proof: UsageProof,
-    /// This exact target is one member of a closed ambiguous binding.
-    /// Ranking graphs may retain it as a candidate edge while preserving the
-    /// row's `Unproven` proof and the graph's incomplete inbound evidence.
-    pub ambiguous_candidate: bool,
-    pub usage_kind: UsageHitKind,
-    pub site_class: SiteClass,
-    /// How the site's enclosing declaration relates to the target, computed
-    /// once by [`classify_owner_relation`] for both producers. `Unknown` when
-    /// the classifier cannot relate the owners; never silently `External`.
-    pub owner_relation: OwnerRelation,
-    pub provenance: EdgeProvenance,
-    /// The workspace generation both endpoints were read from. A comparison
-    /// across two generations is refused, not fudged.
-    pub generation: u64,
-}
-
-impl ReferenceEdgeRow {
-    pub fn target_id(&self) -> DeclarationId {
-        self.target.declaration_id()
-    }
-
-    /// The exact target declaration carries its source language in the
-    /// declaration identity and source path. JVM edges may cross Java, Kotlin
-    /// and Scala while retaining that target language.
-    pub fn target_language(&self) -> Language {
-        self.target.source().declaration_language()
-    }
-
-    pub fn source_id(&self) -> Option<DeclarationId> {
-        self.site.enclosing.as_ref().map(CodeUnit::declaration_id)
-    }
-
-    /// Whether this edge belongs to the given usage surface. Definition sites
-    /// and import bindings are editor-visible but not external usages, exactly
-    /// as on the usage-hit surface this delegates to.
-    pub fn included_in(&self, surface: UsageHitSurface) -> bool {
-        self.usage_kind.included_in(surface)
-    }
-
-    /// Whether this source range overlaps any declaration span belonging to
-    /// the target graph node in the same file.
-    ///
-    /// This predicate is intentionally independent of usage surface. A
-    /// consumer may need the incumbent definition-overlap exclusion for a
-    /// retained editor-only row such as an unproven self-receiver without
-    /// reclassifying that row as an external usage.
-    pub fn overlaps_target_definition_spans(
-        &self,
-        target_definition_spans: &[(ProjectFile, Range)],
-    ) -> bool {
-        target_definition_spans.iter().any(|(file, target)| {
-            file == &self.site.file
-                && target.start_byte < self.site.range.end_byte
-                && self.site.range.start_byte < target.end_byte
-        })
-    }
-
-    /// Whether this row can enter the external workspace usage graph before
-    /// graph-node membership is applied.
-    ///
-    /// The canonical row inventory deliberately retains self type/path
-    /// references for editor and query consumers. The workspace graph has the
-    /// narrower incumbent contract: it excludes every reference whose source
-    /// range overlaps any declaration belonging to the target graph node in
-    /// that file. `target_definition_spans` must contain file-tagged ranges from
-    /// the same generation as this row, including every declaration grouped
-    /// into a C++ or C# graph node. Graph-node membership and grouped self-edge
-    /// exclusion remain the consumer's separate responsibility.
-    pub fn included_in_external_usage_graph(
-        &self,
-        target_definition_spans: &[(ProjectFile, Range)],
-    ) -> bool {
-        if !self.included_in(UsageHitSurface::ExternalUsages) {
-            return false;
-        }
-        if self.site.enclosing.is_none() {
-            return false;
-        }
-        !self.overlaps_target_definition_spans(target_definition_spans)
-    }
-}
-
-/// Why an edge derivation's rows are less than the whole truth.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeIncompleteReason {
-    /// The adapter declares the axis unsupported, so absence of rows for it
-    /// says nothing.
-    AxisUnsupported(EdgeAxis),
-    /// No structural provider is registered for the language in question.
-    NoStructuralAdapter,
-    /// The usage listing was cut short (too many call sites, or a scan
-    /// budget), so absent inverse edges are unknown, not absent.
-    UsageListingTruncated,
-    /// The usage analysis reported a typed failure for the seed declaration.
-    UsageAnalysisFailed { reason_kind: String, reason: String },
-    /// The usage query was cancelled before completing.
-    Cancelled,
-    /// A selected inverse query reached its soft time budget after confirming
-    /// only part of the requested candidate-blob inventory.
-    TimeBudgetExceeded,
-    /// The file's occurrence rows do not cover these reference-producing
-    /// roles, so forward edges at sites of those roles may be missing. Roles
-    /// the file does cover are unaffected: a consumer narrowed to one role
-    /// checks [`EdgeDerivationResult::covers_forward_role`] rather than this
-    /// blanket reason.
-    OccurrenceRowsIncomplete {
-        uncovered_roles: Vec<OccurrenceRole>,
-    },
-    /// The native selected source could not prove that it enumerated every
-    /// reference occurrence in the requested snapshot.
-    ReferenceEnumerationIncomplete,
-    /// One admitted native reference retained an open binding, so omitted
-    /// target edges may still exist even though every retained target remains
-    /// available as unproven inventory.
-    ForwardResolutionIncomplete,
-    /// One native reference retained an open receiver/admission boundary, so
-    /// its known channels remain available but another graph channel may
-    /// still exist.
-    ForwardAdmissionIncomplete,
-    /// Exact source occurrence or declaration correspondence was unavailable
-    /// for at least one native reference edge.
-    ForwardMetadataIncomplete,
-    /// A selected native inverse index could not prove that it enumerated
-    /// every reference occurrence in its generation-bound workspace.
-    InverseIndexReferenceEnumerationIncomplete,
-    /// A selected native inverse index retained an open binding, so a target's
-    /// indexed incoming rows may omit additional references.
-    InverseIndexResolutionIncomplete,
-    /// A selected native inverse index retained an open receiver/admission
-    /// boundary, so a target's indexed incoming rows may omit another channel.
-    InverseIndexAdmissionIncomplete,
-    /// A selected native inverse index lacked required source or declaration
-    /// correspondence for at least one reference edge.
-    InverseIndexMetadataIncomplete,
-    /// The requested declaration is not in the selected inverse index's exact
-    /// covered target universe, so an empty bucket cannot prove absence.
-    InverseIndexTargetUncovered,
-    /// The language's registered selected inverse provider built no index for
-    /// this generation, so no declaration in that language has a selected
-    /// inverse answer. `reason_kind` names which refusal the provider gave and
-    /// `reason` carries its exact detail.
-    SelectedInverseIndexUnavailable { reason_kind: String, reason: String },
-}
-
-/// Which axes this derivation layer answers.
-pub const EDGE_PRODUCER_AXES: &[EdgeAxis] = &[
-    EdgeAxis::ForwardProjection,
-    EdgeAxis::InverseProjection,
-    EdgeAxis::KindClassification,
-    EdgeAxis::ProofAttribution,
-    EdgeAxis::OwnerClassification,
-];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeCompleteness {
-    Complete,
-    Incomplete { reasons: Vec<EdgeIncompleteReason> },
-}
-
-impl EdgeCompleteness {
-    pub fn is_complete(&self) -> bool {
-        matches!(self, Self::Complete)
-    }
-
-    /// Whether rows for `axis` can be trusted to be the complete set.
-    pub fn covers(&self, axis: EdgeAxis) -> bool {
-        if !EDGE_PRODUCER_AXES.contains(&axis) {
-            return false;
-        }
-        match self {
-            Self::Complete => true,
-            Self::Incomplete { reasons } => !reasons.iter().any(|reason| match reason {
-                EdgeIncompleteReason::AxisUnsupported(unsupported) => *unsupported == axis,
-                EdgeIncompleteReason::UsageListingTruncated
-                | EdgeIncompleteReason::UsageAnalysisFailed { .. } => {
-                    axis == EdgeAxis::InverseProjection
-                }
-                EdgeIncompleteReason::OccurrenceRowsIncomplete { .. } => {
-                    axis == EdgeAxis::ForwardProjection
-                }
-                EdgeIncompleteReason::ReferenceEnumerationIncomplete
-                | EdgeIncompleteReason::ForwardResolutionIncomplete
-                | EdgeIncompleteReason::ForwardAdmissionIncomplete => {
-                    axis == EdgeAxis::ForwardProjection
-                }
-                EdgeIncompleteReason::ForwardMetadataIncomplete => matches!(
-                    axis,
-                    EdgeAxis::ForwardProjection
-                        | EdgeAxis::KindClassification
-                        | EdgeAxis::OwnerClassification
-                ),
-                EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
-                | EdgeIncompleteReason::InverseIndexResolutionIncomplete
-                | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
-                | EdgeIncompleteReason::InverseIndexTargetUncovered
-                | EdgeIncompleteReason::TimeBudgetExceeded
-                | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => {
-                    axis == EdgeAxis::InverseProjection
-                }
-                EdgeIncompleteReason::InverseIndexMetadataIncomplete => matches!(
-                    axis,
-                    EdgeAxis::InverseProjection
-                        | EdgeAxis::KindClassification
-                        | EdgeAxis::OwnerClassification
-                ),
-                EdgeIncompleteReason::NoStructuralAdapter | EdgeIncompleteReason::Cancelled => true,
-            }),
-        }
-    }
 }
 
 /// One producer's derived edges with an explicit account of what is missing.
@@ -1206,7 +1070,8 @@ impl<'a> ReferenceEngine<'a> {
 }
 
 impl EdgeDerivationResult {
-    pub(crate) fn incomplete(
+    #[doc(hidden)]
+    pub fn incomplete(
         reasons: Vec<EdgeIncompleteReason>,
         provenance: EdgeProvenance,
         generation: u64,
@@ -1400,16 +1265,6 @@ impl OwnerRelationMemo {
             },
         )
     }
-}
-
-/// The owner-relation rule, with the inheritance test supplied by the caller:
-/// `inherits(hierarchy, site, target)` says whether `target` is among `site`'s
-/// ancestors.
-/// A same-owner value reference is a member reference only when its target
-/// belongs to a declaration rather than directly to a namespace. Sharing a
-/// module does not turn a free function or constant into a self receiver.
-pub(crate) fn is_same_owner_member_reference(relation: OwnerRelation, target: &CodeUnit) -> bool {
-    relation == OwnerRelation::SameOwner && target.fq().namespace_prefix().is_none()
 }
 
 fn classify_owner_relation_by(
@@ -2000,7 +1855,8 @@ pub fn forward_edges_for_file_at_lines(
     forward_edges_from_occurrences(analyzer, file, occurrences, generation)
 }
 
-pub(crate) fn forward_axis_gate(
+#[doc(hidden)]
+pub fn forward_axis_gate(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     generation: u64,
@@ -2022,7 +1878,8 @@ pub(crate) fn forward_axis_gate(
     }
 }
 
-pub(crate) fn forward_edges_from_occurrences(
+#[doc(hidden)]
+pub fn forward_edges_from_occurrences(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     occurrences: OccurrenceFileResult,
@@ -2129,46 +1986,47 @@ fn forward_resolution_incomplete_reason(row: &OccurrenceRow) -> Option<EdgeIncom
     }
 }
 
+// The selected inverse adapter belongs with this engine-owned trait; its
+// concrete reference index lives in the resolution layer below the engine.
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::structural::reference_edges::SelectedInverseReferenceIndex
+    for crate::analyzer::resolution::fact_reference_edges::SelectedReferenceInverseIndex
+{
+    fn generation(&self) -> u64 {
+        crate::analyzer::resolution::fact_reference_edges::SelectedReferenceInverseIndex::generation(
+            self,
+        )
+    }
+
+    fn inverse_for(
+        &self,
+        target: &crate::analyzer::CodeUnit,
+    ) -> crate::analyzer::structural::reference_edges::EdgeDerivationResult {
+        (*crate::analyzer::resolution::fact_reference_edges::SelectedReferenceInverseIndex::inverse_for(self, target)).clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
+    use brokk_bifrost_core::analyzer::usages::model::UsageHitSurface;
+
     use super::*;
+
     use crate::analyzer::java::JavaAnalyzer;
-    use crate::analyzer::structural::test_support::workspace_fixture;
+
     use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-    use crate::analyzer::{CodeUnitIndex, Language, WorkspaceAnalyzer};
+
+    use crate::analyzer::CodeUnitIndex;
+    use crate::analyzer::Language;
+
     use crate::inline_project::InlineTestProject;
+
     use crate::test_support::token_range;
+
     use brokk_bifrost_test_macros::hardwon;
+
     use std::collections::BTreeSet;
-    struct Fixture {
-        _temp: tempfile::TempDir,
-        workspace: WorkspaceAnalyzer,
-        files: Vec<ProjectFile>,
-    }
-
-    impl Fixture {
-        fn new(language: Language, sources: &[(&str, &str)]) -> Self {
-            let (temp, workspace, files, _) = workspace_fixture(language, sources);
-            Self {
-                _temp: temp,
-                workspace,
-                files,
-            }
-        }
-
-        fn analyzer(&self) -> &dyn IAnalyzer {
-            self.workspace.analyzer()
-        }
-
-        fn declaration(&self, fq_suffix: &str) -> CodeUnit {
-            crate::analyzer::structural::test_support::declarations_ending_with(
-                self.analyzer(),
-                fq_suffix,
-            )
-            .next()
-            .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
-        }
-    }
 
     const JAVA_REFERENCE_KIND_SITES: &str = r#"package fixture;
 
@@ -2652,187 +2510,6 @@ class Target {
     }
 
     #[test]
-    #[hardwon("#1645: free-function namespaces and type owners were misclassified as unknown")]
-    fn a_namespace_owner_and_a_type_owner_are_external() {
-        /// One language's contribution: the sources, the free callable, and
-        /// the type-owned target it calls.
-        struct Case {
-            language: Language,
-            sources: &'static [(&'static str, &'static str)],
-            caller: &'static str,
-            target: &'static str,
-        }
-
-        let cases: &[Case] = &[
-            // Rust: the caller sits at the crate root, which the qualified
-            // name spells by carrying no scope segment.
-            Case {
-                language: Language::Rust,
-                sources: &[(
-                    "src/lib.rs",
-                    "pub struct Widget;\n\nimpl Widget {\n    pub fn new() -> Widget {\n        Widget\n    }\n\n    pub fn run(&self) -> usize {\n        1\n    }\n}\n\npub fn drive() -> usize {\n    let s = Widget::new();\n    s.run()\n}\n",
-                )],
-                caller: "drive",
-                target: "Widget.run",
-            },
-            // Rust again, with a named module owner: containing the target's
-            // type is not owning the target.
-            Case {
-                language: Language::Rust,
-                sources: &[(
-                    "src/lib.rs",
-                    "pub mod thing {\n    pub struct Widget;\n    impl Widget {\n        pub fn run(&self) -> usize { 1 }\n    }\n    pub fn drive(w: &Widget) -> usize {\n        w.run()\n    }\n}\n",
-                )],
-                caller: "thing.drive",
-                target: "thing.Widget.run",
-            },
-            // Go: the package prefix is a `Path` segment.
-            Case {
-                language: Language::Go,
-                sources: &[(
-                    "main.go",
-                    "package main\n\ntype Widget struct{}\n\nfunc (w Widget) Run() int { return 1 }\n\nfunc Drive() int {\n\tw := Widget{}\n\treturn w.Run()\n}\n",
-                )],
-                caller: "main.Drive",
-                target: "main.Widget.Run",
-            },
-            // PHP: a namespaced function.
-            Case {
-                language: Language::Php,
-                sources: &[(
-                    "app.php",
-                    "<?php\nnamespace App;\n\nclass Widget {\n    public function run() { return 1; }\n}\n\nfunction drive() {\n    $w = new Widget();\n    return $w->run();\n}\n",
-                )],
-                caller: "App.drive",
-                target: "App.Widget.run",
-            },
-            // Kotlin: a top-level function in a package.
-            Case {
-                language: Language::Kotlin,
-                sources: &[(
-                    "src/app.kt",
-                    "package fixture\n\nclass Widget {\n    fun run(): Int = 1\n}\n\nfun drive(): Int {\n    val w = Widget()\n    return w.run()\n}\n",
-                )],
-                caller: "fixture.drive",
-                target: "fixture.Widget.run",
-            },
-            // Ruby: a top-level method, whose type-owned counterpart carries a
-            // `Nested` prefix rather than a namespace one.
-            Case {
-                language: Language::Ruby,
-                sources: &[(
-                    "app.rb",
-                    "class Widget\n  def run\n    1\n  end\nend\n\ndef drive\n  w = Widget.new\n  w.run\nend\n",
-                )],
-                caller: "drive",
-                target: "Widget.run",
-            },
-            // JavaScript: the same js/ts model, listed separately because it
-            // is a separately claimed language.
-            Case {
-                language: Language::JavaScript,
-                sources: &[
-                    (
-                        "widget.js",
-                        "export class Widget {\n  run() { return 1; }\n}\n",
-                    ),
-                    (
-                        "app.js",
-                        "import { Widget } from './widget.js';\nexport function drive() {\n  const w = new Widget();\n  return w.run();\n}\n",
-                    ),
-                ],
-                caller: "drive",
-                target: "Widget.run",
-            },
-            // TypeScript: the module scope is the file and is unnamed, but the
-            // caller still provably belongs to no type.
-            Case {
-                language: Language::TypeScript,
-                sources: &[
-                    (
-                        "widget.ts",
-                        "export class Widget {\n  run(): number { return 1; }\n}\n",
-                    ),
-                    (
-                        "app.ts",
-                        "import { Widget } from './widget';\nexport function drive(): number {\n  const w = new Widget();\n  return w.run();\n}\n",
-                    ),
-                ],
-                caller: "drive",
-                target: "Widget.run",
-            },
-        ];
-        for case in cases {
-            let language = case.language;
-            let fixture = Fixture::new(language, case.sources);
-            let analyzer = fixture.analyzer();
-            let caller = fixture.declaration(case.caller);
-            let target = fixture.declaration(case.target);
-            assert_eq!(
-                classify_owner_relation(analyzer, Some(&caller), &target),
-                OwnerRelation::External,
-                "{language:?}: {caller:?} owns no type, {target:?} does"
-            );
-            assert_eq!(
-                classify_owner_relation(analyzer, Some(&target), &caller),
-                OwnerRelation::External,
-                "{language:?}: the relation is symmetric across the two scopes"
-            );
-        }
-    }
-
-    #[test]
-    #[hardwon("#1645: named namespace owners were not compared by identity")]
-    fn namespace_owners_are_compared_by_name() {
-        let fixture = Fixture::new(
-            Language::Go,
-            &[
-                (
-                    "main.go",
-                    "package main\n\nfunc Drive() int { return Helper() }\n\nfunc Helper() int { return 1 }\n",
-                ),
-                (
-                    "util/util.go",
-                    "package util\n\nfunc Assist() int { return 1 }\n",
-                ),
-            ],
-        );
-        let analyzer = fixture.analyzer();
-        let drive = fixture.declaration("main.Drive");
-        let helper = fixture.declaration("main.Helper");
-        let assist = fixture.declaration("util.Assist");
-        assert_eq!(
-            classify_owner_relation(analyzer, Some(&drive), &helper),
-            OwnerRelation::SameOwner,
-            "both funcs hang off package `main`"
-        );
-        assert_eq!(
-            classify_owner_relation(analyzer, Some(&drive), &assist),
-            OwnerRelation::External,
-            "`main` and `util` are different packages"
-        );
-    }
-
-    #[test]
-    #[hardwon("#1645: unrelated root-scope functions must remain unknown owners")]
-    fn two_root_scope_owners_stay_unknown() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            &[(
-                "src/lib.rs",
-                "pub fn drive() -> usize {\n    helper()\n}\n\npub fn helper() -> usize {\n    1\n}\n",
-            )],
-        );
-        let analyzer = fixture.analyzer();
-        let drive = fixture.declaration("drive");
-        let helper = fixture.declaration("helper");
-        assert_eq!(
-            classify_owner_relation(analyzer, Some(&drive), &helper),
-            OwnerRelation::Unknown
-        );
-    }
-
-    #[test]
     fn forward_and_inverse_classify_import_binding() {
         let fixture = Fixture::new(
             Language::Java,
@@ -3009,3 +2686,12 @@ class Target {
         }
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
+pub use crate::analyzer::resolution::reference_vocabulary::{
+    EDGE_PRODUCER_AXES, EdgeCompleteness, EdgeIncompleteReason, EdgeSite, ReferenceEdgeRow,
+    is_same_owner_member_reference,
+};

@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-pub(crate) fn content_identity(seed: u64) -> WorkspaceContentIdentity {
+#[doc(hidden)]
+pub fn content_identity(seed: u64) -> WorkspaceContentIdentity {
     WorkspaceContentIdentity::for_test(seed)
 }
 

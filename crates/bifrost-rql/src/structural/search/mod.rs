@@ -84,7 +84,6 @@ use brokk_bifrost_analysis::native_resolution_test_support::{
     FactReferenceEdgeCatalog, FactResolutionSource, SelectedFactResolutionSnapshot,
     SelectedReferenceInverseIndexBuildOutcome, build_selected_reference_inverse_index,
 };
-use brokk_bifrost_analysis::searchtools::session_subset;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::materialization::SourceExportLocalDefinition;
 use brokk_bifrost_core::util::elapsed_ns;
@@ -97,6 +96,7 @@ use brokk_bifrost_rql::{
     ReferenceTraversalFilter, ResolvedCallFilter, ResolvedCallIdentityKind, ResolvedCallProof,
     SetOperator,
 };
+use brokk_bifrost_tools::searchtools::session_subset;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -735,7 +735,6 @@ const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
 // and a 1 GiB probe retains no more than the 256 MiB run, so the walk
 // does not expand to fill the allowance.
 const MAX_SEMANTIC_RETAINED_BYTES: usize = 256 * 1024 * 1024;
-const MAX_SEMANTIC_TRAVERSAL_STEPS: usize = 1_000_000;
 const MAX_PROVENANCE_TRACES: usize = 16;
 const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
 const CODE_QUERY_SCHEDULER_WORKERS: usize = 2;
@@ -1428,8 +1427,11 @@ impl MemberSelectionValue {
 #[derive(Debug, Clone)]
 enum SemanticPipelineValue {
     Procedure(SemanticProcedureValue),
+    ProcedureReference(Box<semantic::SemanticProcedureReferenceValue>),
     ProgramPoint(SemanticProgramPointValue),
+    ProgramPointReference(Box<semantic::SemanticProgramPointReferenceValue>),
     ControlEdge(SemanticControlEdgeValue),
+    ControlEdgeReference(Box<semantic::SemanticControlEdgeReferenceValue>),
     CallResult(SemanticCallResultValue),
     TypestateFinding(SemanticTypestateFindingValue),
     TypestateWitness(SemanticTypestateWitnessValue),
@@ -1531,6 +1533,9 @@ enum PipelineKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SemanticPipelineKey {
+    ProgramPointReference(String),
+    ControlEdgeReference(String),
+    ProcedureReference(Box<crate::analyzer::semantic::SemanticProcedureReference>),
     Procedure(crate::analyzer::semantic::ProcedureHandle),
     ProgramPoint(crate::analyzer::semantic::ProgramPointHandle),
     ControlEdge(crate::analyzer::semantic::ControlEdgeHandle),
@@ -1716,8 +1721,20 @@ impl SemanticPipelineValue {
     fn key(&self) -> SemanticPipelineKey {
         match self {
             Self::Procedure(procedure) => SemanticPipelineKey::Procedure(procedure.handle.clone()),
+            Self::ProcedureReference(value) => SemanticPipelineKey::ProcedureReference(Box::new(
+                crate::analyzer::semantic::SemanticProcedureReference {
+                    key: value.key.clone(),
+                    locator: value.locator.clone(),
+                },
+            )),
             Self::ProgramPoint(point) => SemanticPipelineKey::ProgramPoint(point.handle.clone()),
+            Self::ProgramPointReference(value) => {
+                SemanticPipelineKey::ProgramPointReference(value.public.id.clone())
+            }
             Self::ControlEdge(edge) => SemanticPipelineKey::ControlEdge(edge.handle.clone()),
+            Self::ControlEdgeReference(value) => {
+                SemanticPipelineKey::ControlEdgeReference(value.public.id.clone())
+            }
             Self::CallResult(result) => SemanticPipelineKey::CallResult(result.public().id),
             Self::TypestateFinding(finding) => {
                 SemanticPipelineKey::TypestateFinding(finding.key().to_string())
@@ -1746,8 +1763,11 @@ impl SemanticPipelineValue {
     fn file(&self) -> &ProjectFile {
         match self {
             Self::Procedure(value) => value.file(),
+            Self::ProcedureReference(value) => &value.file,
             Self::ProgramPoint(value) => value.file(),
+            Self::ProgramPointReference(value) => &value.procedure.file,
             Self::ControlEdge(value) => value.file(),
+            Self::ControlEdgeReference(value) => &value.procedure.file,
             Self::CallResult(value) => value.file(),
             Self::TypestateFinding(value) => value.file(),
             Self::TypestateWitness(value) => value.file(),
@@ -1761,11 +1781,20 @@ impl SemanticPipelineValue {
 
     fn public_result(self) -> CodeQueryResultValue {
         match self {
+            Self::ProcedureReference(value) => CodeQueryResultValue::Procedure {
+                value: value.public,
+            },
             Self::Procedure(value) => CodeQueryResultValue::Procedure {
                 value: value.public(),
             },
+            Self::ProgramPointReference(value) => CodeQueryResultValue::ProgramPoint {
+                value: value.public,
+            },
             Self::ProgramPoint(value) => CodeQueryResultValue::ProgramPoint {
                 value: value.public(),
+            },
+            Self::ControlEdgeReference(value) => CodeQueryResultValue::ControlEdge {
+                value: Box::new(value.public),
             },
             Self::ControlEdge(value) => CodeQueryResultValue::ControlEdge {
                 value: Box::new(value.public()),
@@ -1800,7 +1829,24 @@ impl SemanticPipelineValue {
     fn public_ref(&self) -> CodeQueryResultRef {
         match self {
             Self::Procedure(value) => value.public_ref(),
+            Self::ProcedureReference(value) => value.public_ref(),
+            Self::ProgramPointReference(value) => CodeQueryResultRef::ProgramPoint {
+                id: value.public.id.clone(),
+                path: value.public.path.clone(),
+                range: value.public.range,
+                procedure_id: value.public.procedure_id.clone(),
+                boundary: value.public.boundary,
+            },
             Self::ProgramPoint(value) => value.public_ref(),
+            Self::ControlEdgeReference(value) => CodeQueryResultRef::ControlEdge {
+                id: value.public.id.clone(),
+                path: value.public.path.clone(),
+                range: value.public.range,
+                edge_kind: value.public.edge_kind,
+                procedure_id: value.public.procedure_id.clone(),
+                source_id: value.public.source.id.clone(),
+                target_id: value.public.target.id.clone(),
+            },
             Self::ControlEdge(value) => value.public_ref(),
             Self::CallResult(value) => value.public_ref(),
             Self::TypestateFinding(value) => value.public_ref(),
@@ -1820,6 +1866,17 @@ impl SemanticPipelineValue {
 
     fn detailed_projection(&self) -> DetailedSemanticProjection<'_> {
         match self {
+            Self::ProcedureReference(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::Procedure,
+                key: DetailedCodeQueryKey::Procedure {
+                    id: value.public.id.clone(),
+                },
+                file: &value.file,
+                byte_span: value.byte_span.clone(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
             Self::Procedure(value) => {
                 let public = value.public();
                 DetailedSemanticProjection {
@@ -1834,6 +1891,18 @@ impl SemanticPipelineValue {
                     stable_id: public.id,
                 }
             }
+            Self::ProgramPointReference(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::ProgramPoint,
+                key: DetailedCodeQueryKey::ProgramPoint {
+                    id: value.public.id.clone(),
+                    procedure_id: value.public.procedure_id.clone(),
+                },
+                file: &value.procedure.file,
+                byte_span: value.byte_span.clone(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
             Self::ProgramPoint(value) => {
                 let public = value.public();
                 DetailedSemanticProjection {
@@ -1849,6 +1918,18 @@ impl SemanticPipelineValue {
                     stable_id: public.id,
                 }
             }
+            Self::ControlEdgeReference(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::ControlEdge,
+                key: DetailedCodeQueryKey::ControlEdge {
+                    id: value.public.id.clone(),
+                    procedure_id: value.public.procedure_id.clone(),
+                },
+                file: &value.procedure.file,
+                byte_span: value.byte_span.clone(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
             Self::ControlEdge(value) => {
                 let public = value.public();
                 DetailedSemanticProjection {
@@ -1965,6 +2046,8 @@ impl SemanticPipelineValue {
 
 #[derive(Debug, Clone)]
 struct PipelineTrace {
+    // Temporary ordering inside a grouped file-window step; cleared on return.
+    window_order: Option<(usize, usize, usize)>,
     branch: Vec<usize>,
     seed: Arc<SeedMatch>,
     steps: Vec<PipelineTraceStep>,
@@ -1978,10 +2061,55 @@ struct PipelineTraceStep {
 }
 
 #[derive(Debug, Clone)]
+struct SemanticTraceSnapshot {
+    public: CodeQueryResultRef,
+    domain: DetailedCodeQueryDomain,
+    key: DetailedCodeQueryKey,
+    file: ProjectFile,
+    byte_span: std::ops::Range<usize>,
+    display_range: CodeQueryRange,
+    language: &'static str,
+    stable_id: String,
+}
+
+impl SemanticTraceSnapshot {
+    fn of(value: &SemanticPipelineValue) -> Self {
+        let projection = value.detailed_projection();
+        Self {
+            public: value.public_ref(),
+            domain: projection.domain,
+            key: projection.key,
+            file: projection.file.clone(),
+            byte_span: projection.byte_span,
+            display_range: projection.display_range,
+            language: projection.language,
+            stable_id: projection.stable_id,
+        }
+    }
+    fn file(&self) -> &ProjectFile {
+        &self.file
+    }
+    fn public_ref(&self) -> CodeQueryResultRef {
+        self.public.clone()
+    }
+    fn detailed_projection(&self) -> DetailedSemanticProjection<'_> {
+        DetailedSemanticProjection {
+            domain: self.domain,
+            key: self.key.clone(),
+            file: &self.file,
+            byte_span: self.byte_span.clone(),
+            display_range: self.display_range,
+            language: self.language,
+            stable_id: self.stable_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum PipelineTraceValue {
     StructuralMatch(Arc<SeedMatch>),
     Declaration(DeclarationValue),
-    Semantic(SemanticPipelineValue),
+    Semantic(Box<SemanticTraceSnapshot>),
     File(ProjectFile),
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
@@ -2881,6 +3009,9 @@ struct QueryExecutionState<'a> {
     rewrite_path_cache: RewritePathTraversalCache,
     path_cache: PathTraversalCache,
     configuration_cache: ConfigurationFactsTraversalCache,
+    // Parallel seed branches retain separate domains and account for their own
+    // work. A shared blocking initializer could cycle through fair budget waits.
+    comparison_chain_operators: HashMap<ProjectFile, Arc<seeds::ComparisonChainOperators>>,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     /// Reused for the full lifetime of this CodeQuery, including later
     /// receiver steps that resolve additional Go sites.
@@ -4013,10 +4144,8 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
     row_family_session: Option<&mut CodeQueryRowFamilySession>,
 ) -> DetailedCodeQueryResult {
     let parent_scope = parent_semantic.scope_snapshot();
-    let (execution_before, execution_child) = parent_execution.fork_with_additional_limits(
-        limits.semantic.max_materialized_files,
-        limits.semantic.max_traversal_steps,
-    );
+    let (execution_before, execution_child) =
+        parent_execution.fork_with_materialized_file_limit(limits.semantic.max_materialized_files);
     let scope = AnalyzerQueryScope::new(workspace.analyzer());
     let token = scope.token();
     let access_mode = eager_structural_access_mode();
@@ -4556,6 +4685,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             shared_call_target_outcomes,
         ),
         call_binding_identity_request,
+        comparison_chain_operators: HashMap::default(),
         receiver_facts: HashMap::default(),
         receiver_service: None,
         semantic: workspace
@@ -8540,7 +8670,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::Declaration(declaration) => {
             Some(PipelineTraceValue::Declaration(declaration.clone()))
         }
-        PipelineValue::Semantic(value) => Some(PipelineTraceValue::Semantic(value.clone())),
+        PipelineValue::Semantic(value) => Some(PipelineTraceValue::Semantic(Box::new(
+            SemanticTraceSnapshot::of(value),
+        ))),
         PipelineValue::File(file) => Some(PipelineTraceValue::File(file.clone())),
         PipelineValue::ReferenceSite(site) => Some(PipelineTraceValue::ReferenceSite(site.clone())),
         PipelineValue::CallSite(site) => Some(PipelineTraceValue::CallSite(site.clone())),

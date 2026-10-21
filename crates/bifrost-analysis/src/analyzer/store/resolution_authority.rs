@@ -50,7 +50,8 @@ pub(crate) struct RootExportHalf {
 /// selection before a result is returned, so these immutable answers can be
 /// reused across the operation's per-file and engine-step reads.
 #[derive(Default)]
-pub(crate) struct AuthorityValidations {
+#[doc(hidden)]
+pub struct AuthorityValidations {
     mounts: HashSet<(SelectedResolutionMountOrdinal, i64)>,
     queried_mounts: HashSet<(SelectedResolutionMountOrdinal, i64)>,
     memo_hits: u64,
@@ -64,7 +65,8 @@ impl AuthorityValidations {
 
 /// Published answers read by one selected operation, bounded by its touched keys.
 #[derive(Default)]
-pub(super) struct AuthorityRequestMemo {
+#[doc(hidden)]
+pub struct AuthorityRequestMemo {
     /// Canonical content reached by this query. Supplemental aliases are never
     /// reused inside the query; cleanup leaves their high-water counters intact.
     pub(super) canonical_digests:
@@ -74,10 +76,12 @@ pub(super) struct AuthorityRequestMemo {
     node_identities: HashMap<(i64, u32), Option<[u8; 32]>>,
     /// Raw declaration keys, including absence, from immutable blob publications.
     /// Decode with the current mount ordinal at use; never retain mounted IDs.
-    pub(super) rust_reason_owners: HashMap<(i64, i64), Option<i64>>,
+    #[doc(hidden)]
+    pub rust_reason_owners: HashMap<(i64, i64), Option<i64>>,
 }
 
-pub(crate) struct SelectedResolutionAuthority<'project> {
+#[doc(hidden)]
+pub struct SelectedResolutionAuthority<'project> {
     connection: &'project Connection,
     names: &'project super::resolution::SharedNameTable,
     requested_mounts: &'project super::resolution_selection::RequestedResolutionMountRows,
@@ -100,7 +104,8 @@ impl<'project> SelectedResolutionAuthority<'project> {
         )
     }
 
-    pub(super) fn new(
+    #[doc(hidden)]
+    pub fn new(
         connection: &'project Connection,
         names: &'project super::resolution::SharedNameTable,
         requested_mounts: &'project super::resolution_selection::RequestedResolutionMountRows,
@@ -663,7 +668,8 @@ impl<'project> SelectedResolutionAuthority<'project> {
         })
     }
 
-    pub(crate) fn lookup_reference_sites(
+    #[doc(hidden)]
+    pub fn lookup_reference_sites(
         &self,
         mount: &SelectedResolutionMountRecord,
         lookup: SemanticId,
@@ -710,7 +716,8 @@ impl<'project> SelectedResolutionAuthority<'project> {
         })
     }
 
-    pub(crate) fn root_demand_reference_sites(
+    #[doc(hidden)]
+    pub fn root_demand_reference_sites(
         &self,
         mount: &SelectedResolutionMountRecord,
         terminal: SemanticId,
@@ -891,7 +898,8 @@ impl<'project> SelectedResolutionAuthority<'project> {
         })
     }
 
-    pub(crate) fn qualified_route_reference_sites(
+    #[doc(hidden)]
+    pub fn qualified_route_reference_sites(
         &self,
         mount: &SelectedResolutionMountRecord,
         lookup: SemanticId,

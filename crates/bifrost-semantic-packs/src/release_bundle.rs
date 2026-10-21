@@ -18,18 +18,18 @@
 //! needs none of this: a `.gem` file is already the exact artifact its
 //! dependency adapter reads, so it is promoted unchanged.
 //!
-//! The three JVM spec files in `semantic-packs/jvm/` were kept as-is instead
-//! of adding a compatibility path: the JSON vocabulary (field names, tags,
-//! `schema_version` 1) is unchanged by the generalization, so every existing
-//! spec still parses with the same meaning. Only the Rust-level type names
-//! dropped their JVM prefix.
+//! Existing pinned specs continue to parse as schema version 1. Version 2 adds
+//! an optional exact per-shard activation map for authored semantic models;
+//! generated pack inputs retain their existing fields and meaning.
 //!
 //! Extraction rejects are a structured burn-down artifact: `rejects.json`
 //! lists every rejected entry with its reject reason, is content-addressed by
 //! `SHA256SUMS`, and is validated by `verify` so pack completeness converges
 //! release over release.
 
-use std::collections::{BTreeMap, BTreeSet};
+use brokk_bifrost_csharp_analysis::CSharpAssemblyPackProducer;
+use brokk_bifrost_ruby_analysis::RubyGemArchivePackProducer;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::semantic_model::GoPinnedPackage as AnalysisGoPinnedPackage;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AcquisitionReceiptRelease, AcquisitionReceiptSource, ActivationSelector, ArtifactEncoding,
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
@@ -59,14 +60,17 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     resolve_active_semantic_models, verify_recorded_generated_production_digest,
 };
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, CSharpAssemblyPackProducer, ComposerPackagePackProducer,
-    ComposerPinnedAutoloadRule, FileSetProject, GoModulePackProducer,
-    GoPinnedPackage as AnalysisGoPinnedPackage, JavaJarPackProducer, JdkSourceArchiveLayout,
+    AnalyzerConfig, FileSetProject, JavaJarPackProducer, JdkSourceArchiveLayout,
     JdkSourceArchivePackProducer, JdkVersion, JvmDependencyPackAdapter,
-    KotlinSourceJarPackProducer, Language, PhpDeclarationStubPackProducer,
-    PythonArtifactPackProducer, RubyGemArchivePackProducer, RustdocJsonPackProducer,
-    ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer, WorkspaceAnalyzer,
+    KotlinSourceJarPackProducer, Language, ScalaSourceJarPackProducer, WorkspaceAnalyzer,
 };
+use brokk_bifrost_go_analysis::GoModulePackProducer;
+use brokk_bifrost_js_ts_analysis::TypeScriptDeclarationPackProducer;
+use brokk_bifrost_php_analysis::analyzer::php::{
+    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDeclarationStubPackProducer,
+};
+use brokk_bifrost_python_analysis::PythonArtifactPackProducer;
+use brokk_bifrost_rust_analysis::RustdocJsonPackProducer;
 use semver::{Op, Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -78,7 +82,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionCons
 #[cfg(feature = "download")]
 use brokk_bifrost_analysis::analyzer::semantic_model::AcquisitionReceiptRequest;
 
-pub const PACK_SPEC_SCHEMA_VERSION: u32 = 1;
+pub const PACK_SPEC_SCHEMA_VERSION: u32 = 2;
 pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 3;
 
 fn current_release_generator() -> ReleaseGenerator {
@@ -110,6 +114,13 @@ pub struct PinnedPackSpec {
     pub notices: Vec<String>,
     pub measurement_activation: ActivationSelector,
     pub measurement_queries: Vec<PinnedLookupQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedShardActivationPin {
+    pub shard_id: String,
+    pub activation: Vec<ActivationSelector>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,7 +172,14 @@ pub enum PinnedPackKind {
     /// One exact, reviewed semantic-model source. Unlike the artifact-backed
     /// producer families, this input is already an authored pack and must be
     /// compiled directly without being classified as generated declarations.
-    AuthoredSemanticModel,
+    AuthoredSemanticModel {
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_shard_activation_pins",
+            skip_serializing_if = "Option::is_none"
+        )]
+        shard_activation_pins: Option<Vec<PinnedShardActivationPin>>,
+    },
     /// One pinned npm package: its manifest plus the pinned TypeScript
     /// declaration files that make up its public surface. `manifest` names
     /// the pinned `package.json` path; each entry in `declarations` names its
@@ -205,6 +223,15 @@ pub enum PinnedPackKind {
     PhpDeclarationStub {
         stubs: Vec<String>,
     },
+}
+
+fn deserialize_present_shard_activation_pins<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<PinnedShardActivationPin>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<PinnedShardActivationPin>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,7 +326,7 @@ impl PinnedPackKind {
             Self::RubyGemArchive => ExternalArtifactKind::RubyGemArchive,
             Self::ComposerPackage { .. } => ExternalArtifactKind::ComposerPackageSourceSet,
             Self::PhpDeclarationStub { .. } => ExternalArtifactKind::PhpDeclarationStub,
-            Self::AuthoredSemanticModel => return None,
+            Self::AuthoredSemanticModel { .. } => return None,
         })
     }
 }
@@ -835,7 +862,7 @@ fn generate_one(
     input: &BundleInput,
     spec: &PinnedPackSpec,
 ) -> Result<(ReleasePack, ReleasePackMeasurement, ReleasePackRejects), BundleError> {
-    if !matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel)
+    if !matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel { .. })
         && spec.compatibility.bifrost.is_some()
     {
         return Err(BundleError::new(format!(
@@ -874,8 +901,8 @@ fn generate_one(
     let started = Instant::now();
     let cancellation = CancellationToken::default();
     let (authored, diagnostics, suppressed_rejects) = match &spec.kind {
-        PinnedPackKind::AuthoredSemanticModel => (
-            read_authored_semantic_model(spec, &artifact)?,
+        PinnedPackKind::AuthoredSemanticModel { .. } => (
+            read_authored_semantic_model(spec, &artifact, &input.spec_path)?,
             Vec::new(),
             0_u64,
         ),
@@ -995,6 +1022,7 @@ fn generate_one(
 fn read_authored_semantic_model(
     spec: &PinnedPackSpec,
     artifact: &ExactArtifact,
+    spec_path: &Path,
 ) -> Result<AuthoredSemanticModelPack, BundleError> {
     let authored: AuthoredSemanticModelPack = serde_json::from_slice(artifact.bytes())
         .map_err(|error| BundleError::new(format!("parse authored semantic model: {error}")))?;
@@ -1014,17 +1042,95 @@ fn read_authored_semantic_model(
             "authored semantic model metadata does not match its pinned spec",
         ));
     }
-    if authored.shards.is_empty()
-        || authored
-            .shards
-            .iter()
-            .any(|shard| shard.activation != spec.activation)
-    {
-        return Err(BundleError::new(
-            "authored semantic model shards must repeat the pinned activation exactly",
-        ));
+    match &spec.kind {
+        PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } => {
+            if spec.schema_version != PACK_SPEC_SCHEMA_VERSION {
+                return Err(BundleError::new(
+                    "per-shard activation pins require pinned spec schema version 2",
+                ));
+            }
+            validate_pinned_shard_activation_pins(pins, spec_path)?;
+            validate_authored_shard_activation_pins(&authored, pins)?;
+        }
+        PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: None,
+        } => {
+            if authored.shards.is_empty()
+                || authored
+                    .shards
+                    .iter()
+                    .any(|shard| shard.activation != spec.activation)
+            {
+                return Err(BundleError::new(
+                    "authored semantic model shards must repeat the pinned activation exactly",
+                ));
+            }
+        }
+        _ => unreachable!("authored semantic model reader requires an authored pack spec"),
     }
     Ok(authored)
+}
+
+fn validate_authored_shard_activation_pins(
+    authored: &AuthoredSemanticModelPack,
+    pins: &[PinnedShardActivationPin],
+) -> Result<(), BundleError> {
+    if authored.shards.is_empty() {
+        return Err(BundleError::new(
+            "authored semantic model must contain at least one shard",
+        ));
+    }
+
+    let mut pinned_activations = HashMap::new();
+    for pin in pins {
+        assert!(
+            pinned_activations
+                .insert(pin.shard_id.as_str(), pin.activation.as_slice())
+                .is_none(),
+            "validated pin list has unique shard IDs"
+        );
+    }
+
+    let mut authored_ids = HashSet::new();
+    for shard in &authored.shards {
+        if shard.id.trim().is_empty() {
+            return Err(BundleError::new(
+                "authored semantic model has an empty shard ID",
+            ));
+        }
+        if !authored_ids.insert(shard.id.as_str()) {
+            return Err(BundleError::new(format!(
+                "authored semantic model repeats shard ID {}",
+                shard.id
+            )));
+        }
+        let Some(pinned_activation) = pinned_activations.get(shard.id.as_str()) else {
+            return Err(BundleError::new(format!(
+                "authored shard {} has no activation pin",
+                shard.id
+            )));
+        };
+        if shard.activation.as_slice() != *pinned_activation {
+            return Err(BundleError::new(format!(
+                "authored shard {} activation does not match its exact pinned selectors",
+                shard.id
+            )));
+        }
+    }
+
+    if let Some(extra_shard_id) = pinned_activations
+        .keys()
+        .find(|shard_id| !authored_ids.contains(*shard_id))
+    {
+        return Err(BundleError::new(format!(
+            "activation pin {} does not name an authored shard",
+            extra_shard_id
+        )));
+    }
+
+    Ok(())
 }
 
 fn generate_generated_productions(
@@ -1043,7 +1149,7 @@ fn generate_generated_productions(
         // Authored semantic-model inputs are curated packs, never derived
         // productions. Keep them out of this separate generated index even
         // when a future generated producer family is added beside them.
-        if matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel) {
+        if matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel { .. }) {
             continue;
         }
         if !matches!(&spec.kind, PinnedPackKind::JdkSourceZip { .. }) {
@@ -1481,7 +1587,7 @@ fn produce_pinned_pack(
         }
         PinnedPackKind::PhpDeclarationStub { stubs } => PhpDeclarationStubPackProducer
             .produce_loaded_source_set(request, limits, cancellation, artifact, stubs),
-        PinnedPackKind::AuthoredSemanticModel => ArtifactProduction::failed(
+        PinnedPackKind::AuthoredSemanticModel { .. } => ArtifactProduction::failed(
             ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Error,
                 source_entry: None,
@@ -1527,12 +1633,84 @@ fn validate_bounded_requirement(
     Ok(())
 }
 
+fn validate_activation_selector_requirements(
+    selector: &ActivationSelector,
+    spec_path: &Path,
+) -> Result<(), BundleError> {
+    for (axis, coordinate) in [
+        ("package", selector.package.as_ref()),
+        ("module", selector.module.as_ref()),
+        ("toolchain", selector.toolchain.as_ref()),
+    ] {
+        let Some(coordinate) = coordinate else {
+            continue;
+        };
+        if let Some(requirement) = &coordinate.version {
+            validate_bounded_requirement(spec_path, axis, &coordinate.name, requirement)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_pinned_shard_activation_pins(
+    pins: &[PinnedShardActivationPin],
+    spec_path: &Path,
+) -> Result<(), BundleError> {
+    if pins.is_empty() {
+        return Err(BundleError::new(format!(
+            "spec {} must list at least one pinned authored shard activation",
+            spec_path.display()
+        )));
+    }
+
+    let mut shard_ids = HashSet::new();
+    for pin in pins {
+        if pin.shard_id.trim().is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} pins an authored shard with an empty ID",
+                spec_path.display()
+            )));
+        }
+        if !shard_ids.insert(pin.shard_id.as_str()) {
+            return Err(BundleError::new(format!(
+                "spec {} pins authored shard ID {} more than once",
+                spec_path.display(),
+                pin.shard_id
+            )));
+        }
+        if pin.activation.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} gives authored shard {} no activation selectors",
+                spec_path.display(),
+                pin.shard_id
+            )));
+        }
+        for selector in &pin.activation {
+            validate_activation_selector_requirements(selector, spec_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleError> {
-    if spec.schema_version != PACK_SPEC_SCHEMA_VERSION {
+    if !matches!(spec.schema_version, 1 | PACK_SPEC_SCHEMA_VERSION) {
         return Err(BundleError::new(format!(
             "spec {} has unsupported schema version {}",
             spec_path.display(),
             spec.schema_version
+        )));
+    }
+    if spec.schema_version == 1
+        && matches!(
+            &spec.kind,
+            PinnedPackKind::AuthoredSemanticModel {
+                shard_activation_pins: Some(_)
+            }
+        )
+    {
+        return Err(BundleError::new(format!(
+            "spec {} schema version 1 does not support authored shard activation pins",
+            spec_path.display()
         )));
     }
     if spec.pack_id.is_empty() || spec.pack_version.is_empty() || spec.activation.is_empty() {
@@ -1568,18 +1746,7 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
         )?;
     }
     for selector in &spec.activation {
-        for (axis, coordinate) in [
-            ("package", selector.package.as_ref()),
-            ("module", selector.module.as_ref()),
-            ("toolchain", selector.toolchain.as_ref()),
-        ] {
-            let Some(coordinate) = coordinate else {
-                continue;
-            };
-            if let Some(requirement) = &coordinate.version {
-                validate_bounded_requirement(spec_path, axis, &coordinate.name, requirement)?;
-            }
-        }
+        validate_activation_selector_requirements(selector, spec_path)?;
     }
     if let PinnedPackKind::PythonStub { stubs } = &spec.kind {
         if stubs.is_empty() {
@@ -1603,7 +1770,7 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
             }
         }
     }
-    if matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel)
+    if matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel { .. })
         && Path::new(&spec.artifact.file_name)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -3879,6 +4046,139 @@ mod tests {
         }
     }
 
+    fn authored_spec(
+        schema_version: u32,
+        shard_activation_pins: Option<Vec<PinnedShardActivationPin>>,
+    ) -> PinnedPackSpec {
+        let mut spec = pinned_spec(
+            "fixture.typescript-authored",
+            "1.0.0",
+            "npm",
+            PinnedPackKind::AuthoredSemanticModel {
+                shard_activation_pins,
+            },
+            PinnedArtifact {
+                file_name: "authored-model.json".to_owned(),
+                sha256: "a".repeat(64),
+                url: Some("https://example.invalid/authored-model.json".to_owned()),
+                container: None,
+            },
+            "node",
+            "typescript",
+            vec![PinnedLookupQuery::Type {
+                name: "FixtureTypeEs5".to_owned(),
+            }],
+        );
+        spec.schema_version = schema_version;
+        spec
+    }
+
+    fn authored_pin_fixture() -> (PinnedPackSpec, Vec<(String, Vec<ActivationSelector>)>) {
+        let typescript_selector = |configurations: &[&str]| {
+            let mut activation = selector("typescript", "node", "5.0.0");
+            activation.toolchain.as_mut().unwrap().version = Some("=20.0.0".to_owned());
+            activation.configurations = configurations
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect();
+            activation
+        };
+        let es5 = typescript_selector(&["es5", "es2019"]);
+        let es2019 = typescript_selector(&["es2019"]);
+        let shards = vec![
+            ("lib.es5-and-es2019".to_owned(), vec![es5]),
+            ("lib.es2019-only".to_owned(), vec![es2019]),
+        ];
+        let pins = shards
+            .iter()
+            .map(|(shard_id, activation)| PinnedShardActivationPin {
+                shard_id: shard_id.clone(),
+                activation: activation.clone(),
+            })
+            .collect();
+        let mut spec = authored_spec(2, Some(pins));
+        spec.compatibility.toolchains[0].requirement = ">=18.0.0, <24.0.0".to_owned();
+        let mut global = typescript_selector(&["es5", "es2019"]);
+        global.package.as_mut().unwrap().version = Some(">=4.0.0, <6.0.0".to_owned());
+        global.toolchain.as_mut().unwrap().version = Some(">=18.0.0, <24.0.0".to_owned());
+        spec.activation = vec![global];
+        spec.measurement_activation = shards[0].1[0].clone();
+        (spec, shards)
+    }
+
+    fn synthetic_authored_model_bytes(
+        spec: &PinnedPackSpec,
+        shards: &[(String, Vec<ActivationSelector>)],
+    ) -> Vec<u8> {
+        let shards = shards
+            .iter()
+            .enumerate()
+            .map(|(index, (id, activation))| {
+                let type_name = if index == 0 {
+                    "FixtureTypeEs5"
+                } else {
+                    "FixtureTypeEs2019"
+                };
+                serde_json::json!({
+                    "id": id,
+                    "activation": activation,
+                    "payload": {
+                        "kind": "declaration_facts",
+                        "types": [{
+                            "id": format!("fixture.{index}"),
+                            "name": type_name,
+                            "type_kind": "class",
+                            "visibility": "public",
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "index.d.ts",
+                                "symbol": type_name,
+                            },
+                        }],
+                        "members": [],
+                        "relations": [],
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": SEMANTIC_MODEL_SCHEMA_VERSION,
+            "pack_id": spec.pack_id,
+            "version": spec.pack_version,
+            "producer": { "name": "release-bundle-test", "version": "1.0.0" },
+            "language": "typescript",
+            "ecosystem": spec.ecosystem,
+            "compatibility": spec.compatibility,
+            "provenance": spec.provenance,
+            "license": spec.license,
+            "completeness": "partial",
+            "safety": spec.safety,
+            "shards": shards,
+        }))
+        .unwrap()
+    }
+
+    fn read_synthetic_authored_model(
+        spec: &PinnedPackSpec,
+        shards: &[(String, Vec<ActivationSelector>)],
+    ) -> Result<AuthoredSemanticModelPack, BundleError> {
+        let fixture = tempdir().unwrap();
+        let artifact_path = fixture.path().join("authored-model.json");
+        fs::write(&artifact_path, synthetic_authored_model_bytes(spec, shards)).unwrap();
+        let artifact =
+            read_exact_artifact(&artifact_path, &ArtifactProducerLimits::default()).unwrap();
+        read_authored_semantic_model(spec, &artifact, &fixture.path().join("synthetic.spec.json"))
+    }
+
+    fn authored_pins(kind: &PinnedPackKind) -> &[PinnedShardActivationPin] {
+        match kind {
+            PinnedPackKind::AuthoredSemanticModel {
+                shard_activation_pins: Some(pins),
+            } => pins,
+            _ => panic!("fixture must carry authored shard activation pins"),
+        }
+    }
+
     fn assert_deterministic_and_installable(
         first: &Path,
         second: &Path,
@@ -3921,6 +4221,247 @@ mod tests {
     }
 
     #[test]
+    fn authored_spec_v1_and_unpinned_v2_keep_the_exact_legacy_guard() {
+        let legacy_kind: PinnedPackKind =
+            serde_json::from_str(r#"{"artifact_kind":"authored_semantic_model"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&legacy_kind).unwrap(),
+            r#"{"artifact_kind":"authored_semantic_model"}"#
+        );
+
+        for schema_version in [1, 2] {
+            let spec = authored_spec(schema_version, None);
+            let shards = vec![
+                ("legacy-one".to_owned(), spec.activation.clone()),
+                ("legacy-two".to_owned(), spec.activation.clone()),
+            ];
+            validate_spec(&spec, Path::new("legacy.spec.json")).unwrap();
+            assert!(read_synthetic_authored_model(&spec, &shards).is_ok());
+
+            let mut mismatch = shards.clone();
+            mismatch[1].1[0].configurations.push("changed".to_owned());
+            assert!(
+                read_synthetic_authored_model(&spec, &mismatch)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("repeat the pinned activation exactly")
+            );
+        }
+    }
+
+    #[test]
+    fn authored_v2_pins_compile_generate_verify_and_preserve_shard_selectors() {
+        let (mut spec, shards) = authored_pin_fixture();
+        validate_spec(&spec, Path::new("authored-model.spec.json")).unwrap();
+        let artifact_bytes = synthetic_authored_model_bytes(&spec, &shards);
+        spec.artifact.sha256 = sha256_bytes(&artifact_bytes);
+
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "synthetic test notice\n").unwrap();
+        let artifact_path = fixture.path().join(&spec.artifact.file_name);
+        fs::write(&artifact_path, &artifact_bytes).unwrap();
+        let spec_path = fixture.path().join("authored-model.spec.json");
+        fs::write(&spec_path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+        let bundle_path = fixture.path().join("bundle");
+        let input = BundleInput {
+            spec_path,
+            artifact_path,
+        };
+
+        let bundle = generate_release_bundle(&bundle_path, &[input]).unwrap();
+        assert_eq!(bundle.index.packs.len(), 1);
+        assert_eq!(bundle.index.packs[0].shards.len(), 2);
+        assert_eq!(verify_release_bundle(&bundle_path).unwrap(), bundle);
+
+        let measurements: ReleaseBundleMeasurements =
+            serde_json::from_slice(&fs::read(bundle_path.join("measurements.json")).unwrap())
+                .unwrap();
+        assert_eq!(measurements.packs[0].lookups[0].records, 1);
+
+        let indexed_pack = &bundle.index.packs[0];
+        let manifest_bytes = fs::read(bundle_path.join(&indexed_pack.manifest.path)).unwrap();
+        let limits = DecodeLimits::default();
+        let manifest = decode_manifest(&manifest_bytes, &limits).unwrap();
+        for descriptor in &manifest.shards {
+            let indexed_shard = indexed_pack
+                .shards
+                .iter()
+                .find(|shard| shard.shard_id == descriptor.shard_id)
+                .unwrap();
+            let shard_bytes = fs::read(bundle_path.join(&indexed_shard.asset.path)).unwrap();
+            let decoded =
+                decode_validated_shard_for_manifest(&manifest, descriptor, &shard_bytes, &limits)
+                    .unwrap();
+            let decoded_value = serde_json::to_value(decoded).unwrap();
+            let decoded_activation: Vec<ActivationSelector> =
+                serde_json::from_value(decoded_value["activation"].clone()).unwrap();
+            let mut expected_activation = authored_pins(&spec.kind)
+                .iter()
+                .find(|pin| pin.shard_id == descriptor.shard_id)
+                .unwrap()
+                .activation
+                .clone();
+            // Input pins compare the authored vectors exactly. The existing
+            // compiler subsequently canonicalizes unordered configuration
+            // names; state this fixture's complete expected output directly.
+            expected_activation[0].configurations = match descriptor.shard_id.as_str() {
+                "lib.es5-and-es2019" => vec!["es2019".to_owned(), "es5".to_owned()],
+                "lib.es2019-only" => vec!["es2019".to_owned()],
+                other => panic!("unexpected authored fixture shard {other}"),
+            };
+            assert_eq!(decoded_activation, expected_activation);
+        }
+    }
+
+    #[test]
+    fn authored_v2_pins_require_a_complete_exact_shard_map() {
+        let (base_spec, base_shards) = authored_pin_fixture();
+
+        let mut missing = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut missing.kind
+        else {
+            unreachable!()
+        };
+        pins.pop();
+        assert!(read_synthetic_authored_model(&missing, &base_shards).is_err());
+
+        let mut extra = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut extra.kind
+        else {
+            unreachable!()
+        };
+        pins.push(PinnedShardActivationPin {
+            shard_id: "extra-shard".to_owned(),
+            activation: base_shards[0].1.clone(),
+        });
+        assert!(read_synthetic_authored_model(&extra, &base_shards).is_err());
+
+        let mut duplicate_pin = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut duplicate_pin.kind
+        else {
+            unreachable!()
+        };
+        pins.push(pins[0].clone());
+        assert!(read_synthetic_authored_model(&duplicate_pin, &base_shards).is_err());
+
+        let mut duplicate_shard = base_shards.clone();
+        duplicate_shard[1].0 = duplicate_shard[0].0.clone();
+        assert!(read_synthetic_authored_model(&base_spec, &duplicate_shard).is_err());
+
+        let mut empty_pin_id = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut empty_pin_id.kind
+        else {
+            unreachable!()
+        };
+        pins[0].shard_id.clear();
+        assert!(read_synthetic_authored_model(&empty_pin_id, &base_shards).is_err());
+
+        let mut empty_shard_id = base_shards.clone();
+        empty_shard_id[0].0.clear();
+        assert!(read_synthetic_authored_model(&base_spec, &empty_shard_id).is_err());
+
+        let mut empty_pin_list = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut empty_pin_list.kind
+        else {
+            unreachable!()
+        };
+        pins.clear();
+        assert!(read_synthetic_authored_model(&empty_pin_list, &base_shards).is_err());
+
+        let mut empty_pin_selectors = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut empty_pin_selectors.kind
+        else {
+            unreachable!()
+        };
+        pins[0].activation.clear();
+        assert!(read_synthetic_authored_model(&empty_pin_selectors, &base_shards).is_err());
+
+        let mut changed_config = base_shards.clone();
+        changed_config[0].1[0]
+            .configurations
+            .push("es2022".to_owned());
+        assert!(read_synthetic_authored_model(&base_spec, &changed_config).is_err());
+
+        let mut reordered_config = base_shards.clone();
+        reordered_config[0].1[0].configurations.reverse();
+        assert!(read_synthetic_authored_model(&base_spec, &reordered_config).is_err());
+
+        let mut changed_artifact_coordinate = base_shards.clone();
+        changed_artifact_coordinate[0].1[0].artifact_sha256 = Some("b".repeat(64));
+        assert!(read_synthetic_authored_model(&base_spec, &changed_artifact_coordinate).is_err());
+
+        let mut changed_pin = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut changed_pin.kind
+        else {
+            unreachable!()
+        };
+        pins[0].activation[0].package.as_mut().unwrap().name = "other-package".to_owned();
+        assert!(read_synthetic_authored_model(&changed_pin, &base_shards).is_err());
+
+        let mut unbounded = base_spec.clone();
+        let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut unbounded.kind
+        else {
+            unreachable!()
+        };
+        pins[0].activation[0].package.as_mut().unwrap().version = Some(">=5.0.0".to_owned());
+        assert!(
+            read_synthetic_authored_model(&unbounded, &base_shards)
+                .unwrap_err()
+                .to_string()
+                .contains("has no upper bound")
+        );
+    }
+
+    #[test]
+    fn authored_pin_schema_versions_and_closed_serde_shape_are_enforced() {
+        let (base_spec, _) = authored_pin_fixture();
+        let mut schema_one = base_spec.clone();
+        schema_one.schema_version = 1;
+        assert!(
+            validate_spec(&schema_one, Path::new("schema-one.spec.json"))
+                .unwrap_err()
+                .to_string()
+                .contains("schema version 1")
+        );
+
+        let mut unknown_version = base_spec.clone();
+        unknown_version.schema_version = 3;
+        assert!(
+            validate_spec(&unknown_version, Path::new("unknown.spec.json"))
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported schema version 3")
+        );
+
+        assert!(
+            serde_json::from_str::<PinnedPackKind>(
+                r#"{"artifact_kind":"authored_semantic_model","shard_activation_pins":null}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<PinnedPackKind>(
+            r#"{"artifact_kind":"authored_semantic_model","shard_activation_pins":[{"shard_id":"x","activation":[],"unknown":true}]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn authored_python_assertion_pack_is_pinned_and_override_closed() {
         let spec: PinnedPackSpec = serde_json::from_str(include_str!(
             "../../../semantic-packs/python/unittest-assertions-2026.9.7.spec.json"
@@ -3934,7 +4475,12 @@ mod tests {
         fs::write(&artifact_path, source).unwrap();
         let artifact =
             read_exact_artifact(&artifact_path, &ArtifactProducerLimits::default()).unwrap();
-        let authored = read_authored_semantic_model(&spec, &artifact).unwrap();
+        let authored = read_authored_semantic_model(
+            &spec,
+            &artifact,
+            Path::new("unittest-assertions-2026.9.7.spec.json"),
+        )
+        .unwrap();
         let summaries = match &authored.shards[0].payload {
             AuthoredPayload::ProcedureSummaries { summaries } => summaries,
             _ => panic!("assertion pack must carry procedure summaries"),
@@ -4014,7 +4560,12 @@ mod tests {
 
         let mut tampered: PinnedPackSpec = spec.clone();
         tampered.provenance.revision = Some("v3.13.4".to_owned());
-        let error = read_authored_semantic_model(&tampered, &artifact).unwrap_err();
+        let error = read_authored_semantic_model(
+            &tampered,
+            &artifact,
+            Path::new("unittest-assertions-2026.9.7.spec.json"),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("metadata"));
     }
 
@@ -5871,6 +6422,204 @@ mod tests {
         tampered.packs[0].rejects.clear();
         fs::write(output.join("rejects.json"), json_bytes(&tampered).unwrap()).unwrap();
         assert!(verify_release_bundle(&output).is_err());
+    }
+
+    #[test]
+    #[hardwon(
+        "#4709: the Scala repeated-parameter-list warning must stay declaration-scoped through release reject accounting"
+    )]
+    fn scala_repeated_parameter_list_warning_round_trips_through_release_bundle() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture
+            .path()
+            .join("scala-repeated-parameter-lists-sources.jar");
+        write_zip(
+            &artifact,
+            &[(
+                "sample/RepeatedLists.scala",
+                r#"package sample
+trait RepeatedLists {
+  def ordinaryAfter(values: String*)(suffix: String): String = suffix
+  def contextualAfter(values: String*)(implicit suffix: String): String = suffix
+  def finalVararg(values: String*): String = ""
+  def ordinary(value: String, suffix: String): String = value
+}
+"#,
+            )],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let spec = fixture.path().join("scala-repeated-parameter-lists.json");
+        let pinned = pinned_spec(
+            "scala-repeated-parameter-lists-fixture",
+            "2.13.16",
+            "maven",
+            PinnedPackKind::ScalaSourceJar,
+            PinnedArtifact {
+                file_name: "scala-repeated-parameter-lists-sources.jar".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/scala-repeated-parameter-lists.jar".to_owned()),
+                container: None,
+            },
+            "scala",
+            "org.scala-lang:scala-library",
+            vec![PinnedLookupQuery::Type {
+                name: "sample.RepeatedLists".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let output = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &output,
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: artifact,
+            }],
+        )
+        .unwrap();
+
+        let pack_rejects = &bundle.rejects.packs[0];
+        assert_eq!(pack_rejects.completeness, Completeness::Partial);
+        assert_eq!(pack_rejects.suppressed_rejects, 0);
+        assert_eq!(pack_rejects.rejects.len(), 2);
+        for declaration in [
+            "sample.RepeatedLists.ordinaryAfter",
+            "sample.RepeatedLists.contextualAfter",
+        ] {
+            let reject = pack_rejects
+                .rejects
+                .iter()
+                .find(|reject| reject.declaration.as_deref() == Some(declaration))
+                .expect("repeated parameter-list release warning");
+            assert_eq!(reject.severity, ReleaseRejectSeverity::Warning);
+            assert_eq!(reject.code, "scala.signature.repeated_parameter_list");
+            assert_eq!(
+                reject.location.as_deref(),
+                Some("sample/RepeatedLists.scala")
+            );
+            assert!(reject.source_entry.is_none());
+            assert!(
+                reject
+                    .message
+                    .contains("flat external signature cannot represent")
+            );
+        }
+        let accounting =
+            extraction_accounting(&pack_rejects.rejects, pack_rejects.suppressed_rejects);
+        assert!(accounting.warning_only_and_fully_accounted());
+        assert_eq!(accounting.gaps.len(), 2);
+        assert!(accounting.source_entries.is_empty());
+        assert_eq!(verify_release_bundle(&output).unwrap(), bundle);
+    }
+
+    #[test]
+    #[hardwon(
+        "#4709: recoverable PHP syntax rejects must name their source entry before activation"
+    )]
+    fn php_stub_source_entry_reject_verifies_installs_and_activates() {
+        let fixture = tempdir().unwrap();
+        let source_root = fixture.path().join("php-stubs");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("Malformed.php"),
+            "<?php\nclass Incomplete { public function broken( { }\n",
+        )
+        .unwrap();
+        fs::write(source_root.join("Good.php"), "<?php\nclass Good {}\n").unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let stubs = vec!["Malformed.php".to_owned(), "Good.php".to_owned()];
+        let artifact_sha256 = read_exact_source_set(
+            &source_root,
+            &stubs.iter().map(PathBuf::from).collect::<Vec<_>>(),
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let spec = fixture.path().join("php-builtin.json");
+        let pinned = pinned_spec(
+            "php-builtin-fixture",
+            "8.3.0",
+            "php",
+            PinnedPackKind::PhpDeclarationStub { stubs },
+            PinnedArtifact {
+                file_name: "php-stubs".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/php-stubs".to_owned()),
+                container: None,
+            },
+            "php",
+            "php",
+            vec![PinnedLookupQuery::Type {
+                name: "Good".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let output = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &output,
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: source_root,
+            }],
+        )
+        .unwrap();
+
+        let pack_rejects = &bundle.rejects.packs[0];
+        assert_eq!(pack_rejects.completeness, Completeness::Partial);
+        assert_eq!(
+            pack_rejects.rejects,
+            vec![ReleaseReject {
+                severity: ReleaseRejectSeverity::Warning,
+                code: "php.source.syntax".to_owned(),
+                location: Some(format!("php-stub+sha256:{artifact_sha256}!/Malformed.php")),
+                source_entry: Some("Malformed.php".to_owned()),
+                declaration: None,
+                message: "PHP declaration source contains syntax errors".to_owned(),
+            }]
+        );
+        assert_eq!(pack_rejects.suppressed_rejects, 0);
+        assert_eq!(verify_release_bundle(&output).unwrap(), bundle);
+
+        let accounting = extraction_accounting(&pack_rejects.rejects, 0);
+        assert!(accounting.warning_only_and_fully_accounted());
+        assert!(accounting.gaps.is_empty());
+        assert_eq!(accounting.source_entries.len(), 1);
+        assert_eq!(accounting.source_entries[0].source_entry, "Malformed.php");
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&output, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            catalog
+                .extraction_accounting(&installed[0].manifest_digest)
+                .unwrap(),
+            Some(accounting)
+        );
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &package_activation_request("php", "php", "php", "php", "8.3.0", None, None),
+            &CancellationToken::default(),
+        ) else {
+            panic!("source-entry-accounted PHP stub pack must activate");
+        };
+        assert_eq!(active.types_named("Good").records.len(), 1);
+        assert!(active.extraction_gaps().is_empty());
+        assert!(active.gapped("Malformed.php").is_none());
+
+        let mut anonymous = bundle.rejects.clone();
+        anonymous.packs[0].rejects[0].source_entry = None;
+        fs::write(output.join("rejects.json"), json_bytes(&anonymous).unwrap()).unwrap();
+        fs::remove_file(output.join("SHA256SUMS")).unwrap();
+        write_checksums(&output, &bundle.index).unwrap();
+        let error = verify_release_bundle(&output).unwrap_err();
+        assert!(
+            error.to_string().contains("not activation-ready")
+                && error.to_string().contains("source_entries=0"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -22,13 +22,11 @@
 //! rendered name (#2111).
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use super::{
     AcquisitionCompleteness, AcquisitionGap, CorrespondenceCertainty, CorrespondenceEvidence,
-    CorrespondenceKind, CorrespondenceLimits, CorrespondencePair, EntityIndex, ObjectName,
-    RevisionEndpoint, RevisionPin, RevisionSide, UnresolvedEntity, UnresolvedReason,
-    WorkspaceScope,
+    CorrespondenceKind, CorrespondenceLimits, CorrespondencePair, EntityIndex, RevisionEndpoint,
+    RevisionPin, RevisionSide, UnresolvedEntity, UnresolvedReason, WorkspaceScope,
 };
 use crate::analyzer::canonical_hash::{CanonicalHasher, sha256_bytes};
 use crate::analyzer::semantic::{StableDigest, WorkspaceRelativePath};
@@ -538,63 +536,6 @@ impl DeclarationCorrespondence {
     }
 }
 
-/// Correspond the declarations of two committed revisions of one workspace.
-///
-/// Both endpoints are immutable by construction: each revision is exported to a
-/// private temporary directory and analyzed there, so nothing the working tree
-/// does during the comparison can change either side.
-///
-/// Both exports read and write the repository's shared content-addressed
-/// analyzer cache, exactly as the `blast_radius` and `analyze_diff` revision
-/// images do. A comparison of two revisions parses only the blobs the cache has
-/// never seen, and the blobs the two revisions share are parsed once between
-/// them; both sides' work warms every later consumer, including the live
-/// worktree analyzer. The cache is opened from `workspace_root`, never from an
-/// export directory: an export is a self-deleting temp tree with no repository
-/// to resolve a cache location from.
-pub fn correspond_revisions(
-    workspace_root: &Path,
-    base_revision: &str,
-    target_revision: &str,
-    limits: CorrespondenceLimits,
-) -> Result<DeclarationCorrespondence, String> {
-    let builder = DeclarationCorrespondenceBuilder::new(limits);
-    let base_export = crate::diff_analysis::export_revision(workspace_root, base_revision)?;
-    let target_export = crate::diff_analysis::export_revision(workspace_root, target_revision)?;
-    // Opening is strict. A cache that exists but will not open is reported
-    // rather than worked around: the silent alternative re-parses every blob of
-    // both revisions on every request, which is a performance failure worth
-    // naming.
-    // No budgeted host reaches this entry point today, so the cache's build
-    // lock is waited on the way a CLI build waits: until the current builder
-    // is done. A host that calls this inside a request budget must pass its
-    // own token instead of this one.
-    let cancellation = crate::CancellationToken::default();
-    let cache = crate::analyzer::SharedAnalyzerCache::open(workspace_root, &cancellation)
-        .map_err(|error| error.to_string())?;
-    let base_analyzer =
-        crate::diff_analysis::build_revision_analyzer(base_export.image(), Some(&cache))?;
-    let target_analyzer =
-        crate::diff_analysis::build_revision_analyzer(target_export.image(), Some(&cache))?;
-    let base = builder.acquire(
-        base_analyzer.analyzer(),
-        commit_endpoint(base_export.commit_id())?,
-        WorkspaceScope::whole_workspace(),
-    );
-    let target = builder.acquire(
-        target_analyzer.analyzer(),
-        commit_endpoint(target_export.commit_id())?,
-        WorkspaceScope::whole_workspace(),
-    );
-    Ok(builder.build(base, target))
-}
-
-fn commit_endpoint(commit_id: &str) -> Result<RevisionEndpoint, String> {
-    ObjectName::new(commit_id)
-        .map(RevisionEndpoint::Commit)
-        .map_err(|error| format!("commit `{commit_id}` is not a usable object name: {error}"))
-}
-
 /// One declaration read off the analyzer, before ordinals are assigned.
 struct AcquiredDeclaration {
     path: WorkspaceRelativePath,
@@ -733,108 +674,4 @@ fn index_by(
             .push(u32::try_from(position).expect("entity tables are bounded well below u32::MAX"));
     }
     index
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{CorrespondenceLimits, correspond_revisions};
-    use crate::gitblob::test_repo;
-    use crate::test_support::cache_row_count;
-    use std::fs;
-    use std::path::Path;
-
-    /// A two-commit Go module whose second commit edits one function body and
-    /// leaves the other file untouched, so the two revisions share a blob and
-    /// differ in one.
-    fn two_revision_repo(root: &Path) -> (String, String) {
-        let repo = test_repo::init_repo(root);
-        fs::write(root.join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
-        fs::write(
-            root.join("kept.go"),
-            "package repro\n\nfunc Kept() int { return 1 }\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("edited.go"),
-            "package repro\n\nfunc Edited() int { return 1 }\n",
-        )
-        .unwrap();
-        let base = test_repo::commit_all(&repo, "base");
-        fs::write(
-            root.join("edited.go"),
-            "package repro\n\nfunc Edited() int { return 2 }\n",
-        )
-        .unwrap();
-        let head = test_repo::commit_all(&repo, "target");
-        (base.to_string(), head.to_string())
-    }
-
-    /// Both revision exports read and write the repository's shared cache, so a
-    /// repeated comparison of the same pair parses nothing, and neither export
-    /// directory leaves a workspace projection row behind.
-    #[test]
-    fn repeated_correspondence_parses_nothing_the_second_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let (base, head) = two_revision_repo(root);
-
-        let cold = correspond_revisions(root, &base, &head, CorrespondenceLimits::default())
-            .expect("cold correspondence");
-        let after_cold = cache_row_count(root, "blobs");
-        let warm = correspond_revisions(root, &base, &head, CorrespondenceLimits::default())
-            .expect("warm correspondence");
-        let after_warm = cache_row_count(root, "blobs");
-
-        assert_eq!(
-            cold.digest(),
-            warm.digest(),
-            "a warm comparison must answer exactly like the cold one"
-        );
-        assert!(
-            after_cold > 0,
-            "a cold comparison publishes both revisions' parsed blobs"
-        );
-        assert_eq!(
-            after_cold, after_warm,
-            "a warm comparison must publish no new blobs"
-        );
-        // Every workspace identity this comparison could have published names an
-        // export directory that no longer exists.
-        assert_eq!(0, cache_row_count(root, "workspace_heads"));
-        assert_eq!(0, cache_row_count(root, "workspace_revisions"));
-        assert_eq!(0, cache_row_count(root, "workspace_file_versions"));
-    }
-
-    use brokk_bifrost_test_macros::hardwon;
-    /// A comparison that cannot open the repository's shared cache is a hard
-    /// error, not a silently slower ephemeral rebuild of both revisions. This
-    /// is the same contract `an_immutable_request_fails_when_the_shared_cache_cannot_be_opened`
-    /// pins for `blast_radius`; the equality this test used to assert is
-    /// covered by `repeated_correspondence_parses_nothing_the_second_time`.
-    #[test]
-    #[hardwon(
-        "2b220df3e1ac: A cache-open failure must reach the caller and a later retry must recover"
-    )]
-    fn a_comparison_fails_when_the_shared_cache_cannot_be_opened() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let (base, head) = two_revision_repo(root);
-
-        // Occupying the cache file's path with a directory is the portable way
-        // to make the store refuse to open, which is what a read-only cache
-        // location does in production.
-        let db_path = crate::test_support::block_shared_analyzer_cache(root);
-
-        let error = correspond_revisions(root, &base, &head, CorrespondenceLimits::default())
-            .expect_err("a blocked shared cache must fail the comparison, not downgrade it");
-        crate::test_support::assert_shared_analyzer_cache_error(&error, &db_path);
-
-        fs::remove_dir(&db_path).expect("unblock the cache path");
-        correspond_revisions(root, &base, &head, CorrespondenceLimits::default())
-            .expect("persisted correspondence");
-        assert!(
-            cache_row_count(root, "blobs") > 0,
-            "the unblocked run must have used the shared cache"
-        );
-    }
 }

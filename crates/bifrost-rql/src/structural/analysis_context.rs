@@ -1408,7 +1408,7 @@ impl QueryAnalysisContext {
             return Err(QueryAnalysisContextError::Cancelled);
         }
         let generation = NEXT_QUERY_ANALYSIS_GENERATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| QueryAnalysisContextError::GenerationExhausted)

@@ -1,37 +1,50 @@
-use crate::analyzer::cpp::external::{
-    CppDependencyPackAdapter, resolve_cpp_semantic_pack_dependencies,
-};
-use crate::analyzer::dependency_support::resolve_dependency_path as resolve_path;
-use crate::analyzer::jvm::external::jdk_home_for_dependency;
-use crate::analyzer::multi_analyzer::{WorkspaceBuildContext, build_language_delegate};
-use crate::analyzer::semantic_model::{
-    DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
-    DependencyPackLimits, DependencyPackPreparationOutcome, DependencyResolver,
-    DependencyResolverBounds, PendingDependencyPackAcquisition, RuntimeArtifactPublication,
-    SemanticModelActivationEvidence, SemanticModelActivationPersistence,
-    SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    SubprocessPolicy, acquire_active_semantic_models_with_runtime_artifacts,
-    prepare_compatible_installed_semantic_packs, prepare_dependency_semantic_packs,
-    prepare_installed_dependency_packs,
-};
+use crate::analyzer::multi_analyzer::WorkspaceBuildContext;
+use crate::analyzer::multi_analyzer::build_language_delegate;
+
+use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
+use crate::analyzer::semantic_model::DependencyDiscoveryOutcome;
+use crate::analyzer::semantic_model::DependencyPackLimits;
+use crate::analyzer::semantic_model::DependencyPackPreparationOutcome;
+use crate::analyzer::semantic_model::DependencyResolver;
+use crate::analyzer::semantic_model::DependencyResolverBounds;
+use crate::analyzer::semantic_model::PendingDependencyPackAcquisition;
+use crate::analyzer::semantic_model::RuntimeArtifactPublication;
+use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
+use crate::analyzer::semantic_model::SemanticModelActivationPersistence;
+use crate::analyzer::semantic_model::SemanticModelActivationRequest;
+use crate::analyzer::semantic_model::SemanticModelRuntimeOutcome;
+use crate::analyzer::semantic_model::SemanticPackCatalog;
+use crate::analyzer::semantic_model::SubprocessPolicy;
+use crate::analyzer::semantic_model::acquire_active_semantic_models_with_runtime_artifacts;
+use crate::analyzer::semantic_model::prepare_installed_dependency_packs;
+
 use crate::analyzer::store::StoreError;
+
 use crate::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot;
-use crate::analyzer::{
-    AnalyzerBuildTierAccess, AnalyzerConfig, AnalyzerDelegate, BuildProgress,
-    CSharpDependencyPackAdapter, GoDependencyDiscoveryMode, GoDependencyPackAdapter, IAnalyzer,
-    JsTsDependencyPackAdapter, JvmDependencyDiscoveryMode, JvmDependencyPackAdapter, Language,
-    MultiAnalyzer, Project, ProjectFile, PythonDependencyPackAdapter, RevisionBlobIdentities,
-    RubyDependencyPackAdapter, RustDependencyPackAdapter,
-    resolve_csharp_semantic_pack_dependencies, resolve_go_semantic_pack_dependencies,
-    resolve_js_ts_semantic_pack_dependencies, resolve_jvm_semantic_pack_dependencies,
-    resolve_python_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
-    resolve_rust_semantic_pack_dependencies,
-};
+
+use crate::analyzer::AnalyzerBuildTierAccess;
+use crate::analyzer::AnalyzerConfig;
+use crate::analyzer::AnalyzerDelegate;
+use crate::analyzer::BuildProgress;
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::Language;
+use crate::analyzer::MultiAnalyzer;
+use crate::analyzer::Project;
+use crate::analyzer::ProjectFile;
+use crate::analyzer::RevisionBlobIdentities;
+
 use crate::hash::HashMap;
+
 use crate::profiling;
-use std::collections::{BTreeMap, BTreeSet};
+
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+
+use std::path::Path;
+use std::path::PathBuf;
+
 use std::sync::Arc;
 
 /// The repository's shared content-addressed analyzer cache, opened once for a
@@ -44,7 +57,8 @@ use std::sync::Arc;
 /// The cache location resolves from the *original* repository root through the
 /// standard funnel; a revision image's own root is a self-deleting export
 /// directory and must never be used to derive it.
-pub(crate) struct SharedAnalyzerCache {
+#[doc(hidden)]
+pub struct SharedAnalyzerCache {
     store: Arc<crate::analyzer::store::AnalyzerStore>,
     /// The cancellation of the request that opened this cache. Every revision
     /// image built against it waits for the cache's cross-process build lock
@@ -68,7 +82,8 @@ impl SharedAnalyzerCache {
     /// filesystem SQLite rejects. The escape for a checkout that must stay
     /// read-only is `BIFROST_CACHE_ROOT`, which relocates the cache off the
     /// repository.
-    pub(crate) fn open(
+    #[doc(hidden)]
+    pub fn open(
         repository_root: &Path,
         cancellation: &crate::CancellationToken,
     ) -> Result<Self, StoreError> {
@@ -106,7 +121,8 @@ impl SharedAnalyzerCache {
     /// Publish what the request that opened this cache is doing with it,
     /// until the guard is dropped. The token is the request's own, so the
     /// host reads this back if the budget expires (issue #3170).
-    pub(crate) fn enter_phase(
+    #[doc(hidden)]
+    pub fn enter_phase(
         &self,
         phase: impl Into<String>,
     ) -> brokk_bifrost_core::cancellation::PhaseGuard {
@@ -115,7 +131,8 @@ impl SharedAnalyzerCache {
 
     /// Claim the workspace projection rows an immutable image at `image_root`
     /// is about to publish, so they are removed when the request ends.
-    pub(crate) fn claim_revision_workspace(&self, image_root: &Path) -> WorkspaceProjectionLease {
+    #[doc(hidden)]
+    pub fn claim_revision_workspace(&self, image_root: &Path) -> WorkspaceProjectionLease {
         WorkspaceProjectionLease::new(
             self.store(),
             // Resolved now, while the export directory still exists:
@@ -139,7 +156,8 @@ impl SharedAnalyzerCache {
 /// grow the shared cache by one whole file listing per request forever. The
 /// parsed blob facts the same build published are keyed by content and stay:
 /// those are the reusable asset.
-pub(crate) struct WorkspaceProjectionLease {
+#[doc(hidden)]
+pub struct WorkspaceProjectionLease {
     store: Arc<crate::analyzer::store::AnalyzerStore>,
     workspace_id: crate::analyzer::store::WorkspaceId,
 }
@@ -608,25 +626,11 @@ impl DependencyPackEcosystem {
     /// consume patterned build inputs such as arbitrary `*.gradle`, `*.props`,
     /// and `*.targets` files. Keeping the predicate here gives workspace
     /// construction and revision export one source of truth.
-    pub(crate) fn is_file_dependency_input(self, path: &Path) -> bool {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        match self {
-            Self::Jvm => {
-                crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input_path(path)
-            }
-            Self::DotNet => crate::analyzer::csharp::is_csharp_dependency_input_path(path),
-            Self::Npm => {
-                self.dependency_inputs().contains(&name)
-                    || matches!(name, "tsconfig.json" | "jsconfig.json")
-            }
-            Self::Cpp => path == Path::new("compile_commands.json"),
-            Self::Python | Self::Go | Self::Cargo | Self::Ruby | Self::Composer => {
-                self.dependency_inputs().contains(&name)
-            }
-        }
+    #[doc(hidden)]
+    pub fn is_file_dependency_input(self, path: &Path) -> bool {
+        crate::analyzer::languages::language_support(self.languages()[0])
+            .expect("dependency ecosystem primary language support")
+            .is_file_dependency_input(path)
     }
 
     /// The resolver that discovers this ecosystem's dependencies, paired with
@@ -637,31 +641,26 @@ impl DependencyPackEcosystem {
     /// resolver-to-adapter pairing inline, which is how the activation loop
     /// came to hold per-ecosystem limit adjustments as well.
     pub(crate) fn resolver(self) -> &'static dyn DependencyResolver {
-        match self {
-            Self::Jvm => &JvmDependencyResolver,
-            Self::DotNet => &DotNetDependencyResolver,
-            Self::Npm => &NpmDependencyResolver,
-            Self::Python => &PythonDependencyResolver,
-            Self::Go => &GoDependencyResolver,
-            Self::Cargo => &CargoDependencyResolver,
-            Self::Ruby => &RubyDependencyResolver,
-            Self::Composer => &ComposerDependencyResolver,
-            Self::Cpp => &CppDependencyResolver,
-        }
+        crate::analyzer::languages::language_support(self.languages()[0])
+            .expect("dependency ecosystem primary language support")
+            .dependency_pack_resolver()
+            .expect("dependency ecosystem resolver")
     }
 }
 
 /// The bounds a resolver that only reads files declares: no process, no clock
 /// of its own, and a walk bounded by the project's file listing and
 /// `DependencyPackLimits`.
-const READS_FILES_ONLY: DependencyResolverBounds = DependencyResolverBounds {
+#[doc(hidden)]
+pub const READS_FILES_ONLY: DependencyResolverBounds = DependencyResolverBounds {
     max_files_walked: None,
     max_metadata_bytes: None,
     subprocess: SubprocessPolicy::Forbidden,
     wall_clock: None,
 };
 
-fn build_tool_dependency_resolver_bounds(
+#[doc(hidden)]
+pub fn build_tool_dependency_resolver_bounds(
     timeout: Option<std::time::Duration>,
     max_metadata_bytes: Option<u64>,
 ) -> DependencyResolverBounds {
@@ -674,326 +673,6 @@ fn build_tool_dependency_resolver_bounds(
         },
         wall_clock: timeout,
         ..READS_FILES_ONLY
-    }
-}
-
-struct JvmDependencyResolver;
-
-impl DependencyResolver for JvmDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &JvmDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        // `is_jvm_dependency_input` is the reader-side predicate for the same
-        // inputs; these are its base names.
-        &[
-            "pom.xml",
-            "settings.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-            "gradle.properties",
-            "gradle.lockfile",
-            "libs.versions.toml",
-            "gradle-wrapper.properties",
-        ]
-    }
-
-    fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
-        let discovery = &config.jvm.dependency_discovery;
-        let runs_tools = discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools;
-        build_tool_dependency_resolver_bounds(
-            runs_tools.then_some(discovery.timeout),
-            Some(crate::analyzer::jvm::MAX_BUILD_METADATA_BYTES as u64),
-        )
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_jvm_semantic_pack_dependencies(&config.jvm, project, limits, cancellation)
-    }
-}
-
-struct DotNetDependencyResolver;
-
-impl DependencyResolver for DotNetDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &CSharpDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["project.assets.json"]
-    }
-
-    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
-        READS_FILES_ONLY
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_csharp_semantic_pack_dependencies(&config.csharp, project, limits, cancellation)
-    }
-}
-
-struct NpmDependencyResolver;
-
-impl DependencyResolver for NpmDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &JsTsDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["package.json", "package-lock.json", "npm-shrinkwrap.json"]
-    }
-
-    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
-        READS_FILES_ONLY
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_js_ts_semantic_pack_dependencies(
-            &config.js_ts.dependency_discovery,
-            project,
-            limits,
-            cancellation,
-        )
-    }
-}
-
-struct PythonDependencyResolver;
-
-impl DependencyResolver for PythonDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &PythonDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        // Python discovery reads distribution metadata under the roots the
-        // host configures, plus the workspace's own toolchain declaration
-        // files, which key the standard-library pack selection (#1869).
-        &[
-            "METADATA",
-            "RECORD",
-            "top_level.txt",
-            "pyproject.toml",
-            ".python-version",
-        ]
-    }
-
-    fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
-        DependencyResolverBounds {
-            max_files_walked: config
-                .python
-                .environment
-                .as_ref()
-                .map(|environment| environment.limits.max_files_per_distribution),
-            ..READS_FILES_ONLY
-        }
-    }
-
-    fn adjust_limits(&self, config: &AnalyzerConfig, limits: &mut DependencyPackLimits) {
-        if let Some(environment) = &config.python.environment {
-            limits.max_artifacts_per_dependency = limits
-                .max_artifacts_per_dependency
-                .max(environment.limits.max_files_per_distribution);
-        }
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_python_semantic_pack_dependencies(&config.python, project, limits, cancellation)
-    }
-}
-
-struct GoDependencyResolver;
-
-impl DependencyResolver for GoDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &GoDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["go.mod", "go.sum", "go.work", "go.work.sum", "modules.txt"]
-    }
-
-    fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
-        let discovery = &config.go.dependency_discovery;
-        let runs_tools = discovery.mode != GoDependencyDiscoveryMode::Disabled;
-        // `go list` under the bounded-process runner, with a cleared
-        // environment and the module cache the configuration names.
-        build_tool_dependency_resolver_bounds(runs_tools.then_some(discovery.timeout), None)
-    }
-
-    fn prepare(
-        &self,
-        config: &AnalyzerConfig,
-        catalog: &SemanticPackCatalog,
-        dependencies: &[crate::analyzer::semantic_model::ResolvedDependency],
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyPackPreparationOutcome {
-        if config.go.dependency_discovery.mode == GoDependencyDiscoveryMode::CuratedPackEvidence {
-            prepare_compatible_installed_semantic_packs(catalog, dependencies, limits, cancellation)
-        } else {
-            prepare_dependency_semantic_packs(
-                catalog,
-                self.adapter(),
-                dependencies,
-                limits,
-                cancellation,
-            )
-        }
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_go_semantic_pack_dependencies(&config.go, project, limits, cancellation)
-    }
-}
-
-struct CargoDependencyResolver;
-
-impl DependencyResolver for CargoDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &RustDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"]
-    }
-
-    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
-        READS_FILES_ONLY
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_rust_semantic_pack_dependencies(&config.rust, project, limits, cancellation)
-    }
-}
-
-struct RubyDependencyResolver;
-
-impl DependencyResolver for RubyDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &RubyDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["Gemfile", "Gemfile.lock", "gems.locked"]
-    }
-
-    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
-        READS_FILES_ONLY
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_ruby_semantic_pack_dependencies(&config.ruby, project, limits, cancellation)
-    }
-}
-
-struct ComposerDependencyResolver;
-
-impl DependencyResolver for ComposerDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &crate::analyzer::php::PhpDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["composer.json", "composer.lock", "installed.json"]
-    }
-
-    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
-        READS_FILES_ONLY
-    }
-
-    fn adjust_limits(&self, _config: &AnalyzerConfig, limits: &mut DependencyPackLimits) {
-        // Composer emits one artifact per autoload rule so a PSR-4 prefix stays
-        // bound to the files it admits. Discovery caps the rule count itself,
-        // so the artifact budget only has to admit that cap.
-        limits.max_artifacts_per_dependency = limits
-            .max_artifacts_per_dependency
-            .max(crate::analyzer::php::PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE);
-    }
-
-    fn resolve(
-        &self,
-        config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        crate::analyzer::php::resolve_php_semantic_pack_dependencies(
-            &config.php,
-            project,
-            limits,
-            cancellation,
-        )
-    }
-}
-
-struct CppDependencyResolver;
-
-impl DependencyResolver for CppDependencyResolver {
-    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
-        &CppDependencyPackAdapter
-    }
-
-    fn dependency_inputs(&self) -> &'static [&'static str] {
-        &["compile_commands.json"]
-    }
-
-    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
-        READS_FILES_ONLY
-    }
-
-    fn resolve(
-        &self,
-        _config: &AnalyzerConfig,
-        project: &dyn Project,
-        limits: &DependencyPackLimits,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> DependencyDiscoveryOutcome {
-        resolve_cpp_semantic_pack_dependencies(project, limits, cancellation)
     }
 }
 
@@ -1028,38 +707,9 @@ pub(crate) fn prepared_jdk_artifacts_for_source_bindings(
     project_root: &Path,
     outcomes: &[DependencyPackEcosystemOutcome],
 ) -> Option<HashMap<PathBuf, SemanticModelActivationEvidence>> {
-    let jvm = outcomes
-        .iter()
-        .find(|outcome| outcome.ecosystem == DependencyPackEcosystem::Jvm)?;
-    let mut by_home = HashMap::default();
-    if let Some(preparation) = &jvm.preparation {
-        let prepared = preparation
-            .packs
-            .iter()
-            .map(|pack| (pack.dependency_id.as_str(), &pack.evidence))
-            .collect::<HashMap<_, _>>();
-        for dependency in &jvm.discovery.dependencies {
-            let (Some(home), Some(evidence)) = (
-                jdk_home_for_dependency(dependency),
-                prepared.get(dependency.id.as_str()),
-            ) else {
-                continue;
-            };
-            if evidence.artifact_sha256.is_some() {
-                by_home.insert(home.to_path_buf(), (*evidence).clone());
-            }
-        }
-    }
-    let mut selected = HashMap::default();
-    for binding in &config.jvm.standard_library_discovery.source_toolchains {
-        let candidate = resolve_path(project_root, binding.jdk_home());
-        if let Ok(home) = std::fs::canonicalize(candidate)
-            && let Some(evidence) = by_home.get(&home)
-        {
-            selected.insert(binding.jdk_home().to_path_buf(), evidence.clone());
-        }
-    }
-    Some(selected)
+    crate::analyzer::languages::language_support(Language::Java)
+        .expect("Java support")
+        .dependency_source_artifacts(config, project_root, outcomes)
 }
 
 /// The installed-pack stage's activation: the published interim outcome plus
@@ -1107,227 +757,9 @@ fn python_runtime_publication(
     Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
     StoreError,
 > {
-    use crate::analyzer::python::runtime_artifact as verified;
-    use crate::analyzer::store::python_runtime as stored;
-    if config.python.runtime_environments.is_empty() {
-        return Ok(None);
-    }
-    let python =
-        crate::analyzer::resolve_analyzer::<crate::analyzer::PythonAnalyzer>(workspace.analyzer())
-            .ok_or_else(|| {
-                StoreError::new("Python runtime configuration has no Python analyzer")
-            })?;
-    let (store, snapshot) = python.python_runtime_store_snapshot().ok_or_else(|| {
-        StoreError::stale_generation("Python runtime configuration has no selected snapshot")
-    })?;
-    let report = verified::verify_python_runtime_artifacts(
-        workspace.analyzer().project().root(),
-        &config.python.runtime_environments,
-        &context.limits,
-        Some(context.cancellation),
-    );
-    if report.cancelled {
-        return Err(StoreError::new("Python runtime verification cancelled"));
-    }
-    let configuration = serde_json::to_vec(&config.python.runtime_environments)
-        .map_err(|error| StoreError::new(error.to_string()))?;
-    let mut environments = Vec::new();
-    for (index, environment) in config.python.runtime_environments.iter().enumerate() {
-        let mut artifacts = Vec::new();
-        for artifact in report
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.environment_index == index)
-        {
-            let mut providers = Vec::new();
-            let members = artifact
-                .modules
-                .iter()
-                .enumerate()
-                .map(|(member_index, module)| {
-                    if let Some(name) = &module.import_name {
-                        providers.push(stored::PythonRuntimeProviderInput {
-                            import_name: name.clone(),
-                            member_index: Some(member_index),
-                            status: match module.import_status {
-                                verified::PythonRuntimeImportStatus::Unresolved => {
-                                    stored::PythonRuntimeBindingStatus::Unresolved
-                                }
-                                verified::PythonRuntimeImportStatus::Conflict => {
-                                    stored::PythonRuntimeBindingStatus::Conflict
-                                }
-                            },
-                        });
-                    }
-                    stored::PythonRuntimeMemberInput {
-                        archive_member_path: module.archive_member_path.clone(),
-                        installed_path: module.installed_path.clone(),
-                        member_sha256: module.member_sha256.clone(),
-                        installed_sha256: module.installed_sha256.clone(),
-                        installed_bytes_match: module.installed_bytes_match,
-                        role: match (module.runtime, module.stub) {
-                            (true, false) => stored::PythonRuntimeMemberRole::Runtime,
-                            (false, true) => stored::PythonRuntimeMemberRole::Stub,
-                            (true, true) => stored::PythonRuntimeMemberRole::RuntimeAndStub,
-                            (false, false) => stored::PythonRuntimeMemberRole::Other,
-                        },
-                        status: match module.status {
-                            verified::PythonRuntimeModuleStatus::BytesMatched => {
-                                stored::PythonRuntimeStatus::BytesMatched
-                            }
-                            verified::PythonRuntimeModuleStatus::StubOnly => {
-                                stored::PythonRuntimeStatus::StubOnly
-                            }
-                            verified::PythonRuntimeModuleStatus::MissingInstalled => {
-                                stored::PythonRuntimeStatus::MissingInstalled
-                            }
-                            verified::PythonRuntimeModuleStatus::ContentMismatch => {
-                                stored::PythonRuntimeStatus::ContentMismatch
-                            }
-                            verified::PythonRuntimeModuleStatus::Unsupported => {
-                                stored::PythonRuntimeStatus::Unsupported
-                            }
-                            verified::PythonRuntimeModuleStatus::Unresolved => {
-                                stored::PythonRuntimeStatus::Unresolved
-                            }
-                        },
-                        diagnostic: None,
-                    }
-                })
-                .collect();
-            if let Some(identity) = &artifact.identity {
-                activation.evidence.push(SemanticModelActivationEvidence {
-                    language: "python".into(),
-                    ecosystem: "python".into(),
-                    package: Some(crate::analyzer::semantic_model::CatalogCoordinate {
-                        name: identity.purl().to_owned(),
-                        version: None,
-                    }),
-                    module: None,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: Some(identity.archive_sha256().to_owned()),
-                });
-            }
-            artifacts.push(stored::PythonRuntimeArtifactInput {
-                purl: artifact.coordinate.clone(),
-                raw_version: artifact.raw_version.clone(),
-                archive_sha256: artifact.archive_sha256.clone(),
-                archive_path: artifact.archive_path.clone(),
-                installed_root: artifact.installed_root.clone(),
-                status: match artifact.status {
-                    verified::PythonRuntimeArtifactStatus::ArchiveVerified => {
-                        stored::PythonRuntimeStatus::ArchiveVerified
-                    }
-                    verified::PythonRuntimeArtifactStatus::Incomplete => {
-                        stored::PythonRuntimeStatus::Incomplete
-                    }
-                    verified::PythonRuntimeArtifactStatus::Unresolved => {
-                        stored::PythonRuntimeStatus::Unresolved
-                    }
-                    verified::PythonRuntimeArtifactStatus::Conflicting => {
-                        stored::PythonRuntimeStatus::Conflicting
-                    }
-                    verified::PythonRuntimeArtifactStatus::Cancelled => {
-                        stored::PythonRuntimeStatus::Cancelled
-                    }
-                },
-                diagnostic: None,
-                members,
-                providers,
-            });
-        }
-        let frontiers = report
-            .frontiers
-            .iter()
-            .filter(|frontier| frontier.environment_index == index)
-            .map(|frontier| stored::PythonRuntimeFrontierInput {
-                kind: match frontier.kind {
-                    verified::PythonRuntimeFrontierKind::ExtraInstalledCandidate => {
-                        stored::PythonRuntimeFrontierKind::ExtraInstalledCandidate
-                    }
-                    verified::PythonRuntimeFrontierKind::SourceShadowCandidate => {
-                        stored::PythonRuntimeFrontierKind::SourceShadowCandidate
-                    }
-                    verified::PythonRuntimeFrontierKind::CompetingRuntimeProvider => {
-                        stored::PythonRuntimeFrontierKind::CompetingRuntimeProvider
-                    }
-                    verified::PythonRuntimeFrontierKind::NamespaceContributor => {
-                        stored::PythonRuntimeFrontierKind::NamespaceContributor
-                    }
-                    verified::PythonRuntimeFrontierKind::PackageInitializerEffects => {
-                        stored::PythonRuntimeFrontierKind::PackageInitializerEffects
-                    }
-                    verified::PythonRuntimeFrontierKind::CandidatePathCollision => {
-                        stored::PythonRuntimeFrontierKind::CandidatePathCollision
-                    }
-                    verified::PythonRuntimeFrontierKind::CandidateIdentityUnknown => {
-                        stored::PythonRuntimeFrontierKind::CandidateIdentityUnknown
-                    }
-                    verified::PythonRuntimeFrontierKind::MissingInstalledCandidate => {
-                        stored::PythonRuntimeFrontierKind::MissingInstalledCandidate
-                    }
-                    verified::PythonRuntimeFrontierKind::SymlinkSkipped => {
-                        stored::PythonRuntimeFrontierKind::SymlinkSkipped
-                    }
-                    verified::PythonRuntimeFrontierKind::PathUnreadable => {
-                        stored::PythonRuntimeFrontierKind::PathUnreadable
-                    }
-                    verified::PythonRuntimeFrontierKind::ScanLimit => {
-                        stored::PythonRuntimeFrontierKind::ScanLimit
-                    }
-                    verified::PythonRuntimeFrontierKind::ScanDepthLimit => {
-                        stored::PythonRuntimeFrontierKind::ScanDepthLimit
-                    }
-                    verified::PythonRuntimeFrontierKind::ImportPathOrderUnknown => {
-                        stored::PythonRuntimeFrontierKind::ImportPathOrderUnknown
-                    }
-                    verified::PythonRuntimeFrontierKind::ImportHookSemanticsUnknown => {
-                        stored::PythonRuntimeFrontierKind::ImportHookSemanticsUnknown
-                    }
-                },
-                root: frontier.root.clone(),
-                path: frontier.path.clone(),
-                import_name: frontier.import_name.clone(),
-                message: frontier.message.clone(),
-            })
-            .collect();
-        let declared = report
-            .declared_environments
-            .get(index)
-            .and_then(Option::as_ref);
-        environments.push(stored::PythonRuntimeEnvironmentInput {
-            declared_environment: declared.and(environment.declared_environment.clone()),
-            project_config: declared.map(|proof| proof.project_config().clone()),
-            source_scope: environment.source_root.clone(),
-            status: if report.scope_complete {
-                stored::PythonRuntimeStatus::ArchiveVerified
-            } else {
-                stored::PythonRuntimeStatus::Incomplete
-            },
-            diagnostic: None,
-            artifacts,
-            frontiers,
-        });
-    }
-    // Diagnostic formatting is SQL-independent, deterministic input evidence;
-    // this aggregate never substitutes for a raw wheel artifact digest.
-    let mut digest_input = configuration.clone();
-    digest_input.extend(format!("{environments:?}").as_bytes());
-    let evidence_digest = crate::analyzer::canonical_hash::sha256_bytes(&digest_input);
-    let publication = store.publish_python_runtime_providers(
-        &snapshot,
-        Some(crate::analyzer::store::WorkspaceConfigurationInput::new(
-            ".bifrost/python-runtime-selection.json".into(),
-            configuration.into_boxed_slice(),
-        )),
-        evidence_digest,
-        environments,
-        context.cancellation,
-    )?;
-    python.install_python_runtime_snapshot(&snapshot, publication.snapshot.clone())?;
-    Ok(Some(publication))
+    crate::analyzer::languages::language_support(Language::Python).map_or(Ok(None), |support| {
+        support.publish_dependency_runtime(workspace, config, activation, context)
+    })
 }
 
 impl WorkspaceAnalyzer {
@@ -1340,37 +772,17 @@ impl WorkspaceAnalyzer {
         Self::Multi(Box::new(analyzer))
     }
 
-    fn resolve_dependency_discovery(
+    #[doc(hidden)]
+    pub fn resolve_dependency_discovery(
         &self,
         ecosystem: DependencyPackEcosystem,
         config: &AnalyzerConfig,
         limits: &DependencyPackLimits,
         cancellation: &crate::CancellationToken,
     ) -> DependencyDiscoveryOutcome {
-        if ecosystem != DependencyPackEcosystem::Go
-            || config.go.dependency_discovery.mode == GoDependencyDiscoveryMode::Disabled
-        {
-            return ecosystem.resolver().resolve(
-                config,
-                self.analyzer().project(),
-                limits,
-                Some(cancellation),
-            );
-        }
-        match self.resolve_selected_go_dependencies(config, limits, cancellation) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
-                outcome.complete = false;
-                outcome.cancelled = cancellation.is_cancelled();
-                outcome.diagnostics.push(crate::analyzer::semantic_model::DependencyPackDiagnostic {
-                    severity: crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Error,
-                    code: "go.native_context_store_failure".into(), dependency_id: None, location: None,
-                    message: error.to_string(),
-                });
-                outcome
-            }
-        }
+        crate::analyzer::languages::language_support(ecosystem.languages()[0])
+            .expect("dependency ecosystem primary language support")
+            .resolve_workspace_dependencies(self, config, limits, cancellation)
     }
 
     fn discover_dependency_pack_ecosystem(
@@ -1393,181 +805,6 @@ impl WorkspaceAnalyzer {
             self.resolve_dependency_discovery(ecosystem, config, &limits, context.cancellation)
         };
         (resolver, limits, discovery)
-    }
-
-    fn resolve_selected_go_dependencies(
-        &self,
-        config: &AnalyzerConfig,
-        limits: &DependencyPackLimits,
-        cancellation: &crate::CancellationToken,
-    ) -> crate::analyzer::store::Result<DependencyDiscoveryOutcome> {
-        use crate::analyzer::store::go_package_context::{
-            GoContextPublicationOutcome, GoInputObservationOutcome, profile_digest,
-        };
-        use rusqlite::OptionalExtension;
-        let project = self.analyzer().project();
-        let Some(store) = self.store() else {
-            return Ok(
-                crate::analyzer::go::dependency_discovery::discover_go_packages(
-                    &config.go,
-                    project,
-                    limits,
-                    Some(cancellation),
-                )
-                .semantic_packs,
-            );
-        };
-        let workspace_id = crate::analyzer::store::WorkspaceId::for_root(project.root());
-        let snapshot = {
-            let conn = store.read_conn()?;
-            conn.query_row(
-                "SELECT h.workspace_id,h.generation,h.revision FROM workspace_heads h
-                 JOIN analysis_epochs e ON e.lang=h.lang AND e.generation=h.generation
-                 WHERE h.workspace_id=?1 AND h.lang='go'",
-                [workspace_id.as_str()],
-                |row| {
-                    Ok(crate::analyzer::store::WorkspaceSnapshotId {
-                        workspace_id: workspace_id.clone(),
-                        lang: "go".into(),
-                        generation: crate::analyzer::store::GenerationId::from_persisted(
-                            row.get(1)?,
-                        ),
-                        revision: row.get(2)?,
-                    })
-                },
-            )
-            .optional()?
-        };
-        let before = snapshot
-            .as_ref()
-            .map(|snapshot| store.observe_go_context_inputs(snapshot, project, cancellation))
-            .transpose()?;
-        // Keep only this query's result through discovery: the canonical profile
-        // is known after go env, but CAS must use the head before go list ran.
-        let prior_heads = if let Some(snapshot) = snapshot.as_ref() {
-            let conn = store.read_conn()?;
-            let mut query =
-                conn.prepare_cached(crate::analyzer::store::go_package_context::PRIOR_HEADS_SQL)?;
-            query.query_map(rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,
-                crate::analyzer::store::go_package_context::DERIVATION_VERSION], |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?.try_into().expect("schema checks profile digest width"),
-                        crate::analyzer::store::GoContextIdentity {
-                            selection_id:row.get(1)?,context_id:row.get(2)?,
-                            publication_digest:row.get::<_, Vec<u8>>(3)?.try_into().expect("schema checks publication digest width"),
-                        }))
-                })?.collect::<std::result::Result<Vec<([u8;32],crate::analyzer::store::GoContextIdentity)>,_>>()?
-        } else {
-            Vec::new()
-        };
-        let mut discovered = crate::analyzer::go::dependency_discovery::discover_go_packages(
-            &config.go,
-            project,
-            limits,
-            Some(cancellation),
-        );
-        let Some(canonical) = discovered.canonical.take() else {
-            return Ok(discovered.semantic_packs);
-        };
-        let selected_snapshot = snapshot.clone();
-        let profile = profile_digest(&canonical);
-        let publication = match (snapshot, before) {
-            (Some(snapshot), Some(GoInputObservationOutcome::Ready(before))) => {
-                let expected = prior_heads
-                    .into_iter()
-                    .find_map(|(prior_profile, identity)| {
-                        (prior_profile == profile).then_some(identity)
-                    });
-                match store.observe_go_context_inputs(&snapshot, project, cancellation)? {
-                    GoInputObservationOutcome::Ready(after) => store.publish_go_package_context(
-                        snapshot,
-                        project.root().to_path_buf(),
-                        expected,
-                        &before,
-                        &after,
-                        canonical,
-                        cancellation,
-                    )?,
-                    GoInputObservationOutcome::InputsChanged => {
-                        GoContextPublicationOutcome::InputsChanged
-                    }
-                    GoInputObservationOutcome::Cancelled => GoContextPublicationOutcome::Cancelled,
-                }
-            }
-            (_, Some(GoInputObservationOutcome::Cancelled)) => {
-                GoContextPublicationOutcome::Cancelled
-            }
-            _ => GoContextPublicationOutcome::InputsChanged,
-        };
-        let publication = match publication {
-            GoContextPublicationOutcome::Published(identity) => {
-                let activated = selected_snapshot.as_ref().is_some_and(|snapshot| {
-                    crate::analyzer::resolve_analyzer::<crate::analyzer::GoAnalyzer>(
-                        self.analyzer(),
-                    )
-                    .is_some_and(|go| go.activate_native_context_profile(snapshot, profile))
-                });
-                if activated {
-                    GoContextPublicationOutcome::Published(identity)
-                } else {
-                    GoContextPublicationOutcome::InputsChanged
-                }
-            }
-            other => other,
-        };
-        match publication {
-            GoContextPublicationOutcome::Published(identity) => {
-                crate::profiling::note_with(|| format!("go.native_context published={identity:?}"));
-                // The head is the membership authority the unit summaries are
-                // derived from, so they are reconciled after it and never before.
-                let snapshot = selected_snapshot
-                    .as_ref()
-                    .expect("a published Go context was selected at a snapshot");
-                // The summaries are optional (readers fall back), so a store error
-                // here is a diagnostic, not a failure of the activation whose head
-                // was already published.
-                let timing = crate::profiling::scope("go.unit_summaries.reconcile");
-                let reconciliation = store.reconcile_unit_summaries(
-                    snapshot,
-                    crate::analyzer::store::go_unit_summaries::GoUnitSummaries {
-                        context_id: identity.context_id,
-                        profile,
-                    },
-                    cancellation,
-                );
-                drop(timing);
-                crate::profiling::note_with(|| {
-                    format!("go.unit_summaries reconciled={reconciliation:?}")
-                });
-                let failure = match &reconciliation {
-                    Ok(reconciliation) if reconciliation.failed.is_empty() => None,
-                    Ok(reconciliation) => Some(format!(
-                        "Go unit summaries were not published for {:?}",
-                        reconciliation.failed
-                    )),
-                    Err(error) => Some(format!("Go unit summaries were not reconciled: {error}")),
-                };
-                if let Some(message) = failure {
-                    discovered.semantic_packs.diagnostics.push(crate::analyzer::semantic_model::DependencyPackDiagnostic {
-                        severity: crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
-                        code: "go.unit_summary_failed".into(), dependency_id: None, location: None,
-                        message,
-                    });
-                }
-            }
-            GoContextPublicationOutcome::Cancelled => {
-                discovered.semantic_packs.cancelled = true;
-                discovered.semantic_packs.complete = false;
-            }
-            GoContextPublicationOutcome::InputsChanged => {
-                discovered.semantic_packs.complete = false;
-                discovered.semantic_packs.diagnostics.push(crate::analyzer::semantic_model::DependencyPackDiagnostic {
-                    severity: crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
-                    code: "go.native_context_inputs_changed".into(), dependency_id:None, location:None,
-                    message:"Go source or configuration no longer matches the selected revision; native package context was not published".into(),
-                });
-            }
-        }
-        Ok(discovered.semantic_packs)
     }
 
     /// Discover, prepare, and publish exact local dependency packs as one
@@ -1898,10 +1135,7 @@ impl WorkspaceAnalyzer {
     ///
     /// Deliberately Python-specific public workspace API, not a language
     /// capability: hosts call it by name to activate a Python interpreter's
-    /// packs, and there is no other language it would dispatch over. It, along
-    /// with `PythonDependencyPackAdapter` and
-    /// `resolve_python_semantic_pack_dependencies`, is a named allowlist entry
-    /// for the language-reach-in gate rather than a `LanguageSupport` method.
+    /// packs. Discovery dispatches through the language support registry.
     pub fn activate_python_environment_packs(
         &self,
         config: &AnalyzerConfig,
@@ -1923,8 +1157,9 @@ impl WorkspaceAnalyzer {
 
     /// Test hook to retain a dependency-discovery summary for trace-boundary
     /// assertions without rerunning dependency discovery from a query.
-    #[cfg(test)]
-    pub(crate) fn retain_dependency_discovery_evidence(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],
         discovery: &DependencyDiscoveryOutcome,
@@ -2071,7 +1306,8 @@ impl WorkspaceAnalyzer {
     /// root for as long as the analyzer is used, so the workspace projection
     /// rows this build publishes for a temp-directory root do not outlive the
     /// request.
-    pub(crate) fn build_revision_image(
+    #[doc(hidden)]
+    pub fn build_revision_image(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         languages: Option<&BTreeSet<Language>>,
@@ -2220,15 +1456,9 @@ impl WorkspaceAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
-        for binding in
-            crate::analyzer::jvm::toolchains_document::load_source_toolchains(project.root())
-                .map_err(StoreError::new)?
-        {
-            let bindings = &mut config.jvm.standard_library_discovery.source_toolchains;
-            if !bindings.contains(&binding) {
-                bindings.push(binding);
-            }
-        }
+        crate::analyzer::languages::language_support(Language::Java)
+            .expect("Java support")
+            .configure_dependency_workspace(&mut config, project.root())?;
         // A fresh abort per fan-out. The caller's context may outlive this
         // build and go on to serve lazy per-language delegate builds, and those
         // must not inherit a flag this build set.
@@ -2272,7 +1502,7 @@ impl WorkspaceAnalyzer {
                 .collect(),
             _ => project_languages.into_iter().collect(),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let startup_oid_batches = store_context
             .liveness
             .as_ref()
@@ -2410,7 +1640,7 @@ impl WorkspaceAnalyzer {
             store_context,
             requested_languages.cloned(),
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let build_context =
             build_context.with_startup_oid_batch_counter_for_test(startup_oid_batches);
         let build_context = Arc::new(build_context);
@@ -2486,8 +1716,9 @@ impl WorkspaceAnalyzer {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn startup_oid_batch_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn startup_oid_batch_count_for_test(&self) -> usize {
         match self {
             Self::Empty(analyzer) => analyzer
                 .build_context
@@ -2564,6 +1795,9 @@ impl WorkspaceAnalyzer {
             return Ok(None);
         }
         let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let Some(storage_language_key) = self.semantic_artifact_storage_language_key(key) else {
+            return Ok(None);
+        };
         let Some(snapshot) = self.current_program_semantics_artifact_source(&file, usize::MAX)?
         else {
             return Ok(None);
@@ -2585,9 +1819,32 @@ impl WorkspaceAnalyzer {
             crate::analyzer::store::class_set_summaries::ClassSetSummaryAttachment {
                 rel_path: key.path().as_str().to_owned(),
                 blob_oid: blob_oid.to_string(),
+                storage_language_key,
                 language: key.language().language(),
             },
         ))
+    }
+
+    /// Return the exact storage namespace selected by the same per-file
+    /// semantic provider that owns `key`. This is a path/adapter identity
+    /// lookup only; callers that need a current disk owner still use
+    /// [`Self::semantic_artifact_store_attachment`] to bind the key to a
+    /// verified source snapshot and blob identity.
+    pub fn semantic_artifact_storage_language_key(
+        &self,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+    ) -> Option<crate::analyzer::semantic::StorageLanguageKey> {
+        let root = self.analyzer().project().root();
+        if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            return None;
+        }
+        let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let active = self.analyzer().active_semantic_model_snapshot();
+        let (delegate, provider) = self.program_semantics_provider_context_for_file(&file)?;
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            delegate, active,
+        );
+        provider.storage_language_key_for_file(&file)
     }
 
     /// Number of files in the project, i.e. an upper bound on the distinct
@@ -2624,16 +1881,9 @@ impl WorkspaceAnalyzer {
     /// an unpublished live blob is exactly what makes a native graph report
     /// `unavailable_canonical_facts`.
     pub fn warm_rust_usage_facts(&self) {
-        if let Some(rust) =
-            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-        {
-            // The catch-up issues per-file store queries that are only cheap
-            // under request-scoped memoization; without a scope each lookup
-            // re-hydrates (observed ~65s instead of ~3.5s on the Bifrost
-            // workspace).
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
-            rust.warm_usage_facts();
-        }
+        crate::analyzer::languages::language_support(Language::Rust)
+            .expect("Rust support")
+            .warm_usage_facts(self.analyzer());
     }
 
     /// Whether a Rust usage query would wait for a fact catch-up batch.
@@ -2643,8 +1893,9 @@ impl WorkspaceAnalyzer {
     /// persisted in the background. Answers without blocking behind that batch,
     /// which is the point (#1757). Always true for a workspace with no Rust.
     pub fn rust_usage_facts_ready(&self) -> bool {
-        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-            .is_none_or(|rust| rust.rust_usage_facts_ready())
+        crate::analyzer::languages::language_support(Language::Rust)
+            .expect("Rust support")
+            .usage_facts_ready(self.analyzer())
     }
 
     /// Whether the Rust fact catch-up has run for this generation. The
@@ -2652,8 +1903,9 @@ impl WorkspaceAnalyzer {
     /// [`Self::rust_usage_facts_ready`] answers: a session that never warms and
     /// never queries is ready but not warm.
     pub fn rust_usage_facts_warm(&self) -> bool {
-        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-            .is_none_or(|rust| rust.rust_usage_facts_warm())
+        crate::analyzer::languages::language_support(Language::Rust)
+            .expect("Rust support")
+            .usage_facts_warm(self.analyzer())
     }
 
     /// Select the execution-semantics provider for the requested file without
@@ -2694,7 +1946,8 @@ impl WorkspaceAnalyzer {
         analyzer.program_semantics_provider_context_for_file(file)
     }
 
-    pub(crate) fn current_program_semantics_artifact_source(
+    #[doc(hidden)]
+    pub fn current_program_semantics_artifact_source(
         &self,
         file: &crate::analyzer::ProjectFile,
         max_source_bytes: usize,
@@ -2735,8 +1988,9 @@ impl WorkspaceAnalyzer {
 
     /// Check a retained semantic handle against the complete identity of the
     /// file's current analyzer generation without rematerializing its IR.
-    #[cfg(test)]
-    pub(crate) fn semantic_artifact_key_is_current(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn semantic_artifact_key_is_current(
         &self,
         key: &crate::analyzer::semantic::SemanticArtifactKey,
         max_source_bytes: usize,
@@ -2998,328 +2252,20 @@ impl WorkspaceAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic_model::{
-        CompilerOptions, Completeness, DependencyPackDiagnosticSeverity,
-        SemanticModelActivationEvidence, SemanticModelRuntimeLimits, SessionPackSource,
-        SessionPackSourceKind, SourceFormat, compile_source,
-    };
+
     use crate::analyzer::store::liveness::Liveness;
-    use crate::analyzer::{
-        FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile,
-        PythonEnvironmentConfig, PythonEnvironmentLimits, TestProject,
-    };
-    use crate::gitblob::test_repo::{commit_all, init_repo};
+
+    use crate::analyzer::FilesystemProject;
+    use crate::analyzer::OverlayProject;
+    use crate::analyzer::Project;
+    use crate::analyzer::ProjectFile;
+
+    use crate::gitblob::test_repo::commit_all;
+    use crate::gitblob::test_repo::init_repo;
+
     use brokk_bifrost_test_macros::hardwon;
-    use rusqlite::Connection;
-    use std::path::PathBuf;
+
     use std::sync::atomic::Ordering;
-
-    use crate::inline_project::InlineTestProject;
-
-    #[test]
-    fn scoped_cache_projections_are_isolated_and_retained_by_analyzer_clones() {
-        let fixture = InlineTestProject::new()
-            .file("src/app.py", "class Box:\n    pass\n")
-            .file("other/extra.py", "class Extra:\n    pass\n")
-            .with_git()
-            .build();
-        let first_project: Arc<dyn Project> = Arc::new(crate::analyzer::FileSetProject::new(
-            fixture.root(),
-            [PathBuf::from("src/app.py")],
-        ));
-        let second_project: Arc<dyn Project> = Arc::new(crate::analyzer::FileSetProject::new(
-            fixture.root(),
-            [PathBuf::from("other/extra.py")],
-        ));
-        assert!(first_project.persistence_root().is_none());
-        let first = WorkspaceAnalyzer::build_scoped_persisted(
-            Arc::clone(&first_project),
-            AnalyzerConfig::default(),
-        )
-        .unwrap();
-        let second =
-            WorkspaceAnalyzer::build_scoped_persisted(second_project, AnalyzerConfig::default())
-                .unwrap();
-        let conn =
-            Connection::open(crate::analyzer::store::analyzer_db_path(fixture.root())).unwrap();
-        let projection_files = || {
-            conn.prepare(
-                "SELECT workspace_id, rel_path FROM workspace_file_versions
-                 WHERE valid_until IS NULL ORDER BY rel_path",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-        };
-        let files = projection_files();
-        assert_eq!(files.len(), 2, "overlapping scope lifetimes: {files:?}");
-        assert_eq!(files[0].1, "other/extra.py");
-        assert_eq!(files[1].1, "src/app.py");
-        assert_ne!(files[0].0, files[1].0);
-        let live_id = crate::gitblob::workspace_cache_identity(fixture.root());
-        assert!(files.iter().all(|(id, _)| id != &live_id));
-
-        let retained = first.clone_with_project(Arc::clone(&first_project));
-        drop(first);
-        assert_eq!(
-            projection_files(),
-            files,
-            "clones must retain the projection"
-        );
-        drop(second);
-        assert_eq!(projection_files(), vec![files[1].clone()]);
-        let declarations = retained.analyzer().get_all_declarations();
-        let classes: Vec<_> = declarations
-            .iter()
-            .filter(|unit| unit.is_class())
-            .map(|unit| unit.identifier())
-            .collect();
-        assert_eq!(classes, vec!["Box"], "retained scope: {declarations:?}");
-        assert!(
-            declarations
-                .iter()
-                .all(|unit| unit.source() == &fixture.file("src/app.py"))
-        );
-        drop(retained);
-        assert!(projection_files().is_empty());
-        for table in ["workspace_heads", "workspace_revisions"] {
-            let rows: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(rows, 0, "session must release {table}");
-        }
-        let blobs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(blobs, 2, "projection cleanup must retain content facts");
-        let warm =
-            WorkspaceAnalyzer::build_scoped_persisted(first_project, AnalyzerConfig::default())
-                .unwrap();
-        let provider = warm.analyzer().structural_fact_providers()[0];
-        assert_eq!(provider.structural_extraction_count(), 0);
-        assert_eq!(
-            std::collections::HashSet::<_>::from_iter(warm.analyzer().get_all_declarations()),
-            std::collections::HashSet::<_>::from_iter(declarations),
-        );
-    }
-
-    #[test]
-    fn intrinsic_models_activate_when_dependency_discovery_fails() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file("main.go", "package main\n")
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
-        let pack = compile_source(
-            SourceFormat::Json,
-            br#"{
-              "schema_version": 2,
-              "pack_id": "test.go.intrinsic",
-              "version": "1.0.0",
-              "producer": {"name": "test", "version": "1.0.0"},
-              "language": "go",
-              "ecosystem": "go",
-              "compatibility": {"bifrost": ">=0.10.0, <1.0.0"},
-              "provenance": {"source": "test:go-intrinsic"},
-              "license": "Apache-2.0",
-              "completeness": "complete",
-              "safety": {"generated_code_only": false, "review_required": false},
-              "shards": [{
-                "id": "summaries",
-                "activation": [{}],
-                "payload": {
-                  "kind": "procedure_summaries",
-                  "summaries": [{
-                    "id": "test.go.exit",
-                    "target": {
-                      "path": "src/os/proc.go",
-                      "symbol": "os.Exit(code int)",
-                      "has_receiver": false,
-                      "parameter_count": 1
-                    },
-                    "completeness": "complete",
-                    "normal_continuation_absent": true,
-                    "transfers": [],
-                    "effects": [{
-                      "kind": "unknown_call_boundary",
-                      "event": "test.go.exit-boundary"
-                    }]
-                  }]
-                }
-              }]
-            }"#,
-            &CompilerOptions::default(),
-        )
-        .unwrap_or_else(|diagnostics| panic!("intrinsic fixture failed: {diagnostics:#?}"));
-        catalog
-            .register_session_pack(
-                &pack,
-                &SessionPackSource {
-                    kind: SessionPackSourceKind::Embedded,
-                    source_id: "test:go-intrinsic".to_owned(),
-                },
-            )
-            .unwrap();
-
-        let mut config = AnalyzerConfig::default();
-        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
-        config.go.dependency_discovery.go_executable = Some(project.root().join("missing-go"));
-        let request = SemanticModelActivationRequest {
-            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-            evidence: vec![SemanticModelActivationEvidence {
-                language: "go".to_owned(),
-                ecosystem: "go".to_owned(),
-                package: None,
-                module: None,
-                toolchain: None,
-                target: None,
-                configuration: None,
-                artifact_sha256: None,
-            }],
-            controls: Vec::new(),
-            limits: SemanticModelRuntimeLimits::default(),
-        };
-        let outcome = workspace.activate_dependency_packs(
-            &config,
-            &[DependencyPackEcosystem::Go],
-            DependencyPackWorkspaceContext {
-                catalog: &catalog,
-                persistence: None,
-                activation: &request,
-                limits: DependencyPackLimits::default(),
-                cancellation: &crate::CancellationToken::default(),
-            },
-        );
-
-        assert!(!outcome.complete());
-        assert!(outcome.diagnostic_refresh_required);
-        assert!(!outcome.ecosystems[0].discovery.complete);
-        // #2887: an incomplete discovery still prepares the dependencies it
-        // did resolve. Go discovery resolved none here, so preparation has
-        // nothing to select and contributes no evidence of its own.
-        let preparation = outcome.ecosystems[0]
-            .preparation
-            .as_ref()
-            .expect("incomplete discovery must still prepare its resolved set");
-        assert!(preparation.complete, "{preparation:#?}");
-        assert!(preparation.evidence.is_empty(), "{preparation:#?}");
-        let SemanticModelRuntimeOutcome::Ready { active, .. } = outcome
-            .runtime
-            .expect("intrinsic activation must still run")
-        else {
-            panic!("intrinsic activation should be ready")
-        };
-        assert_eq!(active.shards().len(), 1);
-        assert_eq!(active.shards()[0].manifest.pack_id, "test.go.intrinsic");
-    }
-
-    #[test]
-    #[hardwon(
-        "#2542: Kotlin cold query startup repeated workspace listings and blob identity hashing"
-    )]
-    fn git_multilanguage_build_reuses_constructor_listing_and_one_oid_batch() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("Sample.java"), "class Sample {}\n").unwrap();
-        std::fs::write(root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "multi-language workspace");
-
-        let project = Arc::new(FilesystemProject::new(&root).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::clone(&project) as Arc<dyn Project>,
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral multi-language workspace");
-
-        assert_eq!(
-            project.workspace_file_listing_count(),
-            1,
-            "the constructor listing should seed the one build snapshot"
-        );
-        assert_eq!(workspace.startup_oid_batch_count_for_test(), 1);
-        assert!(
-            workspace
-                .analyzer()
-                .declarations(&ProjectFile::new(&root, "Sample.java"))
-                .iter()
-                .any(|unit| unit.identifier() == "Sample")
-        );
-        assert!(
-            workspace
-                .analyzer()
-                .declarations(&ProjectFile::new(&root, "sample.py"))
-                .iter()
-                .any(|unit| unit.identifier() == "SamplePy")
-        );
-
-        let late = ProjectFile::new(&root, "late.go");
-        std::fs::write(late.abs_path(), "package late\n").unwrap();
-        assert!(project.all_files_shared().unwrap().contains(&late));
-        assert_eq!(
-            project.workspace_file_listing_count(),
-            2,
-            "manual sessions must return to a fresh walk after the build seed"
-        );
-    }
-
-    #[test]
-    #[hardwon("#2542: non-Git cold startup repeated constructor path listings")]
-    fn non_git_multilanguage_build_reuses_one_listing_without_live_oids() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("Sample.java"), "class Sample {}\n").unwrap();
-        std::fs::write(root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
-        let project = Arc::new(TestProject::from_root_with_inferred_languages(&root).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::clone(&project) as Arc<dyn Project>,
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral non-Git workspace");
-
-        assert_eq!(project.workspace_file_listing_count(), 1);
-        assert_eq!(workspace.startup_oid_batch_count_for_test(), 0);
-        assert!(workspace.analyzer().languages().contains(&Language::Java));
-        assert!(workspace.analyzer().languages().contains(&Language::Python));
-    }
-
-    #[test]
-    #[hardwon(
-        "#2542: multi-root startup repeated the source listing for each constructor consumer"
-    )]
-    fn multi_root_build_consumes_each_constructor_seed_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let java_root = root.join("java");
-        let python_root = root.join("python");
-        std::fs::create_dir_all(&java_root).unwrap();
-        std::fs::create_dir_all(&python_root).unwrap();
-        std::fs::write(java_root.join("Sample.java"), "class Sample {}\n").unwrap();
-        std::fs::write(python_root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
-
-        let project = Arc::new(MultiRootProject::new([java_root, python_root]).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::clone(&project) as Arc<dyn Project>,
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral multi-root workspace");
-
-        assert_eq!(project.workspace_file_listing_count(), 2);
-        assert!(workspace.analyzer().languages().contains(&Language::Java));
-        assert!(workspace.analyzer().languages().contains(&Language::Python));
-
-        let late = root.join("java").join("late.go");
-        std::fs::write(&late, "package late\n").unwrap();
-        let late_file = ProjectFile::new(&root, "java/late.go");
-        assert!(project.all_files_shared().unwrap().contains(&late_file));
-        assert_eq!(project.workspace_file_listing_count(), 4);
-    }
 
     #[test]
     #[hardwon(
@@ -3414,515 +2360,5 @@ mod tests {
             .expect("refreshed disk live entry")
             .oid();
         assert_ne!(old_oid, new_oid);
-    }
-
-    #[test]
-    fn semantic_generation_check_rejects_a_stale_configuration_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = ProjectFile::new(root.clone(), "src/generation.ts");
-        file.write("export const generation = 1;\n").unwrap();
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::TypeScript));
-        let workspace =
-            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-                .expect("ephemeral workspace should build");
-        let cancellation = crate::analyzer::semantic::CancellationToken::default();
-        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
-        let artifact = workspace
-            .materialize_program_semantics(
-                &file,
-                &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .unwrap()
-            .available_value()
-            .cloned()
-            .expect("semantic artifact");
-        assert!(
-            workspace
-                .semantic_artifact_key_is_current(artifact.key(), usize::MAX)
-                .unwrap()
-                .expect("source within limit")
-        );
-
-        let current = artifact.key();
-        let stale = crate::analyzer::semantic::SemanticArtifactKey::new(
-            current.mount(),
-            current.path().clone(),
-            current.language(),
-            current.revision(),
-            current.adapter().clone(),
-            current.ir_version(),
-            crate::analyzer::semantic::ConfigurationFingerprint::hash_bytes(b"stale-configuration"),
-            current.dependencies(),
-        );
-        assert_eq!(
-            workspace
-                .semantic_artifact_key_is_current(&stale, usize::MAX)
-                .unwrap(),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn index_warm_clone_freezes_source_and_publishes_every_generation_warm_cell() {
-        let fixture = InlineTestProject::new()
-            .file(
-                "src/lib.rs",
-                "pub trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
-            )
-            .file("src/JavaWorker.java", "class JavaWorker {}\n")
-            .file("src/KotlinWorker.kt", "class KotlinWorker\n")
-            .file("src/ScalaWorker.scala", "class ScalaWorker\n")
-            .file("src/CSharpWorker.cs", "class CSharpWorker {}\n")
-            .build();
-        assert_eq!(
-            fixture.languages(),
-            BTreeSet::from([
-                Language::CSharp,
-                Language::Java,
-                Language::Kotlin,
-                Language::Rust,
-                Language::Scala,
-            ])
-        );
-
-        let rust_file = fixture.file("src/lib.rs");
-        let scheduled_source =
-            "pub trait Scheduled {}\npub struct Worker;\nimpl Scheduled for Worker {}\n";
-        let live_project = Arc::new(OverlayProject::new(fixture.project_dyn()));
-        assert!(live_project.set(rust_file.abs_path(), scheduled_source.to_owned()));
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::clone(&live_project) as Arc<dyn Project>,
-            AnalyzerConfig::default(),
-        )
-        .expect("mixed ephemeral workspace should build");
-        assert!(!workspace.query_indexes_warm());
-
-        let frozen_project: Arc<dyn Project> = Arc::new(live_project.snapshot());
-        let warm_snapshot = workspace.clone_for_index_warm(frozen_project);
-        assert!(!warm_snapshot.query_indexes_warm());
-        warm_snapshot.warm_query_indexes();
-        assert!(warm_snapshot.query_indexes_warm());
-        assert!(
-            workspace.query_indexes_warm(),
-            "warming the frozen clone must publish into every live generation-owned cell"
-        );
-
-        assert!(live_project.set(
-            rust_file.abs_path(),
-            "pub trait Later {}\npub struct Worker;\nimpl Later for Worker {}\n".to_owned(),
-        ));
-        assert_eq!(
-            warm_snapshot
-                .analyzer()
-                .project()
-                .read_source(&rust_file)
-                .unwrap(),
-            scheduled_source
-        );
-        let WorkspaceAnalyzer::Multi(multi) = &warm_snapshot else {
-            panic!("five-language workspace must have delegates");
-        };
-        assert_eq!(
-            multi
-                .build_context()
-                .expect("workspace build context")
-                .project()
-                .read_source(&rust_file)
-                .unwrap(),
-            scheduled_source,
-            "future delegate construction must retain the frozen source view"
-        );
-    }
-
-    /// Rust readiness requires verified publication, not just the absence of a
-    /// scheduled repair. Warmth additionally requires the catch-up to settle.
-    /// The two Rust usage predicates a caller can ask a workspace, and the
-    /// distinction ExecPlan Milestone 3 introduced between them: readiness is
-    /// "would a query wait", which a healthy workspace answers `true` even
-    /// before any warm because v2 has nothing to build, and warmth is "has the
-    /// catch-up run for this generation", which only the warm makes true.
-    /// Neither may be `false` for a workspace with no Rust.
-    #[test]
-    fn rust_usage_readiness_and_warmth_are_distinct_and_vacuous_without_rust() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        ProjectFile::new(root.clone(), "src/lib.rs")
-            .write("pub mod worker;\npub fn root() {}\n")
-            .unwrap();
-        ProjectFile::new(root.clone(), "src/worker.rs")
-            .write("use crate::root;\npub fn run() { root(); }\n")
-            .unwrap();
-
-        let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let rust = WorkspaceAnalyzer::build_ephemeral_footgun(rust, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
-        assert!(!rust.rust_usage_facts_ready());
-        assert!(!rust.rust_usage_facts_warm());
-        rust.warm_rust_usage_facts();
-        assert!(rust.rust_usage_facts_ready());
-        assert!(rust.rust_usage_facts_warm());
-
-        let java: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
-        let java = WorkspaceAnalyzer::build_ephemeral_footgun(java, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
-        assert!(java.rust_usage_facts_ready());
-        assert!(java.rust_usage_facts_warm());
-    }
-
-    #[test]
-    #[hardwon("#847: unsupported analyzer queries must remain healthy empty results")]
-    fn unsupported_analyzer_query_remains_a_healthy_empty_result() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
-        let analyzer = EmptyAnalyzer::new(project);
-        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-
-        analyzer.begin_query(&context);
-        assert!(analyzer.definitions("Missing").next().is_none());
-        assert!(context.store_error().is_none());
-        analyzer.end_query(&context);
-    }
-
-    #[test]
-    fn request_overlay_snapshot_cannot_replace_committed_structural_facts() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let disk_source = "export const disk = call(1);\n";
-        let overlay_source = "export const overlay = call(1, 2);\nexport const extra = call(3);\n";
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.ts"), disk_source).unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "disk source");
-        let project: Arc<dyn Project> =
-            Arc::new(TestProject::new(root.clone(), Language::TypeScript));
-        let file = ProjectFile::new(root.clone(), "app.ts");
-
-        let disk_workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("persisted analyzer should build");
-        let disk_provider = disk_workspace.analyzer().structural_fact_providers()[0];
-        let disk_facts = disk_provider.structural_facts(&file).unwrap();
-        let disk_fact_count = disk_facts.nodes().len();
-        assert_eq!(disk_facts.source(), disk_source);
-
-        let overlay = Arc::new(OverlayProject::new(Arc::clone(&project)));
-        assert!(overlay.set(file.abs_path(), overlay_source.to_owned()));
-        let overlay_workspace =
-            disk_workspace.clone_with_project(Arc::clone(&overlay) as Arc<dyn Project>);
-        let overlay_provider = overlay_workspace.analyzer().structural_fact_providers()[0];
-        let extractions_before = overlay_provider.structural_extraction_count();
-        let overlay_facts = overlay_provider.structural_facts(&file).unwrap();
-        assert_eq!(overlay_facts.source(), overlay_source);
-        assert_ne!(overlay_facts.nodes().len(), disk_fact_count);
-        assert_eq!(
-            overlay_provider.structural_extraction_count(),
-            extractions_before + 1,
-            "the unseen overlay blob must extract its own facts"
-        );
-        drop(overlay_workspace);
-        drop(disk_workspace);
-
-        let disk_reopened = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
-            .expect("persisted analyzer should reopen");
-        let disk_provider = disk_reopened.analyzer().structural_fact_providers()[0];
-        let hydrated_before = disk_provider.structural_hydration_count();
-        let disk_facts = disk_provider.structural_facts(&file).unwrap();
-        assert_eq!(disk_facts.source(), disk_source);
-        assert_eq!(disk_facts.nodes().len(), disk_fact_count);
-        assert_eq!(disk_provider.structural_extraction_count(), 0);
-        assert_eq!(
-            disk_provider.structural_hydration_count(),
-            hydrated_before + 1
-        );
-        drop(disk_reopened);
-
-        let disk_oid = git2::Oid::hash_object(git2::ObjectType::Blob, disk_source.as_bytes())
-            .expect("hash committed source");
-        let committed_fact_manifests =
-            Connection::open(crate::analyzer::store::analyzer_db_path(&root))
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM structural_source_manifests
-                 WHERE blob_id = (
-                   SELECT id FROM blobs
-                   WHERE blob_oid = ?1 AND lang = 'typescript:ts'
-                 )",
-                    [disk_oid.to_string()],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap();
-        assert_eq!(
-            committed_fact_manifests, 1,
-            "overlay analysis must not replace the committed source facts"
-        );
-    }
-
-    /// Activate the Python ecosystem against a fabricated environment whose
-    /// standard-library root contains exactly `files`, with no intrinsic
-    /// activation evidence, so the outcome is decided by dependency
-    /// preparation alone.
-    fn activate_python_stdlib_environment(
-        files: &[(&str, &[u8])],
-    ) -> DependencyPackActivationOutcome {
-        let project = InlineTestProject::with_language(Language::Python)
-            .file("main.py", "value = 1\n")
-            .build();
-        let stdlib_root = project.root().join(".env/stdlib");
-        std::fs::create_dir_all(&stdlib_root).expect("create stdlib root");
-        for (name, contents) in files {
-            std::fs::write(stdlib_root.join(name), contents)
-                .unwrap_or_else(|error| panic!("write stdlib artifact {name}: {error}"));
-        }
-        let mut config = AnalyzerConfig::default();
-        config.python.environment = Some(PythonEnvironmentConfig {
-            implementation: "cpython".to_owned(),
-            version: "3.12.0".to_owned(),
-            platform: "linux".to_owned(),
-            standard_library_root: PathBuf::from(".env/stdlib"),
-            bundled_stub_roots: Vec::new(),
-            distribution_roots: Vec::new(),
-            limits: PythonEnvironmentLimits::default(),
-        });
-        let workspace = project.workspace_analyzer(config.clone());
-        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
-        let request = SemanticModelActivationRequest {
-            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-            evidence: Vec::new(),
-            controls: Vec::new(),
-            limits: SemanticModelRuntimeLimits::default(),
-        };
-        workspace.activate_dependency_packs(
-            &config,
-            &[DependencyPackEcosystem::Python],
-            DependencyPackWorkspaceContext {
-                catalog: &catalog,
-                persistence: None,
-                activation: &request,
-                limits: DependencyPackLimits::default(),
-                cancellation: &crate::CancellationToken::default(),
-            },
-        )
-    }
-
-    #[test]
-    #[hardwon(
-        "b610cdc85704: zero-config Servlet-to-JDBC proof dropped supported evidence from partial generated packs"
-    )]
-    fn partial_generated_pack_activates_while_preparation_stays_incomplete() {
-        let outcome = activate_python_stdlib_environment(&[
-            (
-                "good.py",
-                b"class Greeter:\n    def hello(self) -> int:\n        return 1\n".as_slice(),
-            ),
-            // Not valid UTF-8, so the producer fails this one artifact while
-            // the class above still yields a usable partial declaration pack.
-            ("broken.py", &[0xff, 0xfe, 0x00]),
-        ]);
-        let preparation = outcome.ecosystems[0]
-            .preparation
-            .as_ref()
-            .expect("python environment preparation must run");
-        assert!(!preparation.complete, "{preparation:#?}");
-        assert!(
-            preparation.diagnostics.iter().any(|diagnostic| {
-                diagnostic.severity == DependencyPackDiagnosticSeverity::Error
-                    && diagnostic.code == "python.source.encoding"
-            }),
-            "{preparation:#?}"
-        );
-        assert!(
-            !preparation.evidence.is_empty(),
-            "the produced partial pack must carry typed activation evidence: {preparation:#?}"
-        );
-        assert!(!outcome.complete(), "{outcome:#?}");
-        assert!(outcome.diagnostic_refresh_required, "{outcome:#?}");
-        let SemanticModelRuntimeOutcome::Ready { active, .. } = outcome
-            .runtime
-            .expect("partial pack evidence must still activate the runtime")
-        else {
-            panic!("partial pack activation should be ready")
-        };
-        assert_eq!(active.shards().len(), 1, "{active:#?}");
-        assert_eq!(
-            active.shards()[0].manifest.pack_id,
-            "bifrost.external.python"
-        );
-        assert_eq!(
-            active.shards()[0].manifest.completeness,
-            Completeness::Partial
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "b610cdc85704: failed preparation without proof evidence published an inferred model"
-    )]
-    fn failed_preparation_without_evidence_publishes_nothing() {
-        let outcome = activate_python_stdlib_environment(&[("broken.py", &[0xff, 0xfe, 0x00])]);
-        let preparation = outcome.ecosystems[0]
-            .preparation
-            .as_ref()
-            .expect("python environment preparation must run");
-        assert!(!preparation.complete, "{preparation:#?}");
-        assert!(
-            preparation.evidence.is_empty(),
-            "a failed production must not leave activation evidence: {preparation:#?}"
-        );
-        assert!(
-            outcome.ecosystems[0].discovery.complete,
-            "discovery, not preparation, must own this outcome's incompleteness shape"
-        );
-        assert!(outcome.runtime.is_none(), "{outcome:#?}");
-        assert!(!outcome.diagnostic_refresh_required, "{outcome:#?}");
-        assert!(!outcome.complete(), "{outcome:#?}");
-    }
-
-    #[test]
-    #[hardwon(
-        "b610cdc85704: cancellation allowed later ecosystem discovery to publish a partial activation transaction"
-    )]
-    fn cancelled_dependency_discovery_stops_the_whole_activation_transaction() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file("main.go", "package main\n")
-            .build();
-        let mut config = AnalyzerConfig::default();
-        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
-        config.go.dependency_discovery.go_executable = Some(project.root().join("missing-go"));
-        let workspace = project.workspace_analyzer(config.clone());
-        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
-        let request = SemanticModelActivationRequest {
-            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-            evidence: Vec::new(),
-            controls: Vec::new(),
-            limits: SemanticModelRuntimeLimits::default(),
-        };
-        // The first cancellation check is the top of Go discovery itself, so
-        // discovery is cancelled before it resolves anything and before the
-        // second ecosystem can start.
-        let cancellation = crate::CancellationToken::cancel_after_checks_for_test(1);
-        let outcome = workspace.activate_dependency_packs(
-            &config,
-            &[DependencyPackEcosystem::Go, DependencyPackEcosystem::Python],
-            DependencyPackWorkspaceContext {
-                catalog: &catalog,
-                persistence: None,
-                activation: &request,
-                limits: DependencyPackLimits::default(),
-                cancellation: &cancellation,
-            },
-        );
-        assert_eq!(outcome.ecosystems.len(), 1, "{outcome:#?}");
-        assert!(outcome.ecosystems[0].discovery.cancelled, "{outcome:#?}");
-        assert!(outcome.ecosystems[0].preparation.is_none(), "{outcome:#?}");
-        assert!(outcome.runtime.is_none(), "{outcome:#?}");
-        assert!(!outcome.diagnostic_refresh_required, "{outcome:#?}");
-        assert!(!outcome.complete(), "{outcome:#?}");
-    }
-
-    #[test]
-    fn go_native_activation_disabled_never_invokes_configured_tool() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
-            .file("go.mod", "module example.test/root\n")
-            .file("main.go", "package main\nfunc main() {}\n")
-            .build();
-        let mut config = AnalyzerConfig::default();
-        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::Disabled;
-        config.go.dependency_discovery.go_executable = Some(fixture.root().join("absent-go-tool"));
-        assert_eq!(
-            config.go.dependency_discovery.mode,
-            GoDependencyDiscoveryMode::Disabled
-        );
-        let workspace =
-            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), config.clone())
-                .unwrap();
-        let outcome = workspace.resolve_dependency_discovery(
-            DependencyPackEcosystem::Go,
-            &config,
-            &DependencyPackLimits::default(),
-            &crate::CancellationToken::new(),
-        );
-        assert!(outcome.complete);
-        assert!(outcome.diagnostics.is_empty());
-        let conn = workspace.store().unwrap().read_conn().unwrap();
-        let contexts: i64 = conn
-            .query_row("SELECT count(*) FROM go_context_publications", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(contexts, 1);
-        let (complete, gaps): (bool, String) = conn
-            .query_row(
-                "SELECT complete,json(gaps) FROM go_context_publications",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert!(!complete);
-        assert!(gaps.contains("build_selection_unavailable"));
-    }
-
-    #[test]
-    fn warm_query_indexes_reaches_language_analyzers_through_every_workspace_shape() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        ProjectFile::new(root.clone(), "src/lib.rs")
-            .write("trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n")
-            .unwrap();
-
-        let single: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let single = WorkspaceAnalyzer::build_ephemeral_footgun(single, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
-        assert!(!single.query_indexes_warm());
-        single.warm_query_indexes();
-        assert!(single.query_indexes_warm());
-
-        let multi: Arc<dyn Project> = Arc::new(TestProject::with_languages(
-            root,
-            BTreeSet::from([Language::Rust, Language::Java]),
-        ));
-        let multi = WorkspaceAnalyzer::build_ephemeral_footgun(multi, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
-        assert!(!multi.query_indexes_warm());
-        multi.warm_query_indexes();
-        assert!(multi.query_indexes_warm());
-    }
-
-    #[test]
-    fn multi_workspace_derived_cache_uses_configured_budget_share() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let project: Arc<dyn Project> = Arc::new(TestProject::with_languages(
-            root,
-            BTreeSet::from([Language::Java, Language::TypeScript]),
-        ));
-        let config = AnalyzerConfig {
-            memo_cache_budget_bytes: Some(1024 * 1024),
-            ..AnalyzerConfig::default()
-        };
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::clone(&project), config)
-            .expect("ephemeral workspace should build");
-        assert_eq!(
-            workspace
-                .analyzer()
-                .snapshot_caches()
-                .expect("multi workspace caches")
-                .derived_layers()
-                .max_retained_bytes(),
-            128 * 1024
-        );
-
-        let overlay = Arc::new(OverlayProject::new(project));
-        let snapshot = workspace.clone_with_project(overlay as Arc<dyn Project>);
-        assert_eq!(
-            snapshot
-                .analyzer()
-                .snapshot_caches()
-                .expect("snapshot caches")
-                .derived_layers()
-                .max_retained_bytes(),
-            128 * 1024
-        );
     }
 }

@@ -3,19 +3,21 @@ use crate::analyzer::semantic::{SemanticBudgetDimension, SemanticWork};
 use schemars::JsonSchema;
 
 macro_rules! saturating_add_work {
-    ($left:ident, $right:ident; [$($field:ident),* $(,)?]; [$($flag:ident),* $(,)?]) => {
+    ($left:ident, $right:ident; [$($field:ident),* $(,)?]; [$($flag:ident),* $(,)?] $(; [$($peak:ident),* $(,)?])?) => {
         Self {
             $($field: $left.$field.saturating_add($right.$field),)*
             $($flag: $left.$flag || $right.$flag,)*
+            $($($peak: $left.$peak.component_max($right.$peak),)*)?
         }
     };
 }
 
 macro_rules! saturating_sub_work {
-    ($left:ident, $right:ident; [$($field:ident),* $(,)?]; [$($flag:ident),* $(,)?]) => {
+    ($left:ident, $right:ident; [$($field:ident),* $(,)?]; [$($flag:ident),* $(,)?] $(; [$($peak:ident),* $(,)?])?) => {
         Self {
             $($field: $left.$field.saturating_sub($right.$field),)*
             $($flag: $left.$flag && !$right.$flag,)*
+            $($($peak: $left.$peak,)*)?
         }
     };
 }
@@ -553,7 +555,7 @@ pub struct CodeQuerySemanticLimits {
     pub max_source_bytes: usize,
     pub max_rows_per_dimension: usize,
     pub max_retained_bytes: usize,
-    pub max_traversal_steps: usize,
+
     /// Per-dimension row capacities, for a caller that has them.
     ///
     /// `None` is the ordinary case: one uniform `max_rows_per_dimension`
@@ -561,9 +563,9 @@ pub struct CodeQuerySemanticLimits {
     /// estimate for each homogeneous retained-row lane from
     /// `max_retained_bytes` on top of it, because a caller that supplies one
     /// number for fourteen lanes of very different density has not priced any
-    /// of them. `nested_entries` keeps the uniform bound: that lane mixes small
-    /// nested collection entries with non-retained bounded traversal work, so
-    /// pricing every entry as one retained row would not estimate its memory.
+    /// of them. `nested_entries` keeps the uniform bound for heterogeneous
+    /// retained collections. Traversal visits are work telemetry and do not
+    /// consume this resident row grant.
     ///
     /// `Some` says the caller has: it carries its own multi-dimensional
     /// ledger and knows exactly how much of each lane is left. Those
@@ -587,7 +589,6 @@ impl CodeQuerySemanticLimits {
         self.max_materialized_files > 0
             && self.max_source_bytes > 0
             && self.max_retained_bytes > 0
-            && self.max_traversal_steps > 0
             && CodeQuerySemanticRowLimits::ROW_DIMENSIONS
                 .into_iter()
                 .all(|dimension| self.rows(dimension) > 0)
@@ -775,6 +776,17 @@ pub struct CodeQuerySemanticWork {
     pub control_edges: u64,
     pub nested_entries: u64,
     pub retained_bytes: u64,
+    /// Admitted plus worked per lane; held-and-scanned bytes can count twice.
+    /// This cumulative telemetry is not a bound.
+    pub cumulative: crate::analyzer::semantic::SemanticWork,
+    /// Largest live resident census per lane.
+    pub resident_peaks: crate::analyzer::semantic::SemanticWork,
+    /// Largest work balance of any one root or prepass per lane.
+    pub root_work_peaks: crate::analyzer::semantic::SemanticWork,
+    /// The `nested_entries` lane of `resident_peaks`.
+    pub resident_nested_entries_peak: u64,
+    /// The retained-artifact byte peak, also reported as `retained_bytes`.
+    pub resident_retained_bytes_peak: u64,
     pub traversal_steps: u64,
     pub budget_exhausted: bool,
     #[serde(skip_serializing_if = "CodeQueryTypestateWork::is_empty")]
@@ -788,12 +800,28 @@ pub struct CodeQuerySemanticWork {
 impl CodeQuerySemanticWork {
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
         let left = self;
-        saturating_add_work!(left, other; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted])
+        let mut result = saturating_add_work!(left, other; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, cumulative, resident_nested_entries_peak, resident_retained_bytes_peak, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted]; [resident_peaks, root_work_peaks]);
+        result.resident_nested_entries_peak =
+            if left.resident_nested_entries_peak > other.resident_nested_entries_peak {
+                left.resident_nested_entries_peak
+            } else {
+                other.resident_nested_entries_peak
+            };
+        result.resident_retained_bytes_peak =
+            if left.resident_retained_bytes_peak > other.resident_retained_bytes_peak {
+                left.resident_retained_bytes_peak
+            } else {
+                other.resident_retained_bytes_peak
+            };
+        result
     }
 
     pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
         let left = self;
-        saturating_sub_work!(left, earlier; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted])
+        let mut result = saturating_sub_work!(left, earlier; [materialization_attempts, unique_materialized_files, request_cache_hits, source_bytes, procedures, blocks, program_points, values, allocations, call_sites, memory_locations, captures, source_mappings, evidence, gaps, events, control_edges, nested_entries, retained_bytes, cumulative, resident_nested_entries_peak, resident_retained_bytes_peak, traversal_steps, typestate, value_flow, type_flow]; [budget_exhausted]; [resident_peaks, root_work_peaks]);
+        result.resident_nested_entries_peak = left.resident_nested_entries_peak;
+        result.resident_retained_bytes_peak = left.resident_retained_bytes_peak;
+        result
     }
 }
 
@@ -1085,7 +1113,7 @@ impl Default for CodeQuerySemanticLimits {
             max_source_bytes: MAX_SEMANTIC_SOURCE_BYTES,
             max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION,
             max_retained_bytes: MAX_SEMANTIC_RETAINED_BYTES,
-            max_traversal_steps: MAX_SEMANTIC_TRAVERSAL_STEPS,
+
             rows_per_dimension: None,
         }
     }

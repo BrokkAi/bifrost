@@ -11,6 +11,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use super::mapping_span;
 use brokk_bifrost_core::profiling;
@@ -42,8 +43,8 @@ use crate::value_flow::{
     DispatchReadCollector, DispatchStatus, DurableProcedureKey, ProcedureDispatchRead, SkipReason,
     ValueFlowCarrier, ValueFlowEdgeKillSpec, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
     ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPlanError, ValueFlowSinkId,
-    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, WorkspaceValueFlowProvider,
-    discover_closure_with_cuts,
+    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceListId, ValueFlowSourceLists,
+    ValueFlowSourceSpec, ValueFlowSources, WorkspaceValueFlowProvider, discover_closure_with_cuts,
 };
 use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
@@ -614,7 +615,8 @@ const CONTENT_KEYED_ORDINAL_BIT: u32 = 1 << 31;
 /// One spec under construction plus the reporting record parallel to it.
 struct SeedTables {
     sources: Vec<(ValueFlowSourceSpec, ClassAtom, SourceSite)>,
-    open_bound_class_sources: HashSet<ValueFlowEventKey>,
+    source_lists: ValueFlowSourceLists,
+    open_bound_class_sources: HashSet<ValueFlowSourceId>,
     sinks: Vec<(ValueFlowSinkSpec, MemberAccessSite)>,
     member_surface_sources: HashSet<ValueFlowEventKey>,
     /// Python's `*args` and `**kwargs` values are containers. Their element
@@ -630,6 +632,7 @@ impl SeedTables {
     fn new() -> Self {
         Self {
             sources: Vec::new(),
+            source_lists: ValueFlowSourceLists::default(),
             open_bound_class_sources: HashSet::default(),
             sinks: Vec::new(),
             ordinals: HashMap::default(),
@@ -645,11 +648,12 @@ impl SeedTables {
         carrier: ValueFlowCarrier,
         atom: ClassAtom,
         site: SourceSite,
-    ) -> ValueFlowEventKey {
+    ) -> ValueFlowSourceId {
         let key = self.event_key(point, ValueFlowEventKind::Source);
+        let id = ValueFlowSourceId::try_from_index(self.sources.len()).expect("source ID fits u32");
         self.sources.push((
             ValueFlowSourceSpec::new(
-                key.clone(),
+                key,
                 point.clone(),
                 phase,
                 carrier,
@@ -659,12 +663,12 @@ impl SeedTables {
             atom,
             site,
         ));
-        key
+        id
     }
 
-    fn mark_open_bound_class_source(&mut self, key: ValueFlowEventKey) {
+    fn mark_open_bound_class_source(&mut self, id: ValueFlowSourceId) {
         assert!(
-            self.open_bound_class_sources.insert(key),
+            self.open_bound_class_sources.insert(id),
             "a class source is marked open-bound only once"
         );
     }
@@ -682,9 +686,9 @@ impl SeedTables {
             !open_bound_class || matches!(atom, ClassAtom::Class(_)),
             "only a class atom can carry an open class bound"
         );
-        let key = self.push_source(point, phase, carrier, atom, site);
+        let id = self.push_source(point, phase, carrier, atom, site);
         if open_bound_class {
-            self.mark_open_bound_class_source(key);
+            self.mark_open_bound_class_source(id);
         }
     }
 
@@ -902,26 +906,30 @@ fn guard_transfers(
     guard_bindings: &HashMap<DurableProcedureKey, GuardBindings>,
     cancellation: &CancellationToken,
 ) -> Result<Vec<ValueFlowEdgeKillSpec>, TypeFlowPlanError> {
-    let mut sources_by_class = HashMap::<ClassIdentity, Vec<ValueFlowEventKey>>::default();
+    let mut sources_by_class = HashMap::<ClassIdentity, Vec<ValueFlowSourceId>>::default();
     // Every source the domain could not name. A verdict classifies a class
     // against the guard's predicate, and an Unknown has no hierarchy to test,
     // so narrowing alone carries a remainder straight into an arm that has
     // already established what the value is. The guards that do establish it
     // answer for these sources instead (issue #3296). The list grows with the
     // remainders the loop installs, so a later guard sees an earlier guard's.
-    let mut unknown_sources = Vec::<ValueFlowEventKey>::new();
+    let mut unknown_sources = Vec::<ValueFlowSourceId>::new();
     let mut source_evidence = tables
         .sources
         .iter()
-        .map(|(source, atom, site)| (source.key().clone(), (atom.clone(), site.kind)))
+        .enumerate()
+        .map(|(index, (_, atom, site))| {
+            (
+                ValueFlowSourceId::try_from_index(index).expect("source ID fits u32"),
+                (atom.clone(), site.kind),
+            )
+        })
         .collect::<HashMap<_, _>>();
-    for (source, atom, _) in &tables.sources {
+    for (index, (_, atom, _)) in tables.sources.iter().enumerate() {
+        let id = ValueFlowSourceId::try_from_index(index).expect("source ID fits u32");
         match atom {
-            ClassAtom::Class(class) => sources_by_class
-                .entry(class.clone())
-                .or_default()
-                .push(source.key().clone()),
-            ClassAtom::Unknown(_) => unknown_sources.push(source.key().clone()),
+            ClassAtom::Class(class) => sources_by_class.entry(class.clone()).or_default().push(id),
+            ClassAtom::Unknown(_) => unknown_sources.push(id),
         }
     }
     let mut kills = Vec::new();
@@ -987,8 +995,8 @@ fn guard_transfers(
                             replacement_inputs = Some(
                                 class_sources
                                     .iter()
-                                    .flat_map(|(_, sources)| sources.iter().cloned())
-                                    .chain(unknown_sources.iter().cloned())
+                                    .flat_map(|(_, sources)| sources.iter().copied())
+                                    .chain(unknown_sources.iter().copied())
                                     .collect::<Vec<_>>(),
                             );
                             (
@@ -1017,7 +1025,7 @@ fn guard_transfers(
                                 let point = procedure
                                     .point_handle(guard.point)
                                     .expect("a retained guard point is live");
-                                let key = push_guard_remainder(
+                                let id = push_guard_remainder(
                                     workspace,
                                     procedure,
                                     tables,
@@ -1027,17 +1035,17 @@ fn guard_transfers(
                                     UnknownReason::UnmodeledPredicate,
                                     class_sources
                                         .iter()
-                                        .flat_map(|(_, sources)| sources.iter().cloned())
+                                        .flat_map(|(_, sources)| sources.iter().copied())
                                         .collect(),
                                 );
                                 source_evidence.insert(
-                                    key.clone(),
+                                    id,
                                     (
                                         ClassAtom::Unknown(UnknownReason::UnmodeledPredicate),
                                         SourceSiteKind::ConditionalNarrowingGuard,
                                     ),
                                 );
-                                unknown_sources.push(key.clone());
+                                unknown_sources.push(id);
                                 if let Some(join) = guard_join(
                                     procedure,
                                     &mut joins,
@@ -1046,7 +1054,11 @@ fn guard_transfers(
                                     guard.point,
                                 )? {
                                     kill_at_predecessors(
-                                        procedure, &mut kills, join, &carrier, &key,
+                                        procedure,
+                                        &mut kills,
+                                        join,
+                                        &carrier,
+                                        tables.source_lists.intern(vec![id]),
                                     );
                                 }
                             }
@@ -1072,13 +1084,13 @@ fn guard_transfers(
                 classes.len(),
                 "one guard verdict per candidate class"
             );
-            let mut remainders = HashMap::<UnknownReason, Vec<ValueFlowEventKey>>::default();
+            let mut remainders = HashMap::<UnknownReason, Vec<ValueFlowSourceId>>::default();
             for ((_, atom_sources), verdict) in class_sources.iter().zip(&verdicts) {
                 if let NarrowingVerdict::Incomplete(reason) = verdict {
                     remainders
                         .entry(reason.clone())
                         .or_default()
-                        .extend(atom_sources.iter().cloned());
+                        .extend(atom_sources.iter().copied());
                 }
             }
             let mut remainders = remainders.into_iter().collect::<Vec<_>>();
@@ -1126,7 +1138,7 @@ fn guard_transfers(
                 let mut dropped = Vec::new();
                 for ((_, atom_sources), verdict) in class_sources.iter().zip(&verdicts) {
                     if *verdict == dropped_verdict {
-                        dropped.extend(atom_sources.iter().cloned());
+                        dropped.extend(atom_sources.iter().copied());
                     }
                 }
                 if !dropped.is_empty() {
@@ -1137,7 +1149,7 @@ fn guard_transfers(
                         target: edge.target_point,
                         kind: edge.kind,
                         carrier: carrier.clone(),
-                        sources: dropped,
+                        sources: tables.source_lists.intern(dropped),
                     });
                 }
             }
@@ -1157,7 +1169,7 @@ fn guard_transfers(
                     target: edge.target_point,
                     kind: edge.kind,
                     carrier: carrier.clone(),
-                    sources: unknown_sources.clone(),
+                    sources: tables.source_lists.intern(unknown_sources.clone()),
                 });
             }
             if guard.true_edge.is_some() && !true_arm_sources.is_empty() {
@@ -1241,39 +1253,38 @@ fn guard_transfers(
                         &carrier,
                         procedure.semantics().locator(),
                     );
-                    source_evidence.insert(key.clone(), (atom.clone(), kind));
+                    let id = ValueFlowSourceId::try_from_index(tables.sources.len())
+                        .expect("source ID fits u32");
+                    source_evidence.insert(id, (atom.clone(), kind));
                     // The arm's own source is an ordinary plan source: a
                     // later guard classifies it like any other. The atom also
                     // decides where the source stops: a proven class reaches
                     // the reconvergence, an unknown remainder ends there.
                     let ends_at_join = match &atom {
                         ClassAtom::Class(class) => {
-                            sources_by_class
-                                .entry(class.clone())
-                                .or_default()
-                                .push(key.clone());
+                            sources_by_class.entry(class.clone()).or_default().push(id);
                             None
                         }
                         ClassAtom::Unknown(_) => {
-                            unknown_sources.push(key.clone());
+                            unknown_sources.push(id);
                             join
                         }
                     };
                     tables.sources.push((
                         ValueFlowSourceSpec::new(
-                            key.clone(),
+                            key,
                             point.clone(),
                             ValueFlowObservationPhase::AfterEffects,
                             carrier.clone(),
                             ProofStatus::Proven,
                             EvidenceCompleteness::Complete,
                         )
-                        .when_sources_reach(inputs),
+                        .when_sources_reach(tables.source_lists.intern(inputs)),
                         atom,
                         site,
                     ));
                     if open_bound_class {
-                        tables.mark_open_bound_class_source(key.clone());
+                        tables.mark_open_bound_class_source(id);
                     }
                     // The source requires an undecidable candidate on the
                     // guarded binding. Zero can reach an infeasible arm, but
@@ -1285,7 +1296,7 @@ fn guard_transfers(
                                 target: edge.target_point,
                                 kind: edge.kind,
                                 carrier: carrier.clone(),
-                                sources: vec![key.clone()],
+                                sources: tables.source_lists.intern(vec![id]),
                             });
                         }
                     }
@@ -1307,7 +1318,13 @@ fn guard_transfers(
                         .map(|edge| edge.target_point);
                     if replacement_inputs.is_none() {
                         for target in [false_target, ends_at_join].into_iter().flatten() {
-                            kill_at_predecessors(procedure, &mut kills, target, &carrier, &key);
+                            kill_at_predecessors(
+                                procedure,
+                                &mut kills,
+                                target,
+                                &carrier,
+                                tables.source_lists.intern(vec![id]),
+                            );
                         }
                     }
                     // A replacement contributes its type to later joins just
@@ -1351,13 +1368,14 @@ fn guard_transfers(
                     if adapter.instance_of_verdict(workspace, atom, &constraint.classes)
                         == NarrowingVerdict::Drop
                     {
-                        dropped.extend(atom_sources.iter().cloned());
+                        dropped.extend(atom_sources.iter().copied());
                     }
                 }
                 if dropped.is_empty() {
                     continue;
                 }
                 let carrier = binding_carrier(procedure, binding);
+                let dropped = tables.source_lists.intern(dropped);
                 for (_, edge) in procedure.semantics().successor_edges(normal) {
                     if edge.kind != crate::analyzer::semantic::ControlEdgeKind::Normal {
                         continue;
@@ -1369,7 +1387,7 @@ fn guard_transfers(
                         target: edge.target_point,
                         kind: edge.kind,
                         carrier: carrier.clone(),
-                        sources: dropped.clone(),
+                        sources: dropped,
                     });
                 }
             }
@@ -1431,8 +1449,8 @@ fn push_guard_remainder(
     point: &ProgramPointHandle,
     carrier: &ValueFlowCarrier,
     reason: UnknownReason,
-    inputs: Vec<ValueFlowEventKey>,
-) -> ValueFlowEventKey {
+    inputs: Vec<ValueFlowSourceId>,
+) -> ValueFlowSourceId {
     let site = source_site(
         workspace,
         procedure,
@@ -1449,20 +1467,21 @@ fn push_guard_remainder(
         carrier,
         procedure.semantics().locator(),
     );
+    let id = ValueFlowSourceId::try_from_index(tables.sources.len()).expect("source ID fits u32");
     tables.sources.push((
         ValueFlowSourceSpec::new(
-            key.clone(),
+            key,
             point.clone(),
             ValueFlowObservationPhase::AfterEffects,
             carrier.clone(),
             ProofStatus::Proven,
             EvidenceCompleteness::Complete,
         )
-        .when_sources_reach(inputs),
+        .when_sources_reach(tables.source_lists.intern(inputs)),
         atom,
         site,
     ));
-    key
+    id
 }
 
 /// Stop a guard remainder on every edge that enters `target`.
@@ -1471,7 +1490,7 @@ fn kill_at_predecessors(
     kills: &mut Vec<ValueFlowEdgeKillSpec>,
     target: ProgramPointId,
     carrier: &ValueFlowCarrier,
-    key: &ValueFlowEventKey,
+    sources: ValueFlowSourceListId,
 ) {
     for (_, edge) in procedure.semantics().predecessor_edges(target) {
         kills.push(ValueFlowEdgeKillSpec {
@@ -1481,7 +1500,7 @@ fn kill_at_predecessors(
             target,
             kind: edge.kind,
             carrier: carrier.clone(),
-            sources: vec![key.clone()],
+            sources,
         });
     }
 }
@@ -1510,10 +1529,9 @@ fn binding_carrier(
 /// nested-entry budget deriving `Config.__init__` for a plan it then threw
 /// away, leaving too little for the plan it kept (#3163).
 ///
-/// Reuse is charged once per ledger rather than once per process. A ledger
-/// that has not yet paid for a reused refinement is charged the work the
-/// derivation measured, so an attempt whose staged charge is rolled back
-/// pays again on the attempt that replaces it.
+/// Reuse admits a retained refinement once per ledger, while every replay
+/// imports its measured work. A live holder can cross a root boundary, but
+/// its admission never suppresses the new root's work telemetry.
 #[derive(Debug, Default)]
 pub struct ProcedureRefinements {
     bindings: HashMap<StableDigest, DerivedRefinement<GuardBindings>>,
@@ -1525,11 +1543,80 @@ pub struct ProcedureRefinements {
 #[derive(Debug)]
 struct DerivedRefinement<T> {
     value: T,
-    work: SemanticWork,
+    owner: Arc<()>,
+    work: crate::analyzer::semantic::SemanticBudgetReplay,
+}
+
+/// Census the rows and text that actually leave a refinement derivation.
+/// Scratch admission history cannot describe the cache's retained value.
+trait RefinementCensus {
+    fn census(&self) -> SemanticWork;
+}
+
+impl RefinementCensus for GuardBindings {
+    fn census(&self) -> SemanticWork {
+        GuardBindings::census(self)
+    }
+}
+
+impl RefinementCensus for Vec<FieldLoadRefinement> {
+    fn census(&self) -> SemanticWork {
+        SemanticWork {
+            nested_entries: self.len()
+                + self
+                    .iter()
+                    .map(|load| {
+                        load.alternatives.len()
+                            + load
+                                .alternatives
+                                .iter()
+                                .map(|alternative| alternative.guards.len())
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+            owned_text_bytes: self.iter().map(|load| load.member.len()).sum(),
+            ..SemanticWork::default()
+        }
+    }
+}
+
+impl RefinementCensus for CorrelationAnalysis {
+    fn census(&self) -> SemanticWork {
+        SemanticWork {
+            nested_entries: self.definitions.len()
+                + self.guard_edge_exclusions.len()
+                + self
+                    .guard_edge_exclusions
+                    .iter()
+                    .map(|candidate| {
+                        candidate.all_reaching_data_defs.len()
+                            + candidate.compatible_data_defs.len()
+                            + candidate.incompatible_data_defs.len()
+                            + candidate.unknown_data_defs.len()
+                    })
+                    .sum::<usize>()
+                + self.data_reaching_at_event.len()
+                + self
+                    .data_reaching_at_event
+                    .iter()
+                    .map(|row| row.definitions.len())
+                    .sum::<usize>(),
+            ..SemanticWork::default()
+        }
+    }
+}
+
+impl RefinementCensus for HashSet<(ProgramPointId, ValueId)> {
+    fn census(&self) -> SemanticWork {
+        SemanticWork {
+            nested_entries: self.len(),
+            ..SemanticWork::default()
+        }
+    }
 }
 
 /// Answer one refinement from the cache, deriving it on the first request.
-fn reused_or_derived<T: Clone>(
+fn reused_or_derived<T: Clone + RefinementCensus>(
     cache: &mut HashMap<StableDigest, DerivedRefinement<T>>,
     identity: StableDigest,
     budget: &mut SemanticBudget,
@@ -1542,10 +1629,17 @@ fn reused_or_derived<T: Clone>(
         });
     }
     if let Some(derived) = cache.get(&identity) {
-        if !budget.has_charged_artifact(identity) {
-            budget
-                .charge(derived.work)
-                .map_err(CorrelationError::Budget)?;
+        debug_assert_eq!(derived.work.retained, derived.value.census());
+        let already_held = budget.has_replay_holder(&derived.owner);
+        let mut replay = derived.work;
+        if already_held {
+            replay.retained = SemanticWork::default();
+        }
+        budget
+            .replay_continuation(replay)
+            .map_err(CorrelationError::Budget)?;
+        if !already_held {
+            budget.track_replay_holder(&derived.owner, derived.work.retained);
             budget.record_charged_artifact(identity);
         }
         return Ok(derived.value.clone());
@@ -1556,30 +1650,24 @@ fn reused_or_derived<T: Clone>(
             std::any::type_name::<T>()
         )
     });
-    if budget.has_charged_artifact(identity) {
-        // This accounting scope already paid for this exact derivation under
-        // an earlier root whose cache did not outlive it. Deriving it again
-        // must not charge the scope twice, so it runs against a scratch child
-        // ledger that starts at zero and is discarded.
-        let mut scratch = SemanticBudget::new_child(budget.limits(), &budget.scope_snapshot());
-        let value = derive(&mut scratch)?;
-        cache.insert(
-            identity,
-            DerivedRefinement {
-                value: value.clone(),
-                work: scratch.used(),
-            },
-        );
-        return Ok(value);
-    }
-    let before = budget.used();
-    let value = derive(budget)?;
-    let work = budget.used().saturating_sub(before);
+    let before = budget.replay_snapshot();
+    let value = budget.with_temporary_admissions(derive)?;
+    let census = value.census();
+    budget.admit(census).map_err(CorrelationError::Budget)?;
+    let mut work = budget.replay_since(&before);
+    work.retained = census;
+    let owner = Arc::new(());
+    let bound = budget.bind_replay_holder(&owner, &before);
+    debug_assert_eq!(
+        bound, census,
+        "a refinement holder pays its returned census"
+    );
     budget.record_charged_artifact(identity);
     cache.insert(
         identity,
         DerivedRefinement {
             value: value.clone(),
+            owner,
             work,
         },
     );
@@ -1695,9 +1783,23 @@ impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
         }
     }
 
+    pub(super) fn procedure_reference(
+        &self,
+        reference: &crate::analyzer::semantic::SemanticProcedureReference,
+    ) -> Option<&ProcedureHandle> {
+        self.closure
+            .snapshots
+            .iter()
+            .map(|input| input.value().procedure())
+            .find(|procedure| {
+                procedure.artifact().key() == &reference.key
+                    && procedure.semantics().locator() == &reference.locator
+            })
+    }
+
     pub(super) fn excludes_procedures<'a>(
         &self,
-        procedures: impl IntoIterator<Item = &'a ProcedureHandle>,
+        procedures: impl IntoIterator<Item = &'a crate::analyzer::semantic::SemanticProcedureReference>,
     ) -> bool {
         // A stopped discovery or missing control topology is not a negative
         // answer about omitted work. Incomplete value relations alone do not
@@ -1738,10 +1840,10 @@ impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
                     })
             })
             && !procedures.into_iter().any(|procedure| {
-                self.closure
-                    .snapshots
-                    .iter()
-                    .any(|input| input.value().procedure() == procedure)
+                self.closure.snapshots.iter().any(|input| {
+                    input.value().procedure().artifact().key() == &procedure.key
+                        && input.value().procedure().semantics().locator() == &procedure.locator
+                })
             })
     }
 
@@ -2027,7 +2129,7 @@ impl TypeFlowPlan {
                         });
                     }
                     budget
-                        .charge(SemanticWork {
+                        .admit(SemanticWork {
                             nested_entries: loads.len(),
                             ..SemanticWork::default()
                         })
@@ -2110,6 +2212,7 @@ impl TypeFlowPlan {
             cancellation,
         )?;
         let SeedTables {
+            source_lists,
             sources,
             open_bound_class_sources,
             sinks,
@@ -2117,8 +2220,12 @@ impl TypeFlowPlan {
             container_parameter_ports,
             ..
         } = tables;
-        // The ValueFlowPlan sorts specs by event key and rejects duplicates,
-        // so the atom and site of every spec stay recoverable by key.
+        let open_bound_class_sources = open_bound_class_sources
+            .iter()
+            .map(|id| sources[id.index()].0.key().clone())
+            .collect::<HashSet<_>>();
+        // Source IDs follow insertion order; reporting metadata remains
+        // recoverable through the durable event key.
         let mut source_specs = Vec::with_capacity(sources.len());
         let mut atoms_by_key = HashMap::default();
         for (spec, atom, site) in sources {
@@ -2154,7 +2261,7 @@ impl TypeFlowPlan {
                 })
                 .collect(),
             closure.bindings,
-            source_specs,
+            ValueFlowSources::from_parts(source_specs, source_lists),
             sink_specs,
             edge_kills,
             call_behavior,
@@ -2426,19 +2533,17 @@ impl TypeFlowPlan {
         budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SourceRefinement, TypeFlowPlanError> {
-        budget
-            .charge(SemanticWork {
-                nested_entries: self.value_flow.sources().len(),
-                ..SemanticWork::default()
-            })
-            .map_err(TypeFlowPlanError::RefinementBudget)?;
+        budget.charge_work(SemanticWork {
+            nested_entries: self.value_flow.sources().len(),
+            ..SemanticWork::default()
+        });
         let mut correlated_kills = Vec::new();
         for (procedure, analysis) in &self.correlations {
             if cancellation.is_cancelled() {
                 return Err(TypeFlowPlanError::Cancelled);
             }
             for candidate in &analysis.guard_edge_exclusions {
-                let mut sources = HashMap::<ValueFlowEventKey, bool>::default();
+                let mut sources = HashMap::<ValueFlowSourceId, bool>::default();
                 let mut complete = true;
                 for definition in &candidate.all_reaching_data_defs {
                     let point = procedure
@@ -2477,16 +2582,10 @@ impl TypeFlowPlan {
                             complete = false;
                             break;
                         }
-                        let key = self
-                            .value_flow
-                            .source(source)
-                            .expect("a reaching source is retained")
-                            .key()
-                            .clone();
                         let removable =
                             incompatible && matches!(self.atom(source), ClassAtom::Class(_));
                         sources
-                            .entry(key)
+                            .entry(source)
                             .and_modify(|old| *old &= removable)
                             .or_insert(removable);
                     }
@@ -2499,7 +2598,7 @@ impl TypeFlowPlan {
                 }
                 let sources = sources
                     .into_iter()
-                    .filter_map(|(key, remove)| remove.then_some(key))
+                    .filter_map(|(id, remove)| remove.then_some(id))
                     .collect::<Vec<_>>();
                 if sources.is_empty() {
                     continue;
@@ -2508,15 +2607,15 @@ impl TypeFlowPlan {
                     .semantics()
                     .control_edge(candidate.edge)
                     .expect("a candidate edge is live");
-                correlated_kills.push(ValueFlowEdgeKillSpec {
-                    point: procedure
+                correlated_kills.push((
+                    procedure
                         .point_handle(edge.source_point)
                         .expect("a guard point is live"),
-                    target: edge.target_point,
-                    kind: edge.kind,
-                    carrier: binding_carrier(procedure, candidate.data_binding),
+                    edge.target_point,
+                    edge.kind,
+                    binding_carrier(procedure, candidate.data_binding),
                     sources,
-                });
+                ));
             }
         }
         let mut class_closed_loads = HashSet::default();
@@ -2591,7 +2690,9 @@ impl TypeFlowPlan {
                     self.source_site(id).clone(),
                 ));
                 if self.open_bound_class_origins[id.index()] {
-                    tables.mark_open_bound_class_source(spec.key().clone());
+                    let id = ValueFlowSourceId::try_from_index(tables.sources.len() - 1)
+                        .expect("source ID fits u32");
+                    tables.mark_open_bound_class_source(id);
                 }
             }
         }
@@ -2787,7 +2888,7 @@ impl TypeFlowPlan {
                                 && let Some(slot) = field_slots.slot(&class, &field.member)
                             {
                                 budget
-                                    .charge(SemanticWork {
+                                    .admit(SemanticWork {
                                         nested_entries: slot.atoms.len(),
                                         ..SemanticWork::default()
                                     })
@@ -2915,7 +3016,7 @@ impl TypeFlowPlan {
         let mut atoms_by_key = HashMap::default();
         let mut sources = Vec::new();
         budget
-            .charge(SemanticWork {
+            .admit(SemanticWork {
                 nested_entries: tables.sources.len(),
                 ..SemanticWork::default()
             })
@@ -2940,27 +3041,62 @@ impl TypeFlowPlan {
         let replacement = tables
             .sources
             .iter()
-            .map(|(spec, atom, site)| {
+            .enumerate()
+            .map(|(index, (spec, atom, site))| {
                 (
                     spec.point(),
                     spec.phase(),
                     spec.carrier(),
                     atom,
                     site,
-                    tables.open_bound_class_sources.contains(spec.key()),
+                    tables.open_bound_class_sources.contains(
+                        &ValueFlowSourceId::try_from_index(index).expect("source ID fits u32"),
+                    ),
                 )
             })
             .collect::<HashSet<_>>();
         let sources_changed = previous != replacement;
-        let open_bound_class_sources = tables.open_bound_class_sources;
+        let open_bound_class_sources = tables
+            .open_bound_class_sources
+            .iter()
+            .map(|id| tables.sources[id.index()].0.key().clone())
+            .collect::<HashSet<_>>();
         for (spec, atom, site) in tables.sources {
             atoms_by_key.insert(spec.key().clone(), (atom, site));
             sources.push(spec);
         }
-        for mut kill in correlated_kills {
-            kill.sources.retain(|key| atoms_by_key.contains_key(key));
-            if !kill.sources.is_empty() {
-                kills.push(kill);
+        let mut sources = ValueFlowSources::from_parts(sources, tables.source_lists);
+        let ids_by_key = sources
+            .specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                (
+                    spec.key(),
+                    ValueFlowSourceId::try_from_index(index).expect("source ID fits u32"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let old_to_new = self
+            .value_flow
+            .sources()
+            .map(|(_, source)| ids_by_key.get(source.key()).copied())
+            .collect::<Vec<_>>();
+        drop(ids_by_key);
+        for (point, target, kind, carrier, old_ids) in correlated_kills {
+            let ids = old_ids
+                .into_iter()
+                .filter_map(|id| old_to_new[id.index()])
+                .collect::<Vec<_>>();
+            if !ids.is_empty() {
+                let list = sources.intern_list(ids);
+                kills.push(ValueFlowEdgeKillSpec {
+                    point,
+                    target,
+                    kind,
+                    carrier,
+                    sources: list,
+                });
             }
         }
         let value_flow = self.value_flow.with_replaced_sources_and_edge_kills(
@@ -2980,14 +3116,20 @@ impl TypeFlowPlan {
             sites.push(site);
             open_bound_class_origins.push(open_bound_class_sources.contains(spec.key()));
         }
-        if value_flow == self.value_flow
-            && atoms == self.atoms
-            && sites == self.source_sites
-            && open_bound_class_origins == self.open_bound_class_origins
+        if value_flow.has_same_inputs(&self.value_flow)
+            && value_flow.sources().all(|(id, spec)| {
+                let previous = self
+                    .value_flow
+                    .source_id_for_key(spec.key())
+                    .expect("equal plan inputs retain every source key");
+                atoms[id.index()] == self.atoms[previous.index()]
+                    && sites[id.index()] == self.source_sites[previous.index()]
+                    && open_bound_class_origins[id.index()]
+                        == self.open_bound_class_origins[previous.index()]
+            })
         {
-            // The rebuild reproduced the plan. Installing it would replace
-            // each part with its own equal, and the caller's evidence solve
-            // remains a solve of exactly this plan.
+            // Keep the original source coordinates with the preliminary facts.
+            // A rebuilt table may assign different IDs to identical inputs.
             return Ok(SourceRefinement::Unchanged);
         }
         self.value_flow = value_flow;
@@ -4077,6 +4219,15 @@ mod tests {
     use crate::analyzer::semantic::{SemanticWork, StableDigest};
     use brokk_bifrost_test_macros::hardwon;
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TestRefinement(usize);
+
+    impl RefinementCensus for TestRefinement {
+        fn census(&self) -> SemanticWork {
+            nested(self.0)
+        }
+    }
+
     fn test_read(label: &[u8]) -> ReadKey {
         ReadKey::Models(StableDigest::sha256(label))
     }
@@ -4090,12 +4241,12 @@ mod tests {
 
     /// One root solve builds its plan several times. Every build after the
     /// first must reuse the refinement the first build derived, and must not
-    /// charge the ledger for it again (#3163).
+    /// admit another retained copy (#3163).
     #[test]
     #[hardwon(
-        "#2295+#3124+#3129+#3163+#3165+3e81228fb0ab: repeated root-plan construction duplicated procedure refinements, so repeated lookups must charge one derivation."
+        "#2295+#3124+#3129+#3163+#3165+3e81228fb0ab: repeated root-plan construction duplicated procedure refinements, so repeated lookups must retain one derivation."
     )]
-    fn repeated_refinement_lookups_charge_one_derivation() {
+    fn repeated_refinement_lookups_hold_one_derivation() {
         let identity = StableDigest::sha256(b"one-refinement");
         let mut cache = HashMap::default();
         let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
@@ -4106,28 +4257,30 @@ mod tests {
                 reused_or_derived(&mut cache, identity, &mut budget, &cancellation, |budget| {
                     derivations += 1;
                     budget
-                        .charge(nested(400))
+                        .admit(nested(400))
                         .map_err(CorrelationError::Budget)?;
-                    Ok(7_u32)
+                    Ok(TestRefinement(400))
                 })
                 .expect("the refinement derives and then reuses");
-            assert_eq!(value, 7);
+            assert_eq!(value, TestRefinement(400));
         }
         assert_eq!(derivations, 1, "one ledger derives the refinement once");
         assert_eq!(
-            budget.used().nested_entries,
+            budget.resident().nested_entries,
             400,
-            "five lookups charge one derivation, not five"
+            "five lookups hold one derivation, not five"
         );
+        assert_eq!(budget.used().nested_entries, 4_000);
     }
 
     /// The near miss: this ledger holds one derivation of this size and no
-    /// more, so charging the same refinement a second time would exhaust it.
+    /// more. Keep both caches alive so the second entry must coexist with the first.
     #[test]
     #[hardwon("#3163: separate refinement identities must each debit the shared request budget")]
     fn one_ledger_holds_only_one_derivation_of_this_size() {
         let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
         let cancellation = CancellationToken::default();
+        let mut held_caches = Vec::new();
         for (round, label) in [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
             .enumerate()
@@ -4140,22 +4293,24 @@ mod tests {
                 &cancellation,
                 |budget| {
                     budget
-                        .charge(nested(600))
+                        .admit(nested(600))
                         .map_err(CorrelationError::Budget)?;
-                    Ok(7_u32)
+                    Ok(TestRefinement(600))
                 },
             );
             assert_eq!(
                 outcome.is_ok(),
                 round == 0,
-                "a second derivation of this size does not fit"
+                "two retained derivations do not fit"
             );
+            held_caches.push(cache);
         }
     }
 
     /// A later root has its own child ledger. It reuses the request cache
     /// without deriving again, while still paying the measured semantic work.
     #[test]
+    #[hardwon("#5113: a live refinement holder skipped traversal work in a fresh root")]
     fn a_later_root_ledger_reuses_and_pays_for_the_refinement() {
         let identity = StableDigest::sha256(b"one-refinement");
         let mut cache = HashMap::default();
@@ -4163,28 +4318,45 @@ mod tests {
         let cancellation = CancellationToken::default();
         reused_or_derived(&mut cache, identity, &mut first, &cancellation, |budget| {
             budget
-                .charge(nested(400))
+                .admit(nested(400))
                 .map_err(CorrelationError::Budget)?;
-            Ok(7_u32)
+            budget.charge_work(SemanticWork {
+                events: 300,
+                ..SemanticWork::default()
+            });
+            Ok(TestRefinement(400))
         })
         .expect("the first ledger derives the refinement");
 
-        let mut fresh = SemanticBudget::uniform(1_000).expect("a finite budget");
+        let mut fresh = SemanticBudget::new_root_child(&first);
         let mut derivations = 0_usize;
         reused_or_derived(&mut cache, identity, &mut fresh, &cancellation, |budget| {
             derivations += 1;
             budget
-                .charge(nested(400))
+                .admit(nested(400))
                 .map_err(CorrelationError::Budget)?;
-            Ok(7_u32)
+            Ok(TestRefinement(400))
         })
         .expect("the fresh ledger reuses the refinement");
         assert_eq!(derivations, 0, "the cached value is reused, not rederived");
+        assert_eq!(fresh.resident().nested_entries, 400);
+        assert_eq!(fresh.root_work_peak().events, 300);
         assert_eq!(
             fresh.used().nested_entries,
-            400,
+            800,
             "the later root ledger is charged the measured work"
         );
+        fresh.charge_work(SemanticWork {
+            events: 500,
+            ..SemanticWork::default()
+        });
+        let replayed = reused_or_derived(&mut cache, identity, &mut fresh, &cancellation, |_| {
+            panic!("the cached refinement must not be rederived")
+        });
+        assert_eq!(replayed.unwrap(), TestRefinement(400));
+        assert_eq!(fresh.root_work_peak().events, 1_100);
+        assert_eq!(fresh.resident().nested_entries, 400);
+        assert!(fresh.first_refusal().is_none());
     }
 
     #[test]

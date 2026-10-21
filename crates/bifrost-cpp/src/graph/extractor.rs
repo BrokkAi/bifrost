@@ -8815,43 +8815,17 @@ fn recovered_receiver_alias_target(
     if !global
         && components.len() == 2
         && cpp_active_template_type_parameter(type_node, &components[0], ctx.source, &ctx.ancestry)
+        && dependent_nested_alias_concrete_target(
+            &ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            alias,
+            &components[1],
+            type_node,
+        )
+        .is_some_and(|unit| same_visible_symbol(&unit, &target))
     {
-        let alias_provider = ctx.analyzer.type_alias_provider()?;
-        let concrete = ctx
-            .visibility
-            .visible_identifier_candidates(ctx.file, &components[1])
-            .filter(|candidate| {
-                alias_provider.is_type_alias(candidate)
-                    && !same_visible_symbol(candidate, alias)
-                    && type_owner_of(&ctx.analyzer, candidate).is_some_and(|owner| owner.is_class())
-                    && ctx.visibility.is_physically_visible(ctx.file, candidate)
-                    && ctx
-                        .visibility
-                        .external_type_candidate_guard_compatible_in_context(
-                            &ctx.analyzer,
-                            ctx.file,
-                            candidate,
-                            type_node,
-                        )
-            })
-            .filter_map(|candidate| {
-                let canonical = ctx.visibility.canonical_visible_full_type_unit(
-                    &ctx.analyzer,
-                    ctx.file,
-                    candidate,
-                )?;
-                // Another dependent alias can have the same nested name but
-                // still canonicalize only to itself. It supplies no concrete
-                // receiver identity and therefore cannot compete with an
-                // alias that reaches an indexed class.
-                (!same_visible_symbol(&canonical, candidate)).then_some(canonical)
-            })
-            .collect::<Vec<_>>();
-        if let [unit] = unanimous_receiver_units(concrete).as_slice()
-            && same_visible_symbol(unit, &target)
-        {
-            return Some(target);
-        }
+        return Some(target);
     }
     let scope = ctx
         .recovered_sentinel_scope(type_node)
@@ -8864,6 +8838,48 @@ fn recovered_receiver_alias_target(
         type_node,
     );
     (path_matches && visible).then_some(target)
+}
+
+/// The one concrete class that `alias`, spelled `Param::nested_name` through an
+/// active template type parameter `Param`, can name: every other visible
+/// class-owned alias named `nested_name` must reach the same indexed class
+/// (#2250). `type_node` is the alias's target type node, whose guard context
+/// each candidate must be compatible with. Competing concrete targets answer
+/// `None`.
+pub fn dependent_nested_alias_concrete_target(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    alias: &CodeUnit,
+    nested_name: &str,
+    type_node: Node<'_>,
+) -> Option<CodeUnit> {
+    let alias_provider = analyzer.type_alias_provider()?;
+    let concrete = visibility
+        .visible_identifier_candidates(file, nested_name)
+        .filter(|candidate| {
+            alias_provider.is_type_alias(candidate)
+                && !same_visible_symbol(candidate, alias)
+                && type_owner_of(analyzer, candidate).is_some_and(|owner| owner.is_class())
+                && visibility.is_physically_visible(file, candidate)
+                && visibility.external_type_candidate_guard_compatible_in_context(
+                    analyzer, file, candidate, type_node,
+                )
+        })
+        .filter_map(|candidate| {
+            let canonical =
+                visibility.canonical_visible_full_type_unit(analyzer, file, candidate)?;
+            // Another dependent alias can have the same nested name but
+            // still canonicalize only to itself. It supplies no concrete
+            // receiver identity and therefore cannot compete with an
+            // alias that reaches an indexed class.
+            (!same_visible_symbol(&canonical, candidate)).then_some(canonical)
+        })
+        .collect::<Vec<_>>();
+    match unanimous_receiver_units(concrete).as_slice() {
+        [unit] => Some(unit.clone()),
+        _ => None,
+    }
 }
 
 fn receiver_type_name_unit(node: Node<'_>, type_name: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {

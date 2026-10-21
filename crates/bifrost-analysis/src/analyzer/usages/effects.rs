@@ -34,27 +34,46 @@
 //! quality, and pack declarations.
 
 use std::collections::BTreeMap;
+
 use std::sync::Arc;
 
 use crate::analyzer::common::language_for_file;
+
 use crate::analyzer::i_analyzer::IAnalyzer;
-use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmRequest, DenseUsizeGraph, strongly_connected_components,
-};
-use crate::analyzer::semantic::{ExecutionTiming, LengthDelimitedDigest};
-use crate::analyzer::semantic_model::{
-    CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
-};
-use crate::analyzer::usages::call_relations::{
-    CallDispatchBoundaryKind, CallRelationLimits, CallRelationService,
-};
+
+use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmBudget;
+use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmRequest;
+use crate::analyzer::semantic::cfg_algorithms::DenseUsizeGraph;
+use crate::analyzer::semantic::cfg_algorithms::strongly_connected_components;
+
+use crate::analyzer::semantic::ExecutionTiming;
+use crate::analyzer::semantic::LengthDelimitedDigest;
+
+use crate::analyzer::semantic_model::CompiledDeclaredEffect;
+use crate::analyzer::semantic_model::CompiledDeclaredEffectCertainty;
+use crate::analyzer::semantic_model::CompiledDeclaredEffectTiming;
+
+use crate::analyzer::usages::call_relations::CallDispatchBoundaryKind;
+use crate::analyzer::usages::call_relations::CallRelationLimits;
+use crate::analyzer::usages::call_relations::CallRelationService;
+
 use crate::analyzer::usages::call_shape::CallShapeReport;
-use crate::analyzer::usages::callable_signature::{
-    agreed_callable_identity, callable_signature_reports,
-};
-use crate::analyzer::usages::get_definition::{CallApplicationKind, DefinitionLookupStatus};
-use crate::analyzer::{AnalyzerQueryScope, CodeUnit, Language, ProjectFile, QueryScope, Range};
+
+use crate::analyzer::usages::callable_signature::agreed_callable_identity;
+use crate::analyzer::usages::callable_signature::callable_signature_reports;
+
+use crate::analyzer::usages::get_definition::CallApplicationKind;
+use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
+
+use crate::analyzer::AnalyzerQueryScope;
+use crate::analyzer::CodeUnit;
+use crate::analyzer::Language;
+use crate::analyzer::ProjectFile;
+use crate::analyzer::QueryScope;
+use crate::analyzer::Range;
+
 use crate::cancellation::CancellationToken;
+
 use brokk_bifrost_core::analyzer::structural::callable::ReceiverContract;
 
 /// Domain separator for one direct call-effect row id.
@@ -533,7 +552,8 @@ pub fn native_call_targets_for_shapes(
         .collect()
 }
 
-fn project_modeled_call_target_lookup(
+#[doc(hidden)]
+pub fn project_modeled_call_target_lookup(
     analyzer: &dyn IAnalyzer,
     shape: &CallShapeReport,
     external_shape_supported: bool,
@@ -1789,20 +1809,14 @@ pub fn modeled_procedure_key_for_unit(
 
 #[cfg(test)]
 mod tests {
+    use super::rust_tests_test_support::*;
+
     use super::*;
-    use crate::analyzer::usages::call_relations::{CallDispatchBoundaryKind, CallDispatchLookup};
 
-    use crate::analyzer::usages::call_shape::call_shape_for_call;
-    use crate::analyzer::usages::get_definition::ExactExternalCallProof;
+    use crate::analyzer::usages::effects::go_extraction_support_5::arm;
 
-    use crate::analyzer::{Language, ProjectFile};
-    use crate::test_support::AnalyzerFixture;
+    #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
-    use std::env;
-
-    fn file() -> ProjectFile {
-        ProjectFile::new(env::temp_dir().join("bifrost-effects"), "App.java")
-    }
 
     fn range() -> Range {
         Range {
@@ -1834,130 +1848,6 @@ mod tests {
             model_id: "acme.effects/1.0.0".to_owned(),
             summary_id: "summary.send".to_owned(),
         }
-    }
-
-    fn arm(target: &str, proof: EffectProof, lookup: ArmLookup) -> CallEffectArm {
-        CallEffectArm {
-            target_id: target.to_owned(),
-            callee_declaration_id: Some(format!("decl:{target}")),
-            key: Some(ModeledProcedureKey {
-                language: "java".to_owned(),
-                owner: "com.acme.AcmeHttpClient".to_owned(),
-                member: "send".to_owned(),
-                has_receiver: true,
-                parameter_count: 1,
-            }),
-            proof,
-            complete: proof == EffectProof::Proven,
-            execution_timing: ExecutionTiming::SameEvaluation,
-            lookup,
-        }
-    }
-
-    fn go_shape(
-        fixture: &AnalyzerFixture,
-        source: &str,
-        call: &str,
-    ) -> (CallShapeReport, Arc<str>) {
-        let file = ProjectFile::new(fixture.project_root(), "main.go");
-        let facts = fixture
-            .analyzer
-            .analyzer()
-            .structural_fact_providers()
-            .into_iter()
-            .find_map(|provider| provider.structural_facts(&file))
-            .expect("Go structural facts");
-        let call_id = crate::analyzer::usages::test_support::call_node_id(source, &facts, call);
-        (
-            call_shape_for_call(&facts, &file, call_id).expect("exact call shape"),
-            Arc::from(source),
-        )
-    }
-
-    fn rust_shape(fixture: &AnalyzerFixture, source: &str, call: &str) -> CallShapeReport {
-        let file = ProjectFile::new(fixture.project_root(), "main.rs");
-        let facts = fixture
-            .analyzer
-            .analyzer()
-            .structural_fact_providers()
-            .into_iter()
-            .find_map(|provider| provider.structural_facts(&file))
-            .expect("Rust structural facts");
-        let call_id = crate::analyzer::usages::test_support::call_node_id(source, &facts, call);
-        call_shape_for_call(&facts, &file, call_id).expect("exact Rust call shape")
-    }
-
-    fn modeled_lookup(
-        fixture: &AnalyzerFixture,
-        shape: &CallShapeReport,
-        source: Arc<str>,
-        limits: CallRelationLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ModeledCallTargetLookup {
-        modeled_call_targets_for_shape(
-            fixture.analyzer.analyzer(),
-            shape,
-            source,
-            limits,
-            cancellation,
-        )
-    }
-
-    #[test]
-    #[hardwon(
-        "aa501216592e: Real Go fixtures ensure external typed receiver calls stay targetless and preserve bound-receiver classification, including a call-expression receiver"
-    )]
-    fn external_typed_go_receiver_is_adjudicated_without_minting_a_target() {
-        let source = r#"package main
-import "embed"
-var embedded embed.FS
-func factory() embed.FS { return embedded }
-func caller() {
-    _, _ = embedded.Open("book.xlsx")
-    _, _ = factory().Open("book.xlsx")
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let (shape, text) = go_shape(&fixture, source, "embedded.Open(\"book.xlsx\")");
-        let lookup = modeled_lookup(
-            &fixture,
-            &shape,
-            text,
-            CallRelationLimits {
-                max_files: 1,
-                max_source_bytes: usize::MAX,
-                max_candidates: 100,
-            },
-            None,
-        );
-        assert!(lookup.arms.is_empty(), "{lookup:#?}");
-        assert_eq!(lookup.coverage, ModeledCallTargetCoverage::Open);
-        assert_eq!(
-            lookup.call_application,
-            ModeledCallApplication::BoundReceiver,
-            "{lookup:#?}"
-        );
-
-        let (structured_shape, structured_text) =
-            go_shape(&fixture, source, "factory().Open(\"book.xlsx\")");
-        let structured = modeled_lookup(
-            &fixture,
-            &structured_shape,
-            structured_text,
-            CallRelationLimits {
-                max_files: 1,
-                max_source_bytes: usize::MAX,
-                max_candidates: 100,
-            },
-            None,
-        );
-        assert!(structured.arms.is_empty(), "{structured:#?}");
-        assert_eq!(structured.coverage, ModeledCallTargetCoverage::Open);
-        assert_eq!(
-            structured.call_application,
-            ModeledCallApplication::BoundReceiver,
-            "the structured call-expression base is a value: {structured:#?}"
-        );
     }
 
     #[test]
@@ -2478,591 +2368,6 @@ func caller() {
     }
 
     #[test]
-    fn lightweight_modeled_targets_preserve_go_aliases_and_typed_gaps() {
-        let alias_source = r#"package main
-import files "os"
-func caller() { _, _ = files.Open("book.xlsx") }
-"#;
-        let alias_fixture =
-            AnalyzerFixture::new_for_language(Language::Go, &[("main.go", alias_source)]);
-        let (alias_shape, alias_text) =
-            go_shape(&alias_fixture, alias_source, "files.Open(\"book.xlsx\")");
-        let limits = CallRelationLimits {
-            max_files: 1,
-            max_source_bytes: usize::MAX,
-            max_candidates: 100,
-        };
-        let alias = modeled_lookup(&alias_fixture, &alias_shape, alias_text, limits, None);
-        // The import binder proves package-function application, not that the
-        // external package publishes one callable of this exact shape. This
-        // fixture activates no declaration overlay, so target coverage stays
-        // open even though the canonical alias classification is retained.
-        assert_eq!(alias.coverage, ModeledCallTargetCoverage::Open);
-        assert!(alias.arms.is_empty(), "{alias:#?}");
-        assert_eq!(
-            alias.call_application,
-            ModeledCallApplication::PackageFunction
-        );
-
-        let dot_source = r#"package main
-import . "os"
-func caller() { _, _ = Open("book.xlsx") }
-"#;
-        let dot_fixture =
-            AnalyzerFixture::new_for_language(Language::Go, &[("main.go", dot_source)]);
-        let (dot_shape, dot_text) = go_shape(&dot_fixture, dot_source, "Open(\"book.xlsx\")");
-        let dot = modeled_lookup(&dot_fixture, &dot_shape, dot_text, limits, None);
-        assert_eq!(dot.coverage, ModeledCallTargetCoverage::Open, "{dot:#?}");
-        assert_eq!(
-            dot.call_application,
-            ModeledCallApplication::PackageFunction,
-            "{dot:#?}"
-        );
-        assert!(dot.arms.is_empty(), "{dot:#?}");
-
-        let shadowed_predeclared_source = r#"package main
-import . "os"
-func len(values []int) (int, error) { return 0, nil }
-func caller(values []int) {
-    _, _ = Open("book.xlsx")
-    _, _ = len(values)
-}
-"#;
-        let shadowed_predeclared_fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("main.go", shadowed_predeclared_source)],
-        );
-        let (shadowed_predeclared_shape, shadowed_predeclared_text) = go_shape(
-            &shadowed_predeclared_fixture,
-            shadowed_predeclared_source,
-            "len(values)",
-        );
-        let shadowed_predeclared = modeled_lookup(
-            &shadowed_predeclared_fixture,
-            &shadowed_predeclared_shape,
-            shadowed_predeclared_text,
-            limits,
-            None,
-        );
-        assert!(
-            shadowed_predeclared
-                .arms
-                .iter()
-                .all(|arm| arm.key.owner != "os"),
-            "{shadowed_predeclared:#?}"
-        );
-        assert!(
-            !shadowed_predeclared.arms.is_empty(),
-            "the shadowing package declaration must resolve to a target: {shadowed_predeclared:#?}"
-        );
-
-        let local_source = r#"package main
-import os "os"
-type opener struct{}
-func (opener) Open(string) (int, error) { return 0, nil }
-func caller(os opener) { _, _ = os.Open("book.xlsx") }
-"#;
-        let local_fixture =
-            AnalyzerFixture::new_for_language(Language::Go, &[("main.go", local_source)]);
-        let (local_shape, local_text) =
-            go_shape(&local_fixture, local_source, "os.Open(\"book.xlsx\")");
-        // The parameter binding shadows the package import, so the receiver is
-        // the workspace `opener` value and the call binds that type's own
-        // method. Since #3455 recorded Go callable modifiers the method has a
-        // receiver contract and therefore a canonical key, so it resolves to a
-        // workspace arm rather than staying an unkeyable residual. What must
-        // not happen is the call borrowing `os.Open`'s identity.
-        let local = modeled_lookup(&local_fixture, &local_shape, local_text, limits, None);
-        assert_eq!(local.coverage, ModeledCallTargetCoverage::Exhaustive);
-        let [local_arm] = local.arms.as_slice() else {
-            panic!("one workspace arm for the local method: {local:#?}");
-        };
-        assert_eq!(local_arm.origin, ModeledCallTargetOrigin::WorkspaceBody);
-        assert_ne!(local_arm.key.owner, "os");
-        assert_eq!(local_arm.key.member, "Open");
-        assert!(local_arm.key.has_receiver);
-        assert_eq!(
-            local.call_application,
-            ModeledCallApplication::BoundReceiver,
-            "the parameter binding shadows the package import: {local:#?}"
-        );
-
-        let local_callable_source = r#"package main
-func caller(Open func(string) (int, error)) { _, _ = Open("book.xlsx") }
-"#;
-        let local_callable_fixture =
-            AnalyzerFixture::new_for_language(Language::Go, &[("main.go", local_callable_source)]);
-        let (local_callable_shape, local_callable_text) = go_shape(
-            &local_callable_fixture,
-            local_callable_source,
-            "Open(\"book.xlsx\")",
-        );
-        let local_callable = modeled_lookup(
-            &local_callable_fixture,
-            &local_callable_shape,
-            local_callable_text,
-            limits,
-            None,
-        );
-        assert!(local_callable.arms.is_empty(), "{local_callable:#?}");
-        assert_eq!(
-            local_callable.coverage,
-            ModeledCallTargetCoverage::Unmodeled
-        );
-
-        let unresolved_source = r#"package main
-func caller() { _, _ = missing.Open("book.xlsx") }
-"#;
-        let unresolved_fixture =
-            AnalyzerFixture::new_for_language(Language::Go, &[("main.go", unresolved_source)]);
-        let (unresolved_shape, unresolved_text) = go_shape(
-            &unresolved_fixture,
-            unresolved_source,
-            "missing.Open(\"book.xlsx\")",
-        );
-        let unresolved = modeled_lookup(
-            &unresolved_fixture,
-            &unresolved_shape,
-            unresolved_text,
-            limits,
-            None,
-        );
-        assert!(unresolved.arms.is_empty(), "{unresolved:#?}");
-        assert_eq!(unresolved.coverage, ModeledCallTargetCoverage::Open);
-        assert_eq!(unresolved.call_application, ModeledCallApplication::Unknown);
-
-        let modeled_with_residual = project_modeled_call_target_lookup(
-            alias_fixture.analyzer.analyzer(),
-            &alias_shape,
-            true,
-            CallDispatchLookup {
-                status: Some(DefinitionLookupStatus::Ambiguous),
-                call_application: CallApplicationKind::PackageFunction,
-                exact_external_call: Some(ExactExternalCallProof::go_package_function(
-                    "os.Open", 1,
-                )),
-                boundaries: vec![
-                    CallDispatchBoundaryKind::External {
-                        callee_text: Some("os.Open".into()),
-                        normalized_static_owner: None,
-                        external_callee_identity: None,
-                    },
-                    CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NoDefinition),
-                ],
-                ..CallDispatchLookup::default()
-            },
-        );
-        assert_eq!(
-            modeled_with_residual.arms,
-            vec![ModeledCallTargetArm {
-                key: ModeledProcedureKey {
-                    language: "go".to_owned(),
-                    owner: "os".to_owned(),
-                    member: "Open".to_owned(),
-                    has_receiver: false,
-                    parameter_count: 1,
-                },
-                origin: ModeledCallTargetOrigin::UnmaterializedExternal,
-            }]
-        );
-        assert_eq!(
-            modeled_with_residual.coverage,
-            ModeledCallTargetCoverage::Open
-        );
-
-        let cancelled = CancellationToken::default();
-        cancelled.cancel();
-        let interrupted = modeled_lookup(
-            &alias_fixture,
-            &alias_shape,
-            Arc::from(alias_source),
-            limits,
-            Some(&cancelled),
-        );
-        assert!(interrupted.arms.is_empty());
-        assert_eq!(interrupted.coverage, ModeledCallTargetCoverage::Cancelled);
-
-        let budgeted = modeled_lookup(
-            &alias_fixture,
-            &alias_shape,
-            Arc::from(alias_source),
-            CallRelationLimits {
-                max_source_bytes: 1,
-                ..limits
-            },
-            None,
-        );
-        assert!(budgeted.arms.is_empty());
-        assert_eq!(budgeted.coverage, ModeledCallTargetCoverage::Truncated);
-
-        let spread_source = r#"package main
-import "fmt"
-func caller(values []any) { fmt.Println(values...) }
-"#;
-        let spread_fixture =
-            AnalyzerFixture::new_for_language(Language::Go, &[("main.go", spread_source)]);
-        let (spread_shape, spread_text) =
-            go_shape(&spread_fixture, spread_source, "fmt.Println(values...)");
-        let spread = modeled_lookup(&spread_fixture, &spread_shape, spread_text, limits, None);
-        assert!(spread.arms.is_empty(), "{spread:#?}\n{spread_shape:#?}");
-        assert_eq!(spread.coverage, ModeledCallTargetCoverage::Unsupported);
-    }
-
-    #[test]
-    fn exact_concrete_go_receiver_boundary_mints_only_a_receiver_arm() {
-        let source = r#"package main
-import "testing"
-func caller(t *testing.T) { t.Fatal("stop") }
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let (shape, _) = go_shape(&fixture, source, "t.Fatal(\"stop\")");
-        let dispatch = CallDispatchLookup {
-            status: Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-            call_application: CallApplicationKind::BoundReceiver,
-            dispatch_extensibility: Some(crate::analyzer::DispatchExtensibility::Closed),
-            exact_external_call: Some(ExactExternalCallProof::go_concrete_receiver(
-                "testing.T.Fatal",
-                1,
-            )),
-            boundaries: vec![CallDispatchBoundaryKind::External {
-                callee_text: Some("testing.T.Fatal".into()),
-                normalized_static_owner: None,
-                external_callee_identity: None,
-            }],
-            ..CallDispatchLookup::default()
-        };
-
-        let exact = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &shape,
-            true,
-            dispatch.clone(),
-        );
-        assert_eq!(exact.coverage, ModeledCallTargetCoverage::Exhaustive);
-        assert_eq!(
-            exact.arms,
-            vec![ModeledCallTargetArm {
-                key: ModeledProcedureKey {
-                    language: "go".to_owned(),
-                    owner: "testing.T".to_owned(),
-                    member: "Fatal".to_owned(),
-                    has_receiver: true,
-                    parameter_count: 1,
-                },
-                origin: ModeledCallTargetOrigin::UnmaterializedExternal,
-            }]
-        );
-        assert_eq!(
-            exact.call_application,
-            ModeledCallApplication::BoundReceiver
-        );
-
-        let uncertain = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &shape,
-            true,
-            CallDispatchLookup {
-                call_application: CallApplicationKind::ReceiverBindingUnknown,
-                exact_external_call: None,
-                ..dispatch.clone()
-            },
-        );
-        assert!(uncertain.arms.is_empty(), "{uncertain:#?}");
-        assert_eq!(uncertain.coverage, ModeledCallTargetCoverage::Open);
-
-        for dispatch_extensibility in [None, Some(crate::analyzer::DispatchExtensibility::Open)] {
-            let open = project_modeled_call_target_lookup(
-                fixture.analyzer.analyzer(),
-                &shape,
-                true,
-                CallDispatchLookup {
-                    dispatch_extensibility,
-                    exact_external_call: None,
-                    ..dispatch.clone()
-                },
-            );
-            assert!(open.arms.is_empty(), "{open:#?}");
-            assert_eq!(open.coverage, ModeledCallTargetCoverage::Open);
-        }
-
-        let spread = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &shape,
-            false,
-            dispatch,
-        );
-        assert!(spread.arms.is_empty(), "{spread:#?}");
-        assert_eq!(spread.coverage, ModeledCallTargetCoverage::Open);
-    }
-
-    #[test]
-    fn exact_rust_static_and_bound_calls_keep_distinct_modeled_keys() {
-        let source = r#"use std::process::Command;
-fn caller(command: Command) {
-    Command::new("true");
-    command.new("true");
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("main.rs", source)]);
-        let static_shape = rust_shape(&fixture, source, "Command::new(\"true\")");
-        let receiver_shape = rust_shape(&fixture, source, "command.new(\"true\")");
-        let identity = || {
-            crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
-                Language::Rust,
-                "std.process.Command",
-                "new",
-            )
-        };
-        let static_dispatch = CallDispatchLookup {
-            status: Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-            call_application: CallApplicationKind::PackageFunction,
-            exact_external_call: Some(ExactExternalCallProof::rust_external_call(
-                "std::process::Command::new",
-                1,
-            )),
-            boundaries: vec![CallDispatchBoundaryKind::External {
-                callee_text: Some("std::process::Command::new".into()),
-                normalized_static_owner: None,
-                external_callee_identity: Some(identity()),
-            }],
-            ..CallDispatchLookup::default()
-        };
-        let static_target = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &static_shape,
-            true,
-            static_dispatch,
-        );
-        assert_eq!(
-            static_target.coverage,
-            ModeledCallTargetCoverage::Exhaustive
-        );
-        assert_eq!(static_target.arms.len(), 1, "{static_target:#?}");
-        assert_eq!(
-            &static_target.arms[0].key,
-            &ModeledProcedureKey {
-                language: "rust".to_owned(),
-                owner: "std.process.Command".to_owned(),
-                member: "new".to_owned(),
-                has_receiver: false,
-                parameter_count: 1,
-            }
-        );
-
-        let receiver_dispatch = CallDispatchLookup {
-            status: Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-            call_application: CallApplicationKind::BoundReceiver,
-            dispatch_extensibility: Some(crate::analyzer::DispatchExtensibility::Closed),
-            exact_external_call: Some(ExactExternalCallProof::rust_bound_external_member(
-                "std.process.Command",
-                "new",
-                1,
-            )),
-            boundaries: vec![CallDispatchBoundaryKind::External {
-                callee_text: Some("std::process::Command::new".into()),
-                normalized_static_owner: None,
-                external_callee_identity: Some(identity()),
-            }],
-            ..CallDispatchLookup::default()
-        };
-        let receiver_target = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &receiver_shape,
-            true,
-            receiver_dispatch.clone(),
-        );
-        assert_eq!(
-            receiver_target.coverage,
-            ModeledCallTargetCoverage::Exhaustive
-        );
-        assert_eq!(receiver_target.arms.len(), 1, "{receiver_target:#?}");
-        assert_eq!(
-            &receiver_target.arms[0].key,
-            &ModeledProcedureKey {
-                language: "rust".to_owned(),
-                owner: "std.process.Command".to_owned(),
-                member: "new".to_owned(),
-                has_receiver: true,
-                parameter_count: 1,
-            }
-        );
-        assert_ne!(
-            static_target.arms[0].key, receiver_target.arms[0].key,
-            "an associated function and a value receiver stay distinct"
-        );
-
-        let unresolved = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &receiver_shape,
-            true,
-            CallDispatchLookup {
-                call_application: CallApplicationKind::ReceiverBindingUnknown,
-                exact_external_call: None,
-                ..receiver_dispatch
-            },
-        );
-        assert!(unresolved.arms.is_empty(), "{unresolved:#?}");
-        assert_eq!(unresolved.coverage, ModeledCallTargetCoverage::Open);
-    }
-
-    #[test]
-    fn modeled_go_target_uses_resolver_effective_arity_for_a_sole_tuple_call() {
-        let source = r#"package main
-import model "example.com/model"
-func caller() { model.Binary(model.Pair()) }
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let (shape, _) = go_shape(&fixture, source, "model.Binary(model.Pair())");
-        assert_eq!(
-            shape.arguments.len(),
-            1,
-            "the structural call retains one written argument"
-        );
-        let lookup = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &shape,
-            true,
-            CallDispatchLookup {
-                status: Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-                call_application: CallApplicationKind::PackageFunction,
-                exact_external_call: Some(ExactExternalCallProof::go_package_function(
-                    "example.com/model.Binary",
-                    2,
-                )),
-                boundaries: vec![CallDispatchBoundaryKind::External {
-                    callee_text: Some("example.com/model.Binary".into()),
-                    normalized_static_owner: None,
-                    external_callee_identity: None,
-                }],
-                ..CallDispatchLookup::default()
-            },
-        );
-
-        assert_eq!(lookup.coverage, ModeledCallTargetCoverage::Exhaustive);
-        let [arm] = lookup.arms.as_slice() else {
-            panic!("one exact modeled arm: {lookup:#?}");
-        };
-        assert_eq!(arm.key.parameter_count, 2, "{lookup:#?}");
-        assert_ne!(
-            arm.key,
-            ModeledProcedureKey {
-                parameter_count: 1,
-                ..arm.key.clone()
-            },
-            "a one-parameter summary cannot bind the two-result expansion"
-        );
-    }
-
-    #[test]
-    fn adjudicated_modeled_go_noncallable_is_unmodeled_not_open() {
-        let source = r#"package main
-import model "example.com/model"
-func caller() { model.Duration(1) }
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let (shape, _) = go_shape(&fixture, source, "model.Duration(1)");
-        let dispatch = CallDispatchLookup {
-            status: Some(DefinitionLookupStatus::NoDefinition),
-            call_application: CallApplicationKind::PackageFunction,
-            adjudicated_no_target: true,
-            boundaries: vec![CallDispatchBoundaryKind::Unresolved(
-                DefinitionLookupStatus::NoDefinition,
-            )],
-            ..CallDispatchLookup::default()
-        };
-
-        let adjudicated = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &shape,
-            true,
-            dispatch.clone(),
-        );
-        assert!(adjudicated.arms.is_empty(), "{adjudicated:#?}");
-        assert_eq!(adjudicated.coverage, ModeledCallTargetCoverage::Unmodeled);
-
-        let unproven = project_modeled_call_target_lookup(
-            fixture.analyzer.analyzer(),
-            &shape,
-            true,
-            CallDispatchLookup {
-                adjudicated_no_target: false,
-                ..dispatch
-            },
-        );
-        assert!(unproven.arms.is_empty(), "{unproven:#?}");
-        assert_eq!(unproven.coverage, ModeledCallTargetCoverage::Open);
-    }
-
-    #[test]
-    fn external_typed_go_receiver_resolves_its_modeled_method_identity() {
-        let source = r#"package main
-import "embed"
-var embedded embed.FS
-func factory() embed.FS { return embedded }
-func caller() {
-    _, _ = embedded.Open("book.xlsx")
-    _, _ = factory().Open("book.xlsx")
-}
-        "#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        let overlay = crate::analyzer::semantic_model::go_external_receiver_test_overlay();
-        let _overlay_scope = crate::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
-            fixture.analyzer.analyzer(),
-            Some(overlay),
-        );
-        let (shape, text) = go_shape(&fixture, source, "embedded.Open(\"book.xlsx\")");
-        let lookup = modeled_lookup(
-            &fixture,
-            &shape,
-            text,
-            CallRelationLimits {
-                max_files: 1,
-                max_source_bytes: usize::MAX,
-                max_candidates: 100,
-            },
-            None,
-        );
-        let expected_arm = ModeledCallTargetArm {
-            key: ModeledProcedureKey {
-                language: "go".to_owned(),
-                owner: "embed.FS".to_owned(),
-                member: "Open".to_owned(),
-                has_receiver: true,
-                parameter_count: 1,
-            },
-            origin: ModeledCallTargetOrigin::UnmaterializedExternal,
-        };
-        assert_eq!(lookup.arms, vec![expected_arm.clone()], "{lookup:#?}");
-        assert_eq!(lookup.coverage, ModeledCallTargetCoverage::Exhaustive);
-        assert_eq!(
-            lookup.call_application,
-            ModeledCallApplication::BoundReceiver,
-            "{lookup:#?}"
-        );
-
-        let (structured_shape, structured_text) =
-            go_shape(&fixture, source, "factory().Open(\"book.xlsx\")");
-        let structured = modeled_lookup(
-            &fixture,
-            &structured_shape,
-            structured_text,
-            CallRelationLimits {
-                max_files: 1,
-                max_source_bytes: usize::MAX,
-                max_candidates: 100,
-            },
-            None,
-        );
-        assert_eq!(structured.arms, vec![expected_arm], "{structured:#?}");
-        assert_eq!(structured.coverage, ModeledCallTargetCoverage::Exhaustive);
-        assert_eq!(
-            structured.call_application,
-            ModeledCallApplication::BoundReceiver,
-            "the structured call-expression base is a value: {structured:#?}"
-        );
-    }
-
-    #[test]
     fn a_proven_arm_and_a_definite_declaration_yield_a_definite_direct_row() {
         let report = call_effect_report(
             &file(),
@@ -3132,5 +2437,53 @@ func caller() {
             report.rows[0].reason,
             Some(EffectReason::DispatchUnsupported)
         );
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod rust_tests_test_support {
+
+    use crate::analyzer::ProjectFile;
+
+    use std::env;
+
+    #[doc(hidden)]
+    pub fn file() -> ProjectFile {
+        ProjectFile::new(env::temp_dir().join("bifrost-effects"), "App.java")
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod go_extraction_support_5 {
+
+    use crate::analyzer::usages::effects::*;
+
+    use crate::analyzer::ProjectFile;
+
+    use std::env;
+
+    #[doc(hidden)]
+    pub fn file() -> ProjectFile {
+        ProjectFile::new(env::temp_dir().join("bifrost-effects"), "App.java")
+    }
+    #[doc(hidden)]
+    pub fn arm(target: &str, proof: EffectProof, lookup: ArmLookup) -> CallEffectArm {
+        CallEffectArm {
+            target_id: target.to_owned(),
+            callee_declaration_id: Some(format!("decl:{target}")),
+            key: Some(ModeledProcedureKey {
+                language: "java".to_owned(),
+                owner: "com.acme.AcmeHttpClient".to_owned(),
+                member: "send".to_owned(),
+                has_receiver: true,
+                parameter_count: 1,
+            }),
+            proof,
+            complete: proof == EffectProof::Proven,
+            execution_timing: ExecutionTiming::SameEvaluation,
+            lookup,
+        }
     }
 }

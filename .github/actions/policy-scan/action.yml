@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.13.1
+    default: v0.14.0
   packs-source:
     description: >-
       Trusted JSON source selection with repository, exact rules_version and

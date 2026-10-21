@@ -84,6 +84,10 @@ pub(super) struct SemanticTypestateWitnessValue {
 }
 
 impl TypestateQueryState {
+    pub(super) fn release_file_window(&mut self) {
+        self.cache.clear();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn findings(
         &mut self,

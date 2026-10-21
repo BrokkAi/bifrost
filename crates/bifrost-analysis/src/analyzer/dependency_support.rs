@@ -10,15 +10,14 @@ use crate::analyzer::semantic_model::{
 };
 
 #[derive(Debug)]
-pub(crate) enum BoundedReadError {
+#[doc(hidden)]
+pub enum BoundedReadError {
     Io(io::Error),
     LimitExceeded,
 }
 
-pub(crate) fn read_bounded_bytes(
-    reader: impl Read,
-    max_bytes: u64,
-) -> Result<Vec<u8>, BoundedReadError> {
+#[doc(hidden)]
+pub fn read_bounded_bytes(reader: impl Read, max_bytes: u64) -> Result<Vec<u8>, BoundedReadError> {
     let mut bytes = Vec::new();
     reader
         .take(max_bytes.saturating_add(1))
@@ -38,7 +37,8 @@ pub fn resolve_dependency_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-pub(crate) fn dependency_provenance_entry(key: &str, value: impl ToString) -> DependencyProvenance {
+#[doc(hidden)]
+pub fn dependency_provenance_entry(key: &str, value: impl ToString) -> DependencyProvenance {
     DependencyProvenance {
         key: key.to_owned(),
         value: value.to_string(),
@@ -61,7 +61,8 @@ pub(crate) fn dependency_producer_diagnostic(
     }
 }
 
-pub(crate) fn dependency_diagnostic(
+#[doc(hidden)]
+pub fn dependency_diagnostic(
     code: &str,
     path: Option<&Path>,
     message: impl Into<String>,
@@ -75,7 +76,8 @@ pub(crate) fn dependency_diagnostic(
     }
 }
 
-pub(crate) fn require_non_empty_evidence_field(
+#[doc(hidden)]
+pub fn require_non_empty_evidence_field(
     ecosystem: &str,
     code: &str,
     field: &str,
@@ -91,7 +93,8 @@ pub(crate) fn require_non_empty_evidence_field(
     Ok(())
 }
 
-pub(crate) fn cancelled_dependency_evidence_diagnostic(
+#[doc(hidden)]
+pub fn cancelled_dependency_evidence_diagnostic(
     ecosystem: &str,
     code: &str,
     path: Option<&Path>,
@@ -103,7 +106,8 @@ pub(crate) fn cancelled_dependency_evidence_diagnostic(
     )
 }
 
-pub(crate) fn read_evidence_file_with_budget(
+#[doc(hidden)]
+pub fn read_evidence_file_with_budget(
     ecosystem: &str,
     path: &Path,
     limits: &DependencyPackLimits,
@@ -147,26 +151,16 @@ pub(crate) fn read_evidence_file_with_budget(
     Ok(artifact)
 }
 
-pub(crate) fn append_producer_diagnostics(
+#[doc(hidden)]
+pub fn append_producer_diagnostics(
     bounded: &mut BoundedProducerDiagnostics,
     diagnostics: Vec<ProducerDiagnostic>,
 ) {
-    for diagnostic in diagnostics {
-        match diagnostic.severity {
-            ProducerDiagnosticSeverity::Warning => {
-                bounded.warning(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-            ProducerDiagnosticSeverity::Error => {
-                bounded.error(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-        }
-    }
+    bounded.absorb(diagnostics);
 }
 
-pub(crate) fn failed_dependency_pack_production(
-    code: &str,
-    message: &str,
-) -> DependencyPackProduction {
+#[doc(hidden)]
+pub fn failed_dependency_pack_production(code: &str, message: &str) -> DependencyPackProduction {
     DependencyPackProduction {
         pack: None,
         diagnostics: vec![ProducerDiagnostic {
@@ -181,7 +175,8 @@ pub(crate) fn failed_dependency_pack_production(
     }
 }
 
-pub(crate) fn dependency_locator_path(locator: &Locator) -> &str {
+#[doc(hidden)]
+pub fn dependency_locator_path(locator: &Locator) -> &str {
     match locator {
         Locator::Source { path, .. }
         | Locator::Artifact { path, .. }
@@ -189,7 +184,8 @@ pub(crate) fn dependency_locator_path(locator: &Locator) -> &str {
     }
 }
 
-pub(crate) fn read_bounded_declaration_file(
+#[doc(hidden)]
+pub fn read_bounded_declaration_file(
     path: &Path,
     max_bytes: u64,
 ) -> Result<Option<String>, String> {

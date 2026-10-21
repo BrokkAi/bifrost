@@ -1,9 +1,9 @@
--- A target's reference-inventory gaps, given the candidate sites its
+-- Shared predicates for a target's reference-inventory gaps, given the sites its
 -- materialization statement (rust_reverse_gap_candidate_sites.sql) kept in
 -- temp.selected_rust_reverse_gap_sites. The sites depend only on the target, so
--- they are computed once; this statement runs twice per target, first with no
--- accounted references to nominate sites for confirmation and then with the
--- references that confirmation accounted for.
+-- they are computed once. The initial locator projection fixes accounted and
+-- qualified reference sets to empty; the final certificate projection binds
+-- the references and qualified routes that confirmation accounted for.
 --
 -- Parameters: ?1 target key, ?2 target names (JSON), ?3 qualified-reference gap
 -- origin, ?4 local semantic base, ?5 member-reference site kind, ?6 accounted
@@ -61,11 +61,18 @@ WITH raw_gaps(host,reason_key,origin,blob_id,source_site) AS (
       AND confirmed.value->>1=reason.site
   )
 ),
-qualified_routes(host,reason_key,path_key,blob_id,source_site,root_name,topology_id,module_path,scope_ordinal) AS (
+-- effective_gaps probes qualified_routes, external_roots and
+-- out_of_scope_local_alias_roots once per raw gap. Inlined, each probe re-ran
+-- the whole CTE as a correlated co-routine, so one execution cost the square of
+-- the target's gaps; the alias CTE also started from resolution_sites by role,
+-- reading every reference site in the workspace each time. MATERIALIZED
+-- computes each once per execution, and the CROSS JOIN after raw_gaps keeps
+-- the target's bounded gaps driving the loop.
+qualified_routes(host,reason_key,path_key,blob_id,source_site,root_name,topology_id,module_path,scope_ordinal) AS MATERIALIZED (
   SELECT gap.host,gap.reason_key,terminal.path_key,gap.blob_id,gap.source_site,root.segment,
          placement.topology_id,placement.container_path,placement.scope_ordinal
   FROM raw_gaps AS gap
-  JOIN main.resolution_sites AS reference_site
+  CROSS JOIN main.resolution_sites AS reference_site
     ON reference_site.blob_id=gap.blob_id
    AND reference_site.site=gap.source_site
    AND reference_site.role=0
@@ -82,13 +89,13 @@ qualified_routes(host,reason_key,path_key,blob_id,source_site,root_name,topology
   JOIN main.resolution_rust_reference_contexts AS context
     ON context.blob_id=gap.blob_id
    AND context.source_site=gap.source_site
-  JOIN temp.selected_rust_module_placements AS placement
+  JOIN temp.selected_rust_container_placements AS placement
     ON placement.mount_ordinal=gap.host
    AND placement.blob_id=gap.blob_id
    AND placement.module_declaration IS context.module_declaration
   WHERE gap.origin=?3
 ),
-external_roots(host,reason_key,path_key) AS (
+external_roots(host,reason_key,path_key) AS MATERIALIZED (
   SELECT DISTINCT route.host,route.reason_key,route.path_key
   FROM qualified_routes AS route
   WHERE EXISTS (
@@ -157,18 +164,18 @@ external_roots(host,reason_key,path_key) AS (
       )
   )
 ),
-out_of_scope_local_alias_roots(host,blob_id,source_site,reason_key,origin) AS (
+out_of_scope_local_alias_roots(host,blob_id,source_site,reason_key,origin) AS MATERIALIZED (
   -- A local `use` alias only closes a route inside its lexical extent. A
   -- same-spelled path outside that extent cannot name the imported target.
   SELECT DISTINCT gap.host,gap.blob_id,gap.source_site,gap.reason_key,gap.origin
   FROM raw_gaps AS gap
-  JOIN main.resolution_sites AS reference_site
+  CROSS JOIN main.resolution_sites AS reference_site
     ON reference_site.blob_id=gap.blob_id
    AND reference_site.site=gap.source_site
    AND reference_site.role=0
-  JOIN main.resolution_rust_reference_contexts AS context
+  CROSS JOIN main.resolution_rust_reference_contexts AS context
     ON context.blob_id=gap.blob_id AND context.source_site=gap.source_site
-  JOIN temp.selected_rust_module_placements AS placement
+  JOIN temp.selected_rust_container_placements AS placement
     ON placement.mount_ordinal=gap.host
    AND placement.blob_id=gap.blob_id
    AND placement.module_declaration IS context.module_declaration
@@ -265,14 +272,4 @@ effective_gaps AS (
       OR (g.origin<>?3 AND ({effective_gap_remains}))
     )
 )
--- A qualified placeholder can nominate its authored reference even when the
--- route index cannot lower that path. Other gap origins remain obligations:
--- binder, macro/item and enumeration sites are not point-confirmation requests.
-SELECT DISTINCT gap.reason_key,gap.host,
-       CASE WHEN gap.origin=?3 AND EXISTS (
-         SELECT 1 FROM main.resolution_sites AS reference_site
-         WHERE reference_site.blob_id=gap.blob_id
-           AND reference_site.site=gap.source_site
-           AND reference_site.role=0
-       ) THEN gap.source_site END AS source_site
-FROM effective_gaps AS gap
+{projection}

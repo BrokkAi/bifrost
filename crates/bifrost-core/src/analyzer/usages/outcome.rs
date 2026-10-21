@@ -128,6 +128,20 @@ pub struct CandidateUsageHits {
 pub fn union_candidate_usages(
     overloads: &[CodeUnit],
     max_usages: usize,
+    scan: impl FnMut(&CodeUnit) -> Result<CandidateUsageHits, UsageAnalysisDiagnostic>,
+) -> GraphUsageOutcome {
+    union_candidate_usages_with_limit(
+        overloads,
+        max_usages,
+        FuzzyResult::MAX_UNPROVEN_HITS_PER_SYMBOL,
+        scan,
+    )
+}
+
+pub fn union_candidate_usages_with_limit(
+    overloads: &[CodeUnit],
+    max_usages: usize,
+    max_unproven: usize,
     mut scan: impl FnMut(&CodeUnit) -> Result<CandidateUsageHits, UsageAnalysisDiagnostic>,
 ) -> GraphUsageOutcome {
     let Some(primary) = overloads.first() else {
@@ -184,10 +198,11 @@ pub fn union_candidate_usages(
             sample_hits: hits.into_iter().take(max_usages).collect(),
         });
     }
-    GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+    GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven_limit(
         primary.clone(),
         hits,
         unproven_hits,
+        max_unproven,
     ))
 }
 

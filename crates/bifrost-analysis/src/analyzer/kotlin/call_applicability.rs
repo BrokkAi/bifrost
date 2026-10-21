@@ -1,11 +1,13 @@
 use crate::analyzer::resolution::{
     AnswerMap, CallApplicabilityAdapter, CandidateAssessment, ConversionEvidence, ConversionKind,
-    FactEvaluation, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
-    MappingAssessment, PartialOrder, ResolutionCompletion, SemanticId, StateMap,
-    TypeInCallPosition,
+    FactEvaluation, ImplicitReceiverLookup, ImplicitReceiverScopeKind,
+    LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty, MappingAssessment,
+    PartialOrder, ResolutionCompletion, ResolutionSlotValue, ResolutionTypeRef, SemanticId,
+    StateMap, TypeInCallPosition, TypedFrontierState,
 };
 use crate::analyzer::store::Result;
 use crate::hash::HashMap;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 
 pub(super) static KOTLIN_CALL_APPLICABILITY_ADAPTER: KotlinCallApplicabilityAdapter =
@@ -14,6 +16,49 @@ pub(super) static KOTLIN_CALL_APPLICABILITY_ADAPTER: KotlinCallApplicabilityAdap
 pub(crate) struct KotlinCallApplicabilityAdapter;
 
 impl CallApplicabilityAdapter for KotlinCallApplicabilityAdapter {
+    fn implicit_receiver_lookup(&self) -> Option<ImplicitReceiverLookup> {
+        Some(ImplicitReceiverLookup::FirstApplicable)
+    }
+
+    fn implicit_receiver_scope_kind(
+        &self,
+        kind: ResolutionScopeKind,
+    ) -> Option<ImplicitReceiverScopeKind> {
+        match kind {
+            ResolutionScopeKind::TypeBody => Some(ImplicitReceiverScopeKind::Dispatch),
+            ResolutionScopeKind::Executable => Some(ImplicitReceiverScopeKind::Extension),
+            _ => None,
+        }
+    }
+
+    fn has_independent_receiver_bounds(&self) -> bool {
+        true
+    }
+
+    fn receiver_runtime_type(&self, state: &TypedFrontierState) -> Option<ResolutionTypeRef> {
+        match state.possible_values() {
+            [ResolutionSlotValue::Runtime { ty, .. }] => Some(*ty),
+            _ => None,
+        }
+    }
+
+    fn receiver_formal_type(&self, state: &TypedFrontierState) -> Option<ResolutionTypeRef> {
+        match state.possible_values() {
+            [ResolutionSlotValue::TypeObject(ty)] => Some(*ty),
+            _ => None,
+        }
+    }
+
+    fn receiver_is_subtype(
+        &self,
+        evaluation: &mut FactEvaluation<'_, '_>,
+        subtype: SemanticId,
+        supertype: SemanticId,
+        states: &StateMap,
+    ) -> Result<Option<bool>> {
+        evaluation.kotlin_type_is_subtype(subtype, supertype, states)
+    }
+
     fn result_application_member_names(&self) -> &'static [&'static str] {
         &["invoke"]
     }
@@ -25,6 +70,14 @@ impl CallApplicabilityAdapter for KotlinCallApplicabilityAdapter {
     }
 
     fn has_scoped_receiver_extensions(&self) -> bool {
+        true
+    }
+
+    fn retains_extensions_without_receiver_evidence(&self, state: &TypedFrontierState) -> bool {
+        state.possible_values().is_empty()
+    }
+
+    fn scoped_extensions_follow_member_selection(&self) -> bool {
         true
     }
 
@@ -102,6 +155,18 @@ impl CallApplicabilityAdapter for KotlinCallApplicabilityAdapter {
             }
             MappingAssessment::Unknown => Ok(Some(CandidateAssessment::unknown(candidate))),
         }
+    }
+
+    fn unresolved_conversion_completion(
+        &self,
+        assessment: &CandidateAssessment,
+        call: &LoweredCallApplicabilityObligation,
+        signature: &LoweredCallableSignatureProperty,
+        states: &StateMap,
+    ) -> Option<ResolutionCompletion> {
+        crate::analyzer::resolution::unresolved_argument_conversion_completion(
+            assessment, call, signature, states,
+        )
     }
 
     fn compare_conversion(

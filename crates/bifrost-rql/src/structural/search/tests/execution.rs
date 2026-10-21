@@ -16,6 +16,37 @@ use crate::cancellation::CancellationToken;
 use semver::Version;
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#5113: procedure inventory references attributed class-body calls to the initializer"
+)]
+fn python_procedure_inventory_respects_class_body_ownership_holes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "main.py",
+            "marker()\nclass C:\n    marker()\n    def method(self):\n        marker()\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "name": "marker" },
+        "steps": [{ "op": "procedure_of" }]
+    }))
+    .expect("enclosing procedure query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 2, "{result:#?}");
+    assert_eq!(result.diagnostics.len(), 1, "{result:#?}");
+    assert_eq!(
+        result.diagnostics[0].code,
+        CodeQueryDiagnosticCode::NoEnclosingProcedure,
+        "{result:#?}"
+    );
+}
+
+#[test]
 fn occurrence_targets_are_resolved_only_after_the_query_demands_them() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -2181,14 +2212,14 @@ fn two_language_analyzer(root: &std::path::Path) -> MultiAnalyzer {
     MultiAnalyzer::new(BTreeMap::from([
         (
             Language::Rust,
-            AnalyzerDelegate::Rust(RustAnalyzer::from_project(TestProject::new(
+            AnalyzerDelegate::new(RustAnalyzer::from_project(TestProject::new(
                 root.to_path_buf(),
                 Language::Rust,
             ))),
         ),
         (
             Language::Python,
-            AnalyzerDelegate::Python(PythonAnalyzer::from_project(TestProject::new(
+            AnalyzerDelegate::new(PythonAnalyzer::from_project(TestProject::new(
                 root.to_path_buf(),
                 Language::Python,
             ))),
@@ -4101,7 +4132,7 @@ func storeIndex(target []*os.File, path string) {
 #[test]
 fn go_assertion_payload_workspace_proof_requires_current_source_and_budget() {
     use crate::analyzer::semantic::{SemanticOutcome, TransferKind, ValueTransfer};
-    use crate::analyzer::workspace_reference_assertion_accepts_payload;
+    use brokk_bifrost_go_analysis::analyzer::workspace_reference_assertion_accepts_payload;
 
     for (asserted, expected) in [("*Cell", true), ("*Other", false)] {
         let source = format!(
@@ -7126,23 +7157,28 @@ fn finding_free_root_result_persistence_reopens_before_discovery_and_serves_both
     );
 
     let cold = cold.work.semantic.type_flow;
-    assert_eq!(cold.root_result_persistence_hits, 0, "{cold:#?}");
+    // The union's second branch is a second semantic window. Handle-keyed
+    // caches close with the first window, so that branch reopens the result
+    // the first branch just published instead of reusing a query-local cache.
+    assert_eq!(cold.root_result_persistence_hits, 1, "{cold:#?}");
     assert_eq!(cold.root_result_persistence_misses, 1, "{cold:#?}");
     assert_eq!(cold.root_result_persistence_rejections, 0, "{cold:#?}");
     assert_eq!(cold.root_result_store_failures, 0, "{cold:#?}");
     assert_eq!(cold.root_result_publications, 1, "{cold:#?}");
     assert_eq!(cold.solves, 1, "{cold:#?}");
-    assert_eq!(cold.cache_hits, 1, "{cold:#?}");
+    assert_eq!(cold.cache_hits, 0, "{cold:#?}");
     assert_eq!(cold.finding_rows, 0, "{cold:#?}");
 
     let warm = warm.work.semantic.type_flow;
-    assert_eq!(warm.root_result_persistence_hits, 1, "{warm:#?}");
+    // Each union branch is its own semantic window, and both serve the
+    // durable result before discovery.
+    assert_eq!(warm.root_result_persistence_hits, 2, "{warm:#?}");
     assert_eq!(warm.root_result_persistence_misses, 0, "{warm:#?}");
     assert_eq!(warm.root_result_persistence_rejections, 0, "{warm:#?}");
     assert_eq!(warm.root_result_store_failures, 0, "{warm:#?}");
     assert_eq!(warm.root_result_publications, 0, "{warm:#?}");
     assert_eq!(warm.solves, 0, "{warm:#?}");
-    assert_eq!(warm.cache_hits, 1, "{warm:#?}");
+    assert_eq!(warm.cache_hits, 0, "{warm:#?}");
     assert_eq!(warm.snapshot_cache_hits, 0, "{warm:#?}");
     assert_eq!(warm.snapshot_cache_misses, 0, "{warm:#?}");
     assert_eq!(warm.dispatch_cache_hits, 0, "{warm:#?}");
@@ -7726,7 +7762,10 @@ fn field_slot_store_failure_falls_back_without_publishing_a_memory_hit() {
 }
 
 #[test]
-fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
+#[brokk_bifrost_test_macros::hardwon(
+    "#5113: point traversal work caused false semantic-budget exhaustion"
+)]
+fn semantic_scan_work_does_not_exhaust_the_resident_point_grant() {
     let (_project, workspace) = type_flow_workspace();
     let query = CodeQuery::from_json(&json!({
         "execution_mode": "profile",
@@ -7747,15 +7786,9 @@ fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
             semantic: CodeQuerySemanticLimits {
                 rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
                     if dimension == SemanticBudgetDimension::ProgramPoints {
-                        // #3410's Python implicit-abort lowering added the
-                        // unresolved read's claims point and its abort route,
-                        // so this fixture's sink now consumes a 28-point ledger
-                        // where it consumed 26. The budget stays the reported
-                        // reason the sink is unreached while the cap sits in the
-                        // measured [28, 31] window; above it the reason becomes
-                        // the unresolved root parameter, and below it the query
-                        // stops before emitting the row. 30 keeps the pin inside
-                        // that window instead of on its edge.
+                        // This fixture retains 28 points but visits more than
+                        // 30 during solving. Only retained points spend this
+                        // grant; repeated visits remain work telemetry.
                         30
                     } else {
                         1 << 20
@@ -7770,17 +7803,19 @@ fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
         panic!("a profile-mode query returns its profile: {response:#?}");
     };
     assert!(
-        profile.work.semantic.budget_exhausted,
-        "the executor surfaces the exhaustion: {profile:#?}"
+        !profile.work.semantic.budget_exhausted,
+        "scan work cannot exhaust a resident grant: {profile:#?}"
     );
     assert!(
-        profile
+        !profile
             .result
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted),
-        "the diagnostic is raised: {profile:#?}"
+        "no false budget diagnostic is raised: {profile:#?}"
     );
+    assert!(profile.work.semantic.resident_peaks.program_points <= 30);
+    assert!(profile.work.semantic.root_work_peaks.program_points > 30);
     let origins: Vec<&str> = profile
         .result
         .results
@@ -7791,8 +7826,8 @@ fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
         })
         .collect();
     assert!(
-        origins.contains(&"unknown:semantic_budget"),
-        "the unreached sink names the semantic budget: {origins:?}"
+        origins.contains(&"unknown:root_parameter"),
+        "the unresolved root parameter keeps its actual reason: {origins:?}"
     );
 }
 

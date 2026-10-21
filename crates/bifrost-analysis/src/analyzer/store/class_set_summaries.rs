@@ -48,6 +48,7 @@ pub struct ClassSetSummaryRowKey {
 pub struct ClassSetSummaryFamilyKey {
     pub procedure_lineage: ClassSetSummaryDigest,
     pub owner_rel_path: String,
+    pub owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey,
     pub language: Language,
     pub schema_version: u32,
     pub semantics_digest: ClassSetSummaryDigest,
@@ -70,6 +71,7 @@ pub struct ClassSetSummaryFamilyLookupRow {
 pub struct ClassSetSummaryAttachment {
     pub rel_path: String,
     pub blob_oid: String,
+    pub storage_language_key: crate::analyzer::semantic::StorageLanguageKey,
     pub language: Language,
 }
 
@@ -464,16 +466,19 @@ impl ClassSetSummaryRow {
         let ClassSetSummaryAttachment {
             rel_path,
             blob_oid: _,
+            storage_language_key,
             language,
         } = attachment;
         let ClassSetSummaryAttachment {
             rel_path: other_rel_path,
             blob_oid: _,
+            storage_language_key: other_storage_language_key,
             language: other_language,
         } = other_attachment;
 
         key == other_key
             && rel_path == other_rel_path
+            && storage_language_key == other_storage_language_key
             && language == other_language
             && schema_version == other_schema_version
             && semantics_digest == other_semantics_digest
@@ -752,7 +757,7 @@ impl CanonicalDigest {
 pub(crate) static CLASS_SET_SUMMARY_LOOKUP_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT summaries.summary_id, summaries.procedure_lineage,
-            summaries.owner_rel_path, blobs.blob_oid, summaries.lang,
+            summaries.owner_rel_path, blobs.blob_oid, blobs.lang, summaries.lang,
             artifact_public_identity, artifact_content_identity, schema_version,
             semantics_digest, context_digest, behavior_read_digest, dependency_digest,
             carrier_digest, field_slots_digest, root_surface_digest, direct_calls_digest,
@@ -760,7 +765,7 @@ pub(crate) static CLASS_SET_SUMMARY_LOOKUP_SQL: LazyLock<String> = LazyLock::new
             reached_count, dependency_count, read_count, charge_count, output_digest,
             content_digest
      FROM class_set_summaries AS summaries
-     JOIN blobs ON blobs.id = summaries.owner_blob_id AND blobs.lang = summaries.lang
+     JOIN blobs ON blobs.id = summaries.owner_blob_id
      JOIN blob_meta AS meta ON meta.blob_id = blobs.id
      WHERE summaries.lookup_digest = ?1
        AND {PARSED_BLOB_COMPLETE_CONDITION}"
@@ -771,9 +776,10 @@ pub(crate) static CLASS_SET_SUMMARY_PROCEDURE_SQL: LazyLock<String> = LazyLock::
     format!(
         "SELECT 1
      FROM class_set_summaries AS summaries
-     JOIN blobs ON blobs.id = summaries.owner_blob_id AND blobs.lang = summaries.lang
+     JOIN blobs ON blobs.id = summaries.owner_blob_id
      JOIN blob_meta AS meta ON meta.blob_id = blobs.id
      WHERE summaries.procedure_lineage = ?1
+       AND blobs.lang = ?2
        AND {PARSED_BLOB_COMPLETE_CONDITION}
      LIMIT 1"
     )
@@ -782,18 +788,18 @@ pub(crate) static CLASS_SET_SUMMARY_FAMILY_SQL: LazyLock<String> = LazyLock::new
     format!(
         "SELECT summaries.lookup_digest, entry_facts.fact_kind = 'zero'
          FROM class_set_summaries AS summaries
-         JOIN blobs ON blobs.id=summaries.owner_blob_id AND blobs.lang=summaries.lang
+         JOIN blobs ON blobs.id=summaries.owner_blob_id
          JOIN blob_meta AS meta ON meta.blob_id=blobs.id
          JOIN class_set_summary_facts AS entry_facts
            ON entry_facts.summary_id=summaries.summary_id
           AND entry_facts.fact_ordinal=summaries.entry_fact_ordinal
          WHERE summaries.procedure_lineage=?1 AND summaries.owner_rel_path=?2
-           AND summaries.lang=?3 AND summaries.schema_version=?4
-           AND summaries.semantics_digest=?5 AND summaries.context_digest=?6
-           AND summaries.behavior_read_digest=?7 AND summaries.carrier_digest=?8
-           AND summaries.field_slots_digest=?9 AND summaries.root_surface_digest=?10
+           AND summaries.lang=?3 AND blobs.lang=?4 AND summaries.schema_version=?5
+           AND summaries.semantics_digest=?6 AND summaries.context_digest=?7
+           AND summaries.behavior_read_digest=?8 AND summaries.carrier_digest=?9
+           AND summaries.field_slots_digest=?10 AND summaries.root_surface_digest=?11
            AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY summaries.lookup_digest LIMIT ?11"
+         ORDER BY summaries.lookup_digest LIMIT ?12"
     )
 });
 pub(crate) const FACTS_SQL: &str = "SELECT fact_ordinal,fact_kind,source_kind,source_event_key,
@@ -818,7 +824,7 @@ pub(crate) static CLASS_SET_SUMMARY_DEPENDENTS_BY_READ_SQL: LazyLock<String> =
             "SELECT summaries.lookup_digest
          FROM class_set_summary_reads AS reads
          JOIN class_set_summaries AS summaries ON summaries.summary_id = reads.summary_id
-         JOIN blobs ON blobs.id = summaries.owner_blob_id AND blobs.lang = summaries.lang
+         JOIN blobs ON blobs.id = summaries.owner_blob_id
          JOIN blob_meta AS meta ON meta.blob_id = blobs.id
          WHERE reads.key_digest = ?1
            AND {PARSED_BLOB_COMPLETE_CONDITION}
@@ -844,7 +850,7 @@ fn dependent_summary_sql(predicate: &str) -> String {
           AND sources.dependency_ordinal = dependencies.dependency_ordinal
          JOIN class_set_summaries AS summaries
            ON summaries.summary_id = dependencies.summary_id
-         JOIN blobs ON blobs.id = summaries.owner_blob_id AND blobs.lang = summaries.lang
+         JOIN blobs ON blobs.id = summaries.owner_blob_id
          JOIN blob_meta AS meta ON meta.blob_id = blobs.id
          WHERE {predicate}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
@@ -873,12 +879,13 @@ impl AnalyzerStore {
     pub fn contains_class_set_summary_procedure(
         &self,
         identity: ClassSetSummaryDigest,
+        storage_language_key: &crate::analyzer::semantic::StorageLanguageKey,
     ) -> Result<bool> {
         let conn = self.read_conn()?;
         Ok(conn
             .query_row(
                 CLASS_SET_SUMMARY_PROCEDURE_SQL.as_str(),
-                params![identity.as_slice()],
+                params![identity.as_slice(), storage_language_key.as_str()],
                 |_| Ok(()),
             )
             .optional()?
@@ -1011,6 +1018,7 @@ impl AnalyzerStore {
                 key.procedure_lineage.as_slice(),
                 &key.owner_rel_path,
                 key.language.config_label(),
+                key.owner_storage_language_key.as_str(),
                 key.schema_version,
                 key.semantics_digest.as_slice(),
                 key.context_digest.as_slice(),
@@ -1097,10 +1105,10 @@ fn load_summary_for_digest(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(5)?,
                     row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, u32>(7)?,
-                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, u32>(8)?,
                     row.get::<_, Vec<u8>>(9)?,
                     row.get::<_, Vec<u8>>(10)?,
                     row.get::<_, Vec<u8>>(11)?,
@@ -1108,15 +1116,16 @@ fn load_summary_for_digest(
                     row.get::<_, Vec<u8>>(13)?,
                     row.get::<_, Vec<u8>>(14)?,
                     row.get::<_, Vec<u8>>(15)?,
-                    row.get::<_, u32>(16)?,
-                    row.get::<_, usize>(17)?,
+                    row.get::<_, Vec<u8>>(16)?,
+                    row.get::<_, u32>(17)?,
                     row.get::<_, usize>(18)?,
                     row.get::<_, usize>(19)?,
                     row.get::<_, usize>(20)?,
                     row.get::<_, usize>(21)?,
                     row.get::<_, usize>(22)?,
-                    row.get::<_, Vec<u8>>(23)?,
+                    row.get::<_, usize>(23)?,
                     row.get::<_, Vec<u8>>(24)?,
+                    row.get::<_, Vec<u8>>(25)?,
                 ))
             },
         )
@@ -1138,14 +1147,19 @@ fn validate_summary_for_publication(
 }
 
 fn live_owner_blob_id(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow) -> Result<i64> {
-    let lang = summary.header.attachment.language.config_label();
-    super::live_class_set_owner_blob_id(conn, &summary.header.attachment.blob_oid, lang)?
-        .ok_or_else(|| {
-            StoreError::new(format!(
-                "class-set summary owner blob {}/{} is absent",
-                summary.header.attachment.blob_oid, lang
-            ))
-        })
+    let storage_language_key = &summary.header.attachment.storage_language_key;
+    super::live_class_set_owner_blob_id(
+        conn,
+        &summary.header.attachment.blob_oid,
+        storage_language_key,
+    )?
+    .ok_or_else(|| {
+        StoreError::new(format!(
+            "class-set summary owner blob {}/{} is absent",
+            summary.header.attachment.blob_oid,
+            storage_language_key.as_str()
+        ))
+    })
 }
 
 fn validate_root_surface(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow) -> Result<()> {
@@ -1153,11 +1167,11 @@ fn validate_root_surface(conn: &rusqlite::Connection, summary: &ClassSetSummaryR
     let stored = conn
         .query_row(
             &format!(
-                "SELECT surfaces.procedure_lineage,surfaces.owner_rel_path,surfaces.lang,
+                "SELECT surfaces.procedure_lineage,surfaces.owner_rel_path,blobs.lang,surfaces.lang,
                         surfaces.schema_version,surfaces.behavior_read_digest,
                         surfaces.carrier_semantics_digest,surfaces.direct_calls_digest
                  FROM class_set_procedure_surfaces AS surfaces
-                 JOIN blobs ON blobs.id=surfaces.owner_blob_id AND blobs.lang=surfaces.lang
+                 JOIN blobs ON blobs.id=surfaces.owner_blob_id
                  JOIN blob_meta AS meta ON meta.blob_id=blobs.id
                  WHERE surfaces.surface_digest=?1 AND {PARSED_BLOB_COMPLETE_CONDITION}"
             ),
@@ -1167,19 +1181,23 @@ fn validate_root_surface(conn: &rusqlite::Connection, summary: &ClassSetSummaryR
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u32>(4)?,
                     row.get::<_, Vec<u8>>(5)?,
                     row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((lineage, path, language, schema, behavior, carrier, direct_calls)) = stored else {
+    let Some((lineage, path, storage_language, language, schema, behavior, carrier, direct_calls)) =
+        stored
+    else {
         return Err(StoreError::new("class-set summary root surface is absent"));
     };
     if digest(lineage, "root surface lineage")? != header.key.procedure_lineage
         || path != header.attachment.rel_path
+        || storage_language != header.attachment.storage_language_key.as_str()
         || language != header.attachment.language.config_label()
         || schema != header.schema_version
         || digest(behavior, "root surface behavior")? != header.behavior_read_digest
@@ -1517,6 +1535,7 @@ type RawHeader = (
     String,
     String,
     String,
+    String,
     Vec<u8>,
     Vec<u8>,
     u32,
@@ -1548,6 +1567,7 @@ fn load_summary(
         procedure,
         rel_path,
         blob_oid,
+        storage_lang,
         lang,
         artifact_public,
         artifact_content,
@@ -1611,6 +1631,9 @@ fn load_summary(
             attachment: ClassSetSummaryAttachment {
                 rel_path,
                 blob_oid,
+                storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_store(
+                    storage_lang,
+                ),
                 language,
             },
             artifact_public_identity: digest(artifact_public, "artifact public identity")?,
@@ -1873,12 +1896,95 @@ mod tests {
         store
     }
 
+    fn insert_complete_storage_blob(store: &AnalyzerStore, oid: &str, storage_key: &str) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,?2,0)",
+            rusqlite::params![oid, storage_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blob_meta(
+               blob_id,lang,contains_tests,content_package,stored_unit_count,
+               range_count,signature_count,signature_metadata_count,supertype_count,
+               child_count,import_statement_count,type_identifier_count,is_complete
+             )
+             SELECT id,lang,0,'',0,0,0,0,0,0,0,0,1
+             FROM blobs WHERE blob_oid=?1 AND lang=?2",
+            rusqlite::params![oid, storage_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blob_payload_costs(blob_id,payload_bytes)
+             SELECT id,0 FROM blobs WHERE blob_oid=?1 AND lang=?2",
+            rusqlite::params![oid, storage_key],
+        )
+        .unwrap();
+    }
+
+    fn dialect_surface(
+        path: &str,
+        storage_key: &'static str,
+        language: Language,
+        lineage: u8,
+        identity: u8,
+    ) -> ClassSetProcedureSurfaceRow {
+        ClassSetProcedureSurfaceRow::try_new(
+            ClassSetProcedureSurfaceHeaderRow {
+                key: ClassSetProcedureSurfaceKey {
+                    procedure_lineage: digest_byte(lineage),
+                    owner_rel_path: path.to_owned(),
+                    owner_storage_language_key:
+                        crate::analyzer::semantic::StorageLanguageKey::from_adapter(storage_key),
+                    language,
+                    schema_version: 1,
+                    local_structure_digest: digest_byte(identity),
+                    behavior_read_digest: digest_byte(7),
+                },
+                owner_blob_oid: BLOB.to_owned(),
+                artifact_public_identity: digest_byte(identity + 1),
+                artifact_content_identity: digest_byte(identity + 2),
+                exact_behavior_digest: digest_byte(18),
+                carrier_semantics_digest: digest_byte(9),
+                direct_calls_digest: digest_byte(17),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn summary_for_dialect_surface(
+        lookup: u8,
+        surface: &ClassSetProcedureSurfaceRow,
+    ) -> ClassSetSummaryRow {
+        let mut summary = row(lookup);
+        summary.header.key.procedure_lineage = surface.header.key.procedure_lineage;
+        summary.header.attachment = ClassSetSummaryAttachment {
+            rel_path: surface.header.key.owner_rel_path.clone(),
+            blob_oid: surface.header.owner_blob_oid.clone(),
+            storage_language_key: surface.header.key.owner_storage_language_key.clone(),
+            language: surface.header.key.language,
+        };
+        summary.header.artifact_public_identity = surface.header.artifact_public_identity;
+        summary.header.artifact_content_identity = surface.header.artifact_content_identity;
+        summary.header.behavior_read_digest = surface.header.key.behavior_read_digest;
+        summary.header.carrier_digest = surface.header.carrier_semantics_digest;
+        summary.header.root_surface_digest = *surface.surface_digest();
+        summary.header.direct_calls_digest = surface.header.direct_calls_digest;
+        summary.content_digest = summary.canonical_content_digest();
+        summary
+    }
+
     fn root_surface() -> ClassSetProcedureSurfaceRow {
         ClassSetProcedureSurfaceRow::try_new(
             ClassSetProcedureSurfaceHeaderRow {
                 key: ClassSetProcedureSurfaceKey {
                     procedure_lineage: digest_byte(2),
                     owner_rel_path: "src/app.py".to_string(),
+                    owner_storage_language_key:
+                        crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
                     language: Language::Python,
                     schema_version: 1,
                     local_structure_digest: digest_byte(16),
@@ -1908,6 +2014,8 @@ mod tests {
                 attachment: ClassSetSummaryAttachment {
                     rel_path: "src/app.py".to_string(),
                     blob_oid: BLOB.to_string(),
+                    storage_language_key:
+                        crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
                     language: Language::Python,
                 },
                 artifact_public_identity: digest_byte(3),
@@ -1997,6 +2105,185 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5141: class-set owners lost their exact physical storage dialect"
+    )]
+    fn class_set_owners_keep_exact_storage_dialects_for_shared_blob_oids() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let dialects = [
+            (
+                "typescript:ts",
+                "typescript:tsx",
+                "typescript",
+                Language::TypeScript,
+                "ts",
+                "tsx",
+            ),
+            (
+                "javascript",
+                "javascript:jsx",
+                "javascript",
+                Language::JavaScript,
+                "js",
+                "jsx",
+            ),
+            ("cpp", "cpp:c", "cpp", Language::Cpp, "cpp", "c"),
+        ];
+        let mut surfaces = Vec::new();
+        let mut summaries = Vec::new();
+        for (pair_index, (standard, variant, coarse, language, standard_ext, variant_ext)) in
+            dialects.into_iter().enumerate()
+        {
+            insert_complete_storage_blob(&store, BLOB, standard);
+            insert_complete_storage_blob(&store, BLOB, variant);
+            let path_standard = format!("src/owner-{pair_index}.{standard_ext}");
+            let path_variant = format!("src/owner-{pair_index}.{variant_ext}");
+            let standard_lineage = 40 + (pair_index as u8 * 2);
+            let variant_lineage = standard_lineage + 1;
+            let standard_surface = dialect_surface(
+                &path_standard,
+                standard,
+                language,
+                standard_lineage,
+                50 + pair_index as u8 * 2,
+            );
+            let variant_surface = dialect_surface(
+                &path_variant,
+                variant,
+                language,
+                variant_lineage,
+                51 + pair_index as u8 * 2,
+            );
+            for surface in [&standard_surface, &variant_surface] {
+                store
+                    .publish_class_set_procedure_surface(surface.clone(), &CancellationToken::new())
+                    .unwrap();
+            }
+            let standard_summary =
+                summary_for_dialect_surface(60 + pair_index as u8 * 2, &standard_surface);
+            let variant_summary =
+                summary_for_dialect_surface(61 + pair_index as u8 * 2, &variant_surface);
+            for summary in [&standard_summary, &variant_summary] {
+                assert!(
+                    store
+                        .publish_class_set_summary(summary.clone(), &CancellationToken::new())
+                        .unwrap()
+                );
+            }
+            surfaces.push((standard_surface, variant_surface));
+            summaries.push((standard_summary, variant_summary, coarse, standard, variant));
+        }
+
+        for (
+            (standard_surface, variant_surface),
+            (standard_summary, variant_summary, coarse, standard, variant),
+        ) in surfaces.into_iter().zip(summaries)
+        {
+            for surface in [&standard_surface, &variant_surface] {
+                let candidates = store
+                    .class_set_procedure_surface_candidates(&surface.header.key, 4)
+                    .unwrap()
+                    .expect("the exact physical family is complete");
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].header.key, surface.header.key);
+                let loaded = store
+                    .class_set_procedure_surface_for_digest(*surface.surface_digest())
+                    .unwrap()
+                    .expect("published surface remains readable");
+                assert_eq!(
+                    loaded.header.key.owner_storage_language_key,
+                    surface.header.key.owner_storage_language_key
+                );
+
+                let mut wrong_physical_alias = surface.header.key.clone();
+                wrong_physical_alias.owner_storage_language_key =
+                    crate::analyzer::semantic::StorageLanguageKey::from_adapter(
+                        if surface.header.key.owner_storage_language_key.as_str() == standard {
+                            variant
+                        } else {
+                            standard
+                        },
+                    );
+                assert!(
+                    store
+                        .class_set_procedure_surface_candidates(&wrong_physical_alias, 4)
+                        .unwrap()
+                        .expect("the exact alias query is complete")
+                        .is_empty()
+                );
+            }
+
+            for (summary, same_language_lineage) in [
+                (
+                    &standard_summary,
+                    standard_surface.header.key.procedure_lineage,
+                ),
+                (
+                    &variant_summary,
+                    variant_surface.header.key.procedure_lineage,
+                ),
+            ] {
+                let loaded = store
+                    .class_set_summary_for_digest(summary.header.key.lookup_digest)
+                    .unwrap()
+                    .expect("published summary remains readable");
+                assert_eq!(
+                    loaded.header.attachment.storage_language_key,
+                    summary.header.attachment.storage_language_key
+                );
+                assert!(
+                    store
+                        .contains_class_set_summary_procedure(
+                            same_language_lineage,
+                            &summary.header.attachment.storage_language_key,
+                        )
+                        .unwrap()
+                );
+            }
+
+            let variant_key = &variant_summary.header.attachment.storage_language_key;
+            let mut family = ClassSetSummaryFamilyKey {
+                procedure_lineage: variant_summary.header.key.procedure_lineage,
+                owner_rel_path: variant_summary.header.attachment.rel_path.clone(),
+                owner_storage_language_key: variant_key.clone(),
+                language: variant_summary.header.attachment.language,
+                schema_version: variant_summary.header.schema_version,
+                semantics_digest: variant_summary.header.semantics_digest,
+                context_digest: variant_summary.header.context_digest,
+                behavior_read_digest: variant_summary.header.behavior_read_digest,
+                carrier_digest: variant_summary.header.carrier_digest,
+                field_slots_digest: variant_summary.header.field_slots_digest,
+                root_surface_digest: variant_summary.header.root_surface_digest,
+            };
+            assert_eq!(
+                store
+                    .class_set_summary_family_lookups(&family, 4)
+                    .unwrap()
+                    .expect("the exact summary family is complete")
+                    .len(),
+                1
+            );
+            family.owner_storage_language_key =
+                crate::analyzer::semantic::StorageLanguageKey::from_adapter(coarse);
+            assert!(
+                store
+                    .class_set_summary_family_lookups(&family, 4)
+                    .unwrap()
+                    .expect("the wrong physical family is complete")
+                    .is_empty()
+            );
+            assert!(
+                !store
+                    .contains_class_set_summary_procedure(
+                        variant_summary.header.key.procedure_lineage,
+                        &family.owner_storage_language_key,
+                    )
+                    .unwrap()
+            );
+        }
     }
 
     fn relation_row(remap_ordinals: bool) -> ClassSetSummaryRow {
@@ -2273,7 +2560,10 @@ mod tests {
         );
         assert!(
             store
-                .contains_class_set_summary_procedure(digest_byte(2))
+                .contains_class_set_summary_procedure(
+                    digest_byte(2),
+                    &crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
+                )
                 .unwrap()
         );
         assert_eq!(
@@ -2298,6 +2588,7 @@ mod tests {
         let key = ClassSetSummaryFamilyKey {
             procedure_lineage: header.key.procedure_lineage,
             owner_rel_path: header.attachment.rel_path.clone(),
+            owner_storage_language_key: header.attachment.storage_language_key.clone(),
             language: header.attachment.language,
             schema_version: header.schema_version,
             semantics_digest: header.semantics_digest,
@@ -2676,7 +2967,10 @@ mod tests {
 
         assert!(
             !store
-                .contains_class_set_summary_procedure(digest_byte(2))
+                .contains_class_set_summary_procedure(
+                    digest_byte(2),
+                    &crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
+                )
                 .unwrap()
         );
         assert_eq!(
@@ -2704,7 +2998,10 @@ mod tests {
 
         assert!(
             !store
-                .contains_class_set_summary_procedure(digest_byte(2))
+                .contains_class_set_summary_procedure(
+                    digest_byte(2),
+                    &crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
+                )
                 .unwrap()
         );
         assert_eq!(

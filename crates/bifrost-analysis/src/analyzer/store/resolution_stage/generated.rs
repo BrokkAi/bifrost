@@ -71,7 +71,8 @@ impl SelectedResolutionStage<'_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn admit_macro_head_pair(
+    #[doc(hidden)]
+    pub fn admit_macro_head_pair(
         &self,
         source_host: &SelectedResolutionMountRecord,
         reference: SemanticId,

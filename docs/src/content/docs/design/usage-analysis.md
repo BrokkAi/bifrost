@@ -104,6 +104,12 @@ members, import sources, reverse-reference sites, or rename targets. A change to
 this publication contract advances the Go context derivation version so retained
 contexts acquire the new evidence.
 
+Tool-reported package-relative and absolute member paths are normalized before
+source lookup, including Windows separator and prefix variants. Membership uses
+path components relative to the package directory and workspace root; SQLite
+keys join relative components with `/`. Aliases of one source are deduplicated,
+with ignored evidence taking precedence over ordinary membership.
+
 Go admission distinguishes three skipped outcomes. `excluded_build_selection`
 means the tool explicitly ignored the file for this build; it is a structured
 `file_notes` entry and does not make the graph incomplete. `outside_selected_modules`
@@ -114,6 +120,15 @@ selected contexts is tracked by #5664. `unplaced` means no supported placement i
 available; the product records one incomplete reason per file. Missing caller
 authority cannot prove that any declaration has no inbound references. A missing
 selected context itself remains a whole-operation failure.
+
+Configured Go target settings are carried unchanged through session activation,
+discovery, the Go runner environment, and the selected profile digest. They take
+precedence over the host target. If discovery is disabled or fails, the graph
+uses source-inventory placements and emits one `build_selection_unavailable`
+reason with a `discovery_error` field. Filename GOOS/GOARCH suffixes and nested
+module boundaries still prove exclusions; build-directive evaluation remains
+unavailable. Admitted inventory files therefore cannot certify whole-graph
+completeness or absence of inbound references.
 
 Rust retains its existing treatment of files outside selected crates: an explicit
 admitted unit resolves them with an empty crate-key context. The shared admission
@@ -212,14 +227,12 @@ the completed graph unpublished.
 
 ## Persisted inputs and compositional usage facts
 
-> **Current:** Rust target-directed references resolve through the
+> **Current:** Rust and Go target-directed references resolve through the
 > [Name Resolution Engine](../name-resolution/), which stores immutable
 > file-local facts by content identity and composes them with build-unit
-> context in each query. Go's point navigation, calls, rename, selected
-> target-directed references, and rooted and whole-workspace graphs retain the
-> incumbent backend. `BIFROST_TRIAL_NATIVE_GO=1` selects the native point
-> consumers and graph for trial runs; `BIFROST_TRIAL_NATIVE_GO_GRAPH=1` selects
-> the graph alone. Other languages persist declaration and identifier
+> context in each query. Go's rooted and whole-workspace graphs retain the
+> incumbent backend; `BIFROST_TRIAL_NATIVE_GO_GRAPH=1` selects their native
+> provider for trial runs. Other languages persist declaration and identifier
 > projections, own language-specific indexes and prepared facts, and build
 > target-directed or bulk usage products on demand. Only complete workspace
 > ranking graphs are retained under exact content keys.

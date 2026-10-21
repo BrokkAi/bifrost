@@ -1,6 +1,6 @@
 //! Semantic correspondence between two workspace revisions (#2450 slice 1).
 //!
-//! Bifrost can already describe *a* diff: `crate::diff_analysis` resolves two
+//! Bifrost can already describe *a* diff: `brokk_bifrost_tools::diff_analysis` resolves two
 //! Git endpoints, materializes both images, and reports which symbols were
 //! edited, introduced, deleted or moved. What it cannot do is state, as a value
 //! a later stage can consume, *which entity on one side is which entity on the
@@ -101,7 +101,7 @@
 //!
 //! # The #1907 body-similarity move-classification contract
 //!
-//! `crate::diff_analysis::pair_endpoints` already classifies moves by body
+//! `brokk_bifrost_tools::diff_analysis::pair_endpoints` already classifies moves by body
 //! similarity, and this slice does not change its behavior. What follows states
 //! its contract so that tier 4 has a definition before it has a producer. The
 //! citations are the current implementation.

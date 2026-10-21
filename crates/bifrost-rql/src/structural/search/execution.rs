@@ -1269,6 +1269,7 @@ pub(super) fn execute_parallel_seed_union(
                     path_cache: PathTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     call_binding_identity_request: state.call_binding_identity_request,
+                    comparison_chain_operators: HashMap::default(),
                     receiver_facts: HashMap::default(),
                     receiver_service: None,
                     semantic: None,

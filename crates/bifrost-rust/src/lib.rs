@@ -66,3 +66,6 @@ mod producer_smoke_tests;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_helpers;
+
+mod knowledge;
+pub use knowledge::RustKnowledge;

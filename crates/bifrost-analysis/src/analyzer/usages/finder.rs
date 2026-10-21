@@ -4,7 +4,8 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::model::{FuzzyResult, UsageProofAuthority};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{
-    CandidateFileProvider, GraphUsageAnalyzer, PreparedUsageQuery, UsageScanScope,
+    CandidateFileProvider, GraphUsageAnalyzer, GraphUsageBatchQuery, PreparedUsageQuery,
+    UsageScanScope,
 };
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, DescendantIndexScope, IAnalyzer, Language, ProjectFile,
@@ -94,14 +95,23 @@ pub struct CandidateFilesSample {
 }
 
 /// Scope and budget facts fixed before a graph scan and reported afterward.
-struct AdmittedUsageQuery {
-    candidate_files: HashSet<ProjectFile>,
-    candidate_files_truncated: bool,
-    candidate_files_budget_exhausted: bool,
-    source_bytes_truncated: bool,
-    scanned_source_bytes: usize,
-    candidate_files_sample: Option<CandidateFilesSample>,
+#[doc(hidden)]
+pub struct AdmittedUsageQuery {
+    #[doc(hidden)]
+    pub candidate_files: HashSet<ProjectFile>,
+    #[doc(hidden)]
+    pub candidate_files_truncated: bool,
+    #[doc(hidden)]
+    pub candidate_files_budget_exhausted: bool,
+    #[doc(hidden)]
+    pub source_bytes_truncated: bool,
+    #[doc(hidden)]
+    pub scanned_source_bytes: usize,
+    #[doc(hidden)]
+    pub candidate_files_sample: Option<CandidateFilesSample>,
 }
+
+type AdmittedUsagePlan = (AdmittedUsageQuery, Option<Box<dyn PreparedUsageQuery>>);
 
 /// The common reference engine.
 ///
@@ -120,6 +130,7 @@ struct AdmittedUsageQuery {
 ///
 /// JDT-based Java analysis is intentionally omitted; bifrost is tree-sitter only.
 pub struct ReferenceEngine<'a> {
+    max_unproven: usize,
     file_filter: Option<FileFilter<'a>>,
     /// The request's test-file exclusion on its own, when it asked to drop
     /// test files.
@@ -139,6 +150,7 @@ impl<'a> ReferenceEngine<'a> {
     pub fn new() -> Self {
         let cancellation = CancellationToken::default();
         Self {
+            max_unproven: FuzzyResult::MAX_UNPROVEN_HITS_PER_SYMBOL,
             file_filter: None,
             excluded_test_files: None,
             cancellation,
@@ -152,6 +164,11 @@ impl<'a> ReferenceEngine<'a> {
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    pub fn with_unproven_limit(mut self, limit: usize) -> Self {
+        self.max_unproven = limit;
+        self
     }
 
     pub fn with_file_filter<F>(mut self, filter: F) -> Self
@@ -227,7 +244,8 @@ impl<'a> ReferenceEngine<'a> {
         )
     }
 
-    pub(crate) fn query_with_provider_and_source_budget(
+    #[doc(hidden)]
+    pub fn query_with_provider_and_source_budget(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
@@ -236,6 +254,53 @@ impl<'a> ReferenceEngine<'a> {
         max_usages: usize,
         max_source_bytes: Option<usize>,
     ) -> QueryResult {
+        let _query_scope = AnalyzerQueryScope::with_cancellation(analyzer, &self.cancellation);
+        let (admitted_query, prepared) = match self.admit_query(
+            analyzer,
+            overloads,
+            explicit_provider,
+            max_files,
+            max_source_bytes,
+        ) {
+            Ok(admitted) => admitted,
+            Err(result) => return *result,
+        };
+        let target = &overloads[0];
+        let strategy = language_support(language_for_target(target))
+            .map(|support| support.reference_plugin().target_strategy());
+        let explicit_candidates = explicit_provider
+            .and_then(CandidateFileProvider::explicit_candidate_files)
+            .map(|files| {
+                files
+                    .intersection(&admitted_query.candidate_files)
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            });
+        let scan_scope =
+            UsageScanScope::with_cancellation(&admitted_query.candidate_files, &self.cancellation)
+                .with_explicit_candidates(explicit_candidates.as_ref())
+                .with_test_inclusion(self.excluded_test_files.is_none())
+                .with_unproven_limit(self.max_unproven);
+        let _graph_scope = crate::profiling::scope("usages::graph_find_usages");
+        let outcome = graph_find_usages(
+            language_for_target(target),
+            analyzer,
+            overloads,
+            &scan_scope,
+            prepared.as_deref(),
+            max_usages,
+        );
+        finalize_graph_usage_query(outcome, &self.cancellation, admitted_query, strategy)
+    }
+
+    fn admit_query(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        explicit_provider: Option<&dyn CandidateFileProvider>,
+        max_files: usize,
+        max_source_bytes: Option<usize>,
+    ) -> Result<AdmittedUsagePlan, Box<QueryResult>> {
         // The scan's deadline, not just its loops: candidate discovery spends
         // most of its time inside single analyzer reads that take no token
         // (`definitions` for one import target is 1.14 s for a hot short name
@@ -243,7 +308,7 @@ impl<'a> ReferenceEngine<'a> {
         // what lets those reads stop when this scan's budget does.
         let _query_scope = AnalyzerQueryScope::with_cancellation(analyzer, &self.cancellation);
         if overloads.is_empty() {
-            return QueryResult {
+            return Err(Box::new(QueryResult {
                 completion: UsageQueryCompletion::Complete,
                 candidate_files: HashSet::default(),
                 candidate_files_truncated: false,
@@ -254,10 +319,10 @@ impl<'a> ReferenceEngine<'a> {
                 // No overloads means no target language and no strategy.
                 proof_authority: UsageProofAuthority::Legacy,
                 graph_failure: None,
-            };
+            }));
         }
         if self.cancellation.is_cancelled() {
-            return cancelled_query_result();
+            return Err(Box::new(cancelled_query_result()));
         }
 
         let target = &overloads[0];
@@ -279,7 +344,7 @@ impl<'a> ReferenceEngine<'a> {
                 }
             }
             if self.cancellation.is_cancelled() {
-                return cancelled_query_result();
+                return Err(Box::new(cancelled_query_result()));
             }
         }
         let strategy = language_support(language_for_target(target))
@@ -307,7 +372,7 @@ impl<'a> ReferenceEngine<'a> {
             candidates.extend(prepared.candidate_files().iter().cloned());
         }
         if self.cancellation.is_cancelled() {
-            return cancelled_query_result();
+            return Err(Box::new(cancelled_query_result()));
         }
         // Protected files are everything discovered so far; the supplemental files join
         // only afterwards, so both budgets below drop them before touching anything here.
@@ -320,7 +385,7 @@ impl<'a> ReferenceEngine<'a> {
             protected_candidates.retain(|file| !self.cancellation.is_cancelled() && filter(file));
         }
         if self.cancellation.is_cancelled() {
-            return cancelled_query_result();
+            return Err(Box::new(cancelled_query_result()));
         }
 
         let all_candidates = candidates.clone();
@@ -346,7 +411,7 @@ impl<'a> ReferenceEngine<'a> {
                 &self.cancellation,
             );
         if source_admission_cancelled {
-            return cancelled_query_result();
+            return Err(Box::new(cancelled_query_result()));
         }
         candidates = admitted;
         let candidate_files_truncated = candidates.len() < all_candidates.len();
@@ -362,29 +427,87 @@ impl<'a> ReferenceEngine<'a> {
             candidate_files_sample,
         };
 
-        drop(_cand_scope);
-        let explicit_candidates = explicit_provider
-            .and_then(CandidateFileProvider::explicit_candidate_files)
-            .map(|files| {
-                files
-                    .intersection(&admitted_query.candidate_files)
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            });
-        let scan_scope =
-            UsageScanScope::with_cancellation(&admitted_query.candidate_files, &self.cancellation)
-                .with_explicit_candidates(explicit_candidates.as_ref())
-                .with_test_inclusion(self.excluded_test_files.is_none());
-        let _graph_scope = crate::profiling::scope("usages::graph_find_usages");
-        let outcome = graph_find_usages(
-            language_for_target(target),
-            analyzer,
-            overloads,
-            &scan_scope,
-            prepared.as_deref(),
-            max_usages,
-        );
-        finalize_graph_usage_query(outcome, &self.cancellation, admitted_query, strategy)
+        Ok((admitted_query, prepared))
+    }
+
+    /// Independent target queries sharing a language's file walk when supported.
+    pub(crate) fn query_batch_with_source_budget(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        targets: &[CodeUnit],
+        max_files: usize,
+        max_usages: usize,
+        max_source_bytes: usize,
+    ) -> Vec<QueryResult> {
+        let _scope = AnalyzerQueryScope::with_cancellation(analyzer, &self.cancellation);
+        let mut answers: Vec<Option<QueryResult>> = (0..targets.len()).map(|_| None).collect();
+        let mut groups: crate::hash::HashMap<Language, Vec<_>> = crate::hash::HashMap::default();
+        for (index, target) in targets.iter().enumerate() {
+            match self.admit_query(
+                analyzer,
+                std::slice::from_ref(target),
+                None,
+                max_files,
+                Some(max_source_bytes),
+            ) {
+                Ok(query) => {
+                    groups
+                        .entry(language_for_target(target))
+                        .or_default()
+                        .push((index, query));
+                }
+                Err(result) => answers[index] = Some(*result),
+            }
+        }
+        for (language, admitted) in groups {
+            let queries: Vec<_> = admitted
+                .iter()
+                .map(|(target_index, (query, prepared))| GraphUsageBatchQuery {
+                    overloads: std::slice::from_ref(&targets[*target_index]),
+                    scope: UsageScanScope::with_cancellation(
+                        &query.candidate_files,
+                        &self.cancellation,
+                    )
+                    .with_test_inclusion(self.excluded_test_files.is_none())
+                    .with_unproven_limit(self.max_unproven),
+                    prepared: prepared.as_deref(),
+                })
+                .collect();
+            let outcomes = match language_support(language) {
+                Some(support) => support
+                    .reference_plugin()
+                    .target_strategy()
+                    .find_graph_usages_batch(analyzer, &queries, max_usages),
+                None => queries
+                    .iter()
+                    .map(|query| {
+                        graph_find_usages(
+                            language,
+                            analyzer,
+                            query.overloads,
+                            &query.scope,
+                            query.prepared,
+                            max_usages,
+                        )
+                    })
+                    .collect(),
+            };
+            assert_eq!(outcomes.len(), admitted.len());
+            for ((target_index, (query, _)), outcome) in admitted.into_iter().zip(outcomes) {
+                let strategy = language_support(language)
+                    .map(|support| support.reference_plugin().target_strategy());
+                answers[target_index] = Some(finalize_graph_usage_query(
+                    outcome,
+                    &self.cancellation,
+                    query,
+                    strategy,
+                ));
+            }
+        }
+        answers
+            .into_iter()
+            .map(|answer| answer.expect("every target has a query result"))
+            .collect()
     }
 
     pub fn find_usages(
@@ -407,7 +530,8 @@ impl<'a> ReferenceEngine<'a> {
     }
 }
 
-fn finalize_graph_usage_query(
+#[doc(hidden)]
+pub fn finalize_graph_usage_query(
     outcome: GraphUsageOutcome,
     cancellation: &CancellationToken,
     admitted_query: AdmittedUsageQuery,
@@ -581,7 +705,8 @@ fn sorted_files(files: &HashSet<ProjectFile>) -> Vec<ProjectFile> {
         .collect()
 }
 
-fn graph_strategy_find_usages(
+#[doc(hidden)]
+pub fn graph_strategy_find_usages(
     strategy: &dyn GraphUsageAnalyzer,
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
@@ -624,12 +749,10 @@ fn graph_find_usages(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::{
-        CodeUnitType, EmptyAnalyzer, FileSetProject, Project, ProjectFile, RubyAnalyzer,
-    };
-    use crate::inline_project::InlineTestProject;
+
+    use crate::analyzer::{CodeUnitType, EmptyAnalyzer, FileSetProject, Project, ProjectFile};
 
     use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
@@ -725,342 +848,8 @@ mod tests {
         assert!(result.candidate_files.is_empty());
         assert!(result.result.all_hits_including_imports().is_empty());
     }
-
-    struct CancellingRubyGraphStrategy {
-        delegate: crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy,
-        cancellation: CancellationToken,
-    }
-
-    impl GraphUsageAnalyzer for CancellingRubyGraphStrategy {
-        fn find_graph_usages(
-            &self,
-            analyzer: &dyn IAnalyzer,
-            overloads: &[CodeUnit],
-            scan_scope: &UsageScanScope<'_>,
-            max_usages: usize,
-        ) -> GraphUsageOutcome {
-            let outcome = self
-                .delegate
-                .find_graph_usages(analyzer, overloads, scan_scope, max_usages);
-            self.cancellation.cancel();
-            outcome
-        }
-    }
-
-    #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "5258690d40b2: graph cancellation discarded proven hits already found in the admitted scope"
-    )]
-    fn graph_cancellation_preserves_proven_hits_and_the_admitted_scope() {
-        let fixture = InlineTestProject::with_language(Language::Ruby)
-            .file(
-                "Gemfile",
-                "source \"https://rubygems.org\"\ngem \"rails\"\n",
-            )
-            .file(
-                "app/models/user.rb",
-                "class User\n  def self.build\n    new\n  end\nend\n",
-            )
-            .file(
-                "app/controllers/caller_controller.rb",
-                "class CallerController\n  def show\n    User.build\n  end\nend\n",
-            )
-            .build();
-        let analyzer = RubyAnalyzer::from_project(fixture.project().clone());
-        let target_file = fixture.file("app/models/user.rb");
-        let target = analyzer
-            .declarations(&target_file)
-            .into_iter()
-            .find(|unit| unit.identifier() == "build")
-            .expect("fixture declares User.build");
-        let candidate_files = HashSet::from_iter(analyzer.analyzed_files());
-        let strategy = crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy::new();
-        let complete_cancellation = CancellationToken::new();
-
-        let complete_outcome = graph_strategy_find_usages(
-            &strategy,
-            &analyzer,
-            std::slice::from_ref(&target),
-            &UsageScanScope::with_cancellation(&candidate_files, &complete_cancellation),
-            None,
-            DEFAULT_MAX_USAGES,
-        );
-        let complete_hits = match &complete_outcome {
-            GraphUsageOutcome::Resolved(result) => result.all_hits_including_imports(),
-            other => panic!("uncancelled production resolver failed: {other:?}"),
-        };
-        assert!(
-            !complete_hits.is_empty(),
-            "fixture must prove User.build usage"
-        );
-        assert!(
-            complete_hits
-                .iter()
-                .all(|hit| hit.proof == crate::analyzer::usages::model::UsageProof::Proven)
-        );
-        let complete = finalize_graph_usage_query(
-            complete_outcome,
-            &complete_cancellation,
-            AdmittedUsageQuery {
-                candidate_files: candidate_files.clone(),
-                candidate_files_truncated: false,
-                candidate_files_budget_exhausted: false,
-                source_bytes_truncated: false,
-                scanned_source_bytes: 0,
-                candidate_files_sample: None,
-            },
-            Some(&strategy),
-        );
-        assert_eq!(complete.completion, UsageQueryCompletion::Complete);
-        assert_eq!(complete.proof_authority, UsageProofAuthority::Legacy);
-
-        let cancellation = CancellationToken::new();
-        let cancelling_strategy = CancellingRubyGraphStrategy {
-            delegate: strategy,
-            cancellation: cancellation.clone(),
-        };
-        let outcome = graph_strategy_find_usages(
-            &cancelling_strategy,
-            &analyzer,
-            std::slice::from_ref(&target),
-            &UsageScanScope::with_cancellation(&candidate_files, &cancellation),
-            None,
-            DEFAULT_MAX_USAGES,
-        );
-        let result = finalize_graph_usage_query(
-            outcome,
-            &cancellation,
-            AdmittedUsageQuery {
-                candidate_files: candidate_files.clone(),
-                candidate_files_truncated: false,
-                candidate_files_budget_exhausted: false,
-                source_bytes_truncated: false,
-                scanned_source_bytes: 0,
-                candidate_files_sample: None,
-            },
-            Some(&cancelling_strategy),
-        );
-
-        assert_eq!(result.completion, UsageQueryCompletion::Cancelled);
-        assert_eq!(result.candidate_files, candidate_files);
-        assert_eq!(result.result.all_hits_including_imports(), complete_hits);
-        assert_eq!(result.proof_authority, UsageProofAuthority::Legacy);
-    }
-
-    fn write_fixture(root: &std::path::Path, files: &[(&str, &str)]) {
-        for (rel, content) in files {
-            ProjectFile::new(root.to_path_buf(), rel)
-                .write(content)
-                .unwrap_or_else(|err| panic!("write {rel}: {err}"));
-        }
-    }
-
-    fn augmentation_of(
-        analyzer: &dyn IAnalyzer,
-        target: &CodeUnit,
-    ) -> crate::analyzer::languages::CandidateAugmentation {
-        candidate_augmentation(&CandidateCtx {
-            analyzer,
-            target,
-            cancellation: &CancellationToken::default(),
-        })
-        .expect("fixture target's language augments its candidates")
-    }
-
-    fn default_route_candidates(
-        analyzer: &dyn IAnalyzer,
-        target: &CodeUnit,
-    ) -> HashSet<ProjectFile> {
-        let uncancelled = CancellationToken::default();
-        find_default_candidates_within(
-            target,
-            analyzer,
-            &DescendantIndexScope::whole_workspace(&uncancelled),
-        )
-    }
-
-    fn php_composer_fixture() -> (tempfile::TempDir, crate::analyzer::PhpAnalyzer, CodeUnit) {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonicalize temp dir");
-        let mut files = vec![
-            (
-                "composer.json".to_string(),
-                r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#.to_string(),
-            ),
-            (
-                "src/Domain/Service.php".to_string(),
-                "<?php\nnamespace App\\Domain;\n\nclass Service {\n    public function run(): void {}\n}\n".to_string(),
-            ),
-            (
-                "src/Http/Controller.php".to_string(),
-                "<?php\nnamespace App\\Http;\n\nuse App\\Domain\\Service;\n\nclass Controller {\n    public function handle(Service $service): void {\n        $service->run();\n    }\n}\n".to_string(),
-            ),
-        ];
-        for index in 0..6 {
-            files.push((
-                format!("src/Unrelated/Widget{index}.php"),
-                format!(
-                    "<?php\nnamespace App\\Unrelated;\n\nclass Widget{index} {{\n    public function tick(): void {{}}\n}}\n"
-                ),
-            ));
-        }
-        let borrowed: Vec<(&str, &str)> = files
-            .iter()
-            .map(|(rel, content)| (rel.as_str(), content.as_str()))
-            .collect();
-        write_fixture(&root, &borrowed);
-
-        let analyzer = crate::analyzer::PhpAnalyzer::from_project(
-            crate::analyzer::TestProject::new(root.clone(), Language::Php),
-        );
-        let target = analyzer
-            .declarations(&ProjectFile::new(root, "src/Domain/Service.php"))
-            .into_iter()
-            .find(|unit| unit.is_class())
-            .expect("fixture declares the Service class");
-        (temp, analyzer, target)
-    }
-
-    #[test]
-    fn a_protected_augmentation_survives_the_file_count_budget() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonicalize temp dir");
-        write_fixture(
-            &root,
-            &[
-                (
-                    "Cargo.toml",
-                    "[package]\nname = \"pinned\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
-                ),
-                (
-                    "src/lib.rs",
-                    "pub mod aapp;\npub mod reexport;\npub mod target;\n",
-                ),
-                ("src/target.rs", "pub fn collect_it() -> i32 {\n    1\n}\n"),
-                ("src/reexport.rs", "pub use crate::target::collect_it;\n"),
-                ("src/aapp/mod.rs", "pub mod caller;\n"),
-                (
-                    "src/aapp/caller.rs",
-                    "use crate::reexport::collect_it;\n\npub fn call_it() -> i32 {\n    collect_it()\n}\n",
-                ),
-            ],
-        );
-
-        let analyzer = crate::analyzer::RustAnalyzer::from_project(
-            crate::analyzer::TestProject::new(root.clone(), Language::Rust),
-        );
-        let target = analyzer
-            .declarations(&ProjectFile::new(root.clone(), "src/target.rs"))
-            .into_iter()
-            .find(|unit| unit.identifier() == "collect_it")
-            .expect("fixture declares collect_it");
-
-        let routed = default_route_candidates(&analyzer, &target);
-        let caller = ProjectFile::new(root, "src/aapp/caller.rs");
-        assert!(
-            !routed.contains(&caller),
-            "the fixture must require Rust's binding graph: routed={routed:?}"
-        );
-
-        let result = UsageFinder::new().query(
-            &analyzer,
-            std::slice::from_ref(&target),
-            routed.len(),
-            DEFAULT_MAX_USAGES,
-        );
-
-        assert_eq!(
-            result.completion,
-            UsageQueryCompletion::CandidateFilesBudgetExhausted
-        );
-        assert_eq!(result.candidate_files.len(), routed.len());
-        assert!(
-            result.candidate_files.contains(&caller),
-            "{caller:?} was dropped although it is protected: {:?}",
-            result.candidate_files
-        );
-    }
-
-    #[test]
-    fn b_a_supplemental_augmentation_is_dropped_first_by_the_file_count_budget() {
-        let (_temp, analyzer, target) = php_composer_fixture();
-
-        let routed = default_route_candidates(&analyzer, &target);
-        let augmentation = augmentation_of(&analyzer, &target);
-        assert!(augmentation.protected.is_empty());
-        let supplemental_only: HashSet<ProjectFile> = augmentation
-            .supplemental
-            .difference(&routed)
-            .cloned()
-            .collect();
-        assert!(
-            supplemental_only
-                .iter()
-                .any(|file| file.rel_path().starts_with("src/Unrelated")),
-            "composer autoload visibility must expand to the unrelated files: {:?}",
-            augmentation.supplemental
-        );
-
-        let result = UsageFinder::new().query(
-            &analyzer,
-            std::slice::from_ref(&target),
-            routed.len(),
-            DEFAULT_MAX_USAGES,
-        );
-
-        assert_eq!(
-            result.completion,
-            UsageQueryCompletion::CandidateFilesBudgetExhausted
-        );
-        assert_eq!(
-            result.candidate_files, routed,
-            "the budget must keep exactly the protected set"
-        );
-        for file in &supplemental_only {
-            assert!(!result.candidate_files.contains(file), "{file:?} survived");
-        }
-    }
-
-    #[test]
-    fn c_cancellation_during_a_supplemental_augmentation_abandons_the_query() {
-        let (_temp, analyzer, target) = php_composer_fixture();
-
-        let complete = UsageFinder::new().query(
-            &analyzer,
-            std::slice::from_ref(&target),
-            DEFAULT_MAX_FILES,
-            DEFAULT_MAX_USAGES,
-        );
-        assert_eq!(complete.completion, UsageQueryCompletion::Complete);
-        assert!(!complete.candidate_files.is_empty());
-
-        let mut cancelled = 0usize;
-        for checks in 1..=400 {
-            let result = UsageFinder::new()
-                .with_cancellation(CancellationToken::cancel_after_checks_for_test(checks))
-                .query(
-                    &analyzer,
-                    std::slice::from_ref(&target),
-                    DEFAULT_MAX_FILES,
-                    DEFAULT_MAX_USAGES,
-                );
-            if result.completion != UsageQueryCompletion::Cancelled {
-                continue;
-            }
-            if result.candidate_files.is_empty() {
-                cancelled += 1;
-                assert!(!result.candidate_files_truncated);
-                assert!(result.result.all_hits_including_imports().is_empty());
-                continue;
-            }
-            assert_eq!(
-                result.candidate_files, complete.candidate_files,
-                "a cancelled query reported a half-expanded scope at checks={checks}"
-            );
-        }
-        assert!(
-            cancelled > 0,
-            "the sweep must reach the discovery-time cancellation window"
-        );
-    }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;

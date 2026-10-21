@@ -274,10 +274,10 @@ fn package_identity_shares_structured_path_with_native_segments() {
         &source[package_site.start_byte..package_site.end_byte],
         "@Anno(value=) package p /* package */ . q;"
     );
-    assert!(!facts.gaps.contains(&ResolutionGapFact {
-        site: package_declaration,
-        kind: ResolutionGapKind::UnsupportedRoute,
-    }));
+    assert!(
+        !facts.gaps.iter().any(|gap| gap.site == package_declaration
+            && gap.kind == ResolutionGapKind::UnsupportedRoute)
+    );
     assert_eq!(
         facts
             .package_segments
@@ -307,10 +307,10 @@ fn package_identity_shares_structured_path_with_native_segments() {
         .iter()
         .find(|site| &source[site.start_byte..site.end_byte] == "@Anno(value=)")
         .expect("package annotation site");
-    assert!(facts.gaps.contains(&ResolutionGapFact {
-        site: annotation.id,
-        kind: ResolutionGapKind::MalformedSyntax,
-    }));
+    assert!(facts.gaps.contains(&ResolutionGapFact::new(
+        annotation.id,
+        ResolutionGapKind::MalformedSyntax
+    )));
 }
 
 #[test]
@@ -437,12 +437,13 @@ import late.;
                 && &source[site.start_byte..site.end_byte] == "import late.Valid;"
         })
         .expect("late valid import native site");
-    assert!(parsed.resolution_facts.gaps.contains(
-        &brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapFact {
-            site: late_site.id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }
-    ));
+    assert!(
+        parsed
+            .resolution_facts
+            .gaps
+            .iter()
+            .any(|gap| gap.site == late_site.id && gap.kind == ResolutionGapKind::UnsupportedRoute)
+    );
     let malformed_site = parsed
         .resolution_facts
         .sites
@@ -452,11 +453,8 @@ import late.;
                 && &source[site.start_byte..site.end_byte] == "import broken.;"
         })
         .expect("malformed import native site");
-    assert!(parsed.resolution_facts.gaps.contains(
-        &brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapFact {
-            site: malformed_site.id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }
+    assert!(parsed.resolution_facts.gaps.iter().any(
+        |gap| gap.site == malformed_site.id && gap.kind == ResolutionGapKind::UnsupportedRoute
     ));
     let late_malformed_site = parsed
         .resolution_facts
@@ -467,12 +465,14 @@ import late.;
                 && &source[site.start_byte..site.end_byte] == "import late.;"
         })
         .expect("late malformed import native site");
-    assert!(parsed.resolution_facts.gaps.contains(
-        &brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapFact {
-            site: late_malformed_site.id,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }
-    ));
+    assert!(
+        parsed
+            .resolution_facts
+            .gaps
+            .iter()
+            .any(|gap| gap.site == late_malformed_site.id
+                && gap.kind == ResolutionGapKind::UnsupportedRoute)
+    );
 }
 
 #[test]

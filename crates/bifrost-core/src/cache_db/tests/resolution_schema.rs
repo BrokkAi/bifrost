@@ -2487,7 +2487,19 @@ fn unit_summary_profile_migration_preserves_rust_and_rebinds_go() {
          INSERT INTO rust_resolution_unit_summary_versions
          VALUES(printf('%064d',1),'rust',0,zeroblob(32),1,1,NULL,1);"
     ).unwrap();
-    migrate(&mut upgraded).unwrap();
+    // Migration 190 deliberately retires Rust summaries so they re-derive
+    // with shared placements. Stop before it to keep this test pinned to the
+    // #5147 profile invariant: later migrations that retire a language are
+    // tested by their own migration test.
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > 181 && migration.version < 190)
+    {
+        upgraded.execute_batch(migration.sql).unwrap();
+        upgraded
+            .pragma_update(None, "user_version", migration.version)
+            .unwrap();
+    }
     assert_eq!(upgraded.query_row(
         "SELECT count(*) FROM resolution_unit_summary_versions WHERE lang='rust' AND profile_digest=zeroblob(32)",
         [], |row| row.get::<_, i64>(0),
@@ -2544,6 +2556,9 @@ fn unit_summary_profile_migration_preserves_rust_and_rebinds_go() {
         0,
         "the extended Rust foreign key must still cascade"
     );
+    // Finish the chain so the schema-identity assertion below covers the
+    // current shape; 190 retires the Rust header this test no longer needs.
+    migrate(&mut upgraded).unwrap();
 
     for conn in [upgraded, open_in_memory_cache()] {
         conn.execute(

@@ -137,7 +137,11 @@ pub struct OpenPackSelection {
     pub rejections: Vec<Value>,
     pub inventory: PackInventorySnapshot,
     pub semantic_bundle_root: Option<PathBuf>,
-    pub policy_pack_root: PathBuf,
+    /// The catalog rules root, for a root release consumed as a catalog.
+    pub policy_pack_root: Option<PathBuf>,
+    /// The extracted policy bundle, for a root release that requires the
+    /// premium-policy-zip host route. Exactly one of the two roots is set.
+    pub policy_bundle_root: Option<PathBuf>,
     pub semantic_cache_root: PathBuf,
     pub receipt_path: PathBuf,
     pub cache_reused: bool,
@@ -709,12 +713,7 @@ impl SchemaSet {
 
     fn validate(&self, label: &str) -> Result<(), OpenPackError> {
         for (axis, versions) in self.axes() {
-            ensure_unique(versions, &format!("{label}.{axis}"))?;
-            if versions.contains(&0) {
-                return Err(OpenPackError::manifest(format!(
-                    "{label}.{axis} contains schema version zero"
-                )));
-            }
+            validate_version_set(versions, &format!("{label}.{axis}"))?;
         }
         Ok(())
     }
@@ -787,7 +786,37 @@ struct ReleaseContent {
     content_version: Option<String>,
     #[serde(default)]
     completeness: Option<String>,
+    /// Manifest schema 3: the host formats this content needs, separate from
+    /// the engine schema axes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_schemas: Option<HostSchemaSet>,
 }
+
+/// The host-facing schema axes of manifest schema 3 (bifrost-packs
+/// release-contract `host-schema-set`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostSchemaSet {
+    policy_bundle: Vec<u32>,
+}
+
+/// Manifest schema 3 release-level host requirements (bifrost-packs
+/// release-contract `host-compatibility`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostCompatibility {
+    contract_version: u32,
+    schemas: HostSchemaSet,
+    required_routes: Vec<String>,
+}
+
+/// The policy-bundle formats this acquirer's host consumes: the extracted
+/// bundle is exported as `BIFROST_POLICY_BUNDLE_ROOT` and verified by
+/// bifrost-policy, whose bundle schema this must equal.
+pub const HOST_POLICY_BUNDLE_SCHEMA_VERSIONS: &[u32] = &[1];
+/// The release route whose extraction is exported as a policy bundle root.
+pub const PREMIUM_POLICY_ZIP_ROUTE: &str = "premium-policy-zip";
+const HOST_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -925,6 +954,9 @@ struct PackReleaseV2 {
     release_dependencies: Vec<ReleaseDependency>,
     #[serde(default)]
     provenance: Option<Provenance>,
+    /// Required in manifest schema 3 and absent in schema 2.
+    #[serde(default)]
+    host_compatibility: Option<HostCompatibility>,
 }
 
 #[derive(Debug, Clone)]
@@ -944,6 +976,7 @@ struct PackRelease {
     qualification_v2: Option<QualificationV2>,
     release_dependencies: Vec<ReleaseDependency>,
     provenance: Option<Provenance>,
+    host_compatibility: Option<HostCompatibility>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1820,12 +1853,17 @@ fn prepare_selected_set(
             inspect_archive_format(&archive.path, &archive.artifact.format, Some(&destination))?;
         verify_manifest_contents(&release.manifest, &destination)?;
         if *release_index == root_index {
-            if files.iter().any(|file| !file.path.starts_with("rules/")) {
-                return Err(OpenPackError::integrity(
-                    "root policy archive contains files outside rules/",
-                ));
-            }
+            // Every root content entry lies beneath rules/
+            // (validate_rules_source_contents), and only rules/ is exported.
+            // A public source archive also carries its README, licenses,
+            // docs and fixtures; the manifest pins the whole archive's digest.
             require_real_directory(&destination.join("rules"), "policy pack root")?;
+            if requires_policy_bundle_route(&release.manifest) {
+                require_regular_file(
+                    &destination.join("policy-bundle.json"),
+                    "policy bundle index",
+                )?;
+            }
         } else if has_native_artifact(&release.manifest) {
             require_regular_file(
                 &destination
@@ -1908,10 +1946,17 @@ fn content_artifact(manifest: &PackRelease, root: bool) -> Result<&ReleaseArtifa
     } else {
         ArtifactRole::Native
     };
-    let mut matches = manifest
-        .artifacts
-        .iter()
-        .filter(|artifact| artifact.role == role && is_archive_format(&artifact.format));
+    // A root without a policy archive carries its content in its one source
+    // tar.gz. A source ZIP beside it is an attachment, such as the smoke
+    // evidence archive that bifrost-packs adds to qualified rules releases.
+    let mut matches = manifest.artifacts.iter().filter(|artifact| {
+        artifact.role == role
+            && if role == ArtifactRole::Source {
+                artifact.format == "tar.gz"
+            } else {
+                is_archive_format(&artifact.format)
+            }
+    });
     let first = matches.next().ok_or_else(|| {
         OpenPackError::manifest(format!(
             "release {}@{} has no archive artifact for role {role:?}",
@@ -1941,6 +1986,8 @@ fn selection_result(
         .iter()
         .find(|index| has_native_artifact(&inventory.releases[**index].manifest))
         .map(|index| inventory.releases[*index].manifest.pack.id.as_str());
+    let bundle_root =
+        requires_policy_bundle_route(&inventory.releases[selected.root_index].manifest);
     OpenPackSelection {
         selection_id: selection_id.to_owned(),
         selection_reason: selected.selection_reason.to_owned(),
@@ -1953,7 +2000,8 @@ fn selection_result(
         semantic_bundle_root: native_dependency.map(|pack_id| {
             selection_root.join(format!("dependency-{pack_id}/bifrost-semantic-packs"))
         }),
-        policy_pack_root: selection_root.join("root/rules"),
+        policy_pack_root: (!bundle_root).then(|| selection_root.join("root/rules")),
+        policy_bundle_root: bundle_root.then(|| selection_root.join("root")),
         semantic_cache_root: root.join(CACHE_CATALOG_DIRECTORY),
         receipt_path,
         cache_reused,
@@ -2591,21 +2639,40 @@ fn parse_release_manifest_for_source(
                 qualification_v2: None,
                 release_dependencies: value.release_dependencies,
                 provenance: None,
+                host_compatibility: None,
             }
         }
-        2 => {
+        version @ (2 | 3) => {
             let value = serde_json::from_slice::<PackReleaseV2>(bytes).map_err(|error| {
-                OpenPackError::manifest(format!("invalid schema 2 release manifest: {error}"))
+                OpenPackError::manifest(format!(
+                    "invalid schema {version} release manifest: {error}"
+                ))
             })?;
-            if value.manifest_schema_version != 2 {
-                return Err(OpenPackError::manifest(
-                    "release schema version does not match schema 2",
-                ));
+            if value.manifest_schema_version != version {
+                return Err(OpenPackError::manifest(format!(
+                    "release schema version does not match schema {version}"
+                )));
+            }
+            // Schema 3 adds the host scope; schema 2 must not carry it.
+            let has_host_scope = value.host_compatibility.is_some()
+                || value
+                    .contents
+                    .iter()
+                    .any(|content| content.host_schemas.is_some());
+            let complete_host_scope = value.host_compatibility.is_some()
+                && value
+                    .contents
+                    .iter()
+                    .all(|content| content.host_schemas.is_some());
+            if (version == 2 && has_host_scope) || (version == 3 && !complete_host_scope) {
+                return Err(OpenPackError::manifest(format!(
+                    "schema {version} release manifest has the wrong host compatibility scope"
+                )));
             }
             let qualification = serde_json::to_value(&value.qualification)
                 .expect("qualification serialization cannot fail");
             PackRelease {
-                schema_version: 2,
+                schema_version: version,
                 pack: value.pack,
                 release_version: value.release_version,
                 source: value.source,
@@ -2620,6 +2687,7 @@ fn parse_release_manifest_for_source(
                 qualification_v2: Some(value.qualification),
                 release_dependencies: value.release_dependencies,
                 provenance: value.provenance,
+                host_compatibility: value.host_compatibility,
             }
         }
         version => {
@@ -2636,6 +2704,67 @@ fn parse_json_value(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     // serde_json's default recursion limit is 128, matching the launcher
     // reader's strict JSON limit.
     serde_json::from_slice(bytes)
+}
+
+/// The schema 3 rules of bifrost-packs release-contract `release.py`: a
+/// closed contract-1 object, known routes, content host schemas within the
+/// release declaration, and a release declaration equal to their union.
+fn validate_host_compatibility(
+    host: &HostCompatibility,
+    contents: &[ReleaseContent],
+) -> Result<(), OpenPackError> {
+    if host.contract_version != HOST_CONTRACT_VERSION {
+        return Err(OpenPackError::manifest(
+            "unsupported host compatibility contract version",
+        ));
+    }
+    validate_version_set(
+        &host.schemas.policy_bundle,
+        "host_compatibility.schemas.policy_bundle",
+    )?;
+    validate_string_set(&host.required_routes, "host_compatibility.required_routes")?;
+    if host
+        .required_routes
+        .iter()
+        .any(|route| route != PREMIUM_POLICY_ZIP_ROUTE)
+    {
+        return Err(OpenPackError::manifest(format!(
+            "unknown host route in {:?}",
+            host.required_routes
+        )));
+    }
+    let mut union = BTreeSet::new();
+    for content in contents {
+        let schemas = content
+            .host_schemas
+            .as_ref()
+            .expect("schema 3 contents carry host schemas");
+        validate_version_set(&schemas.policy_bundle, "content.host_schemas.policy_bundle")?;
+        if schemas
+            .policy_bundle
+            .iter()
+            .any(|version| !host.schemas.policy_bundle.contains(version))
+        {
+            return Err(OpenPackError::manifest(format!(
+                "content {} requires a host schema absent from the release declaration",
+                content.identity
+            )));
+        }
+        union.extend(schemas.policy_bundle.iter().copied());
+    }
+    if union
+        != host
+            .schemas
+            .policy_bundle
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    {
+        return Err(OpenPackError::manifest(
+            "host compatibility schemas must equal the content host schema union",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_release_manifest(
@@ -2668,6 +2797,9 @@ fn validate_release_manifest(
                 "release engine compatibility range is empty",
             ));
         }
+    }
+    if let Some(host) = &manifest.host_compatibility {
+        validate_host_compatibility(host, &manifest.contents)?;
     }
     let required_capabilities = manifest
         .capabilities
@@ -2793,7 +2925,7 @@ fn validate_release_manifest(
                 ));
             }
         }
-        (2, None, Some(qualification)) => {
+        (2 | 3, None, Some(qualification)) => {
             let integrity_status = qualification.integrity.status.as_str();
             let behavior_status = qualification.behavior.status.as_str();
             if !["pending", "verified", "failed"].contains(&integrity_status)
@@ -2843,7 +2975,7 @@ fn validate_release_manifest(
                 "release manifest repeats an exact dependency",
             ));
         }
-        if manifest.schema_version == 2 {
+        if manifest.schema_version >= 2 {
             let key = (dependency.pack_id.as_str(), dependency.repository.as_str());
             if dependency_versions
                 .insert(key, dependency.release_version.as_str())
@@ -2908,6 +3040,16 @@ fn validate_capabilities(capabilities: &Capabilities, label: &str) -> Result<(),
     }
     validate_string_set(&capabilities.required, &format!("{label}.required"))?;
     validate_string_set(&capabilities.provided, &format!("{label}.provided"))
+}
+
+fn validate_version_set(versions: &[u32], label: &str) -> Result<(), OpenPackError> {
+    ensure_unique(versions, label)?;
+    if versions.contains(&0) {
+        return Err(OpenPackError::manifest(format!(
+            "{label} contains schema version zero"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_string_set(values: &[String], label: &str) -> Result<(), OpenPackError> {
@@ -3134,8 +3276,12 @@ fn release_compatible(manifest: &PackRelease, profile: &EngineProfile) -> bool {
     incompatibility_detail(manifest, profile).is_none()
 }
 
+/// Whole-release admission: the engine range, the capability contract version
+/// and every schema axis. A capability the engine does not provide does not
+/// reject the release. Each policy declares its own required capabilities, and
+/// policy evaluation reports a policy whose capabilities the engine lacks as
+/// not run with the missing names, so the rest of the release still runs.
 fn incompatibility_detail(manifest: &PackRelease, profile: &EngineProfile) -> Option<String> {
-    let mut missing_capabilities = BTreeSet::new();
     let mut unsupported_schema_axes = Vec::<(String, Vec<u32>, Vec<u32>)>::new();
     let mut engine_range_mismatch = false;
     if let Some(range) = &manifest.engine_range {
@@ -3154,11 +3300,6 @@ fn incompatibility_detail(manifest: &PackRelease, profile: &EngineProfile) -> Op
     }
     let contract_mismatch =
         manifest.capabilities.contract_version != profile.capability_contract_version;
-    for capability in &manifest.capabilities.required {
-        if !profile.capabilities.contains(capability) {
-            missing_capabilities.insert(capability.as_str());
-        }
-    }
     collect_unsupported_schema_axes(
         "release",
         &manifest.compatibility_schemas,
@@ -3166,11 +3307,6 @@ fn incompatibility_detail(manifest: &PackRelease, profile: &EngineProfile) -> Op
         &mut unsupported_schema_axes,
     );
     for content in &manifest.contents {
-        for capability in &content.required_capabilities {
-            if !profile.capabilities.contains(capability) {
-                missing_capabilities.insert(capability.as_str());
-            }
-        }
         collect_unsupported_schema_axes(
             &format!("content:{}", content.path),
             &content.schemas,
@@ -3178,15 +3314,24 @@ fn incompatibility_detail(manifest: &PackRelease, profile: &EngineProfile) -> Op
             &mut unsupported_schema_axes,
         );
     }
-    if missing_capabilities.is_empty()
-        && unsupported_schema_axes.is_empty()
+    // Schema 3 host admission: this acquirer provides the premium-policy-zip
+    // route, the only route a valid manifest can name, and consumes the
+    // policy-bundle formats in HOST_POLICY_BUNDLE_SCHEMA_VERSIONS.
+    let unsupported_host_schemas = manifest
+        .host_compatibility
+        .iter()
+        .flat_map(|host| host.schemas.policy_bundle.iter().copied())
+        .filter(|version| !HOST_POLICY_BUNDLE_SCHEMA_VERSIONS.contains(version))
+        .collect::<Vec<_>>();
+    if unsupported_schema_axes.is_empty()
+        && unsupported_host_schemas.is_empty()
         && !contract_mismatch
         && !engine_range_mismatch
     {
         None
     } else {
         Some(format!(
-            "missing capabilities {missing_capabilities:?}; unsupported schema axes {unsupported_schema_axes:?}; capability contract mismatch {contract_mismatch}; engine range mismatch {engine_range_mismatch}"
+            "unsupported schema axes {unsupported_schema_axes:?}; unsupported host policy_bundle schemas {unsupported_host_schemas:?}; capability contract mismatch {contract_mismatch}; engine range mismatch {engine_range_mismatch}"
         ))
     }
 }
@@ -3655,6 +3800,14 @@ fn inspect_candidate(
     Ok(dependency_indices)
 }
 
+fn requires_policy_bundle_route(manifest: &PackRelease) -> bool {
+    manifest.host_compatibility.as_ref().is_some_and(|host| {
+        host.required_routes
+            .iter()
+            .any(|route| route == PREMIUM_POLICY_ZIP_ROUTE)
+    })
+}
+
 fn has_native_artifact(manifest: &PackRelease) -> bool {
     manifest.artifacts.iter().any(|artifact| {
         artifact.role == ArtifactRole::Native && is_archive_format(&artifact.format)
@@ -4082,6 +4235,7 @@ pub fn acquisition_outcome(
                         "cache_reused": selection.cache_reused,
                         "receipt_path": selection.receipt_path,
                         "policy_pack_root": selection.policy_pack_root,
+                        "policy_bundle_root": selection.policy_bundle_root,
                         "semantic_bundle_root": selection.semantic_bundle_root,
                         "receipt": receipt,
                     },
@@ -5340,6 +5494,8 @@ mod tests {
         assert!(
             first
                 .policy_pack_root
+                .as_ref()
+                .expect("catalog root")
                 .join("fixture/manifest.json")
                 .is_file()
         );
@@ -5389,7 +5545,11 @@ mod tests {
         assert!(stale_selection.cache_reused);
         assert_eq!(stale_runtime_transport.call_count(), 1);
 
-        let policy_manifest_path = first.policy_pack_root.join("fixture/manifest.json");
+        let policy_manifest_path = first
+            .policy_pack_root
+            .as_ref()
+            .expect("catalog root")
+            .join("fixture/manifest.json");
         let policy_manifest_bytes = fs::read(&policy_manifest_path).expect("read extracted policy");
         fs::write(&policy_manifest_path, b"tampered extracted bytes")
             .expect("tamper extracted policy");
@@ -5594,8 +5754,7 @@ mod tests {
             dependencies: Vec::new(),
         });
         let mut manifest_value: Value = serde_json::from_slice(&bytes).unwrap();
-        manifest_value["compatibility"]["capabilities"]["required"] =
-            json!(["capability.absent-from-engine"]);
+        manifest_value["compatibility"]["schemas"]["rql"] = json!([999]);
         let manifest_bytes = serde_json::to_vec(&manifest_value).unwrap();
         let (manifest, raw_manifest) = parse_release_manifest(&manifest_bytes)
             .expect("well-formed but incompatible descriptor");

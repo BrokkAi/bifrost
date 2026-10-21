@@ -101,7 +101,7 @@ fn declarator_named<'a>(
     name: &str,
 ) -> tree_sitter::Node<'a> {
     let mut found = None;
-    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(root, true, |node| {
+    brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(root, true, |node| {
         if node.kind() == "variable_declarator"
             && node
                 .child_by_field_name("name")
@@ -613,7 +613,7 @@ fn free_this_scan_honors_cancellation() {
         )
         .expect("Java source must parse");
     let mut body = None;
-    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+    brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
         tree.root_node(),
         true,
         |node| {

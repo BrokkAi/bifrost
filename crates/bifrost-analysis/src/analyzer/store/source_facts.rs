@@ -5,16 +5,63 @@
 //! only external ids are the already-prepared code-unit keys in the
 //! declaration bridge.
 
-mod declaration_read;
+use super::Result;
+
+use super::StoreError;
+
+use super::usize_to_i64;
+
+use crate::CancellationToken;
+
+use crate::analyzer::store::structural_vocabulary::STRUCTURAL_FACTS_VERSION;
+
+use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationBoundary;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationPropertyFact;
+
+use brokk_bifrost_core::analyzer::rust_facts::RustValueConstructorProperties;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceImportId;
+
+use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+
+use brokk_bifrost_core::analyzer::CodeUnit;
+
+use brokk_bifrost_core::analyzer::ProjectFile;
+
+use brokk_bifrost_core::hash::HashMap;
+
+#[cfg(any(test, feature = "test-support"))]
+use rusqlite::Connection;
+
+use rusqlite::OptionalExtension;
+
+use rusqlite::Transaction;
+
+use rusqlite::params;
+
+#[doc(hidden)]
+pub mod declaration_read;
 mod declaration_visibility;
-mod import_read;
-pub(in crate::analyzer) mod rust_items;
+#[doc(hidden)]
+pub mod import_read;
+#[doc(hidden)]
+pub mod rust_items;
 
 pub(in crate::analyzer) use declaration_read::read_source_identity_rows;
+
 pub(in crate::analyzer) use import_read::read_source_imports;
 
-#[cfg(test)]
-mod cpp_tests;
 #[cfg(test)]
 mod declaration_visibility_tests;
 #[cfg(test)]
@@ -26,40 +73,12 @@ mod java_go_publication_tests;
 #[cfg(test)]
 mod java_tests;
 #[cfg(test)]
-mod js_ts_tests;
-#[cfg(test)]
-mod php_tests;
-#[cfg(test)]
-mod python_tests;
-#[cfg(test)]
-mod ruby_tests;
 #[cfg(test)]
 mod scala_tests;
-#[cfg(test)]
-mod source_import_path_tests;
 
-use crate::analyzer::structural::facts::STRUCTURAL_FACTS_VERSION;
-use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
-use brokk_bifrost_core::analyzer::rust_facts::{
-    RustDeclarationBoundary, RustDeclarationKind, RustDeclarationPropertyFact,
-    RustValueConstructorProperties,
-};
-use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
-use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
-use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceImportId};
-use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
-use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
-use brokk_bifrost_core::hash::HashMap;
-
-use crate::CancellationToken;
-#[cfg(test)]
-use rusqlite::Connection;
-use rusqlite::{OptionalExtension, Transaction, params};
-
-use super::{Result, StoreError, usize_to_i64};
-
-#[cfg(test)]
-pub(crate) fn assert_source_facts_match_across_mounts<T, F>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_source_facts_match_across_mounts<T, F>(
     store: &super::AnalyzerStore,
     generation: super::GenerationId,
     first_file: &ProjectFile,
@@ -85,8 +104,9 @@ where
     (first, second)
 }
 
-#[cfg(test)]
-pub(crate) fn assert_source_read_cancellation_retries<T>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_source_read_cancellation_retries<T>(
     mut read: impl FnMut(&dyn Fn() -> bool) -> Result<Option<T>>,
 ) {
     let visits = std::cell::Cell::new(0usize);
@@ -109,8 +129,9 @@ pub(crate) fn assert_source_read_cancellation_retries<T>(
     );
 }
 
-#[cfg(test)]
-pub(crate) fn assert_missing_then_republished<T>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_missing_then_republished<T>(
     read: impl Fn() -> Result<Option<T>>,
     republish: impl FnOnce() -> Result<()>,
 ) {
@@ -125,8 +146,9 @@ pub(crate) fn assert_missing_then_republished<T>(
     );
 }
 
-#[cfg(test)]
-pub(crate) fn assert_reader_rejects_tampering<T>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_reader_rejects_tampering<T>(
     tamper: impl FnOnce() -> Result<()>,
     read: impl FnOnce() -> Result<T>,
 ) {
@@ -134,8 +156,9 @@ pub(crate) fn assert_reader_rejects_tampering<T>(
     assert!(read().is_err(), "reader accepted tampered source facts");
 }
 
-#[cfg(test)]
-pub(crate) fn assert_source_lookup_plan(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_source_lookup_plan(
     store: &super::AnalyzerStore,
     explain: impl Fn(&Connection) -> Vec<String>,
     mut read_published: impl FnMut() -> bool,
@@ -165,7 +188,8 @@ pub(crate) fn assert_source_lookup_plan(
     }
 }
 
-pub(in crate::analyzer) fn source_occurrence(
+#[doc(hidden)]
+pub fn source_occurrence(
     value: i64,
     label: &str,
 ) -> Result<brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId> {
@@ -173,20 +197,24 @@ pub(in crate::analyzer) fn source_occurrence(
     Ok(brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId::new(value))
 }
 
-pub(in crate::analyzer) fn source_import(value: i64, label: &str) -> Result<SourceImportId> {
+#[doc(hidden)]
+pub fn source_import(value: i64, label: &str) -> Result<SourceImportId> {
     let value = checked_source_id(value, label, "source import")?;
     Ok(SourceImportId::new(value))
 }
 
-pub(in crate::analyzer) fn checked_source_id(value: i64, label: &str, kind: &str) -> Result<u32> {
+#[doc(hidden)]
+pub fn checked_source_id(value: i64, label: &str, kind: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| StoreError::new(format!("invalid {label} {kind} id {value}")))
 }
 
-pub(in crate::analyzer) fn nonnegative_usize(value: i64, label: &str) -> Result<usize> {
+#[doc(hidden)]
+pub fn nonnegative_usize(value: i64, label: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| StoreError::new(format!("invalid {label} value {value}")))
 }
 
-pub(in crate::analyzer) fn strict_bool(value: i64, label: &str) -> Result<bool> {
+#[doc(hidden)]
+pub fn strict_bool(value: i64, label: &str) -> Result<bool> {
     match value {
         0 => Ok(false),
         1 => Ok(true),
@@ -196,14 +224,16 @@ pub(in crate::analyzer) fn strict_bool(value: i64, label: &str) -> Result<bool> 
 
 /// Selected consumer view of one import's canonical token occurrences. The
 /// ordinal selects the import; ranges are output attributes, never lookup keys.
-#[cfg(test)]
-pub(crate) struct ImportSourceLocations {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct ImportSourceLocations {
     pub root_owned: bool,
     pub target: Option<brokk_bifrost_core::analyzer::structural::facts::Span>,
 }
 
-#[cfg(test)]
-pub(super) const IMPORT_SOURCE_LOCATIONS_SQL: &str = "
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const IMPORT_SOURCE_LOCATIONS_SQL: &str = "
     WITH requested AS MATERIALIZED (
       SELECT imports.*
       FROM blobs AS keys
@@ -230,7 +260,8 @@ pub(super) const IMPORT_SOURCE_LOCATIONS_SQL: &str = "
       ON target.blob_id = imports.blob_id
      AND target.occurrence_id = imports.target_occurrence_id";
 
-pub(super) const RUST_DECLARATION_PROPERTY_MANIFEST_SQL: &str =
+#[doc(hidden)]
+pub const RUST_DECLARATION_PROPERTY_MANIFEST_SQL: &str =
     "SELECT keys.blob_id, manifest.rust_declaration_property_count,
                     manifest.rust_constructor_field_count, manifest.declaration_unit_count
              FROM rust_published_fact_blobs AS keys
@@ -238,7 +269,8 @@ pub(super) const RUST_DECLARATION_PROPERTY_MANIFEST_SQL: &str =
              WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.generation = ?2
                AND manifest.facts_version = ?3";
 
-pub(super) const RUST_DECLARATION_PROPERTIES_SQL: &str =
+#[doc(hidden)]
+pub const RUST_DECLARATION_PROPERTIES_SQL: &str =
     "SELECT declaration_id, visibility, cfg_condition, constructor_non_exhaustive,
             declaration_kind, macro_exported, trait_impl_member,
             has_impl_or_trait_ancestor, nearest_declaration_boundary,
@@ -285,11 +317,13 @@ fn decode_rust_declaration_kind(kind: i64) -> Result<RustDeclarationKind> {
     })
 }
 
-pub(super) const RUST_CONSTRUCTOR_FIELDS_SQL: &str =
+#[doc(hidden)]
+pub const RUST_CONSTRUCTOR_FIELDS_SQL: &str =
     "SELECT declaration_id, ordinal, visibility FROM source_rust_constructor_fields
              WHERE blob_id = ?1 ORDER BY declaration_id, ordinal";
 
-pub(in crate::analyzer) const SOURCE_DECLARATION_UNITS_SQL: &str =
+#[doc(hidden)]
+pub const SOURCE_DECLARATION_UNITS_SQL: &str =
     "SELECT declaration_id, unit_key FROM source_declaration_units
              WHERE blob_id = ?1 ORDER BY declaration_id, unit_key";
 
@@ -298,7 +332,7 @@ pub(in crate::analyzer) const SOURCE_DECLARATION_UNITS_SQL: &str =
 // exact source range, so the range index this named was dropped. A production
 // point read of this shape would need the index back, because the blob-only
 // primary-key prefix enumerates every occurrence of the file.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) const RUST_PRIMARY_OCCURRENCES_AT_SQL: &str =
     "SELECT occurrence_id FROM source_occurrences
       WHERE blob_id = ?1 AND start_byte = ?2 AND end_byte = ?3
@@ -306,15 +340,17 @@ pub(super) const RUST_PRIMARY_OCCURRENCES_AT_SQL: &str =
 
 // Context-first access avoids enumerating every earlier source occurrence
 // and sorting the result when a populated store has no planner statistics.
-#[cfg(test)]
-pub(super) const RUST_PRIMARY_CONTEXTS_AT_SQL: &str = "SELECT context.occurrence_id
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const RUST_PRIMARY_CONTEXTS_AT_SQL: &str = "SELECT context.occurrence_id
        FROM source_rust_item_contexts AS context
       WHERE context.blob_id = ?1 AND context.provenance = 0
         AND context.start_byte <= ?2 AND ?2 < context.end_byte
       ORDER BY context.ordinal";
 
-#[cfg(test)]
-pub(super) const RUST_PRIMARY_CONTEXT_MANIFEST_SQL: &str = "SELECT keys.blob_id
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const RUST_PRIMARY_CONTEXT_MANIFEST_SQL: &str = "SELECT keys.blob_id
        FROM rust_published_fact_blobs AS keys
        JOIN source_fact_manifests AS manifest ON manifest.blob_id = keys.blob_id
        JOIN source_rust_item_manifests AS item ON item.blob_id = keys.blob_id
@@ -327,8 +363,9 @@ pub(super) const RUST_PRIMARY_CONTEXT_MANIFEST_SQL: &str = "SELECT keys.blob_id
 impl super::AnalyzerStore {
     /// Select query-side lexical context identities from canonical extents.
     /// Candidate declarations are joined by their source IDs, not these spans.
-    #[cfg(test)]
-    pub(crate) fn rust_primary_contexts_at(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn rust_primary_contexts_at(
         &self,
         oid: git2::Oid,
         generation: super::GenerationId,
@@ -377,8 +414,9 @@ impl super::AnalyzerStore {
     /// Translate a primary query AST location into canonical source identities.
     /// Spans only select the query location; declaration relationships are read
     /// through the returned IDs, never reconstructed from display ranges.
-    #[cfg(test)]
-    pub(crate) fn rust_primary_occurrences_at(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn rust_primary_occurrences_at(
         &self,
         oid: git2::Oid,
         generation: super::GenerationId,
@@ -429,7 +467,8 @@ impl super::AnalyzerStore {
     /// Read one exact publication and its creation-time declaration bridge.
     /// A CodeUnit can occur more than once; callers must retain every source ID.
     /// None means cancellation, never absent property publication.
-    pub(crate) fn rust_declaration_properties<A: super::LanguageAdapter>(
+    #[doc(hidden)]
+    pub fn rust_declaration_properties<A: super::LanguageAdapter>(
         &self,
         oid: git2::Oid,
         generation: super::GenerationId,
@@ -612,8 +651,9 @@ impl super::AnalyzerStore {
 
     /// Hydrate only the demanded import ordinals under one generation-checked
     /// snapshot. No complete source arena or unrelated import rows are loaded.
-    #[cfg(test)]
-    pub(crate) fn load_rust_import_source_locations(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn load_rust_import_source_locations(
         &self,
         oid: git2::Oid,
         generation: super::GenerationId,
@@ -673,12 +713,14 @@ impl super::AnalyzerStore {
 /// The schema-41 source-facts manifest uses the structural vocabulary version
 /// as its semantic row-version gate.  Keep this alias at the store boundary
 /// so callers do not need to know which model version owns that vocabulary.
-pub(in crate::analyzer) const SOURCE_FACTS_VERSION: i64 = STRUCTURAL_FACTS_VERSION;
+#[doc(hidden)]
+pub const SOURCE_FACTS_VERSION: i64 = STRUCTURAL_FACTS_VERSION;
 
 /// The code a provenance is stored under in the arena (milestone 5, lane ST).
 /// The view `source_occurrences` turns it back into the label every statement
 /// written before the fold expects.
-pub(in crate::analyzer) fn provenance_code(provenance: SourceOccurrenceProvenance) -> u8 {
+#[doc(hidden)]
+pub fn provenance_code(provenance: SourceOccurrenceProvenance) -> u8 {
     match provenance {
         SourceOccurrenceProvenance::PrimaryNode => 0,
         SourceOccurrenceProvenance::ExplicitSubspan => 1,
@@ -902,7 +944,8 @@ fn cancelled() -> StoreError {
     StoreError::new("source fact persistence was cancelled")
 }
 
-pub(in crate::analyzer) fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
+#[doc(hidden)]
+pub fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
     if cancellation.is_cancelled() {
         Err(cancelled())
     } else {
@@ -918,9 +961,10 @@ pub(in crate::analyzer) fn check_cancelled(cancellation: &CancellationToken) -> 
 #[derive(Debug)]
 pub struct SourceFactStorage {
     // `None` means this capability does not own a populated family in the input.
-    pub(crate) cost: fn(&ParsedSourceFacts) -> Option<(usize, usize)>,
-    pub(crate) insert:
-        fn(&Transaction<'_>, i64, &ParsedSourceFacts, &CancellationToken) -> Result<()>,
+    #[doc(hidden)]
+    pub cost: fn(&ParsedSourceFacts) -> Option<(usize, usize)>,
+    #[doc(hidden)]
+    pub insert: fn(&Transaction<'_>, i64, &ParsedSourceFacts, &CancellationToken) -> Result<()>,
 }
 
 /// Return the admission accounting for canonical source facts.

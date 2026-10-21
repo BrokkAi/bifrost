@@ -12,7 +12,7 @@
 #[cfg(test)]
 pub(crate) use brokk_bifrost_core::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use super::kinds::NormalizedKind;
 
 /// Every [`NormalizedKind::Block`] fact a spec produces for `source`, as its
@@ -23,8 +23,9 @@ use super::kinds::NormalizedKind;
 /// returns: the nodes at `(id + 1)..subtree_end` are exactly the facts whose
 /// range lies inside the block. An adapter test therefore only has to state
 /// which statement lists it expects.
-#[cfg(test)]
-pub(crate) fn block_facts_of<'source>(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn block_facts_of<'source>(
     spec: &dyn super::spec::StructuralSpec,
     grammar: &tree_sitter::Language,
     source: &'source str,
@@ -64,7 +65,8 @@ pub(crate) fn block_facts_of<'source>(
 /// tests extract facts directly rather than standing up a project: the analyzer
 /// and cache layers in between cannot change the answer, and the triples carry
 /// enough context to make a failure readable.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub fn occurrence_roles_of<'source>(
     spec: &dyn super::spec::StructuralSpec,
     grammar: &tree_sitter::Language,
@@ -86,7 +88,7 @@ pub fn occurrence_roles_of<'source>(
     found
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn assert_occurrence_roles_are_supported(
     spec: &dyn super::spec::StructuralSpec,
     grammar: &tree_sitter::Language,
@@ -108,7 +110,8 @@ pub fn assert_occurrence_roles_are_supported(
 
 /// Assert that the token starting at `needle`'s first occurrence carries
 /// exactly `role`, naming every classified token when it does not.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub fn assert_occurrence_role(
     found: &[(usize, &str, super::occurrences::OccurrenceRole)],
     start_byte: usize,

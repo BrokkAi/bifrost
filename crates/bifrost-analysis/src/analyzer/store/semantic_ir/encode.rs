@@ -85,7 +85,7 @@ impl EncodedRows {
         self.payload_bytes.iter().sum()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn table_payload_bytes(&self, table: Table) -> usize {
         self.payload_bytes[table as usize]
     }

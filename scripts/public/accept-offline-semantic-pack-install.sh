@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: $0 BIFROST INSTALLER LAUNCHER_CACHE_DIR JAVA_HOME SCRATCH_ROOT" >&2
+if [[ $# -ne 8 ]]; then
+  echo "usage: $0 BIFROST INSTALLER BUNDLE POLICY_ROOT PACK_CACHE_ROOT RECEIPT JAVA_HOME SCRATCH_ROOT" >&2
   exit 2
 fi
 
 bifrost=$(realpath "$1")
 installer=$(realpath "$2")
-launcher_cache=$(realpath -m "$3")
-java_home=$(realpath "$4")
-scratch=$(realpath -m "$5")
+bundle=$(realpath "$3")
+policy_root=$(realpath "$4")
+pack_cache=$(realpath -m "$5")
+receipt=$(realpath "$6")
+java_home=$(realpath "$7")
+scratch=$(realpath -m "$8")
 
 for executable in "$bifrost" "$installer"; do
   [[ -x "$executable" ]] || { echo "not executable: $executable" >&2; exit 2; }
 done
-mkdir -p -- "$launcher_cache"
+[[ -f "$bundle/index.json" ]] || { echo "bundle has no index.json: $bundle" >&2; exit 2; }
+[[ -d "$policy_root" ]] || { echo "policy pack root is not a directory: $policy_root" >&2; exit 2; }
+mkdir -p -- "$pack_cache"
+[[ -d "$pack_cache" ]] || { echo "pack cache root is not a directory: $pack_cache" >&2; exit 2; }
+cache_write_probe=$(mktemp "$pack_cache/.bifrost-write-test.XXXXXX")
+rm -f -- "$cache_write_probe"
+[[ -s "$receipt" ]] || { echo "pack selection receipt is missing: $receipt" >&2; exit 2; }
+node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$receipt"
 [[ -x "$java_home/bin/java" && -d "$java_home/jmods" ]] || {
   echo "JAVA_HOME is not a complete JDK: $java_home" >&2
   exit 2
@@ -23,6 +33,7 @@ mkdir -p -- "$launcher_cache"
 
 rm -rf "$scratch"
 mkdir -p "$scratch/workspace/src/main/java/fixture" "$scratch/empty-home"
+cp "$receipt" "$scratch/open-packs-receipt.json"
 workspace="$scratch/workspace"
 catalog="$workspace/.bifrost/semantic-pack-catalog"
 mkdir -p "$workspace/.bifrost"
@@ -63,45 +74,6 @@ public final class App {
     }
 }
 JAVA
-
-# The staged binary owns acquisition. This real policy activation also selects
-# against the JDK installed for the offline acceptance below.
-set +e
-BIFROST_LAUNCHER_CACHE_DIR="$launcher_cache" \
-  "$bifrost" --root "$workspace" --policy \
-  --policy-id bifrost.security.java.system-getenv-to-runtime-exec \
-  --format json --fail-on never --evaluation-date 2026-09-17 \
-  > "$scratch/acquisition.json" 2> "$scratch/acquisition.stderr"
-acquisition_status=$?
-set -e
-if [[ "$acquisition_status" -ne 0 && "$acquisition_status" -ne 2 ]]; then
-  echo "binary pack acquisition scan failed with exit $acquisition_status" >&2
-  cat "$scratch/acquisition.stderr" >&2
-  exit 1
-fi
-
-open_pack_cache="$launcher_cache/open-pack-releases"
-receipt=$(find "$open_pack_cache/selections" -mindepth 2 -maxdepth 2 -type f -name receipt.json -print 2>/dev/null | sort | tail -n 1)
-[[ -n "$receipt" && -s "$receipt" ]] || {
-  echo "binary did not publish a verified open-pack selection receipt" >&2
-  cat "$scratch/acquisition.stderr" >&2
-  exit 1
-}
-node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$receipt"
-selection_root=$(dirname "$receipt")
-bundle="$selection_root/semantic/bifrost-semantic-packs"
-policy_root="$selection_root/source/rules"
-pack_cache="$open_pack_cache/semantic-pack-catalog"
-[[ -f "$bundle/index.json" ]] || { echo "selected bundle has no index.json: $bundle" >&2; exit 2; }
-[[ -d "$policy_root" ]] || { echo "selected policy pack root is not a directory: $policy_root" >&2; exit 2; }
-mkdir -p -- "$pack_cache"
-cache_write_probe=$(mktemp "$pack_cache/.bifrost-write-test.XXXXXX")
-rm -f -- "$cache_write_probe"
-selection_id=$(node -e 'const receipt = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (typeof receipt.selection_id !== "string" || !/^[0-9a-f]{64}$/.test(receipt.selection_id)) process.exit(1); process.stdout.write(receipt.selection_id)' "$receipt")
-cp "$receipt" "$scratch/open-packs-receipt.json"
-if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-  printf 'selection_id=%s\n' "$selection_id" >> "$GITHUB_OUTPUT"
-fi
 
 run_scan() {
   local label=$1

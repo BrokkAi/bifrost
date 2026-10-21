@@ -141,7 +141,7 @@ part of the policy meaning; the directory path and unselected leaves are not.
 - **Query:** both RQL and canonical JSON when applicable, `schema_version`, file hash, result detail, limits, languages, and path filters.
 - **Policy:** every root and dependency source, source hashes, resolved policy/endpoint and nested RQL schema versions plus origins, loaded semantic hash, selected endpoint and catalog manifests, precedence manifest, suppression source and hash, evaluation date, report limits, output format, `--fail-on`, and strict-version mode.
 - **Interface:** exact CLI command, MCP toolset and arguments, Python package version and call, or Rust dependency revision.
-- **Environment:** operating system and hardware when timing matters; every Bifrost environment variable that was set, such as `BIFROST_PARALLELISM`, `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`, and `BIFROST_OPEN_POLICY_PACK_ROOT`; and the semantic packs the report lists as selected.
+- **Environment:** operating system and hardware when timing matters; every Bifrost environment variable that was set, such as `BIFROST_PARALLELISM`, `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`, and `BIFROST_POLICY_PACK_ROOT`; and the semantic packs the report lists as selected.
 - **Response:** every typed result variant, diagnostics, `truncated`, proof tiers, provenance, and `provenance_truncated` before downstream filtering.
 
 For MCP, record the configured workspace root and the exact `query_code` or

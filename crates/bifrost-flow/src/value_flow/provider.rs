@@ -105,6 +105,7 @@
 //! and it is why relation arenas are documented as query-local rather than
 //! durable identities.
 
+use crate::analyzer::semantic::service::ArtifactRetentionCensus;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -235,6 +236,35 @@ impl DispatchReadCollector {
     }
 }
 
+// Preserve exact context-handle equality without retaining artifacts in keys.
+// CompleteValueCache keeps weak-value registry keys after ready eviction.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CallContextCacheKey {
+    calls: Box<[(StableDigest, usize, ProcedureId, CallSiteId)]>,
+    truncated: bool,
+}
+
+impl CallContextCacheKey {
+    fn of(context: &OracleCallContext) -> Self {
+        Self {
+            calls: context
+                .calls()
+                .iter()
+                .map(|call| {
+                    let procedure = call.procedure();
+                    (
+                        procedure.artifact().key().fingerprint(),
+                        Arc::as_ptr(procedure.artifact()) as usize,
+                        procedure.id(),
+                        call.id(),
+                    )
+                })
+                .collect(),
+            truncated: context.was_truncated(),
+        }
+    }
+}
+
 /// Content-addressed identity of one procedure-local value-flow snapshot
 /// verdict.
 ///
@@ -248,7 +278,7 @@ struct SnapshotKey {
     artifact: StableDigest,
     procedure: ProcedureId,
     limits: OracleLimits,
-    context: OracleCallContext,
+    context: CallContextCacheKey,
 }
 
 impl SnapshotKey {
@@ -261,7 +291,7 @@ impl SnapshotKey {
             artifact: procedure.artifact().key().fingerprint(),
             procedure: procedure.id(),
             limits,
-            context: context.clone(),
+            context: CallContextCacheKey::of(context),
         }
     }
 }
@@ -332,7 +362,7 @@ struct BindingsKey {
     candidate_proof: ProofStatus,
     candidate_completeness: EvidenceCompleteness,
     excluded_targets: Box<[ProcedureId]>,
-    context: OracleCallContext,
+    context: CallContextCacheKey,
     limits: OracleLimits,
 }
 
@@ -368,7 +398,7 @@ impl BindingsKey {
                 .iter()
                 .map(ProcedureHandle::id)
                 .collect(),
-            context: context.clone(),
+            context: CallContextCacheKey::of(context),
             limits,
         }
     }
@@ -383,12 +413,13 @@ fn weigh_snapshot(_key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
         .available_value()
         .map_or(0, |snapshot| snapshot.relations().len())
         .saturating_mul(size_of::<ValueFlowRelation>());
-    let arena = outcome
-        .available_value()
-        .map_or(0, ValueFlowSnapshot::retained_arena_bytes);
+    let mut census = ArtifactRetentionCensus::default();
+    if let Some(snapshot) = outcome.available_value() {
+        snapshot.retained_artifacts(&mut census);
+    }
     size_of::<MemoizedSnapshot>()
         .saturating_add(relations)
-        .saturating_add(arena)
+        .saturating_add(census.retained_bytes().min(usize::MAX as u64) as usize)
         .min(u32::MAX as usize) as u32
 }
 
@@ -402,9 +433,14 @@ fn weigh_bindings(_key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
         .available_value()
         .map_or(0, |bindings| bindings.candidate().excluded_targets().len())
         .saturating_mul(size_of::<ProcedureHandle>());
+    let mut census = ArtifactRetentionCensus::default();
+    if let Some(bindings) = outcome.available_value() {
+        bindings.retained_artifacts(&mut census);
+    }
     size_of::<MemoizedBindings>()
         .saturating_add(rows)
         .saturating_add(excluded_targets)
+        .saturating_add(census.retained_bytes().min(usize::MAX as u64) as usize)
         .min(u32::MAX as usize) as u32
 }
 
@@ -422,8 +458,13 @@ fn weigh_dispatch(_key: &DispatchKey, outcome: &Arc<MemoizedDispatch>) -> u32 {
                     .saturating_mul(size_of::<DispatchBoundary>()),
             )
     });
+    let mut census = ArtifactRetentionCensus::default();
+    if let Some(dispatch) = outcome.available_value() {
+        dispatch.retained_artifacts(&mut census);
+    }
     size_of::<MemoizedDispatch>()
         .saturating_add(rows)
+        .saturating_add(census.retained_bytes().min(usize::MAX as u64) as usize)
         .min(u32::MAX as usize) as u32
 }
 
@@ -509,6 +550,27 @@ impl ValueFlowCache {
         }
     }
 
+    /// Union of artifacts pinned by ready snapshot, dispatch and binding verdicts.
+    pub fn artifact_bytes(&self) -> u64 {
+        let mut census = ArtifactRetentionCensus::default();
+        self.snapshots.visit_ready(|outcome| {
+            if let Some(value) = outcome.available_value() {
+                value.retained_artifacts(&mut census);
+            }
+        });
+        self.dispatch.visit_ready(|outcome| {
+            if let Some(value) = outcome.available_value() {
+                value.retained_artifacts(&mut census);
+            }
+        });
+        self.bindings.visit_ready(|outcome| {
+            if let Some(value) = outcome.available_value() {
+                value.retained_artifacts(&mut census);
+            }
+        });
+        census.artifact_bytes()
+    }
+
     /// Count of snapshot lookups served from a ready cache entry.
     pub fn snapshot_hits(&self) -> u64 {
         self.stats.snapshot_hits.load(Ordering::Relaxed)
@@ -578,6 +640,11 @@ pub struct WorkspaceValueFlowProvider<'a> {
 }
 
 impl<'a> WorkspaceValueFlowProvider<'a> {
+    /// Ready prepared-source artifacts retained by this provider.
+    pub fn prepared_pool_artifact_bytes(&self) -> u64 {
+        self.dispatch_sessions.artifact_bytes()
+    }
+
     /// Bind the provider to one analyzer generation and one shared cache.
     pub fn new(workspace: &'a WorkspaceAnalyzer, cache: ValueFlowCache) -> Self {
         let provider = WorkspaceIcfgProvider::new(workspace);
@@ -829,6 +896,7 @@ mod tests {
     use crate::analyzer::semantic::{CancellationToken, SemanticBudget, SemanticBudgetDimension};
     use crate::analyzer::{AnalyzerConfig, Language};
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     const BATCH_CALL_SOURCE: &str = concat!(
         "import { open } from \"third-party\";\n",
@@ -881,6 +949,163 @@ mod tests {
         body(&workspace, calls, ValueFlowCache::default());
     }
 
+    fn rematerialize_fixture_artifact(
+        original: &crate::analyzer::semantic::SemanticArtifact,
+    ) -> Arc<crate::analyzer::semantic::SemanticArtifact> {
+        use crate::analyzer::semantic::{ProcedureSemanticsParts, SemanticArtifact};
+        assert!(original.go_predeclared_builtin_assumptions().is_empty());
+        let parts = original
+            .procedures()
+            .iter()
+            .map(|procedure| {
+                assert!(procedure.guard_facts().is_empty());
+                assert!(procedure.switch_facts().is_empty());
+                let mut parts = ProcedureSemanticsParts::new(
+                    procedure.id(),
+                    procedure.locator().clone(),
+                    procedure.kind(),
+                    procedure.source(),
+                    procedure.evidence(),
+                );
+                parts.lexical_parent = procedure.lexical_parent();
+                parts.properties = procedure.properties();
+                macro_rules! copy_rows {
+                ($($field:ident),* $(,)?) => { $(parts.$field = procedure.$field().to_vec();)* };
+            }
+                copy_rows!(
+                    values,
+                    allocations,
+                    memory_locations,
+                    captures,
+                    call_sites,
+                    source_mappings,
+                    statement_entries,
+                    loop_sites,
+                    evidence_rows,
+                    gaps,
+                    blocks,
+                    points,
+                    drops,
+                    move_outs,
+                    scope_ends,
+                    pointer_origins,
+                    pointer_aliases,
+                    pointer_accesses,
+                    pointer_invalidations,
+                    incomplete_facts,
+                    receiver_type_facts
+                );
+                parts.control_edges = procedure.cfg().edges().to_vec();
+                parts
+            })
+            .collect();
+        let artifact = Arc::new(
+            SemanticArtifact::try_new(
+                original.key().clone(),
+                original.capabilities().clone(),
+                parts,
+            )
+            .expect("validated fixture rematerialization"),
+        );
+        assert_eq!(artifact.materialization_id(), original.materialization_id());
+        artifact
+    }
+
+    #[test]
+    #[hardwon(
+        "#5113: verdict caches and prepared sessions retained artifacts beyond their byte caps"
+    )]
+    fn byte_caps_release_caller_artifacts_including_context_keys() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file("flow.ts", "function leaf(v: number) { return v; }\nexport function caller() { return leaf(1); }\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            memo_cache_budget_bytes: Some(8),
+            ..AnalyzerConfig::default()
+        });
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let lowered = workspace
+            .materialize_program_semantics(
+                &project.file("flow.ts"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture materialization")
+            .available_value()
+            .cloned()
+            .expect("fixture artifact");
+        // An independently allocated copy isolates these owners from the
+        // analyzer's artifact cache and tests context-key retention too.
+        let artifact = rematerialize_fixture_artifact(&lowered);
+        let weak = Arc::downgrade(&artifact);
+        let cache = ValueFlowCache::new(1);
+        {
+            let caller = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("caller")
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("caller");
+            let call = caller
+                .call_site_handle(caller.semantics().call_sites()[0].id)
+                .expect("call");
+            let context = OracleCallContext::bounded(vec![call.clone()], OracleLimits::default());
+            let provider = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
+            let snapshot = provider
+                .procedure_snapshot(
+                    &caller,
+                    &context,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("snapshot");
+            assert!(snapshot.available_value().is_some());
+            let dispatch = provider
+                .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+                .expect("dispatch");
+            let target = dispatch
+                .available_value()
+                .expect("dispatch result")
+                .candidates()
+                .first()
+                .expect("leaf target");
+            let bindings = provider
+                .call_bindings(
+                    &call,
+                    target,
+                    &context,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("bindings");
+            assert!(bindings.available_value().is_some());
+            // The fixed materialization pool is independent of the tiny
+            // verdict cache. Its pins end when this provider leaves scope;
+            // the verdict cache must still release its context-key owners.
+            assert!(provider.prepared_pool_artifact_bytes() > 0);
+        }
+        drop(artifact);
+        // Drain logical evictions and allow Moka's epoch grace period to end.
+        for _ in 0..100 {
+            if cache.artifact_bytes() == 0 && weak.strong_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(cache.artifact_bytes(), 0);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "weak-value registry keys must not pin caller artifacts"
+        );
+    }
+
     #[test]
     fn observer_clones_share_one_prepared_source_charge_for_distinct_calls() {
         with_batch_calls(|workspace, calls, cache| {
@@ -909,32 +1134,106 @@ mod tests {
             assert!(second.available_value().is_some(), "{second:?}");
             assert_eq!(first.work().source_bytes, BATCH_CALL_SOURCE.len());
             assert_eq!(second.work().source_bytes, 0);
-            assert_eq!(budget.used().source_bytes, BATCH_CALL_SOURCE.len());
+            // Parking the first session refunds residency. The second call
+            // re-admits that source, but reuses the scan: two admissions and
+            // one scan remain in cumulative telemetry.
+            assert_eq!(budget.used().source_bytes, 3 * BATCH_CALL_SOURCE.len());
+            assert_eq!(budget.resident().source_bytes, 0);
             assert_eq!(cache.dispatch_misses(), 2);
             assert_eq!(cache.dispatch_hits(), 0);
         });
     }
 
     #[test]
-    fn unpaid_prepared_source_is_dropped_before_a_dispatch_retry() {
+    #[hardwon("#5113: equal-content re-lowerings accumulated prepared source sessions")]
+    fn prepared_pool_rebinds_equal_content_without_repaying_source() {
+        with_batch_calls(|workspace, calls, cache| {
+            let provider = WorkspaceValueFlowProvider::new(workspace, cache);
+            let cancellation = CancellationToken::default();
+            let mut limits = SemanticBudget::default().limits();
+            limits.source_bytes = BATCH_CALL_SOURCE.len();
+            let mut budget = SemanticBudget::new(limits).expect("positive source grant");
+            let first = provider
+                .resolve_call(
+                    &calls[0],
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("first call");
+            assert!(first.available_value().is_some());
+            let artifact = rematerialize_fixture_artifact(calls[1].procedure().artifact());
+            let call = artifact
+                .procedure_handle(calls[1].procedure().id())
+                .and_then(|procedure| procedure.call_site_handle(calls[1].id()))
+                .expect("rematerialized call");
+            let second = provider
+                .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+                .expect("second allocation call");
+            let result = second
+                .available_value()
+                .expect("equal-content syntax remains reusable");
+            result
+                .validate_for_call(&call)
+                .expect("provenance belongs to the new caller allocation");
+            assert_eq!(second.work().source_bytes, 0);
+            assert_eq!(
+                provider.prepared_pool_artifact_bytes(),
+                crate::analyzer::semantic::semantic_artifact_retained_bytes(
+                    calls[0].procedure().artifact()
+                )
+            );
+        });
+    }
+
+    #[test]
+    #[hardwon("#5113: concurrent prepared calls must share one paid source allocation")]
+    fn concurrent_dispatch_calls_share_paid_prepared_source() {
+        with_batch_calls(|workspace, calls, cache| {
+            let provider = WorkspaceValueFlowProvider::new(workspace, cache);
+            let barrier = std::sync::Barrier::new(2);
+            let cancellation = CancellationToken::default();
+            let resolve = |call: &CallSiteHandle| {
+                barrier.wait();
+                let mut budget = SemanticBudget::default();
+                provider
+                    .resolve_call(call, &mut SemanticRequest::new(&mut budget, &cancellation))
+                    .expect("concurrent dispatch")
+            };
+            let outcomes = std::thread::scope(|scope| {
+                let left = scope.spawn(|| resolve(&calls[0]));
+                let right = scope.spawn(|| resolve(&calls[1]));
+                [
+                    left.join().expect("first dispatch thread"),
+                    right.join().expect("second dispatch thread"),
+                ]
+            });
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| outcome.available_value().is_some())
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .map(|outcome| outcome.work().source_bytes)
+                    .sum::<usize>(),
+                BATCH_CALL_SOURCE.len()
+            );
+        });
+    }
+
+    #[test]
+    #[hardwon("#5113: dispatch result refusal rolled back scan telemetry")]
+    fn failed_prepared_dispatch_releases_source_but_keeps_scan_work() {
         with_batch_calls(|workspace, calls, cache| {
             let provider = WorkspaceValueFlowProvider::new(workspace, cache.clone());
             let cancellation = CancellationToken::default();
             let mut starved_budget = SemanticBudget::default();
             let nested_limit = starved_budget.limits().nested_entries;
-            // Pay the native IR producer probe first; leave the source
-            // resolver only one nested entry so its parsed syntax is unpaid.
-            let producer_entries: usize = calls[0]
-                .procedure()
-                .semantics()
-                .points()
-                .iter()
-                .map(|point| point.events.len())
-                .sum();
-            assert!(producer_entries < nested_limit);
+            // Leave one retained entry; the dispatch payload cannot fit,
+            // even though the resolver's traversal work always proceeds.
             starved_budget
-                .charge(SemanticWork {
-                    nested_entries: nested_limit - producer_entries - 1,
+                .admit(SemanticWork {
+                    nested_entries: nested_limit - 1,
                     ..SemanticWork::default()
                 })
                 .expect("leave one nested entry of headroom");
@@ -950,7 +1249,15 @@ mod tests {
             };
             assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
             assert_eq!(work.source_bytes, BATCH_CALL_SOURCE.len());
-            assert_eq!(starved_budget.used().source_bytes, 0);
+            assert_eq!(
+                starved_budget.used().source_bytes,
+                2 * BATCH_CALL_SOURCE.len()
+            );
+            assert_eq!(
+                provider.prepared_pool_artifact_bytes(),
+                0,
+                "an unpaid empty session must not pin its artifact"
+            );
 
             let mut retry_budget = SemanticBudget::default();
             let retry = provider
@@ -961,7 +1268,10 @@ mod tests {
                 .expect("funded retry reparses the unpaid source");
             assert!(retry.available_value().is_some(), "{retry:?}");
             assert_eq!(retry.work().source_bytes, BATCH_CALL_SOURCE.len());
-            assert_eq!(retry_budget.used().source_bytes, BATCH_CALL_SOURCE.len());
+            assert_eq!(
+                retry_budget.used().source_bytes,
+                2 * BATCH_CALL_SOURCE.len()
+            );
             assert_eq!(cache.dispatch_misses(), 2);
             assert_eq!(cache.dispatch_hits(), 0);
         });

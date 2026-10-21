@@ -19,8 +19,8 @@ pub(super) use brokk_bifrost_core::analyzer::tree_walk::has_token_child as has_t
 
 pub(super) use brokk_bifrost_jvm::kotlin::declarations::kotlin_has_modifier as has_modifier;
 pub(super) use brokk_bifrost_jvm::kotlin::syntax::{
-    KotlinScalarType, kotlin_binding_name_nodes as binding_names,
-    kotlin_binding_node as binding_node, kotlin_binding_type_node, kotlin_call_arity,
+    kotlin_binding_name_nodes as binding_names, kotlin_binding_node as binding_node,
+    kotlin_binding_type_node, kotlin_call_arity,
     kotlin_call_trailing_lambda_body as trailing_lambda, kotlin_callee,
     kotlin_decimal_integer_value, kotlin_declared_return_type_node, kotlin_declared_scalar_type,
     kotlin_first_token as first_token, kotlin_literal_scalar_type, kotlin_named_argument_label,

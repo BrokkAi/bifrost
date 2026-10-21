@@ -25,7 +25,20 @@
 //! [`crate::analyzer::usages::effects`] and is unit-tested without a workspace.
 
 use super::*;
+use brokk_bifrost_cpp_analysis::analyzer::CppCallResultUseIndex;
+use brokk_bifrost_php_analysis::analyzer::php::PhpCallResultUseIndex;
+use brokk_bifrost_ruby_analysis::RubyCallResultUseIndex;
 
+use crate::analyzer::CSharpCallResultUseIndex;
+use crate::analyzer::CallResultUse;
+use crate::analyzer::CallResultUseOpenReason;
+use crate::analyzer::CallResultUseSite;
+use crate::analyzer::JavaCallResultUse;
+use crate::analyzer::JavaCallResultUseOpen;
+use crate::analyzer::JavaCallResultUseRelationIndex;
+use crate::analyzer::NativeResultObligationBasis;
+use crate::analyzer::RustCallResultUseIndex;
+use crate::analyzer::RustNativeObligationProof;
 use crate::analyzer::semantic::{
     ArgumentDomain, BackingStoreOffset, CallArgumentExpansion, CallInvocationMode, CallSiteHandle,
     CallableReferenceKind, CallableTarget, CallableTargetResolution, CallerReceiverBinding,
@@ -58,12 +71,8 @@ use crate::analyzer::usages::effects::{
     ProcedureEffectReport, call_effect_report, modeled_call_targets_for_shapes,
     modeled_procedure_key_for_unit, native_call_targets_for_shapes, summarize_procedure_effects,
 };
-use crate::analyzer::{
-    CSharpCallResultUseIndex, CallResultUse, CallResultUseOpenReason, CallResultUseSite,
-    CppCallResultUseIndex, GoCallResultUseIndex, JavaCallResultUse, JavaCallResultUseOpen,
-    JavaCallResultUseRelationIndex, NativeResultObligationBasis, PhpCallResultUseIndex,
-    RubyCallResultUseIndex, RustCallResultUseIndex, RustNativeObligationProof,
-};
+use brokk_bifrost_go_analysis::analyzer::GoCallResultUseIndex;
+
 use crate::structural::NormalizedKind;
 use crate::structural::flow_state::{FlowStateIncompleteReason, GuardDominanceAnswer};
 use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
@@ -659,6 +668,8 @@ impl NativeCallResultUseIndex {
 /// Per-query state shared by every effect row a single query derives.
 #[derive(Default)]
 pub(super) struct EffectTraversalCache {
+    /// Complete, sorted source-attributed reasons observed during this query.
+    open_callees: BTreeSet<String>,
     models: Option<Option<Arc<ResolvedActiveSemanticModels>>>,
     keys: HashMap<CodeUnit, Option<ModeledProcedureKey>>,
     answers: HashMap<ModeledProcedureKey, ModelAnswer>,
@@ -1434,7 +1445,7 @@ impl ResultUseIndex {
                     "Go result assignment type proof",
                 );
                 let exact = charged
-                    && crate::analyzer::go_modeled_result_binding_type_identity_is_exact(
+                    && brokk_bifrost_go_analysis::analyzer::go_modeled_result_binding_type_identity_is_exact(
                         proof.analyzer,
                         proof.overlay,
                         proof.file,
@@ -3412,7 +3423,12 @@ fn native_rust_call_result_obligation_expansions(
     }
     let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
     let standard_drop_wrapper = shape.source.as_deref().is_some_and(|source| {
-        crate::analyzer::rust_call_is_standard_drop(analyzer, &outcome.file, source, outcome.range)
+        brokk_bifrost_rust_analysis::rust_call_is_standard_drop(
+            analyzer,
+            &outcome.file,
+            source,
+            outcome.range,
+        )
     });
     let dispatch_coverage = coverage_for(answer.coverage);
     let dispatch_can_close = standard_drop_wrapper
@@ -3455,19 +3471,20 @@ fn native_rust_call_result_obligation_expansions(
                 reason = Some("native_target_unknown");
                 continue;
             };
-            let candidate =
-                match crate::analyzer::rust_native_result_obligation(analyzer, target, 0) {
-                    RustNativeObligationProof::Obligation(obligation) => {
-                        modeled_arm_count += 1;
-                        Some(Some(obligation))
-                    }
-                    RustNativeObligationProof::NoObligation => Some(None),
-                    RustNativeObligationProof::Open(open_reason) => {
-                        all_proofs_agree = false;
-                        reason = Some(open_reason);
-                        None
-                    }
-                };
+            let candidate = match brokk_bifrost_rust_analysis::rust_native_result_obligation(
+                analyzer, target, 0,
+            ) {
+                RustNativeObligationProof::Obligation(obligation) => {
+                    modeled_arm_count += 1;
+                    Some(Some(obligation))
+                }
+                RustNativeObligationProof::NoObligation => Some(None),
+                RustNativeObligationProof::Open(open_reason) => {
+                    all_proofs_agree = false;
+                    reason = Some(open_reason);
+                    None
+                }
+            };
             if let Some(candidate) = candidate {
                 if common.is_none() {
                     common = Some(candidate);
@@ -4042,19 +4059,28 @@ fn native_cpp_call_result_obligation_expansions(
                 reason = Some("native_target_unknown");
                 continue;
             };
-            let candidate = match crate::analyzer::cpp_native_result_obligation(analyzer, target, 0)
-            {
-                crate::analyzer::CppNativeObligationProof::Obligation(obligation) => {
+            let candidate = match brokk_bifrost_cpp_analysis::analyzer::cpp_native_result_obligation(
+                analyzer, target, 0,
+            ) {
+                brokk_bifrost_cpp_analysis::analyzer::CppNativeObligationProof::Obligation(
+                    obligation,
+                ) => {
                     modeled_arm_count += 1;
                     Some(Some(obligation))
                 }
-                crate::analyzer::CppNativeObligationProof::BaseContract(obligation) => {
+                brokk_bifrost_cpp_analysis::analyzer::CppNativeObligationProof::BaseContract(
+                    obligation,
+                ) => {
                     modeled_arm_count += 1;
                     base_contract = true;
                     Some(Some(obligation))
                 }
-                crate::analyzer::CppNativeObligationProof::NoObligation => Some(None),
-                crate::analyzer::CppNativeObligationProof::Open(open_reason) => {
+                brokk_bifrost_cpp_analysis::analyzer::CppNativeObligationProof::NoObligation => {
+                    Some(None)
+                }
+                brokk_bifrost_cpp_analysis::analyzer::CppNativeObligationProof::Open(
+                    open_reason,
+                ) => {
                     all_proofs_agree = false;
                     reason = Some(open_reason);
                     None
@@ -4086,8 +4112,11 @@ fn native_cpp_call_result_obligation_expansions(
         // override boundary. Ambiguous overloads retain multiple arms and do
         // not enter this fallback; they remain open as required by B4.
         if let Some(target) = fallback_target.as_ref()
-            && let crate::analyzer::CppNativeObligationProof::BaseContract(obligation) =
-                crate::analyzer::cpp_native_result_obligation(analyzer, target, 0)
+            && let brokk_bifrost_cpp_analysis::analyzer::CppNativeObligationProof::BaseContract(
+                obligation,
+            ) = brokk_bifrost_cpp_analysis::analyzer::cpp_native_result_obligation(
+                analyzer, target, 0,
+            )
         {
             native_obligation = Some(obligation);
             modeled_arm_count = 1;
@@ -4162,14 +4191,14 @@ fn native_go_call_result_obligation_expansions(
             .external_callee_identity
             .as_ref()
             .and_then(|identity| {
-                crate::analyzer::go_native_obligation_exclusion(
+                brokk_bifrost_go_analysis::analyzer::go_native_obligation_exclusion(
                     identity.owner_fqn(),
                     identity.member(),
                 )
             })
             .or_else(|| {
                 arm.unmaterialized_target.as_ref().and_then(|target| {
-                    crate::analyzer::go_native_obligation_exclusion(
+                    brokk_bifrost_go_analysis::analyzer::go_native_obligation_exclusion(
                         target.owner_fqn(),
                         target.member(),
                     )
@@ -4304,11 +4333,12 @@ fn native_go_call_result_obligation_expansions(
                     all_obligations_agree = false;
                     continue;
                 }
-                let obligation = crate::analyzer::go_native_error_result_obligation(
-                    analyzer,
-                    target,
-                    result_ordinal,
-                );
+                let obligation =
+                    brokk_bifrost_go_analysis::analyzer::go_native_error_result_obligation(
+                        analyzer,
+                        target,
+                        result_ordinal,
+                    );
                 if obligation.is_some() {
                     modeled_arm_count += 1;
                 } else {
@@ -4333,12 +4363,14 @@ fn native_go_call_result_obligation_expansions(
                 reason = Some("native_signature_unknown");
             }
         } else if answer.arms.is_empty() {
-            if let Some(obligation) = crate::analyzer::go_native_error_function_value_obligation(
-                analyzer,
-                &outcome.file,
-                outcome.range,
-                result_ordinal,
-            ) {
+            if let Some(obligation) =
+                brokk_bifrost_go_analysis::analyzer::go_native_error_function_value_obligation(
+                    analyzer,
+                    &outcome.file,
+                    outcome.range,
+                    result_ordinal,
+                )
+            {
                 native_obligation = Some(obligation);
             } else {
                 reason = Some("dispatch_unresolved");
@@ -5369,7 +5401,11 @@ fn javascript_typescript_call_result_obligation_expansions(
                     break;
                 }
             };
-            if !reviewed_js_ts_evidence_selected(language, &summary.shard.matched_evidence) {
+            if !reviewed_js_ts_evidence_selected(
+                language,
+                &summary.record.target.path,
+                &summary.shard.matched_evidence,
+            ) {
                 row.reason = Some("artifact_unselected");
                 break;
             }
@@ -5512,6 +5548,7 @@ fn ruby_core_evidence_selected(evidence: &SemanticModelActivationEvidence) -> bo
 
 fn reviewed_js_ts_evidence_selected(
     language: crate::analyzer::Language,
+    declaration_path: &str,
     evidence: &crate::analyzer::semantic_model::SemanticModelActivationEvidence,
 ) -> bool {
     let package_matches = |name: &str, version: Option<&str>| {
@@ -5530,7 +5567,13 @@ fn reviewed_js_ts_evidence_selected(
             evidence.language == "typescript"
                 && evidence.ecosystem == "npm"
                 && package_matches("typescript", Some("7.0.2"))
-                && evidence.configuration.as_deref() == Some("typescript-lib:es5")
+                && matches!(
+                    (declaration_path, evidence.configuration.as_deref()),
+                    (
+                        "lib/lib.es5.d.ts",
+                        Some("typescript-lib:es5" | "typescript-lib:es2019")
+                    ) | ("lib/lib.es2019.string.d.ts", Some("typescript-lib:es2019"))
+                )
                 && evidence.artifact_sha256.is_none()
         }
         crate::analyzer::Language::JavaScript => {
@@ -8241,9 +8284,9 @@ pub(super) fn result_contract_failure_use_expansions(
     let exact_source = semantic_model_overlay
         .as_ref()
         .and_then(|_| cache.exact_source(analyzer, &value.file));
-    let assignment_conversion_proof_work = exact_source
-        .as_deref()
-        .and_then(crate::analyzer::go_modeled_result_binding_type_identity_proof_work);
+    let assignment_conversion_proof_work = exact_source.as_deref().and_then(
+        brokk_bifrost_go_analysis::analyzer::go_modeled_result_binding_type_identity_proof_work,
+    );
     let assignment_conversion_proof = result_assignment_conversion_proof_context(
         analyzer,
         &value.file,
@@ -8539,9 +8582,9 @@ fn result_contract_success_guards(
     let exact_source = semantic_model_overlay
         .as_ref()
         .and_then(|_| model_cache.exact_source(analyzer, file));
-    let assignment_conversion_proof_work = exact_source
-        .as_deref()
-        .and_then(crate::analyzer::go_modeled_result_binding_type_identity_proof_work);
+    let assignment_conversion_proof_work = exact_source.as_deref().and_then(
+        brokk_bifrost_go_analysis::analyzer::go_modeled_result_binding_type_identity_proof_work,
+    );
     let assignment_conversion_proof = result_assignment_conversion_proof_context(
         analyzer,
         file,
@@ -9614,7 +9657,7 @@ fn modeled_pointer_result_field(
     if field.is_empty() {
         return false;
     }
-    crate::analyzer::modeled_go_callable_result_pointer_field(
+    brokk_bifrost_go_analysis::analyzer::modeled_go_callable_result_pointer_field(
         context.semantic_model_overlay,
         &target.owner,
         &target.member,
@@ -11384,9 +11427,9 @@ fn validate_result_contract_uses(
         semantic_model_overlay: semantic_model_overlay.as_deref(),
         exact_source: exact_source.as_deref(),
     };
-    let assignment_conversion_proof_work = exact_source
-        .as_deref()
-        .and_then(crate::analyzer::go_modeled_result_binding_type_identity_proof_work);
+    let assignment_conversion_proof_work = exact_source.as_deref().and_then(
+        brokk_bifrost_go_analysis::analyzer::go_modeled_result_binding_type_identity_proof_work,
+    );
     let assignment_conversion_proof = result_assignment_conversion_proof_context(
         analyzer,
         file,
@@ -13010,17 +13053,23 @@ fn record_coverage(
             cache.incomplete = true;
         }
         EffectCoverage::Open | EffectCoverage::Unsupported => {
-            if !cache.incomplete {
-                cache.incomplete = true;
+            cache.incomplete = true;
+            let message = format!(
+                "an unresolved or unmodeled callee leaves the effect set non-exhaustive; open callees: {:?}",
+                cache.open_callees
+            );
+            if let Some(diagnostic) = diagnostics.iter_mut().find(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::EffectDerivationIncomplete
+            }) {
+                diagnostic.message = message;
+            } else {
                 diagnostics.push(CodeQueryDiagnostic {
                     source: None,
                     code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
                     language,
-                    message:
-                        "an unresolved or unmodeled callee leaves the effect set non-exhaustive"
-                            .to_owned(),
+                    message,
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
                 });
@@ -13218,6 +13267,38 @@ fn dispatch_arms(
         },
         _ => CallEffectSiteStatus::Answered { coverage },
     };
+    let site = format!(
+        "{}:bytes[{}..{}]",
+        rel_path_string(file),
+        range.start_byte,
+        range.end_byte
+    );
+    if !coverage.is_exhaustive()
+        || matches!(status, CallEffectSiteStatus::Interrupted { .. })
+        || arms
+            .iter()
+            .any(|arm| !arm.effect.complete && !arm.effect.lookup.is_closed_by_summary())
+    {
+        cache.open_callees.insert(format!(
+            "{site}: dispatch={}, coverage={coverage:?}, unsupported={:?}, limit={:?}, residuals={:?}, reasons={:?}",
+            answer.outcome, answer.semantic_unsupported, answer.exceeded_limit,
+            answer.unnamed_boundaries, answer.coverage_reasons
+        ));
+    }
+    for arm in &arms {
+        let reason = match &arm.effect.lookup {
+            ArmLookup::Unkeyable => Some("CalleeUnkeyable"),
+            ArmLookup::Conflict => Some("ModelConflict"),
+            ArmLookup::Unmodeled { analyzable: false } => Some("CalleeUnmodeled"),
+            ArmLookup::Declared(_) if arm.external_callee.is_some() => Some("IncompleteSummary"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            cache
+                .open_callees
+                .insert(format!("{site}: {reason}, callee={:?}", arm.effect.key));
+        }
+    }
     DispatchedArms {
         status,
         arms,
@@ -13874,6 +13955,23 @@ fn discover_effect_graph(
             ))
     });
     graph.edges.dedup();
+    for ((unit, _), &node) in &index_by_unit {
+        let procedure = &graph.procedures[node];
+        if !procedure.basis.is_established() || !procedure.local_gaps.is_empty() {
+            let spans = analyzer
+                .ranges_of(unit)
+                .iter()
+                .map(|range| (range.start_byte, range.end_byte))
+                .collect::<Vec<_>>();
+            cache.open_callees.insert(format!(
+                "{}:byte_spans={spans:?}: callee={}, basis={:?}, reasons={:?}",
+                rel_path_string(unit.source()),
+                procedure.display_name,
+                procedure.basis,
+                procedure.local_gaps
+            ));
+        }
+    }
     graph
 }
 

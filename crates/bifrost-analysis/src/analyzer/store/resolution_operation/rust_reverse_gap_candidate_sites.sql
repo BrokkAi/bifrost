@@ -3,11 +3,11 @@
 -- Parameters: ?1 definition mount, ?2 target names (JSON), ?3 admitted (0/1),
 -- ?4 admitted fragments (JSON), ?5 member-reference site kind, ?6 target owner
 -- is a type scope, ?7 callable-reference site kind, ?8-?12 macro/expression gap
--- origins, ?13 target key.
+-- origins, ?13 target key, ?14 malformed-syntax gap origin.
 INSERT INTO temp.selected_rust_reverse_gap_sites(target_key,host,blob_id,site)
 WITH RECURSIVE target_scope(topology_id,crate_key,summary_id) AS (
   SELECT placement.topology_id,placement.unit_key,placement.summary_id
-  FROM temp.selected_rust_module_placements AS placement
+  FROM temp.selected_rust_container_placements AS placement
   WHERE placement.mount_ordinal=?1
   UNION
   SELECT importer.topology_id,importer.unit_key,importer.summary_id
@@ -22,9 +22,15 @@ WITH RECURSIVE target_scope(topology_id,crate_key,summary_id) AS (
 target_hosts(host,topology_id,blob_id,summary_id) AS (
   SELECT DISTINCT placement.mount_ordinal,placement.topology_id,placement.blob_id,placement.summary_id
   FROM target_scope AS scope
-  JOIN temp.selected_rust_module_placements AS placement
-    ON placement.topology_id=scope.topology_id
-  JOIN temp.selected_resolution_scope_mounts AS selected
+  -- Seek every selected summary of this topology before expanding placements.
+  -- The reached summary alone need not cover all selected owners of the topology.
+  CROSS JOIN selected_rust_unit_summaries AS host_owner
+    INDEXED BY selected_rust_unit_summaries_topology
+    ON host_owner.topology_id=scope.topology_id
+  CROSS JOIN temp.selected_rust_container_placements AS placement
+    ON placement.summary_id=host_owner.summary_id
+   AND placement.topology_id=scope.topology_id
+  CROSS JOIN temp.selected_resolution_scope_mounts AS selected
     ON selected.mount_ordinal=placement.mount_ordinal
   WHERE ?3=0 OR placement.mount_ordinal IN (SELECT value FROM json_each(?4))
   UNION
@@ -41,7 +47,7 @@ target_name_closure(host,name,namespace) AS (
   FROM target_hosts AS host
   CROSS JOIN json_each(?2) AS seed
   WHERE seed.value->>2 IS NULL OR EXISTS (
-    SELECT 1 FROM temp.selected_rust_module_placements AS placement
+    SELECT 1 FROM temp.selected_rust_container_placements AS placement
     WHERE placement.mount_ordinal=host.host
       AND placement.topology_id=seed.value->>2
       AND placement.container_path=seed.value->>3
@@ -62,7 +68,7 @@ target_name_closure(host,name,namespace) AS (
     -- Bind the import through its selected canonical module placement: a
     -- file-local `crate` scope can be mounted as `crate::child`.
     AND NOT EXISTS (
-      SELECT 1 FROM temp.selected_rust_module_placements AS placement
+      SELECT 1 FROM temp.selected_rust_container_placements AS placement
       JOIN main.rust_resolution_unit_summary_import_routes AS bound
         INDEXED BY rust_resolution_unit_summary_import_routes_site
         ON bound.summary_id=placement.summary_id
@@ -88,7 +94,7 @@ target_name_closure(host,name,namespace) AS (
     AND imported.bound_name IS NOT NULL
     AND imported.bound_name<>names.name
     AND NOT EXISTS (
-      SELECT 1 FROM temp.selected_rust_module_placements AS placement
+      SELECT 1 FROM temp.selected_rust_container_placements AS placement
       JOIN main.rust_resolution_unit_summary_import_routes AS bound
         INDEXED BY rust_resolution_unit_summary_import_routes_site
         ON bound.summary_id=placement.summary_id
@@ -118,7 +124,7 @@ target_name_closure(host,name,namespace) AS (
   WHERE imported.bound_name IS NOT NULL
     AND imported.bound_name<>names.name
     AND NOT EXISTS (
-      SELECT 1 FROM temp.selected_rust_module_placements AS placement
+      SELECT 1 FROM temp.selected_rust_container_placements AS placement
       JOIN main.rust_resolution_unit_summary_import_routes AS bound
         INDEXED BY rust_resolution_unit_summary_import_routes_site
         ON bound.summary_id=placement.summary_id
@@ -145,7 +151,7 @@ target_name_closure(host,name,namespace) AS (
   WHERE imported.bound_name IS NOT NULL
     AND imported.bound_name<>names.name
     AND NOT EXISTS (
-      SELECT 1 FROM temp.selected_rust_module_placements AS placement
+      SELECT 1 FROM temp.selected_rust_container_placements AS placement
       JOIN main.rust_resolution_unit_summary_import_routes AS bound
         INDEXED BY rust_resolution_unit_summary_import_routes_site
         ON bound.summary_id=placement.summary_id
@@ -209,8 +215,7 @@ target_name_closure(host,name,namespace) AS (
     ON root.blob_id=terminal.blob_id
    AND root.type_occurrence_id=terminal.type_occurrence_id
    AND root.ordinal=0
-  CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS dependency_name
-    INDEXED BY rust_resolution_unit_summary_dependency_names_extern
+  CROSS JOIN main.rust_unit_summary_dependency_names AS dependency_name
     ON dependency_name.summary_id=host.summary_id
    AND dependency_name.extern_name=root.name
   CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
@@ -228,6 +233,47 @@ target_name_closure(host,name,namespace) AS (
   WHERE names.namespace='type'
     AND terminal.ordinal>0
 ),
+-- A `Self` spelling means the target only inside one of the target type's
+-- impl bodies or its own declaration. The reverse candidate name `Self` is
+-- global to the file's name index, so without this scope every unrelated
+-- impl's `Self` site could be nominated for this target and every resolution
+-- gap there would keep the target's inventory open.
+target_self_scopes(host,blob_id,start_byte,end_byte) AS (
+  SELECT DISTINCT names.host,impl.blob_id,impl.body_start_byte,impl.body_end_byte
+  FROM target_name_closure AS names
+  JOIN target_hosts AS host ON host.host=names.host
+  JOIN main.source_rust_impl_items AS impl
+    ON impl.blob_id=host.blob_id
+  JOIN main.source_rust_types AS typ
+    ON typ.blob_id=impl.blob_id
+   AND typ.occurrence_id=impl.target_type_occurrence_id
+  JOIN main.source_rust_type_segments AS segment
+    ON segment.blob_id=typ.blob_id
+   AND segment.type_occurrence_id=typ.occurrence_id
+  WHERE names.namespace='type'
+    AND names.name<>'Self'
+    AND segment.name=names.name
+    AND segment.ordinal=(
+      SELECT max(terminal.ordinal)
+      FROM main.source_rust_type_segments AS terminal
+      WHERE terminal.blob_id=segment.blob_id
+        AND terminal.type_occurrence_id=segment.type_occurrence_id
+    )
+  UNION
+  SELECT mount.mount_ordinal,bridge.blob_id,context.start_byte,context.end_byte
+  FROM temp.selected_resolution_mounts AS mount
+  JOIN main.resolution_semantic_sites AS semantic
+    ON semantic.blob_id=mount.blob_id
+   AND semantic.semantic_key=?13
+   AND semantic.semantic_role='definition'
+  JOIN main.source_native_declaration_bridges AS bridge
+    ON bridge.blob_id=semantic.blob_id
+   AND bridge.source_site=semantic.source_site
+  JOIN main.source_rust_item_contexts AS context
+    ON context.blob_id=bridge.blob_id
+   AND context.owner_declaration_id=bridge.declaration_id
+  WHERE mount.mount_ordinal=?1
+),
 candidate_sites_unfiltered(host,blob_id,site) AS (
   -- The name-keyed branches use CROSS JOIN so the name closure drives the loop
   -- and each name seeks the candidate name index. A plain JOIN let the planner
@@ -241,6 +287,30 @@ candidate_sites_unfiltered(host,blob_id,site) AS (
     ON candidate.candidate_name=names.name
    AND candidate.blob_id=host.blob_id
    AND candidate.namespace=names.namespace
+  WHERE names.name<>'Self' OR EXISTS (
+    SELECT 1
+    FROM target_self_scopes AS scope
+    WHERE scope.host=names.host
+      AND scope.blob_id=candidate.blob_id
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM main.resolution_sites AS span
+          WHERE span.blob_id=candidate.blob_id
+            AND span.site=candidate.site
+            AND span.start_byte>=scope.start_byte
+            AND span.start_byte<scope.end_byte
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM main.source_rust_macro_inputs AS input
+          WHERE input.blob_id=candidate.blob_id
+            AND input.native_gap_site=candidate.site
+            AND input.start_byte>=scope.start_byte
+            AND input.start_byte<scope.end_byte
+        )
+      )
+  )
   UNION
   SELECT names.host,candidate.blob_id,candidate.site
   FROM target_name_closure AS names
@@ -250,6 +320,30 @@ candidate_sites_unfiltered(host,blob_id,site) AS (
     ON candidate.candidate_name=names.name
    AND candidate.blob_id=host.blob_id
    AND candidate.namespace='*'
+  WHERE names.name<>'Self' OR EXISTS (
+    SELECT 1
+    FROM target_self_scopes AS scope
+    WHERE scope.host=names.host
+      AND scope.blob_id=candidate.blob_id
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM main.resolution_sites AS span
+          WHERE span.blob_id=candidate.blob_id
+            AND span.site=candidate.site
+            AND span.start_byte>=scope.start_byte
+            AND span.start_byte<scope.end_byte
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM main.source_rust_macro_inputs AS input
+          WHERE input.blob_id=candidate.blob_id
+            AND input.native_gap_site=candidate.site
+            AND input.start_byte>=scope.start_byte
+            AND input.start_byte<scope.end_byte
+        )
+      )
+  )
   UNION
   SELECT names.host,candidate.blob_id,candidate.site
   FROM target_name_closure AS names
@@ -270,7 +364,38 @@ candidate_sites_unfiltered(host,blob_id,site) AS (
    AND candidate.blob_id=host.blob_id
    AND candidate.namespace='type_or_value'
   WHERE names.namespace IN ('type','value','callable','constructor')
+    AND (names.name<>'Self' OR EXISTS (
+      SELECT 1
+      FROM target_self_scopes AS scope
+      WHERE scope.host=names.host
+        AND scope.blob_id=candidate.blob_id
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM main.resolution_sites AS span
+            WHERE span.blob_id=candidate.blob_id
+              AND span.site=candidate.site
+              AND span.start_byte>=scope.start_byte
+              AND span.start_byte<scope.end_byte
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM main.source_rust_macro_inputs AS input
+            WHERE input.blob_id=candidate.blob_id
+              AND input.native_gap_site=candidate.site
+              AND input.start_byte>=scope.start_byte
+              AND input.start_byte<scope.end_byte
+          )
+        )
+    ))
   UNION
+  -- Parse recovery can hide a reference without naming it in any structured
+  -- node, so a target-name occurrence anywhere in the blob keeps a malformed
+  -- wildcard gap open. Other wildcard gaps are not parse recovery: an explicit
+  -- macro frontier is bounded by its invocation input and definition below,
+  -- and an unsupported scope or binder that parsed cleanly cannot hide an
+  -- authored spelling. Nominating those here let an unrelated target-name
+  -- occurrence in the same blob open every gap in it.
   SELECT names.host,candidate.blob_id,candidate.site
   FROM target_name_closure AS names
   JOIN target_hosts AS host ON host.host=names.host
@@ -278,10 +403,39 @@ candidate_sites_unfiltered(host,blob_id,site) AS (
     INDEXED BY resolution_rust_reverse_gap_candidates_name
     ON candidate.blob_id=host.blob_id
    AND candidate.candidate_name='*' AND candidate.namespace='*'
+  JOIN main.resolution_gap_reasons AS reason
+    INDEXED BY resolution_gap_reasons_site
+    ON reason.blob_id=candidate.blob_id
+   AND reason.site=candidate.site
+   AND reason.origin=?14
   JOIN main.rust_identifier_occurrences AS occurrence
     ON occurrence.blob_id=host.blob_id
    AND occurrence.identifier=names.name
    AND (occurrence.context_mask & 1)<>0
+  WHERE names.name<>'Self' OR EXISTS (
+    SELECT 1
+    FROM target_self_scopes AS scope
+    WHERE scope.host=names.host
+      AND scope.blob_id=candidate.blob_id
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM main.resolution_sites AS span
+          WHERE span.blob_id=candidate.blob_id
+            AND span.site=candidate.site
+            AND span.start_byte>=scope.start_byte
+            AND span.start_byte<scope.end_byte
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM main.source_rust_macro_inputs AS input
+          WHERE input.blob_id=candidate.blob_id
+            AND input.native_gap_site=candidate.site
+            AND input.start_byte>=scope.start_byte
+            AND input.start_byte<scope.end_byte
+        )
+      )
+  )
   UNION
   -- An unexpanded macro frontier can synthesize a reference without spelling
   -- the target in its input. Expression-position macros are recorded as
@@ -305,6 +459,30 @@ candidate_sites_unfiltered(host,blob_id,site) AS (
     ON input.blob_id=candidate.blob_id
    AND input.native_gap_site=candidate.site
   WHERE reason.origin IN (?8,?9,?10,?11,?12)
+    AND (names.name<>'Self' OR EXISTS (
+      SELECT 1
+      FROM target_self_scopes AS scope
+      WHERE scope.host=names.host
+        AND scope.blob_id=candidate.blob_id
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM main.resolution_sites AS span
+            WHERE span.blob_id=candidate.blob_id
+              AND span.site=candidate.site
+              AND span.start_byte>=scope.start_byte
+              AND span.start_byte<scope.end_byte
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM main.source_rust_macro_inputs AS input
+            WHERE input.blob_id=candidate.blob_id
+              AND input.native_gap_site=candidate.site
+              AND input.start_byte>=scope.start_byte
+              AND input.start_byte<scope.end_byte
+          )
+        )
+    ))
 ),
 candidate_sites(host,blob_id,site) AS (
   -- A member call cannot name a free function. Conversely, a method target

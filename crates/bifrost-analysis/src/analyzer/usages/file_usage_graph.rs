@@ -13,7 +13,8 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 
-pub(crate) enum WorkspaceFileUsageGraphBuildOutcome {
+#[doc(hidden)]
+pub enum WorkspaceFileUsageGraphBuildOutcome {
     Complete(WorkspaceUsageRankingGraph),
     Incomplete(WorkspaceUsageRankingGraph),
     Cancelled,
@@ -26,7 +27,8 @@ pub(crate) enum WorkspaceFileUsageGraphBuildOutcome {
 /// relations remain available through `usage_graph_exact` ranking and the
 /// public `usage_graph` tool. Besides ordinary imports, providers may contribute
 /// dependencies such as Rust's structured external-module declarations.
-pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
+#[doc(hidden)]
+pub fn build_workspace_file_usage_graph_with_cancellation(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
@@ -223,9 +225,30 @@ fn file_graph(
         nodes,
         edges,
         node_indices_by_file,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         resolved_ecosystems: Vec::new(),
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_edge(graph: &WorkspaceUsageRankingGraph, source: &ProjectFile, target: &ProjectFile) {
+    let source_index = graph
+        .nodes
+        .iter()
+        .position(|node| node.primary_file == *source)
+        .unwrap();
+    let target_index = graph
+        .nodes
+        .iter()
+        .position(|node| node.primary_file == *target)
+        .unwrap();
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == source_index && edge.to == target_index)
+    );
 }
 
 #[cfg(test)]
@@ -265,7 +288,3 @@ mod tests {
         assert_eq!(Some(true), graph.nodes[2].contains_tests);
     }
 }
-
-#[cfg(test)]
-#[path = "file_usage_graph_tests.rs"]
-mod contract_tests;

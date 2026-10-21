@@ -1583,7 +1583,7 @@ rql_forms! {
         class: Wrapper,
         shape: Pattern,
         signature: "(inside-decl container-pattern query)",
-        description: "Require the root match to be inside a matching container without crossing a callable declaration; Rust impl members can also match their resolved owning type.",
+        description: "Require the root match to be inside a matching container without crossing a callable declaration; Rust impl members and out-of-line C++ member definitions can also match their resolved owning type.",
     }
     NotInside {
         labels: ["not-inside"],
@@ -3698,7 +3698,7 @@ json_fields! {
     Intersect { label: "intersect", shape: QueryList, signature: "\"intersect\": [{ query }, { query }, ...]", description: "Keep compatible typed endpoints reached by every branch." }
     Except { label: "except", shape: QueryList, signature: "\"except\": [{ query }, { query }, ...]", description: "Keep first-branch endpoints absent from every later branch." }
     Inside { label: "inside", shape: Pattern, signature: "\"inside\": { pattern }", description: "Require the root match to be inside a matching container." }
-    InsideDecl { label: "inside_decl", shape: Pattern, signature: "\"inside_decl\": { pattern }", description: "Require the root match to be inside a matching container without crossing a callable declaration; Rust impl members can also match their resolved owning type." }
+    InsideDecl { label: "inside_decl", shape: Pattern, signature: "\"inside_decl\": { pattern }", description: "Require the root match to be inside a matching container without crossing a callable declaration; Rust impl members and out-of-line C++ member definitions can also match their resolved owning type." }
     NotInside { label: "not_inside", shape: Pattern, signature: "\"not_inside\": { pattern }", description: "Exclude root matches inside a matching container." }
     Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }

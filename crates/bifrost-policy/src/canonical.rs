@@ -34,6 +34,9 @@ impl RqlpDocument {
             Self::Policy { definition } => policy_definition_to_json(definition),
             Self::Endpoint { definition } => endpoint_definition_to_json(definition),
             Self::EndpointSet { definition } => endpoint_set_document_to_json(definition),
+            Self::DeclarationSelection { definition } => {
+                declaration_selection_document_to_json(definition)
+            }
         }
     }
 
@@ -135,6 +138,8 @@ fn ensure_inline_local_document(
         RqlpDocument::EndpointSet { definition } => {
             ensure_inline_local_taint(&definition.spec, &HashSet::new())
         }
+        // Every declaration is an inline selector by construction.
+        RqlpDocument::DeclarationSelection { .. } => Ok(()),
     }
 }
 
@@ -498,7 +503,8 @@ fn ensure_inline_selector(
 ) -> Result<(), InlineLocalSemanticProjectionError> {
     match selector {
         PolicySelector::Inline { .. } => Ok(()),
-        PolicySelector::File { path, .. } => {
+        PolicySelector::File { path, .. }
+        | PolicySelector::DeclarationSelection(DeclarationSelectionReference { path, .. }) => {
             Err(InlineLocalSemanticProjectionError::FileSelector {
                 path: path.as_str().to_string(),
             })
@@ -648,6 +654,39 @@ fn endpoint_definition_to_json(definition: &MatchEndpointDefinition) -> Value {
         &mut object,
         "supersedes",
         id_set(definition.supersedes.iter().map(EndpointId::as_str)),
+    );
+    Value::Object(object)
+}
+
+fn declaration_selection_document_to_json(definition: &DeclarationSelectionDocument) -> Value {
+    let mut object = Map::new();
+    insert(&mut object, "type", json!("declaration-selection-document"));
+    insert(
+        &mut object,
+        "schema_version",
+        json!(definition.schema_version.version),
+    );
+    insert(
+        &mut object,
+        "language",
+        json!(definition.language.config_label()),
+    );
+    insert(
+        &mut object,
+        "declarations",
+        Value::Array(
+            definition
+                .declarations
+                .iter()
+                .map(|(schema, query)| {
+                    json!({
+                        "type": "inline",
+                        "schema_version": schema.version,
+                        "query": query.to_canonical_query_plan_json(),
+                    })
+                })
+                .collect(),
+        ),
     );
     Value::Object(object)
 }
@@ -1562,6 +1601,17 @@ pub(crate) fn selector_to_json(selector: &PolicySelector) -> Value {
                     .map(|version| json!(version)),
             );
             insert(&mut object, "path", json!(path.as_str()));
+            Value::Object(object)
+        }
+        PolicySelector::DeclarationSelection(reference) => {
+            let mut object = tagged("declaration_selection");
+            insert(&mut object, "path", json!(reference.path.as_str()));
+            insert(
+                &mut object,
+                "language",
+                json!(reference.language.config_label()),
+            );
+            insert(&mut object, "output", json!(reference.output.label()));
             Value::Object(object)
         }
     }

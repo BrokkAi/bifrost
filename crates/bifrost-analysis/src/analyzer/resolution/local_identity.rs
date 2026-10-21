@@ -7,21 +7,34 @@
 //! the content-owned rows.
 
 use brokk_bifrost_core::analyzer::Language;
+
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionNamespace, ResolutionScopeId, ResolutionSiteId,
-};
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
+
 use std::collections::hash_map::Entry;
 
 use crate::CancellationToken;
-use crate::hash::{HashMap, HashSet};
+
+use crate::hash::HashMap;
+use crate::hash::HashSet;
 
 use super::fact_lowering::LoweredSemanticRole;
-use super::fact_source::{ResolutionIdentityDomain, language_identity_domain};
-use super::model::{
-    BindingFragmentId, BindingNodeId, MOUNT_ORDINAL_LIMIT, PartialPathId, PrecedenceStep,
-    SemanticId, SharedNameId, StackVariableId, UNMOUNTED_ORDINAL,
-};
+
+use super::fact_source::ResolutionIdentityDomain;
+use super::fact_source::language_identity_domain;
+
+use super::model::BindingFragmentId;
+use super::model::BindingNodeId;
+use super::model::MOUNT_ORDINAL_LIMIT;
+use super::model::PartialPathId;
+use super::model::PrecedenceStep;
+use super::model::SemanticId;
+use super::model::SharedNameId;
+use super::model::StackVariableId;
+use super::model::UNMOUNTED_ORDINAL;
 
 fn shared_name_digest(
     shared_name_digests: &HashMap<SharedNameId, [u8; 32]>,
@@ -104,14 +117,17 @@ pub(crate) fn selected_resolution_fragment_id(
 /// selection fingerprint, the mount record and the interior cache key are its
 /// only readers, and content addressing is exactly what each of them wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SelectedResolutionFragmentDigest([u8; 32]);
+// Public only so tools engine tests can name it (#4452), not as API.
+#[doc(hidden)]
+pub struct SelectedResolutionFragmentDigest([u8; 32]);
 
 impl SelectedResolutionFragmentDigest {
     pub(crate) const fn new(digest: [u8; 32]) -> Self {
         Self(digest)
     }
 
-    pub(crate) const fn as_bytes(self) -> [u8; 32] {
+    #[doc(hidden)]
+    pub const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -119,12 +135,15 @@ impl SelectedResolutionFragmentDigest {
 /// A source-site address that can be resolved before any opaque runtime ID
 /// exists for the selected mount.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SelectedSemanticLocator {
+#[doc(hidden)]
+pub struct SelectedSemanticLocator {
     storage_language: String,
-    relative_path: String,
+    #[doc(hidden)]
+    pub relative_path: String,
     address: SelectedSemanticAddress,
     role: LoweredSemanticRole,
     reference_namespace: Option<ResolutionNamespace>,
+    fallback_reference_namespace: Option<ResolutionNamespace>,
     call_argument_ordinal: Option<u32>,
 }
 
@@ -136,7 +155,8 @@ enum SelectedSemanticAddress {
 }
 
 impl SelectedSemanticLocator {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         storage_language: impl Into<String>,
         relative_path: impl Into<String>,
         source_site: ResolutionSiteId,
@@ -158,6 +178,7 @@ impl SelectedSemanticLocator {
             address: SelectedSemanticAddress::SourceSite(source_site),
             role,
             reference_namespace: None,
+            fallback_reference_namespace: None,
             call_argument_ordinal: None,
         }
     }
@@ -165,7 +186,8 @@ impl SelectedSemanticLocator {
     /// Address one exact selected reference by the syntax range available to
     /// production consumers. Producer-local site ids stay behind the selected
     /// store boundary.
-    pub(crate) fn for_reference_range(
+    #[doc(hidden)]
+    pub fn for_reference_range(
         storage_language: impl Into<String>,
         relative_path: impl Into<String>,
         start_byte: usize,
@@ -199,7 +221,8 @@ impl SelectedSemanticLocator {
     /// Address one exact reference namespace when source syntax admits more
     /// than one native reference over the same token, as Java construction
     /// syntax does for its type and constructor name.
-    pub(crate) fn for_reference_range_in_namespace(
+    #[doc(hidden)]
+    pub fn for_reference_range_in_namespace(
         storage_language: impl Into<String>,
         relative_path: impl Into<String>,
         start_byte: usize,
@@ -209,6 +232,26 @@ impl SelectedSemanticLocator {
         let mut locator =
             Self::for_reference_range(storage_language, relative_path, start_byte, end_byte);
         locator.reference_namespace = Some(namespace);
+        locator
+    }
+
+    /// Prefer one reference namespace while retaining a structurally distinct
+    /// fallback namespace for languages whose syntax uses the same token for
+    /// different reference forms.
+    #[doc(hidden)]
+    pub fn for_reference_range_preferring_namespace(
+        storage_language: impl Into<String>,
+        relative_path: impl Into<String>,
+        start_byte: usize,
+        end_byte: usize,
+        namespace: ResolutionNamespace,
+        fallback_namespace: ResolutionNamespace,
+    ) -> Self {
+        assert_ne!(namespace, fallback_namespace);
+        let mut locator =
+            Self::for_reference_range(storage_language, relative_path, start_byte, end_byte);
+        locator.reference_namespace = Some(namespace);
+        locator.fallback_reference_namespace = Some(fallback_namespace);
         locator
     }
 
@@ -225,8 +268,13 @@ impl SelectedSemanticLocator {
         self.reference_namespace
     }
 
+    pub(crate) const fn fallback_reference_namespace(&self) -> Option<ResolutionNamespace> {
+        self.fallback_reference_namespace
+    }
+
     /// Address the name of a native declaration, independently of references.
-    pub(crate) fn for_declaration_range(
+    #[doc(hidden)]
+    pub fn for_declaration_range(
         storage_language: impl Into<String>,
         relative_path: impl Into<String>,
         start_byte: usize,
@@ -260,6 +308,7 @@ impl SelectedSemanticLocator {
             address,
             role,
             reference_namespace: None,
+            fallback_reference_namespace: None,
             call_argument_ordinal: None,
         }
     }
@@ -278,11 +327,13 @@ impl SelectedSemanticLocator {
         &self.storage_language
     }
 
-    pub(crate) fn relative_path(&self) -> &str {
+    #[doc(hidden)]
+    pub fn relative_path(&self) -> &str {
         &self.relative_path
     }
 
-    pub(crate) const fn source_site(&self) -> Option<ResolutionSiteId> {
+    #[doc(hidden)]
+    pub const fn source_site(&self) -> Option<ResolutionSiteId> {
         match self.address {
             SelectedSemanticAddress::SourceSite(site) => Some(site),
             SelectedSemanticAddress::ReferenceRange { .. }
@@ -290,7 +341,8 @@ impl SelectedSemanticLocator {
         }
     }
 
-    pub(crate) const fn reference_range(&self) -> Option<(usize, usize)> {
+    #[doc(hidden)]
+    pub const fn reference_range(&self) -> Option<(usize, usize)> {
         match self.address {
             SelectedSemanticAddress::SourceSite(_)
             | SelectedSemanticAddress::DeclarationRange { .. } => None,
@@ -315,26 +367,31 @@ impl SelectedSemanticLocator {
 pub struct SelectedResolutionMountOrdinal(u32);
 
 impl SelectedResolutionMountOrdinal {
-    pub(crate) const fn new(value: u32) -> Self {
+    #[doc(hidden)]
+    pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> u32 {
+    #[doc(hidden)]
+    pub const fn get(self) -> u32 {
         self.0
     }
 }
 
 /// Nonnegative blob-local key from one persisted identity dictionary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ResolutionLocalKey(i64);
+#[doc(hidden)]
+pub struct ResolutionLocalKey(i64);
 
 impl ResolutionLocalKey {
-    pub(crate) fn new(value: i64) -> Self {
+    #[doc(hidden)]
+    pub fn new(value: i64) -> Self {
         assert!(value >= 0, "a resolution local key cannot be negative");
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> i64 {
+    #[doc(hidden)]
+    pub const fn get(self) -> i64 {
         self.0
     }
 
@@ -352,7 +409,8 @@ impl ResolutionLocalKey {
 /// record, which is where the selection fingerprint and the interior cache
 /// want it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SelectedResolutionMount {
+#[doc(hidden)]
+pub struct SelectedResolutionMount {
     ordinal: SelectedResolutionMountOrdinal,
 }
 
@@ -372,14 +430,18 @@ impl SelectedResolutionMount {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SelectedLocalIdentityProvenance<Identity> {
-    mount: SelectedResolutionMount,
+#[doc(hidden)]
+pub struct SelectedLocalIdentityProvenance<Identity> {
+    #[doc(hidden)]
+    pub mount: SelectedResolutionMount,
     local_key: ResolutionLocalKey,
-    identity: Identity,
+    #[doc(hidden)]
+    pub identity: Identity,
 }
 
 impl<Identity: Copy> SelectedLocalIdentityProvenance<Identity> {
-    pub(crate) const fn mount(self) -> SelectedResolutionMount {
+    #[doc(hidden)]
+    pub const fn mount(self) -> SelectedResolutionMount {
         self.mount
     }
 
@@ -387,7 +449,8 @@ impl<Identity: Copy> SelectedLocalIdentityProvenance<Identity> {
         self.local_key
     }
 
-    pub(crate) const fn identity(self) -> Identity {
+    #[doc(hidden)]
+    pub const fn identity(self) -> Identity {
         self.identity
     }
 }
@@ -395,7 +458,8 @@ impl<Identity: Copy> SelectedLocalIdentityProvenance<Identity> {
 /// An active-stage identity belongs to a selected host but has no ordinary
 /// blob-local coordinate. Its caller keeps the original full runtime ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SelectedStageIdentityProvenance<Identity> {
+#[doc(hidden)]
+pub struct SelectedStageIdentityProvenance<Identity> {
     mount: SelectedResolutionMount,
     identity: Identity,
 }
@@ -411,7 +475,8 @@ impl<Identity: Copy> SelectedStageIdentityProvenance<Identity> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SelectedSemanticProvenance {
+#[doc(hidden)]
+pub enum SelectedSemanticProvenance {
     FragmentLocal(SelectedLocalIdentityProvenance<ResolutionSemanticIdentity>),
     Stage(SelectedStageIdentityProvenance<ResolutionSemanticIdentity>),
     Shared(ResolutionSemanticIdentity),
@@ -436,7 +501,8 @@ impl SelectedSemanticProvenance {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SelectedNodeProvenance {
+#[doc(hidden)]
+pub enum SelectedNodeProvenance {
     FragmentLocal(SelectedLocalIdentityProvenance<ResolutionNodeIdentity>),
     Stage(SelectedStageIdentityProvenance<ResolutionNodeIdentity>),
     UniversalRoot,
@@ -526,7 +592,8 @@ pub(crate) enum SelectedNodeMount {
 /// only the identities it registers, while reverse lookup can recover exact
 /// mount provenance for every issued fragment-local ID.
 #[derive(Clone, Debug)]
-pub(crate) struct MountRebaser {
+#[doc(hidden)]
+pub struct MountRebaser {
     /// The ordinals this selection has registered.
     ///
     /// This used to be three maps: ordinal to fragment, fragment to ordinal,
@@ -632,7 +699,8 @@ impl MountRebaser {
         }
     }
 
-    pub(crate) fn new() -> Self {
+    #[doc(hidden)]
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -751,7 +819,8 @@ impl MountRebaser {
     /// make an unmounted id look like one of this selection's; that is what
     /// the prefix assertions this replaces were for, and it is one comparison
     /// now instead of two digest compares and a map.
-    pub(crate) fn register_mount(
+    #[doc(hidden)]
+    pub fn register_mount(
         &mut self,
         ordinal: SelectedResolutionMountOrdinal,
     ) -> SelectedResolutionMount {
@@ -821,7 +890,8 @@ impl MountRebaser {
     /// on one tract reverse frontier that walk taught the rebaser 1,974,097
     /// semantics, 432,242 paths, 394,894 nodes and 156,273 stack variables and
     /// held 1.24 GiB of live heap.
-    pub(crate) fn register_identity_catalog(
+    #[doc(hidden)]
+    pub fn register_identity_catalog(
         &mut self,
         ordinal: SelectedResolutionMountOrdinal,
         catalog: &ResolutionIdentityCatalog,
@@ -1194,7 +1264,8 @@ impl MountRebaser {
     /// mount's identity, a supplemental identity, or a selected-context shared
     /// recipe. A persisted mount's own semantic is not here; its key is the
     /// position it occupies in the mount's interior identity catalog.
-    pub(crate) fn registered_semantic_provenance(
+    #[doc(hidden)]
+    pub fn registered_semantic_provenance(
         &self,
         semantic: SemanticId,
     ) -> Option<SelectedSemanticProvenance> {
@@ -1336,7 +1407,8 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ResolutionSemanticIdentitySpace {
+#[doc(hidden)]
+pub enum ResolutionSemanticIdentitySpace {
     FragmentLocal,
     Shared,
 }
@@ -1353,7 +1425,8 @@ pub(crate) enum ResolutionSemanticIdentitySpace {
 /// catalog carries it for the preparer through
 /// [`ResolutionIdentityCatalog::shared_name_digest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ResolutionSemanticIdentity {
+#[doc(hidden)]
+pub enum ResolutionSemanticIdentity {
     FragmentLocal([u8; 32]),
     Shared(SharedNameId),
     /// A gap reason: fragment-local like `FragmentLocal`, but it occupies a
@@ -1393,7 +1466,8 @@ impl ResolutionSemanticIdentity {
         }
     }
 
-    pub(crate) const fn space(self) -> ResolutionSemanticIdentitySpace {
+    #[doc(hidden)]
+    pub const fn space(self) -> ResolutionSemanticIdentitySpace {
         match self {
             Self::FragmentLocal(_) | Self::GapReason(_) => {
                 ResolutionSemanticIdentitySpace::FragmentLocal
@@ -1413,7 +1487,8 @@ impl ResolutionSemanticIdentity {
     }
 
     /// The shared name this identity is, or `None` when it is fragment-local.
-    pub(crate) const fn shared_name(self) -> Option<SharedNameId> {
+    #[doc(hidden)]
+    pub const fn shared_name(self) -> Option<SharedNameId> {
         match self {
             Self::FragmentLocal(_) | Self::GapReason(_) => None,
             Self::Shared(name) => Some(name),
@@ -1445,7 +1520,8 @@ impl ResolutionSemanticIdentity {
 /// for the process gives that property back without pretending any of these
 /// ids is a store fact: every one of them is in the per-request range.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn test_shared_names() -> &'static dyn SharedNameInterner {
+#[doc(hidden)]
+pub fn test_shared_names() -> &'static dyn SharedNameInterner {
     static NAMES: std::sync::OnceLock<TestSharedNames> = std::sync::OnceLock::new();
     NAMES.get_or_init(TestSharedNames::default)
 }
@@ -1605,11 +1681,14 @@ impl SharedNameInterner for PerRequestSharedNames {
 /// remounting and can be written directly to the normalized lookup-recipe
 /// relation without trying to invert an opaque semantic digest.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct ResolutionLookupSemanticRecipe {
+#[doc(hidden)]
+pub struct ResolutionLookupSemanticRecipe {
     identity_domain: ResolutionIdentityDomain,
-    namespace: ResolutionNamespace,
+    #[doc(hidden)]
+    pub namespace: ResolutionNamespace,
     spelling: String,
-    name_digest: [u8; 32],
+    #[doc(hidden)]
+    pub name_digest: [u8; 32],
 }
 
 // The carried digest is derived data. Keep recipe hashing on the original
@@ -1634,7 +1713,8 @@ impl ResolutionLookupSemanticRecipe {
         spelling.capacity()
     }
 
-    pub(crate) fn new(language: Language, namespace: ResolutionNamespace, spelling: &str) -> Self {
+    #[doc(hidden)]
+    pub fn new(language: Language, namespace: ResolutionNamespace, spelling: &str) -> Self {
         Self::new_in_domain(language_identity_domain(language), namespace, spelling)
     }
 
@@ -1691,7 +1771,8 @@ impl ResolutionLookupSemanticRecipe {
         self.identity_domain
     }
 
-    pub(crate) const fn namespace(&self) -> ResolutionNamespace {
+    #[doc(hidden)]
+    pub const fn namespace(&self) -> ResolutionNamespace {
         self.namespace
     }
 
@@ -1703,15 +1784,18 @@ impl ResolutionLookupSemanticRecipe {
     ///
     /// This is the interning key, not the identity: it is how a store finds or
     /// creates the row whose id the recipe then is.
-    pub(crate) const fn name_digest(&self) -> [u8; 32] {
+    #[doc(hidden)]
+    pub const fn name_digest(&self) -> [u8; 32] {
         self.name_digest
     }
 
-    pub(crate) fn identity(&self, names: &dyn SharedNameInterner) -> ResolutionSemanticIdentity {
+    #[doc(hidden)]
+    pub fn identity(&self, names: &dyn SharedNameInterner) -> ResolutionSemanticIdentity {
         ResolutionSemanticIdentity::shared(self.shared_name_id(names))
     }
 
-    pub(crate) fn semantic(&self, names: &dyn SharedNameInterner) -> SemanticId {
+    #[doc(hidden)]
+    pub fn semantic(&self, names: &dyn SharedNameInterner) -> SemanticId {
         SemanticId::shared_name(self.shared_name_id(names))
     }
 
@@ -1721,9 +1805,10 @@ impl ResolutionLookupSemanticRecipe {
 }
 
 macro_rules! local_identity {
-    ($name:ident, $mounted:ty) => {
+    ($visibility:vis $name:ident, $mounted:ty) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub(crate) struct $name([u8; 32]);
+        #[doc(hidden)]
+        $visibility struct $name([u8; 32]);
 
         impl $name {
             pub(crate) const fn new(digest: [u8; 32]) -> Self {
@@ -1749,9 +1834,9 @@ macro_rules! local_identity {
     };
 }
 
-local_identity!(ResolutionNodeIdentity, BindingNodeId);
-local_identity!(ResolutionPathIdentity, PartialPathId);
-local_identity!(ResolutionStackVariableIdentity, StackVariableId);
+local_identity!(pub ResolutionNodeIdentity, BindingNodeId);
+local_identity!(pub ResolutionPathIdentity, PartialPathId);
+local_identity!(pub ResolutionStackVariableIdentity, StackVariableId);
 
 /// One catalog index as the position a mounted id carries.
 fn catalog_position(index: usize) -> u32 {
@@ -1766,7 +1851,8 @@ fn catalog_local_key(position: u32) -> ResolutionLocalKey {
 /// Explicit Go spelling-scope choice coverage, separate from effective namespace
 /// precedence. A missing spelling must be covered in all four namespaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GoSpellingChoiceAuthority {
+#[doc(hidden)]
+pub struct GoSpellingChoiceAuthority {
     pub(crate) scope: ResolutionScopeId,
     pub(crate) activation_start: Option<usize>,
 }
@@ -1779,7 +1865,8 @@ pub(crate) const GO_SPELLING_NAMESPACES: [ResolutionNamespace; 4] = [
 ];
 
 #[derive(Debug)]
-pub(crate) struct ResolutionIdentityCatalogBuilder<'a> {
+#[doc(hidden)]
+pub struct ResolutionIdentityCatalogBuilder<'a> {
     fragment: BindingFragmentId,
     /// Where a shared name's id comes from. A shared name belongs to no file,
     /// so the lowering cannot mint one; it asks this.
@@ -2390,7 +2477,8 @@ fn canonical_recipe_entries(
 /// name in the semantic catalog, whose id is its `resolution_identities` id --
 /// and the ids of a catalog whose order is not the position they carry, which
 /// is the lookup-recipe catalog, ordered by recipe.
-pub(crate) trait CarriesCatalogPosition: Copy + Ord + std::fmt::Debug {
+#[doc(hidden)]
+pub trait CarriesCatalogPosition: Copy + Ord + std::fmt::Debug {
     /// The catalog position this id carries, if it carries one.
     fn carried_position(self) -> Option<usize>;
 }
@@ -2431,7 +2519,8 @@ carries_catalog_position!(SemanticId, BindingNodeId, PartialPathId, StackVariabl
 /// than positions, and the lookup-recipe catalog, which is ordered by recipe
 /// and whose positions are therefore not the semantics' own.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MountedIdentities<Mounted, Identity> {
+#[doc(hidden)]
+pub struct MountedIdentities<Mounted, Identity> {
     entries: Vec<(Mounted, Identity)>,
     /// Positions of the entries `entries[id.carried_position()]` does not
     /// find, ordered by their mounted id.
@@ -2573,7 +2662,8 @@ impl<Mounted: CarriesCatalogPosition, Identity> MountedIdentities<Mounted, Ident
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolutionIdentityCatalog {
+#[doc(hidden)]
+pub struct ResolutionIdentityCatalog {
     fragment: BindingFragmentId,
     /// How many leading catalog positions belong to sites.
     ///
@@ -2586,15 +2676,19 @@ pub(crate) struct ResolutionIdentityCatalog {
     /// rows carry the digest, because interning is a store fact the per-blob
     /// producer cannot know; everything in the heap carries the id.
     shared_name_digests: HashMap<SharedNameId, [u8; 32]>,
-    semantics: MountedIdentities<SemanticId, ResolutionSemanticIdentity>,
+    #[doc(hidden)]
+    pub semantics: MountedIdentities<SemanticId, ResolutionSemanticIdentity>,
     lookup_recipes: MountedIdentities<SemanticId, ResolutionLookupSemanticRecipe>,
     precedence_namespaces: HashMap<PrecedenceStep, ResolutionNamespace>,
-    go_spelling_choices: HashMap<PrecedenceStep, GoSpellingChoiceAuthority>,
-    nodes: MountedIdentities<BindingNodeId, ResolutionNodeIdentity>,
+    #[doc(hidden)]
+    pub go_spelling_choices: HashMap<PrecedenceStep, GoSpellingChoiceAuthority>,
+    #[doc(hidden)]
+    pub nodes: MountedIdentities<BindingNodeId, ResolutionNodeIdentity>,
     source_site_nodes: HashSet<BindingNodeId>,
     source_scope_ordinals: HashMap<BindingNodeId, ResolutionScopeId>,
     paths: MountedIdentities<PartialPathId, ResolutionPathIdentity>,
-    stack_variables: MountedIdentities<StackVariableId, ResolutionStackVariableIdentity>,
+    #[doc(hidden)]
+    pub stack_variables: MountedIdentities<StackVariableId, ResolutionStackVariableIdentity>,
 }
 
 /// One total runtime-identity translation, as the deep walks in `remount.rs`
@@ -2606,7 +2700,8 @@ pub(crate) struct ResolutionIdentityCatalog {
 /// an unmounted interior and the engine, with nothing to look up. The walks
 /// over paths, completions and typed rows are the same walks either way, so
 /// they are written once and take whichever translation the caller has.
-pub(crate) trait ResolutionIdentityTranslation {
+#[doc(hidden)]
+pub trait ResolutionIdentityTranslation {
     fn semantic(&self, semantic: SemanticId) -> SemanticId;
 
     fn node(&self, node: BindingNodeId) -> BindingNodeId;
@@ -3039,10 +3134,8 @@ impl ResolutionIdentityCatalog {
         self.fragment
     }
 
-    pub(crate) fn semantic_identity(
-        &self,
-        semantic: SemanticId,
-    ) -> Option<ResolutionSemanticIdentity> {
+    #[doc(hidden)]
+    pub fn semantic_identity(&self, semantic: SemanticId) -> Option<ResolutionSemanticIdentity> {
         self.semantics.get(semantic).copied()
     }
 
@@ -3060,7 +3153,8 @@ impl ResolutionIdentityCatalog {
     /// own catalog can, and this is where it answers. An identity a site
     /// numbers is not searched here; `mounted_site_semantic` reads it from the
     /// site number directly.
-    pub(crate) fn semantic_for_identity(
+    #[doc(hidden)]
+    pub fn semantic_for_identity(
         &self,
         identity: ResolutionSemanticIdentity,
     ) -> Option<SemanticId> {
@@ -3230,7 +3324,8 @@ impl ResolutionIdentityCatalog {
     /// name, so that an interior produced for this blob later can assert that
     /// every shared id it holds is a store fact. An interior is cached across
     /// requests, so an id minted for one request must never enter one.
-    pub(crate) fn shared_names(&self) -> Vec<[u8; 32]> {
+    #[doc(hidden)]
+    pub fn shared_names(&self) -> Vec<[u8; 32]> {
         let mut digests = self
             .shared_name_digests
             .values()
@@ -3241,7 +3336,8 @@ impl ResolutionIdentityCatalog {
     }
 
     /// The digest that names one shared name in `resolution_identities`.
-    pub(crate) fn shared_name_digest(&self, name: SharedNameId) -> [u8; 32] {
+    #[doc(hidden)]
+    pub fn shared_name_digest(&self, name: SharedNameId) -> [u8; 32] {
         shared_name_digest(&self.shared_name_digests, name)
     }
 
@@ -3252,9 +3348,8 @@ impl ResolutionIdentityCatalog {
         self.lookup_recipes.get(semantic)
     }
 
-    pub(crate) const fn go_spelling_choices(
-        &self,
-    ) -> &HashMap<PrecedenceStep, GoSpellingChoiceAuthority> {
+    #[doc(hidden)]
+    pub const fn go_spelling_choices(&self) -> &HashMap<PrecedenceStep, GoSpellingChoiceAuthority> {
         &self.go_spelling_choices
     }
 
@@ -3272,7 +3367,8 @@ impl ResolutionIdentityCatalog {
         self.nodes.get(node).copied()
     }
 
-    pub(crate) fn path_identity(&self, path: PartialPathId) -> Option<ResolutionPathIdentity> {
+    #[doc(hidden)]
+    pub fn path_identity(&self, path: PartialPathId) -> Option<ResolutionPathIdentity> {
         self.paths.get(path).copied()
     }
 
@@ -3283,7 +3379,8 @@ impl ResolutionIdentityCatalog {
         self.stack_variables.get(variable).copied()
     }
 
-    pub(crate) fn semantics(&self) -> &[(SemanticId, ResolutionSemanticIdentity)] {
+    #[doc(hidden)]
+    pub fn semantics(&self) -> &[(SemanticId, ResolutionSemanticIdentity)] {
         self.semantics.entries()
     }
 
@@ -3291,7 +3388,8 @@ impl ResolutionIdentityCatalog {
         self.lookup_recipes.entries()
     }
 
-    pub(crate) fn nodes(&self) -> &[(BindingNodeId, ResolutionNodeIdentity)] {
+    #[doc(hidden)]
+    pub fn nodes(&self) -> &[(BindingNodeId, ResolutionNodeIdentity)] {
         self.nodes.entries()
     }
 
@@ -3303,7 +3401,8 @@ impl ResolutionIdentityCatalog {
         self.paths.entries()
     }
 
-    pub(crate) fn stack_variables(&self) -> &[(StackVariableId, ResolutionStackVariableIdentity)] {
+    #[doc(hidden)]
+    pub fn stack_variables(&self) -> &[(StackVariableId, ResolutionStackVariableIdentity)] {
         self.stack_variables.entries()
     }
 
@@ -3350,6 +3449,7 @@ impl ResolutionIdentityCatalog {
         &mut self,
         invocation_digest: [u8; 32],
         checkpoint: ResolutionNodeIdentity,
+        checkpoint_scope: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId>,
         module_scope: brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId,
     ) {
         use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
@@ -3369,6 +3469,12 @@ impl ResolutionIdentityCatalog {
             ))
             .expect("a lowered artifact's catalog holds its root scope head");
         self.source_site_nodes.insert(root);
+        // The root becomes the host's checkpoint node, so it carries the
+        // host's source scope for that node. The stage row for it shares the
+        // ordinary catalog's runtime key, and the two authorities must agree.
+        if let Some(scope) = checkpoint_scope {
+            self.source_scope_ordinals.insert(root, scope);
+        }
         for (runtime, identity) in self.nodes.identities_mut() {
             *identity = if runtime == root {
                 checkpoint
@@ -3596,7 +3702,7 @@ impl ResolutionIdentityCatalog {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ResolutionIdentityCatalog {
     pub(super) fn register_variable_for_publication_test(&mut self) -> StackVariableId {
         let identity = ResolutionStackVariableIdentity::new([0x73; 32]);
@@ -3644,10 +3750,15 @@ impl ResolutionIdentityCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::native_resolution_test_support::fixture_fragment as fragment;
+
     use brokk_bifrost_test_macros::hardwon;
+
     use std::cell::Cell;
-    use std::hash::{Hash, Hasher};
+
+    use std::hash::Hash;
+    use std::hash::Hasher;
 
     thread_local! {
         static IDENTITY_KEY_HASHES: Cell<usize> = const { Cell::new(0) };

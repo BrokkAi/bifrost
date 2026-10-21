@@ -14,7 +14,8 @@ use crate::hash::HashSet;
 ///
 /// The plan owns its language-specific execution, so framework code never names
 /// a language module or downcasts an untyped payload.
-pub(crate) trait PreparedUsageQuery: Send + Sync {
+#[doc(hidden)]
+pub trait PreparedUsageQuery: Send + Sync {
     fn candidate_files(&self) -> &HashSet<ProjectFile>;
 
     fn find_graph_usages(
@@ -37,8 +38,17 @@ pub trait UsageAnalyzer: Send + Sync {
     ) -> FuzzyResult;
 }
 
+/// One independently admitted target group in a shared scan.
+#[doc(hidden)]
+pub struct GraphUsageBatchQuery<'a> {
+    pub overloads: &'a [CodeUnit],
+    pub scope: UsageScanScope<'a>,
+    pub prepared: Option<&'a dyn PreparedUsageQuery>,
+}
+
 /// Graph-backed usage strategy that can distinguish fallback-safe gaps from terminal failures.
-pub(crate) trait GraphUsageAnalyzer: Send + Sync {
+#[doc(hidden)]
+pub trait GraphUsageAnalyzer: Send + Sync {
     /// Whether this strategy's proof tiers are authoritative. The engine stamps
     /// the answer with it so a consumer that may publish only proven evidence
     /// can tell a certified native inventory from a legacy language resolver's
@@ -61,6 +71,23 @@ pub(crate) trait GraphUsageAnalyzer: Send + Sync {
         _cancellation: &CancellationToken,
     ) -> Option<Box<dyn PreparedUsageQuery>> {
         None
+    }
+
+    fn find_graph_usages_batch(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        queries: &[GraphUsageBatchQuery<'_>],
+        max_usages: usize,
+    ) -> Vec<GraphUsageOutcome> {
+        queries
+            .iter()
+            .map(|query| match query.prepared {
+                Some(prepared) => {
+                    prepared.find_graph_usages(analyzer, query.overloads, &query.scope, max_usages)
+                }
+                None => self.find_graph_usages(analyzer, query.overloads, &query.scope, max_usages),
+            })
+            .collect()
     }
 
     fn find_graph_usages(
@@ -100,7 +127,8 @@ where
 ///
 /// The `'a` borrow is load-bearing: impls hold `&'a ConcreteAnalyzer` from the analyzer
 /// passed to `try_new`. Used only as a static bound, never as `dyn`.
-pub(crate) trait UsageQueryResolver<'a>: Sized {
+#[doc(hidden)]
+pub trait UsageQueryResolver<'a>: Sized {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self>;
 
     fn find_usages(
@@ -112,14 +140,20 @@ pub(crate) trait UsageQueryResolver<'a>: Sized {
     ) -> GraphUsageOutcome;
 }
 
-pub(crate) struct GraphUsageDispatchSpec {
-    pub(crate) target_language: Language,
-    pub(crate) unsupported_target: &'static str,
-    pub(crate) missing_analyzer: &'static str,
-    pub(crate) strategy: &'static str,
+#[doc(hidden)]
+pub struct GraphUsageDispatchSpec {
+    #[doc(hidden)]
+    pub target_language: Language,
+    #[doc(hidden)]
+    pub unsupported_target: &'static str,
+    #[doc(hidden)]
+    pub missing_analyzer: &'static str,
+    #[doc(hidden)]
+    pub strategy: &'static str,
 }
 
-pub(crate) fn dispatch_graph_usage_query<'a, Resolver>(
+#[doc(hidden)]
+pub fn dispatch_graph_usage_query<'a, Resolver>(
     analyzer: &'a dyn IAnalyzer,
     overloads: &[CodeUnit],
     scan_scope: &UsageScanScope<'_>,

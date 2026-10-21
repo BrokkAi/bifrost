@@ -151,15 +151,15 @@ test("runtime and individual host paths select their contracts", () => {
     selected(classifyChangeSet({ eventName: "pull_request", changedPaths: fixture("runtime") })),
     ["lsp_contract", "mcp_contract", "rql_runtime"],
   );
-  assert.deepEqual(
-    selected(
-      classifyChangeSet({
-        eventName: "pull_request",
-        changedPaths: ["crates/bifrost-mcp/src/mcp_extended.rs"],
-      }),
-    ),
-    ["mcp_contract", "rql_runtime"],
-  );
+  for (const path of [
+    "crates/bifrost-mcp/src/mcp_extended.rs",
+    "crates/bifrost-tools/src/searchtools/mod.rs",
+  ]) {
+    assert.deepEqual(
+      selected(classifyChangeSet({ eventName: "pull_request", changedPaths: [path] })),
+      ["mcp_contract", "rql_runtime"],
+    );
+  }
 });
 
 test("ordinary analyzer and test changes select the Rust matrix only", () => {
@@ -167,6 +167,7 @@ test("ordinary analyzer and test changes select the Rust matrix only", () => {
     eventName: "pull_request",
     changedPaths: [
       "crates/bifrost-analysis/src/analyzer/javascript/semantic.rs",
+      "crates/bifrost-tools/src/relevance.rs",
       "crates/bifrost-test-macros/src/lib.rs",
       "tests/fixtures/testcode-js/FeaturesTest.jsx",
       "tests/suite_analyzers/language_behavior.rs",
@@ -286,6 +287,10 @@ test("legacy analyzer producer paths select their matching pinned pack lanes", (
   for (const [changedPath, components] of [
     [
       "crates/bifrost-analysis/src/analyzer/semantic_model/catalog/mod.rs",
+      ["rust", "semantic_pack_jvm", "semantic_pack_python", "semantic_pack_rust", "semantic_pack_typescript"],
+    ],
+    [
+      "crates/bifrost-semantic/src/analyzer/semantic_model/catalog/db.rs",
       ["rust", "semantic_pack_jvm", "semantic_pack_python", "semantic_pack_rust", "semantic_pack_typescript"],
     ],
     ["crates/bifrost-analysis/src/analyzer/jvm/jmod_artifact.rs", ["rust", "semantic_pack_jvm"]],
@@ -458,6 +463,30 @@ test("version RC pushes select the full matrix for changed, empty, or failed dif
     assert.deepEqual(selected(decision), [...COMPONENTS].sort());
     assert.match(decision.reasons[0], /release-candidate push/u);
   }
+});
+
+test("a single checksum-correction commit on an RC runs only the plugin legs", () => {
+  const checksumPaths = ["plugins/bifrost-agent/bifrost-release.json", "plugins/bifrost-dsh/bifrost-release.json"];
+  const decision = classifyChangeSet({
+    eventName: "push",
+    ref: "refs/heads/candidate/v1.2.3-rc",
+    changedPaths: checksumPaths,
+    singleCommit: true,
+  });
+  assert.equal(decision.mode, "checksum");
+  assert.deepEqual(selected(decision), ["agent_plugin", "pi_package"]);
+
+  // Several commits, a failed diff, or any other path keep the full matrix.
+  for (const context of [
+    { changedPaths: checksumPaths, singleCommit: false },
+    { changedPaths: checksumPaths, singleCommit: true, diffFailed: true },
+    { changedPaths: [...checksumPaths, "Cargo.toml"], singleCommit: true },
+  ]) {
+    const full = classifyChangeSet({ eventName: "push", ref: "refs/heads/candidate/v1.2.3-rc", ...context });
+    assert.equal(full.mode, "full");
+  }
+  const master = classifyChangeSet({ eventName: "push", ref: "refs/heads/master", changedPaths: checksumPaths, singleCommit: true });
+  assert.equal(master.mode, "full");
 });
 
 test("manual RC CI selects the full matrix without a push before-SHA", () => {

@@ -33,3 +33,6 @@ pub mod queries;
 pub mod structural;
 pub mod syntax;
 pub mod test_detection;
+
+mod knowledge;
+pub use knowledge::RubyKnowledge;

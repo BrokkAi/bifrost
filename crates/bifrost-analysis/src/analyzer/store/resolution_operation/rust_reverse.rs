@@ -5,45 +5,55 @@ use super::*;
 use crate::analyzer::resolution::FactReverseReferenceBinding;
 
 #[derive(Debug)]
-pub(crate) struct SelectedRustTargetReferences {
-    pub(crate) target: CodeUnit,
-    pub(crate) search: SelectedReferenceSearchAnswer,
-    pub(crate) bindings: Box<[FactReverseReferenceBinding]>,
-    pub(crate) metrics: FactReverseResolutionMetrics,
+#[doc(hidden)]
+pub struct SelectedRustTargetReferences {
+    #[doc(hidden)]
+    pub target: CodeUnit,
+    #[doc(hidden)]
+    pub search: SelectedReferenceSearchAnswer,
+    #[doc(hidden)]
+    pub bindings: Box<[FactReverseReferenceBinding]>,
+    #[doc(hidden)]
+    pub metrics: FactReverseResolutionMetrics,
 }
 
-pub(crate) enum SelectedRustReverseBatchOutcome {
+#[doc(hidden)]
+pub enum SelectedRustReverseBatchOutcome {
     Ready(Vec<SelectedRustTargetReferences>),
     Unavailable(SelectedResolutionUnavailable),
     Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RustReverseRequest {
+#[doc(hidden)]
+pub enum RustReverseRequest {
     References,
     CallSites,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn test_reverse_source_does_not_own_sql_reader() -> ! {
     unreachable!("test reverse source does not own a selected SQL reader")
 }
 
 /// One requested reference retains all of its selected root answers.
-pub(crate) enum ReferenceResolution {
+#[doc(hidden)]
+pub enum ReferenceResolution {
     Answered(Vec<FactResolutionAnswer>),
     Omitted(ReferenceOmission),
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum ReferenceOmission {
+#[doc(hidden)]
+pub enum ReferenceOmission {
     ReceiverBudget(brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit),
     TimeBudgetExceeded,
 }
 
 /// Values returned inside this callback are provisional. Only the enclosing
 /// selected operation can authorize publication after its final authority check.
-pub(crate) trait SelectedRustReverseQueries {
+#[doc(hidden)]
+pub trait SelectedRustReverseQueries {
     /// The project's analysis generation, as this operation captured it when
     /// it opened. `finish` checks it again before authorizing publication.
     fn analysis_generation(&self) -> u64;
@@ -85,17 +95,17 @@ pub(crate) trait SelectedRustReverseQueries {
         references: &[SemanticId],
     ) -> Result<Option<Vec<ReferenceResolution>>>;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// Actual persisted definition-map loads in this selected operation. This
     /// excludes transient lookups and is not a count of queried definitions.
     fn definition_mount_read_count(&self) -> usize;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn begin_sql_work_trace(&self) {
         test_reverse_source_does_not_own_sql_reader()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn finish_sql_work_trace(&self) -> (usize, usize) {
         test_reverse_source_does_not_own_sql_reader()
     }

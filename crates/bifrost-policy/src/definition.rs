@@ -70,6 +70,10 @@ pub enum RqlpDocument {
     EndpointSet {
         definition: Box<EndpointSetDocument>,
     },
+    /// A reviewed set of exact declarations a policy imports (#5931).
+    DeclarationSelection {
+        definition: Box<DeclarationSelectionDocument>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -945,9 +949,11 @@ impl OriginShape {
 /// is not loop-invariant, even though its binding is declared outside.
 ///
 /// A value is established inside the related capture when the binding's
-/// declaring scope is inside it, or when some assignment whose left operand
-/// reaches the same binding is written inside it. The requirement is over both
-/// origins, so the violation -- the finding -- is "established by neither".
+/// declaring scope is inside it, or when a supported assignment or classified
+/// loop-target site inside it reaches the same canonical binding. Site position
+/// is independent of lexical ownership. Discovered targets need a unique
+/// unshadowed binding answer; missing or conflicting answers are inconclusive.
+/// This is not an exhaustive inventory of iteration writes or receiver mutation.
 #[derive(Debug, Clone)]
 pub struct ValueOriginAssert {
     pub id: PolicyAssertId,
@@ -1566,6 +1572,45 @@ pub enum PolicySelector {
         analysis_schema_version: Option<u32>,
         path: WorkspaceRelativePath,
     },
+    /// The exact declarations of one reviewed workspace document (#5931).
+    DeclarationSelection(DeclarationSelectionReference),
+}
+
+/// One relational binding over an imported declaration selection.
+///
+/// The document is workspace content, so the registry reads it only at
+/// activation. Relational plans type their bindings when the policy source
+/// is decoded, so the reference carries `shape`: a query of the document
+/// contract's exact form (`enclosing-decl` over one declaration, with the
+/// same output step) whose rows have the schema every valid document's rows
+/// have. Activation replaces it with the document's own query; it is never
+/// executed.
+#[derive(Debug, Clone)]
+pub struct DeclarationSelectionReference {
+    pub path: WorkspaceRelativePath,
+    pub language: brokk_bifrost_analysis::analyzer::Language,
+    pub output: DeclarationSelectionOutput,
+    pub shape: CodeQuery,
+    /// Byte range of the authored reference, for activation diagnostics.
+    pub range: Range<usize>,
+}
+
+/// What a binding reads from its imported declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclarationSelectionOutput {
+    /// The selected declarations themselves.
+    Declarations,
+    /// The `procedure-effects` rows of the selected declarations.
+    ProcedureEffects,
+}
+
+impl DeclarationSelectionOutput {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Declarations => "declarations",
+            Self::ProcedureEffects => "procedure_effects",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1790,6 +1835,19 @@ pub struct EndpointSetDocument {
     pub schema_version: PolicySchemaVersion,
     pub kind: EndpointSetKind,
     pub spec: TaintPolicySpec,
+}
+
+/// A standalone reviewed set of exact declarations (#5931).
+///
+/// Every entry is an inline `enclosing-decl` selector of one function,
+/// method, or class with an exact name, optionally inside one exactly named
+/// owner, scoped to the document's single language. Entries are sorted by
+/// their canonical query so source order and comments are not identity.
+#[derive(Debug, Clone)]
+pub struct DeclarationSelectionDocument {
+    pub schema_version: PolicySchemaVersion,
+    pub language: brokk_bifrost_analysis::analyzer::Language,
+    pub declarations: Vec<(SchemaVersionResolution, CodeQuery)>,
 }
 
 /// One workspace-relative endpoint-set dependency and its optional content

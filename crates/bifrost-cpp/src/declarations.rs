@@ -5924,7 +5924,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         } else {
             namespace.clone()
         };
-        let mut intern = |family: Node<'_>| {
+        let intern = |family: Node<'_>| {
             let mut collector = self.source_collector.borrow_mut();
             if family.id() == self.primary_root_id || self.primary_ancestry.contains(family) {
                 collector.intern_node(family)
@@ -5934,13 +5934,13 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             }
         };
         let family = preprocessor_conditional_family_node(node)
-            .map(&mut intern)
+            .map(intern)
             .or_else(|| inherited.and_then(|outer| outer.family));
         let exhaustive_family = preprocessor_conditional_family_for_declaration_with_cache(
             node,
             &mut self.preprocessor_context_cache,
         )
-        .map(&mut intern)
+        .map(intern)
         .or_else(|| inherited.and_then(|outer| outer.exhaustive_family));
         let local_completion = crate::graph::resolver::callable_guard_completion_byte_with_cache(
             node,
@@ -9499,7 +9499,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         fact.callable_activation = Some(range.end_byte);
         fact.callable_guard_completion_byte = captured.callable_guard_completion_byte;
         fact.flattened_macro_namespace = captured.flattened_macro_namespace;
-        let mut intern = |node: Node<'_>| {
+        let intern = |node: Node<'_>| {
             let mut collector = self.source_collector.borrow_mut();
             if node.id() == self.primary_root_id || self.primary_ancestry.contains(node) {
                 collector.intern_node(node)
@@ -9508,11 +9508,10 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             }
         };
         fact.conditional_family =
-            crate::graph::resolver::preprocessor_conditional_family_node(context).map(&mut intern);
-        fact.exhaustive_conditional_family =
-            captured.exhaustive_conditional_family.map(&mut intern);
+            crate::graph::resolver::preprocessor_conditional_family_node(context).map(intern);
+        fact.exhaustive_conditional_family = captured.exhaustive_conditional_family.map(intern);
         fact.displaced_namespace_closing_brace =
-            captured.displaced_namespace_closing_brace.map(&mut intern);
+            captured.displaced_namespace_closing_brace.map(intern);
         self.capture_source_dependencies(&mut fact, context, unit);
         self.apply_active_source_context(&mut fact);
         assert!(

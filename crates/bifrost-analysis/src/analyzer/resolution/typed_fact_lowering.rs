@@ -2352,7 +2352,10 @@ impl LoweredTypedFragment {
         let identity_outputs = self
             .transfers
             .iter()
-            .filter(|transfer| transfer.kind() == ResolutionTypeTransferKind::TypeIdentity)
+            .filter(|transfer| {
+                transfer.kind() == ResolutionTypeTransferKind::TypeIdentity
+                    && transfer.rule().value_transform() == TypeTransferValueTransform::Preserve
+            })
             .map(|transfer| transfer.rule().target_slot())
             .collect::<HashSet<_>>();
         let projected_outputs = self
@@ -2403,13 +2406,19 @@ impl LoweredTypedFragment {
                 transfer.rule.value_transform(),
             );
             match transfer.kind {
-                ResolutionTypeTransferKind::TypeIdentity
-                | ResolutionTypeTransferKind::TypeUnion
-                | ResolutionTypeTransferKind::TypeAlias => assert_eq!(
+                ResolutionTypeTransferKind::TypeIdentity => validate_type_identity_transfer(
                     source_role,
-                    ResolutionTypeSlotRole::TargetTypeIdentity,
-                    "type-identity transfer input must retain a type object"
+                    transfer.rule.indirection_delta(),
+                    transfer.rule.reference_indirection_delta(),
+                    transfer.rule.value_transform(),
                 ),
+                ResolutionTypeTransferKind::TypeUnion | ResolutionTypeTransferKind::TypeAlias => {
+                    assert_eq!(
+                        source_role,
+                        ResolutionTypeSlotRole::TargetTypeIdentity,
+                        "type-identity transfer input must retain a type object"
+                    )
+                }
                 ResolutionTypeTransferKind::DeclaredType => assert_eq!(
                     source_role,
                     ResolutionTypeSlotRole::TargetTypeIdentity,
@@ -2451,7 +2460,11 @@ impl LoweredTypedFragment {
                 ),
                 ResolutionTypeTransferKind::ComponentElement
                 | ResolutionTypeTransferKind::ComponentKey
-                | ResolutionTypeTransferKind::ComponentValue => validate_component_transfer(
+                | ResolutionTypeTransferKind::ComponentValue
+                | ResolutionTypeTransferKind::ComponentIndex
+                | ResolutionTypeTransferKind::ComponentIndexOk
+                | ResolutionTypeTransferKind::ComponentCommaOkValue
+                | ResolutionTypeTransferKind::ComponentSlice => validate_component_transfer(
                     source_role,
                     output_role,
                     transfer.rule.indirection_delta(),
@@ -2489,10 +2502,7 @@ impl LoweredTypedFragment {
                     "address-of requires an expression operand"
                 );
             }
-            if matches!(
-                transfer.kind,
-                ResolutionTypeTransferKind::TypeIdentity | ResolutionTypeTransferKind::TypeUnion
-            ) {
+            if transfer.kind == ResolutionTypeTransferKind::TypeUnion {
                 assert_eq!(
                     (
                         transfer.rule.indirection_delta(),
@@ -3190,10 +3200,15 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         .iter()
         .map(|projection| projection.output)
         .collect::<HashSet<_>>();
+    // A static-type lift refines dataflow from an existing value binding;
+    // unlike Rust Self-style identity transfers, it does not own that name.
     let transferred_identity_outputs = facts
         .type_transfers
         .iter()
-        .filter(|transfer| transfer.kind == ResolutionTypeTransferKind::TypeIdentity)
+        .filter(|transfer| {
+            transfer.kind == ResolutionTypeTransferKind::TypeIdentity
+                && transfer.value_transform == ResolutionTypeTransferValueTransform::Preserve
+        })
         .map(|transfer| transfer.output)
         .collect::<HashSet<_>>();
     let frontiers = facts
@@ -3642,10 +3657,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             "local or pattern binder must identify a declaration"
         );
         assert!(
-            matches!(
-                index.site(binder.declaration).kind,
-                ResolutionSiteKind::ValueDeclaration | ResolutionSiteKind::Pattern
-            ),
+            index.site(binder.declaration).kind.is_value_declaration()
+                || index.site(binder.declaration).kind == ResolutionSiteKind::Pattern,
             "local or pattern binder must be attached to its declaration site: {binder:?}"
         );
         let assignment_slots = index
@@ -4804,6 +4817,11 @@ impl<'facts> TypedFactIndex<'facts> {
         let mut seen_binders = HashSet::default();
         for binder in &facts.binders {
             assert!(seen_binders.insert(*binder), "duplicate binder: {binder:?}");
+            // Lexical lowering validates aliases and routes them to their target.
+            // The binding site itself owns no declaration or typed properties.
+            if matches!(binder.kind, ResolutionBinderKind::Alias { .. }) {
+                continue;
+            }
             let declaration = self.definition_identifier(binder.declaration);
             assert!(self.scopes.contains_key(&binder.scope));
             assert!(binder.activation_start <= binder.activation_end);
@@ -4923,7 +4941,7 @@ impl<'facts> TypedFactIndex<'facts> {
             ));
             self.definition_identifier(parameter.callable);
             let parameter_site = self.site(parameter.parameter);
-            assert_eq!(parameter_site.kind, ResolutionSiteKind::ValueDeclaration);
+            assert!(parameter_site.kind.is_value_declaration());
             // A wildcard parameter (Rust `_`) binds nothing, so its site has
             // no identifier and its slot no declaration-type property: there
             // is no definition to carry one. A named parameter has both.
@@ -5270,9 +5288,13 @@ fn validate_transfer_roles(
         lower_value_transform(fact.value_transform),
     );
     match fact.kind {
-        ResolutionTypeTransferKind::TypeIdentity
-        | ResolutionTypeTransferKind::TypeUnion
-        | ResolutionTypeTransferKind::TypeAlias => {
+        ResolutionTypeTransferKind::TypeIdentity => validate_type_identity_transfer(
+            input,
+            i64::from(fact.indirection_delta),
+            i64::from(fact.reference_indirection_delta),
+            lower_value_transform(fact.value_transform),
+        ),
+        ResolutionTypeTransferKind::TypeUnion | ResolutionTypeTransferKind::TypeAlias => {
             assert_eq!(
                 input,
                 ResolutionTypeSlotRole::TargetTypeIdentity,
@@ -5329,7 +5351,11 @@ fn validate_transfer_roles(
         ),
         ResolutionTypeTransferKind::ComponentElement
         | ResolutionTypeTransferKind::ComponentKey
-        | ResolutionTypeTransferKind::ComponentValue => validate_component_transfer(
+        | ResolutionTypeTransferKind::ComponentValue
+        | ResolutionTypeTransferKind::ComponentIndex
+        | ResolutionTypeTransferKind::ComponentIndexOk
+        | ResolutionTypeTransferKind::ComponentCommaOkValue
+        | ResolutionTypeTransferKind::ComponentSlice => validate_component_transfer(
             input,
             output,
             i64::from(fact.indirection_delta),
@@ -5358,10 +5384,7 @@ fn validate_transfer_roles(
             "address-of requires an expression operand"
         );
     }
-    if matches!(
-        fact.kind,
-        ResolutionTypeTransferKind::TypeIdentity | ResolutionTypeTransferKind::TypeUnion
-    ) {
+    if fact.kind == ResolutionTypeTransferKind::TypeUnion {
         assert_eq!(
             (fact.indirection_delta, fact.reference_indirection_delta),
             (0, 0),
@@ -5471,6 +5494,33 @@ fn validate_value_join_transfer(
     );
 }
 
+pub(crate) fn validate_type_identity_transfer(
+    input: ResolutionTypeSlotRole,
+    delta: i64,
+    reference_delta: i64,
+    transform: TypeTransferValueTransform,
+) {
+    // Kotlin smart-cast refinement preserves the binding's declared projection
+    // and lifts that occurrence's static type into an independent union bound.
+    assert!(
+        matches!(
+            (input, delta, reference_delta, transform),
+            (
+                ResolutionTypeSlotRole::TargetTypeIdentity,
+                0,
+                0,
+                TypeTransferValueTransform::Preserve
+            ) | (
+                ResolutionTypeSlotRole::ExpressionValue,
+                0,
+                0,
+                TypeTransferValueTransform::StaticTypeObject
+            )
+        ),
+        "type-identity input must retain a type object or lift a smart-cast static type"
+    );
+}
+
 fn validate_address_of_transfer(
     delta: i64,
     reference_delta: i64,
@@ -5508,7 +5558,11 @@ fn transfer_accepts_output_role(
         | ResolutionTypeTransferKind::ValueJoin => ResolutionTypeSlotRole::ExpressionValue,
         ResolutionTypeTransferKind::ComponentElement
         | ResolutionTypeTransferKind::ComponentKey
-        | ResolutionTypeTransferKind::ComponentValue => {
+        | ResolutionTypeTransferKind::ComponentValue
+        | ResolutionTypeTransferKind::ComponentIndex
+        | ResolutionTypeTransferKind::ComponentIndexOk
+        | ResolutionTypeTransferKind::ComponentCommaOkValue
+        | ResolutionTypeTransferKind::ComponentSlice => {
             return matches!(
                 output,
                 ResolutionTypeSlotRole::DeclaredValue
@@ -5696,13 +5750,13 @@ fn validate_declaration_type(fact: DeclarationTypeSlotFact, index: &TypedFactInd
             ));
         }
         DeclarationTypeRole::Value | DeclarationTypeRole::Parameter => {
-            assert_eq!(declaration.kind, ResolutionSiteKind::ValueDeclaration);
+            assert!(declaration.kind.is_value_declaration());
         }
         DeclarationTypeRole::ObservedValue => {
-            assert!(matches!(
-                declaration.kind,
-                ResolutionSiteKind::ValueDeclaration | ResolutionSiteKind::Pattern
-            ));
+            assert!(
+                declaration.kind.is_value_declaration()
+                    || declaration.kind == ResolutionSiteKind::Pattern
+            );
         }
         DeclarationTypeRole::Return | DeclarationTypeRole::CallableFirstResult => {
             assert_eq!(declaration.kind, ResolutionSiteKind::CallableDeclaration);
@@ -5865,8 +5919,15 @@ fn gaps_by_site(facts: &FileResolutionFacts) -> HashMap<ResolutionSiteId, Vec<Re
     let mut gaps: HashMap<_, Vec<_>> = HashMap::default();
     let mut seen = HashSet::default();
     for gap in &facts.gaps {
-        assert!(seen.insert(*gap), "duplicate resolution gap: {gap:?}");
-        gaps.entry(gap.site).or_default().push(gap.kind);
+        assert!(seen.insert(gap), "duplicate resolution gap: {gap:?}");
+        if !matches!(
+            gap.route(),
+            Some(
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionRouteGap::UnknownAlias { .. }
+            )
+        ) {
+            gaps.entry(gap.site).or_default().push(gap.kind);
+        }
     }
     for kinds in gaps.values_mut() {
         kinds.sort_unstable();
@@ -6472,6 +6533,10 @@ const fn transfer_kind_rank(kind: ResolutionTypeTransferKind) -> u8 {
         // ValueJoin is appended after the existing operand-promotion ranks so
         // the combined order keeps every persisted identity stable.
         ResolutionTypeTransferKind::ValueJoin => 20,
+        ResolutionTypeTransferKind::ComponentIndex => 21,
+        ResolutionTypeTransferKind::ComponentIndexOk => 22,
+        ResolutionTypeTransferKind::ComponentSlice => 23,
+        ResolutionTypeTransferKind::ComponentCommaOkValue => 24,
         ResolutionTypeTransferKind::NumericPromotion => 18,
         ResolutionTypeTransferKind::StringConcatenation => 19,
     }
@@ -6678,10 +6743,10 @@ mod tests {
                 indirection_delta: 0,
                 reference_indirection_delta: 0,
             }],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(2),
-                kind: ResolutionGapKind::UnsupportedTypeSyntax,
-            }],
+            gaps: vec![ResolutionGapFact::new(
+                ResolutionSiteId::new(2),
+                ResolutionGapKind::UnsupportedTypeSyntax,
+            )],
             ..FileResolutionFacts::default()
         };
 
@@ -7169,14 +7234,14 @@ mod tests {
                 kind: ResolutionSupertypeKind::Superclass,
             }],
             gaps: vec![
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(0),
-                    kind: ResolutionGapKind::ImplicitConstructor,
-                },
-                ResolutionGapFact {
-                    site: ResolutionSiteId::new(1),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
+                ResolutionGapFact::new(
+                    ResolutionSiteId::new(0),
+                    ResolutionGapKind::ImplicitConstructor,
+                ),
+                ResolutionGapFact::new(
+                    ResolutionSiteId::new(1),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                ),
             ],
             declaration_visibilities: vec![ResolutionDeclarationVisibilityFact {
                 declaration: ResolutionSiteId::new(0),

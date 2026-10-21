@@ -18,8 +18,12 @@ would make it mean. And every answer states whether it is complete, so an empty
 answer is a claim of absence only when the search finished.
 
 > **Status:** This chapter describes the design that every analyzable language
-> moves onto. Rust uses it in production. Java, Kotlin, Scala, and Go have
-> producers and test-only resolvers; their production switch is in progress.
+> moves onto. Rust uses it in production. Go uses it for point navigation,
+> calls, rename and target-directed references; its workspace graph rollout
+> remains separate. Kotlin definition and type points also use it in
+> production; Kotlin usage graphs retain their existing backend. Java and
+> Scala have producers and trial resolvers; their production switch is in
+> progress.
 > The other languages still use the structured resolvers described in
 > [Usage Analysis Engine](../usage-analysis/). See
 > [Language status](#language-status).
@@ -246,6 +250,33 @@ files depends on configuration:
 - Other languages: project references, include paths, preprocessor
   configuration, or import roots.
 
+For Go, the go command is the package authority. In module mode, vendoring
+uses the main module root's `vendor` directory; nested `vendor` directories
+are not providers. Bifrost reports the tool's discovery error for an unresolved
+import, including the import path, rather than selecting a nearby source copy.
+This retires the legacy nearest-vendor guarantee (#5697).
+
+Go is the only native language whose prefixes can resolve into a remote source
+environment: a package in the module cache or a vendor tree, prepared as an
+overlay. Rust reads dependency packs and rustdoc JSON, and the JVM languages
+read JARs, so neither needs one. Go therefore keeps a language hook for remote
+prefixes: a nested evaluator resolves the prefix inside the remote
+environment's prepared context. The shared demand scheduler evaluates prefixes
+only in the caller's environment. Moving remote environments into it would
+need a request-owned registry of environments and, for overlays prepared
+during the request, a stable owner outside the request. That work waits until
+a second language needs remote environments or the nested evaluator causes a
+defect (#5658).
+
+Source-owned root imports are published independently of lookup demands in
+`resolution_root_imports`, `resolution_root_import_segments`, and
+`resolution_root_import_demands`. Each route retains its native site and scope,
+anchor, source position, named/glob kind, ordered path, and optional exact target
+reference with its source spelling. An unused glob still has a route. A shared indexed reader selects a
+scope's named and glob routes; language-specific context then chooses their
+destinations. Rust import tokens carry an explicit site crosswalk rather than
+borrowing a source import ordinal from a semantic key.
+
 ### Import halves and export halves
 
 File-local facts describe each cross-file route in two halves that do not know
@@ -283,6 +314,14 @@ has one rebuild rule.
 JVM selected operations reuse completed reads by their full inputs and selection
 epochs within that request. These memos die with the operation and are never
 persisted or shared with a later request.
+The shared context-preparation lifecycle owns memo admission, lazy import
+plans, compiled projections and registration charges. Languages supply exact
+keys and typed derivations, including their metadata and inventory proofs.
+Joinable membership remains in request TEMP rows, and named publication is a
+SQL delta against staged membership. Compiling a projection does not authorize
+its reuse as a published row until the context transaction commits; failed
+registration charges do not advance the provider ledger. Provider cells are
+registered once per request, with new named cells charged as deltas.
 
 The rebuild rule for a summary gives the engine its incremental behavior. A
 unit is derived again when its own inputs change or when a consumed unit's
@@ -324,6 +363,58 @@ Those surface gaps belong to the topology, not to a member's binding summary: a
 missing public module still has a known declaration and a known failed lookup,
 so it opens the topology inventory and changes the digest without marking every
 member of the crate incomplete.
+
+### Rust import determinacy
+
+Rust derives bindings by module, lexical scope, namespace and spelling, retaining
+all distinct canonical declaration endpoints. Item and named-import precedence
+is applied before glob propagation at each intermediate module. Accessibility
+is checked on the carried binding. Equal-precedence endpoints remain ambiguous
+and carry scoped `InconsistentPrecedence` evidence; SQLite row order never
+selects a representative. Ambiguity follows accessible binding flows and named
+path dependencies. A dependency needed only to prove completeness does not
+carry ambiguity from names that the consumer cannot access.
+
+Canonical endpoints do not replace dependency edges. A separate Rust binding
+provenance relation retains each admitted source import, its first provider
+binding and its canonical endpoint. Summary route provenance reads these edges,
+so two facades of one declaration remain distinct dependencies. Point lookup
+continues to read canonical endpoints directly. The output digest covers these
+dependency-visible edges using logical source paths rather than blob ids, so
+ordinary body edits can still stop at an unchanged output digest.
+
+A conflicting glob group's visibility is exact when all members agree. A
+consumer admitted by every member reads the group as ambiguous. If only some
+members admit that consumer, the facts do not determine the group's effective
+visibility: rustc's import resolution order selects the visibility of its
+ambiguity binding. Bifrost preserves every canonical endpoint as scoped
+`UnsupportedSemantic` evidence instead of modeling an order or selecting a
+member. Exact exports exclude endpoints supported only by that uncertain
+flow; an independent exact witness for the same endpoint remains available.
+The final positive witness closure and uncertainty evidence are add-only, as
+is the canonical binding relation. Point readers consume the same scoped exact
+set; raw glob reachability cannot make an unsupported member exact. All-private
+groups export nothing to an
+inaccessible consumer, while all-public groups export their ambiguity.
+
+Import lookup and glob propagation form one dependency graph. Lookup and glob
+inputs are positive edges; named shadowing and external-prelude fallback add
+negative edges. The shared SCC algorithm partitions this graph. A component
+without an internal negative edge reaches its least fixed point after its
+predecessor strata are complete. An empty such component proves absence,
+including an unanchored cycle of named imports. An internal negative edge keeps
+unsettled keys incomplete with `CyclicExpansion`. Open macro or external inputs
+remain incomplete through the existing boundary evidence. Admitted endpoints
+are never withdrawn.
+
+A named import's source lookup excludes that import's own contribution when it
+reads its bound spelling in its own scope. Other imports and globs still count.
+These temporary lookup keys share the admission relation but are never
+published as module exports. This allows a named import to obtain a binding
+from its module's glob without making that weaker glob visible prematurely to
+other readers. Named re-export chasing deduplicates the source identity and
+current canonical target; it terminates on the finite relation rather than an
+arbitrary hop limit. Visibility walks terminate at the path's segment count.
 
 ### Incremental context derivation
 
@@ -629,17 +720,27 @@ worktree that opens the cache.
 
 ## Language status
 
-Each language moves onto this engine as a whole. Definition and type lookup,
-forward and reverse usages, calls, rename, workspace graphs, missing-test and
-dead-code analysis, relevance, RQL, and policy all switch to it together, and
-the language's previous resolver is then removed. No language runs two
-resolvers with a hidden fallback between them.
+Migration proceeds by consumer family. Each migrated consumer has one
+resolution authority, without a hidden fallback to its previous resolver.
+Go definition and type lookup, call targets and evidence, rename, selected
+inverse references and target-directed usages use the native engine. Its
+rooted and whole-workspace usage graphs retain the incumbent backend,
+including deferred site disambiguation; `BIFROST_TRIAL_NATIVE_GO_GRAPH=1`
+selects the native graph for trial runs. Dead-code analysis also retains the
+incumbent strategy. The previous Go resolver can be removed after these
+remaining consumers move. Kotlin definition and type points use native
+resolution; its reference and workspace graph consumers retain the existing
+Kotlin edge pass. The incumbent Kotlin point resolver is removed, while
+graph-specific name and hierarchy support remains until those graph
+consumers migrate. Calls, RQL and policy use the authority of the underlying
+consumer.
 
 | Language | Status | Context the language must supply |
 | --- | --- | --- |
 | Rust | Current | Cargo targets, module trees, editions, `cfg` options, preludes |
-| Java, Kotlin, Scala | Direction | Source roots, packages, dependencies; one shared JVM ecosystem |
-| Go | Direction | Modules, packages, imports, build constraints |
+| Kotlin | Current for definition/type points; graph migration pending | Source roots, packages, dependencies; shared JVM ecosystem |
+| Java, Scala | Direction | Source roots, packages, dependencies; shared JVM ecosystem |
+| Go | Current for point, call, rename and target-directed reference consumers; graph rollout in progress | Modules, packages, imports, build constraints |
 | JavaScript, TypeScript | Direction | Module resolution and project configuration |
 | Python | Direction | Import roots and packages |
 | C# | Direction | Projects and their references |

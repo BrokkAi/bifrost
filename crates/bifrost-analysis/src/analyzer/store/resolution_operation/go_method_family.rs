@@ -4,20 +4,26 @@ use crate::analyzer::resolution::{GoInterfaceSatisfaction, GoMethodSatisfaction}
 use rusqlite::{OptionalExtension, params};
 
 #[derive(Clone, Debug)]
-pub(crate) struct GoFamilyInterface {
-    pub(crate) name: String,
+#[doc(hidden)]
+pub struct GoFamilyInterface {
+    #[doc(hidden)]
+    pub name: String,
     pub(crate) package_id: i64,
     pub(crate) methods: Vec<SemanticId>,
-    pub(crate) outcome: GoMethodSatisfaction,
+    #[doc(hidden)]
+    pub outcome: GoMethodSatisfaction,
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct GoMethodFamily {
-    pub(crate) interfaces: Vec<GoFamilyInterface>,
+#[doc(hidden)]
+pub struct GoMethodFamily {
+    #[doc(hidden)]
+    pub interfaces: Vec<GoFamilyInterface>,
 }
 
 impl GoMethodFamily {
-    pub(crate) fn contains(&self, method: SemanticId) -> bool {
+    #[doc(hidden)]
+    pub fn contains(&self, method: SemanticId) -> bool {
         self.interfaces.iter().any(|interface| {
             interface.outcome == GoMethodSatisfaction::Satisfies
                 && interface.methods.contains(&method)
@@ -36,7 +42,8 @@ impl GoMethodFamily {
         packages
     }
 
-    pub(crate) fn rename_refusal(&self) -> Option<(&'static str, String)> {
+    #[doc(hidden)]
+    pub fn rename_refusal(&self) -> Option<(&'static str, String)> {
         if self.interfaces.is_empty() {
             return None;
         }

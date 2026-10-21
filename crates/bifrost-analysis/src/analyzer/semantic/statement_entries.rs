@@ -7,222 +7,23 @@
 use crate::analyzer::languages::ProcedureSyntaxRoles;
 use crate::analyzer::languages::language_support;
 use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, Reachability, forward_reachability,
+    CfgAlgorithmBudget, CfgAlgorithmRequest, forward_reachability,
 };
 use crate::analyzer::semantic::type_flow::{
     source_span_for_node, validate_prepared_syntax_source_for_procedure,
 };
 use crate::analyzer::semantic::{
-    ContentIdentity, EvidenceCompleteness, OverlaySnapshotId, ProcedureHandle, ProcedureSemantics,
-    ProgramPointId, ProofStatus, SemanticCapability, SemanticGapDischarge, SemanticGapSubject,
-    SemanticRole, SourceMappingKind, SourceRevision, SourceSpan, StableDigest, WorkspaceMountId,
-    WorkspaceRelativePath,
+    ProcedureHandle, ProgramPointId, SemanticRole, SourceMappingKind, SourceSpan,
 };
 use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
-use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxTree};
-use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
+use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use brokk_bifrost_core::analyzer::tree_walk::node_range;
-use std::mem::size_of;
-use std::sync::Arc;
+pub use brokk_bifrost_semantic::analyzer::semantic::statement_entries::*;
 use tree_sitter::Node;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatementEntryOpen {
-    SourceSnapshotMismatch,
-    MissingProducerSite,
-}
-
-/// An exact span-to-entry index for one procedure and one prepared source.
-///
-/// Several points may enter the same statement (for example, distinct finally
-/// routes), so callers must inspect every returned point. An entry point may
-/// also be shared with an enclosing statement; the producer's source mapping
-/// identifies which statement each row describes.
-pub struct StatementEntryIndex {
-    by_span: HashMap<SourceSpan, Vec<ProgramPointId>>,
-}
-
-impl StatementEntryIndex {
-    pub fn new(
-        procedure: &ProcedureHandle,
-        file: &ProjectFile,
-        prepared: &PreparedSyntaxTree,
-    ) -> Result<Self, StatementEntryOpen> {
-        let key = procedure.artifact().key();
-        let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-            .map_err(|_| StatementEntryOpen::SourceSnapshotMismatch)?;
-        let content =
-            ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
-        let revision_matches = match (key.revision(), prepared.origin()) {
-            (SourceRevision::Disk { content: expected }, PreparedSourceOrigin::Disk) => {
-                content == expected
-            }
-            (
-                SourceRevision::Overlay {
-                    content: expected,
-                    snapshot,
-                },
-                PreparedSourceOrigin::Overlay,
-            ) => {
-                content == expected
-                    && prepared.overlay_revision().is_some_and(|overlay| {
-                        OverlaySnapshotId::hash_bytes(overlay.get().to_le_bytes()) == snapshot
-                    })
-            }
-            _ => false,
-        };
-        if key.mount() != WorkspaceMountId::from_root(file.root())
-            || key.path() != &path
-            || key.language() != prepared.dialect()
-            || !revision_matches
-        {
-            return Err(StatementEntryOpen::SourceSnapshotMismatch);
-        }
-
-        let semantics = procedure.semantics();
-        let mut by_span = HashMap::default();
-        for site in semantics.statement_entries() {
-            let source = semantics
-                .source_mapping(site.source)
-                .expect("validated statement entry has an exact source mapping");
-            by_span
-                .entry(source.locator.anchor().span())
-                .or_insert_with(Vec::new)
-                .push(site.point);
-        }
-        Ok(Self { by_span })
-    }
-
-    /// Look up one independently enumerated executable statement node.
-    ///
-    /// The caller is responsible for proving that only one candidate syntax
-    /// node of the relevant statement role owns this exact span. A missing
-    /// site is explicitly open; it must not be treated as a dead statement.
-    pub fn at_span(&self, span: SourceSpan) -> Result<&[ProgramPointId], StatementEntryOpen> {
-        self.by_span
-            .get(&span)
-            .map(Vec::as_slice)
-            .ok_or(StatementEntryOpen::MissingProducerSite)
-    }
-}
-
-const MAX_STATEMENT_SOURCE_BYTES: usize = 1_048_576;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatementVerdict {
-    Reachable,
-    Unreachable,
-    Open(&'static str),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct StatementCoordinates {
-    pub start_line: usize,
-    pub start_column: usize,
-    pub end_line: usize,
-    pub end_column: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct StatementAssessment {
-    pub range: Range,
-    pub coordinates: StatementCoordinates,
-    pub kind: &'static str,
-    pub verdict: StatementVerdict,
-}
-
-#[derive(Debug, Clone)]
-pub struct StatementAssessments {
-    pub rows: Vec<StatementAssessment>,
-    pub complete: bool,
-    pub reason: Option<&'static str>,
-}
-
-fn unavailable(reason: &'static str) -> StatementAssessments {
-    StatementAssessments {
-        rows: Vec::new(),
-        complete: false,
-        reason: Some(reason),
-    }
-}
-
-fn algorithm_open_reason(error: CfgAlgorithmError<ProgramPointId>) -> &'static str {
-    match error {
-        CfgAlgorithmError::Cancelled { .. } => "cancelled",
-        CfgAlgorithmError::ExceededBudget(_) => "control_budget_exhausted",
-        CfgAlgorithmError::InvalidNode(point) => {
-            panic!("validated procedure has an invalid CFG point {point:?}")
-        }
-    }
-}
-
-fn scan_control_evidence(
-    semantics: &ProcedureSemantics,
-    reachable: &Reachability<ProgramPointId>,
-    request: &mut CfgAlgorithmRequest<'_>,
-) -> Result<Option<&'static str>, CfgAlgorithmError<ProgramPointId>> {
-    let complete_evidence = |id| {
-        let evidence = semantics
-            .evidence_row(id)
-            .expect("validated control row has evidence");
-        evidence.proof == ProofStatus::Proven
-            && evidence.completeness == EvidenceCompleteness::Complete
-    };
-    for gap in semantics.gaps() {
-        request.visit_node::<ProgramPointId>()?;
-        // Reachability depends only on the retained successor topology. A
-        // retained-topology gap keeps every successor, and a non-rejoining
-        // exceptional exit omits only a route that enters no handler or
-        // cleanup code and never resumes this procedure, so neither can make
-        // a statement reachable.
-        if matches!(
-            gap.discharge,
-            SemanticGapDischarge::RetainedControlTopology
-                | SemanticGapDischarge::NonRejoiningExceptionalExit
-        ) {
-            continue;
-        }
-        if matches!(
-            gap.capability,
-            SemanticCapability::NormalControlFlow
-                | SemanticCapability::ExceptionalControlFlow
-                | SemanticCapability::CleanupControlFlow
-                | SemanticCapability::NonLocalControl
-                | SemanticCapability::GuardFacts
-                | SemanticCapability::SwitchFacts
-        ) && (gap.subject == SemanticGapSubject::Procedure
-            || reachable.contains(semantics, gap.point))
-        {
-            return Ok(Some("control_evidence_incomplete"));
-        }
-    }
-    for point in semantics.points() {
-        request.visit_node::<ProgramPointId>()?;
-        if !reachable.contains(semantics, point.id) {
-            continue;
-        }
-        if !complete_evidence(point.evidence) {
-            return Ok(Some("control_evidence_incomplete"));
-        }
-        if point.id != semantics.normal_exit_point()
-            && point.id != semantics.exceptional_exit_point()
-            && semantics.successor_edges(point.id).len() == 0
-        {
-            return Ok(Some("control_frontier_incomplete"));
-        }
-    }
-    for edge in semantics.control_edges() {
-        request.visit_edge::<ProgramPointId>()?;
-        if reachable.contains(semantics, edge.source_point) && !complete_evidence(edge.evidence) {
-            return Ok(Some("control_evidence_incomplete"));
-        }
-    }
-    Ok(None)
-}
-
 /// Prepared syntax validated against one procedure's artifact snapshot, with
 /// the syntax roles of the procedure's language.
 pub(crate) struct ProcedureSyntax {
@@ -356,22 +157,6 @@ pub fn statement_assessments(
     .clone()
 }
 
-pub(crate) fn weight_statement_assessments(
-    _key: &(
-        crate::analyzer::semantic::SemanticArtifactMaterializationId,
-        crate::analyzer::semantic::ProcedureId,
-    ),
-    value: &Arc<StatementAssessments>,
-) -> u32 {
-    let size = size_of::<StatementAssessments>().saturating_add(
-        value
-            .rows
-            .capacity()
-            .saturating_mul(size_of::<StatementAssessment>()),
-    );
-    size.clamp(1, u32::MAX as usize) as u32
-}
-
 pub(crate) fn build_statement_assessments(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -492,13 +277,24 @@ pub(crate) fn build_statement_assessments(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::semantic::{
-        CancellationToken, ProcedureKind, SemanticBudget, SemanticRequest,
-    };
-    use crate::analyzer::{AnalyzerConfig, Language};
+pub(crate) mod tests {
+
+    use brokk_bifrost_analysis::analyzer::semantic::statement_entries::StatementVerdict;
+
+    use brokk_bifrost_analysis::analyzer::semantic::statement_entries::statement_assessments;
+
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ir::model::ProcedureKind;
+
+    use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticBudget;
+
+    use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticRequest;
+
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_core::analyzer::model::Language;
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]

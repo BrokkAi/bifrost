@@ -40,7 +40,25 @@ pub const CORRECTNESS_PACK_ID: &str = "bifrost.correctness";
 pub const SECURITY_PACK_ID: &str = "bifrost.security";
 pub const EFFECTS_PACK_ID: &str = "bifrost.effects";
 pub const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 2;
-const OPEN_POLICY_PACK_ROOT_ENV: &str = "BIFROST_OPEN_POLICY_PACK_ROOT";
+/// Extracted policy rules trees, as one directory or an OS path list.
+pub const POLICY_PACK_ROOT_ENV: &str = "BIFROST_POLICY_PACK_ROOT";
+/// The former name of [`POLICY_PACK_ROOT_ENV`], read until v0.15.0.
+pub const DEPRECATED_OPEN_POLICY_PACK_ROOT_ENV: &str = "BIFROST_OPEN_POLICY_PACK_ROOT";
+
+/// The configured policy pack roots. The deprecated name is accepted until
+/// v0.15.0; when both names are set they must agree.
+pub fn policy_pack_roots_from_env() -> Result<Option<std::ffi::OsString>, BuiltInPolicyError> {
+    let current = std::env::var_os(POLICY_PACK_ROOT_ENV);
+    let deprecated = std::env::var_os(DEPRECATED_OPEN_POLICY_PACK_ROOT_ENV);
+    match (current, deprecated) {
+        (Some(current), Some(deprecated)) if current != deprecated => {
+            Err(BuiltInPolicyError::new(format!(
+                "{POLICY_PACK_ROOT_ENV} and the deprecated {DEPRECATED_OPEN_POLICY_PACK_ROOT_ENV} name different policy pack roots"
+            )))
+        }
+        (current, deprecated) => Ok(current.or(deprecated)),
+    }
+}
 
 // Retained authoring fixtures support evaluator regressions. Production builds
 // contain no product rules; hosts supply a verified external catalog.
@@ -787,14 +805,23 @@ pub struct BuiltInPolicyCatalog {
 impl BuiltInPolicyCatalog {
     /// Load host-supplied rules. A production core without rules has an empty
     /// catalog; acquiring and verifying a release belongs to its host.
+    ///
+    /// The variable holds one root or an OS path list (the `PATH` syntax), so a
+    /// host can activate catalog releases it acquired separately as one
+    /// catalog. Pack and policy ids stay unique across roots.
     fn load() -> Result<Self, BuiltInPolicyError> {
-        if let Some(root) = std::env::var_os(OPEN_POLICY_PACK_ROOT_ENV) {
-            if root.is_empty() {
+        if let Some(roots) = policy_pack_roots_from_env()? {
+            let roots = std::env::split_paths(&roots).collect::<Vec<_>>();
+            if roots.iter().any(|root| root.as_os_str().is_empty()) {
                 return Err(BuiltInPolicyError::new(format!(
-                    "{OPEN_POLICY_PACK_ROOT_ENV} must name a policy pack root"
+                    "{POLICY_PACK_ROOT_ENV} must name policy pack roots without empty entries"
                 )));
             }
-            return load_external_policy_catalog(Path::new(&root));
+            let mut packs = Vec::new();
+            for root in &roots {
+                packs.extend(load_external_policy_packs(root)?);
+            }
+            return Self::from_embedded_packs(packs);
         }
 
         // Test-support is explicitly enabled by repository regression suites,
@@ -1160,7 +1187,12 @@ impl BuiltInPolicyCatalog {
 const MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_EXTERNAL_POLICY_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
+#[cfg(any(test, feature = "test-support"))]
 fn load_external_policy_catalog(root: &Path) -> Result<BuiltInPolicyCatalog, BuiltInPolicyError> {
+    BuiltInPolicyCatalog::from_embedded_packs(load_external_policy_packs(root)?)
+}
+
+fn load_external_policy_packs(root: &Path) -> Result<Vec<EmbeddedPolicyPack>, BuiltInPolicyError> {
     let metadata = fs::symlink_metadata(root).map_err(|error| {
         BuiltInPolicyError::new(format!(
             "cannot inspect configured policy pack root `{}`: {error}",
@@ -1265,7 +1297,7 @@ fn load_external_policy_catalog(root: &Path) -> Result<BuiltInPolicyCatalog, Bui
         packs.push(pack);
     }
 
-    BuiltInPolicyCatalog::from_embedded_packs(packs)
+    Ok(packs)
 }
 
 fn validate_external_policy_path(value: &str) -> Result<(), BuiltInPolicyError> {
@@ -1282,6 +1314,24 @@ fn validate_external_policy_path(value: &str) -> Result<(), BuiltInPolicyError> 
     Ok(())
 }
 
+/// A bundle file path is relative and portable: forward slashes only, and
+/// every component a plain name. The workspace reader then refuses symlinks.
+fn validate_policy_bundle_path(value: &str) -> Result<(), BuiltInPolicyError> {
+    if value.is_empty()
+        || value.contains('\\')
+        || value.contains(':')
+        || value.contains('\0')
+        || !Path::new(value)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BuiltInPolicyError::new(format!(
+            "policy bundle path `{value}` must be a portable relative path"
+        )));
+    }
+    Ok(())
+}
+
 fn read_external_policy_document(
     root: &WorkspaceRoot,
     relative_path: &Path,
@@ -1293,7 +1343,12 @@ fn read_external_policy_document(
     let filename = relative_path
         .file_name()
         .expect("policy files have a filename");
-    let directory = root.open_directory(parent).map_err(|error| {
+    let directory = if parent.as_os_str().is_empty() {
+        root.root_directory()
+    } else {
+        root.open_directory(parent)
+    }
+    .map_err(|error| {
         BuiltInPolicyError::new(format!(
             "invalid or unsafe configured policy path `{}`: {error}",
             relative_path.display()
@@ -1333,21 +1388,93 @@ fn read_external_policy_document(
     Ok(document.source().to_owned())
 }
 
-/// The deterministic authored identity: close the policy with every qualified
-/// locator preserved, so the qualified name stays in the plan.
+/// Analyzer-free identity outcomes for one policy source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySourceIdentityResolution {
+    /// The source has a complete analyzer-free executable identity.
+    Available { semantic_hash: PolicySemanticHash },
+    /// The authored identity is available, but executable identity needs a
+    /// workspace model or workspace-authored endpoint-set closure.
+    WorkspaceRequired {
+        diagnostic_code: &'static str,
+        message: String,
+    },
+}
+
+/// The two production-registry identities for one policy source.
+///
+/// This report deliberately carries no source-byte digest. A caller that
+/// needs provenance for a file should compute its raw-byte SHA-256 separately;
+/// neither that digest nor an observed scan result is a policy identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicySourceIdentityReport {
+    pub source_identity: PolicySourceIdentity,
+    pub authored_hash: PolicySemanticHash,
+    pub analyzer_free: PolicySourceIdentityResolution,
+}
+
+/// Compute policy identities without opening a workspace or the built-in
+/// catalog.
+///
+/// The authored hash is minted by the same deferred `PolicyRegistry` boundary
+/// used for built-in policy authoring. The analyzer-free result is minted by
+/// the strict production registration boundary. A qualified locator or
+/// workspace-authored endpoint-set import produces an explicit
+/// [`PolicySourceIdentityResolution::WorkspaceRequired`] result; every other
+/// registry failure is returned to the caller.
+pub fn policy_source_identity(
+    identity: PolicySourceIdentity,
+    source: &[u8],
+) -> Result<PolicySourceIdentityReport, PolicyRegistryError> {
+    let authored_hash = authored_semantic_hash(&identity, source)?;
+    let analyzer_free = match resolved_semantic_hash(&identity, source) {
+        Ok(semantic_hash) => PolicySourceIdentityResolution::Available { semantic_hash },
+        Err(error) => match workspace_required_resolution(&error) {
+            Some((diagnostic_code, message)) => PolicySourceIdentityResolution::WorkspaceRequired {
+                diagnostic_code,
+                message: message.to_owned(),
+            },
+            None => return Err(error),
+        },
+    };
+    Ok(PolicySourceIdentityReport {
+        source_identity: identity,
+        authored_hash,
+        analyzer_free,
+    })
+}
+
+fn authored_semantic_hash(
+    identity: &PolicySourceIdentity,
+    source: &[u8],
+) -> Result<PolicySemanticHash, PolicyRegistryError> {
+    let mut registry = builtin_policy_registry();
+    registry
+        .register_policy_bytes_deferred(identity.clone(), source)
+        .map(|loaded| loaded.semantic_hash())
+}
+
+fn resolved_semantic_hash(
+    identity: &PolicySourceIdentity,
+    source: &[u8],
+) -> Result<PolicySemanticHash, PolicyRegistryError> {
+    let mut registry = builtin_policy_registry();
+    registry
+        .register_policy_bytes(identity.clone(), source)
+        .map(|loaded| loaded.semantic_hash())
+}
+
 fn authored_identity(
     identity: &PolicySourceIdentity,
     source: &str,
 ) -> Result<String, BuiltInPolicyError> {
-    let mut registry = builtin_policy_registry();
-    let loaded = registry
-        .register_policy_bytes_deferred(identity.clone(), source.as_bytes())
+    authored_semantic_hash(identity, source.as_bytes())
+        .map(|semantic_hash| semantic_hash.to_string())
         .map_err(|error| {
             BuiltInPolicyError::new(format!(
                 "failed to load built-in policy `{identity}`: {error}"
             ))
-        })?;
-    Ok(loaded.semantic_hash().to_string())
+        })
 }
 
 /// The analyzer-free executable identity, available only when the source
@@ -1356,10 +1483,8 @@ fn resolved_identity(
     identity: &PolicySourceIdentity,
     source: &str,
 ) -> Result<String, PolicyRegistryError> {
-    let mut registry = builtin_policy_registry();
-    registry
-        .register_policy_bytes(identity.clone(), source.as_bytes())
-        .map(|loaded| loaded.semantic_hash().to_string())
+    resolved_semantic_hash(identity, source.as_bytes())
+        .map(|semantic_hash| semantic_hash.to_string())
 }
 
 fn builtin_policy_registry() -> PolicyRegistry {
@@ -1373,12 +1498,27 @@ fn builtin_policy_registry() -> PolicyRegistry {
 /// locator needs an active model or a workspace-authored endpoint-set import
 /// needs the workspace. Every other failure is an authoring defect.
 fn is_deferred_rejection(error: &PolicyRegistryError) -> bool {
+    workspace_required_resolution(error).is_some()
+}
+
+fn workspace_required_resolution(error: &PolicyRegistryError) -> Option<(&'static str, &str)> {
     match error {
-        PolicyRegistryError::Source(source) => is_qualified_locator_code(source.diagnostic.code),
-        PolicyRegistryError::EndpointSetImport { error, .. } => {
-            error.diagnostic.code == "endpoint-set-import-requires-workspace"
+        PolicyRegistryError::Source(source)
+            if is_qualified_locator_code(source.diagnostic.code) =>
+        {
+            Some((source.diagnostic.code, source.diagnostic.message.as_str()))
         }
-        _ => false,
+        PolicyRegistryError::EndpointSetImport { error, .. }
+            if error.diagnostic.code == "endpoint-set-import-requires-workspace" =>
+        {
+            Some((error.diagnostic.code, error.diagnostic.message.as_str()))
+        }
+        PolicyRegistryError::DeclarationSelectionImport { error, .. }
+            if error.diagnostic.code == "declaration-selection-import-requires-workspace" =>
+        {
+            Some((error.diagnostic.code, error.diagnostic.message.as_str()))
+        }
+        _ => None,
     }
 }
 
@@ -1505,10 +1645,241 @@ impl fmt::Display for BuiltInPolicyError {
 }
 
 impl std::error::Error for BuiltInPolicyError {}
+/// Extracted premium policy archives: each directory holds a
+/// `policy-bundle.json` index and the `.rqlp` files it lists. The variable is
+/// one directory or an OS path list (the `PATH` syntax).
+pub const POLICY_BUNDLE_ROOT_ENV: &str = "BIFROST_POLICY_BUNDLE_ROOT";
+pub const POLICY_BUNDLE_SCHEMA_VERSION: u32 = 1;
+const POLICY_BUNDLE_INDEX: &str = "policy-bundle.json";
+
+static POLICY_BUNDLES: OnceLock<PolicyBundles> = OnceLock::new();
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyBundleIndex {
+    schema_version: u32,
+    repository: String,
+    source_commit: String,
+    /// The engine build the bundle was qualified on. It is provenance, not a
+    /// requirement, so it is read only to keep unknown fields rejected.
+    #[allow(dead_code)]
+    bifrost_pin: serde_json::Value,
+    files: Vec<PolicyBundleFile>,
+    policies: Vec<PolicyBundlePolicy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyBundleFile {
+    path: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyBundlePolicy {
+    id: String,
+    path: String,
+}
+
+/// Policies from verified policy bundles (policy-bundle schema 1).
+///
+/// A bundle is not a catalog: its policies carry no catalog metadata and run
+/// only when a caller names them by ID, exactly like an explicitly selected
+/// policy file. They never join default, pack, or category selection.
+#[derive(Debug, Default)]
+pub struct PolicyBundles {
+    sources: HashMap<String, (PolicySourceIdentity, String)>,
+}
+
+impl PolicyBundles {
+    fn load() -> Result<Self, BuiltInPolicyError> {
+        let Some(roots) = std::env::var_os(POLICY_BUNDLE_ROOT_ENV) else {
+            return Ok(Self::default());
+        };
+        let roots = std::env::split_paths(&roots).collect::<Vec<_>>();
+        if roots.iter().any(|root| root.as_os_str().is_empty()) {
+            return Err(BuiltInPolicyError::new(format!(
+                "{POLICY_BUNDLE_ROOT_ENV} must name policy bundle roots without empty entries"
+            )));
+        }
+        let mut bundles = Self::default();
+        for root in &roots {
+            bundles.load_bundle(root)?;
+        }
+        Ok(bundles)
+    }
+
+    fn load_bundle(&mut self, root: &Path) -> Result<(), BuiltInPolicyError> {
+        let workspace_root = WorkspaceRoot::open(root).map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "cannot open policy bundle root `{}`: {error}",
+                root.display()
+            ))
+        })?;
+        let index_source =
+            read_external_policy_document(&workspace_root, Path::new(POLICY_BUNDLE_INDEX), "json")?;
+        let index = serde_json::from_str::<PolicyBundleIndex>(&index_source).map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "invalid policy bundle index `{}`: {error}",
+                root.join(POLICY_BUNDLE_INDEX).display()
+            ))
+        })?;
+        if index.schema_version != POLICY_BUNDLE_SCHEMA_VERSION {
+            return Err(BuiltInPolicyError::new(format!(
+                "unsupported policy bundle schema version {} in `{}`",
+                index.schema_version,
+                root.display()
+            )));
+        }
+        let mut verified = HashMap::with_capacity(index.files.len());
+        for file in &index.files {
+            validate_policy_bundle_path(&file.path)?;
+            let path = Path::new(&file.path);
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .ok_or_else(|| {
+                    BuiltInPolicyError::new(format!(
+                        "policy bundle file `{}` has no extension",
+                        file.path
+                    ))
+                })?;
+            let source = read_external_policy_document(&workspace_root, path, extension)?;
+            let digest = {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(source.as_bytes()))
+            };
+            if digest != file.sha256 || source.len() as u64 != file.size {
+                return Err(BuiltInPolicyError::new(format!(
+                    "policy bundle file `{}` does not match its indexed SHA-256 and size",
+                    file.path
+                )));
+            }
+            if verified.insert(file.path.as_str(), source).is_some() {
+                return Err(BuiltInPolicyError::new(format!(
+                    "policy bundle file `{}` is indexed more than once",
+                    file.path
+                )));
+            }
+        }
+        for policy in &index.policies {
+            let source = verified.get(policy.path.as_str()).ok_or_else(|| {
+                BuiltInPolicyError::new(format!(
+                    "policy bundle policy `{}` names unindexed file `{}`",
+                    policy.id, policy.path
+                ))
+            })?;
+            let identity = PolicySourceIdentity::new(format!(
+                "{}@{}/{}",
+                index.repository, index.source_commit, policy.path
+            ));
+            let parsed = super::parse_rqlp_source(source, identity.clone()).map_err(|error| {
+                BuiltInPolicyError::new(format!(
+                    "policy bundle policy `{}` does not parse: {error}",
+                    policy.id
+                ))
+            })?;
+            let super::RqlpDocument::Policy { definition } = parsed.document() else {
+                return Err(BuiltInPolicyError::new(format!(
+                    "policy bundle entry `{}` is not a policy document",
+                    policy.id
+                )));
+            };
+            if definition.metadata.id.as_str() != policy.id {
+                return Err(BuiltInPolicyError::new(format!(
+                    "policy bundle entry `{}` names a document whose id is `{}`",
+                    policy.id,
+                    definition.metadata.id.as_str()
+                )));
+            }
+            if self
+                .sources
+                .insert(policy.id.clone(), (identity, source.clone()))
+                .is_some()
+            {
+                return Err(BuiltInPolicyError::new(format!(
+                    "policy bundle policy id `{}` is declared more than once",
+                    policy.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Move each policy ID that a bundle provides out of `selection` and
+    /// return those policies as explicitly selected inputs. A bundle ID that
+    /// the catalog also defines is ambiguous and rejected.
+    pub fn take_selected(
+        &self,
+        selection: &mut BuiltInPolicySelection,
+    ) -> Result<Vec<super::PolicyEvaluationInput>, BuiltInPolicyError> {
+        let mut inputs = Vec::new();
+        let mut remaining = Vec::with_capacity(selection.policy_ids.len());
+        for id in std::mem::take(&mut selection.policy_ids) {
+            let Some((identity, source)) = self.sources.get(&id) else {
+                remaining.push(id);
+                continue;
+            };
+            if built_in_policy_catalog()?
+                .source_by_policy_id
+                .contains_key(&id)
+            {
+                return Err(BuiltInPolicyError::new(format!(
+                    "policy id `{id}` is defined by both a policy bundle and the policy catalog"
+                )));
+            }
+            inputs.push(super::PolicyEvaluationInput::explicitly_selected(
+                identity.clone(),
+                source.clone(),
+            ));
+        }
+        selection.policy_ids = remaining;
+        Ok(inputs)
+    }
+}
+
+/// The policy bundles named by `BIFROST_POLICY_BUNDLE_ROOT`, verified once
+/// per process.
+pub fn policy_bundles() -> Result<&'static PolicyBundles, BuiltInPolicyError> {
+    if let Some(bundles) = POLICY_BUNDLES.get() {
+        return Ok(bundles);
+    }
+    let bundles = PolicyBundles::load()?;
+    Ok(POLICY_BUNDLES.get_or_init(|| bundles))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PolicySourceHash;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn engine_advertises_every_capability_a_retained_policy_requires() {
+        let advertised = crate::ENGINE_POLICY_CAPABILITIES;
+        assert!(
+            advertised.windows(2).all(|pair| pair[0] < pair[1]),
+            "ENGINE_POLICY_CAPABILITIES must be sorted and unique for lookup: {advertised:?}"
+        );
+        for (pack_id, source) in EMBEDDED_POLICY_PACK_SOURCES {
+            let manifest: BuiltInPolicyPackManifest =
+                serde_json::from_str(source).expect("retained policy pack manifest");
+            for entry in &manifest.policies {
+                let missing = entry
+                    .required_capabilities
+                    .iter()
+                    .filter(|label| advertised.binary_search(&label.as_str()).is_err())
+                    .collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "{pack_id} policy {} requires unadvertised capabilities {missing:?}",
+                    entry.id
+                );
+            }
+        }
+    }
 
     #[test]
     fn core_without_host_rules_has_no_policy_content() {
@@ -1636,6 +2007,82 @@ mod tests {
         let rebuilt = deferred_catalog(None).expect("the deferred entry loads again");
         assert_eq!(catalog.document(), rebuilt.document());
         assert_eq!(catalog.digest(), rebuilt.digest());
+    }
+
+    #[test]
+    fn public_source_identity_matches_an_existing_policy_golden() {
+        let (path, source) = CORRECTNESS_POLICY_SOURCES
+            .iter()
+            .copied()
+            .find(|(path, _)| *path == "policies/resource-lifecycle.rqlp")
+            .expect("the checked-in correctness golden source exists");
+        let manifest: BuiltInPolicyPackManifest =
+            serde_json::from_str(CORRECTNESS_MANIFEST_SOURCE).expect("the checked-in manifest");
+        let entry = manifest
+            .policies
+            .iter()
+            .find(|entry| entry.path == path)
+            .expect("the source has a manifest identity");
+        let report = policy_source_identity(
+            PolicySourceIdentity::new(format!("builtin:{CORRECTNESS_PACK_ID}/{path}")),
+            source.as_bytes(),
+        )
+        .expect("the existing golden source closes at both registry boundaries");
+
+        assert_eq!(report.authored_hash.to_string(), entry.authored_hash);
+        let PolicySourceIdentityResolution::Available { semantic_hash } = report.analyzer_free
+        else {
+            panic!("the existing golden source must have an analyzer-free identity");
+        };
+        assert_eq!(
+            semantic_hash.to_string(),
+            entry
+                .resolved_semantic_hash
+                .as_deref()
+                .expect("the existing golden records a resolved identity")
+        );
+    }
+
+    #[test]
+    fn source_layout_changes_are_separate_from_semantic_identity() {
+        let (_, source) = CORRECTNESS_POLICY_SOURCES
+            .iter()
+            .copied()
+            .find(|(path, _)| *path == "policies/resource-lifecycle.rqlp")
+            .expect("the checked-in correctness source exists");
+        let variant = format!("; cosmetic source variation\n{source}");
+        let identity = PolicySourceIdentity::new("test.identity/resource-lifecycle.rqlp");
+        let original = policy_source_identity(identity.clone(), source.as_bytes())
+            .expect("the original source closes");
+        let changed = policy_source_identity(identity, variant.as_bytes())
+            .expect("the source variation closes");
+
+        assert_eq!(original.authored_hash, changed.authored_hash);
+        assert_ne!(
+            PolicySourceHash::from_source_bytes(source.as_bytes()),
+            PolicySourceHash::from_source_bytes(variant.as_bytes())
+        );
+    }
+
+    #[test]
+    fn public_source_identity_reports_workspace_requirement_and_invalid_source() {
+        let identity = PolicySourceIdentity::new("test.issue-3316/deferred.rqlp");
+        let report = policy_source_identity(identity, DEFERRED_QUALIFIED_POLICY.as_bytes())
+            .expect("the deferred source still has an authored identity");
+        assert!(matches!(
+            report.analyzer_free,
+            PolicySourceIdentityResolution::WorkspaceRequired {
+                diagnostic_code: "qualified-call-locator-incomplete",
+                ..
+            }
+        ));
+
+        let error = policy_source_identity(
+            PolicySourceIdentity::new("test.invalid/document.rqlp"),
+            b"(policy",
+        )
+        .expect_err("an invalid policy document must fail identity computation");
+        assert!(matches!(error, PolicyRegistryError::Source(_)));
     }
 
     #[test]
@@ -1974,7 +2421,7 @@ mod external_policy_runtime_tests {
                 "builtin::external_policy_runtime_tests::configured_empty_rules_root_fails_closed_in_a_subprocess",
                 "--nocapture",
             ])
-            .env(OPEN_POLICY_PACK_ROOT_ENV, root.path())
+            .env(POLICY_PACK_ROOT_ENV, root.path())
             .env(CHILD_MARKER, "1")
             .output()
             .expect("run isolated environment test");

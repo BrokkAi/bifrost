@@ -1,3 +1,7 @@
+pub(crate) use brokk_bifrost_jvm::java::primitives::{
+    primitive_converts, primitive_for_name, primitive_widens,
+};
+
 use crate::analyzer::java::JavaAnalyzer;
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::external::{
@@ -657,10 +661,6 @@ pub(crate) fn formal_shapes(
             }
         })
         .collect()
-}
-
-pub(crate) fn primitive_converts(source: JavaPrimitive, target: JavaPrimitive) -> bool {
-    source == target || primitive_widens(source, target)
 }
 
 pub(crate) static CALL_ARGUMENT_CONVERSION_PROVER: JavaCallArgumentConversionProver =
@@ -1545,20 +1545,6 @@ fn resolve_external_spelling(
         .ok_or(unknown)
 }
 
-pub(crate) fn primitive_for_name(name: &str) -> Option<JavaPrimitive> {
-    match name {
-        "boolean" => Some(JavaPrimitive::Boolean),
-        "byte" => Some(JavaPrimitive::Byte),
-        "short" => Some(JavaPrimitive::Short),
-        "char" => Some(JavaPrimitive::Char),
-        "int" => Some(JavaPrimitive::Int),
-        "long" => Some(JavaPrimitive::Long),
-        "float" => Some(JavaPrimitive::Float),
-        "double" => Some(JavaPrimitive::Double),
-        _ => None,
-    }
-}
-
 /// Resolve the model's structured type term through the same declaration
 /// surface used for source formals. The field is a structured `TypeRef`, not
 /// a rendered signature; generic terms remain explicitly unresolved and
@@ -1928,34 +1914,6 @@ pub(crate) fn declaration_declares_array(declaration: Node<'_>, type_node: Node<
         current = node.parent();
     }
     false
-}
-
-fn primitive_widens(source: JavaPrimitive, target: JavaPrimitive) -> bool {
-    match source {
-        JavaPrimitive::Byte => matches!(
-            target,
-            JavaPrimitive::Short
-                | JavaPrimitive::Int
-                | JavaPrimitive::Long
-                | JavaPrimitive::Float
-                | JavaPrimitive::Double
-        ),
-        JavaPrimitive::Short => matches!(
-            target,
-            JavaPrimitive::Int | JavaPrimitive::Long | JavaPrimitive::Float | JavaPrimitive::Double
-        ),
-        JavaPrimitive::Char => matches!(
-            target,
-            JavaPrimitive::Int | JavaPrimitive::Long | JavaPrimitive::Float | JavaPrimitive::Double
-        ),
-        JavaPrimitive::Int => matches!(
-            target,
-            JavaPrimitive::Long | JavaPrimitive::Float | JavaPrimitive::Double
-        ),
-        JavaPrimitive::Long => matches!(target, JavaPrimitive::Float | JavaPrimitive::Double),
-        JavaPrimitive::Float => target == JavaPrimitive::Double,
-        JavaPrimitive::Boolean | JavaPrimitive::Double => false,
-    }
 }
 
 fn wrapper_for(identity: &str) -> Option<JavaPrimitive> {

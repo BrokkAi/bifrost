@@ -38,9 +38,12 @@
 //! downcasts that produce the arguments -- including the three that build a
 //! [`realm::JvmSourceRealm`].
 
+mod anonymous_type;
 mod call_arguments;
 mod constructor_site;
 pub(crate) mod graph_hits;
+mod implicit_supertype;
+pub mod intrinsics;
 pub mod java;
 pub mod kotlin;
 mod package_lookup;
@@ -227,3 +230,6 @@ pub(crate) mod test_support {
         );
     }
 }
+
+mod knowledge;
+pub use knowledge::{JavaKnowledge, KotlinKnowledge, ScalaKnowledge};

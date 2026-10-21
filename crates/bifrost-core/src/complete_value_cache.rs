@@ -115,6 +115,37 @@ where
     Cancelled,
 }
 
+// The ready cache owns exactly the retention object. Its weak projection
+// preserves the public Arc<V> identity and the live-instance revival contract.
+struct ReadyValue<V> {
+    value: Weak<V>,
+    _retention: Arc<dyn Send + Sync>,
+}
+
+impl<V> Clone for ReadyValue<V> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            _retention: Arc::clone(&self._retention),
+        }
+    }
+}
+
+impl<V> ReadyValue<V> {
+    fn new(value: Arc<V>, retain: fn(Arc<V>) -> Arc<dyn Send + Sync>) -> Self {
+        Self {
+            value: Arc::downgrade(&value),
+            _retention: retain(value),
+        }
+    }
+
+    fn get(&self) -> Arc<V> {
+        self.value
+            .upgrade()
+            .expect("ready retention owns its value")
+    }
+}
+
 /// Byte- or weight-bounded ready values plus strict same-key single-flight.
 ///
 /// `K` is the caller's complete validity identity. A derived-layer owner must
@@ -132,7 +163,8 @@ pub struct CompleteValueCache<K, V>
 where
     K: Eq + Hash,
 {
-    entries: Cache<K, Arc<V>>,
+    entries: Cache<K, ReadyValue<V>>,
+    retain: fn(Arc<V>) -> Arc<dyn Send + Sync>,
     in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
     live: Arc<Mutex<HashMap<K, Weak<V>>>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -146,6 +178,7 @@ where
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
+            retain: self.retain,
             in_flight: Arc::clone(&self.in_flight),
             live: Arc::clone(&self.live),
             #[cfg(any(test, feature = "test-support"))]
@@ -163,10 +196,23 @@ where
         max_retained_weight: u64,
         weigher: impl Fn(&K, &Arc<V>) -> u32 + Send + Sync + 'static,
     ) -> Self {
+        Self::with_retention(max_retained_weight, weigher, |value| value)
+    }
+
+    /// Retain ready values with an owner that distinguishes cache pins from
+    /// consumer pins. `retain` must own the supplied allocation until its
+    /// returned object drops; it must not substitute a different allocation.
+    /// The live registry and all callers still use the original Arc identity.
+    pub fn with_retention(
+        max_retained_weight: u64,
+        weigher: impl Fn(&K, &Arc<V>) -> u32 + Send + Sync + 'static,
+        retain: fn(Arc<V>) -> Arc<dyn Send + Sync>,
+    ) -> Self {
         Self {
+            retain,
             entries: Cache::builder()
                 .max_capacity(max_retained_weight.max(1))
-                .weigher(move |key, value| weigher(key, value).max(1))
+                .weigher(move |key, value: &ReadyValue<V>| weigher(key, &value.get()).max(1))
                 .build(),
             in_flight: Arc::new(Mutex::new(HashMap::default())),
             live: Arc::new(Mutex::new(HashMap::default())),
@@ -202,7 +248,10 @@ where
             .lock()
             .expect("complete-value live-instance map mutex poisoned");
         let value = live.get(key).and_then(Weak::upgrade)?;
-        self.entries.insert(key.clone(), Arc::clone(&value));
+        self.entries.insert(
+            key.clone(),
+            ReadyValue::new(Arc::clone(&value), self.retain),
+        );
         #[cfg(any(test, feature = "test-support"))]
         self.revival_tracker
             .lock()
@@ -225,7 +274,7 @@ where
             if cancellation.is_cancelled() {
                 return (CompleteValueAcquisition::Cancelled, wait);
             }
-            if let Some(value) = self.entries.get(key) {
+            if let Some(value) = self.entries.get(key).map(|entry| entry.get()) {
                 return (CompleteValueAcquisition::Cached { value }, wait);
             }
             if let Some(value) = self.revive(key) {
@@ -240,7 +289,12 @@ where
 
                 // Close the race between the optimistic ready lookup above and
                 // a previous leader publishing and removing its flight.
-                if let Some(value) = self.entries.get(key).or_else(|| self.revive(key)) {
+                if let Some(value) = self
+                    .entries
+                    .get(key)
+                    .map(|entry| entry.get())
+                    .or_else(|| self.revive(key))
+                {
                     (Some(value), None, false)
                 } else {
                     match in_flight.get(key) {
@@ -265,6 +319,7 @@ where
                             key: key.clone(),
                             flight,
                             entries: self.entries.clone(),
+                            retain: self.retain,
                             in_flight: Arc::clone(&self.in_flight),
                             live: Arc::clone(&self.live),
                         },
@@ -291,6 +346,14 @@ where
         }
     }
 
+    /// Visit ready entries for a temporary diagnostic census.
+    pub fn visit_ready(&self, mut visitor: impl FnMut(&V)) {
+        self.entries.run_pending_tasks();
+        for (_, value) in self.entries.iter() {
+            visitor(&value.get());
+        }
+    }
+
     /// Return a resident complete value without reserving build leadership.
     /// This supports physical planners that may reuse an index for a narrow
     /// request but must not construct the whole-workspace value for it.
@@ -298,7 +361,10 @@ where
         if cancellation.is_cancelled() {
             return None;
         }
-        self.entries.get(key).or_else(|| self.revive(key))
+        self.entries
+            .get(key)
+            .map(|entry| entry.get())
+            .or_else(|| self.revive(key))
     }
 
     /// Remove one complete value and its live-instance identity.
@@ -353,7 +419,8 @@ where
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn insert_complete_for_test(&self, key: K, value: Arc<V>) {
-        self.entries.insert(key, value);
+        self.entries
+            .insert(key, ReadyValue::new(value, self.retain));
     }
 
     /// Drop one key from the weight-bounded ready cache, exactly as the bound
@@ -462,7 +529,8 @@ where
 {
     key: K,
     flight: Arc<InFlightMaterialization<V>>,
-    entries: Cache<K, Arc<V>>,
+    entries: Cache<K, ReadyValue<V>>,
+    retain: fn(Arc<V>) -> Arc<dyn Send + Sync>,
     in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
     live: Arc<Mutex<HashMap<K, Weak<V>>>>,
 }
@@ -481,7 +549,10 @@ where
         // Keep the live-map lock through both operations. `invalidate` and
         // `revive` use the same order, so an invalidated value cannot be
         // reinserted after its weak identity was removed.
-        self.entries.insert(self.key.clone(), Arc::clone(&value));
+        self.entries.insert(
+            self.key.clone(),
+            ReadyValue::new(Arc::clone(&value), self.retain),
+        );
         live.insert(self.key.clone(), Arc::downgrade(&value));
         if live.len() > LIVE_REGISTRY_SWEEP_KEYS {
             live.retain(|_, weak| weak.strong_count() > 0);

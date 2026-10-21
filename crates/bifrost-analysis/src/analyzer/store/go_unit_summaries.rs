@@ -27,7 +27,8 @@ use crate::analyzer::canonical_hash::CanonicalHasher;
 
 /// Version 6 records imports from every source role included in a test unit.
 // Version 8 consumes the anonymous/local declaration inventory (#5074).
-pub(crate) const GO_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 8;
+#[doc(hidden)]
+pub const GO_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 8;
 
 fn go_provider_gap_detail(gaps_json: &str) -> Option<String> {
     let mut gaps: Value =
@@ -59,7 +60,8 @@ fn go_provider_gap_detail(gaps_json: &str) -> Option<String> {
 /// recorded in each summary's read ledger, so a reader matches the summary of the
 /// profile its request selected. (The publication digest cannot be recorded: it
 /// folds file mtimes and moves on every edit.)
-pub(crate) struct GoUnitSummaries {
+#[doc(hidden)]
+pub struct GoUnitSummaries {
     pub context_id: i64,
     pub profile: [u8; 32],
 }
@@ -339,14 +341,16 @@ pub(crate) const GO_LIVE_SUMMARY_SQL: &str = concat!(
 );
 
 /// The read-ledger key under which a Go summary records its context profile.
-pub(crate) fn go_profile_read_key(unit_key: &[u8; 32]) -> [u8; 32] {
+#[doc(hidden)]
+pub fn go_profile_read_key(unit_key: &[u8; 32]) -> [u8; 32] {
     read_key("go-context-profile", Some(unit_key))
 }
 
 /// The live Go summary of one unit key under the Go validity predicate, for the
 /// selected context profile. `None` when no summary is live, or when the live
 /// one derives from the other profile.
-pub(crate) fn go_live_summary(
+#[doc(hidden)]
+pub fn go_live_summary(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
     producer_epoch: &str,
@@ -372,7 +376,8 @@ pub(crate) fn go_live_summary(
         .optional()?)
 }
 
-pub(crate) fn go_unit_key(tool_import_path: &str, for_test: &str, source_role: &str) -> [u8; 32] {
+#[doc(hidden)]
+pub fn go_unit_key(tool_import_path: &str, for_test: &str, source_role: &str) -> [u8; 32] {
     let mut hash = CanonicalHasher::new(b"bifrost-go-unit-key:v1");
     hash.field("tool-import-path", tool_import_path.as_bytes());
     hash.field("for-test", for_test.as_bytes());
@@ -384,7 +389,8 @@ pub(crate) fn go_unit_key(tool_import_path: &str, for_test: &str, source_role: &
 /// keys are fixed-width values and every call is over rows already selected by
 /// the Go context or summary dependency indexes.
 #[allow(dead_code)] // Used by the Milestone 3 reverse summary reader.
-pub(crate) fn register_go_summary_sql_functions(conn: &Connection) -> rusqlite::Result<()> {
+#[doc(hidden)]
+pub fn register_go_summary_sql_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
         "bifrost_go_unit_key",
         3,
@@ -660,6 +666,9 @@ impl UnitSummaryLanguage for GoUnitSummaries {
             }
         }
         Ok(UnitInputs {
+            dependency_names: Vec::new(),
+            containers: Vec::new(),
+            placements: Vec::new(),
             unit_id,
             unit_key,
             label,
@@ -840,7 +849,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                 let spelling = pending.segments.join("/");
                 let dependency_ordinal = targets
                     .get(&(pending.source_role.clone(), spelling.clone()))
-                    .and_then(&ordinal_of);
+                    .and_then(ordinal_of);
                 let state = if pending.kind == "blank" {
                     "blank"
                 } else if dependency_ordinal.is_some() {

@@ -197,18 +197,6 @@ pub(super) fn scan_kotlin_files_replayable(
     })
 }
 
-/// Whether `unit` is a Kotlin `companion object`.
-///
-/// A wrapper over
-/// [`brokk_bifrost_jvm::kotlin::graph::resolver::is_companion_object`] that
-/// builds the graph source: the definition route asks this from a `&dyn
-/// IAnalyzer` and stays in this crate until the `ResolutionSession` band moves.
-pub(crate) fn is_companion_object(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
-    with_kotlin_graph_source(analyzer, |graph| {
-        brokk_bifrost_jvm::kotlin::graph::resolver::is_companion_object(&graph, unit)
-    })
-}
-
 /// Every Kotlin `caller -> callee` edge whose callee is one of `nodes`.
 #[cfg(test)]
 pub(crate) fn build_kotlin_usage_edges<F>(

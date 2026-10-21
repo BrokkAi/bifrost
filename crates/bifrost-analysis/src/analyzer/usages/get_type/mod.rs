@@ -1,42 +1,44 @@
 use super::read_source;
+
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::languages::{BoundedReceiverQuery, language_support};
-use crate::analyzer::usages::get_definition::{
-    BoundedResolution, java::JavaResolutionSession, parse_tree_for_language,
-};
-use crate::analyzer::usages::receiver_analysis::{
-    INTERACTIVE_TYPE_LOOKUP_BUDGET, ReceiverAnalysisBudget, ReceiverBudgetLimit,
-};
-use crate::analyzer::usages::reference_site::{
-    ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
-};
+
+use crate::analyzer::languages::BoundedReceiverQuery;
+use crate::analyzer::languages::language_support;
+
+use crate::analyzer::usages::get_definition::BoundedResolution;
+use crate::analyzer::usages::get_definition::parse_tree_for_language;
+
+use crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+
+use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::usages::reference_site::SourceLocationRequest;
+use crate::analyzer::usages::reference_site::resolve_reference_site;
+
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+
+use crate::analyzer::AnalyzerDefinitionLookup;
+use crate::analyzer::CodeUnit;
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::Language;
+use crate::analyzer::ProjectFile;
+
+use crate::hash::HashMap;
+use crate::hash::HashSet;
+
 use crate::path_utils::rel_path_string;
+
 use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
+
 use std::sync::Arc;
+
 use tree_sitter::Tree;
 
-mod cpp;
-mod csharp;
-mod go;
 pub(crate) mod java;
-mod js_ts;
-mod kotlin;
-mod php;
-mod python;
-mod ruby;
+
 mod scala;
 
-pub(crate) use cpp::resolve_cpp_type_bounded;
-pub(crate) use csharp::resolve_csharp_type_bounded;
-pub(crate) use go::resolve_go_type_bounded;
-pub(crate) use js_ts::resolve_js_ts_type_bounded;
-pub(crate) use kotlin::resolve_kotlin_type_bounded;
-pub(crate) use php::resolve_php_type_bounded;
-pub(crate) use python::resolve_python_type_bounded;
-pub(crate) use ruby::resolve_ruby_type_bounded;
 pub(crate) use scala::resolve_scala_type_bounded;
 
 #[derive(Debug, Clone)]
@@ -51,15 +53,19 @@ pub struct TypeLookupRequest {
 
 #[derive(Debug, Clone)]
 pub struct TypeLookupOutcome {
-    pub(crate) status: TypeLookupStatus,
-    pub(crate) reference: Option<ResolvedReferenceSite>,
+    #[doc(hidden)]
+    pub status: TypeLookupStatus,
+    #[doc(hidden)]
+    pub reference: Option<ResolvedReferenceSite>,
     pub types: Vec<TypeLookupType>,
-    pub(crate) diagnostics: Vec<TypeLookupDiagnostic>,
+    #[doc(hidden)]
+    pub diagnostics: Vec<TypeLookupDiagnostic>,
     pub target_kind: TypeLookupTargetKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TypeLookupStatus {
+#[doc(hidden)]
+pub enum TypeLookupStatus {
     Resolved,
     Unavailable,
     /// Resolution produced a source-backed partial answer, but the resolver
@@ -80,7 +86,8 @@ pub(crate) enum TypeLookupStatus {
 }
 
 impl TypeLookupStatus {
-    pub(crate) fn as_str(self) -> &'static str {
+    #[doc(hidden)]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Resolved => "resolved",
             Self::Unavailable => "unavailable",
@@ -97,9 +104,12 @@ impl TypeLookupStatus {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TypeLookupDiagnostic {
-    pub(crate) kind: String,
-    pub(crate) message: String,
+#[doc(hidden)]
+pub struct TypeLookupDiagnostic {
+    #[doc(hidden)]
+    pub kind: String,
+    #[doc(hidden)]
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +126,8 @@ pub struct TypeLookupType {
 /// Project one exact semantic-model type record into the compatibility type
 /// lookup domain. The synthetic declaration is only a DTO carrier; callers
 /// must retain `semantic_model_id` and use it for identity-sensitive work.
-pub(crate) fn semantic_model_lookup_type(
+#[doc(hidden)]
+pub fn semantic_model_lookup_type(
     file: &ProjectFile,
     symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> TypeLookupType {
@@ -134,7 +145,8 @@ pub(crate) fn semantic_model_lookup_type(
     }
 }
 
-pub(super) fn exact_semantic_model_type_outcome(
+#[doc(hidden)]
+pub fn exact_semantic_model_type_outcome(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     language: Language,
@@ -196,7 +208,8 @@ pub fn resolve_type_batch(
     resolve_type_batch_with_budget(analyzer, requests, INTERACTIVE_TYPE_LOOKUP_BUDGET)
 }
 
-fn resolve_type_batch_with_budget(
+#[doc(hidden)]
+pub fn resolve_type_batch_with_budget(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,
     budget: ReceiverAnalysisBudget,
@@ -212,7 +225,8 @@ fn resolve_type_batch_with_budget(
 /// editor selection/token expansion contract. Callers must supply the exact
 /// source and its corresponding parsed tree; this entry point validates those
 /// inputs before entering the same bounded language dispatch as batch lookup.
-pub(crate) fn resolve_type_at_reference_site_with_budget(
+#[doc(hidden)]
+pub fn resolve_type_at_reference_site_with_budget(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -356,7 +370,8 @@ fn finish_bounded_resolution(
     finish_lookup_outcome(outcome, site)
 }
 
-fn validate_caller_reference_site(
+#[doc(hidden)]
+pub fn validate_caller_reference_site(
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -436,32 +451,19 @@ fn bounded_type_resolution(
     site: &ResolvedReferenceSite,
     budget: ReceiverAnalysisBudget,
 ) -> Option<BoundedResolution<TypeLookupOutcome>> {
-    match language {
-        Language::Java => {
-            support.set_language(language);
-            let session = JavaResolutionSession::bounded(support, budget, None);
-            return Some(java::resolve_java_type_bounded(
-                analyzer, &session, file, source, tree, site,
-            ));
-        }
-        Language::JavaScript | Language::TypeScript => {
-            support.set_language(language);
-            return Some(js_ts::resolve_js_ts_type_bounded(
-                analyzer, support, file, language, source, tree, site, budget, None,
-            ));
-        }
-        _ => {}
-    }
-    let resolver = language_support(language)?.structural_receiver()?;
-    Some(resolver.resolve_type_bounded(BoundedReceiverQuery {
-        analyzer,
-        file,
-        source,
-        tree,
-        site,
-        budget,
-        cancellation: None,
-    }))
+    language_support(language)?.bounded_type_resolution(
+        support,
+        language,
+        BoundedReceiverQuery {
+            analyzer,
+            file,
+            source,
+            tree,
+            site,
+            budget,
+            cancellation: None,
+        },
+    )
 }
 
 fn finish_lookup_outcome(
@@ -484,32 +486,33 @@ impl TypeLookupRequest {
     }
 }
 
-fn parse_tree_for_type_lookup(
+#[doc(hidden)]
+pub fn parse_tree_for_type_lookup(
     file: &ProjectFile,
     language: Language,
     source: &str,
 ) -> Option<Tree> {
-    match language {
-        Language::Go => brokk_bifrost_go::parse::parse_go(source),
-        _ => parse_tree_for_language(file, language, source),
+    match language_support(language) {
+        Some(support) => support.parse_tree_for_type_lookup(file, language, source),
+        None => parse_tree_for_language(file, language, source),
     }
 }
 
-pub(super) fn candidates_outcome(
-    fqn: impl Into<String>,
-    candidates: Vec<CodeUnit>,
-) -> TypeLookupOutcome {
+#[doc(hidden)]
+pub fn candidates_outcome(fqn: impl Into<String>, candidates: Vec<CodeUnit>) -> TypeLookupOutcome {
     candidates_outcome_with_target_kind(fqn, candidates, TypeLookupTargetKind::ValueExpression)
 }
 
-pub(super) fn type_reference_outcome(
+#[doc(hidden)]
+pub fn type_reference_outcome(
     fqn: impl Into<String>,
     candidates: Vec<CodeUnit>,
 ) -> TypeLookupOutcome {
     candidates_outcome_with_target_kind(fqn, candidates, TypeLookupTargetKind::TypeReference)
 }
 
-pub(super) fn candidates_outcome_with_target_kind(
+#[doc(hidden)]
+pub fn candidates_outcome_with_target_kind(
     fqn: impl Into<String>,
     mut candidates: Vec<CodeUnit>,
     target_kind: TypeLookupTargetKind,
@@ -528,7 +531,8 @@ pub(super) fn candidates_outcome_with_target_kind(
     candidates_outcome_with_status(fqn, candidates, status, target_kind)
 }
 
-pub(super) fn candidates_outcome_with_status(
+#[doc(hidden)]
+pub fn candidates_outcome_with_status(
     fqn: impl Into<String>,
     candidates: Vec<CodeUnit>,
     status: TypeLookupStatus,
@@ -554,7 +558,8 @@ pub(super) fn candidates_outcome_with_status(
     }
 }
 
-pub(crate) fn no_type(kind: impl Into<String>, message: impl Into<String>) -> TypeLookupOutcome {
+#[doc(hidden)]
+pub fn no_type(kind: impl Into<String>, message: impl Into<String>) -> TypeLookupOutcome {
     diagnostic_outcome(TypeLookupStatus::NoType, kind, message)
 }
 
@@ -575,7 +580,8 @@ fn diagnostic_outcome(
     }
 }
 
-pub(super) fn sort_units(units: &mut [CodeUnit]) {
+#[doc(hidden)]
+pub fn sort_units(units: &mut [CodeUnit]) {
     units.sort_by(|left, right| {
         left.fq_name()
             .cmp(&right.fq_name())
@@ -583,7 +589,8 @@ pub(super) fn sort_units(units: &mut [CodeUnit]) {
     });
 }
 
-pub(crate) fn projection_target_kind(
+#[doc(hidden)]
+pub fn projection_target_kind(
     projections: &[crate::analyzer::resolution::LoweredBindingProjection],
 ) -> (
     TypeLookupTargetKind,
@@ -635,130 +642,6 @@ pub(crate) fn projection_target_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::AnalyzerFixture;
-
-    fn direct_site(
-        fixture: &AnalyzerFixture,
-        language: Language,
-        path: &str,
-        source: &str,
-        expression: &str,
-        focus: &str,
-    ) -> TypeLookupOutcome {
-        let file = ProjectFile::new(fixture.project_root(), path);
-        let tree = parse_tree_for_type_lookup(&file, language, source).expect("fixture parses");
-        let start = source.rfind(expression).expect("expression source");
-        let focus_start = start + expression.find(focus).expect("focus in expression");
-        resolve_type_at_reference_site_with_budget(
-            fixture.analyzer.analyzer(),
-            &file,
-            source,
-            Some(&tree),
-            ResolvedReferenceSite {
-                path: path.to_string(),
-                text: expression.to_string(),
-                range: crate::analyzer::Range {
-                    start_byte: start,
-                    end_byte: start + expression.len(),
-                    start_line: 0,
-                    end_line: 0,
-                },
-                focus_start_byte: focus_start,
-                focus_end_byte: focus_start + focus.len(),
-            },
-            INTERACTIVE_TYPE_LOOKUP_BUDGET,
-        )
-    }
-
-    #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "#4811: the type validator rejected files whose parsed root starts after leading whitespace"
-    )]
-    fn caller_reference_root_accepts_trivia_and_rejects_uncovered_ranges() {
-        for (language, path, source, reference) in [
-            (
-                Language::Python,
-                "app.py",
-                "\nclass Widget:\n    pass\n\n",
-                "Widget",
-            ),
-            (
-                Language::Php,
-                "app.php",
-                "\n<?php class Widget {}\n\n",
-                "Widget",
-            ),
-            (
-                Language::Ruby,
-                "app.rb",
-                "\nclass Widget\nend\n\n",
-                "Widget",
-            ),
-            (
-                Language::Go,
-                "app.go",
-                "\npackage main\ntype Widget struct {}\n\n",
-                "Widget",
-            ),
-        ] {
-            let root = std::env::current_dir().expect("absolute project root");
-            let file = ProjectFile::new(root, path);
-            let tree = parse_tree_for_type_lookup(&file, language, source).expect("grammar parses");
-            let start = source.find(reference).unwrap();
-            let mut site = ResolvedReferenceSite {
-                path: path.to_string(),
-                text: reference.to_string(),
-                range: crate::analyzer::Range {
-                    start_byte: start,
-                    end_byte: start + reference.len(),
-                    start_line: 0,
-                    end_line: 0,
-                },
-                focus_start_byte: start,
-                focus_end_byte: start + reference.len(),
-            };
-            let syntax_root = tree.root_node();
-            eprintln!(
-                "{language:?}: root {}..{}, source {}",
-                syntax_root.start_byte(),
-                syntax_root.end_byte(),
-                source.len()
-            );
-            if language == Language::Python {
-                assert!(syntax_root.start_byte() > 0);
-            }
-            assert!(validate_caller_reference_site(&file, source, Some(&tree), &site).is_ok());
-            // The same parsed tree remains valid when the supplied source has
-            // trailing trivia beyond its root, but not for a reference there.
-            let padded = format!("{source}   ");
-            assert!(validate_caller_reference_site(&file, &padded, Some(&tree), &site).is_ok());
-            let extended = format!("{source}{reference}");
-            site.range.start_byte = source.len();
-            site.range.end_byte = extended.len();
-            site.focus_start_byte = site.range.start_byte;
-            site.focus_end_byte = site.range.end_byte;
-            assert!(validate_caller_reference_site(&file, &extended, Some(&tree), &site).is_err());
-            assert!(
-                validate_caller_reference_site(
-                    &file,
-                    reference,
-                    Some(&tree),
-                    &ResolvedReferenceSite {
-                        range: crate::analyzer::Range {
-                            start_byte: 0,
-                            end_byte: reference.len(),
-                            start_line: 0,
-                            end_line: 0
-                        },
-                        focus_start_byte: 0,
-                        focus_end_byte: reference.len(),
-                        ..site
-                    }
-                )
-                .is_err()
-            );
-        }
-    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -792,56 +675,5 @@ mod tests {
             Some("product")
         );
         assert_eq!(outcome.diagnostics[0].kind, "cancelled");
-    }
-
-    #[test]
-    fn namespace_constructor_rebinding_and_invalid_direct_sites_fail_closed() {
-        let models = "class Widget:\n    pass\n";
-        let consumer = concat!(
-            "import models\n",
-            "models = object()\n",
-            "def make():\n",
-            "    return models.Widget()\n",
-        );
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[("models.py", models), ("consumer.py", consumer)],
-        );
-        let outcome = direct_site(
-            &fixture,
-            Language::Python,
-            "consumer.py",
-            consumer,
-            "models.Widget",
-            "Widget",
-        );
-        assert_ne!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
-
-        let file = ProjectFile::new(fixture.project_root(), "consumer.py");
-        let start = consumer.rfind("models.Widget").unwrap();
-        let invalid = resolve_type_at_reference_site_with_budget(
-            fixture.analyzer.analyzer(),
-            &file,
-            consumer,
-            None,
-            ResolvedReferenceSite {
-                path: "wrong.py".to_string(),
-                text: "models.Widget".to_string(),
-                range: crate::analyzer::Range {
-                    start_byte: start,
-                    end_byte: start + "models.Widget".len(),
-                    start_line: 0,
-                    end_line: 0,
-                },
-                focus_start_byte: start,
-                focus_end_byte: start + "models".len(),
-            },
-            INTERACTIVE_TYPE_LOOKUP_BUDGET,
-        );
-        assert_eq!(
-            invalid.status,
-            TypeLookupStatus::InvalidLocation,
-            "{invalid:#?}"
-        );
     }
 }

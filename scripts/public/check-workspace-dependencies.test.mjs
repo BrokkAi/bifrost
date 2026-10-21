@@ -3,6 +3,42 @@ import test from "node:test";
 
 import { validateWorkspaceGraph } from "./check-workspace-dependencies.mjs";
 
+// Each extracted implementation adds one descriptor; its fixture package,
+// required edges, consumers and layer checks follow from this entry.
+const languageImplementations = [
+  { name: "brokk-bifrost-rust-analysis", knowledge: "brokk-bifrost-rust", extra: ["brokk-bifrost-semantic"], consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs", "brokk-bifrost-policy"] },
+  { name: "brokk-bifrost-go-analysis", knowledge: "brokk-bifrost-go", extra: ["brokk-bifrost-semantic"], consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"] },
+  { name: "brokk-bifrost-cpp-analysis", knowledge: "brokk-bifrost-cpp", consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql"] },
+  { name: "brokk-bifrost-js-ts-analysis", knowledge: "brokk-bifrost-js-ts", extra: ["brokk-bifrost-semantic"], consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"] },
+  {
+    name: "brokk-bifrost-csharp-analysis",
+    knowledge: "brokk-bifrost-csharp",
+    consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"],
+  },
+  {
+    name: "brokk-bifrost-php-analysis",
+    knowledge: "brokk-bifrost-php",
+    extra: ["brokk-bifrost-semantic"],
+    consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"],
+  },
+  {
+    name: "brokk-bifrost-python-analysis",
+    knowledge: "brokk-bifrost-python",
+    consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"],
+  },
+  {
+    name: "brokk-bifrost-ruby-analysis",
+    knowledge: "brokk-bifrost-ruby",
+    consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"],
+  },
+];
+
+function implementationDependencies(consumer) {
+  return languageImplementations
+    .filter(({ consumers }) => consumers.includes(consumer))
+    .map(({ name }) => dependency(name));
+}
+
 const names = [
   "brokk-bifrost",
   "brokk-bifrost-core",
@@ -15,7 +51,11 @@ const names = [
   "brokk-bifrost-python",
   "brokk-bifrost-ruby",
   "brokk-bifrost-rust",
+  "brokk-bifrost-semantic",
+  "brokk-bifrost-store",
   "brokk-bifrost-analysis",
+  ...languageImplementations.map(({ name }) => name),
+  "brokk-bifrost-tools",
   "brokk-bifrost-flow",
   "brokk-bifrost-rql",
   "brokk-bifrost-policy",
@@ -46,7 +86,7 @@ function metadata(overrides = {}) {
     "brokk-bifrost-python": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-ruby": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-rust": [dependency("brokk-bifrost-core")],
-    "brokk-bifrost-analysis": [
+    "brokk-bifrost-semantic": [
       dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-cpp"),
       dependency("brokk-bifrost-csharp"),
@@ -58,6 +98,22 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-ruby"),
       dependency("brokk-bifrost-rust"),
     ],
+    "brokk-bifrost-store": [],
+    "brokk-bifrost-analysis": [
+      dependency("brokk-bifrost-core"),
+      dependency("brokk-bifrost-semantic"),
+      dependency("brokk-bifrost-store"),
+      dependency("brokk-bifrost-cpp"),
+      dependency("brokk-bifrost-csharp"),
+      dependency("brokk-bifrost-go"),
+      dependency("brokk-bifrost-js-ts"),
+      dependency("brokk-bifrost-jvm"),
+      dependency("brokk-bifrost-php"),
+      dependency("brokk-bifrost-python"),
+      dependency("brokk-bifrost-ruby"),
+      dependency("brokk-bifrost-rust"),
+    ],
+    "brokk-bifrost-tools": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-flow": [
       dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-analysis"),
@@ -68,6 +124,7 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-flow"),
     ],
     "brokk-bifrost-policy": [
+      dependency("brokk-bifrost-cpp-analysis", "dev"),
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-flow"),
       dependency("brokk-bifrost-rql"),
@@ -89,8 +146,18 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-flow"),
     ],
-    ...overrides.dependencies,
+    ...Object.fromEntries(languageImplementations.map(({ name, knowledge, extra = [] }) => [name, [
+      dependency("brokk-bifrost-core"),
+      dependency("brokk-bifrost-analysis"),
+      dependency(knowledge),
+      ...extra.map((name) => dependency(name)),
+    ]])),
   };
+  for (const name of Object.keys(dependencies)) {
+    dependencies[name].push(...implementationDependencies(name));
+  }
+  Object.assign(dependencies, overrides.dependencies);
+
   const versions = { ...Object.fromEntries(names.map((name) => [name, "0.8.12"])), ...overrides.versions };
   const packageNames = overrides.names ?? names;
   const packages = packageNames.map((name) => ({
@@ -159,6 +226,16 @@ test("development edges do not bypass other workspace boundaries", () => {
   ]);
 });
 
+test("semantic packs may reach tools only through the optional release-tooling edge", () => {
+  const optional = metadata();
+  optional.packages.find(({ name }) => name === "brokk-bifrost-semantic-packs")
+    .dependencies.push({ ...dependency("brokk-bifrost-tools"), optional: true });
+  assert.deepEqual(validateWorkspaceGraph(optional), []);
+  assert.deepEqual(validateWorkspaceGraph(withExtraDependency(
+    metadata(), "brokk-bifrost-semantic-packs", "brokk-bifrost-tools",
+  )), ["brokk-bifrost-semantic-packs must not depend on workspace package brokk-bifrost-tools"]);
+});
+
 test("rejects a runtime dependency on a protocol host", () => {
   const errors = validateWorkspaceGraph(
     metadata({
@@ -185,6 +262,8 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
         dependencies: {
           "brokk-bifrost-analysis": [
             dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-semantic"),
+            dependency("brokk-bifrost-store"),
             dependency("brokk-bifrost-cpp"),
             dependency("brokk-bifrost-csharp"),
             dependency("brokk-bifrost-go"),
@@ -268,6 +347,7 @@ test("accepts RQL grammar hooks below analysis but rejects policy", () => {
       metadata({
         dependencies: {
           "brokk-bifrost-rql": [
+            ...implementationDependencies("brokk-bifrost-rql"),
             dependency("brokk-bifrost-core"),
             dependency("brokk-bifrost-analysis"),
             dependency("brokk-bifrost-flow"),
@@ -286,6 +366,7 @@ test("accepts RQL grammar hooks below analysis but rejects policy", () => {
       metadata({
         dependencies: {
           "brokk-bifrost-rql": [
+            ...implementationDependencies("brokk-bifrost-rql"),
             dependency("brokk-bifrost-core"),
             dependency("brokk-bifrost-analysis"),
             dependency("brokk-bifrost-flow"),
@@ -368,36 +449,56 @@ test("rejects unexpected workspace members", () => {
   );
 });
 
-test("rejects a language crate reaching back up to analysis", () => {
-  assert.deepEqual(
-    validateWorkspaceGraph(
-      metadata({
-        dependencies: {
-          "brokk-bifrost-rust": [
-            dependency("brokk-bifrost-core"),
-            dependency("brokk-bifrost-analysis"),
-          ],
-        },
-      }),
-    ),
-    ["brokk-bifrost-rust must not depend on workspace package brokk-bifrost-analysis"],
-  );
+const knowledgeCrates = metadata().packages.find(
+  (pkg) => pkg.name === "brokk-bifrost-semantic",
+).dependencies.map(({ name }) => name).filter(
+  (name) => name !== "brokk-bifrost-core" && name !== "brokk-bifrost-test-macros",
+);
+
+function withExtraDependency(graph, from, to) {
+  graph.packages.find(({ name }) => name === from).dependencies.push(dependency(to));
+  return graph;
+}
+
+test("rejects a language knowledge crate reaching back up to analysis", () => {
+  for (const name of knowledgeCrates) {
+    assert.deepEqual(validateWorkspaceGraph(withExtraDependency(
+      metadata(), name, "brokk-bifrost-analysis",
+    )), [`${name} must not depend on workspace package brokk-bifrost-analysis`]);
+  }
 });
 
 test("rejects one language crate depending on another", () => {
-  assert.deepEqual(
-    validateWorkspaceGraph(
-      metadata({
-        dependencies: {
-          "brokk-bifrost-rust": [
-            dependency("brokk-bifrost-core"),
-            dependency("brokk-bifrost-go"),
-          ],
-        },
-      }),
-    ),
-    ["brokk-bifrost-rust must not depend on workspace package brokk-bifrost-go"],
-  );
+  for (const name of knowledgeCrates) {
+    for (const other of knowledgeCrates.filter((candidate) => candidate !== name)) {
+      assert.deepEqual(validateWorkspaceGraph(withExtraDependency(
+        metadata(), name, other,
+      )), [`${name} must not depend on workspace package ${other}`]);
+    }
+  }
+  for (const { name, knowledge } of languageImplementations) {
+    const peers = [
+      ...knowledgeCrates.filter((candidate) => candidate !== knowledge),
+      ...languageImplementations.map((entry) => entry.name).filter((candidate) => candidate !== name),
+    ];
+    for (const other of peers) {
+      assert.deepEqual(validateWorkspaceGraph(withExtraDependency(
+        metadata(), name, other,
+      )), [`${name} must not depend on workspace package ${other}`]);
+    }
+  }
+});
+
+test("language implementations depend on analysis while knowledge stays below it", () => {
+  for (const { name, knowledge } of languageImplementations) {
+    assert.deepEqual(validateWorkspaceGraph(metadata()), []);
+    assert.deepEqual(validateWorkspaceGraph(withExtraDependency(
+      metadata(), knowledge, name,
+    )), [`${knowledge} must not depend on workspace package ${name}`]);
+    assert.deepEqual(validateWorkspaceGraph(withExtraDependency(
+      metadata(), "brokk-bifrost-analysis", name,
+    )), [`brokk-bifrost-analysis must not depend on workspace package ${name}`]);
+  }
 });
 
 test("rejects a cpp crate reaching back up to analysis", () => {

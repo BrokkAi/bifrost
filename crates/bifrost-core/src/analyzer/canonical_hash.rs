@@ -80,7 +80,7 @@ pub fn parse_lower_sha256(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         digest[index] = (lower_hex_nibble(pair[0])? << 4) | lower_hex_nibble(pair[1])?;
     }
     Some(digest)

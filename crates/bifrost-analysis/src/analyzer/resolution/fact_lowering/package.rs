@@ -3,37 +3,61 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LoweredPackageReference {
-    pub(crate) token: SemanticId,
-    pub(crate) domain: SemanticId,
-    pub(crate) reference: SemanticId,
-    pub(crate) source_site: ResolutionSiteId,
-    pub(crate) root_scope: BindingNodeId,
+#[doc(hidden)]
+pub struct LoweredPackageReference {
+    #[doc(hidden)]
+    pub token: SemanticId,
+    #[doc(hidden)]
+    pub domain: SemanticId,
+    #[doc(hidden)]
+    pub reference: SemanticId,
+    #[doc(hidden)]
+    pub source_site: ResolutionSiteId,
+    #[doc(hidden)]
+    pub root_scope: BindingNodeId,
     pub(crate) choice: Option<SemanticId>,
-    pub(crate) namespace: ResolutionNamespace,
-    pub(crate) lookup: SemanticId,
+    #[doc(hidden)]
+    pub namespace: ResolutionNamespace,
+    #[doc(hidden)]
+    pub lookup: SemanticId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LoweredPackageMember {
-    pub(crate) token: SemanticId,
-    pub(crate) domain: SemanticId,
-    pub(crate) definition: SemanticId,
-    pub(crate) source_site: ResolutionSiteId,
-    pub(crate) root_scope: BindingNodeId,
-    pub(crate) namespace: ResolutionNamespace,
-    pub(crate) lookup: SemanticId,
+#[doc(hidden)]
+pub struct LoweredPackageMember {
+    #[doc(hidden)]
+    pub token: SemanticId,
+    #[doc(hidden)]
+    pub domain: SemanticId,
+    #[doc(hidden)]
+    pub definition: SemanticId,
+    #[doc(hidden)]
+    pub source_site: ResolutionSiteId,
+    #[doc(hidden)]
+    pub root_scope: BindingNodeId,
+    #[doc(hidden)]
+    pub namespace: ResolutionNamespace,
+    #[doc(hidden)]
+    pub lookup: SemanticId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LoweredGoPackageImport {
-    pub(crate) definition: SemanticId,
-    pub(crate) source_site: ResolutionSiteId,
-    pub(crate) file_scope: BindingNodeId,
-    pub(crate) spelling_choice: SemanticId,
-    pub(crate) start_byte: usize,
-    pub(crate) end_byte: usize,
-    pub(crate) kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionGoPackageImportKind,
+#[doc(hidden)]
+pub struct LoweredGoPackageImport {
+    #[doc(hidden)]
+    pub definition: SemanticId,
+    #[doc(hidden)]
+    pub source_site: ResolutionSiteId,
+    #[doc(hidden)]
+    pub file_scope: BindingNodeId,
+    #[doc(hidden)]
+    pub spelling_choice: SemanticId,
+    #[doc(hidden)]
+    pub start_byte: usize,
+    #[doc(hidden)]
+    pub end_byte: usize,
+    #[doc(hidden)]
+    pub kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionGoPackageImportKind,
 }
 
 pub(crate) fn lower_import_metadata(
@@ -95,7 +119,8 @@ fn domain(identities: &mut ResolutionIdentityCatalogBuilder, language: Language)
     identities.shared_name(package_domain_digest(language))
 }
 
-pub(crate) fn package_domain_semantic(
+#[doc(hidden)]
+pub fn package_domain_semantic(
     language: Language,
     names: &dyn super::super::local_identity::SharedNameInterner,
 ) -> SemanticId {
@@ -108,7 +133,8 @@ fn package_domain_digest(language: Language) -> [u8; 32] {
     hasher.finish()
 }
 
-fn token(
+#[doc(hidden)]
+pub fn token(
     identities: &mut ResolutionIdentityCatalogBuilder,
     domain: &[u8],
     coordinate: u32,
@@ -289,7 +315,8 @@ pub(crate) fn lower_metadata(
     (references, members)
 }
 
-fn namespaces(
+#[doc(hidden)]
+pub fn namespaces(
     language: Language,
     reference_namespace: ResolutionNamespace,
 ) -> &'static [ResolutionNamespace] {
@@ -426,6 +453,14 @@ pub(super) fn lower_paths(
                 // obligations belong to their typed/contextual consumers, not
                 // every auxiliary reverse walk through this package member.
                 completion_for_site(reasons_by_site, row.source_site, lexical_declaration_gap)
+                    .combine(&route_publication_completion(
+                        identities,
+                        language,
+                        &index,
+                        index.site(row.source_site).scope,
+                        index.declaration_identifier(row.source_site).name,
+                        row.namespace,
+                    ))
                     .combine(
                         &scope_reasons
                             .get(&index.site(row.source_site).scope)
@@ -507,7 +542,7 @@ fn package_precedence(
 mod tests {
     use super::*;
     use crate::CancellationToken;
-    use crate::analyzer::go::GoAdapter;
+
     use crate::analyzer::kotlin::KotlinAdapter;
     use crate::analyzer::resolution::{
         BatchResolutionEngine, LoweredResolutionFactsWithIdentityCatalog, PreloadedFragmentSource,
@@ -516,25 +551,6 @@ mod tests {
     use crate::analyzer::scala::ScalaAdapter;
     use crate::analyzer::{LanguageAdapter, ProjectFile};
     use std::collections::{BTreeMap, BTreeSet};
-
-    fn parsed(
-        label: &str,
-        source: &str,
-    ) -> (
-        FileResolutionFacts,
-        LoweredResolutionFactsWithIdentityCatalog,
-    ) {
-        let file = ProjectFile::new(std::env::temp_dir(), format!("{label}.go"));
-        let adapter = GoAdapter;
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&adapter.parser_language_for_file(&file))
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let facts = adapter.parse_file(&file, source, &tree).resolution_facts;
-        let artifact = lower_for_test(BindingFragmentId::for_test(label), Language::Go, &facts);
-        (facts, artifact)
-    }
 
     fn parsed_scala(
         label: &str,
@@ -620,139 +636,6 @@ mod tests {
             .find(|id| id.role == role && facts.names[id.name.index()].spelling == "private")
             .unwrap()
             .site
-    }
-
-    #[test]
-    fn repeated_go_package_references_share_one_path_per_lookup() {
-        let uses = (0..20)
-            .flat_map(|_| ["_ = c", "_ = x"])
-            .collect::<Vec<_>>()
-            .join("\n");
-        let source = format!("package p\nfunc use() {{\n{uses}\n}}\n");
-        let (facts, lowered) = parsed("go-shared-package-reference", &source);
-        let index = FactIndex::new(Language::Go, &facts);
-        let mut names = BTreeMap::<String, usize>::new();
-        for fact in &facts.package_references {
-            let identifier = index.identifiers_by_site[&fact.reference]
-                .iter()
-                .find(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
-                .expect("Go package reference has a source identifier");
-            let name = index.name(identifier.name);
-            if name != "_" {
-                *names.entry(name.to_owned()).or_default() += 1;
-            }
-        }
-        assert_eq!(
-            names,
-            BTreeMap::from([("c".to_owned(), 20), ("x".to_owned(), 20)])
-        );
-
-        let references = &lowered.common.package_references;
-        assert_eq!(
-            references.len(),
-            facts.package_references.len()
-                * namespaces(Language::Go, ResolutionNamespace::Value).len()
-        );
-        let mut sites_by_group = BTreeMap::<
-            (BindingNodeId, ResolutionNamespace, SemanticId),
-            (SemanticId, BTreeSet<SemanticId>, BTreeSet<ResolutionSiteId>),
-        >::new();
-        let mut per_site = BTreeSet::new();
-        for reference in references {
-            let identifier = index.identifiers_by_site[&reference.source_site]
-                .iter()
-                .find(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
-                .expect("Go package reference has a source identifier");
-            if index.name(identifier.name) == "_" {
-                continue;
-            }
-            assert!(per_site.insert((reference.reference, reference.namespace)));
-            let group = (reference.root_scope, reference.namespace, reference.lookup);
-            let (token, source_references, source_sites) = sites_by_group
-                .entry(group)
-                .or_insert_with(|| (reference.token, BTreeSet::new(), BTreeSet::new()));
-            assert_eq!(*token, reference.token);
-            source_references.insert(reference.reference);
-            source_sites.insert(reference.source_site);
-        }
-        assert_eq!(sites_by_group.len(), 6);
-        for (group, (_, source_references, source_sites)) in &sites_by_group {
-            assert_eq!(source_references.len(), 20, "group {group:?}");
-            assert_eq!(source_sites.len(), 20, "group {group:?}");
-        }
-
-        let path_groups = references
-            .iter()
-            .map(|reference| {
-                (
-                    reference.root_scope,
-                    reference.domain,
-                    reference.token,
-                    reference.lookup,
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        let package_paths = lowered
-            .lexical
-            .paths()
-            .iter()
-            .filter(|(_, path)| {
-                let symbols = path.end().symbols().fixed();
-                path.end().node() == BindingNodeId::universal_root()
-                    && symbols.len() == 3
-                    && path_groups.contains(&(
-                        path.start().node(),
-                        symbols[0].symbol(),
-                        symbols[1].symbol(),
-                        symbols[2].symbol(),
-                    ))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(package_paths.len(), path_groups.len());
-        assert!(
-            package_paths
-                .iter()
-                .all(|(_, path)| { path.completion() == &ResolutionCompletion::Complete })
-        );
-    }
-
-    #[test]
-    fn kotlin_and_scala_package_references_publish_all_jvm_namespaces() {
-        let (facts, _) = parsed(
-            "jvm-package-reference",
-            "package p\nfunc use(){ _ = remote }\n",
-        );
-        let reference_site = facts
-            .identifiers
-            .iter()
-            .find(|identifier| {
-                identifier.role == ResolutionIdentifierRole::Reference
-                    && facts.names[identifier.name.index()].spelling == "remote"
-            })
-            .unwrap()
-            .site;
-        for language in [Language::Kotlin, Language::Scala] {
-            let lowered = lower_for_test(
-                BindingFragmentId::for_test(language.config_label()),
-                language,
-                &facts,
-            );
-            let namespaces = lowered
-                .common
-                .package_references
-                .iter()
-                .filter(|reference| reference.source_site == reference_site)
-                .map(|reference| reference.namespace)
-                .collect::<BTreeSet<_>>();
-            assert_eq!(
-                namespaces,
-                BTreeSet::from([
-                    ResolutionNamespace::Callable,
-                    ResolutionNamespace::Type,
-                    ResolutionNamespace::Value,
-                ])
-            );
-        }
     }
 
     #[test]
@@ -883,72 +766,5 @@ mod tests {
         );
         assert!(PrecedenceTier::ExplicitImport < PrecedenceTier::WildcardImport);
         assert!(PrecedenceTier::WildcardImport < PrecedenceTier::OtherCompilationUnitPackage);
-    }
-
-    #[test]
-    fn scala_package_object_export_becomes_package_membership() {
-        let (mut facts, _) = parsed(
-            "scala-package-object-export",
-            "package p\ntype Box struct {}\nvar Exported int\n",
-        );
-        let declaration_site = |spelling: &str| {
-            facts
-                .identifiers
-                .iter()
-                .find(|identifier| {
-                    identifier.role == ResolutionIdentifierRole::Declaration
-                        && facts.names[identifier.name.index()].spelling == spelling
-                })
-                .expect("hand-built package-object export declaration")
-                .site
-        };
-        let package_object = declaration_site("Box");
-        let member = declaration_site("Exported");
-        let package_scope =
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId::new(1);
-        facts.packages.push(
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionPackageFact {
-                root_scope: package_scope,
-                declaration: None,
-                placement_gap_site: package_object,
-            },
-        );
-        facts.package_object_exports.push(
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionPackageObjectExportFact {
-                package_object,
-                package_scope,
-                member,
-            },
-        );
-
-        let lowered = lower_for_test(
-            BindingFragmentId::for_test("scala-package-object-export"),
-            Language::Scala,
-            &facts,
-        );
-        let package_root = lowered
-            .common
-            .package_members
-            .iter()
-            .find(|row| row.source_site == package_object)
-            .unwrap()
-            .root_scope;
-        assert!(lowered.common.package_members.iter().any(|row| {
-            row.source_site == member
-                && row.root_scope == package_root
-                && row.namespace == ResolutionNamespace::Value
-        }));
-        assert!(
-            lowered
-                .common
-                .shared_language
-                .package_object_exports
-                .iter()
-                .any(|row| {
-                    row.package_object == package_object
-                        && row.package_scope == package_root
-                        && row.member == member
-                })
-        );
     }
 }

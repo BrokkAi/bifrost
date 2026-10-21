@@ -1,0 +1,24 @@
+[package]
+name = "brokk-bifrost-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = true
+rust-version.workspace = true
+description = "SQLite-backed analyzer store and resolution support for brokk-bifrost"
+
+[lib]
+name = "brokk_bifrost_store"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+test-support = []
+
+[dependencies]

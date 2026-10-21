@@ -183,3 +183,26 @@ pub(crate) fn resolve_rust_type_prefixes(
         },
     )
 }
+
+/// Rust schedules only positioned Type prefixes with a lexical scope witness.
+/// The shared frame owns task deduplication and keeps each source-half incidence.
+pub(super) fn rust_prefix_operands(
+    frame: &super::demand_closure::RootFrame,
+    caller: super::demand_closure::EnvironmentId,
+) -> Vec<super::demand_closure::PrefixOperand> {
+    use super::demand_closure::{HalfId, PrefixKey, PrefixOperand};
+    frame
+        .halves
+        .iter()
+        .enumerate()
+        .filter_map(|(index, half)| {
+            rust_qualified_prefix(half).map(|prefix| PrefixOperand {
+                key: PrefixKey {
+                    reference: prefix.reference,
+                    environment: caller,
+                },
+                source_halves: Box::new([HalfId(index)]),
+            })
+        })
+        .collect()
+}

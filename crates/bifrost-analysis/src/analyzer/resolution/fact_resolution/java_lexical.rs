@@ -187,6 +187,12 @@ impl JavaLexicalReplay {
         let Some(calls) = evaluation.accept_session_read(read) else {
             return Ok(None);
         };
+        if calls.iter().any(|call| {
+            let call = call.get(evaluation.session).row();
+            call.callee_reference() == reference && implicit_receiver_call(call)
+        }) {
+            return Ok(None);
+        }
         let has_jvm_call = calls.iter().any(|call| {
             let call = call.get(evaluation.session).row();
             call.callee_reference() == reference
@@ -522,23 +528,10 @@ impl JavaLexicalReplay {
                 }
             }
             if companion_member_call {
-                let relation_read = evaluation
-                    .session
-                    .companion_relations_for_enclosing_types(&[owner])?;
-                let Some(relations) = evaluation.accept_session_read(relation_read) else {
+                let Some(companions) = evaluation.enclosing_companion_types(owner)? else {
                     return Ok(None);
                 };
-                for relation in relations {
-                    if evaluation.poll_cancelled() {
-                        return Ok(None);
-                    }
-                    let relation = relation.get(evaluation.session).row();
-                    assert_eq!(
-                        relation.enclosing_type(),
-                        owner,
-                        "selected companion relation belongs to the requested class body"
-                    );
-                    let companion = relation.companion_type();
+                for companion in companions {
                     for (shape, identity, path) in &enclosing_type_branches {
                         branches.push((*shape, companion, *identity, path.clone()));
                     }
@@ -608,39 +601,16 @@ impl JavaLexicalReplay {
             AwaitingDependencies, AwaitingHierarchyReferences, Continue, Ready,
         };
         if let Some(group) = &mut self.group {
-            let selected = if let Some(inherited) = &mut group.inherited {
-                match inherited.poll(evaluation, readiness)? {
-                    DemandHierarchySelectionPoll::Continue => return Ok(Continue),
-                    DemandHierarchySelectionPoll::AwaitingDependencies => {
-                        return Ok(AwaitingDependencies);
-                    }
-                    DemandHierarchySelectionPoll::AwaitingHierarchyReferences(refs) => {
-                        return Ok(AwaitingHierarchyReferences(refs));
-                    }
-                    DemandHierarchySelectionPoll::Ready(None) => return Ok(Ready(None)),
-                    DemandHierarchySelectionPoll::Ready(Some(selected)) => selected,
+            let selected = match group.poll(evaluation, readiness)? {
+                DemandHierarchySelectionPoll::Continue => return Ok(Continue),
+                DemandHierarchySelectionPoll::AwaitingDependencies => {
+                    return Ok(AwaitingDependencies);
                 }
-            } else {
-                match group.local.poll(evaluation, readiness)? {
-                    DemandHierarchyLocalPoll::Continue => return Ok(Continue),
-                    DemandHierarchyLocalPoll::AwaitingDependencies => {
-                        return Ok(AwaitingDependencies);
-                    }
-                    DemandHierarchyLocalPoll::AwaitingHierarchyReferences(refs) => {
-                        return Ok(AwaitingHierarchyReferences(refs));
-                    }
-                    DemandHierarchyLocalPoll::Ready(false) => return Ok(Ready(None)),
-                    DemandHierarchyLocalPoll::Ready(true) => match evaluation
-                        .select_direct_hierarchy_candidates(group.roots.take().unwrap())
-                    {
-                        None => return Ok(Ready(None)),
-                        Some(DirectHierarchySelection::Ready(selected)) => selected,
-                        Some(DirectHierarchySelection::Inherited(roots)) => {
-                            group.inherited = DemandInheritedHierarchyFrame::new(evaluation, roots);
-                            return Ok(Continue);
-                        }
-                    },
+                DemandHierarchySelectionPoll::AwaitingHierarchyReferences(references) => {
+                    return Ok(DemandQualifiedPoll::AwaitingHierarchyReferences(references));
                 }
+                DemandHierarchySelectionPoll::Ready(None) => return Ok(Ready(None)),
+                DemandHierarchySelectionPoll::Ready(Some(selected)) => selected,
             };
             let HierarchySelectionState::Ready(selected) =
                 evaluation.materialize_hierarchy_candidate_expressions(selected)?
@@ -703,6 +673,7 @@ impl JavaLexicalReplay {
             let (shape, owner, _, _) = &self.branches[self.cursor];
             let owner = *owner;
             let roots = [HierarchyRoot {
+                owner_path_prefix: None,
                 owner,
                 value: ResolutionSlotValue::type_object(ResolutionTypeRef::new(owner, 0)),
                 route_ordinal: 0,
@@ -891,20 +862,56 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(answer))
     }
 
+    pub(super) fn enclosing_companion_types(
+        &mut self,
+        owner: SemanticId,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        let support = hierarchy_support_read_identity(
+            self.session,
+            &*self.hierarchy,
+            b"companion-relation-by-enclosing-type",
+            &[owner],
+        )?;
+        let read = self
+            .session
+            .companion_relations_for_enclosing_types(&[owner])?;
+        let Some(relations) = self.accept_hierarchy_session_read(support, read) else {
+            return Ok(None);
+        };
+        let mut companions = Vec::with_capacity(relations.len());
+        for relation in relations {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let relation = relation.get(self.session).row();
+            assert_eq!(
+                relation.enclosing_type(),
+                owner,
+                "selected companion relation belongs to the requested class body"
+            );
+            companions.push(relation.companion_type());
+        }
+        Ok(Some(companions))
+    }
+
     pub(super) fn lexical_paths_at(
         &mut self,
         endpoint: EndpointSignature,
     ) -> StoreResult<Vec<(CandidatePathIdentity, PartialPath)>> {
-        let matches = self.session.lexical_source.match_forward_candidates(
+        let (matches, unconditional, branches) = read_forward_candidate_artifacts(
+            self.session.lexical_source,
+            self.forward_candidate_artifacts.as_deref_mut(),
             &[BatchCandidateRequest::new(0, endpoint)],
             self.cancellation,
+            self.session.resolution_session,
+            &mut self.work,
+            &mut self.cancellation_observed,
         )?;
-        self.observe_cancellation_completion(matches.unconditional_completion());
-        for completion in matches.branch_completions() {
+        self.observe_cancellation_completion(&unconditional);
+        for completion in &branches {
             self.observe_cancellation_completion(completion);
         }
         let candidates = matches
-            .matches()
             .iter()
             .map(|row| row.candidate())
             .collect::<BTreeSet<_>>()
@@ -916,10 +923,28 @@ impl FactEvaluation<'_, '_> {
                 self.cancellation_observed = true;
                 break;
             }
-            let returned = self
-                .session
-                .lexical_source
-                .hydrate_candidate_paths(chunk, self.cancellation)?;
+            let returned = if self.forward_candidate_artifacts.is_some() {
+                let (returned, evidence) = read_hydrated_candidate_artifacts(
+                    self.session.lexical_source,
+                    &mut self.candidate_paths,
+                    chunk,
+                    self.cancellation,
+                    &mut self.work,
+                    &mut self.cancellation_observed,
+                )?;
+                let (evidence, cancelled) = evidence.finish(
+                    self.cancellation_observed,
+                    self.cancellation,
+                    &mut self.work,
+                );
+                self.observe_cancellation_completion(&evidence);
+                self.cancellation_observed |= cancelled;
+                returned
+            } else {
+                self.session
+                    .lexical_source
+                    .hydrate_candidate_paths(chunk, self.cancellation)?
+            };
             // A source can return evidence together with cancellation. Ledger
             // every returned path before any caller abandons provisional work.
             for (_, path) in &returned {
@@ -982,7 +1007,7 @@ impl FactEvaluation<'_, '_> {
 
     /// Returns the replacement paths for one source-owned hierarchy branch and
     /// whether that branch is retired.
-    fn java_lexical_bridges(
+    pub(super) fn java_lexical_bridges(
         &mut self,
         reference: SemanticId,
         shape: HierarchyLookupShape,
@@ -1087,7 +1112,87 @@ impl FactEvaluation<'_, '_> {
                 break;
             };
             for scope in scopes {
-                let head = scope.get(self.session).row().scope_head();
+                let scope = scope.get(self.session).row();
+                if scope.external_coverage().is_some() {
+                    // The typed hierarchy owns external inventory routes. They
+                    // carry provider-qualified identities, never source heads.
+                    assert!(
+                        self.session
+                            .context_identities
+                            .as_ref()
+                            .is_some_and(|identities| identities
+                                .external_owner_identity(scope.definition())
+                                .is_some())
+                    );
+                    for definition in self.hierarchy.local_nodes[&HierarchyNodeKey {
+                        shape,
+                        owner: selected.owner,
+                    }]
+                        .direct_definitions
+                        .clone()
+                    {
+                        self.record_member_owner_with_route_kind(
+                            definition,
+                            shape
+                                .inherited_member_kind()
+                                .unwrap_or(ResolutionMemberKind::Method),
+                            selected.owner_path.clone(),
+                            false,
+                            FactMemberRouteKind::Member,
+                        );
+                    }
+                    // Inventory identity does not provide a source declaration
+                    // endpoint. Keep this exact external route open instead of
+                    // replaying it as a closed source-scope miss.
+                    let external_completion = branch_completion.combine(&completion).combine(
+                        &ResolutionCompletion::incomplete([ResolutionIncompleteReason::OpenBoundary {
+                            semantic: selected.owner,
+                            status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                        }]),
+                    );
+                    let mut steps = branch.witness().to_vec();
+                    steps.extend(selected.ancestry.iter().map(|&semantic| {
+                        WitnessStep::Candidate {
+                            semantic,
+                            outcome: CandidateOutcome::Selected,
+                        }
+                    }));
+                    steps.push(WitnessStep::Boundary {
+                        semantic: selected.owner,
+                        status:
+                            crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                    });
+                    let mut descriptor = CanonicalIdentityDescriptor::new(
+                        b"bifrost-java-lexical-external-owner-route:v1",
+                        |key| self.session.identity_digest(self.hierarchy, key),
+                    );
+                    descriptor.field(
+                        "branch",
+                        CanonicalIdentityPart::identity(branch_identity.path()),
+                    )?;
+                    descriptor.field(
+                        "branch-fragment",
+                        CanonicalIdentityPart::identity(branch_identity.fragment()),
+                    )?;
+                    descriptor.field("owner", CanonicalIdentityPart::identity(selected.owner))?;
+                    descriptor.field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                    let identity = CandidatePathIdentity::new(
+                        branch_identity.fragment(),
+                        self.hierarchy.operation_path(descriptor.finish()),
+                    );
+                    additions.push((
+                        identity,
+                        PartialPath::new(
+                            branch.start().clone(),
+                            branch.end().clone(),
+                            branch.precedence().to_vec(),
+                            steps,
+                            external_completion,
+                        ),
+                    ));
+                    continue;
+                }
+                let head = scope.scope_head();
                 let paths = self.lexical_paths_at(closed_endpoint(head, [shape.lookup]))?;
                 for (identity, path) in paths {
                     if self.poll_cancelled() {
@@ -1210,6 +1315,10 @@ impl FactEvaluation<'_, '_> {
                         CanonicalIdentityPart::identity(identity.fragment()),
                     )?;
                     descriptor.field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                    descriptor.field(
+                        "receiver-root",
+                        CanonicalIdentityPart::identity(selected.root.owner),
+                    )?;
                     let path_id = self.hierarchy.operation_path(descriptor.finish());
                     additions.push((
                         CandidatePathIdentity::new(branch_identity.fragment(), path_id),
@@ -1238,5 +1347,97 @@ impl FactEvaluation<'_, '_> {
             return Ok(None);
         };
         Ok(Some(outside.contains(&lookup)))
+    }
+
+    /// Whether every supertype edge reachable from `owner` is resolved, apart
+    /// from implicit superclass edges (Java's `java.lang.Object`) whose
+    /// absolute route is unindexed. The references of those implicit edges
+    /// are returned. `None` reports cancellation. An owner without a sealed
+    /// edge node, an ambiguous edge, or an unresolved authored supertype makes
+    /// this `Some(None)`. Local member inventories must also be indexed and
+    /// complete; a minted external identity is not an empty source class.
+    pub(super) fn jvm_hierarchy_implicit_root_gap_references(
+        &mut self,
+        shape: HierarchyLookupShape,
+        owner: SemanticId,
+    ) -> StoreResult<Option<Option<BTreeSet<SemanticId>>>> {
+        // A missing receiver scope is not an exhaustive empty inventory. The
+        // generic hierarchy already proves closure for this exact lookup;
+        // retain every other local/edge operand while accounting for the
+        // explicitly marked language-root gaps below.
+        if !self.hierarchy.hierarchy_closed(shape, owner) {
+            return Ok(Some(None));
+        }
+        let local_inventory_complete = |hierarchy: &HierarchyOperationArena, owner| {
+            hierarchy.edge_nodes.get(&owner).is_some_and(|node| {
+                node.indexed
+                    && node.hierarchy_inventory_complete
+                    && matches!(node.evidence, HierarchyEvidence::Complete)
+            }) && hierarchy
+                .local_nodes
+                .get(&HierarchyNodeKey { shape, owner })
+                .is_some_and(|local| matches!(local.evidence, HierarchyEvidence::Complete))
+        };
+        let mut pending = vec![owner];
+        let mut visited = HashSet::default();
+        let mut implicit_root_references = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(node) = self.hierarchy.edge_node_snapshot(current) else {
+                return Ok(Some(None));
+            };
+            if !local_inventory_complete(self.hierarchy, current) {
+                return Ok(Some(None));
+            }
+            let mut unresolved = Vec::new();
+            for ordinal in 0..node.edge_count {
+                if self.poll_cancelled() {
+                    return Ok(None);
+                }
+                let edge = self.hierarchy.edge_snapshot(current, ordinal);
+                match edge.target_count {
+                    1 => {
+                        let target = self.hierarchy.edge_target(current, ordinal, 0);
+                        if local_inventory_complete(self.hierarchy, target) {
+                            pending.push(target);
+                        } else {
+                            // An indexed child may name an unindexed implicit
+                            // root. Only that marked edge can be discharged.
+                            unresolved.push(edge.reference);
+                        }
+                    }
+                    0 => unresolved.push(edge.reference),
+                    _ => return Ok(Some(None)),
+                }
+            }
+            if unresolved.is_empty() {
+                continue;
+            }
+            let read = self.session.supertypes_for_definitions(&[current])?;
+            let Some(supertypes) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            let implicit = supertypes
+                .iter()
+                .map(|row| row.get(self.session).row())
+                .filter(|row| {
+                    row.source_kind() == Some(ResolutionSupertypeKind::ImplicitSuperclass)
+                })
+                .map(|row| row.reference())
+                .collect::<HashSet<_>>();
+            if unresolved
+                .iter()
+                .any(|reference| !implicit.contains(reference))
+            {
+                return Ok(Some(None));
+            }
+            implicit_root_references.extend(unresolved);
+        }
+        Ok(Some(Some(implicit_root_references)))
     }
 }

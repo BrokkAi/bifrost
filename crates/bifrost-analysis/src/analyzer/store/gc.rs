@@ -12,12 +12,13 @@ use crate::gitblob;
 ///
 /// Use the workspace's live store so the shared collection entry point can
 /// reload statistics and recycle its pooled readers after collection.
-fn run_gc(
+#[doc(hidden)]
+pub fn run_gc(
     store: &AnalyzerStore,
     repo: &git2::Repository,
     workspace_root: &Path,
 ) -> Result<crate::cache_gc::GcOutcome, String> {
-    crate::cache_gc::maybe_gc_for_analyzer(store, repo, workspace_root)
+    crate::analyzer::store::cache_gc::maybe_gc_for_analyzer(store, repo, workspace_root)
 }
 
 /// Owns best-effort analyzer cache GC tasks for one workspace lifetime.
@@ -36,12 +37,13 @@ fn run_gc(
 /// whether the worker thread had reached its first instruction yet, and it
 /// carried a hazard of its own: a worker whose upgraded reference was the last
 /// strong one would have run this drop on its own thread and joined itself.
-pub(crate) struct AnalyzerGcCoordinator {
+#[doc(hidden)]
+pub struct AnalyzerGcCoordinator {
     automatic: bool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Parks a worker before it touches the repository or the store, so a test
     /// can order the final drop ahead of the collection deterministically.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     hold_workers_for_test: Option<Arc<WorkerHold>>,
 }
 
@@ -60,13 +62,14 @@ impl AnalyzerGcCoordinator {
         Self {
             automatic,
             tasks: Mutex::new(Vec::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             hold_workers_for_test: None,
         }
     }
 
-    #[cfg(test)]
-    fn holding_workers_for_test(hold: Arc<WorkerHold>) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn holding_workers_for_test(hold: Arc<WorkerHold>) -> Self {
         let mut coordinator = Self::new(true);
         coordinator.hold_workers_for_test = Some(hold);
         coordinator
@@ -74,7 +77,8 @@ impl AnalyzerGcCoordinator {
 
     /// Run a throttled GC after a persisted analyzer build/update.
     /// Plain in-memory stores never GC.
-    pub(crate) fn schedule(&self, workspace_root: &Path, store: Arc<AnalyzerStore>) {
+    #[doc(hidden)]
+    pub fn schedule(&self, workspace_root: &Path, store: Arc<AnalyzerStore>) {
         if !self.automatic {
             return;
         }
@@ -83,12 +87,12 @@ impl AnalyzerGcCoordinator {
         }
         self.reap_finished();
         let root = workspace_root.to_path_buf();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let hold = self.hold_workers_for_test.clone();
         let spawned = std::thread::Builder::new()
             .name("bifrost-analyzer-store-gc".to_string())
             .spawn(move || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(hold) = hold {
                     hold.park_until_released();
                 }
@@ -155,21 +159,22 @@ impl Drop for AnalyzerGcCoordinator {
 ///
 /// The safety timeouts turn a regression into a failed test rather than a
 /// wedged test binary.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
-struct WorkerHold {
+#[doc(hidden)]
+pub struct WorkerHold {
     state: Mutex<WorkerHoldState>,
     changed: std::sync::Condvar,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct WorkerHoldState {
     parked: bool,
     released: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl WorkerHold {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -187,7 +192,8 @@ impl WorkerHold {
         );
     }
 
-    fn wait_until_parked(&self) {
+    #[doc(hidden)]
+    pub fn wait_until_parked(&self) {
         let state = self.state.lock().expect("worker hold mutex poisoned");
         let (_state, wait) = self
             .changed
@@ -196,7 +202,8 @@ impl WorkerHold {
         assert!(!wait.timed_out(), "the scheduled GC worker never started");
     }
 
-    fn release(&self) {
+    #[doc(hidden)]
+    pub fn release(&self) {
         self.state
             .lock()
             .expect("worker hold mutex poisoned")
@@ -221,188 +228,4 @@ pub fn set_min_interval_secs_for_test(seconds: i64) -> GcIntervalGuard {
 }
 
 #[cfg(test)]
-mod tests {
-    use brokk_bifrost_test_macros::hardwon;
-    use std::sync::Arc;
-
-    use super::{AnalyzerGcCoordinator, AnalyzerStore, WorkerHold, run_gc};
-    use crate::analyzer::store::test_adapters::two_revision_collection_fixture;
-    use crate::analyzer::workspace::WorkspaceAnalyzer;
-    use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject};
-    use crate::gitblob::test_repo::{commit_all, init_repo};
-
-    /// Issue #3170: a store created moments ago is not overdue for collection.
-    ///
-    /// Collection is due when the store has grown and the time cadence has
-    /// elapsed since the last one. A store whose `cache_state` row was written
-    /// with `last_gc_at = 0` reads as overdue by the whole epoch, so the first
-    /// build that persisted a blob scheduled a full sweep of a store it had
-    /// just written -- and that sweep held the analyzer-cache build lock in
-    /// front of the session's first diff-derived request.
-    ///
-    /// The tuning guard pins the production cadence rather than changing it:
-    /// the default interval is the subject here.
-    #[test]
-    #[hardwon("#3170: a newly created store was immediately treated as due for collection")]
-    fn a_fresh_store_is_not_born_due_for_collection() {
-        let _tuning = crate::cache_gc::set_tuning_for_test(
-            crate::cache_gc::GC_AUTO_BLOB_THRESHOLD,
-            crate::cache_gc::GC_MIN_INTERVAL_SECS,
-        );
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.rs"), "pub fn widget() -> u32 { 1 }\n").unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "first content");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-            project,
-            AnalyzerConfig::default(),
-        )
-        .expect("persisted analyzer should build");
-        let db_path = workspace
-            .persisted_store_path()
-            .expect("a persisted build reports its store path");
-        drop(workspace);
-
-        let store = AnalyzerStore::open_persistent(&db_path).expect("open the built store");
-        let outcome = run_gc(&store, &repository, &root).expect("scheduled collection");
-
-        assert!(
-            !outcome.ran,
-            "a store created by this build must not already be due: {outcome:?}"
-        );
-        assert!(
-            outcome.total_blobs_after > 0,
-            "the build must persist blobs, or the scheduling condition is vacuous"
-        );
-        let (last_gc_at, blobs_at_last_gc) =
-            crate::cache_gc::gc_accounting_for_test(&db_path).expect("cache_state accounting");
-        assert_eq!(
-            blobs_at_last_gc, 0,
-            "no collection ran, so the recorded blob count must still be the store's initial one"
-        );
-        assert!(
-            last_gc_at > 0,
-            "a created store starts its collection cadence at its creation time"
-        );
-    }
-
-    /// A collection that dropped rows leaves this store's pooled readers
-    /// planning against statistics the collection invalidated, so the
-    /// collection recycles them (issue #3029).
-    ///
-    /// This is the case the build hook does not cover: the first `ANALYZE` of a
-    /// store's life creates `sqlite_stat1`, which is a schema change every
-    /// connection notices, while a collection rewrites rows in a table that
-    /// already exists.
-    ///
-    /// The setup makes one persisted blob unreachable the same way
-    /// `a_collection_that_drops_rows_refreshes_the_statistics` does: two
-    /// commits, each built, then the branch moves back to the first and the
-    /// working tree with it, and the retained workspace projection is released.
-    #[test]
-    #[hardwon(
-        "d78f9a16030c: readers kept stale query plans after garbage collection changed planner statistics"
-    )]
-    fn a_collection_that_drops_rows_recycles_this_stores_readers() {
-        let _statistics = brokk_bifrost_core::cache_gc::planner_statistics_test_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _tuning = crate::cache_gc::set_tuning_for_test(0, 0);
-        let fixture = two_revision_collection_fixture();
-        let store = &fixture.store;
-        drop(store.read_conn().expect("warm one pooled reader"));
-        assert_eq!(
-            store.readers.idle_len(),
-            1,
-            "the warmed reader must be back in the pool before the collection"
-        );
-
-        let outcome = run_gc(store, &fixture.repository, &fixture.root).expect("collection");
-        assert!(
-            outcome.analyzer_dropped > 0,
-            "the setup must leave the second content collectable: {outcome:?}"
-        );
-        assert_eq!(
-            store.readers.idle_len(),
-            0,
-            "a collection that dropped {} rows must close the readers that planned before it",
-            outcome.analyzer_dropped
-        );
-    }
-
-    /// Issue #3349: a collection scheduled by a build whose final owner goes
-    /// away immediately afterwards still runs, and that owner's drop waits for
-    /// it.
-    ///
-    /// This is what `SearchToolsService::close` does to a watched persisted
-    /// session that is closed right after construction: the build has already
-    /// scheduled a collection, and the close drops the last store context.
-    /// The worker used to consult a weak reference to the coordinator before
-    /// touching anything, so when the final drop began before the worker
-    /// thread had run its first instruction the collection was cancelled and
-    /// `cache_state` never advanced -- an outcome of thread scheduling, which
-    /// is why the MCP regression flaked. The hold reproduces that ordering
-    /// exactly: the worker is parked before it does anything until the final
-    /// drop is already waiting for it.
-    #[test]
-    #[hardwon("#3349: dropping the last coordinator cancelled a scheduled collection")]
-    fn a_collection_scheduled_before_the_final_drop_still_runs_and_the_drop_waits() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.rs"), "pub fn widget() -> u32 { 1 }\n").unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "first content");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-            project,
-            AnalyzerConfig::default(),
-        )
-        .expect("persisted analyzer should build");
-        let db_path = workspace
-            .persisted_store_path()
-            .expect("a persisted build reports its store path");
-        drop(workspace);
-        // The MCP regression's setup: a store that holds blobs and is due.
-        crate::cache_gc::set_accounting_for_test(&db_path, 0, 0).expect("make collection due");
-        let store =
-            Arc::new(AnalyzerStore::open_persistent(&db_path).expect("open the built store"));
-
-        let hold = Arc::new(WorkerHold::default());
-        let coordinator = Arc::new(AnalyzerGcCoordinator::holding_workers_for_test(Arc::clone(
-            &hold,
-        )));
-        coordinator.schedule(&root, Arc::clone(&store));
-        let final_drop = std::thread::spawn(move || drop(coordinator));
-        hold.wait_until_parked();
-
-        // The worker has done nothing yet, and the final owner cannot finish
-        // dropping while the worker is parked: the drop is waiting for it.
-        assert_eq!(
-            crate::cache_gc::gc_accounting_for_test(&db_path).expect("cache_state accounting"),
-            (0, 0)
-        );
-        assert!(
-            !final_drop.is_finished(),
-            "the final drop must join the scheduled collection, not return around it"
-        );
-
-        hold.release();
-        final_drop
-            .join()
-            .expect("the final drop must not panic while joining the collection");
-        let (last_gc_at, blobs_at_last_gc) =
-            crate::cache_gc::gc_accounting_for_test(&db_path).expect("cache_state accounting");
-        assert!(
-            last_gc_at > 0,
-            "the collection scheduled before the final drop must have run"
-        );
-        assert!(
-            blobs_at_last_gc > 0,
-            "the collection must have accounted for the store's blobs"
-        );
-    }
-}
+mod tests {}

@@ -111,7 +111,8 @@ thread_local! {
 /// path. Ephemeral stores retain a local mutex because their backing database
 /// is unique, and because the in-memory fallback must route reads through the
 /// same connection.
-pub(super) enum StoreWriter {
+#[doc(hidden)]
+pub enum StoreWriter {
     Local(Mutex<Connection>),
     Persistent(Arc<PersistentWriter>),
 }
@@ -160,7 +161,8 @@ impl StoreWriter {
         Ok((Self::Persistent(writer), reader_source))
     }
 
-    pub(super) fn execute<T, F>(&self, job: F) -> T
+    #[doc(hidden)]
+    pub fn execute<T, F>(&self, job: F) -> T
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> T + Send + 'static,
@@ -190,7 +192,8 @@ impl StoreWriter {
 
     /// Local-connection access for the in-memory reader fallback and existing
     /// ephemeral-store SQL tests. Persistent callers must use `execute`.
-    pub(super) fn lock(&self) -> LockResult<MutexGuard<'_, Connection>> {
+    #[doc(hidden)]
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, Connection>> {
         match self {
             Self::Local(conn) => conn.lock(),
             Self::Persistent(_) => {
@@ -267,7 +270,8 @@ fn repair_planner_statistics_on_open(conn: &Connection) {
     }
 }
 
-pub(super) struct PersistentWriter {
+#[doc(hidden)]
+pub struct PersistentWriter {
     registry_key: PathBuf,
     reader_source: PathBuf,
     sender: Mutex<Option<SyncSender<WriterMessage>>>,

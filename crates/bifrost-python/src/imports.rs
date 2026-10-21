@@ -572,62 +572,91 @@ pub fn python_import_bindings_from_imports(
     root: Node<'_>,
     source_len: usize,
 ) -> Vec<PythonImportBinding> {
-    let mut bindings = imports
-        .iter()
-        .filter_map(|import| {
-            let path = import.path.as_ref()?;
-            let details = python_import_details(import)?;
-            let mut binding_scope = None;
-            for scope in path.lexical_scopes.iter().rev() {
-                let node = root.descendant_for_byte_range(scope.start_byte, scope.end_byte)?;
-                if node.start_byte() != scope.start_byte || node.end_byte() != scope.end_byte {
-                    return None;
-                }
-                if matches!(node.kind(), "function_definition" | "lambda") {
-                    binding_scope = Some((scope.start_byte, scope.end_byte, true));
-                    break;
-                }
+    python_import_bindings_from_imports_bounded(imports, root, source_len, || true)
+        .expect("unbounded import projection completes")
+}
+
+/// Project canonical import facts under the caller's own sticky traversal
+/// budget. A stopped projection is distinct from a complete empty inventory.
+pub fn python_import_bindings_from_imports_bounded(
+    imports: &[ImportInfo],
+    root: Node<'_>,
+    source_len: usize,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Vec<PythonImportBinding>> {
+    let mut bindings = Vec::new();
+    for import in imports {
+        if !scope_step() {
+            return None;
+        }
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        for _segment in &path.segments {
+            if !scope_step() {
+                return None;
             }
-            let (scope_start_byte, scope_end_byte, function_scoped) =
-                binding_scope.unwrap_or((0, source_len, false));
-            let start_byte = path.declaration_start_byte;
-            match details {
-                PythonImportDetails::Import { module, alias } => {
-                    let consumed_attributes = if alias.is_some() {
-                        0
-                    } else {
-                        path.segments.len().saturating_sub(1)
-                    };
-                    Some(PythonImportBinding {
-                        start_byte,
-                        scope_start_byte,
-                        scope_end_byte,
-                        function_scoped,
-                        local_name: import.identifier.clone()?,
-                        qualified_name: module,
-                        consumed_attributes,
-                    })
-                }
-                PythonImportDetails::FromImport {
-                    module,
-                    name,
-                    alias: _,
-                    wildcard: false,
-                } => Some(PythonImportBinding {
-                    start_byte,
-                    scope_start_byte,
-                    scope_end_byte,
-                    function_scoped,
-                    local_name: import.identifier.clone()?,
-                    qualified_name: format!("{module}.{name}"),
-                    consumed_attributes: 0,
-                }),
-                PythonImportDetails::FromImport { wildcard: true, .. } => None,
+        }
+        let Some(details) = python_import_details(import) else {
+            continue;
+        };
+        let mut binding_scope = None;
+        let mut valid = true;
+        for scope in path.lexical_scopes.iter().rev() {
+            if !scope_step() {
+                return None;
             }
-        })
-        .collect::<Vec<_>>();
+            let Some(node) = root.descendant_for_byte_range(scope.start_byte, scope.end_byte)
+            else {
+                valid = false;
+                break;
+            };
+            if node.start_byte() != scope.start_byte || node.end_byte() != scope.end_byte {
+                valid = false;
+                break;
+            }
+            if matches!(node.kind(), "function_definition" | "lambda") {
+                binding_scope = Some((scope.start_byte, scope.end_byte, true));
+                break;
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let (scope_start_byte, scope_end_byte, function_scoped) =
+            binding_scope.unwrap_or((0, source_len, false));
+        let Some(local_name) = import.identifier.clone() else {
+            continue;
+        };
+        let (qualified_name, consumed_attributes) = match details {
+            PythonImportDetails::Import { module, alias } => (
+                module,
+                if alias.is_some() {
+                    0
+                } else {
+                    path.segments.len().saturating_sub(1)
+                },
+            ),
+            PythonImportDetails::FromImport {
+                module,
+                name,
+                wildcard: false,
+                ..
+            } => (format!("{module}.{name}"), 0),
+            PythonImportDetails::FromImport { wildcard: true, .. } => continue,
+        };
+        bindings.push(PythonImportBinding {
+            start_byte: path.declaration_start_byte,
+            scope_start_byte,
+            scope_end_byte,
+            function_scoped,
+            local_name,
+            qualified_name,
+            consumed_attributes,
+        });
+    }
     bindings.sort_by_key(|binding| binding.start_byte);
-    bindings
+    Some(bindings)
 }
 
 fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usize, bool) {
@@ -1323,6 +1352,9 @@ pub enum PythonImportDetails {
 #[derive(Debug, Clone)]
 pub struct PythonImportSyntax<'tree> {
     pub info: ImportInfo,
+    pub module: Node<'tree>,
+    pub member: Option<Node<'tree>>,
+    pub leaf: Node<'tree>,
     pub declaration: Node<'tree>,
     pub target: Option<Node<'tree>>,
     pub alias: Option<Node<'tree>>,
@@ -1431,6 +1463,9 @@ fn python_namespace_import_syntaxes<'tree>(
         };
         infos.push(PythonImportSyntax {
             info,
+            module: module_node,
+            member: None,
+            leaf: imported,
             declaration: node,
             target,
             alias: alias_node,
@@ -1478,6 +1513,9 @@ fn python_from_import_syntaxes<'tree>(
         };
         infos.push(PythonImportSyntax {
             info,
+            module: module_node,
+            member: None,
+            leaf: node,
             declaration: node,
             target: None,
             alias: None,
@@ -1542,6 +1580,9 @@ fn python_from_import_syntaxes<'tree>(
         };
         infos.push(PythonImportSyntax {
             info,
+            module: module_node,
+            member: Some(name_node),
+            leaf: imported,
             declaration: node,
             target,
             alias: alias_node,
@@ -1596,26 +1637,25 @@ fn python_first_segment_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// Identifier components selected from an import path AST, in source order.
+/// Relative punctuation is deliberately not a name component.
+pub(crate) fn python_import_identifier_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+    let mut segments = Vec::new();
+    walk_named_tree_preorder(node, true, |node| {
+        if node.kind() == "identifier" {
+            segments.push(node);
+        }
+        WalkControl::Continue
+    });
+    segments
+}
+
 fn python_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
-    match node.kind() {
-        "identifier" => vec![py_node_text(node, source).trim().to_string()],
-        "dotted_name" => {
-            let mut segments = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                segments.extend(python_path_segments(child, source));
-            }
-            segments
-        }
-        _ => {
-            let mut segments = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                segments.extend(python_path_segments(child, source));
-            }
-            segments
-        }
-    }
+    python_import_identifier_nodes(node)
+        .into_iter()
+        .map(|node| py_node_text(node, source).trim().to_string())
+        .collect()
 }
 
 fn join_python_import_segments(segments: &[String]) -> String {

@@ -1,0 +1,2236 @@
+use crate::searchtools::navigation::deserialize_symbol_lookup_names;
+
+use crate::searchtools::selectors::*;
+
+use crate::searchtools::*;
+
+use brokk_bifrost_analysis::analyzer::languages::package_fq_name;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+use brokk_bifrost_core::analyzer::query_token::QueryScope;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::{
+    DefinitionLanguageScope, PackageRelationKind, PackageRelationValue, RelationalBatchOutcome,
+    RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+    RelationalName,
+};
+use std::cell::OnceCell;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePatternsParams {
+    pub file_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummariesParams {
+    #[serde(deserialize_with = "deserialize_symbol_lookup_names")]
+    pub targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MostRelevantFilesParams {
+    pub seed_file_paths: Vec<String>,
+    #[serde(default)]
+    pub seed_weights: Option<Vec<f64>>,
+    #[serde(default = "default_recency_half_life")]
+    pub recency_half_life: Option<f64>,
+    #[serde(default)]
+    pub ranking_mode: MostRelevantFilesRankingMode,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryResult {
+    pub summaries: Vec<SummaryBlock>,
+    pub listings: Vec<ContainerListing>,
+    pub not_found: Vec<NotFoundInput>,
+    pub ambiguous: Vec<AmbiguousSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub too_broad: Vec<TooBroadScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerKind {
+    Directory,
+    Package,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerListing {
+    pub target: String,
+    pub kind: ContainerKind,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub languages: Vec<String>,
+    pub entries: Vec<ContainerListingEntry>,
+    pub total_entries: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerListingEntry {
+    Directory {
+        name: String,
+        path: String,
+    },
+    File {
+        name: String,
+        path: String,
+    },
+    Package {
+        name: String,
+        qualified_name: String,
+        languages: Vec<String>,
+    },
+    Type {
+        name: String,
+        symbol: String,
+        language: String,
+        path: String,
+        start_line: usize,
+        end_line: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryBlock {
+    pub label: String,
+    pub path: String,
+    pub preamble: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    pub elements: Vec<SummaryElement>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryElement {
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
+    /// Display symbol of the enclosing scope (declaring/receiver type) for a method, else
+    /// None for a top-level declaration. Lets consumers resolve a method's parent without
+    /// the brittle line-span/string heuristics that break on Go/Rust/C++ method layouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkimFilesResult {
+    pub truncated: bool,
+    pub total_files: usize,
+    pub files: Vec<SkimFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
+}
+
+/// A ranked file plus the test classification the caller needs to apply its own
+/// policy. Ranking never drops test files: the four-way verdict cannot be
+/// collapsed into a boolean without lying about `Ambiguous`, and a repository
+/// with no JVM-style `src/main` pair (every C project, for one) can never
+/// produce `Production` at all, so a server-side "no tests" filter would have to
+/// guess (#1575).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MostRelevantFile {
+    pub path: String,
+    pub test: TestFileKind,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MostRelevantFilesResult {
+    pub files: Vec<MostRelevantFile>,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case the ranking drew from that many files (#2770).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
+    pub not_found: Vec<NotFoundInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub duplicates: Vec<String>,
+    pub complete: bool,
+    pub ranking_mode_used: MostRelevantFilesRankingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<MostRelevantFilesIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MostRelevantFilesIncompleteReason {
+    Cancelled,
+    TimeBudget,
+    /// The exact usage graph contained sound positive evidence but could not
+    /// certify that its edge inventory was complete.
+    UsageGraphIncomplete,
+    /// Ranking ran without the git co-change leg because this repository cannot
+    /// supply recent history as local work. A partial clone (`--filter=blob:none`)
+    /// is the case that motivated the distinction: walking its history makes Git
+    /// refetch absent objects one round trip at a time (issue #1373).
+    HistoryUnavailable,
+    /// The usage graph was incomplete and recent commit history was also
+    /// unavailable; neither independent quality shortfall is hidden.
+    UsageGraphIncompleteAndHistoryUnavailable,
+}
+
+pub(crate) fn default_recency_half_life() -> Option<f64> {
+    Some(DEFAULT_RECENCY_HALF_LIFE)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkimFile {
+    pub path: String,
+    pub loc: usize,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SummaryTargets {
+    pub(crate) file_targets: Vec<ProjectFile>,
+    pub(crate) listings: Vec<ContainerListing>,
+    pub(crate) symbol_targets: Vec<String>,
+    pub(crate) ambiguous_paths: Vec<AmbiguousPathInput>,
+    pub(crate) too_broad: Vec<TooBroadScope>,
+}
+
+#[cfg(test)]
+pub(crate) fn route_summary_targets(
+    analyzer: &dyn IAnalyzer,
+    targets: &[String],
+) -> SummaryTargets {
+    route_summary_targets_with_cancellation(
+        analyzer,
+        targets,
+        GET_SUMMARIES_MAX_FILES_PER_TARGET,
+        None,
+    )
+}
+
+/// `max_files_per_target` bounds how many files one glob target may expand to;
+/// a target over the bound is reported through `too_broad` and contributes no
+/// files at all, because a summary of an arbitrary subset of a huge match
+/// looks complete while meaning nothing.
+fn route_summary_targets_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    targets: &[String],
+    max_files_per_target: usize,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> SummaryTargets {
+    let _scope = profiling::scope("searchtools::route_summary_targets");
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    // Materialized only for targets that actually name a container. Summary
+    // routing used to build the whole workspace file set up front purely to ask
+    // "is this target a directory?", so every `get_summaries` request — the
+    // overwhelmingly common shape being a plain file path — paid a full
+    // ignore-aware traversal of the repository (#1325: ~4-9s per call on a
+    // 2,700-file C# tree, half the fuzzer census's tool time). The directory
+    // question is now answered by a `stat` and the listing is built only when
+    // that says yes.
+    let workspace_files: OnceCell<Arc<BTreeSet<ProjectFile>>> = OnceCell::new();
+    let mut file_targets = BTreeSet::new();
+    let mut listings = Vec::new();
+    let mut listed_containers = HashSet::default();
+    let mut symbol_targets = Vec::new();
+    let mut ambiguous_paths = Vec::new();
+    let mut too_broad = Vec::new();
+
+    for target in targets
+        .iter()
+        .map(|target| target.trim())
+        .filter(|target| !target.is_empty())
+    {
+        if cancellation
+            .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
+        {
+            break;
+        }
+        // A real filesystem directory at this workspace-relative path takes
+        // precedence over any file whose *basename* merely collides with the
+        // target (documented contract: "Real filesystem directories win name
+        // collisions"). Check directory candidates before falling back to
+        // resolver.resolve_literal's basename search, otherwise a bare name
+        // that happens to collide with unrelated same-named files elsewhere
+        // in the tree short-circuits into an ambiguous/file match and the
+        // directory is never offered. An exact file match at this literal
+        // path cannot itself collide with a directory (a path cannot be both
+        // on a real filesystem), so this reordering cannot regress plain file
+        // targets. The check runs before the `path#symbol` split for the same
+        // whole-input reason the splitter itself now checks the complete
+        // literal file first: `#` is legal in a directory name too, and a
+        // target that names the complete existing directory is that
+        // directory, not a symbol anchored in a truncated path (#3505).
+        if let Some(directory) = workspace_directory_path(target)
+            && analyzer.project().has_directory(&directory)
+            && let Some(listing) = directory_listing(
+                // `all_files_shared` hands back the project's own cached listing
+                // behind an `Arc`; `all_files` would deep-clone that whole
+                // `BTreeSet` on every call (#1738).
+                workspace_files.get_or_init(|| {
+                    analyzer
+                        .project()
+                        .all_files_shared()
+                        .unwrap_or_else(|_| Arc::new(BTreeSet::new()))
+                }),
+                target,
+            )
+        {
+            let key = (listing.kind, listing.target.clone());
+            if listed_containers.insert(key) {
+                listings.push(listing);
+            }
+            continue;
+        }
+
+        if matches!(
+            split_definition_selector_with_workspace_files(&resolver, target),
+            DefinitionSelector::FileAnchored { .. }
+        ) {
+            symbol_targets.push(target.to_string());
+            continue;
+        }
+
+        match resolver.resolve_literal(target) {
+            ResolvedFileInput::File(file) => {
+                file_targets.insert(file);
+                continue;
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                ambiguous_paths.push(item);
+                continue;
+            }
+            ResolvedFileInput::NotFound(_) => {}
+        }
+
+        let matches =
+            resolve_file_patterns(analyzer, &[target.to_string()], Some(max_files_per_target));
+        if !matches.ambiguous_paths.is_empty() {
+            ambiguous_paths.extend(matches.ambiguous_paths);
+            continue;
+        }
+        // The glob leg counted its matches and stopped: the target is over the
+        // fan-out cap, so nothing about it was validated or summarized. Before
+        // #1738 the count came out of a fully validated match set, which meant
+        // the tool paid the whole cost of a target it was about to skip.
+        if let Some(fanout) = matches.glob_overflow {
+            too_broad.push(fanout.too_broad_scope(target, max_files_per_target));
+            continue;
+        }
+        if !matches.files.is_empty() {
+            if matches.files.len() > max_files_per_target {
+                too_broad.push(too_broad_scope(
+                    target,
+                    &matches.files,
+                    max_files_per_target,
+                ));
+                continue;
+            }
+            file_targets.extend(matches.files);
+            continue;
+        }
+
+        if let Some(listing) = package_listing(analyzer, target) {
+            let key = (listing.kind, listing.target.clone());
+            if listed_containers.insert(key) {
+                listings.push(listing);
+            }
+            continue;
+        }
+
+        // A file-*shaped* target that matched no file is still a symbol
+        // candidate: C# members legitimately end in a segment that also spells
+        // a file extension (`MetadataConfiguration.Properties` vs
+        // `.properties`), and short-circuiting here reported "no workspace
+        // file matched" for a symbol that resolves (#1196). File shape only
+        // picks the wording of the not-found note, which
+        // `summarize_symbol_targets_with_cancellation` applies once symbol
+        // resolution has had its say.
+        symbol_targets.push(target.to_string());
+    }
+
+    SummaryTargets {
+        file_targets: file_targets.into_iter().collect(),
+        listings,
+        symbol_targets,
+        ambiguous_paths,
+        too_broad,
+    }
+}
+
+pub(crate) fn directory_listing(
+    files: &BTreeSet<ProjectFile>,
+    target: &str,
+) -> Option<ContainerListing> {
+    // Reconstructed per call: it scans every workspace file to keep the direct
+    // children of one directory. Spanned so #1738 can split this cost from the
+    // walk that produced `files` (`project::collect_workspace_files`) and from
+    // the git-status subprocess inside it (`gitblob::dirty_worktree_paths`).
+    let _scope = profiling::scope("searchtools::directory_listing");
+    let directory = workspace_directory_path(target)?;
+
+    let mut entries_by_path = HashMap::default();
+    for file in files {
+        let Ok(remainder) = file.rel_path().strip_prefix(&directory) else {
+            continue;
+        };
+        let mut components = remainder.components();
+        let Some(first) = components.next() else {
+            continue;
+        };
+        let first_path = directory.join(first.as_os_str());
+        let path = stable_workspace_path(&first_path);
+        let name = first.as_os_str().to_string_lossy().into_owned();
+        let entry = if components.next().is_some() {
+            ContainerListingEntry::Directory {
+                name,
+                path: path.clone(),
+            }
+        } else {
+            ContainerListingEntry::File {
+                name,
+                path: path.clone(),
+            }
+        };
+        entries_by_path.insert(path, entry);
+    }
+    if entries_by_path.is_empty() {
+        return None;
+    }
+
+    let mut entries: Vec<_> = entries_by_path.into_values().collect();
+    sort_container_entries(&mut entries);
+    Some(ContainerListing {
+        target: if directory.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            stable_workspace_path(&directory)
+        },
+        kind: ContainerKind::Directory,
+        languages: Vec::new(),
+        total_entries: entries.len(),
+        entries,
+        truncated: false,
+    })
+}
+
+pub(crate) fn stable_workspace_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+pub(crate) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<ContainerListing> {
+    let package = target.trim().trim_end_matches('/');
+    if package.is_empty() {
+        return None;
+    }
+    // Relative paths that are not real directories are handled as misses.
+    // Import paths have a dotted first component (for example, github.com or
+    // k8s.io) and remain eligible for package resolution.
+    if package.contains('/')
+        && !package
+            .split('/')
+            .next()
+            .is_some_and(|component| component.contains('.'))
+    {
+        return None;
+    }
+    let mut languages = analyzer.languages().into_iter().collect::<Vec<_>>();
+    languages.sort();
+    let mut requests = Vec::with_capacity(languages.len() * 3);
+    for language in &languages {
+        let name = RelationalName::stable(package_fq_name(*language, package));
+        for relation in [
+            PackageRelationKind::Exists,
+            PackageRelationKind::Files,
+            PackageRelationKind::Children,
+        ] {
+            requests.push(RelationalDefinitionRequest {
+                ordinal: requests.len(),
+                language_scope: DefinitionLanguageScope::Language(*language),
+                name: name.clone(),
+                query: RelationalDefinitionQuery::PackageRelation(relation),
+            });
+        }
+    }
+    let RelationalBatchOutcome::Complete(results) = analyzer.relational_definition_batch(
+        &requests,
+        &brokk_bifrost_core::cancellation::CancellationToken::new(),
+    ) else {
+        return None;
+    };
+    assert_eq!(results.len(), requests.len());
+    let mut results = results
+        .into_iter()
+        .map(|result| (result.ordinal, result.value))
+        .collect::<HashMap<_, _>>();
+
+    let mut package_languages = Vec::new();
+    let mut package_files = Vec::new();
+    let mut child_languages: HashMap<String, Vec<Language>> = HashMap::default();
+    for (language_index, language) in languages.iter().enumerate() {
+        let base = language_index * 3;
+        let exists = match results.remove(&base) {
+            Some(RelationalDefinitionValue::PackageRelation(PackageRelationValue::Exists(
+                exists,
+            ))) => exists,
+            _ => panic!("package existence request returned the wrong result shape"),
+        };
+        let files = match results.remove(&(base + 1)) {
+            Some(RelationalDefinitionValue::PackageRelation(PackageRelationValue::Files(
+                files,
+            ))) => files,
+            _ => panic!("package files request returned the wrong result shape"),
+        };
+        let children = match results.remove(&(base + 2)) {
+            Some(RelationalDefinitionValue::PackageRelation(PackageRelationValue::Packages(
+                packages,
+            ))) => packages,
+            _ => panic!("package children request returned the wrong result shape"),
+        };
+        if exists || !children.is_empty() {
+            package_languages.push(*language);
+        }
+        package_files.extend(files);
+        for child in children {
+            child_languages.entry(child).or_default().push(*language);
+        }
+    }
+    assert!(results.is_empty());
+    if package_languages.is_empty() {
+        return None;
+    }
+    package_files.sort();
+    package_files.dedup();
+
+    let mut entries = Vec::new();
+    for (child, languages) in child_languages {
+        let languages = package_language_labels(languages);
+        entries.push(ContainerListingEntry::Package {
+            name: package_leaf_name(&child).to_string(),
+            qualified_name: child,
+            languages,
+        });
+    }
+
+    let mut seen_types = HashSet::default();
+    for file in package_files {
+        for unit in analyzer.top_level_declarations(&file) {
+            if !unit.is_class() || unit.package_name() != package {
+                continue;
+            }
+            let language = language_for_file(unit.source()).config_label().to_string();
+            for range in analyzer.ranges(&unit) {
+                let path = rel_path_string(unit.source());
+                let symbol = unit.fq_name();
+                if !seen_types.insert((
+                    language.clone(),
+                    path.clone(),
+                    symbol.clone(),
+                    range.start_line,
+                    range.end_line,
+                )) {
+                    continue;
+                }
+                entries.push(ContainerListingEntry::Type {
+                    name: display_identifier_for_target(&unit),
+                    symbol,
+                    language: language.clone(),
+                    path,
+                    start_line: range.start_line,
+                    end_line: range.end_line,
+                });
+            }
+        }
+    }
+
+    sort_container_entries(&mut entries);
+    Some(ContainerListing {
+        target: package.to_string(),
+        kind: ContainerKind::Package,
+        languages: package_language_labels(package_languages),
+        total_entries: entries.len(),
+        entries,
+        truncated: false,
+    })
+}
+
+pub(crate) fn package_language_labels(languages: Vec<Language>) -> Vec<String> {
+    languages
+        .into_iter()
+        .filter(|language| *language != Language::None)
+        .map(|language| language.config_label().to_string())
+        .collect()
+}
+
+pub(crate) fn package_leaf_name(package: &str) -> &str {
+    package
+        .rsplit_once("::")
+        .or_else(|| package.rsplit_once('/'))
+        .or_else(|| package.rsplit_once('.'))
+        .map(|(_, leaf)| leaf)
+        .unwrap_or(package)
+}
+
+pub(crate) fn sort_container_entries(entries: &mut [ContainerListingEntry]) {
+    entries.sort_by(|left, right| {
+        container_entry_sort_key(left).cmp(&container_entry_sort_key(right))
+    });
+}
+
+pub(crate) fn container_entry_sort_key(entry: &ContainerListingEntry) -> (u8, &str, &str) {
+    match entry {
+        ContainerListingEntry::Directory { name, path } => (0, name, path),
+        ContainerListingEntry::Package {
+            name,
+            qualified_name,
+            ..
+        } => (0, name, qualified_name),
+        ContainerListingEntry::File { name, path } => (1, name, path),
+        ContainerListingEntry::Type { name, symbol, .. } => (1, name, symbol),
+    }
+}
+
+fn summarize_symbol_targets_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    targets: Vec<String>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> SummaryResult {
+    let _scope = profiling::scope("searchtools::summarize_symbol_targets");
+    let mut summaries = Vec::new();
+    let mut not_found = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut too_broad = Vec::new();
+
+    for target in targets {
+        if cancellation
+            .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
+        {
+            break;
+        }
+        let _target_scope = profiling::scope(format!("summarize_symbol_target[{target}]"));
+        // A slash-bearing target can be a canonical symbol. Go import paths
+        // make this shape normal. Give exact structured resolution precedence.
+        // If it does not resolve, treat a target without a source extension as
+        // a missing relative directory or package path. Do not build the
+        // workspace-wide definition index to prove that a path typo is not a
+        // symbol (#1608: a 399k-row Go index added 20 seconds to an ordinary
+        // directory listing request).
+        //
+        // A file-anchored selector (`src/a.js#Widget`) is also slash-bearing
+        // and is not itself an explicit source file target -- the anchor is,
+        // the whole selector is not -- so the anchor split has to decide the
+        // shape before this bailout sees it. The splitter is the same one
+        // `resolve_selectable_definitions` uses one call below, so the two
+        // cannot disagree about what is anchored. It reads no definitions: a
+        // slash-bearing anchor is accepted on its shape alone, and a target
+        // with no `#` never reaches the file check at all.
+        let file_anchored = matches!(
+            split_workspace_definition_selector(analyzer, &target),
+            DefinitionSelector::FileAnchored { .. }
+        );
+        if !file_anchored && (target.contains('/') || target.contains('\\')) {
+            match resolve_selectable_definitions(
+                analyzer,
+                token,
+                &target,
+                exact_codeunit_resolution,
+            ) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
+                    extend_symbol_summaries(
+                        analyzer,
+                        &target,
+                        code_units,
+                        &mut summaries,
+                        &mut not_found,
+                    );
+                    continue;
+                }
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    ambiguous.push(item);
+                    continue;
+                }
+                SelectableDefinitionResolution::NotFound(_) => {}
+            }
+        }
+        if !file_anchored
+            && (target.contains('/') || target.contains('\\'))
+            && !looks_like_explicit_source_file_target(&target)
+        {
+            not_found.push(file_not_found_input(target));
+            continue;
+        }
+        if looks_like_explicit_source_file_target(&target) {
+            match resolve_selectable_definitions(
+                analyzer,
+                token,
+                &target,
+                exact_codeunit_resolution,
+            ) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
+                    extend_symbol_summaries(
+                        analyzer,
+                        &target,
+                        code_units,
+                        &mut summaries,
+                        &mut not_found,
+                    );
+                    continue;
+                }
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    ambiguous.push(item);
+                    continue;
+                }
+                SelectableDefinitionResolution::NotFound(_) => {
+                    // Literal and pattern routing has already proved this is not
+                    // a workspace file. Exact symbols, including slash-bearing
+                    // Go names, had precedence above. Do not send an explicit
+                    // missing source path through workspace-wide fuzzy lookup
+                    // (#1430).
+                    not_found.push(file_not_found_input(target));
+                    continue;
+                }
+            }
+        }
+        let keep_going = || {
+            !cancellation
+                .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
+        };
+        let budget = FuzzyResolveBudget::new(&keep_going, SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES);
+        let resolution = resolve_selectable_definitions_bounded(
+            analyzer,
+            token,
+            &target,
+            budget,
+            |analyzer, lookup| resolve_codeunit_fuzzy_bounded(analyzer, lookup, budget),
+        );
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            // The selector names more declarations than this tool will
+            // summarize. Reported by its count, with no candidate list: the
+            // list is the work the cap skipped (#1908).
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                too_broad.push(too_broad_resolution_candidates(&target, total, limit));
+                continue;
+            }
+            // Same handling as the cancellation check at the top of this loop.
+            Err(FuzzyResolveStop::Cancelled) => break,
+        };
+        match resolution {
+            SelectableDefinitionResolution::Resolved(code_units) => {
+                extend_symbol_summaries(
+                    analyzer,
+                    &target,
+                    code_units,
+                    &mut summaries,
+                    &mut not_found,
+                );
+            }
+            SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
+            // A file-shaped target that resolved to nothing keeps the
+            // file-flavored note routing used to emit up front; see the
+            // routing comment for why the shape check moved down here (#1196).
+            SelectableDefinitionResolution::NotFound(item) => {
+                not_found.push(if looks_like_file_target(&target) {
+                    file_not_found_input(target)
+                } else {
+                    item
+                });
+            }
+        }
+    }
+
+    SummaryResult {
+        summaries,
+        listings: Vec::new(),
+        not_found,
+        ambiguous,
+        ambiguous_paths: Vec::new(),
+        too_broad,
+    }
+}
+
+fn extend_symbol_summaries(
+    analyzer: &dyn IAnalyzer,
+    target: &str,
+    code_units: Vec<CodeUnit>,
+    summaries: &mut Vec<SummaryBlock>,
+    not_found: &mut Vec<NotFoundInput>,
+) {
+    let start_len = summaries.len();
+    for code_unit in code_units {
+        if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
+            summaries.push(block);
+        }
+    }
+    if summaries.len() == start_len {
+        not_found.push(renderable_not_found_input(target));
+    }
+}
+
+pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
+    get_summaries_with_cancellation(analyzer, params, None)
+}
+
+pub fn get_summaries_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: SummariesParams,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> SummaryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let _scope = profiling::scope("searchtools::get_summaries");
+    // Same request boundary as `get_symbol_sources`: routing builds a resolver
+    // per target through `resolve_file_patterns`, so without a shared listing
+    // an N-target request walked the workspace O(N) times (#1334). It also
+    // carries the caller's deadline down to reads whose signatures do not take
+    // one, which is what `get_summaries[g]` needed in #1908.
+    let _analyzer_query = match cancellation {
+        Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+        None => AnalyzerQueryScope::new(analyzer),
+    };
+    let targets = route_summary_targets_with_cancellation(
+        analyzer,
+        &params.targets,
+        GET_SUMMARIES_MAX_FILES_PER_TARGET,
+        cancellation,
+    );
+    summarize_routed_targets_with_cancellation(analyzer, token, &targets, cancellation)
+}
+
+pub(crate) fn skim_files_for_files(
+    analyzer: &dyn IAnalyzer,
+    files: Vec<ProjectFile>,
+) -> SkimFilesResult {
+    let total_files = files.len();
+    let truncated = total_files > FILE_SKIM_LIMIT;
+    let selected = select_files_for_display(analyzer, files, FILE_SKIM_LIMIT);
+    let mut files: Vec<_> = selected
+        .into_par_iter()
+        .map(|file| {
+            let lines: Vec<_> = analyzer
+                .list_symbols(&file)
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let path = rel_path_string(&file);
+            // Line count is rendering metadata alongside `list_symbols`,
+            // which already reads the analyzed snapshot; use the same
+            // snapshot here instead of a fresh disk read for consistency.
+            let loc = analyzer
+                .indexed_source(&file)
+                .map(|content| line_count(&content))
+                .unwrap_or(0);
+            SkimFile { path, loc, lines }
+        })
+        .collect();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let note = skim_files_note(truncated, files.len(), total_files);
+
+    SkimFilesResult {
+        truncated,
+        total_files,
+        files,
+        note,
+        ambiguous_paths: Vec::new(),
+    }
+}
+
+pub(crate) fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Option<String> {
+    truncated.then(|| {
+        format!(
+            "Showing {shown} of {total} selected files. Narrow `file_patterns` on list_symbols or `targets` on get_summaries to see the rest."
+        )
+    })
+}
+
+pub fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
+    summarize_files_with_cancellation(analyzer, files, None)
+}
+
+fn summary_block_for_file_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> Option<SummaryBlock> {
+    if cancellation.is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled) {
+        return None;
+    }
+    let mut elements = analyzer
+        .summary_file_projection(file)
+        .map(|projection| summary_elements_from_file_projection(analyzer, &projection, file))
+        .unwrap_or_else(|| {
+            let mut elements = Vec::new();
+            for code_unit in analyzer.top_level_declarations(file) {
+                elements.extend(summary_elements_for_code_unit_in_file(
+                    analyzer, &code_unit, file,
+                ));
+            }
+            elements
+        });
+
+    // A module-level declaration can appear both as its own entry in
+    // top_level_declarations and as a child of the synthetic module unit
+    // (which is itself top-level), so the recursion above emits it twice.
+    let mut seen = HashSet::default();
+    elements.retain(|element| {
+        seen.insert((element.symbol.clone(), element.start_line, element.end_line))
+    });
+
+    let (elements, fallback_reason) = if elements.is_empty() {
+        summary_fallback_for_file(analyzer, file)?
+    } else {
+        (elements, None)
+    };
+
+    Some(SummaryBlock {
+        label: rel_path_string(file),
+        path: rel_path_string(file),
+        preamble: file_preamble(analyzer, file, &elements),
+        fallback_reason,
+        elements,
+    })
+}
+
+fn summarize_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    files: Vec<ProjectFile>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> SummaryResult {
+    let _scope = profiling::scope("searchtools::summarize_files");
+    let mut summaries: Vec<_> = files
+        .into_par_iter()
+        .filter_map(|file| summary_block_for_file_with_cancellation(analyzer, &file, cancellation))
+        .collect();
+    summaries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.label.cmp(&right.label))
+    });
+
+    SummaryResult {
+        summaries,
+        listings: Vec::new(),
+        not_found: Vec::new(),
+        ambiguous: Vec::new(),
+        ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
+    }
+}
+
+pub(crate) fn summary_fallback_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<(Vec<SummaryElement>, Option<String>)> {
+    let include_elements = include_fallback_elements(analyzer, file);
+    if !include_elements.is_empty() {
+        return Some((
+            include_elements,
+            Some("no indexed declarations found; showing top-level includes".to_string()),
+        ));
+    }
+
+    excerpt_fallback_elements(analyzer, file).map(|(elements, note)| (elements, Some(note)))
+}
+
+pub(crate) fn include_fallback_elements(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Vec<SummaryElement> {
+    let include_lines: Vec<_> = analyzer
+        .import_statements(file)
+        .iter()
+        .filter(|statement| is_include_statement(statement))
+        .cloned()
+        .collect();
+    if include_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(content) = analyzer.project().read_source(file) else {
+        return Vec::new();
+    };
+    let path = rel_path_string(file);
+    let physical_lines: Vec<&str> = content.lines().collect();
+    let normalized_lines: Vec<String> = physical_lines
+        .iter()
+        .map(|line| normalize_include_line(line))
+        .collect();
+
+    let mut next_search_index = 0usize;
+    let mut elements = Vec::new();
+    for include in include_lines {
+        let Some((line_index, line_text)) = normalized_lines
+            .iter()
+            .enumerate()
+            .skip(next_search_index)
+            .find_map(|(line_index, normalized)| {
+                (normalized == &include).then(|| {
+                    (
+                        line_index,
+                        physical_lines.get(line_index).copied().unwrap_or(""),
+                    )
+                })
+            })
+        else {
+            continue;
+        };
+        next_search_index = line_index + 1;
+        elements.push(SummaryElement {
+            path: path.clone(),
+            symbol: extract_include_target(&include),
+            kind: "include".to_string(),
+            start_line: line_index + 1,
+            end_line: line_index + 1,
+            text: line_text.trim_end().to_string(),
+            parent_symbol: None,
+            presentation: None,
+        });
+    }
+    elements
+}
+
+pub(crate) fn excerpt_fallback_elements(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<(Vec<SummaryElement>, String)> {
+    let content = analyzer.project().read_source(file).ok()?;
+    let sampled = model_context::sample(&content);
+    if sampled.text.is_empty() {
+        return None;
+    }
+    let note = sampled_excerpt_note(&sampled);
+    let elements = vec![SummaryElement {
+        path: rel_path_string(file),
+        symbol: rel_path_string(file),
+        kind: "excerpt".to_string(),
+        start_line: 1,
+        end_line: sampled.total_lines,
+        text: sampled.text,
+        parent_symbol: None,
+        presentation: Some("sampled_excerpt".to_string()),
+    }];
+    Some((elements, note))
+}
+
+pub(crate) fn sampled_excerpt_note(sampled: &model_context::HeadTail) -> String {
+    if sampled.truncated {
+        format!(
+            "no indexed declarations or top-level includes found in this file; showing a head/tail sample with the first {} and last {} of its {} lines (the middle is omitted)",
+            sampled.head_shown, sampled.tail_shown, sampled.total_lines
+        )
+    } else {
+        format!(
+            "no indexed declarations or top-level includes found in this file; showing its full text ({} lines)",
+            sampled.total_lines
+        )
+    }
+}
+
+pub(crate) fn is_include_statement(statement: &str) -> bool {
+    statement.trim_start().starts_with("#include")
+}
+
+pub(crate) fn normalize_include_line(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn extract_include_target(statement: &str) -> String {
+    let trimmed = statement.trim();
+    let rest = trimmed.strip_prefix("#include").unwrap_or(trimmed).trim();
+    if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+        return rest[1..rest.len() - 1].to_string();
+    }
+    if rest.starts_with('<') && rest.ends_with('>') && rest.len() >= 2 {
+        return rest[1..rest.len() - 1].to_string();
+    }
+    rest.to_string()
+}
+
+fn summarize_routed_targets_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    summary_targets: &SummaryTargets,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> SummaryResult {
+    let mut file_output = summarize_files_with_cancellation(
+        analyzer,
+        summary_targets.file_targets.clone(),
+        cancellation,
+    );
+    let symbol_output = summarize_symbol_targets_with_cancellation(
+        analyzer,
+        token,
+        summary_targets.symbol_targets.clone(),
+        cancellation,
+    );
+
+    file_output.summaries.extend(symbol_output.summaries);
+    file_output.listings = summary_targets.listings.clone();
+    file_output.too_broad = summary_targets.too_broad.clone();
+    // Routing reports file fan-out; symbol summarization reports resolution
+    // fan-out (#1908). One target can only produce one of them.
+    file_output.too_broad.extend(symbol_output.too_broad);
+    file_output.not_found.extend(symbol_output.not_found);
+    file_output.ambiguous.extend(symbol_output.ambiguous);
+    file_output
+        .ambiguous_paths
+        .extend(symbol_output.ambiguous_paths);
+    file_output
+        .ambiguous_paths
+        .extend(summary_targets.ambiguous_paths.clone());
+    file_output.summaries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.label.cmp(&right.label))
+    });
+    file_output
+}
+
+pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
+    // No fan-out budget: this tool answers with `total_files` and a "showing X
+    // of Y" note computed from the whole match set, so cutting the expansion
+    // short would make it report a number it did not measure. It still resolves
+    // globs against the cheap listing universe rather than the analyzed set.
+    let expanded = resolve_file_patterns(analyzer, &params.file_patterns, None);
+    let mut result = skim_files_for_files(analyzer, expanded.files);
+    result.ambiguous_paths = expanded.ambiguous_paths;
+    result
+}
+
+pub fn most_relevant_files(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+) -> Result<MostRelevantFilesResult, String> {
+    most_relevant_files_with_cancellation(
+        analyzer,
+        params,
+        &brokk_bifrost_core::cancellation::CancellationToken::default(),
+    )
+}
+
+pub fn most_relevant_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<MostRelevantFilesResult, String> {
+    most_relevant_files_with_ranker(
+        analyzer,
+        params,
+        cancellation,
+        |token, seeds, top_k, half_life, ranking_mode, cancellation| {
+            Ok(
+                most_relevant_project_files_with_ranking_mode_and_cancellation(
+                    analyzer,
+                    token,
+                    seeds,
+                    top_k,
+                    half_life,
+                    ranking_mode,
+                    cancellation,
+                ),
+            )
+        },
+    )
+}
+
+/// Test-support facade for the full `most_relevant_files` operation with a
+/// selected Java producer at the exact usage-graph cache-miss seam.
+#[cfg(any(test, feature = "test-support"))]
+pub fn most_relevant_files_with_selected_exact_graph_builder<F, E>(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    telemetry: &mut crate::relevance::selected_exact_relevance::SelectedExactRelevanceTelemetry,
+    mut build_graph: F,
+) -> Result<MostRelevantFilesResult, String>
+where
+    F: FnMut(
+        &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageRankingBuildOutcome,
+        E,
+    >,
+    E: std::fmt::Display,
+{
+    *telemetry =
+        crate::relevance::selected_exact_relevance::SelectedExactRelevanceTelemetry::default();
+    let mut build_graph = |cancellation: &brokk_bifrost_core::cancellation::CancellationToken| {
+        build_graph(cancellation).map_err(|error| error.to_string())
+    };
+    most_relevant_files_with_ranker(
+        analyzer,
+        params,
+        cancellation,
+        |_token, seeds, top_k, half_life, ranking_mode, cancellation| {
+            if ranking_mode != MostRelevantFilesRankingMode::UsageGraphExact {
+                return Err(format!(
+                    "selected Java relevance requires ranking_mode=usage_graph_exact, got {ranking_mode:?}"
+                ));
+            }
+            crate::relevance::selected_exact_relevance::most_relevant_project_files_with_selected_exact_graph_and_cancellation(
+                analyzer,
+                seeds,
+                top_k,
+                half_life,
+                cancellation,
+                telemetry,
+                &mut build_graph,
+            )
+        },
+    )
+}
+
+#[derive(Default)]
+struct ResolvedMostRelevantSeeds {
+    seeds: Vec<(ProjectFile, f64)>,
+    not_found: Vec<NotFoundInput>,
+    ambiguous_paths: Vec<AmbiguousPathInput>,
+    duplicates: Vec<String>,
+    resolved_by_file: HashMap<ProjectFile, ()>,
+}
+
+impl ResolvedMostRelevantSeeds {
+    fn resolve(&mut self, resolver: &WorkspaceFileResolver, input: &str, weight: f64) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) => {
+                let display_path = rel_path_string(&file);
+                if self.resolved_by_file.insert(file.clone(), ()).is_some() {
+                    self.duplicates.push(display_path);
+                } else {
+                    self.seeds.push((file, weight));
+                }
+            }
+            ResolvedFileInput::Ambiguous(item) => self.ambiguous_paths.push(item),
+            ResolvedFileInput::NotFound(item) => {
+                self.not_found.push(file_not_found_input(item));
+            }
+        }
+    }
+
+    fn sort_duplicates(&mut self) {
+        self.duplicates.sort();
+        self.duplicates.dedup();
+    }
+}
+
+fn most_relevant_files_with_ranker(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    mut rank_project_files: impl FnMut(
+        QueryToken<'_>,
+        &[(ProjectFile, f64)],
+        usize,
+        Option<f64>,
+        MostRelevantFilesRankingMode,
+        &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<MostRelevantProjectFilesOutcome, String>,
+) -> Result<MostRelevantFilesResult, String> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let _scope = profiling::scope("searchtools::most_relevant_files");
+    validate_most_relevant_files_params(&params)?;
+    if cancellation.is_cancelled() {
+        return Err(most_relevant_files_cancellation_message(cancellation));
+    }
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    let mut resolved = ResolvedMostRelevantSeeds::default();
+    let seed_weights = params
+        .seed_weights
+        .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
+    let recency_half_life = params.recency_half_life;
+    let ranking_mode = params.ranking_mode;
+    let requested_limit = params.limit;
+
+    {
+        let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
+        for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
+            if cancellation.is_cancelled() {
+                return Err(most_relevant_files_cancellation_message(cancellation));
+            }
+            resolved.resolve(&resolver, &input, weight);
+        }
+    }
+
+    resolved.sort_duplicates();
+    if !resolved.duplicates.is_empty() {
+        return Ok(MostRelevantFilesResult {
+            files: Vec::new(),
+            session_subset: session_subset(analyzer),
+            not_found: resolved.not_found,
+            ambiguous_paths: resolved.ambiguous_paths,
+            duplicates: resolved.duplicates,
+            complete: true,
+            ranking_mode_used: ranking_mode,
+            incomplete_reason: None,
+        });
+    }
+
+    let (mut files, mut complete, ranking_mode_used, mut incomplete_reason) = {
+        let _scope = profiling::scope("searchtools::most_relevant_files.rank");
+        let (ranked, mut complete, ranking_mode_used, mut incomplete_reason) =
+            match rank_project_files(
+                token,
+                &resolved.seeds,
+                requested_limit,
+                recency_half_life,
+                ranking_mode,
+                cancellation,
+            )? {
+                MostRelevantProjectFilesOutcome::Complete(files) => {
+                    (files, true, ranking_mode, None)
+                }
+                MostRelevantProjectFilesOutcome::UsageGraphIncomplete(files) => (
+                    files,
+                    false,
+                    ranking_mode,
+                    Some(MostRelevantFilesIncompleteReason::UsageGraphIncomplete),
+                ),
+                // The import leg still ranked these files; only the commit-history
+                // leg was missing, so the ranking is served with the shortfall
+                // named rather than discarded.
+                MostRelevantProjectFilesOutcome::HistoryUnavailable(files) => (
+                    files,
+                    false,
+                    ranking_mode,
+                    Some(MostRelevantFilesIncompleteReason::HistoryUnavailable),
+                ),
+                MostRelevantProjectFilesOutcome::UsageGraphIncompleteAndHistoryUnavailable(
+                    files,
+                ) => (
+                    files,
+                    false,
+                    ranking_mode,
+                    Some(
+                        MostRelevantFilesIncompleteReason::UsageGraphIncompleteAndHistoryUnavailable,
+                    ),
+                ),
+                // Issue #1304: a producer-local cancellation may use the
+                // deterministic history/import fallback while the shared
+                // request token remains live. Shared-token cancellation skips
+                // that fallback and publishes no ranked prefix.
+                MostRelevantProjectFilesOutcome::Cancelled => {
+                    let reason = most_relevant_files_incomplete_reason(cancellation);
+                    let files = if cancellation.is_cancelled() {
+                        Vec::new()
+                    } else {
+                        most_relevant_project_files_with_half_life(
+                            analyzer,
+                            &resolved.seeds,
+                            params.limit,
+                            recency_half_life,
+                            cancellation,
+                        )
+                        .0
+                    };
+                    (
+                        files,
+                        false,
+                        MostRelevantFilesRankingMode::HistoryImports,
+                        Some(reason),
+                    )
+                }
+            };
+        let mut files = Vec::with_capacity(ranked.len());
+        for file in ranked {
+            if cancellation.is_cancelled() {
+                files.clear();
+                complete = false;
+                incomplete_reason = Some(most_relevant_files_incomplete_reason(cancellation));
+                break;
+            }
+            // The one shared classifier, so a ranked file carries exactly the
+            // verdict `classify_test_files` would give it. Bounded by `limit`
+            // entries.
+            files.push(MostRelevantFile {
+                test: crate::searchtools::scan_usages::classify_resolved_test_file(analyzer, &file)
+                    .kind,
+                path: rel_path_string(&file),
+            });
+        }
+        if cancellation.is_cancelled() {
+            files.clear();
+            complete = false;
+            incomplete_reason = Some(most_relevant_files_incomplete_reason(cancellation));
+        }
+        (files, complete, ranking_mode_used, incomplete_reason)
+    };
+
+    if cancellation.is_cancelled() {
+        files.clear();
+        complete = false;
+        incomplete_reason = Some(most_relevant_files_incomplete_reason(cancellation));
+    }
+
+    Ok(MostRelevantFilesResult {
+        files,
+        session_subset: session_subset(analyzer),
+        not_found: resolved.not_found,
+        ambiguous_paths: resolved.ambiguous_paths,
+        duplicates: resolved.duplicates,
+        complete,
+        ranking_mode_used,
+        incomplete_reason,
+    })
+}
+
+/// Rank files by recent Git co-change without expanding the import graph.
+///
+/// This is an internal retrieval primitive for semantic search. The public
+/// `most_relevant_files` tool keeps its history-plus-import behavior.
+pub fn most_relevant_files_history_only(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+) -> Result<MostRelevantFilesResult, String> {
+    let _scope = profiling::scope("searchtools::most_relevant_files_history_only");
+    validate_most_relevant_files_params(&params)?;
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    let mut resolved = ResolvedMostRelevantSeeds::default();
+    let seed_weights = params
+        .seed_weights
+        .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
+    let recency_half_life = params.recency_half_life;
+    let requested_limit = params.limit;
+
+    for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
+        resolved.resolve(&resolver, &input, weight);
+    }
+
+    resolved.sort_duplicates();
+    if !resolved.duplicates.is_empty() {
+        return Ok(MostRelevantFilesResult {
+            files: Vec::new(),
+            session_subset: session_subset(analyzer),
+            not_found: resolved.not_found,
+            ambiguous_paths: resolved.ambiguous_paths,
+            duplicates: resolved.duplicates,
+            complete: true,
+            ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
+            incomplete_reason: None,
+        });
+    }
+
+    let (ranked, history_status) = most_relevant_project_files_history_only(
+        analyzer,
+        &resolved.seeds,
+        requested_limit,
+        recency_half_life,
+        &brokk_bifrost_core::cancellation::CancellationToken::default(),
+    );
+    let files = ranked
+        .into_iter()
+        .map(|file| MostRelevantFile {
+            test: crate::searchtools::scan_usages::classify_resolved_test_file(analyzer, &file)
+                .kind,
+            path: rel_path_string(&file),
+        })
+        .collect();
+    let (complete, incomplete_reason) = match history_status {
+        crate::relevance::HistoryRankingStatus::Complete => (true, None),
+        crate::relevance::HistoryRankingStatus::HistoryUnavailable => (
+            false,
+            Some(MostRelevantFilesIncompleteReason::HistoryUnavailable),
+        ),
+        crate::relevance::HistoryRankingStatus::Cancelled => {
+            (false, Some(MostRelevantFilesIncompleteReason::Cancelled))
+        }
+    };
+
+    Ok(MostRelevantFilesResult {
+        files,
+        session_subset: session_subset(analyzer),
+        not_found: resolved.not_found,
+        ambiguous_paths: resolved.ambiguous_paths,
+        duplicates: resolved.duplicates,
+        complete,
+        ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
+        incomplete_reason,
+    })
+}
+
+fn most_relevant_files_cancellation_message(
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> String {
+    match most_relevant_files_incomplete_reason(cancellation) {
+        MostRelevantFilesIncompleteReason::TimeBudget => {
+            "most_relevant_files exceeded its request-wide time budget".to_string()
+        }
+        MostRelevantFilesIncompleteReason::Cancelled => {
+            "most_relevant_files was cancelled".to_string()
+        }
+        _ => unreachable!("cancellation maps only to time budget or cancelled"),
+    }
+}
+
+fn most_relevant_files_incomplete_reason(
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> MostRelevantFilesIncompleteReason {
+    if cancellation.is_timed_out() {
+        MostRelevantFilesIncompleteReason::TimeBudget
+    } else {
+        MostRelevantFilesIncompleteReason::Cancelled
+    }
+}
+
+pub(crate) fn validate_most_relevant_files_params(
+    params: &MostRelevantFilesParams,
+) -> Result<(), String> {
+    if let Some(seed_weights) = params.seed_weights.as_ref() {
+        if seed_weights.len() != params.seed_file_paths.len() {
+            return Err(format!(
+                "seed_weights length {} must match seed_file_paths length {}",
+                seed_weights.len(),
+                params.seed_file_paths.len()
+            ));
+        }
+
+        for (index, weight) in seed_weights.iter().enumerate() {
+            if !weight.is_finite() || *weight <= 0.0 {
+                return Err(format!(
+                    "seed_weights[{index}] must be finite and > 0, got {weight}"
+                ));
+            }
+        }
+    }
+
+    if let Some(half_life) = params.recency_half_life
+        && (!half_life.is_finite() || half_life <= 0.0)
+    {
+        return Err(format!(
+            "recency_half_life must be finite and > 0, got {half_life}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn summary_block_for_code_unit(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<SummaryBlock> {
+    let elements = summary_elements_for_code_unit(analyzer, code_unit);
+    if elements.is_empty() {
+        return None;
+    }
+
+    Some(SummaryBlock {
+        label: display_symbol_for_target(analyzer, code_unit),
+        path: rel_path_string(code_unit.source()),
+        preamble: file_preamble(analyzer, code_unit.source(), &elements),
+        fallback_reason: None,
+        elements,
+    })
+}
+
+pub(crate) fn summary_elements_for_code_unit(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Vec<SummaryElement> {
+    // getSkeleton()/getSkeletons() are opaque display strings from the analyzer layer and are not
+    // suitable for ranged searchtools summaries. Searchtools needs stable per-element line ranges,
+    // so it derives summary elements from signatures and source ranges instead of reverse-mapping
+    // formatted skeleton text.
+    summary_elements_for_code_unit_with_children(analyzer, code_unit, |unit| {
+        analyzer.direct_children(unit)
+    })
+}
+
+pub(crate) fn summary_elements_for_code_unit_in_file(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    file: &ProjectFile,
+) -> Vec<SummaryElement> {
+    summary_elements_for_code_unit_with_children(analyzer, code_unit, |unit| {
+        let children = analyzer.direct_children_in_file(unit);
+        for child in &children {
+            debug_assert_eq!(child.source(), file);
+        }
+        children
+    })
+}
+
+fn summary_elements_for_code_unit_with_children(
+    analyzer: &dyn IAnalyzer,
+    root: &CodeUnit,
+    mut children_for: impl FnMut(&CodeUnit) -> Vec<CodeUnit>,
+) -> Vec<SummaryElement> {
+    let mut elements = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(code_unit) = stack.pop() {
+        elements.extend(signature_elements(analyzer, &code_unit));
+        if code_unit.is_class() || code_unit.is_module() {
+            let children = children_for(&code_unit)
+                .into_iter()
+                .filter(|child| !child.is_anonymous())
+                .collect::<Vec<_>>();
+            stack.extend(children.into_iter().rev());
+        }
+    }
+    elements
+}
+
+pub(crate) fn summary_elements_from_file_projection(
+    analyzer: &dyn IAnalyzer,
+    projection: &SummaryFileProjection,
+    file: &ProjectFile,
+) -> Vec<SummaryElement> {
+    let _scope = profiling::scope("searchtools::summary_elements_from_file_projection");
+    prefetch_display_symbols(analyzer, &projection.declarations);
+    let mut elements = Vec::new();
+    let mut stack: Vec<_> = projection
+        .top_level_declarations
+        .iter()
+        .rev()
+        .cloned()
+        .collect();
+    let mut visited = HashSet::default();
+
+    while let Some(code_unit) = stack.pop() {
+        if !visited.insert(code_unit.clone()) {
+            continue;
+        }
+        let signatures = projection
+            .signatures
+            .get(&code_unit)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let ranges = projection
+            .ranges
+            .get(&code_unit)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        elements.extend(summary_elements_from_signature_data(
+            analyzer, &code_unit, signatures, ranges,
+        ));
+
+        if !code_unit.is_class() && !code_unit.is_module() {
+            continue;
+        }
+        if let Some(children) = projection.children.get(&code_unit) {
+            stack.extend(
+                children
+                    .iter()
+                    .rev()
+                    .filter(|child| !child.is_anonymous() && child.source() == file)
+                    .cloned(),
+            );
+        }
+    }
+
+    elements
+}
+
+pub(crate) fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<String> {
+    let signatures: Vec<_> = analyzer
+        .signatures(code_unit)
+        .iter()
+        .filter_map(|signature| {
+            let normalized = normalize_display_signature(signature);
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect();
+    if !signatures.is_empty() {
+        return signatures;
+    }
+
+    let fallback = match code_unit.kind() {
+        CodeUnitType::Class => format!("class {}", display_identifier_for_target(code_unit)),
+        CodeUnitType::Function => code_unit
+            .signature()
+            .map(|signature| format!("{}{}", display_identifier_for_target(code_unit), signature))
+            .unwrap_or_else(|| format!("{}()", display_identifier_for_target(code_unit))),
+        CodeUnitType::Field => display_identifier_for_target(code_unit),
+        CodeUnitType::Module => {
+            display_symbol_name(language_for_target(code_unit), code_unit.short_name())
+        }
+        CodeUnitType::Macro => code_unit
+            .signature()
+            .map(str::to_string)
+            .unwrap_or_else(|| display_identifier_for_target(code_unit).to_string()),
+        CodeUnitType::FileScope => display_identifier_for_target(code_unit).to_string(),
+    };
+    vec![fallback]
+}
+
+pub(crate) fn normalize_display_signature(signature: &str) -> String {
+    let mut normalized = signature
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    while normalized.ends_with('{') {
+        normalized.pop();
+        normalized = normalized.trim_end().to_string();
+    }
+    normalized
+}
+
+pub(crate) fn signature_elements(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Vec<SummaryElement> {
+    let signatures = analyzer.signatures(code_unit);
+    let ranges = analyzer.ranges(code_unit);
+    summary_elements_from_signature_data(analyzer, code_unit, &signatures, &ranges)
+}
+
+pub(crate) fn summary_elements_from_signature_data(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    signatures: &[String],
+    ranges: &[Range],
+) -> Vec<SummaryElement> {
+    if signatures.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = ranges.to_vec();
+    ranges.sort_by_key(|range| (range.start_line, range.start_byte));
+    let path = rel_path_string(code_unit.source());
+    // One declaration, one selector: every element below describes the same
+    // declaration at a different range, so its printed spellings are resolved
+    // once rather than once per overload.
+    let symbol = display_symbol_for_target(analyzer, code_unit);
+    let parent_symbol = display_parent_symbol_for_target(analyzer, code_unit);
+    let fallback_start = ranges.first().map(|range| range.start_line).unwrap_or(1);
+
+    let element_count = if signatures.len() == 1 {
+        ranges.len().max(1)
+    } else {
+        signatures.len()
+    };
+
+    (0..element_count)
+        .filter_map(|index| {
+            let signature = signatures
+                .get(index)
+                .or_else(|| signatures.first())
+                .expect("signatures is not empty");
+            let text = trim_summary_signature(signature);
+            if text.is_empty() {
+                return None;
+            }
+
+            let start_line = ranges
+                .get(index)
+                .map(|range| range.start_line)
+                .unwrap_or(fallback_start);
+            let signature_line_count = text.lines().count().max(1);
+            let range_line_count = ranges
+                .get(index)
+                .map(|range| {
+                    range
+                        .end_line
+                        .saturating_sub(range.start_line)
+                        .saturating_add(1)
+                })
+                .unwrap_or(1);
+            let line_count = signature_line_count.max(range_line_count);
+            let end_line = start_line + line_count.saturating_sub(1);
+            Some(SummaryElement {
+                path: path.clone(),
+                symbol: symbol.clone(),
+                kind: code_unit_kind_name(code_unit.kind()).to_string(),
+                start_line,
+                end_line,
+                text,
+                parent_symbol: parent_symbol.clone(),
+                presentation: None,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn file_preamble(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    elements: &[SummaryElement],
+) -> String {
+    let Some(first_start_line) = elements.iter().map(|element| element.start_line).min() else {
+        return String::new();
+    };
+    if first_start_line <= 1 {
+        return String::new();
+    }
+    let Ok(content) = analyzer.project().read_source(file) else {
+        return String::new();
+    };
+    content
+        .lines()
+        .take(first_start_line.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
+}
+
+pub(crate) fn trim_summary_signature(signature: &str) -> String {
+    signature
+        .lines()
+        .map(str::trim_end)
+        .map(|line| {
+            if let Some(stripped) = line.strip_suffix('{') {
+                stripped.trim_end()
+            } else {
+                line
+            }
+        })
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && trimmed != "}" && trimmed != "[...]"
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+#[cfg(test)]
+mod selected_java_outer_relevance_tests {
+
+    use crate::searchtools::summaries::*;
+
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceCounts;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageRankingBuildOutcome;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageRankingGraph;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::WorkspaceUsageEdge;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::WorkspaceUsageRankingGraph;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::WorkspaceUsageRankingNode;
+
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+
+    use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+    use brokk_bifrost_core::analyzer::model::Language;
+
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+    use crate::relevance::selected_exact_relevance::SelectedExactRelevanceTelemetry;
+
+    use crate::relevance::selected_exact_relevance::SelectedExactUsageGraphLifecycle;
+
+    fn exact_params(seed_file_paths: Vec<String>, limit: usize) -> MostRelevantFilesParams {
+        MostRelevantFilesParams {
+            seed_file_paths,
+            seed_weights: None,
+            recency_half_life: Some(DEFAULT_RECENCY_HALF_LIFE),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
+            limit,
+        }
+    }
+
+    fn selected_graph(
+        analyzer: &dyn IAnalyzer,
+        files: &[ProjectFile],
+        edges: &[(usize, usize)],
+    ) -> SelectedWorkspaceUsageRankingGraph {
+        let mut node_indices_by_file = HashMap::default();
+        let nodes = files
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, file)| {
+                node_indices_by_file.insert(file.clone(), vec![index]);
+                WorkspaceUsageRankingNode {
+                    primary_file: file.clone(),
+                    seed_files: vec![file],
+                    incomplete: false,
+                    contains_tests: None,
+                }
+            })
+            .collect();
+        let graph = WorkspaceUsageRankingGraph {
+            nodes,
+            edges: edges
+                .iter()
+                .map(|&(from, to)| WorkspaceUsageEdge {
+                    from,
+                    to,
+                    counts: UsageReferenceCounts {
+                        calls: 1,
+                        ..UsageReferenceCounts::default()
+                    },
+                })
+                .collect(),
+            node_indices_by_file,
+            resolved_ecosystems: vec![UsageEcosystem::Jvm],
+        };
+        SelectedWorkspaceUsageRankingGraph::from_ranking_graph_for_test(
+            graph,
+            analyzer.project().analysis_generation(),
+        )
+    }
+
+    #[test]
+    fn full_selected_operation_preserves_paths_classification_and_complete_warm_hits() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/main/java/p/Seed.java", "package p; class Seed {}\n")
+            .file("other/Seed.java", "class OtherSeed {}\n")
+            .file(
+                "src/test/java/p/TargetHelper.java",
+                "package p; class TargetHelper {}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let seed = project.file("src/main/java/p/Seed.java");
+        let target = project.file("src/test/java/p/TargetHelper.java");
+        let params = || {
+            exact_params(
+                vec![
+                    " src/main/java/p/Seed.java ".to_string(),
+                    "Seed.java".to_string(),
+                    "missing/Absent.java".to_string(),
+                ],
+                1,
+            )
+        };
+
+        // Populate the incumbent exact entry first. The selected call must
+        // still build because producer identity is part of the cache key.
+        most_relevant_files_with_cancellation(
+            analyzer,
+            exact_params(vec!["src/main/java/p/Seed.java".to_string()], 1),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+        )
+        .expect("incumbent exact ranking should finish");
+
+        let mut first_telemetry = SelectedExactRelevanceTelemetry::default();
+        let first = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &mut first_telemetry,
+            |_| {
+                Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Complete(
+                    selected_graph(analyzer, &[seed.clone(), target.clone()], &[(0, 1)]),
+                ))
+            },
+        )
+        .expect("selected exact ranking should finish");
+
+        assert_eq!(1, first_telemetry.build_attempts);
+        assert_eq!(Some(true), first_telemetry.graph_complete);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Built,
+            first_telemetry.lifecycle
+        );
+        assert_eq!(vec!["src/test/java/p/TargetHelper.java"], paths(&first));
+        assert_eq!(1, first.not_found.len());
+        assert_eq!(1, first.ambiguous_paths.len());
+        let classification = crate::searchtools::scan_usages::classify_test_files(
+            analyzer,
+            crate::searchtools::scan_usages::ClassifyTestFilesParams {
+                file_paths: vec!["src/test/java/p/TargetHelper.java".to_string()],
+            },
+        );
+        assert_eq!(
+            classification.classifications["src/test/java/p/TargetHelper.java"].kind,
+            first.files[0].test
+        );
+
+        let mut warm_telemetry = SelectedExactRelevanceTelemetry::default();
+        let warm = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &mut warm_telemetry,
+            |_| -> Result<SelectedWorkspaceUsageRankingBuildOutcome, String> {
+                panic!("a selected complete cache hit must not rebuild")
+            },
+        )
+        .expect("warm selected exact ranking should hit");
+        assert_eq!(0, warm_telemetry.build_attempts);
+        assert_eq!(Some(true), warm_telemetry.graph_complete);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Hit,
+            warm_telemetry.lifecycle
+        );
+        assert_eq!(paths(&first), paths(&warm));
+
+        let mut duplicate_telemetry = SelectedExactRelevanceTelemetry::default();
+        let duplicate = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            exact_params(
+                vec![
+                    "src/main/java/p/Seed.java".to_string(),
+                    " src/main/java/p/Seed.java ".to_string(),
+                ],
+                1,
+            ),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &mut duplicate_telemetry,
+            |_| -> Result<SelectedWorkspaceUsageRankingBuildOutcome, String> {
+                panic!("duplicate seed short-circuit must not acquire a graph")
+            },
+        )
+        .expect("duplicate seeds are a structured result");
+        assert_eq!(vec!["src/main/java/p/Seed.java"], duplicate.duplicates);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::NotRequested,
+            duplicate_telemetry.lifecycle
+        );
+    }
+
+    #[test]
+    fn incomplete_selected_graph_rebuilds_and_keeps_import_fill_without_duplicates() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "src/main/java/p/Seed.java",
+                "package p; import q.ImportTarget; class Seed { ImportTarget target; }\n",
+            )
+            .file(
+                "src/main/java/p/GraphTarget.java",
+                "package p; class GraphTarget {}\n",
+            )
+            .file(
+                "src/main/java/q/ImportTarget.java",
+                "package q; public class ImportTarget {}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let seed = project.file("src/main/java/p/Seed.java");
+        let graph_target = project.file("src/main/java/p/GraphTarget.java");
+
+        for _ in 0..2 {
+            let mut telemetry = SelectedExactRelevanceTelemetry::default();
+            let result = most_relevant_files_with_selected_exact_graph_builder(
+                analyzer,
+                exact_params(vec!["src/main/java/p/Seed.java".to_string()], 2),
+                &brokk_bifrost_core::cancellation::CancellationToken::default(),
+                &mut telemetry,
+                |_| {
+                    Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Incomplete(
+                        selected_graph(analyzer, &[seed.clone(), graph_target.clone()], &[(0, 1)]),
+                    ))
+                },
+            )
+            .expect("incomplete selected graph should still rank sound positives");
+
+            assert_eq!(1, telemetry.build_attempts);
+            assert_eq!(Some(false), telemetry.graph_complete);
+            assert_eq!(
+                SelectedExactUsageGraphLifecycle::Incomplete,
+                telemetry.lifecycle
+            );
+            assert!(!result.complete);
+            assert_eq!(
+                Some(MostRelevantFilesIncompleteReason::UsageGraphIncomplete),
+                result.incomplete_reason
+            );
+            let ranked = paths(&result);
+            assert_eq!(2, ranked.len());
+            assert!(ranked.contains(&"src/main/java/p/GraphTarget.java"));
+            assert!(ranked.contains(&"src/main/java/q/ImportTarget.java"));
+            assert!(!ranked.contains(&"src/main/java/p/Seed.java"));
+        }
+    }
+
+    #[test]
+    fn selected_cancel_stale_and_error_do_not_publish_and_retry() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/Seed.java", "class Seed {}\n")
+            .file("src/Target.java", "class Target {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let seed = project.file("src/Seed.java");
+        let target = project.file("src/Target.java");
+        let params = || exact_params(vec!["src/Seed.java".to_string()], 1);
+
+        let mut error_telemetry = SelectedExactRelevanceTelemetry::default();
+        let error = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &mut error_telemetry,
+            |_| Err::<SelectedWorkspaceUsageRankingBuildOutcome, _>("build failed"),
+        );
+        assert_eq!("build failed", error.unwrap_err());
+        assert_eq!(1, error_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Error,
+            error_telemetry.lifecycle
+        );
+
+        let mut stale_attempt = 0;
+        let mut retry_telemetry = SelectedExactRelevanceTelemetry::default();
+        let retry = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &mut retry_telemetry,
+            |_| {
+                stale_attempt += 1;
+                Ok::<_, String>(if stale_attempt == 1 {
+                    SelectedWorkspaceUsageRankingBuildOutcome::Stale
+                } else {
+                    SelectedWorkspaceUsageRankingBuildOutcome::Complete(selected_graph(
+                        analyzer,
+                        &[seed.clone(), target.clone()],
+                        &[(0, 1)],
+                    ))
+                })
+            },
+        )
+        .expect("a fresh selected build should retry stale evidence");
+        assert_eq!(vec!["src/Target.java"], paths(&retry));
+        assert_eq!(2, retry_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Built,
+            retry_telemetry.lifecycle
+        );
+
+        let second_project = InlineTestProject::with_language(Language::Java)
+            .file("src/Seed.java", "class Seed {}\n")
+            .file("src/Target.java", "class Target {}\n")
+            .build();
+        let second_workspace = second_project.workspace_analyzer(AnalyzerConfig::default());
+        let second_analyzer = second_workspace.analyzer();
+        let second_seed = second_project.file("src/Seed.java");
+        let second_target = second_project.file("src/Target.java");
+
+        let simultaneous_cancellation =
+            brokk_bifrost_core::cancellation::CancellationToken::default();
+        let mut simultaneous_telemetry = SelectedExactRelevanceTelemetry::default();
+        let simultaneous = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &simultaneous_cancellation,
+            &mut simultaneous_telemetry,
+            |_| {
+                simultaneous_cancellation.cancel();
+                Err::<SelectedWorkspaceUsageRankingBuildOutcome, _>("error raced cancellation")
+            },
+        )
+        .expect("cancellation must outrank a simultaneous selected build error");
+        assert!(simultaneous.files.is_empty());
+        assert!(!simultaneous.complete);
+        assert_eq!(
+            Some(MostRelevantFilesIncompleteReason::Cancelled),
+            simultaneous.incomplete_reason
+        );
+        assert_eq!(1, simultaneous_telemetry.build_attempts);
+        assert_eq!(None, simultaneous_telemetry.graph_complete);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Cancelled,
+            simultaneous_telemetry.lifecycle
+        );
+
+        let mut cancelled_telemetry = SelectedExactRelevanceTelemetry::default();
+        let cancelled = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &mut cancelled_telemetry,
+            |_| Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Cancelled),
+        )
+        .expect("builder cancellation is a structured incomplete result");
+        assert!(!cancelled.complete);
+        assert_eq!(
+            Some(MostRelevantFilesIncompleteReason::Cancelled),
+            cancelled.incomplete_reason
+        );
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Cancelled,
+            cancelled_telemetry.lifecycle
+        );
+
+        let mut after_cancel_telemetry = SelectedExactRelevanceTelemetry::default();
+        let after_cancel = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &mut after_cancel_telemetry,
+            |_| {
+                Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Complete(
+                    selected_graph(
+                        second_analyzer,
+                        &[second_seed.clone(), second_target.clone()],
+                        &[(0, 1)],
+                    ),
+                ))
+            },
+        )
+        .expect("cancelled selected build must leave the cache retryable");
+        assert_eq!(vec!["src/Target.java"], paths(&after_cancel));
+        assert_eq!(1, after_cancel_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Built,
+            after_cancel_telemetry.lifecycle
+        );
+
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        cancellation.cancel();
+        let mut entry_telemetry = SelectedExactRelevanceTelemetry::default();
+        let entry = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &cancellation,
+            &mut entry_telemetry,
+            |_| -> Result<SelectedWorkspaceUsageRankingBuildOutcome, String> {
+                panic!("pre-cancelled outer request must not build")
+            },
+        );
+        assert!(entry.unwrap_err().contains("cancelled"));
+        assert_eq!(0, entry_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::NotRequested,
+            entry_telemetry.lifecycle
+        );
+    }
+
+    fn paths(result: &MostRelevantFilesResult) -> Vec<&str> {
+        result.files.iter().map(|file| file.path.as_str()).collect()
+    }
+}
+
+#[cfg(test)]
+mod issue_1304_tests {
+
+    use crate::searchtools::summaries::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::time::Duration;
+
+    #[test]
+    #[hardwon("d57e0ee72ded: timeout and explicit cancellation have distinct reasons")]
+    fn timeout_and_explicit_cancellation_have_distinct_reasons() {
+        let timed_out = brokk_bifrost_core::cancellation::CancellationToken::default()
+            .with_timeout(Duration::ZERO);
+        assert!(timed_out.is_cancelled());
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&timed_out),
+            MostRelevantFilesIncompleteReason::TimeBudget
+        );
+
+        let cancelled = brokk_bifrost_core::cancellation::CancellationToken::default();
+        cancelled.cancel();
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&cancelled),
+            MostRelevantFilesIncompleteReason::Cancelled
+        );
+    }
+}

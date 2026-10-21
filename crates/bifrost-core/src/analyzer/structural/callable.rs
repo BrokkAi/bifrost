@@ -145,6 +145,7 @@ labelled_enum! {
         PrimitiveTypeMismatch => "primitive_type_mismatch",
         LessSpecificPrimitiveOverload => "less_specific_primitive_overload",
         RequiresBoxing => "requires_boxing",
+        ArgumentTypeMismatch => "argument_type_mismatch",
     }
 }
 

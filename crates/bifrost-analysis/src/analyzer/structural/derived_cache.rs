@@ -596,8 +596,9 @@ impl DirectImportTopology {
         Some(outgoing_files(&self.graph, source))
     }
 
-    #[cfg(test)]
-    fn importers_of(&self, file: &ProjectFile) -> Option<Vec<ProjectFile>> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn importers_of(&self, file: &ProjectFile) -> Option<Vec<ProjectFile>> {
         if !self.reverse_relation_complete() {
             return None;
         }
@@ -846,7 +847,8 @@ impl RequestLocalDirectImportGraph {
         Self::from_files(all_files)
     }
 
-    pub(crate) fn from_files(all_files: Vec<ProjectFile>) -> Self {
+    #[doc(hidden)]
+    pub fn from_files(all_files: Vec<ProjectFile>) -> Self {
         let analyzed = all_files.iter().cloned().collect();
         Self {
             all_files,
@@ -936,7 +938,8 @@ impl RequestLocalDirectImportGraph {
         }
     }
 
-    pub(crate) fn persisted_edges(&self) -> Vec<crate::analyzer::PersistedImportEdge> {
+    #[doc(hidden)]
+    pub fn persisted_edges(&self) -> Vec<crate::analyzer::PersistedImportEdge> {
         let mut edges = self.persisted_import_edges.clone();
         edges.sort_by(|left, right| {
             left.importer
@@ -947,7 +950,8 @@ impl RequestLocalDirectImportGraph {
         edges
     }
 
-    pub(crate) fn persisted_resolution_dependencies(
+    #[doc(hidden)]
+    pub fn persisted_resolution_dependencies(
         &self,
     ) -> Vec<crate::analyzer::PersistedImportDependencies> {
         let mut dependencies = self
@@ -1176,7 +1180,8 @@ impl RequestLocalDirectImportGraph {
 
     // These inputs identify distinct demand and snapshot state; an envelope would add indirection.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn ensure_forward_selected(
+    #[doc(hidden)]
+    pub fn ensure_forward_selected(
         &mut self,
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
@@ -1515,7 +1520,7 @@ mod tests {
     use super::*;
     use crate::analyzer::structural::test_support::content_identity as content;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-    use crate::analyzer::{JavaAnalyzer, PhpAnalyzer, RubyAnalyzer, TestProject};
+    use crate::analyzer::{JavaAnalyzer, TestProject};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -1927,270 +1932,6 @@ mod tests {
         assert_eq!(builds.load(Ordering::Relaxed), 1);
     }
 
-    fn completed_topology(build: DirectImportTopologyBuild) -> DirectImportTopology {
-        assert!(build.fallback.is_none());
-        match build.outcome {
-            DerivedLayerBuildOutcome::Complete {
-                layer: DerivedLayer::DirectImportTopology(topology),
-                ..
-            } => topology,
-            DerivedLayerBuildOutcome::Cancelled { .. }
-            | DerivedLayerBuildOutcome::Unavailable { .. } => {
-                panic!("expected complete direct import topology")
-            }
-        }
-    }
-
-    fn generous_limits() -> DirectImportTopologyLimits {
-        DirectImportTopologyLimits {
-            max_files: 100,
-            max_edges: 100,
-            max_retained_bytes: 1024 * 1024,
-        }
-    }
-
-    #[test]
-    fn topology_deduplicates_cycle_edges_and_orders_neighbors() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let a = ProjectFile::new(root.clone(), PathBuf::from("a.rb"));
-        let b = ProjectFile::new(root.clone(), PathBuf::from("b.rb"));
-        let c = ProjectFile::new(root.clone(), PathBuf::from("c.rb"));
-        a.write(
-            "require_relative 'c'\nrequire_relative 'b'\nrequire_relative 'b'\ndef from_a; end\n",
-        )
-        .expect("write a");
-        b.write("require_relative 'a'\ndef from_b; end\n")
-            .expect("write b");
-        c.write("def from_c; end\n").expect("write c");
-        let analyzer = RubyAnalyzer::from_project(TestProject::new(root, Language::Ruby));
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let first = completed_topology(build_direct_import_topology(
-            &analyzer,
-            token,
-            &CancellationToken::default(),
-            generous_limits(),
-        ));
-        let second = completed_topology(build_direct_import_topology(
-            &analyzer,
-            token,
-            &CancellationToken::default(),
-            generous_limits(),
-        ));
-
-        assert_eq!(first.resolved_files(), 3);
-        assert_eq!(first.resolved_edges(), 3);
-        assert_eq!(
-            first
-                .imports_of(&a)
-                .expect("supported source")
-                .iter()
-                .map(rel_path_string)
-                .collect::<Vec<_>>(),
-            vec!["b.rb", "c.rb"]
-        );
-        assert_eq!(
-            first
-                .importers_of(&a)
-                .expect("complete reverse relation")
-                .iter()
-                .map(rel_path_string)
-                .collect::<Vec<_>>(),
-            vec!["b.rb"]
-        );
-        for file in [&a, &b, &c] {
-            assert_eq!(first.imports_of(file), second.imports_of(file));
-            assert_eq!(first.importers_of(file), second.importers_of(file));
-        }
-        assert_eq!(first.retained_bytes(), second.retained_bytes());
-    }
-
-    /// Wraps a real analyzer and reports one extra file that no delegate
-    /// claims, so `import_analysis_provider_for_file` returns `None` for it
-    /// through the topology's own rule rather than through a language whose
-    /// analyzer happens not to implement import analysis. Every method other
-    /// than `analyzed_files` and `import_analysis_provider_for_file` is
-    /// unreachable from `build_direct_import_topology`'s code path: the
-    /// import provider it obtains for a supported file borrows from `inner`
-    /// directly and does its own work without going back through this
-    /// wrapper, so those bodies are deliberately `unimplemented!()`.
-    struct AnalyzerWithUnclaimedFile {
-        inner: PhpAnalyzer,
-        unclaimed_file: ProjectFile,
-    }
-
-    impl crate::analyzer::CodeUnitIndex for AnalyzerWithUnclaimedFile {
-        crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
-            fn project(&self) -> &dyn crate::analyzer::Project;
-        }
-
-        fn languages(&self) -> std::collections::BTreeSet<Language> {
-            self.inner.languages()
-        }
-
-        fn analyzed_files(&self) -> Vec<ProjectFile> {
-            let mut files = self.inner.analyzed_files();
-            files.push(self.unclaimed_file.clone());
-            files
-        }
-
-        fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::analyzer::CodeUnit> + '_> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn search_definitions(
-            &self,
-            _pattern: &str,
-            _auto_quote: bool,
-        ) -> std::collections::BTreeSet<crate::analyzer::CodeUnit> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn enclosing_code_unit(
-            &self,
-            _file: &ProjectFile,
-            _range: &crate::analyzer::Range,
-        ) -> Option<crate::analyzer::CodeUnit> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn enclosing_code_unit_for_lines(
-            &self,
-            _file: &ProjectFile,
-            _start_line: usize,
-            _end_line: usize,
-        ) -> Option<crate::analyzer::CodeUnit> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn get_skeleton(&self, _code_unit: &crate::analyzer::CodeUnit) -> Option<String> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn get_skeleton_header(&self, _code_unit: &crate::analyzer::CodeUnit) -> Option<String> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn get_source(
-            &self,
-            _code_unit: &crate::analyzer::CodeUnit,
-            _include_comments: bool,
-        ) -> Option<String> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn get_sources(
-            &self,
-            _code_unit: &crate::analyzer::CodeUnit,
-            _include_comments: bool,
-        ) -> std::collections::BTreeSet<String> {
-            unimplemented!("not exercised by this fixture")
-        }
-    }
-
-    impl IAnalyzer for AnalyzerWithUnclaimedFile {
-        fn update(&self, _changed_files: &std::collections::BTreeSet<ProjectFile>) -> Self
-        where
-            Self: Sized,
-        {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn update_all(&self) -> Self
-        where
-            Self: Sized,
-        {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn is_access_expression(
-            &self,
-            _file: &ProjectFile,
-            _start_byte: usize,
-            _end_byte: usize,
-        ) -> bool {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn find_nearest_declaration(
-            &self,
-            _file: &ProjectFile,
-            _start_byte: usize,
-            _end_byte: usize,
-            _ident: &str,
-        ) -> Option<crate::analyzer::DeclarationInfo> {
-            unimplemented!("not exercised by this fixture")
-        }
-
-        fn begin_query(&self, context: &std::sync::Arc<crate::analyzer::AnalyzerQueryContext>) {
-            self.inner.begin_query(context);
-        }
-
-        fn end_query(&self, context: &std::sync::Arc<crate::analyzer::AnalyzerQueryContext>) {
-            self.inner.end_query(context);
-        }
-
-        fn import_analysis_provider_for_file(
-            &self,
-            file: &ProjectFile,
-        ) -> Option<&dyn crate::analyzer::ImportAnalysisProvider> {
-            if file == &self.unclaimed_file {
-                None
-            } else {
-                self.inner.import_analysis_provider_for_file(file)
-            }
-        }
-    }
-
-    /// The topology marks a pending file unsupported when
-    /// `import_analysis_provider_for_file` returns `None` for it (the rule at
-    /// `DirectImportTopology`'s construction, ~line 1131). Every real
-    /// language now has an import provider (PHP gained one in #1713), so this
-    /// exercises that rule through a hand-written `IAnalyzer` fake -- wrapping
-    /// a real `PhpAnalyzer` but reporting an extra Ruby file no delegate
-    /// claims -- rather than depending on a language accidentally lacking
-    /// import support.
-    #[test]
-    fn unsupported_sources_prevent_exact_reverse_reuse() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root.clone(), PathBuf::from("app.php"));
-        file.write("<?php\nfunction target() {}\n")
-            .expect("write source");
-        let unclaimed_file = ProjectFile::new(root.clone(), PathBuf::from("helper.rb"));
-        unclaimed_file
-            .write("def helper; end\n")
-            .expect("write unclaimed source");
-        let analyzer = AnalyzerWithUnclaimedFile {
-            inner: PhpAnalyzer::from_project(TestProject::new(root, Language::Php)),
-            unclaimed_file: unclaimed_file.clone(),
-        };
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let topology = completed_topology(build_direct_import_topology(
-            &analyzer,
-            token,
-            &CancellationToken::default(),
-            generous_limits(),
-        ));
-
-        assert_eq!(topology.resolved_files(), 2);
-        assert_eq!(topology.resolved_edges(), 0);
-        assert!(!topology.reverse_relation_complete());
-        assert_eq!(topology.imports_of(&file), Some(Vec::new()));
-        assert_eq!(topology.importers_of(&file), None);
-        assert_eq!(topology.imports_of(&unclaimed_file), None);
-        assert_eq!(topology.importers_of(&unclaimed_file), None);
-        assert_eq!(topology.unsupported_languages(), vec![Language::Ruby]);
-    }
-
     #[test]
     fn topology_construction_preflights_fixed_memory_before_resolution() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2263,3 +2004,7 @@ mod tests {
         assert!(outcome.fallback.is_some());
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;

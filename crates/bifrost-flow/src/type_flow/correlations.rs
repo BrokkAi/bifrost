@@ -1072,10 +1072,31 @@ pub(super) fn charge_edges(
     if count == 0 {
         return Ok(());
     }
-    budget.charge(SemanticWork {
+    budget.charge_work(SemanticWork {
         control_edges: count,
         ..SemanticWork::default()
-    })?;
+    });
+    Ok(())
+}
+
+pub(super) fn record_entry_work(budget: &mut SemanticBudget, count: usize) {
+    budget.charge_work(SemanticWork {
+        nested_entries: count,
+        ..SemanticWork::default()
+    });
+}
+
+/// Admit a new row before a temporary set grows. Repeated visits keep no
+/// additional row; callers record their scan work separately.
+pub(super) fn admit_set_entry<T: Eq + std::hash::Hash>(
+    budget: &mut SemanticBudget,
+    entries: &mut HashSet<T>,
+    value: T,
+) -> Result<(), CorrelationError> {
+    if !entries.contains(&value) {
+        charge_entries(budget, 1)?;
+        assert!(entries.insert(value), "the checked set entry is new");
+    }
     Ok(())
 }
 
@@ -1086,7 +1107,7 @@ pub(super) fn charge_entries(
     if count == 0 {
         return Ok(());
     }
-    budget.charge(SemanticWork {
+    budget.admit(SemanticWork {
         nested_entries: count,
         ..SemanticWork::default()
     })?;
@@ -1097,13 +1118,13 @@ fn charge_reused_preprocessing_inputs(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     budget: &mut SemanticBudget,
 ) -> Result<(), CorrelationError> {
-    budget.charge(SemanticWork {
+    budget.charge_work(SemanticWork {
         values: semantics.values().len(),
         memory_locations: semantics.memory_locations().len(),
         captures: semantics.captures().len(),
         nested_entries: semantics.guard_facts().len(),
         ..SemanticWork::default()
-    })?;
+    });
     Ok(())
 }
 
@@ -1228,7 +1249,10 @@ pub(super) fn tested_boolean_bindings_from_copy_graph(
             continue;
         };
         for &target in targets {
-            charge_entries(budget, 1)?;
+            budget.charge_work(SemanticWork {
+                nested_entries: 1,
+                ..Default::default()
+            });
             check_cancelled(cancellation)?;
             if literal_reachable.insert(target) {
                 worklist.push_back(target);
@@ -1244,10 +1268,10 @@ pub(super) fn tested_boolean_bindings_from_copy_graph(
             continue;
         };
         for &source in sources {
-            budget.charge(SemanticWork {
+            budget.charge_work(SemanticWork {
                 nested_entries: 1,
                 ..SemanticWork::default()
-            })?;
+            });
             check_cancelled(cancellation)?;
             // Literal values are handled directly by replace_boolean_component;
             // retaining them as relation keys only adds a Cartesian row. Any
@@ -2042,13 +2066,23 @@ fn replace_boolean_fact_component(
     if state.is_bottom() {
         return Ok(());
     }
-    // One definition with one fact reaches every data definition of every
-    // binding: the write says nothing about which data definition holds, so
-    // the pair's relation is the product again.
+    // Replacing a component pays only its size change. In particular, an
+    // identical replacement neither admits nor refunds another copy.
+    let previous = state.facts.get(&target).map_or(0, HashSet::len);
+    let unchanged = state
+        .facts
+        .get(&target)
+        .is_some_and(|facts| facts.contains(&(definition, fact)));
+    budget.release_admission(SemanticWork {
+        nested_entries: previous - usize::from(unchanged),
+        ..SemanticWork::default()
+    });
+    charge_entries(budget, usize::from(!unchanged))?;
+    // The replacement says nothing about the data definition, so the
+    // relation becomes the product of its components again.
     state
         .correlated
-        .retain(|(_, boolean_binding), _| *boolean_binding != target);
-    charge_entries(budget, 1)?;
+        .retain(|(_, binding), _| *binding != target);
     state
         .facts
         .insert(target, [(definition, fact)].into_iter().collect());
@@ -2314,6 +2348,45 @@ mod correlation_properties {
             condition: None,
             edge: None,
         }
+    }
+
+    #[test]
+    #[hardwon("#5113: identical boolean fact replacements repeatedly grew resident accounting")]
+    fn repeated_fact_replacement_refunds_removed_entries() {
+        let binding = ValueId::new(0);
+        let definition = boolean_definition(0, binding);
+        let mut state = FlowState {
+            reachable: true,
+            facts: HashMap::from_iter([(
+                binding,
+                HashSet::from_iter([(definition, BoolFact::True), (definition, BoolFact::False)]),
+            )]),
+            ..FlowState::default()
+        };
+        let mut budget = SemanticBudget::uniform(2).expect("two facts fit");
+        charge_entries(&mut budget, 2).expect("seed facts");
+        for _ in 0..64 {
+            replace_boolean_fact_component(
+                &mut state,
+                binding,
+                definition,
+                BoolFact::False,
+                &mut budget,
+            )
+            .expect("a shrinking or identical replacement fits");
+            assert_eq!(budget.resident().nested_entries, 1);
+        }
+        assert_eq!(budget.used().nested_entries, 2);
+        replace_boolean_fact_component(
+            &mut state,
+            binding,
+            definition,
+            BoolFact::True,
+            &mut budget,
+        )
+        .expect("a different fact replaces the held fact");
+        assert_eq!(budget.resident().nested_entries, 1);
+        assert_eq!(budget.used().nested_entries, 3);
     }
 
     fn seed_states(
@@ -2732,6 +2805,7 @@ mod correlation_properties {
         let definitions = definition_table(300);
         let (mut actual, mut reference) = seed_states(&data_bindings, &boolean_bindings);
         let mut budget = SemanticBudget::uniform(100_000).expect("positive test budget");
+        charge_entries(&mut budget, actual.retained_entries()).expect("seed state admission");
         for (step, operation) in trace.iter().copied().enumerate() {
             let data_binding = data_bindings[operation.binding()];
             let boolean_binding = boolean_bindings[operation.binding()];
@@ -2759,6 +2833,8 @@ mod correlation_properties {
                     );
                 }
                 TraceOperation::JoinData { definition, .. } => {
+                    charge_entries(&mut budget, actual.retained_entries())
+                        .expect("cloned state admission");
                     let mut branch_actual = actual.clone();
                     let mut branch_reference = reference.clone();
                     replace_data_component(&mut branch_actual, data_binding, definition as usize);
@@ -2775,6 +2851,8 @@ mod correlation_properties {
                 TraceOperation::JoinBoolean {
                     definition, fact, ..
                 } => {
+                    charge_entries(&mut budget, actual.retained_entries())
+                        .expect("cloned state admission");
                     let mut branch_actual = actual.clone();
                     let mut branch_reference = reference.clone();
                     replace_boolean_fact_component(
@@ -2799,10 +2877,14 @@ mod correlation_properties {
                 TraceOperation::JoinCorrelated {
                     definition, fact, ..
                 } => {
+                    charge_entries(&mut budget, actual.retained_entries())
+                        .expect("cloned state admission");
                     let mut data_actual = actual.clone();
                     let mut data_reference = reference.clone();
                     replace_data_component(&mut data_actual, data_binding, definition as usize);
                     reference_replace_data(&mut data_reference, data_binding, definition as usize);
+                    charge_entries(&mut budget, actual.retained_entries())
+                        .expect("cloned state admission");
                     let mut boolean_actual = actual.clone();
                     let mut boolean_reference = reference.clone();
                     replace_boolean_fact_component(
@@ -2842,6 +2924,8 @@ mod correlation_properties {
         let mut previous_actual = None;
         let mut previous_reference = None;
         for _ in 0..3 {
+            charge_entries(&mut budget, actual.retained_entries())
+                .expect("cloned state admission");
             let mut body_actual = actual.clone();
             let mut body_reference = reference.clone();
             replace_boolean_fact_component(

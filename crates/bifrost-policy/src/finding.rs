@@ -3986,6 +3986,42 @@ pub struct PolicyWorkMetric {
     value: u64,
 }
 
+/// Append the same all-lane accounting vocabulary for every policy surface.
+/// The fixed metric set keeps report retention independent of counter values.
+pub(crate) fn append_semantic_budget_metrics(
+    metrics: &mut Vec<PolicyWorkMetric>,
+    prefix: &str,
+    cumulative: brokk_bifrost_analysis::analyzer::semantic::SemanticWork,
+    resident: brokk_bifrost_analysis::analyzer::semantic::SemanticWork,
+    root_work: brokk_bifrost_analysis::analyzer::semantic::SemanticWork,
+) {
+    use brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension as Dimension;
+    for dimension in Dimension::ALL {
+        let unit = if matches!(
+            dimension,
+            Dimension::SourceBytes | Dimension::OwnedTextBytes
+        ) {
+            PolicyWorkUnit::Bytes
+        } else {
+            PolicyWorkUnit::Rows
+        };
+        for (category, value) in [
+            ("cumulative", cumulative.get(dimension)),
+            ("resident_peak", resident.get(dimension)),
+            ("root_work_peak", root_work.get(dimension)),
+        ] {
+            let name = format!("{prefix}.semantic_{category}_{}", dimension.label());
+            if metrics.iter().any(|metric| metric.name() == name) {
+                continue;
+            }
+            metrics.push(
+                PolicyWorkMetric::try_new(name, unit, u64::try_from(value).unwrap_or(u64::MAX))
+                    .expect("semantic lane metric is valid"),
+            );
+        }
+    }
+}
+
 impl PolicyWorkMetric {
     pub fn try_new(
         name: impl Into<String>,

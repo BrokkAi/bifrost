@@ -1,0 +1,441 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/rust/0.1/schema.json",
+  "title": "CSMI Rust interoperability profile 0.1.0",
+  "description": "Payload schema for csmi.rust version 0.1.0.",
+  "oneOf": [
+    { "$ref": "#/$defs/configuration" },
+    { "$ref": "#/$defs/crateMapping" },
+    { "$ref": "#/$defs/reexport" },
+    { "$ref": "#/$defs/implementation" },
+    { "$ref": "#/$defs/generation" },
+    { "$ref": "#/$defs/nativeMapping" }
+  ],
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "localId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "purl": { "type": "string", "pattern": "^pkg:" },
+    "cargoPurl": {
+      "type": "string",
+      "pattern": "^pkg:cargo/[^@/?#]+@[^/?#]+(?:\\?[^#]+)?$"
+    },
+    "rustSysrootPurl": {
+      "type": "string",
+      "pattern": "^pkg:generic/rust-sysroot@[^/?#]+(?:\\?[^#]+)?$"
+    },
+    "artifactDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "coverage", "value"],
+      "properties": {
+        "algorithm": { "enum": ["sha-256", "sha-384", "sha-512"] },
+        "coverage": { "$ref": "#/$defs/nonEmptyString" },
+        "canonicalization": { "type": "string", "format": "uri" },
+        "value": { "type": "string", "pattern": "^[0-9a-f]+$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "algorithm": { "const": "sha-256" } } },
+          "then": { "properties": { "value": { "$ref": "#/$defs/sha256" } } }
+        },
+        {
+          "if": { "properties": { "algorithm": { "const": "sha-384" } } },
+          "then": { "properties": { "value": { "type": "string", "pattern": "^[0-9a-f]{96}$" } } }
+        },
+        {
+          "if": { "properties": { "algorithm": { "const": "sha-512" } } },
+          "then": { "properties": { "value": { "type": "string", "pattern": "^[0-9a-f]{128}$" } } }
+        }
+      ]
+    },
+    "artifactSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purl"],
+      "properties": {
+        "purl": { "$ref": "#/$defs/purl" },
+        "versionRange": { "type": "string", "pattern": "^vers:" },
+        "digests": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "#/$defs/artifactDigest" }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": { "purl": { "pattern": "^pkg:[^?#]+@[^?#]+(?:\\?[^#]+)?$" } },
+          "not": { "required": ["versionRange"] }
+        },
+        {
+          "required": ["versionRange"],
+          "properties": { "purl": { "pattern": "^pkg:[^@?#]+(?:\\?[^#]+)?$" } }
+        }
+      ]
+    },
+    "stringSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmptyString" }
+    },
+    "cfgAtom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key"],
+      "properties": {
+        "key": { "$ref": "#/$defs/nonEmptyString" },
+        "value": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "compiler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release"],
+      "properties": {
+        "release": { "$ref": "#/$defs/nonEmptyString" },
+        "commitHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "release": { "pattern": "nightly" } } },
+          "then": { "required": ["commitHash"] }
+        }
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "triple": { "$ref": "#/$defs/nonEmptyString" },
+        "customName": { "$ref": "#/$defs/nonEmptyString" },
+        "customSpecSha256": { "$ref": "#/$defs/sha256" }
+      },
+      "oneOf": [
+        {
+          "required": ["triple"],
+          "not": { "anyOf": [{ "required": ["customName"] }, { "required": ["customSpecSha256"] }] }
+        },
+        {
+          "required": ["customName", "customSpecSha256"],
+          "not": { "required": ["triple"] }
+        }
+      ]
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "edition", "compiler", "cargoResolver", "target",
+        "compilationRole", "enabledFeatures", "cfgAtoms"
+      ],
+      "properties": {
+        "kind": { "const": "configuration" },
+        "edition": { "enum": ["2015", "2018", "2021", "2024"] },
+        "compiler": { "$ref": "#/$defs/compiler" },
+        "cargoResolver": { "enum": ["1", "2", "3"] },
+        "target": { "$ref": "#/$defs/target" },
+        "compilationRole": { "enum": ["host", "target"] },
+        "enabledFeatures": { "$ref": "#/$defs/stringSet" },
+        "cfgAtoms": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/cfgAtom" }
+        },
+        "compilerArgumentsSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "crateTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "packagePurl", "targetKind", "targetName", "crateName",
+        "compilationRole"
+      ],
+      "properties": {
+        "kind": { "const": "crate-target" },
+        "packagePurl": { "$ref": "#/$defs/cargoPurl" },
+        "targetKind": {
+          "enum": ["lib", "bin", "example", "test", "bench", "proc-macro", "build-script"]
+        },
+        "targetName": { "$ref": "#/$defs/nonEmptyString" },
+        "crateName": { "$ref": "#/$defs/nonEmptyString" },
+        "compilationRole": { "enum": ["host", "target"] }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "members", "selectedMembers", "cargoResolver"],
+      "properties": {
+        "kind": { "const": "workspace" },
+        "members": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "#/$defs/cargoPurl" }
+        },
+        "selectedMembers": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "#/$defs/cargoPurl" }
+        },
+        "cargoResolver": { "enum": ["1", "2", "3"] }
+      }
+    },
+    "dependencyBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "dependentCrate", "binding", "targetCrate"],
+      "properties": {
+        "kind": { "const": "dependency-binding" },
+        "dependentCrate": { "$ref": "#/$defs/localId" },
+        "binding": { "$ref": "#/$defs/nonEmptyString" },
+        "targetCrate": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "sysrootCrate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "crateName", "artifactPurl", "compilerRelease", "targetTriple",
+        "componentSha256"
+      ],
+      "properties": {
+        "kind": { "const": "sysroot-crate" },
+        "crateName": { "$ref": "#/$defs/nonEmptyString" },
+        "artifactPurl": { "$ref": "#/$defs/rustSysrootPurl" },
+        "compilerRelease": { "$ref": "#/$defs/nonEmptyString" },
+        "targetTriple": { "$ref": "#/$defs/nonEmptyString" },
+        "componentSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "crateMapping": {
+      "oneOf": [
+        { "$ref": "#/$defs/crateTarget" },
+        { "$ref": "#/$defs/workspace" },
+        { "$ref": "#/$defs/dependencyBinding" },
+        { "$ref": "#/$defs/sysrootCrate" }
+      ]
+    },
+    "reexport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "exportingModule", "exportedName", "namespace", "target"],
+      "properties": {
+        "kind": { "const": "reexport" },
+        "exportingModule": { "$ref": "#/$defs/localId" },
+        "exportedName": { "$ref": "#/$defs/nonEmptyString" },
+        "namespace": { "enum": ["type", "value", "macro"] },
+        "target": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "symbolKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactSelectors", "scheme", "schemeVersion", "stability", "descriptors"],
+      "properties": {
+        "artifactSelectors": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "#/$defs/artifactSelector" }
+        },
+        "scheme": { "const": "csmi.rust.source-item" },
+        "schemeVersion": { "const": "0.1.0" },
+        "stability": { "enum": ["portable", "artifact-local"] },
+        "descriptors": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "name", "disambiguator"],
+            "properties": {
+              "role": {
+                "enum": ["namespace", "type", "term", "callable", "type-parameter", "value-parameter", "meta"]
+              },
+              "name": { "$ref": "#/$defs/nonEmptyString" },
+              "disambiguator": { "$ref": "#/$defs/nonEmptyString" }
+            }
+          }
+        }
+      }
+    },
+    "typePattern": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "symbol"],
+          "properties": {
+            "kind": { "const": "declared" },
+            "symbol": { "$ref": "#/$defs/symbolKey" },
+            "arguments": { "type": "array", "items": { "$ref": "#/$defs/typePattern" } }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "position", "parameterKind"],
+          "properties": {
+            "kind": { "const": "binder" },
+            "position": { "type": "integer", "minimum": 0 },
+            "parameterKind": { "enum": ["type", "const", "lifetime"] }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "element"],
+          "properties": {
+            "kind": { "const": "reference" },
+            "mutable": { "type": "boolean" },
+            "element": { "$ref": "#/$defs/typePattern" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "elements"],
+          "properties": {
+            "kind": { "const": "tuple" },
+            "elements": { "type": "array", "items": { "$ref": "#/$defs/typePattern" } }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "trait"],
+          "properties": {
+            "kind": { "const": "trait-object" },
+            "trait": { "$ref": "#/$defs/symbolKey" }
+          }
+        }
+      ]
+    },
+    "implementationKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "trait", "implementingType", "binders"],
+      "properties": {
+        "kind": { "const": "implementation-key" },
+        "trait": { "$ref": "#/$defs/symbolKey" },
+        "implementingType": { "$ref": "#/$defs/typePattern" },
+        "binders": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["position", "kind"],
+            "properties": {
+              "position": { "type": "integer", "minimum": 0 },
+              "kind": { "enum": ["type", "const", "lifetime"] }
+            }
+          }
+        }
+      }
+    },
+    "associatedItemMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providedItem", "traitItem"],
+      "properties": {
+        "providedItem": { "$ref": "#/$defs/localId" },
+        "traitItem": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "implementation", "implementationKind", "implementingType", "identityKey"],
+      "properties": {
+        "kind": { "const": "implementation" },
+        "implementation": { "$ref": "#/$defs/localId" },
+        "implementationKind": { "enum": ["trait", "negative-trait"] },
+        "implementingType": { "$ref": "#/$defs/localId" },
+        "identityKey": { "$ref": "#/$defs/implementationKey" },
+        "trait": { "$ref": "#/$defs/localId" },
+        "associatedItems": {
+          "type": "array", "uniqueItems": true,
+          "items": { "$ref": "#/$defs/associatedItemMapping" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "implementationKind": { "enum": ["trait", "negative-trait"] } } },
+          "then": { "required": ["trait"] }
+        },
+        {
+          "if": { "properties": { "implementationKind": { "const": "negative-trait" } } },
+          "then": { "not": { "required": ["associatedItems"] } }
+        }
+      ]
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "item", "generatorKind", "portability"],
+      "properties": {
+        "kind": { "const": "generation" },
+        "item": { "$ref": "#/$defs/localId" },
+        "generatorKind": { "enum": ["declarative-macro", "procedural-macro", "build-script", "compiler"] },
+        "generator": { "$ref": "#/$defs/localId" },
+        "portability": { "enum": ["portable", "artifact-local", "unavailable"] },
+        "generatorArtifactSha256": { "$ref": "#/$defs/sha256" },
+        "inputSha256": { "$ref": "#/$defs/sha256" },
+        "outputSha256": { "$ref": "#/$defs/sha256" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "portability": { "const": "portable" } } },
+          "then": {
+            "required": ["inputSha256", "outputSha256"],
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "generatorKind": { "enum": ["procedural-macro", "build-script"] }
+                  }
+                },
+                "then": { "required": ["generator", "generatorArtifactSha256"] }
+              },
+              {
+                "if": {
+                  "properties": { "generatorKind": { "const": "declarative-macro" } }
+                },
+                "then": { "required": ["generator"] }
+              }
+            ]
+          }
+        },
+        {
+          "if": { "properties": { "portability": { "const": "artifact-local" } } },
+          "then": { "required": ["outputSha256"] }
+        },
+        {
+          "if": { "properties": { "portability": { "const": "unavailable" } } },
+          "then": {
+            "not": { "required": ["inputSha256", "outputSha256"] }
+          }
+        }
+      ]
+    },
+    "nativeMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source", "nativeSystem", "nativeVersion", "artifactSha256", "status", "cardinality"],
+      "properties": {
+        "kind": { "const": "native-mapping" },
+        "source": { "$ref": "#/$defs/localId" },
+        "nativeSystem": { "$ref": "#/$defs/nonEmptyString" },
+        "nativeVersion": { "$ref": "#/$defs/nonEmptyString" },
+        "artifactSha256": { "$ref": "#/$defs/sha256" },
+        "status": { "enum": ["exact", "conditional", "none"] },
+        "cardinality": { "enum": ["one-to-one", "one-to-many", "many-to-one", "many-to-many"] },
+        "nativeIdentities": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "compilerRelease": { "$ref": "#/$defs/nonEmptyString" },
+        "targetTriple": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "none" } } },
+          "then": { "not": { "required": ["nativeIdentities"] } },
+          "else": { "required": ["nativeIdentities"] }
+        }
+      ]
+    }
+  }
+}

@@ -32,89 +32,42 @@
 //! [`TraceSession`] for the extent of one batch, drained per request, and
 //! removed on drop, so its lifetime is exactly the batch that asked for it.
 
-use super::{DefinitionLookupOutcome, DefinitionLookupStatus, resolve_definition_resolutions};
+use super::DefinitionLookupOutcome;
+use super::DefinitionLookupStatus;
+use super::resolve_definition_resolutions;
+
 use crate::analyzer::QueryScope;
-use crate::analyzer::lexical_definitions::LexicalDefinition;
-use crate::analyzer::structural::resolution::{
-    BoundaryStatus, CandidateOutcome, DeclaredVisibility, HierarchyRelation, MemberDispatchTier,
-    PrecedenceTier, RejectionReason,
-};
-use crate::analyzer::usages::applicability::{ApplicabilityOutcome, CandidateApplicability};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+
+use crate::analyzer::structural::resolution::BoundaryStatus;
+use crate::analyzer::structural::resolution::CandidateOutcome;
+use crate::analyzer::structural::resolution::DeclaredVisibility;
+use crate::analyzer::structural::resolution::HierarchyRelation;
+use crate::analyzer::structural::resolution::MemberDispatchTier;
+use crate::analyzer::structural::resolution::PrecedenceTier;
+use crate::analyzer::structural::resolution::RejectionReason;
+
+use crate::analyzer::usages::applicability::ApplicabilityOutcome;
+use crate::analyzer::usages::applicability::CandidateApplicability;
+
+use crate::analyzer::CodeUnit;
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::ProjectFile;
+
 use crate::cancellation::CancellationToken;
-use brokk_bifrost_core::analyzer::structural::callable::{
-    ApplicabilityVerdict, CallableRejectionReason,
-};
+
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
 use std::cell::RefCell;
+
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "../../../../../../test-support/declaration_facts_pack.rs"]
-mod declaration_facts_pack;
+#[doc(hidden)]
+pub mod declaration_facts_pack;
 
-/// What a trace row points at.
-///
-/// A candidate is not always a workspace declaration: a lexical binding has no
-/// `CodeUnit`, and an import route that lost to a stronger tier is named by the
-/// binder it introduced -- plus the parser-derived target path the route
-/// pointed at, where the adapter recorded one -- rather than by a resolution
-/// the resolver never performed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TraceCandidateRef {
-    /// An indexed workspace declaration.
-    Unit(CodeUnit),
-    /// A canonical language intrinsic identity with no source location.
-    Intrinsic { name: String },
-    /// An exact declaration published by an activated semantic model.
-    Modeled { symbol_id: String, name: String },
-    /// A binder in the referencing file itself, as the resolver reports it.
-    Lexical(LexicalDefinition),
-    /// A binding row of the file's lexical environment, addressed by the
-    /// binder token's facts-arena node where the adapter records one. This is
-    /// the shape a *losing* binder takes: the resolver stops at the winner, so
-    /// a shadowed binding is named by its environment row rather than by a
-    /// `LexicalDefinition` the resolver never built.
-    Binding {
-        file: ProjectFile,
-        node: Option<u32>,
-        name: String,
-    },
-    /// An import route. `node` is the binder token's facts-arena node where the
-    /// adapter records one; `name` is the local name the import binds, or the
-    /// wildcard marker for an on-demand import, which binds no single name.
-    /// `target_segments` is the parser-derived path the route pointed at; an
-    /// empty list is a stated gap (the adapter recorded no structured path),
-    /// never a claim that the import has no target.
-    ImportBinder {
-        file: ProjectFile,
-        node: Option<u32>,
-        name: String,
-        target_segments: Vec<String>,
-    },
-    /// The route out of the workspace a boundary outcome took, named by the
-    /// reference spelling. It is a candidate in the sense that matters here:
-    /// something is there, and this lookup could not see it.
-    ExternalRoute { name: String },
-}
-
-/// The wildcard marker used as the `name` of an on-demand import route. It
-/// matches the marker the lexical environment layer uses for the same reason:
-/// a wildcard introduces an unspecified set of names, so it binds no
-/// identifier and must never behave like one.
-pub const WILDCARD_ROUTE_NAME: &str = "*";
-
-/// One exact hierarchy edge on one candidate's route (#1477): hop `hop` took
-/// the walk from `from` to `to`. A candidate's route is contiguous, starts at
-/// the receiver's declared owner, and terminates at the candidate's owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HierarchyHopRecord {
-    pub hop: usize,
-    pub from: CodeUnit,
-    pub to: CodeUnit,
-    pub relation: HierarchyRelation,
-}
-
-pub(crate) fn hierarchy_route_from_predecessors<Key>(
+#[doc(hidden)]
+pub fn hierarchy_route_from_predecessors<Key>(
     found_on: &Key,
     depth: usize,
     is_base: impl Fn(&Key, usize) -> bool,
@@ -150,27 +103,8 @@ where
     Some((route, reached_base))
 }
 
-/// Member-selection attribution for one candidate (#1477): the exact owner the
-/// resolver found the member on, how many hierarchy hops away that owner is,
-/// which language-neutral dispatch bucket the find belongs to, whether the
-/// candidate is applicable to the call shape as far as this seam checked, and
-/// the exact hierarchy route.
-///
-/// Like the tier, this is recorded where the resolver already holds the fact
-/// and never reconstructed afterwards: a candidate without enrichment is
-/// unattributed, not depth zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberEnrichment {
-    pub owner: CodeUnit,
-    pub hierarchy_depth: usize,
-    pub dispatch_tier: MemberDispatchTier,
-    pub applicability: ApplicabilityVerdict,
-    /// Empty exactly when `hierarchy_depth` is zero: a direct member has no
-    /// route to walk.
-    pub route: Vec<HierarchyHopRecord>,
-}
-
-pub(crate) fn member_enrichment(
+#[doc(hidden)]
+pub fn member_enrichment(
     owner: CodeUnit,
     hierarchy_depth: usize,
     applicability: ApplicabilityVerdict,
@@ -184,7 +118,8 @@ pub(crate) fn member_enrichment(
     member_enrichment_with_tier(owner, hierarchy_depth, dispatch_tier, applicability, route)
 }
 
-pub(crate) fn member_enrichment_with_tier(
+#[doc(hidden)]
+pub fn member_enrichment_with_tier(
     owner: CodeUnit,
     hierarchy_depth: usize,
     dispatch_tier: MemberDispatchTier,
@@ -200,120 +135,12 @@ pub(crate) fn member_enrichment_with_tier(
     }
 }
 
-/// Callable-applicability attribution for one candidate (#1478): whether the
-/// candidate's declared parameter list accepts this call site's argument shape,
-/// and the typed reason it does not.
-///
-/// This is the callable axis, and it is deliberately separate from
-/// [`MemberEnrichment`]'s `applicability`, which is the member axis #1477
-/// recorded: a constructor call or a free-function call has no member walk at
-/// all and still has an applicability answer. A candidate without this record
-/// is unattributed on the callable axis, never applicable.
-///
-/// The record is produced by the same function that produced the resolver's
-/// winners -- see `crate::analyzer::usages::applicability` -- so the rows and
-/// the binding cannot disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CallableApplicabilityRecord {
-    pub verdict: ApplicabilityVerdict,
-    /// Set only when `verdict` is [`ApplicabilityVerdict::Inapplicable`].
-    pub reason: Option<CallableRejectionReason>,
-}
-
 impl From<&CandidateApplicability> for CallableApplicabilityRecord {
     fn from(verdict: &CandidateApplicability) -> Self {
         Self {
             verdict: verdict.verdict,
             reason: verdict.reason,
         }
-    }
-}
-
-/// One candidate the resolver considered for one reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceCandidate {
-    pub candidate: TraceCandidateRef,
-    /// The precedence tier the candidate was considered at, or `None` when the
-    /// seam that recorded it cannot name one. `None` is not a tier: a policy
-    /// comparing tiers must treat it as unattributed, never as weakest.
-    pub tier: Option<PrecedenceTier>,
-    pub outcome: CandidateOutcome,
-    pub boundary: BoundaryStatus,
-    pub visibility: DeclaredVisibility,
-    /// The fully-qualified external type a boundary refinement resolved, set
-    /// only when `boundary` is [`BoundaryStatus::ExternalIndexed`]. That boundary
-    /// covers provider-resolved targets and engine-known intrinsic external
-    /// identities; intrinsic candidates carry their identity without this field.
-    pub external_target: Option<String>,
-    /// Member-selection attribution, present only when the seam that recorded
-    /// the candidate is a member lookup that knows its owner and route.
-    pub member: Option<Box<MemberEnrichment>>,
-    /// Callable-applicability attribution (#1478), present only when the seam
-    /// that recorded the candidate ran the language's own call-shape check.
-    pub callable: Option<CallableApplicabilityRecord>,
-}
-
-impl TraceCandidate {
-    /// A selected candidate with nothing further claimed. Intrinsic external
-    /// identities are known without a workspace location or an external provider.
-    pub fn selected(candidate: TraceCandidateRef, tier: Option<PrecedenceTier>) -> Self {
-        let boundary = if matches!(&candidate, TraceCandidateRef::Intrinsic { .. }) {
-            BoundaryStatus::ExternalIndexed
-        } else {
-            BoundaryStatus::WorkspaceLocal
-        };
-        Self {
-            candidate,
-            tier,
-            outcome: CandidateOutcome::Selected,
-            boundary,
-            visibility: DeclaredVisibility::Unknown,
-            external_target: None,
-            member: None,
-            callable: None,
-        }
-    }
-
-    /// A candidate the resolver computed and then discarded.
-    pub fn rejected(
-        candidate: TraceCandidateRef,
-        tier: Option<PrecedenceTier>,
-        reason: RejectionReason,
-    ) -> Self {
-        let boundary = if matches!(&candidate, TraceCandidateRef::Intrinsic { .. }) {
-            BoundaryStatus::ExternalIndexed
-        } else {
-            BoundaryStatus::WorkspaceLocal
-        };
-        Self {
-            candidate,
-            tier,
-            outcome: CandidateOutcome::Rejected(reason),
-            boundary,
-            visibility: DeclaredVisibility::Unknown,
-            external_target: None,
-            member: None,
-            callable: None,
-        }
-    }
-
-    pub fn with_boundary(mut self, boundary: BoundaryStatus) -> Self {
-        self.boundary = boundary;
-        self
-    }
-
-    pub fn with_member(mut self, member: MemberEnrichment) -> Self {
-        self.member = Some(Box::new(member));
-        self
-    }
-
-    pub fn with_callable(mut self, callable: CallableApplicabilityRecord) -> Self {
-        self.callable = Some(callable);
-        self
-    }
-
-    pub fn is_selected(&self) -> bool {
-        self.outcome.is_selected()
     }
 }
 
@@ -502,7 +329,8 @@ thread_local! {
 
 /// Whether a trace is being recorded on this thread. Every emission site reads
 /// this first so an untraced resolution allocates nothing.
-pub(crate) fn recording() -> bool {
+#[doc(hidden)]
+pub fn recording() -> bool {
     RECORDER.with(|recorder| recorder.borrow().is_some())
 }
 
@@ -512,7 +340,6 @@ fn with_recorder<R>(action: impl FnOnce(&mut Recorder) -> R) -> Option<R> {
 
 /// Native adapters opt into operation-local rejection evidence before resolving.
 /// An unsupported, cancelled or unavailable operation cannot claim coverage.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn begin_native_trace() {
     with_recorder(|recorder| {
         recorder
@@ -540,7 +367,8 @@ pub(crate) fn record_native_rejection_coverage(covered: bool) {
 }
 
 /// Append one row. Callers guard with [`recording`] before building the row.
-pub(crate) fn record(candidate: TraceCandidate) {
+#[doc(hidden)]
+pub fn record(candidate: TraceCandidate) {
     record_all([candidate]);
 }
 
@@ -624,17 +452,16 @@ pub(crate) fn record_native_declared_visibilities(rows: &[(CodeUnit, DeclaredVis
 
 /// Stage `tier` for the next outcome constructor that reports one of
 /// `fq_names`.
-pub(crate) fn stage_tier(tier: PrecedenceTier, fq_names: Vec<String>) {
+#[doc(hidden)]
+pub fn stage_tier(tier: PrecedenceTier, fq_names: Vec<String>) {
     with_recorder(|recorder| recorder.pending = Some(PendingSelection { tier, fq_names }));
 }
 
 /// Stage the least precedence tier among the candidates a member walk returned.
 /// The candidate tiers come from the walk itself; names include every returned
 /// candidate, even when the walk could not attribute one to a tier.
-pub(crate) fn stage_winner_tier(
-    winners: &[CodeUnit],
-    tiers: impl IntoIterator<Item = PrecedenceTier>,
-) {
+#[doc(hidden)]
+pub fn stage_winner_tier(winners: &[CodeUnit], tiers: impl IntoIterator<Item = PrecedenceTier>) {
     if let Some(tier) = tiers.into_iter().min() {
         stage_tier(tier, winners.iter().map(CodeUnit::fq_name).collect());
     }
@@ -643,7 +470,8 @@ pub(crate) fn stage_winner_tier(
 /// Stage the member and callable facts for a selection. The walk supplies its
 /// own enrichment function; an absent callable verdict stays unknown on the
 /// member axis and absent on the callable axis.
-pub(crate) fn stage_applicability_context(
+#[doc(hidden)]
+pub fn stage_applicability_context(
     winners: &[CodeUnit],
     applicability: &ApplicabilityOutcome,
     enrichment: impl Fn(&CodeUnit, ApplicabilityVerdict) -> Option<MemberEnrichment>,
@@ -679,7 +507,8 @@ pub(crate) fn stage_applicability_context(
 
 /// Record a rejected workspace candidate with the attribution the resolver
 /// already knows at this discard point.
-pub(crate) fn record_rejected_unit(
+#[doc(hidden)]
+pub fn record_rejected_unit(
     candidate: &CodeUnit,
     tier: Option<PrecedenceTier>,
     reason: RejectionReason,
@@ -700,7 +529,8 @@ pub(crate) fn record_rejected_unit(
 /// Stage member attribution for the next outcome constructor whose candidates
 /// the map names. Callers guard with [`recording`] before building the
 /// entries, so an untraced lookup allocates nothing.
-pub(crate) fn stage_member_context(by_fq_name: Vec<(String, MemberEnrichment)>) {
+#[doc(hidden)]
+pub fn stage_member_context(by_fq_name: Vec<(String, MemberEnrichment)>) {
     with_recorder(|recorder| {
         recorder.pending_member = Some(PendingMemberContext { by_fq_name });
     });
@@ -709,7 +539,8 @@ pub(crate) fn stage_member_context(by_fq_name: Vec<(String, MemberEnrichment)>) 
 /// Stage callable-applicability attribution for the next outcome constructor
 /// whose candidates the map names (#1478). Callers guard with [`recording`]
 /// before building the entries.
-pub(crate) fn stage_callable_context(by_fq_name: Vec<(String, CallableApplicabilityRecord)>) {
+#[doc(hidden)]
+pub fn stage_callable_context(by_fq_name: Vec<(String, CallableApplicabilityRecord)>) {
     with_recorder(|recorder| {
         recorder.pending_callable = Some(PendingCallableContext { by_fq_name });
     });
@@ -845,7 +676,8 @@ impl Drop for TraceSession {
 /// Ambiguity stays explicit: every reported definition becomes its own
 /// `Selected` row, and the outcome's `Ambiguous` status is what says they are
 /// peers rather than a single answer.
-pub(crate) fn record_selected_units(outcome: &DefinitionLookupOutcome) {
+#[doc(hidden)]
+pub fn record_selected_units(outcome: &DefinitionLookupOutcome) {
     if !recording() || outcome.definitions.is_empty() {
         return;
     }
@@ -877,7 +709,8 @@ pub(crate) fn record_selected_units(outcome: &DefinitionLookupOutcome) {
 }
 
 /// Preserve the explicit model declaration identity selected by the resolver.
-pub(crate) fn record_selected_modeled(outcome: &DefinitionLookupOutcome) {
+#[doc(hidden)]
+pub fn record_selected_modeled(outcome: &DefinitionLookupOutcome) {
     if !recording() {
         return;
     }
@@ -900,7 +733,8 @@ pub(crate) fn record_selected_modeled(outcome: &DefinitionLookupOutcome) {
 
 /// The row the shared seam records for a lexical selection. The tier is not
 /// staged and never guessed: a lexical binding *is* the strongest tier.
-pub(crate) fn record_selected_lexical(outcome: &DefinitionLookupOutcome) {
+#[doc(hidden)]
+pub fn record_selected_lexical(outcome: &DefinitionLookupOutcome) {
     if !recording() {
         return;
     }
@@ -937,7 +771,8 @@ pub(super) fn record_boundary_gate() {
     record(external_route_row(name));
 }
 
-pub(super) fn record_named_boundary(name: String) {
+#[doc(hidden)]
+pub fn record_named_boundary(name: String) {
     if recording() {
         record(external_route_row(name));
     }
@@ -946,7 +781,8 @@ pub(super) fn record_named_boundary(name: String) {
 /// Record a boundary whose structured resolver already identified the exact
 /// external declaration-model target. The target is carried by the trace row
 /// instead of being reconstructed from the written reference later.
-pub(super) fn record_named_boundary_with_target(name: String, target: String) {
+#[doc(hidden)]
+pub fn record_named_boundary_with_target(name: String, target: String) {
     if !recording() {
         return;
     }
@@ -966,7 +802,8 @@ pub(super) fn record_named_boundary_with_target(name: String, target: String) {
 /// "not there" rather than a declaration. The row therefore stays rejected and
 /// names no external target, and [`finish_boundary`] leaves the status alone
 /// because it is no longer [`BoundaryStatus::ExternalUnknown`].
-pub(super) fn record_named_boundary_declared_unindexed(name: String) {
+#[doc(hidden)]
+pub fn record_named_boundary_declared_unindexed(name: String) {
     if !recording() {
         return;
     }
@@ -1264,11 +1101,9 @@ fn boundary_evidence_for(
 ) -> (BoundaryStatus, Option<String>) {
     let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
+    use crate::analyzer::Language;
     use crate::analyzer::common::language_for_file;
     use crate::analyzer::semantic_model::SemanticModelSymbolKind;
-    use crate::analyzer::{
-        CSharpAnalyzer, JavaAnalyzer, KotlinAnalyzer, Language, ScalaAnalyzer, resolve_analyzer,
-    };
 
     match language_for_file(file) {
         language @ (Language::Java | Language::Kotlin | Language::Scala | Language::CSharp) => {
@@ -1284,35 +1119,10 @@ fn boundary_evidence_for(
             // host asked, which in a mixed JVM workspace is the `MultiAnalyzer`.
             // This is the same reason `collect_java_semantic_diagnostics` takes
             // its `JvmOverlayModel` as a parameter (#1893).
-            let evidence = match language {
-                Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer).map(|java| {
-                    java.external_boundary_evidence(
-                        token,
-                        analyzer.semantic_model_overlay(),
-                        file,
-                        name,
-                    )
-                }),
-                Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|kotlin| {
-                    kotlin.external_boundary_evidence(
-                        token,
-                        analyzer.semantic_model_overlay(),
-                        file,
-                        name,
-                    )
-                }),
-                Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|scala| {
-                    scala.external_boundary_evidence(
-                        token,
-                        analyzer.semantic_model_overlay(),
-                        file,
-                        name,
-                    )
-                }),
-                Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
-                    .map(|csharp| csharp.external_boundary_evidence(token, file, name)),
-                _ => unreachable!("the arm pattern admits exactly these four languages"),
-            };
+            let evidence =
+                crate::analyzer::languages::language_support(language).and_then(|support| {
+                    support.definition_boundary_evidence(analyzer, token, file, name)
+                });
             match evidence {
                 Some((BoundaryStatus::ExternalUnknown, target)) => {
                     let discovery = analyzer.dependency_discovery_evidence(language);
@@ -1367,82 +1177,7 @@ fn boundary_evidence_for(
                 (BoundaryStatus::ExternalUnknown, None)
             }
         }
-        Language::Go => {
-            // Go's boundary evidence is the same pair the Python and JS/TS arm
-            // reads, resolved through the shared Go package identity so a
-            // trace, a definition, and a diagnostic classify one import path
-            // identically. Import paths are slash-separated, so the declared
-            // check walks them by segment rather than by dot.
-            let overlay = analyzer.semantic_model_overlay();
-            let packages =
-                crate::analyzer::go::package_identity::GoOverlayPackages::new(overlay.as_deref());
-            if let Some(symbol) = packages.unique_symbol(name) {
-                return (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone()));
-            }
-            let declared = analyzer
-                .dependency_discovery_evidence(Language::Go)
-                .is_some_and(|evidence| {
-                    evidence.truncated() || evidence.declares_go_import_path(name)
-                });
-            if declared {
-                (BoundaryStatus::ExternalDeclaredUnindexed, None)
-            } else {
-                (BoundaryStatus::ExternalUnknown, None)
-            }
-        }
-        Language::Rust => {
-            // Rust reads the same pair, resolved through the shared crate
-            // identity so a trace, a definition, and a diagnostic classify one
-            // crate path identically. A path is spelled with `::` and a pack
-            // records it dotted, and a Cargo rename is published as an alias,
-            // so the written spelling is the lookup key either way. The lookup
-            // is gated on its crate root, so a name reaching a crate the
-            // workspace renamed away is unindexed here exactly as it is in
-            // diagnostics (#1795).
-            let overlay = analyzer.semantic_model_overlay();
-            let crates =
-                crate::analyzer::rust::crate_identity::RustOverlayCrates::new(overlay.as_deref());
-            if let Some(symbol) = crates.referenceable_symbol(name) {
-                return (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone()));
-            }
-            let declared = analyzer
-                .dependency_discovery_evidence(Language::Rust)
-                .is_some_and(|evidence| {
-                    evidence.truncated() || evidence.declares_module_path(name)
-                });
-            if declared {
-                (BoundaryStatus::ExternalDeclaredUnindexed, None)
-            } else {
-                (BoundaryStatus::ExternalUnknown, None)
-            }
-        }
-        Language::Ruby => {
-            // A Ruby boundary reference is a `::`-joined constant path, and
-            // `ruby::constant_identity` is the one resolver that turns such a
-            // path into a gem-pack declaration identity, shared with Ruby's
-            // proof-gated diagnostics so both classify one path identically. A
-            // constant path is *not* a require path, so retained gem evidence
-            // is consulted only through the shared verdict helper: a truncated
-            // discovery keeps the name accountable, while gem names are never
-            // inflected into constant names.
-            let overlay = analyzer.semantic_model_overlay();
-            let constants = crate::analyzer::ruby::constant_identity::RubyOverlayConstants::new(
-                overlay.as_deref(),
-            );
-            if let Some(symbol) = constants.unique_type(name) {
-                return (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone()));
-            }
-            // Two activated packs claiming one path is still an indexed name;
-            // no single target can be reported.
-            if constants.conflicts(name) {
-                return (BoundaryStatus::ExternalIndexed, None);
-            }
-            if declared_by_retained_discovery(analyzer, Language::Ruby, name) {
-                (BoundaryStatus::ExternalDeclaredUnindexed, None)
-            } else {
-                (BoundaryStatus::ExternalUnknown, None)
-            }
-        }
+
         Language::Php => {
             // PHP spells qualified names with `\`, which the reference-site
             // scanner does not span, so the trace holds a single written
@@ -1475,35 +1210,18 @@ fn boundary_evidence_for(
                 (BoundaryStatus::ExternalUnknown, None)
             }
         }
-        Language::Cpp => resolve_analyzer::<crate::analyzer::CppAnalyzer>(analyzer)
-            .map(|cpp| {
-                crate::analyzer::cpp::external::external_boundary_evidence(
-                    cpp,
-                    analyzer.semantic_model_overlay().as_deref(),
-                    file,
-                    name,
-                )
-            })
-            .unwrap_or((BoundaryStatus::ExternalUnknown, None)),
+        Language::Go | Language::Rust | Language::Ruby | Language::Cpp => {
+            crate::analyzer::languages::language_support(language_for_file(file))
+                .and_then(|support| {
+                    support.definition_boundary_evidence(analyzer, token, file, name)
+                })
+                .unwrap_or((BoundaryStatus::ExternalUnknown, None))
+        }
         Language::None => (BoundaryStatus::ExternalUnknown, None),
     }
 }
 
-/// How completely a call, reference, or boundary lookup answered the question
-/// dispatch asked. `workspace_oracle::dispatch` reports this as its
-/// `SemanticOutcome` variant; the external-reference probe reports it as one
-/// chain link (#1885) alongside the boundary and trace evidence the same
-/// lookup produced, so the two must read one mapping rather than two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchQuality {
-    Complete,
-    Ambiguous,
-    Unproven,
-    Unknown,
-    Unsupported(crate::analyzer::semantic::SemanticCapability),
-    Truncated,
-    Cancelled,
-}
+pub use crate::analyzer::semantic::trace::DispatchQuality;
 
 /// The total mapping from a definition lookup's status and, at a boundary
 /// outcome, its refined [`BoundaryStatus`], to the [`DispatchQuality`] that
@@ -1648,7 +1366,8 @@ mod dispatch_quality_tests {
 /// accounts for `name`: the build declares it (or a module containing it), or
 /// discovery could not read everything the build declared. Reads what the
 /// analyzer already holds; never starts discovery.
-fn declared_by_retained_discovery(
+#[doc(hidden)]
+pub fn declared_by_retained_discovery(
     analyzer: &dyn IAnalyzer,
     language: crate::analyzer::Language,
     name: &str,
@@ -1722,45 +1441,25 @@ fn declared_import_route(
 ) -> bool {
     let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    use crate::analyzer::Language;
-
     // `name` is the resolved reference site's rendered text; its leading
     // dotted segment is the local binder an import introduced.
     let Some(leading) = name.split('.').next().filter(|head| !head.is_empty()) else {
         return false;
     };
-    match language {
-        Language::Python => {
-            let Some(provider) = analyzer.import_analysis_provider_for_file(file) else {
-                return false;
-            };
-            provider.import_info_of(token, file).iter().any(|import| {
-                let binds = import.is_wildcard || import.local_name() == Some(leading);
-                binds
-                    && import.path.as_ref().is_some_and(|path| {
-                        evidence.declares_module_path(&path.render_segments("."))
-                    })
-            })
-        }
-        Language::JavaScript | Language::TypeScript => {
-            let Some(index) =
-                crate::analyzer::usages::js_ts_graph::cached_jsts_index(analyzer, language, None)
-            else {
-                return false;
-            };
-            index
-                .import_bindings(file, leading)
-                .any(|binding| evidence.declares_module_path(&binding.module_specifier))
-        }
-        _ => false,
-    }
+    crate::analyzer::languages::language_support(language).is_some_and(|support| {
+        support.definition_declared_import_route(analyzer, token, file, leading, evidence)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::resolution::lexical_definition::LexicalDefinition;
+
     use crate::analyzer::DeclarationKind;
+
     use crate::analyzer::Range;
+
     use brokk_bifrost_test_macros::hardwon;
 
     fn lexical(identifier: &str) -> LexicalDefinition {
@@ -1831,34 +1530,20 @@ mod tests {
 /// route row at all (#1889).
 #[cfg(test)]
 mod boundary_evidence_tests {
-    use super::*;
-    use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
-    use crate::analyzer::structural::occurrences::OccurrenceRole;
-    use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
-    use crate::analyzer::{
-        AnalyzerConfig, AnalyzerQueryScope, Language, Project, QueryScope, TestProject,
-        WorkspaceAnalyzer,
-    };
-    use crate::test_support::activation_evidence;
-    use brokk_bifrost_test_macros::hardwon;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use super::test_support::*;
 
-    const PHP_USE_ALIAS_SOURCE: &str = concat!(
-        "<?php\n",
-        "\n",
-        "namespace App\\Model {\n",
-        "    class Widget {}\n",
-        "}\n",
-        "\n",
-        "namespace App\\Util {\n",
-        "    use App\\Model\\Widget as Gadget;\n",
-        "\n",
-        "    function make(): Gadget {\n",
-        "        return new Gadget();\n",
-        "    }\n",
-        "}\n",
-    );
+    use super::*;
+
+    use crate::analyzer::AnalyzerConfig;
+    use crate::analyzer::AnalyzerQueryScope;
+    use crate::analyzer::Language;
+
+    use crate::test_support::activation_evidence;
+
+    use brokk_bifrost_test_macros::hardwon;
+
+    use std::path::Path;
+    use std::path::PathBuf;
 
     const KOTLIN_BOUNDARY_SOURCE: &str = concat!(
         "package app\n",
@@ -1887,215 +1572,6 @@ mod boundary_evidence_tests {
         "  fun helper(): Collections? = null\n",
         "}\n",
     );
-
-    struct BoundaryFixture {
-        _temp: tempfile::TempDir,
-        workspace: WorkspaceAnalyzer,
-        file: ProjectFile,
-        source: String,
-    }
-
-    impl BoundaryFixture {
-        fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            Self::with_config(language, relative_path, source, |_| {
-                AnalyzerConfig::default()
-            })
-        }
-
-        /// A fixture whose analyzer config is built from the canonical project
-        /// root, for boundary tests that point external-dependency config at
-        /// artifacts written inside the fixture.
-        fn with_config(
-            language: Language,
-            relative_path: &str,
-            source: &str,
-            config: impl FnOnce(&Path) -> AnalyzerConfig,
-        ) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let file = ProjectFile::new(root.clone(), relative_path);
-            file.write(source).expect("write fixture source");
-            let config = config(&root);
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                config,
-            )
-            .expect("ephemeral workspace should build");
-            Self {
-                _temp: temp,
-                workspace,
-                file,
-                source: source.to_owned(),
-            }
-        }
-
-        /// The traced resolution of the reference whose first token starts
-        /// `needle`.
-        fn trace(&self, needle: &str) -> (DefinitionLookupOutcome, ResolutionTraceResult) {
-            let requests = vec![self.request_for(needle)];
-            resolve_definition_batch_with_trace(
-                self.workspace.analyzer(),
-                requests,
-                self.file.clone(),
-                Arc::from(self.source.as_str()),
-                &CancellationToken::new(),
-            )
-            .pop()
-            .expect("one traced outcome per request")
-        }
-
-        fn request_for(&self, needle: &str) -> DefinitionLookupRequest {
-            let start = self
-                .source
-                .find(needle)
-                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"));
-            DefinitionLookupRequest {
-                file: self.file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start),
-                end_byte: None,
-            }
-        }
-
-        /// The same traced resolution as [`Self::trace`], reached through the
-        /// public probe entry point (#1885).
-        fn trace_via_probe_entry_point(
-            &self,
-            needle: &str,
-        ) -> (DefinitionLookupOutcome, ResolutionTraceResult) {
-            let requests = vec![self.request_for(needle)];
-            super::super::resolve_definition_batch_with_source_traced(
-                self.workspace.analyzer(),
-                requests,
-                self.file.clone(),
-                Arc::from(self.source.as_str()),
-            )
-            .pop()
-            .expect("one traced outcome per request")
-        }
-    }
-
-    /// The external-route rows of one trace: `(boundary, external_target)`.
-    /// Empty means the resolver never drew a boundary, which fails the test
-    /// asking about one.
-    fn external_routes(trace: &ResolutionTraceResult) -> Vec<(BoundaryStatus, Option<String>)> {
-        let routes: Vec<_> = route_rows(trace);
-        assert!(
-            !routes.is_empty(),
-            "a boundary outcome always reports the route it took: {:?}",
-            trace.candidates
-        );
-        routes
-    }
-
-    fn route_rows(trace: &ResolutionTraceResult) -> Vec<(BoundaryStatus, Option<String>)> {
-        crate::test_support::external_route_candidates(trace)
-            .into_iter()
-            .map(|row| (row.boundary, row.external_target.clone()))
-            .collect()
-    }
-
-    fn assert_declared_unindexed_routes(routes: &[(BoundaryStatus, Option<String>)]) {
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "a declared but unread dependency stays accountable: {routes:?}"
-        );
-    }
-
-    /// The written names of one trace's external-route rows, in order.
-    fn route_names(trace: &ResolutionTraceResult) -> Vec<String> {
-        crate::test_support::external_route_candidates(trace)
-            .into_iter()
-            .filter_map(|row| match &row.candidate {
-                TraceCandidateRef::ExternalRoute { name } => Some(name.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Whether the traced occurrence row at the reference starting with
-    /// `needle` carries the route row the definition trace published.
-    ///
-    /// This is the exact join `candidates_of` performs: it re-locates a
-    /// reference occurrence in the traced file by AST identity and reads the
-    /// candidate rows hanging off it. Both consumers reading one publication
-    /// means this row exists and carries the route (#3466).
-    fn assert_boundary_route_joins_occurrence(
-        fixture: &BoundaryFixture,
-        needle: &str,
-        role: OccurrenceRole,
-    ) {
-        use crate::analyzer::structural::occurrence_rows::{
-            OccurrenceDerivationOptions, occurrences_for_file_with_options,
-        };
-
-        let start = fixture
-            .source
-            .find(needle)
-            .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"));
-        let result = occurrences_for_file_with_options(
-            fixture.workspace.analyzer(),
-            &fixture.file,
-            OccurrenceDerivationOptions::WITH_CANDIDATES,
-            &CancellationToken::new(),
-        )
-        .expect("occurrence rows");
-        let row = result
-            .rows
-            .iter()
-            .find(|row| row.range.start_byte == start)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no occurrence row starts at byte {start} ({needle:?}): {:#?}",
-                    result
-                        .rows
-                        .iter()
-                        .map(|row| (&row.raw_spelling, row.role))
-                        .collect::<Vec<_>>()
-                )
-            });
-        assert_eq!(
-            row.role, role,
-            "the reference token `{needle}` is the row candidates_of joins on"
-        );
-        let candidates = row
-            .candidates
-            .as_ref()
-            .unwrap_or_else(|| panic!("no candidates derived for `{needle}`"));
-        let routes = candidates
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                matches!(candidate.candidate, TraceCandidateRef::ExternalRoute { .. })
-            })
-            .count();
-        assert_eq!(
-            routes, 1,
-            "the occurrence row carries the one route row the definition trace published: {:#?}",
-            candidates.candidates
-        );
-    }
-
-    /// A reference whose failing segment stays inside the workspace: the status
-    /// is a plain miss and the trace carries no route out of the workspace.
-    fn assert_no_boundary_was_drawn(needle: &str, fixture: &BoundaryFixture) {
-        let (outcome, trace) = fixture.trace(needle);
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::NoDefinition,
-            "an in-workspace miss stays a plain no-definition: {:?}",
-            outcome.diagnostics
-        );
-        assert!(
-            route_rows(&trace).is_empty(),
-            "an in-workspace miss reports no route out of the workspace: {:?}",
-            trace.candidates
-        );
-    }
 
     /// A discovery outcome declaring exactly `modules` for `language`; an
     /// incomplete outcome records that the build could not be read fully.
@@ -2148,115 +1624,6 @@ mod boundary_evidence_tests {
         }
     }
 
-    /// Compile one authored session pack and activate it against the
-    /// fixture's analyzer, retaining `discovery` beside it when given.
-    /// Everything is a session pack in an ephemeral catalog; nothing is
-    /// installed and nothing is downloaded.
-    fn activate_fixture_pack(
-        fixture: &BoundaryFixture,
-        pack_id: &str,
-        pack_json: &serde_json::Value,
-        evidence: SemanticModelActivationEvidence,
-    ) {
-        use crate::analyzer::semantic_model::{
-            CatalogOptions, CompilerOptions, SemanticModelActivationControl,
-            SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
-            SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
-            SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
-            acquire_active_semantic_models_with_evidence, compile_source,
-        };
-
-        let pack = compile_source(
-            SourceFormat::Json,
-            &serde_json::to_vec(pack_json).expect("serialize fixture pack"),
-            &CompilerOptions::default(),
-        )
-        .unwrap_or_else(|diagnostics| panic!("fixture pack must compile: {diagnostics:#?}"));
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral catalog");
-        catalog
-            .register_session_pack(
-                &pack,
-                &SessionPackSource {
-                    kind: SessionPackSourceKind::Embedded,
-                    source_id: pack_id.to_owned(),
-                },
-            )
-            .expect("register session pack");
-        let request = SemanticModelActivationRequest {
-            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
-                .expect("crate version"),
-            evidence: vec![evidence],
-            controls: vec![SemanticModelActivationControl {
-                scope: SemanticModelControlScope::Workspace,
-                action: SemanticModelControlAction::Enable,
-                selector: SemanticModelPackSelector {
-                    pack_id: pack_id.to_owned(),
-                    version: None,
-                    manifest_digest: None,
-                },
-            }],
-            limits: SemanticModelRuntimeLimits::default(),
-        };
-        let SemanticModelRuntimeOutcome::Ready { .. } =
-            acquire_active_semantic_models_with_evidence(
-                fixture.workspace.analyzer(),
-                &catalog,
-                None,
-                &request,
-                None,
-                &CancellationToken::new(),
-            )
-        else {
-            panic!("fixture pack must activate");
-        };
-        assert!(
-            fixture
-                .workspace
-                .analyzer()
-                .semantic_model_overlay()
-                .is_some(),
-            "activation publishes an overlay"
-        );
-    }
-
-    /// One declaration-facts pack with a single public type, carrying whatever
-    /// `members` the caller declares on it.
-    fn single_type_pack(
-        pack_id: &str,
-        language: &str,
-        ecosystem: &str,
-        package: &str,
-        type_id: &str,
-        type_name: &str,
-        members: serde_json::Value,
-    ) -> serde_json::Value {
-        declaration_facts_pack::build(declaration_facts_pack::DeclarationFactsPack {
-            pack_id,
-            version: "1.0.0",
-            producer_name: &format!("{language}-fixture"),
-            language,
-            ecosystem,
-            toolchains: serde_json::json!([]),
-            completeness: "complete",
-            shard_id: &format!("declarations.{pack_id}"),
-            activation: serde_json::json!([{ "package": { "name": package } }]),
-            types: serde_json::json!([{
-                "id": type_id,
-                "name": type_name,
-                "type_kind": "class",
-                "visibility": "public",
-                "hierarchy": [],
-                "locator": {
-                    "kind": "artifact",
-                    "path": "fixture-source",
-                    "symbol": type_name
-                }
-            }]),
-            members,
-        })
-    }
-
     // -----------------------------------------------------------------------
     // Scala: end-to-end through the resolver's own boundary outcome.
     // -----------------------------------------------------------------------
@@ -2299,51 +1666,6 @@ mod boundary_evidence_tests {
     // -----------------------------------------------------------------------
     // PHP: end-to-end through the resolver's own boundary outcome.
     // -----------------------------------------------------------------------
-
-    const PHP_BOUNDARY_SOURCE: &str = concat!(
-        "<?php\n",
-        "namespace App;\n",
-        "\n",
-        "use Vendor\\Widget\\Helper;\n",
-        "\n",
-        "class Service {\n",
-        "    private Helper $helper;\n",
-        "}\n",
-    );
-
-    #[test]
-    fn a_php_use_of_an_indexed_composer_type_reports_external_indexed() {
-        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
-
-        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_BOUNDARY_SOURCE);
-        let type_id = type_declaration_id(TypeIdentity {
-            ecosystem: "composer",
-            name: "Vendor.Widget.Helper",
-        });
-        activate_fixture_pack(
-            &fixture,
-            "fixture.php.widget",
-            &single_type_pack(
-                "fixture.php.widget",
-                "php",
-                "composer",
-                "vendor/widget",
-                &type_id,
-                "Vendor.Widget.Helper",
-                serde_json::json!([]),
-            ),
-            activation_evidence("php", "composer", "vendor/widget"),
-        );
-        let (_, trace) = fixture.trace("Helper $helper");
-        let routes = external_routes(&trace);
-        assert!(
-            routes.iter().all(|(boundary, target)| {
-                *boundary == BoundaryStatus::ExternalIndexed
-                    && target.as_deref() == Some(type_id.as_str())
-            }),
-            "the activated pack publishes `Helper`: {routes:?}"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // Kotlin: end-to-end through the resolver's own boundary outcome (#1889).
@@ -2839,184 +2161,6 @@ mod boundary_evidence_tests {
         );
     }
 
-    /// #3466: a static member call whose receiver is a bare external type
-    /// qualifier. No value channel of the workspace declares `Environment` and
-    /// no indexed assembly owns it, so the receiver identifier is the type the
-    /// member is qualified with, and the call crossed a boundary. Before the fix
-    /// the same call answered `unsupported_csharp_receiver` with no route row
-    /// while `call_bindings` resolved the identical written reference.
-    #[test]
-    #[hardwon(
-        "#3466: A C# static call over a declared but unindexed type publishes the route joined by its occurrence row"
-    )]
-    fn a_csharp_static_member_call_on_an_unindexed_type_publishes_its_route_row() {
-        let source = concat!(
-            "namespace App;\n",
-            "class Caller {\n",
-            "    string Go() { return Environment.GetEnvironmentVariable(\"PATH\"); }\n",
-            "}\n",
-        );
-        let fixture = BoundaryFixture::new(Language::CSharp, "src/App.cs", source);
-        let (outcome, trace) = fixture.trace("GetEnvironmentVariable");
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "a member on a type the workspace does not index is a boundary: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            outcome.resolved_reference_target(),
-            Some("Environment.GetEnvironmentVariable"),
-            "the boundary names the written member identity: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            route_names(&trace),
-            vec!["Environment.GetEnvironmentVariable".to_string()],
-            "the trace publishes one route row under the same identity: {:#?}",
-            trace.candidates
-        );
-        assert_eq!(
-            external_routes(&trace),
-            vec![(BoundaryStatus::ExternalUnknown, None)],
-            "no assembly index is configured, so the row names the boundary without sharpening it"
-        );
-        assert_boundary_route_joins_occurrence(
-            &fixture,
-            "GetEnvironmentVariable",
-            OccurrenceRole::MemberPosition,
-        );
-    }
-
-    /// #3466: `ENV.fetch` is a method call on a constant no workspace file
-    /// declares, and no activated pack or retained discovery claims it. The
-    /// call's written `<receiver>.<member>` identity is one boundary row, the
-    /// same identity `call_bindings` reports for the call site.
-    #[test]
-    #[hardwon(
-        "#3466: A Ruby external constant receiver call publishes one candidate route for the matching occurrence"
-    )]
-    fn a_ruby_external_constant_receiver_call_publishes_its_route_row() {
-        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "ENV.fetch(\"PATH\")\n");
-        let (outcome, trace) = fixture.trace("fetch");
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "a method on a module declared outside the workspace is a boundary: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            outcome.resolved_reference_target(),
-            Some("ENV.fetch"),
-            "the boundary names the written member identity: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            route_names(&trace),
-            vec!["ENV.fetch".to_string()],
-            "the trace publishes one route row under the same identity: {:#?}",
-            trace.candidates
-        );
-        assert_eq!(
-            external_routes(&trace),
-            vec![(BoundaryStatus::ExternalUnknown, None)],
-            "nothing has discovered a gem for `ENV`, so the row names the boundary without sharpening it"
-        );
-        assert_boundary_route_joins_occurrence(&fixture, "fetch", OccurrenceRole::MemberPosition);
-    }
-
-    /// The workspace guard beside it: a constant receiver the workspace does
-    /// declare is an ordinary in-workspace miss, not a boundary.
-    #[test]
-    #[hardwon(
-        "#3466: A Ruby constant receiver declared in the workspace does not turn its missing member into an external boundary"
-    )]
-    fn a_ruby_constant_receiver_declared_in_the_workspace_stays_a_plain_miss() {
-        let fixture = BoundaryFixture::new(
-            Language::Ruby,
-            "app.rb",
-            concat!("module Widget\n", "end\n", "\n", "Widget.fetch(\"PATH\")\n"),
-        );
-        assert_no_boundary_was_drawn("fetch", &fixture);
-    }
-
-    /// #3466: a C free function called across an unresolved include. Two
-    /// defects used to hide the boundary: the adapter classified no occurrence
-    /// at the callee token, leaving the traced route nothing to join against,
-    /// and the identifier call arm had no include-boundary decision. Both
-    /// halves now publish one `getenv` row.
-    #[test]
-    #[hardwon(
-        "#3466: A C call through an unindexed system include publishes one route and the occurrence row joins it"
-    )]
-    fn a_c_free_function_call_across_an_unindexed_include_publishes_one_row() {
-        let fixture = BoundaryFixture::new(
-            Language::Cpp,
-            "main.c",
-            "#include <stdlib.h>\nint main(void) { return getenv(\"PATH\") != 0; }\n",
-        );
-        let (outcome, trace) = fixture.trace("getenv");
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "the unresolved `<stdlib.h>` above the call makes the callee a boundary: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            outcome.resolved_reference_target(),
-            Some("getenv"),
-            "the boundary names the written callee: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            route_names(&trace),
-            vec!["getenv".to_string()],
-            "the trace publishes one route row: {:#?}",
-            trace.candidates
-        );
-        assert_eq!(
-            external_routes(&trace),
-            vec![(BoundaryStatus::ExternalUnknown, None)],
-            "no header pack is activated, so the row names the boundary without sharpening it"
-        );
-        assert_boundary_route_joins_occurrence(&fixture, "getenv", OccurrenceRole::ValueReference);
-    }
-
-    /// C APIs are not required to use lowercase names. Keep a capitalized
-    /// file-scope call on the same unresolved-include boundary as `getenv`;
-    /// the C++ construction-shape guard must not reject a C source file.
-    #[test]
-    fn a_c_capitalized_free_function_call_across_an_unindexed_include_publishes_one_row() {
-        let fixture = BoundaryFixture::new(
-            Language::Cpp,
-            "main.c",
-            "#include <openssl/evp.h>\nint main(void) { return EVP_des_cbc() != 0; }\n",
-        );
-        let (outcome, trace) = fixture.trace("EVP_des_cbc");
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "the unresolved `<openssl/evp.h>` above the call makes the C API a boundary: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            outcome.resolved_reference_target(),
-            Some("EVP_des_cbc"),
-            "the boundary names the written capitalized C callee: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            route_names(&trace),
-            vec!["EVP_des_cbc".to_string()],
-            "the trace publishes one route row for the capitalized C callee: {:#?}",
-            trace.candidates
-        );
-        assert_boundary_route_joins_occurrence(
-            &fixture,
-            "EVP_des_cbc",
-            OccurrenceRole::ValueReference,
-        );
-    }
     #[test]
     fn a_class_jar_the_index_could_not_read_proves_nothing_about_its_members() {
         // The honesty rule #1900 names, on the artifact half: a jar the bounded
@@ -3107,6 +2251,7 @@ mod boundary_evidence_tests {
     /// What one caret over the written `Registry.register` spelling answered.
     struct MemberSpellingAnswer {
         status: DefinitionLookupStatus,
+        outcome: DefinitionLookupOutcome,
         routes: Vec<(BoundaryStatus, Option<String>)>,
     }
 
@@ -3120,6 +2265,7 @@ mod boundary_evidence_tests {
                 MemberSpellingAnswer {
                     status: outcome.status,
                     routes: route_rows(&trace),
+                    outcome,
                 }
             })
             .collect()
@@ -3188,8 +2334,8 @@ mod boundary_evidence_tests {
         for answer in member_spelling_answers(&absent) {
             assert_eq!(
                 answer.status,
-                DefinitionLookupStatus::NoDefinition,
-                "with no jar the member spelling is not a proven boundary crossing"
+                DefinitionLookupStatus::Incomplete,
+                "with no jar native resolution cannot prove member absence"
             );
             assert!(
                 answer.routes.is_empty(),
@@ -3213,7 +2359,8 @@ mod boundary_evidence_tests {
             assert_eq!(
                 answer.status,
                 DefinitionLookupStatus::NoDefinition,
-                "an indexed owner that declares no members proves nothing about them"
+                "an indexed owner that declares no members proves nothing about them: {:?}",
+                answer.outcome
             );
             assert!(
                 answer.routes.is_empty(),
@@ -3279,8 +2426,12 @@ mod boundary_evidence_tests {
         for answer in member_spelling_answers(&absent) {
             assert_eq!(
                 answer.status,
-                DefinitionLookupStatus::NoDefinition,
-                "with no jar the member spelling is not a proven boundary crossing"
+                if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
+                    DefinitionLookupStatus::Incomplete
+                } else {
+                    DefinitionLookupStatus::NoDefinition
+                },
+                "with no jar native resolution cannot prove member absence"
             );
             assert!(
                 answer.routes.is_empty(),
@@ -3297,10 +2448,19 @@ mod boundary_evidence_tests {
             JVM_ARTIFACT_SCALA_MEMBER_SOURCE,
             |_| jvm_config_with_artifact_jar(Some(memberless.clone())),
         );
-        for answer in member_spelling_answers(&type_only) {
+        for (caret_index, answer) in member_spelling_answers(&type_only).into_iter().enumerate() {
+            let expected_status = if caret_index == 0 {
+                DefinitionLookupStatus::NoDefinition
+            } else {
+                // under the Scala trial the given-extension frontier (#5956) keeps the memberless owner Incomplete
+                if std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some() {
+                    DefinitionLookupStatus::Incomplete
+                } else {
+                    DefinitionLookupStatus::NoDefinition
+                }
+            };
             assert_eq!(
-                answer.status,
-                DefinitionLookupStatus::NoDefinition,
+                answer.status, expected_status,
                 "an indexed owner that declares no members proves nothing about them"
             );
             assert!(
@@ -3439,82 +2599,6 @@ mod boundary_evidence_tests {
         assert_declared_unindexed_routes(&routes);
     }
 
-    #[test]
-    fn a_csharp_reference_into_a_declared_unindexed_package_reports_declared_unindexed() {
-        let source = concat!(
-            "using Newtonsoft.Json;\n",
-            "namespace App;\n",
-            "class Caller {\n",
-            "    Newtonsoft.Json.JsonConvert Ping() { return default; }\n",
-            "}\n",
-        );
-        let fixture = BoundaryFixture::new(Language::CSharp, "src/App.cs", source);
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::CSharp],
-            &crate::test_support::discovery_declaring("csharp", &["Newtonsoft.Json"], |_| {
-                Vec::new()
-            }),
-        );
-        let (_, trace) = fixture.trace("JsonConvert Ping");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "the build declares `Newtonsoft.Json`, so the miss is declared-unindexed: {routes:?}"
-        );
-    }
-    #[test]
-    fn a_php_use_alias_reports_the_workspace_candidate_it_selected() {
-        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_USE_ALIAS_SOURCE);
-        let (outcome, trace) = fixture.trace("Gadget();");
-        assert!(
-            !outcome.definitions.is_empty(),
-            "the alias names a workspace declaration: {outcome:?}"
-        );
-        let selected: Vec<String> = trace
-            .selected()
-            .map(|candidate| match &candidate.candidate {
-                TraceCandidateRef::Unit(unit) => unit.fq_name(),
-                other => panic!("expected a unit-backed candidate, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            selected,
-            ["App.Model.Widget"],
-            "the trace names the declaration the alias resolved to: {:?}",
-            trace.candidates
-        );
-        assert_eq!(
-            trace.completeness,
-            TraceCompleteness::SelectionOnly,
-            "PHP declares candidate_selection and not candidate_rejection"
-        );
-        assert!(
-            route_rows(&trace).is_empty(),
-            "a name the workspace declares draws no boundary: {:?}",
-            trace.candidates
-        );
-    }
-
-    #[test]
-    fn a_php_use_of_a_declared_unread_composer_dependency_reports_declared_unindexed() {
-        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_BOUNDARY_SOURCE);
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::Php],
-            &crate::test_support::incomplete_discovery_declaring("php", &["Vendor.Widget"], |_| {
-                Vec::new()
-            }),
-        );
-        let (_, trace) = fixture.trace("Helper $helper");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "a truncated Composer discovery keeps the name accountable: {routes:?}"
-        );
-    }
     #[hardwon("#1889: Kotlin imports failed to report the indexed external boundary")]
     #[test]
     fn a_kotlin_import_of_an_indexed_external_type_reports_external_indexed() {
@@ -3606,83 +2690,7 @@ mod boundary_evidence_tests {
         );
         assert_no_boundary_was_drawn("Helper? = null", &fixture);
     }
-    #[hardwon("#1889: qualified Ruby gem constants failed to report indexed external boundaries")]
-    #[test]
-    fn a_ruby_reference_to_an_indexed_gem_constant_reports_external_indexed() {
-        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
 
-        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
-        let type_id = type_declaration_id(TypeIdentity {
-            ecosystem: "rubygems",
-            name: "Widget::Config",
-        });
-        activate_fixture_pack(
-            &fixture,
-            "fixture.ruby.widget",
-            &single_type_pack(
-                "fixture.ruby.widget",
-                "ruby",
-                "rubygems",
-                "widget",
-                &type_id,
-                "Widget::Config",
-                serde_json::json!([]),
-            ),
-            activation_evidence("ruby", "rubygems", "widget"),
-        );
-        let (_, trace) = fixture.trace("Config");
-        let routes = external_routes(&trace);
-        assert!(
-            routes.iter().all(|(boundary, target)| {
-                *boundary == BoundaryStatus::ExternalIndexed
-                    && target.as_deref() == Some(type_id.as_str())
-            }),
-            "the activated pack publishes `Widget::Config`: {routes:?}"
-        );
-    }
-    #[hardwon("#1889: qualified Ruby gem constants failed to report declared unread boundaries")]
-    #[test]
-    fn a_ruby_reference_into_a_declared_unread_gem_reports_declared_unindexed() {
-        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
-        let (_, trace) = fixture.trace("Config");
-        assert!(
-            external_routes(&trace)
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
-            "with no overlay and no retained discovery, nothing is known: {:?}",
-            trace.candidates
-        );
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::Ruby],
-            &crate::test_support::incomplete_discovery_declaring("ruby", &["widget"], |_| {
-                Vec::new()
-            }),
-        );
-        let (_, trace) = fixture.trace("Config");
-        let routes = external_routes(&trace);
-        assert_declared_unindexed_routes(&routes);
-    }
-    #[hardwon("#1889: Ruby workspace namespaces were at risk of false external classification")]
-    #[test]
-    fn a_ruby_path_under_a_workspace_namespace_stays_a_plain_miss() {
-        // `Widget` is a workspace module, so the miss is inside the workspace
-        // however the path continues.
-        let fixture = BoundaryFixture::new(
-            Language::Ruby,
-            "app.rb",
-            concat!("module Widget\n", "end\n", "\n", "Widget::Missing\n"),
-        );
-        assert_no_boundary_was_drawn("Missing", &fixture);
-    }
-    #[hardwon("#1889: bare Ruby constants were at risk of false external classification")]
-    #[test]
-    fn a_bare_ruby_constant_never_draws_a_boundary() {
-        // Ruby's top-level surface includes the core library and everything a
-        // loaded gem defines as a side effect, none of which Bifrost publishes,
-        // so a bare miss says nothing about where the name lives (#1624).
-        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Missing\n");
-        assert_no_boundary_was_drawn("Missing", &fixture);
-    }
     #[hardwon("#1893: Java resolution ignored selected declaration-facts packs")]
     #[test]
     fn a_java_import_of_a_pack_declared_type_reports_external_indexed() {
@@ -3993,31 +3001,7 @@ mod boundary_evidence_tests {
             "nothing named this declaration, so nothing was selected: {unknown:?}"
         );
     }
-    #[hardwon(
-        "#3466: lowercase C++ free-function calls across unresolved includes published no candidate row"
-    )]
-    #[test]
-    fn a_cpp_free_function_call_across_an_unindexed_include_publishes_one_row() {
-        let fixture = BoundaryFixture::new(
-            Language::Cpp,
-            "main.cpp",
-            "#include <cstdlib>\nint main() { return getenv(\"PATH\") != nullptr; }\n",
-        );
-        let (outcome, trace) = fixture.trace("getenv");
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary,
-            "the unresolved `<cstdlib>` above the call makes the callee a boundary: {:?}",
-            outcome.diagnostics
-        );
-        assert_eq!(
-            route_names(&trace),
-            vec!["getenv".to_string()],
-            "the trace publishes one route row: {:#?}",
-            trace.candidates
-        );
-        assert_boundary_route_joins_occurrence(&fixture, "getenv", OccurrenceRole::ValueReference);
-    }
+
     #[hardwon(
         "#1900: Kotlin and Scala member spellings did not reach the shared JVM external member surface"
     )]
@@ -4109,4 +3093,96 @@ mod boundary_evidence_tests {
             "Scala's import ladder reaches the pack-declared member"
         );
     }
+
+    #[test]
+    #[hardwon(
+        "#6103: a semantic-model provider counted as a complete inventory and proved a constructor absent"
+    )]
+    fn kotlin_model_only_constructor_retains_external_type_boundary() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
+            SemanticPackCatalog, SourceFormat, compile_source,
+        };
+
+        // Match the policy fixture's workspace-installed model, without pack
+        // acquisition. Merely writing this file does not activate the model.
+        let model = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../semantic-packs/web-network/jvm/bifrost.web-network-jvm.json"
+        ));
+        let fixture = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            "package app\nimport java.net.URL\nfun use(x: String): URL = URL(x)\n",
+            |root| {
+                let models = root.join(".bifrost/semantic-models");
+                std::fs::create_dir_all(&models).unwrap();
+                std::fs::write(models.join("bifrost.web-network-jvm.json"), model).unwrap();
+                jvm_config_with_artifact_jar(None)
+            },
+        );
+        let pack = compile_source(
+            SourceFormat::Json,
+            model.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .expect("compile reviewed JVM model");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "workspace-network-model".into(),
+                },
+            )
+            .unwrap();
+        activate_fixture_catalog(
+            &fixture,
+            &catalog,
+            "bifrost.web-network-jvm",
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        for needle in ["URL =", "URL(x)"] {
+            let (outcome, trace) = fixture.trace_via_probe_entry_point(needle);
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::UnresolvableImportBoundary,
+                "{needle}: {outcome:#?} {trace:#?}"
+            );
+            let routes = external_routes(&trace);
+            assert!(
+                routes
+                    .iter()
+                    .all(|(_, target)| target.as_deref() == Some("java.net.URL")),
+                "{routes:#?}"
+            );
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
+pub use crate::analyzer::resolution::trace_vocabulary::{
+    CallableApplicabilityRecord, HierarchyHopRecord, MemberEnrichment, TraceCandidate,
+    TraceCandidateRef, WILDCARD_ROUTE_NAME,
+};
+
+struct EngineResolutionDiagnostics;
+
+impl crate::analyzer::resolution::ResolutionDiagnostics for EngineResolutionDiagnostics {
+    fn recording(&self) -> bool {
+        recording()
+    }
+
+    fn native_rejection_projection_active(&self) -> bool {
+        native_rejection_projection_active()
+    }
+}
+
+pub(crate) fn resolution_diagnostics()
+-> &'static dyn crate::analyzer::resolution::ResolutionDiagnostics {
+    &EngineResolutionDiagnostics
 }

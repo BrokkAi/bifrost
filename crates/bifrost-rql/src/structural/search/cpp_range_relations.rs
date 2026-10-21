@@ -7,11 +7,11 @@
 
 use super::call_binding::CallBindingValue;
 use super::*;
-use brokk_bifrost_analysis::analyzer::range_facts::{
+use brokk_bifrost_core::analyzer::cpp_facts::CppRangeFactOutcome;
+use brokk_bifrost_cpp_analysis::analyzer::range_facts::{
     bad_strncpy_size, inconsistent_loop_direction, network_to_host_function_as_array_bound,
     unsafe_array_for_days_of_the_year,
 };
-use brokk_bifrost_core::analyzer::cpp_facts::CppRangeFactOutcome;
 
 fn report_incomplete(
     file: &ProjectFile,

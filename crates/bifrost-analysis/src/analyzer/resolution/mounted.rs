@@ -277,7 +277,8 @@ splice_translation!(OutOfInterior);
 /// a completion's reasons, a path's precedence, a typed row -- through the
 /// same [`SpliceMount`] the mount seam uses.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct OperationBlind;
+#[doc(hidden)]
+pub struct OperationBlind;
 
 #[cfg(any(test, feature = "test-support"))]
 impl OperationBlind {
@@ -335,7 +336,8 @@ impl ResolutionIdentityTranslation for OperationBlind {
 /// Every implementation is total over the value's identities: a field this
 /// trait forgets is a field the engine reads at the wrong ordinal, so each
 /// implementation names every field it carries.
-pub(crate) trait SpliceMount: Sized {
+#[doc(hidden)]
+pub trait SpliceMount: Sized {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self;
 }
 
@@ -793,6 +795,12 @@ impl SpliceMount for ReferenceLocalPathEvidence {
             self.reaches_package_root_scope(),
         )
         .with_local_bindings_certified(self.local_bindings_certified())
+        .with_lexical_scopes(
+            self.lexical_scopes()
+                .iter()
+                .map(|(scope, depth)| (translation.node(*scope), *depth))
+                .collect(),
+        )
     }
 }
 
@@ -1089,7 +1097,7 @@ impl<S> Mounted<S> {
 /// A batch method whose arguments and results are both slices of spliceable
 /// values.
 macro_rules! spliced_batch {
-    ($method:ident ( $argument:ident : &[$argument_type:ty] ) -> $return:ty) => {
+    ($method:ident ( $argument:ident : &[$argument_type:ty] $(,)? ) -> $return:ty) => {
         fn $method(
             &self,
             $argument: &[$argument_type],
@@ -1271,15 +1279,37 @@ where
     spliced_batch!(lookup_definition_nodes(definitions: &[SemanticId]) -> Vec<BatchDefinitionNode>);
 
     spliced_batch!(
-        issue_reverse_reference_seeds(requests: &[ReverseReferenceSeedRequest])
-            -> Vec<ReferenceSeed>
+        issue_reverse_reference_seeds(
+            requests: &[ReverseReferenceSeedRequest],
+        ) -> Vec<ReferenceSeed>
     );
 
-    spliced_batch!(scope_owners_for_heads(heads: &[BindingNodeId]) -> Vec<LoweredMemberScopeProperty>);
+    spliced_batch!(
+        scope_owners_for_heads(heads: &[BindingNodeId]) -> Vec<LoweredMemberScopeProperty>
+    );
 
     spliced_batch!(
         classify_endpoint_nodes(nodes: &[BindingNodeId]) -> Vec<BatchEndpointClassification>
     );
+
+    fn classify_endpoint_nodes_with_member_owners(
+        &self,
+        nodes: &[BindingNodeId],
+        cancellation: &CancellationToken,
+        member_owners: &mut super::batch::ClassificationMemberOwnerReader<'_>,
+    ) -> StoreResult<Option<Vec<BatchEndpointClassification>>> {
+        let nodes = self.arguments(nodes);
+        let mut rebased_reader = |definitions: &[SemanticId]| {
+            let definitions = self.results(definitions);
+            member_owners(&definitions).map(|rows| rows.map(|rows| self.arguments(&rows)))
+        };
+        let rows = self.inner.classify_endpoint_nodes_with_member_owners(
+            &nodes,
+            cancellation,
+            &mut rebased_reader,
+        )?;
+        Ok(rows.map(|rows| self.results(&rows)))
+    }
 
     spliced_batch!(
         match_forward_candidates(requests: &[BatchCandidateRequest]) -> BatchCandidateOutcome
@@ -1290,8 +1320,9 @@ where
     );
 
     spliced_batch!(
-        hydrate_candidate_paths(candidates: &[CandidatePathIdentity])
-            -> Vec<(CandidatePathIdentity, PartialPath)>
+        hydrate_candidate_paths(
+            candidates: &[CandidatePathIdentity],
+        ) -> Vec<(CandidatePathIdentity, PartialPath)>
     );
 
     fn visit_reference_seed_batches(
@@ -2221,7 +2252,7 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 33, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(batch.len(), 34, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
         assert_eq!(typed.len(), 79, "SelectedTypedFactSource: {typed:?}");

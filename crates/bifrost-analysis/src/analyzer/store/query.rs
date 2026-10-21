@@ -246,7 +246,10 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
     }
 
     fn rebase_to_project_root(&self, file: &ProjectFile) -> Option<ProjectFile> {
-        crate::analyzer::common::rebase_project_file_to_root(file, self.project_root)
+        crate::analyzer::resolution::file_paths::rebase_project_file_to_root(
+            file,
+            self.project_root,
+        )
     }
 
     fn code_unit_for_row(&self, row: &HydratedCandidateRow, file: &ProjectFile) -> CodeUnit {

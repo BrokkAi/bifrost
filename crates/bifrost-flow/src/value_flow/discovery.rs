@@ -244,15 +244,10 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
             result.status = result.status.merge(SemanticInputStatus::Cancelled);
             break;
         }
-        if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+        semantic_budget.charge_work(SemanticWork {
             nested_entries: 1 + context.calls().len(),
             ..SemanticWork::default()
-        }) {
-            result.status = result
-                .status
-                .merge(SemanticInputStatus::ExceededBudget { exceeded });
-            break;
-        }
+        });
         if limits.max_contexts == 0 {
             result.truncated = true;
             result.status = result.status.merge(SemanticInputStatus::Unknown);
@@ -288,15 +283,10 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
                 result.status = result.status.merge(SemanticInputStatus::Cancelled);
                 return Ok(result);
             }
-            if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+            semantic_budget.charge_work(SemanticWork {
                 nested_entries: 1,
                 ..SemanticWork::default()
-            }) {
-                result.status = result
-                    .status
-                    .merge(SemanticInputStatus::ExceededBudget { exceeded });
-                return Ok(result);
-            }
+            });
             let call = procedure.call_site_handle(row.id).expect("live call row");
             let outcome = provider.resolve_call_in_context(
                 &call,
@@ -330,15 +320,10 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
                             .bindings
                             .push(ValueFlowInput::new(binding, binding_status));
                     }
-                    if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+                    semantic_budget.charge_work(SemanticWork {
                         nested_entries: 1 + context.calls().len(),
                         ..SemanticWork::default()
-                    }) {
-                        result.status = result
-                            .status
-                            .merge(SemanticInputStatus::ExceededBudget { exceeded });
-                        return Ok(result);
-                    }
+                    });
                     let next = context.extended(call.clone(), limits.oracle);
                     if next.was_truncated() {
                         result.truncated = true;
@@ -354,16 +339,11 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
                     }
                 }
                 if let Some(proof) = dispatch.argument_callable() {
-                    if let Err(exceeded) = semantic_budget.charge(SemanticWork {
+                    semantic_budget.charge_work(SemanticWork {
                         captures: proof.capture_bindings().len(),
                         nested_entries: 1,
                         ..SemanticWork::default()
-                    }) {
-                        result.status = result
-                            .status
-                            .merge(SemanticInputStatus::ExceededBudget { exceeded });
-                        return Ok(result);
-                    }
+                    });
                     if !proof.captures().is_empty() {
                         result.status = result.status.merge(SemanticInputStatus::Unsupported {
                             capability: SemanticCapability::Captures,

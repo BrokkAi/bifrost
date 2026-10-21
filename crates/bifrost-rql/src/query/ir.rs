@@ -4013,7 +4013,8 @@ pub struct CodeQuerySeed {
     pub inside: Option<Pattern>,
     /// The root match must be inside a matching ancestor without crossing an
     /// intervening callable declaration. Rust impl members can also match the
-    /// resolved type declaration that owns the impl.
+    /// resolved type declaration that owns the impl, and out-of-line C++
+    /// member definitions the class that declares them.
     pub inside_decl: Option<Pattern>,
     /// Verifier-only negative containment: never used for candidate pruning.
     pub not_inside: Option<Pattern>,
@@ -5764,27 +5765,45 @@ impl Pattern {
             .any(|(_, pattern)| pattern.constrains_boolean_value())
     }
 
-    fn any_nested_pattern(&self, mut predicate: impl FnMut(&Pattern) -> bool) -> bool {
-        if self.has.as_deref().is_some_and(&mut predicate)
-            || self.not_has.as_deref().is_some_and(&mut predicate)
-            || self.local_value.as_deref().is_some_and(&mut predicate)
-            || self.not.as_deref().is_some_and(&mut predicate)
-            || self.all.iter().any(&mut predicate)
-            || self.any.iter().any(&mut predicate)
-        {
-            return true;
-        }
-        for &role in Role::single_target_roles() {
-            if self.single_role_pattern(role).is_some_and(&mut predicate) {
-                return true;
-            }
-        }
-        for &role in Role::list_target_roles() {
-            if self.list_role_patterns(role).iter().any(&mut predicate) {
-                return true;
-            }
-        }
-        self.kwargs.iter().any(|(_, pattern)| predicate(pattern))
+    /// Immediate compiled-pattern children, including Boolean and negative
+    /// positions. Callers analyzing necessary conditions must retain their
+    /// context; enumeration alone does not make a child a positive demand.
+    pub(crate) fn nested_patterns(&self) -> impl Iterator<Item = &Pattern> {
+        self.has
+            .iter()
+            .map(Box::as_ref)
+            .chain(self.not_has.iter().map(Box::as_ref))
+            .chain(self.local_value.iter().map(Box::as_ref))
+            .chain(self.not.iter().map(Box::as_ref))
+            .chain(self.all.iter())
+            .chain(self.any.iter())
+            .chain(
+                Role::single_target_roles()
+                    .iter()
+                    .filter_map(move |role| self.single_role_pattern(*role)),
+            )
+            .chain(
+                Role::list_target_roles()
+                    .iter()
+                    .flat_map(move |role| self.list_role_patterns(*role)),
+            )
+            .chain(self.kwargs.iter().map(|(_, pattern)| pattern))
+    }
+
+    fn any_nested_pattern(&self, predicate: impl FnMut(&Pattern) -> bool) -> bool {
+        self.nested_patterns().any(predicate)
+    }
+
+    /// Pure necessary name/text constraints, shared by raw-role matching and
+    /// negative candidate proofs. This never evaluates captures or roles.
+    pub(crate) fn name_text_matches(&self, name: Option<&str>, text: &str) -> bool {
+        self.name
+            .as_ref()
+            .is_none_or(|predicate| name.is_some_and(|name| predicate.matches(name)))
+            && self
+                .text
+                .as_ref()
+                .is_none_or(|predicate| predicate.matches(text))
     }
 
     /// Whether this pattern or a nested pattern constrains callable asyncness.

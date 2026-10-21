@@ -1,0 +1,1637 @@
+//! Deterministic, bounded rendering for semantic artifacts.
+//!
+//! The renderer is intentionally a view over validated semantic IR. It does
+//! not parse source, resolve targets, or infer missing semantics.
+
+use std::fmt;
+
+use brokk_bifrost_core::bounded_output::{BalancedWriter, TruncationStyle, quoted};
+
+use crate::analyzer::semantic::capabilities::CapabilitySupport;
+
+use crate::analyzer::semantic::capabilities::SemanticCapabilities;
+
+use crate::analyzer::semantic::ids::ControlEdgeId;
+
+use crate::analyzer::semantic::ids::ProcedureId;
+
+use crate::analyzer::semantic::ids::SemanticArtifactKey;
+
+use crate::analyzer::semantic::ids::SemanticLocator;
+
+use crate::analyzer::semantic::ids::SourceRevision;
+
+use crate::analyzer::semantic::ir::AllocationKind;
+
+use crate::analyzer::semantic::ir::AllocationSite;
+
+use crate::analyzer::semantic::ir::ArgumentDomain;
+
+use crate::analyzer::semantic::ir::BackingStoreOffset;
+
+use crate::analyzer::semantic::ir::BasicBlock;
+
+use crate::analyzer::semantic::ir::CallableTarget;
+
+use crate::analyzer::semantic::ir::CallableTargetResolution;
+
+use crate::analyzer::semantic::ir::CallableValue;
+
+use crate::analyzer::semantic::ir::CaptureBinding;
+
+use crate::analyzer::semantic::ir::CaptureSource;
+
+use crate::analyzer::semantic::ir::ControlContinuation;
+
+use crate::analyzer::semantic::ir::ControlEdge;
+
+use crate::analyzer::semantic::ir::Evidence;
+
+use crate::analyzer::semantic::ir::EvidenceCompleteness;
+
+use crate::analyzer::semantic::ir::FormalMultiplicity;
+
+use crate::analyzer::semantic::ir::MemoryLocation;
+
+use crate::analyzer::semantic::ir::MemoryLocationKind;
+
+use crate::analyzer::semantic::ir::ProcedureSemantics;
+
+use crate::analyzer::semantic::ir::ProgramPoint;
+
+use crate::analyzer::semantic::ir::ProofStatus;
+
+use crate::analyzer::semantic::ir::SemanticArtifact;
+
+use crate::analyzer::semantic::ir::SemanticCallSite;
+
+use crate::analyzer::semantic::ir::SemanticEffect;
+
+use crate::analyzer::semantic::ir::SemanticEvent;
+
+use crate::analyzer::semantic::ir::SemanticGap;
+
+use crate::analyzer::semantic::ir::SemanticGapSubject;
+
+use crate::analyzer::semantic::ir::SemanticValue;
+
+use crate::analyzer::semantic::ir::SemanticValueKind;
+
+use crate::analyzer::semantic::ir::SourceMapping;
+
+use crate::analyzer::semantic::ir::SynchronizationPayload;
+
+use crate::analyzer::semantic::ir::TransferKind;
+
+use crate::analyzer::semantic::ir::TransferOperation;
+
+use crate::analyzer::semantic::ir::ValueFlowKind;
+
+use crate::analyzer::semantic::DispatchBoundaryKind;
+
+use crate::analyzer::semantic::IcfgBoundary;
+
+use crate::analyzer::semantic::IcfgBoundaryKind;
+
+use crate::analyzer::semantic::IcfgEdge;
+
+use crate::analyzer::semantic::IcfgNodeKey;
+
+use crate::analyzer::semantic::IcfgSnapshot;
+
+#[doc(hidden)]
+pub const TRUNCATION_RESERVE: usize = 160;
+#[doc(hidden)]
+pub const MIN_OUTPUT_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticIrLimits {
+    pub max_procedures: usize,
+    pub max_rows: usize,
+    pub max_source_entries: usize,
+    pub max_output_bytes: usize,
+}
+
+impl Default for SemanticIrLimits {
+    fn default() -> Self {
+        Self {
+            max_procedures: 256,
+            max_rows: 100_000,
+            max_source_entries: 20_000,
+            max_output_bytes: 512 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticIrSelection {
+    Artifact,
+    Procedure(ProcedureId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedSemanticIr {
+    pub semantic_ir: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IcfgRenderLimits {
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub max_boundaries: usize,
+    pub max_output_bytes: usize,
+}
+
+impl Default for IcfgRenderLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 50_000,
+            max_edges: 200_000,
+            max_boundaries: 50_000,
+            max_output_bytes: 512 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedIcfgSnapshot {
+    pub icfg: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticRenderError {
+    InvalidLimits,
+    UnknownProcedure(ProcedureId),
+}
+
+impl fmt::Display for SemanticRenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimits => write!(
+                f,
+                "semantic IR procedure, row, and source-entry limits must be greater than zero, and the output limit must be at least {MIN_OUTPUT_BYTES} bytes"
+            ),
+            Self::UnknownProcedure(procedure) => {
+                write!(
+                    f,
+                    "semantic artifact does not contain procedure {procedure}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SemanticRenderError {}
+
+/// Render one already-bounded ICFG slice without resolving or materializing
+/// additional procedures. Node references are source-backed and never expose
+/// snapshot-local dense IDs as an assertion contract.
+pub fn render_icfg_snapshot(
+    snapshot: &IcfgSnapshot,
+    limits: IcfgRenderLimits,
+) -> Result<RenderedIcfgSnapshot, SemanticRenderError> {
+    if limits.max_nodes == 0
+        || limits.max_edges == 0
+        || limits.max_boundaries == 0
+        || limits.max_output_bytes < MIN_OUTPUT_BYTES
+    {
+        return Err(SemanticRenderError::InvalidLimits);
+    }
+    let mut writer = BalancedWriter::new(
+        limits.max_output_bytes,
+        TRUNCATION_RESERVE,
+        TruncationStyle::ReasonAttribute,
+    );
+    if writer.open(0, "(icfg-snapshot") && writer.open(1, "(nodes") {
+        for node in snapshot.nodes().iter().take(limits.max_nodes) {
+            if !writer.line_with(2, |output| write_icfg_node(output, node)) {
+                break;
+            }
+        }
+        if snapshot.node_count() > limits.max_nodes {
+            writer.truncate("ICFG node render limit reached");
+        }
+        if !writer.is_truncated() {
+            writer.close(1);
+            writer.open(1, "(edges");
+            for edge in snapshot.edges().iter().take(limits.max_edges) {
+                if !writer.line_with(2, |output| write_icfg_edge(output, snapshot, edge)) {
+                    break;
+                }
+            }
+            if snapshot.edge_count() > limits.max_edges {
+                writer.truncate("ICFG edge render limit reached");
+            }
+        }
+        if !writer.is_truncated() {
+            writer.close(1);
+            writer.open(1, "(boundaries");
+            for boundary in snapshot.boundaries().iter().take(limits.max_boundaries) {
+                if !writer.line_with(2, |output| write_icfg_boundary(output, snapshot, boundary)) {
+                    break;
+                }
+            }
+            if snapshot.boundaries().len() > limits.max_boundaries {
+                writer.truncate("ICFG boundary render limit reached");
+            }
+        }
+    }
+    if !writer.is_truncated() {
+        writer.close(1);
+        writer.close(0);
+    }
+    let (icfg, truncated) = writer.finish();
+    Ok(RenderedIcfgSnapshot { icfg, truncated })
+}
+
+impl SemanticIrLimits {
+    fn validate(self) -> Result<Self, SemanticRenderError> {
+        if self.max_procedures == 0
+            || self.max_rows == 0
+            || self.max_source_entries == 0
+            || self.max_output_bytes < MIN_OUTPUT_BYTES
+        {
+            return Err(SemanticRenderError::InvalidLimits);
+        }
+        Ok(self)
+    }
+}
+
+pub fn render_semantic_ir(
+    artifact: &SemanticArtifact,
+    selection: SemanticIrSelection,
+    limits: SemanticIrLimits,
+) -> Result<RenderedSemanticIr, SemanticRenderError> {
+    let limits = limits.validate()?;
+    let selected = match selection {
+        SemanticIrSelection::Artifact => None,
+        SemanticIrSelection::Procedure(id) => Some(
+            artifact
+                .procedure(id)
+                .ok_or(SemanticRenderError::UnknownProcedure(id))?,
+        ),
+    };
+    let mut state = RenderState::new(limits);
+    if open_artifact(&mut state, artifact.key())
+        && render_capabilities(&mut state, artifact.capabilities())
+    {
+        match selected {
+            Some(procedure) => {
+                render_procedure(&mut state, procedure);
+            }
+            None => {
+                for procedure in artifact.procedures() {
+                    if !render_procedure(&mut state, procedure) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if !state.writer.is_truncated() {
+        state.writer.close(1);
+        state.writer.close(0);
+    }
+    let (semantic_ir, truncated) = state.writer.finish();
+    Ok(RenderedSemanticIr {
+        semantic_ir,
+        truncated,
+    })
+}
+
+#[doc(hidden)]
+pub struct RenderState {
+    limits: SemanticIrLimits,
+    #[doc(hidden)]
+    pub writer: BalancedWriter,
+    rendered_procedures: usize,
+    rendered_rows: usize,
+    rendered_source_entries: usize,
+}
+
+impl RenderState {
+    #[doc(hidden)]
+    pub fn new(limits: SemanticIrLimits) -> Self {
+        Self {
+            writer: BalancedWriter::new(
+                limits.max_output_bytes,
+                TRUNCATION_RESERVE,
+                TruncationStyle::ReasonAttribute,
+            ),
+            limits,
+            rendered_procedures: 0,
+            rendered_rows: 0,
+            rendered_source_entries: 0,
+        }
+    }
+
+    fn begin_procedure(&mut self) -> bool {
+        if self.rendered_procedures >= self.limits.max_procedures {
+            self.writer.truncate("procedure limit reached");
+            return false;
+        }
+        self.rendered_procedures += 1;
+        true
+    }
+
+    fn row_with(
+        &mut self,
+        depth: usize,
+        render: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+    ) -> bool {
+        if self.rendered_rows >= self.limits.max_rows {
+            self.writer.truncate("row limit reached");
+            return false;
+        }
+        if !self.writer.line_with(depth, render) {
+            return false;
+        }
+        self.rendered_rows += 1;
+        true
+    }
+
+    fn open_row_with(
+        &mut self,
+        depth: usize,
+        render: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+    ) -> bool {
+        if self.rendered_rows >= self.limits.max_rows {
+            self.writer.truncate("row limit reached");
+            return false;
+        }
+        if !self.writer.open_with(depth, render) {
+            return false;
+        }
+        self.rendered_rows += 1;
+        true
+    }
+
+    fn source_row_with(
+        &mut self,
+        depth: usize,
+        render: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+    ) -> bool {
+        if self.rendered_source_entries >= self.limits.max_source_entries {
+            self.writer.truncate("source entry limit reached");
+            return false;
+        }
+        if !self.row_with(depth, render) {
+            return false;
+        }
+        self.rendered_source_entries += 1;
+        true
+    }
+}
+
+fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.begin_procedure() {
+        return false;
+    }
+    let properties = procedure.properties();
+    if !state.writer.open_with(2, |writer| {
+        write!(
+            writer,
+            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {} :dispatch-extensibility {} :call-boundary {} :receiver-binding {} :construction-return {}",
+            procedure.id(),
+            quoted(procedure.kind().label()),
+            optional_id(procedure.lexical_parent()),
+            procedure.source(),
+            procedure.evidence(),
+            procedure.entry_point(),
+            procedure.normal_exit_point(),
+            procedure.exceptional_exit_point(),
+            properties.is_async,
+            properties.is_generator,
+            properties.is_static,
+            properties.is_synthetic,
+            quoted(properties.invocation.label()),
+            quoted(properties.dispatch_extensibility.label()),
+            quoted(properties.call_boundary.label()),
+            quoted(properties.receiver_binding.label()),
+            quoted(properties.construction_return.label()),
+        )
+    }) {
+        return false;
+    }
+    if !state.source_row_with(3, |writer| {
+        writer.write_str("(locator ")?;
+        write_locator(writer, procedure.locator())?;
+        writer.write_char(')')
+    }) || !render_values(state, procedure)
+        || !render_allocations(state, procedure)
+        || !render_memory_locations(state, procedure)
+        || !render_captures(state, procedure)
+        || !render_call_sites(state, procedure)
+        || !render_source_mappings(state, procedure)
+        || !render_evidence(state, procedure)
+        || !render_gaps(state, procedure)
+        || !render_blocks(state, procedure)
+        || !render_points(state, procedure)
+        || !render_control_edges(state, procedure)
+    {
+        return false;
+    }
+    state.writer.close(2)
+}
+
+fn render_values(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(values") {
+        return false;
+    }
+    for value in procedure.values() {
+        if !state.row_with(4, |writer| write_value(writer, value)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_allocations(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(allocations") {
+        return false;
+    }
+    for allocation in procedure.allocations() {
+        if !state.row_with(4, |writer| write_allocation(writer, allocation)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_memory_locations(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(memory-locations") {
+        return false;
+    }
+    for location in procedure.memory_locations() {
+        if !state.row_with(4, |writer| write_memory_location(writer, location)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_captures(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(captures") {
+        return false;
+    }
+    for capture in procedure.captures() {
+        if !state.row_with(4, |writer| write_capture(writer, capture)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_call_sites(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(call-sites") {
+        return false;
+    }
+    for call_site in procedure.call_sites() {
+        if !state.row_with(4, |writer| write_call_site(writer, call_site)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_source_mappings(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(source-mappings") {
+        return false;
+    }
+    for mapping in procedure.source_mappings() {
+        if !state.source_row_with(4, |writer| write_source_mapping(writer, mapping)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_evidence(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(evidence") {
+        return false;
+    }
+    for evidence in procedure.evidence_rows() {
+        if !state.row_with(4, |writer| write_evidence(writer, evidence)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_gaps(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(gaps") {
+        return false;
+    }
+    for gap in procedure.gaps() {
+        if !state.row_with(4, |writer| write_gap(writer, gap)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_blocks(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(blocks") {
+        return false;
+    }
+    for block in procedure.blocks() {
+        if !state.row_with(4, |writer| write_block(writer, block)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_points(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(program-points") {
+        return false;
+    }
+    for point in procedure.points() {
+        if !render_point(state, procedure, point) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn render_control_edges(state: &mut RenderState, procedure: &ProcedureSemantics) -> bool {
+    if !state.writer.open(3, "(control-edges") {
+        return false;
+    }
+    for (index, edge) in procedure.cfg().edges().iter().enumerate() {
+        let edge_id = ControlEdgeId::try_from_index(index)
+            .expect("validated semantic control-edge count must fit in a u32");
+        if !state.row_with(4, |writer| write_control_edge(writer, edge_id, edge)) {
+            return false;
+        }
+    }
+    state.writer.close(3)
+}
+
+fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Result {
+    write!(
+        writer,
+        "(value :id {} :kind {}",
+        value.id,
+        quoted(value.kind.label())
+    )?;
+    match &value.kind {
+        SemanticValueKind::Parameter {
+            ordinal,
+            multiplicity,
+            name,
+            passing_mode,
+        } => {
+            write!(
+                writer,
+                " :ordinal {ordinal} :multiplicity {} :passing-mode {}",
+                quoted(multiplicity.label()),
+                quoted(passing_mode.label()),
+            )?;
+            if let Some(name) = name {
+                write!(writer, " :name {}", quoted(name))?;
+            }
+            if let FormalMultiplicity::Rest(domain) = multiplicity {
+                write!(writer, " :argument-domain {}", quoted(domain.label()))?;
+                if let ArgumentDomain::LanguageDefined(detail) = domain {
+                    write!(writer, " :language-domain {}", quoted(detail))?;
+                }
+            }
+        }
+        SemanticValueKind::DefaultArgument { ordinal } => {
+            write!(writer, " :ordinal {ordinal}")?;
+        }
+        SemanticValueKind::LanguageDefined(kind) => {
+            write!(writer, " :language-kind {}", quoted(kind))?;
+        }
+        SemanticValueKind::Boolean(value) => {
+            write!(writer, " :boolean-value {value}")?;
+        }
+        SemanticValueKind::UnsignedInteger(value) => {
+            write!(writer, " :unsigned-value {value}")?;
+        }
+        SemanticValueKind::SignedInteger(value) => {
+            write!(writer, " :signed-value {value}")?;
+        }
+        SemanticValueKind::FloatingPoint { bits } => {
+            write!(writer, " :float-value {:?}", f64::from_bits(*bits))?;
+        }
+        SemanticValueKind::ConstantString(payload) => {
+            write!(writer, " :constant-string {}", quoted(payload))?;
+        }
+        SemanticValueKind::Local
+        | SemanticValueKind::Receiver { .. }
+        | SemanticValueKind::Return
+        | SemanticValueKind::Temporary
+        | SemanticValueKind::Address
+        | SemanticValueKind::Null
+        | SemanticValueKind::Constant
+        | SemanticValueKind::Exception
+        | SemanticValueKind::Callable
+        | SemanticValueKind::AwaitResult => {}
+    }
+    write!(
+        writer,
+        " :source {} :evidence {})",
+        value.source, value.evidence
+    )
+}
+
+fn write_allocation(writer: &mut dyn fmt::Write, allocation: &AllocationSite) -> fmt::Result {
+    write!(
+        writer,
+        "(allocation :id {} :point {} :result {} :kind {}",
+        allocation.id,
+        allocation.point,
+        allocation.result,
+        quoted(allocation.kind.label())
+    )?;
+    if let AllocationKind::LanguageDefined(kind) = &allocation.kind {
+        write!(writer, " :language-kind {}", quoted(kind))?;
+    }
+    write!(
+        writer,
+        " :source {} :evidence {})",
+        allocation.source, allocation.evidence
+    )
+}
+
+fn write_memory_location(writer: &mut dyn fmt::Write, location: &MemoryLocation) -> fmt::Result {
+    write!(
+        writer,
+        "(memory-location :id {} :kind {}",
+        location.id,
+        quoted(location.kind.label())
+    )?;
+    match &location.kind {
+        MemoryLocationKind::Field { base, member } => {
+            write!(writer, " :base {base} :member (locator ")?;
+            write_locator(writer, member)?;
+            writer.write_char(')')?;
+        }
+        MemoryLocationKind::Property { base, key } => {
+            write!(writer, " :base {base} :property-key {}", quoted(key))?;
+        }
+        MemoryLocationKind::Static { member } => {
+            writer.write_str(" :member (locator ")?;
+            write_locator(writer, member)?;
+            writer.write_char(')')?;
+        }
+        MemoryLocationKind::Index {
+            base,
+            index,
+            constant_index,
+            identity,
+        } => {
+            write!(
+                writer,
+                " :base {base} :index {} :indexed-identity {}",
+                optional_id(*index),
+                quoted(identity.label())
+            )?;
+            if let Some(index) = constant_index {
+                write!(writer, " :constant-index {index}")?;
+            }
+        }
+        MemoryLocationKind::Dereference { address } => {
+            write!(writer, " :address-value {address}")?;
+        }
+        MemoryLocationKind::LexicalCell { binding } => {
+            write!(writer, " :binding-value {binding}")?;
+        }
+        MemoryLocationKind::Capture {
+            lexical_parent,
+            binding,
+        } => {
+            write!(writer, " :lexical-parent {lexical_parent}")?;
+            if let Some(binding) = binding {
+                write!(writer, " :binding-value {binding}")?;
+            }
+        }
+    }
+    write!(
+        writer,
+        " :value-copy {}",
+        quoted(location.value_copy.label())
+    )?;
+    if let crate::analyzer::semantic::ir::MemoryValueCopy::BackingStore { identity } =
+        location.value_copy
+    {
+        write!(
+            writer,
+            " :value-copy-indexed-identity {}",
+            quoted(identity.label())
+        )?;
+    }
+    write!(
+        writer,
+        " :source {} :evidence {})",
+        location.source, location.evidence
+    )
+}
+
+fn write_capture(writer: &mut dyn fmt::Write, capture: &CaptureBinding) -> fmt::Result {
+    write!(
+        writer,
+        "(capture :id {} :point {} :callable {} :target-procedure {} :environment {} :source-kind {}",
+        capture.id,
+        capture.point,
+        capture.callable,
+        capture.target,
+        capture.environment,
+        quoted(capture.captured.label()),
+    )?;
+    match capture.captured {
+        CaptureSource::Value(value) => write!(writer, " :source-value {value}")?,
+        CaptureSource::Location(location) => write!(writer, " :source-location {location}")?,
+    }
+    write!(
+        writer,
+        " :destination (procedure {} :memory-location {}) :mode {}",
+        capture.target,
+        capture.destination,
+        quoted(capture.mode.label()),
+    )?;
+    if let crate::analyzer::semantic::ir::CaptureMode::LanguageDefined(mode) = &capture.mode {
+        write!(writer, " :language-mode {}", quoted(mode))?;
+    }
+    write!(
+        writer,
+        " :source {} :evidence {})",
+        capture.source, capture.evidence,
+    )
+}
+
+fn write_call_site(writer: &mut dyn fmt::Write, call_site: &SemanticCallSite) -> fmt::Result {
+    write!(
+        writer,
+        "(call-site :id {} :point {} :invocation-mode {} :execution-timing {} :callee {} :receiver {} :arguments ",
+        call_site.id,
+        call_site.point,
+        quoted(call_site.invocation_mode.label()),
+        quoted(call_site.execution_timing.label()),
+        call_site.callee,
+        optional_id(call_site.receiver),
+    )?;
+    writer.write_char('(')?;
+    for (index, argument) in call_site.arguments.iter().enumerate() {
+        if index > 0 {
+            writer.write_char(' ')?;
+        }
+        write!(
+            writer,
+            "(argument :value {} :expansion {}",
+            argument.value,
+            quoted(argument.expansion.label()),
+        )?;
+        if let Some(domain) = argument.expansion.domain() {
+            write!(writer, " :domain {}", quoted(domain.label()))?;
+            if let ArgumentDomain::LanguageDefined(detail) = domain {
+                write!(writer, " :language-domain {}", quoted(detail))?;
+            }
+        }
+        if let Some(keyword) = &argument.keyword {
+            write!(writer, " :keyword {}", quoted(keyword))?;
+        }
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')?;
+    writer.write_str(" :normal-results [")?;
+    for (index, result) in call_site.normal_results.iter().enumerate() {
+        if index > 0 {
+            writer.write_char(' ')?;
+        }
+        write!(writer, "{result}")?;
+    }
+    write!(
+        writer,
+        "] :result {} :thrown {} :declared-targets (",
+        optional_id(call_site.result),
+        optional_id(call_site.thrown),
+    )?;
+    write_target_resolution(writer, &call_site.declared_targets)?;
+    write!(
+        writer,
+        ") :target-evidence {} :normal-continuation ",
+        call_site.target_evidence,
+    )?;
+    write_control_continuation(writer, call_site.normal_continuation)?;
+    writer.write_str(" :exceptional-continuation ")?;
+    write_control_continuation(writer, call_site.exceptional_continuation)?;
+    write!(
+        writer,
+        " :source {} :evidence {})",
+        call_site.source, call_site.evidence,
+    )
+}
+
+#[doc(hidden)]
+pub fn write_source_mapping(writer: &mut dyn fmt::Write, mapping: &SourceMapping) -> fmt::Result {
+    write!(
+        writer,
+        "(source-mapping :id {} :kind {}",
+        mapping.id,
+        quoted(mapping.kind.label()),
+    )?;
+    if let Some(identity) = mapping.ast_identity {
+        write!(
+            writer,
+            " :ast-identity (structural-node :content {} :node-id {})",
+            identity.content(),
+            identity.normalized_node_id(),
+        )?;
+    }
+    writer.write_str(" :locator (locator ")?;
+    write_locator(writer, &mapping.locator)?;
+    writer.write_str("))")
+}
+
+fn write_control_continuation(
+    writer: &mut dyn fmt::Write,
+    continuation: ControlContinuation,
+) -> fmt::Result {
+    match continuation {
+        ControlContinuation::Target(target) => {
+            write!(writer, "(continuation :outcome \"target\" :point {target})")
+        }
+        continuation => write!(
+            writer,
+            "(continuation :outcome {})",
+            quoted(continuation.label())
+        ),
+    }
+}
+
+fn write_evidence(writer: &mut dyn fmt::Write, evidence: &Evidence) -> fmt::Result {
+    write!(
+        writer,
+        "(evidence-row :id {} :proof {}",
+        evidence.id,
+        quoted(evidence.proof.label())
+    )?;
+    if let ProofStatus::Unproven(detail) = &evidence.proof {
+        write!(writer, " :proof-detail {}", quoted(detail))?;
+    }
+    write!(
+        writer,
+        " :completeness {}",
+        quoted(evidence.completeness.label())
+    )?;
+    if let EvidenceCompleteness::Partial(detail) = &evidence.completeness {
+        write!(writer, " :completeness-detail {}", quoted(detail))?;
+    }
+    writer.write_str(" :sources ")?;
+    write_id_list(writer, evidence.sources.iter().copied())?;
+    writer.write_char(')')
+}
+
+fn write_gap(writer: &mut dyn fmt::Write, gap: &SemanticGap) -> fmt::Result {
+    write!(writer, "(gap :id {} :point {} :subject ", gap.id, gap.point)?;
+    write_gap_subject(writer, gap.subject)?;
+    write!(
+        writer,
+        " :capability {} :impacts (",
+        quoted(gap.capability.label()),
+    )?;
+    for (index, impact) in gap.impacts.iter().enumerate() {
+        if index > 0 {
+            writer.write_char(' ')?;
+        }
+        write!(writer, "{}", quoted(impact.label()))?;
+    }
+    write!(writer, ") :kind {} :budget ", quoted(gap.kind.label()),)?;
+    if let Some(budget) = gap.budget {
+        write!(
+            writer,
+            "(budget :dimension {} :limit {} :attempted {})",
+            quoted(budget.dimension().public_lane().label()),
+            budget.limit(),
+            budget.attempted(),
+        )?;
+    } else {
+        writer.write_str("none")?;
+    }
+    write!(
+        writer,
+        " :detail {} :source {} :evidence {})",
+        quoted(&gap.detail),
+        gap.source,
+        gap.evidence,
+    )
+}
+
+fn write_gap_subject(writer: &mut dyn fmt::Write, subject: SemanticGapSubject) -> fmt::Result {
+    write!(writer, "(subject :kind {}", quoted(subject.label()))?;
+    match subject {
+        SemanticGapSubject::Procedure | SemanticGapSubject::Point => {}
+        SemanticGapSubject::Value(value) => write!(writer, " :value {value}")?,
+        SemanticGapSubject::MemoryLocation(location) => {
+            write!(writer, " :memory-location {location}")?;
+        }
+        SemanticGapSubject::Capture(capture) => {
+            write!(writer, " :capture {capture}")?;
+        }
+        SemanticGapSubject::CallSite(call_site) => {
+            write!(writer, " :call-site {call_site}")?;
+        }
+        SemanticGapSubject::CallContinuation { call_site, kind } => {
+            write!(
+                writer,
+                " :call-site {call_site} :continuation-kind {}",
+                quoted(kind.label())
+            )?;
+        }
+        SemanticGapSubject::AsyncContinuation { suspend, kind } => {
+            write!(
+                writer,
+                " :suspend {suspend} :resume-kind {}",
+                quoted(kind.label())
+            )?;
+        }
+    }
+    writer.write_char(')')
+}
+
+fn write_block(writer: &mut dyn fmt::Write, block: &BasicBlock) -> fmt::Result {
+    write!(writer, "(block :id {} :points ", block.id)?;
+    write_id_list(writer, block.points.iter().copied())?;
+    write!(
+        writer,
+        " :source {} :evidence {})",
+        block.source, block.evidence,
+    )
+}
+
+#[doc(hidden)]
+pub fn render_point(
+    state: &mut RenderState,
+    procedure: &ProcedureSemantics,
+    point: &ProgramPoint,
+) -> bool {
+    if !state.open_row_with(4, |writer| {
+        write!(
+            writer,
+            "(program-point :id {} :block {} :source {} :evidence {}",
+            point.id, point.block, point.source, point.evidence
+        )?;
+        writer.write_str(" :predecessor-edges ")?;
+        write_id_list(
+            writer,
+            procedure
+                .predecessor_edges(point.id)
+                .map(|(edge_id, _)| edge_id),
+        )?;
+        writer.write_str(" :successor-edges ")?;
+        write_id_list(
+            writer,
+            procedure
+                .successor_edges(point.id)
+                .map(|(edge_id, _)| edge_id),
+        )
+    }) {
+        return false;
+    }
+    for (index, event) in point.events.iter().enumerate() {
+        if !state.row_with(5, |writer| write_event(writer, index, event)) {
+            return false;
+        }
+    }
+    state.writer.close(4)
+}
+
+fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent) -> fmt::Result {
+    write!(
+        writer,
+        "(event :index {index} :effect {}",
+        quoted(event.effect.label())
+    )?;
+    match &event.effect {
+        SemanticEffect::Entry | SemanticEffect::NormalExit | SemanticEffect::ExceptionalExit => {}
+        SemanticEffect::Assignment { target, value } => {
+            write!(writer, " :target {target} :value {value}")?;
+        }
+        SemanticEffect::AggregateInitializer {
+            aggregate,
+            selector,
+            value,
+        } => {
+            write!(writer, " :aggregate {aggregate} :selector (locator ")?;
+            write_locator(writer, selector)?;
+            write!(writer, ") :value {value}")?;
+        }
+        SemanticEffect::ValueFlow {
+            kind,
+            source,
+            target,
+        } => {
+            write!(
+                writer,
+                " :flow-kind {} :flow-source {source} :target {target}",
+                quoted(kind.label())
+            )?;
+            if let ValueFlowKind::IndexedReturn { ordinal } = kind {
+                write!(writer, " :result-index {ordinal}")?;
+            }
+            if let ValueFlowKind::Transfer(transfer) = kind {
+                write!(writer, " :transfer-kind {}", quoted(transfer.kind.label()))?;
+                match transfer.kind {
+                    TransferKind::Move { invalidation } => {
+                        write!(writer, " :invalidation {}", quoted(invalidation.label()))?;
+                    }
+                    TransferKind::Conversion { preservation } => {
+                        write!(writer, " :preservation {}", quoted(preservation.label()))?;
+                    }
+                    TransferKind::Copy
+                    | TransferKind::AggregateCopy
+                    | TransferKind::Boxing
+                    | TransferKind::Unboxing => {}
+                }
+                match transfer.operation {
+                    TransferOperation::None => {}
+                    TransferOperation::CallSite(call_site) => {
+                        write!(writer, " :operation-call-site {call_site}")?;
+                    }
+                    TransferOperation::CallArgumentConversion(conversion) => {
+                        write!(writer, " :operation-call-argument-conversion {conversion}")?;
+                    }
+                    TransferOperation::ValueCarrierAdaptation(adaptation) => {
+                        write!(writer, " :operation-value-carrier-adaptation {adaptation}")?;
+                    }
+                    TransferOperation::Unknown => {
+                        writer.write_str(" :operation \"unknown\"")?;
+                    }
+                }
+            }
+            if let ValueFlowKind::BackingStore { offset } = kind {
+                match offset {
+                    BackingStoreOffset::Zero => writer.write_str(" :element-offset 0")?,
+                    BackingStoreOffset::Constant(offset) => {
+                        write!(writer, " :element-offset {offset}")?;
+                    }
+                    BackingStoreOffset::Value(value) => {
+                        write!(writer, " :element-offset-value {value}")?;
+                    }
+                }
+            }
+            if let ValueFlowKind::IntegerOffset { offset } = kind {
+                write!(
+                    writer,
+                    " :integer-offset-sign {} :integer-offset-magnitude {}",
+                    quoted(if offset.negative() {
+                        "negative"
+                    } else {
+                        "positive"
+                    }),
+                    offset.magnitude()
+                )?;
+            }
+            if let ValueFlowKind::BackingStoreAlternative { offset, allocation } = kind {
+                write!(writer, " :alternative-allocation {allocation}")?;
+                match offset {
+                    BackingStoreOffset::Zero => writer.write_str(" :element-offset 0")?,
+                    BackingStoreOffset::Constant(offset) => {
+                        write!(writer, " :element-offset {offset}")?;
+                    }
+                    BackingStoreOffset::Value(value) => {
+                        write!(writer, " :element-offset-value {value}")?;
+                    }
+                }
+            }
+        }
+        SemanticEffect::ValueUse { kind, value } => {
+            write!(writer, " :use-kind {} :value {value}", quoted(kind.label()))?;
+        }
+        SemanticEffect::Allocation { allocation } => {
+            write!(writer, " :allocation {allocation}")?;
+        }
+        SemanticEffect::MemoryLoad {
+            kind,
+            location,
+            result,
+        } => {
+            write!(
+                writer,
+                " :access-kind {} :location {location} :result {result}",
+                quoted(kind.label())
+            )?;
+        }
+        SemanticEffect::MemoryStore {
+            kind,
+            location,
+            value,
+        } => {
+            write!(
+                writer,
+                " :access-kind {} :location {location} :value {value}",
+                quoted(kind.label())
+            )?;
+        }
+        SemanticEffect::Synchronization {
+            operation,
+            subject,
+            payload,
+        } => {
+            write!(
+                writer,
+                " :operation {} :subject {subject}",
+                quoted(operation.label())
+            )?;
+            match payload {
+                Some(SynchronizationPayload::Send { value, copy }) => {
+                    write!(
+                        writer,
+                        " :payload-kind {} :payload-value {value} :payload-copy {}",
+                        quoted("send"),
+                        quoted(copy.label())
+                    )?;
+                    if let crate::analyzer::semantic::ir::SynchronizationPayloadCopy::BackingStore { identity } = copy {
+                        write!(
+                            writer,
+                            " :payload-index-identity {}",
+                            quoted(identity.label())
+                        )?;
+                    }
+                }
+                Some(SynchronizationPayload::Receive { result }) => {
+                    write!(
+                        writer,
+                        " :payload-kind {} :payload-result {result}",
+                        quoted("receive")
+                    )?;
+                }
+                None => {}
+            }
+        }
+        SemanticEffect::CallableCreation { result, callable }
+        | SemanticEffect::CallableReference { result, callable } => {
+            write!(writer, " :result {result} ")?;
+            write_callable(writer, callable)?;
+        }
+        SemanticEffect::CaptureBind { capture } => {
+            write!(writer, " :capture {capture}")?;
+        }
+        SemanticEffect::Invoke { call_site } => {
+            write!(writer, " :call-site {call_site}")?;
+        }
+        SemanticEffect::CallContinuation { call_site, kind } => {
+            write!(
+                writer,
+                " :call-site {call_site} :continuation-kind {}",
+                quoted(kind.label())
+            )?;
+        }
+        SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
+            write!(writer, " :value {}", optional_id(*value))?;
+        }
+        SemanticEffect::AsyncSuspend {
+            awaited,
+            normal_resume,
+            exceptional_resume,
+        } => {
+            write!(
+                writer,
+                " :awaited {} :normal-resume ",
+                optional_id(*awaited)
+            )?;
+            write_control_continuation(writer, *normal_resume)?;
+            writer.write_str(" :exceptional-resume ")?;
+            write_control_continuation(writer, *exceptional_resume)?;
+        }
+        SemanticEffect::AsyncResume {
+            suspend,
+            kind,
+            result,
+        } => {
+            write!(
+                writer,
+                " :suspend {suspend} :resume-kind {} :result {}",
+                quoted(kind.label()),
+                optional_id(*result)
+            )?;
+        }
+        SemanticEffect::Gap { gap } => {
+            write!(writer, " :gap {gap}")?;
+        }
+    }
+    write!(
+        writer,
+        " :source {} :evidence {})",
+        event.source, event.evidence
+    )
+}
+
+fn write_callable(writer: &mut dyn fmt::Write, callable: &CallableValue) -> fmt::Result {
+    write!(writer, ":callable-kind {} ", quoted(callable.kind.label()))?;
+    match callable.kind {
+        crate::analyzer::semantic::ir::CallableReferenceKind::ModuleQualified { qualifier } => {
+            write!(writer, ":module-qualifier {qualifier} ")?;
+        }
+        crate::analyzer::semantic::ir::CallableReferenceKind::TypeQualifiedMethod { qualifier } => {
+            write!(writer, ":type-qualifier {qualifier} ")?;
+        }
+        _ => {}
+    }
+    write_target_resolution(writer, &callable.targets)?;
+    write!(
+        writer,
+        " :target-evidence {} :bound-receiver {} :environment {}",
+        callable.target_evidence,
+        optional_id(callable.bound_receiver),
+        optional_id(callable.environment),
+    )
+}
+
+fn write_target_resolution(
+    writer: &mut dyn fmt::Write,
+    resolution: &CallableTargetResolution,
+) -> fmt::Result {
+    write!(
+        writer,
+        ":target-resolution {} :targets (",
+        quoted(resolution.label())
+    )?;
+    for target in resolution.candidates() {
+        write!(writer, "(target :kind {}", quoted(target.label()))?;
+        match target {
+            CallableTarget::Artifact(target) => {
+                let identity = target.identity();
+                write!(
+                    writer,
+                    " :artifact-sha256 {} :package {} :file {} :start-byte {} :end-byte {} :source-identity {}",
+                    quoted(&identity.artifact_sha256),
+                    quoted(&identity.package_identity),
+                    quoted(&identity.anchor.file),
+                    identity.anchor.byte_range.start,
+                    identity.anchor.byte_range.end,
+                    quoted(&format!("{identity:?}")),
+                )?;
+            }
+            CallableTarget::Local(procedure) => write!(writer, " :procedure {procedure}")?,
+            CallableTarget::Unmaterialized(locator) | CallableTarget::External(locator) => {
+                writer.write_str(" :locator (locator ")?;
+                write_locator(writer, locator)?;
+                writer.write_char(')')?;
+            }
+        }
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')
+}
+
+#[doc(hidden)]
+pub fn write_control_edge(
+    writer: &mut dyn fmt::Write,
+    edge_id: ControlEdgeId,
+    edge: &ControlEdge,
+) -> fmt::Result {
+    write!(
+        writer,
+        "(control-edge :id {} :source-point {} :target-point {} :kind {} :source {} :evidence {})",
+        edge_id,
+        edge.source_point,
+        edge.target_point,
+        quoted(edge.kind.label()),
+        edge.source,
+        edge.evidence,
+    )
+}
+
+fn write_icfg_node(writer: &mut dyn fmt::Write, node: &IcfgNodeKey) -> fmt::Result {
+    writer.write_str("(icfg-node :point ")?;
+    write_icfg_point_ref(writer, node.point())?;
+    writer.write_str(" :context (")?;
+    for call in node.call_context() {
+        writer.write_str("(call ")?;
+        let semantic_call = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("published ICFG call context retains a valid call handle");
+        let mapping = call
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published semantic call retains a valid source mapping");
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_str("))")
+}
+
+fn write_icfg_point_ref(
+    writer: &mut dyn fmt::Write,
+    point: &crate::analyzer::semantic::ProgramPointHandle,
+) -> fmt::Result {
+    let procedure = point.procedure().semantics();
+    let semantic_point = procedure
+        .point(point.id())
+        .expect("published ICFG node retains a valid point handle");
+    let mapping = procedure
+        .source_mapping(semantic_point.source)
+        .expect("published semantic point retains a valid source mapping");
+    writer.write_str("(point :procedure (locator ")?;
+    write_locator(writer, procedure.locator())?;
+    writer.write_str(") :source (locator ")?;
+    write_locator(writer, &mapping.locator)?;
+    writer.write_str(") :effects (")?;
+    for event in semantic_point.events.iter() {
+        write!(writer, "{} ", quoted(event.effect.label()))?;
+    }
+    writer.write_str("))")
+}
+
+fn write_icfg_edge(
+    writer: &mut dyn fmt::Write,
+    snapshot: &IcfgSnapshot,
+    edge: &IcfgEdge,
+) -> fmt::Result {
+    write!(
+        writer,
+        "(icfg-edge :kind {} :source ",
+        quoted(edge.kind.label())
+    )?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(edge.source)
+            .expect("published ICFG edge source exists"),
+    )?;
+    writer.write_str(" :target ")?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(edge.target)
+            .expect("published ICFG edge target exists"),
+    )?;
+    write!(
+        writer,
+        " :proof {} :completeness {}",
+        quoted(edge.proof.label()),
+        quoted(edge.completeness.label())
+    )?;
+    if let Some(origin) = &edge.origin {
+        writer.write_str(" :origin ")?;
+        let semantic_call = origin
+            .procedure()
+            .semantics()
+            .call_site(origin.id())
+            .expect("published ICFG edge origin exists");
+        let mapping = origin
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published ICFG edge origin has a source mapping");
+        writer.write_str("(call ")?;
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')
+}
+
+fn write_icfg_boundary(
+    writer: &mut dyn fmt::Write,
+    snapshot: &IcfgSnapshot,
+    boundary: &IcfgBoundary,
+) -> fmt::Result {
+    writer.write_str("(icfg-boundary :at ")?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(boundary.at)
+            .expect("published ICFG boundary node exists"),
+    )?;
+    writer.write_str(" :kind ")?;
+    match &boundary.kind {
+        IcfgBoundaryKind::Dispatch(dispatch) => {
+            write!(writer, "{}", quoted(dispatch_boundary_label(dispatch)))?
+        }
+        IcfgBoundaryKind::Limit(limit) => write!(writer, "{}", quoted(limit.label()))?,
+        IcfgBoundaryKind::Continuation { kind, state } => write!(
+            writer,
+            "{} :continuation-state {}",
+            quoted(match kind {
+                crate::analyzer::semantic::CallContinuationKind::Normal => "normal_continuation",
+                crate::analyzer::semantic::CallContinuationKind::Exceptional =>
+                    "exceptional_continuation",
+            }),
+            quoted(state.label())
+        )?,
+    }
+    if let IcfgBoundaryKind::Dispatch(
+        DispatchBoundaryKind::External(Some(locator))
+        | DispatchBoundaryKind::Unmaterialized(locator)
+        | DispatchBoundaryKind::Deferred {
+            target: locator, ..
+        },
+    ) = &boundary.kind
+    {
+        writer.write_str(" :target (locator ")?;
+        write_locator(writer, locator)?;
+        writer.write_char(')')?;
+    }
+    if let Some(origin) = &boundary.origin {
+        writer.write_str(" :origin ")?;
+        let semantic_call = origin
+            .procedure()
+            .semantics()
+            .call_site(origin.id())
+            .expect("published ICFG boundary origin exists");
+        let mapping = origin
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published ICFG boundary origin has a source mapping");
+        writer.write_str("(call ")?;
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')
+}
+
+fn dispatch_boundary_label(boundary: &DispatchBoundaryKind) -> &'static str {
+    match boundary {
+        DispatchBoundaryKind::External(_) => "external",
+        DispatchBoundaryKind::Unmaterialized(_) => "unmaterialized",
+        DispatchBoundaryKind::Deferred { kind, .. } => match kind {
+            crate::analyzer::semantic::DeferredInvocationKind::Async => "deferred_async",
+            crate::analyzer::semantic::DeferredInvocationKind::Generator => "deferred_generator",
+            crate::analyzer::semantic::DeferredInvocationKind::AsyncGenerator => {
+                "deferred_async_generator"
+            }
+            crate::analyzer::semantic::DeferredInvocationKind::LanguageDefined => {
+                "deferred_language_defined"
+            }
+        },
+        DispatchBoundaryKind::Unresolved => "unresolved",
+        DispatchBoundaryKind::Truncated => "truncated",
+    }
+}
+
+fn write_locator(writer: &mut dyn fmt::Write, locator: &SemanticLocator) -> fmt::Result {
+    let anchor = locator.anchor();
+    let span = anchor.span();
+    let start = span.start();
+    let end = span.end();
+    writer.write_str(":mount ")?;
+    write_quoted_display(writer, locator.mount())?;
+    write!(
+        writer,
+        " :path {} :language {} :role {} :byte-span (start-inclusive {} end-exclusive {}) :start (position :line0 {} :utf8-byte-column {}) :end (position :line0 {} :utf8-byte-column {}) :occurrence {} :declaration (",
+        quoted(locator.path().as_str()),
+        quoted(locator.language().stable_label()),
+        quoted(locator.role().stable_label()),
+        span.start_byte(),
+        span.end_byte(),
+        start.line(),
+        start.byte_column(),
+        end.line(),
+        end.byte_column(),
+        anchor.occurrence(),
+    )?;
+    for segment in locator.declaration().segments() {
+        let segment_anchor = segment.anchor();
+        let segment_span = segment_anchor.span();
+        write!(
+            writer,
+            "(segment :kind {} :name ",
+            quoted(segment.kind().stable_label()),
+        )?;
+        if let Some(name) = segment.name() {
+            write!(writer, "{}", quoted(name))?;
+        } else {
+            writer.write_str("none")?;
+        }
+        write!(
+            writer,
+            " :byte-span (start-inclusive {} end-exclusive {}) :occurrence {} :sibling-ordinal {})",
+            segment_span.start_byte(),
+            segment_span.end_byte(),
+            segment_anchor.occurrence(),
+            segment.sibling_ordinal(),
+        )?;
+    }
+    writer.write_char(')')
+}
+struct OptionalId<T>(Option<T>);
+
+impl<T: fmt::Display> fmt::Display for OptionalId<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(value) => value.fmt(formatter),
+            None => formatter.write_str("none"),
+        }
+    }
+}
+
+const fn optional_id<T>(id: Option<T>) -> OptionalId<T> {
+    OptionalId(id)
+}
+
+#[doc(hidden)]
+pub fn write_id_list<T: fmt::Display>(
+    writer: &mut dyn fmt::Write,
+    ids: impl IntoIterator<Item = T>,
+) -> fmt::Result {
+    writer.write_char('(')?;
+    let mut first = true;
+    for id in ids {
+        if !first {
+            writer.write_char(' ')?;
+        }
+        first = false;
+        write!(writer, "{id}")?;
+    }
+    writer.write_char(')')
+}
+
+fn write_quoted_display(writer: &mut dyn fmt::Write, value: impl fmt::Display) -> fmt::Result {
+    writer.write_char('"')?;
+    write!(writer, "{value}")?;
+    writer.write_char('"')
+}
+
+fn open_artifact(state: &mut RenderState, key: &SemanticArtifactKey) -> bool {
+    if !state.writer.open(0, "(semantic-ir") {
+        return false;
+    }
+    if !state.writer.open_with(1, |writer| {
+        writer.write_str("(artifact :fingerprint ")?;
+        write_quoted_display(writer, key.fingerprint())
+    }) {
+        return false;
+    }
+    if !state.source_row_with(2, |writer| {
+        writer.write_str("(source :mount ")?;
+        write_quoted_display(writer, key.mount())?;
+        write!(
+            writer,
+            " :path {} :language {})",
+            quoted(key.path().as_str()),
+            quoted(key.language().stable_label()),
+        )
+    }) {
+        return false;
+    }
+    if !state.row_with(2, |writer| match key.revision() {
+        SourceRevision::Disk { content } => {
+            writer.write_str("(revision :kind \"disk\" :content ")?;
+            write_quoted_display(writer, content)?;
+            writer.write_char(')')
+        }
+        SourceRevision::Overlay { content, snapshot } => {
+            writer.write_str("(revision :kind \"overlay\" :content ")?;
+            write_quoted_display(writer, content)?;
+            writer.write_str(" :snapshot ")?;
+            write_quoted_display(writer, snapshot)?;
+            writer.write_char(')')
+        }
+    }) || !state.row_with(2, |writer| {
+        write!(
+            writer,
+            "(adapter :name {} :fingerprint ",
+            quoted(key.adapter().name()),
+        )?;
+        write_quoted_display(writer, key.adapter().fingerprint())?;
+        writer.write_char(')')
+    }) || !state.row_with(2, |writer| {
+        writer.write_str("(versions :semantic-ir ")?;
+        write_quoted_display(writer, key.ir_version())?;
+        writer.write_str(" :configuration ")?;
+        write_quoted_display(writer, key.configuration())?;
+        writer.write_str(" :dependencies ")?;
+        write_quoted_display(writer, key.dependencies())?;
+        writer.write_char(')')
+    }) {
+        return false;
+    }
+    true
+}
+
+fn render_capabilities(state: &mut RenderState, capabilities: &SemanticCapabilities) -> bool {
+    if !state.writer.open(2, "(capabilities") {
+        return false;
+    }
+    for (capability, support) in capabilities.iter() {
+        if !state.row_with(3, |writer| {
+            write!(
+                writer,
+                "(capability :name {} :support {})",
+                quoted(capability.label()),
+                quoted(capability_support_label(support))
+            )
+        }) {
+            return false;
+        }
+    }
+    state.writer.close(2)
+}
+
+const fn capability_support_label(support: CapabilitySupport) -> &'static str {
+    match support {
+        CapabilitySupport::Complete => "complete",
+        CapabilitySupport::Partial => "partial",
+        CapabilitySupport::Unsupported => "unsupported",
+    }
+}

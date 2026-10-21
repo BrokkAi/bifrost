@@ -96,6 +96,8 @@ pub(super) const DISPATCH_ARM_LABELS: &[&str] = &["proven_dispatch", "may_dispat
 pub(super) struct DispatchSiteAnswer {
     pub(super) outcome: &'static str,
     pub(super) coverage: CandidateCoverage,
+    /// Detailed oracle reasons retained for source-attributed effect diagnostics.
+    pub(super) coverage_reasons: Vec<String>,
     pub(super) call_site_count: usize,
     pub(super) semantic_unsupported: Option<&'static str>,
     pub(super) exceeded_limit: Option<&'static str>,
@@ -129,6 +131,7 @@ impl DispatchSiteAnswer {
         Self {
             outcome,
             coverage: CandidateCoverage::Open,
+            coverage_reasons: Vec::new(),
             call_site_count: 0,
             semantic_unsupported,
             exceeded_limit,

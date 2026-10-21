@@ -49,7 +49,8 @@ const SEMANTIC_IR_ROWS_VERSION: u32 = 7;
 
 /// What a parse-time lowerer produced for one blob.
 #[derive(Debug)]
-pub(crate) enum SemanticIrLoweringOutcome {
+#[doc(hidden)]
+pub enum SemanticIrLoweringOutcome {
     /// The validated procedures. Go predeclared-builtin assumptions travel
     /// inside the parts.
     Complete {
@@ -67,7 +68,8 @@ pub(crate) enum SemanticIrLoweringOutcome {
 
 /// The head values and encoded child rows of one blob, ready to insert.
 #[derive(Debug)]
-pub(crate) struct PreparedSemanticIr {
+#[doc(hidden)]
+pub struct PreparedSemanticIr {
     producer_epoch: String,
     content: ContentIdentity,
     source_bytes: usize,
@@ -84,7 +86,8 @@ impl PreparedSemanticIr {
     /// `partial_flows` holds one entry per procedure of a complete outcome.
     /// Its rows are encoded in the same pass as the IR, because the flows name
     /// locators and texts that the IR's own interning assigns.
-    pub(crate) fn prepare(
+    #[doc(hidden)]
+    pub fn prepare(
         outcome: SemanticIrLoweringOutcome,
         partial_flows: Option<&[ProcedurePartialFlows]>,
         producer_epoch: &str,
@@ -137,13 +140,15 @@ impl PreparedSemanticIr {
     }
 
     /// The head row plus every child row.
-    pub(crate) fn logical_rows(&self) -> usize {
+    #[doc(hidden)]
+    pub fn logical_rows(&self) -> usize {
         1 + self.rows.row_count()
     }
 
     /// An estimate: 4 bytes per integer cell plus the bytes of every text
     /// and blob cell, over the head and the child rows.
-    pub(crate) fn payload_bytes(&self) -> usize {
+    #[doc(hidden)]
+    pub fn payload_bytes(&self) -> usize {
         let head = 4 * 8
             + self.producer_epoch.len()
             + self.content.as_bytes().len()
@@ -153,8 +158,9 @@ impl PreparedSemanticIr {
     }
 
     /// Rows and estimated payload bytes per child table.
-    #[cfg(test)]
-    fn table_census(&self) -> Vec<(&'static str, usize, usize)> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn table_census(&self) -> Vec<(&'static str, usize, usize)> {
         Table::ALL
             .iter()
             .map(|table| {
@@ -170,7 +176,8 @@ impl PreparedSemanticIr {
 
 /// Insert one blob's head as `building`, its child rows, then seal the head
 /// `complete`. Returns false when cancelled; the caller rolls back.
-pub(super) fn insert_semantic_ir_tx(
+#[doc(hidden)]
+pub fn insert_semantic_ir_tx(
     tx: &rusqlite::Transaction<'_>,
     blob_id: i64,
     lang: &str,
@@ -243,7 +250,8 @@ pub(super) fn insert_semantic_ir_tx(
 /// schema, the configuration and the row encoding. The dependency
 /// fingerprint is deliberately absent, because a parse-time lowerer's output
 /// depends on nothing but the file.
-pub(crate) fn semantic_ir_producer_epoch(identity: &SemanticAdapterIdentity) -> String {
+#[doc(hidden)]
+pub fn semantic_ir_producer_epoch(identity: &SemanticAdapterIdentity) -> String {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-semantic-ir-rows-producer-epoch");
     digest.push(identity.adapter.name().as_bytes());
     digest.push(identity.adapter.fingerprint().as_bytes());
@@ -255,15 +263,21 @@ pub(crate) fn semantic_ir_producer_epoch(identity: &SemanticAdapterIdentity) -> 
 
 /// A valid head: complete and written under the language's active epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SemanticIrPublication {
-    pub(crate) blob_id: i64,
-    pub(crate) content: ContentIdentity,
-    pub(crate) source_bytes: usize,
-    pub(crate) outcome: SemanticIrPublicationOutcome,
+#[doc(hidden)]
+pub struct SemanticIrPublication {
+    #[doc(hidden)]
+    pub blob_id: i64,
+    #[doc(hidden)]
+    pub content: ContentIdentity,
+    #[doc(hidden)]
+    pub source_bytes: usize,
+    #[doc(hidden)]
+    pub outcome: SemanticIrPublicationOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SemanticIrPublicationOutcome {
+#[doc(hidden)]
+pub enum SemanticIrPublicationOutcome {
     Complete,
     ExceededBudget(SemanticBudgetExceeded),
     Unsupported(SemanticCapability),
@@ -276,11 +290,30 @@ pub(crate) enum SemanticIrPublicationOutcome {
 /// or language, and no path when it is the blob's own; the decoder takes
 /// them from here.
 #[derive(Debug, Clone)]
-pub(crate) struct SemanticIrMountScope {
+#[doc(hidden)]
+pub struct SemanticIrMountScope {
     pub(crate) mount: WorkspaceMountId,
     pub(crate) path: WorkspaceRelativePath,
     pub(crate) language: SemanticLanguage,
     pub(crate) content: ContentIdentity,
+}
+
+impl SemanticIrMountScope {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(
+        mount: WorkspaceMountId,
+        path: WorkspaceRelativePath,
+        language: SemanticLanguage,
+        content: ContentIdentity,
+    ) -> Self {
+        Self {
+            mount,
+            path,
+            language,
+            content,
+        }
+    }
 }
 
 /// The head lookup. Its validity rule is the one the missing-analysis
@@ -300,7 +333,8 @@ impl AnalyzerStore {
     /// Install the active producer epoch for one storage language. Returns
     /// whether it changed. Heads written under another epoch stop being
     /// valid; replacing their blob removes them.
-    pub(crate) fn ensure_semantic_ir_producer_epoch(
+    #[doc(hidden)]
+    pub fn ensure_semantic_ir_producer_epoch(
         &self,
         storage_language: &str,
         producer_epoch: &str,
@@ -335,7 +369,8 @@ impl AnalyzerStore {
 
     /// The valid head of one blob, or `None` when there is no head or it was
     /// written under another producer epoch.
-    pub(crate) fn semantic_ir_publication(
+    #[doc(hidden)]
+    pub fn semantic_ir_publication(
         &self,
         oid: Oid,
         lang: &str,
@@ -375,7 +410,8 @@ impl AnalyzerStore {
     /// One procedure's partial flows, read in one transaction, or `None` when
     /// the procedure has no head row. `scope` is the mount the locators of the
     /// blob are rebuilt under, as for [`Self::read_semantic_ir`].
-    pub(crate) fn read_partial_flows(
+    #[doc(hidden)]
+    pub fn read_partial_flows(
         &self,
         blob_id: i64,
         procedure: ProcedureId,
@@ -391,7 +427,8 @@ impl AnalyzerStore {
     /// Every row of one blob, read in one transaction and decoded into the
     /// procedures the lowerer produced. Go builtin assumptions are restored
     /// onto procedure 0.
-    pub(crate) fn read_semantic_ir(
+    #[doc(hidden)]
+    pub fn read_semantic_ir(
         &self,
         blob_id: i64,
         scope: &SemanticIrMountScope,

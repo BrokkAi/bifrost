@@ -4,7 +4,7 @@ INSERT INTO cr_gaps
 SELECT 'open_export_inventory',
        'public-module-surface:' || hex(fact.crate_key) || ':' || fact.module_path
          || ':' || fact.namespace || ':' || fact.name,
-       json_object('reason', fact.kind, 'crate_key', hex(fact.crate_key),
+       json_object('subject_level', 'public_surface', 'reason', fact.kind, 'crate_key', hex(fact.crate_key),
                    'module_path', fact.module_path, 'namespace', fact.namespace,
                    'name', fact.name,
                    'candidates', json((

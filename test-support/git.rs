@@ -2,7 +2,8 @@ use git2::{Commit, Index, IndexAddOption, Oid, Repository, Signature};
 use std::path::Path;
 
 #[allow(dead_code)]
-pub(crate) fn commit_index(
+#[doc(hidden)]
+pub fn commit_index(
     repo: &Repository,
     index: Index,
     message: &str,
@@ -18,7 +19,8 @@ pub(crate) fn commit_index(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_index_without_parent(
+#[doc(hidden)]
+pub fn commit_index_without_parent(
     repo: &Repository,
     index: Index,
     message: &str,
@@ -28,7 +30,8 @@ pub(crate) fn commit_index_without_parent(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_index_after_head(
+#[doc(hidden)]
+pub fn commit_index_after_head(
     repo: &Repository,
     index: Index,
     message: &str,
@@ -57,7 +60,8 @@ fn commit_index_with_parents(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_all(repo: &Repository, message: &str, signature: &Signature<'_>) -> Oid {
+#[doc(hidden)]
+pub fn commit_all(repo: &Repository, message: &str, signature: &Signature<'_>) -> Oid {
     let mut index = repo.index().expect("repository index");
     index
         .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
@@ -66,7 +70,8 @@ pub(crate) fn commit_all(repo: &Repository, message: &str, signature: &Signature
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_all_without_parent(
+#[doc(hidden)]
+pub fn commit_all_without_parent(
     repo: &Repository,
     message: &str,
     signature: &Signature<'_>,
@@ -79,11 +84,8 @@ pub(crate) fn commit_all_without_parent(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_all_after_head(
-    repo: &Repository,
-    message: &str,
-    signature: &Signature<'_>,
-) -> Oid {
+#[doc(hidden)]
+pub fn commit_all_after_head(repo: &Repository, message: &str, signature: &Signature<'_>) -> Oid {
     let mut index = repo.index().expect("repository index");
     index
         .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
@@ -92,7 +94,8 @@ pub(crate) fn commit_all_after_head(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_all_with_deletions(
+#[doc(hidden)]
+pub fn commit_all_with_deletions(
     repo: &Repository,
     message: &str,
     signature: &Signature<'_>,
@@ -108,7 +111,8 @@ pub(crate) fn commit_all_with_deletions(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_all_skipping_bifrost_cache(
+#[doc(hidden)]
+pub fn commit_all_skipping_bifrost_cache(
     repo: &Repository,
     message: &str,
     signature: &Signature<'_>,
@@ -128,7 +132,8 @@ pub(crate) fn commit_all_skipping_bifrost_cache(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_paths(
+#[doc(hidden)]
+pub fn commit_paths(
     repo: &Repository,
     paths: &[&str],
     message: &str,
@@ -142,7 +147,8 @@ pub(crate) fn commit_paths(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_paths_without_parent(
+#[doc(hidden)]
+pub fn commit_paths_without_parent(
     repo: &Repository,
     paths: &[&str],
     message: &str,
@@ -156,7 +162,8 @@ pub(crate) fn commit_paths_without_parent(
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_paths_with_removals(
+#[doc(hidden)]
+pub fn commit_paths_with_removals(
     repo: &Repository,
     add: &[&str],
     remove: &[&str],

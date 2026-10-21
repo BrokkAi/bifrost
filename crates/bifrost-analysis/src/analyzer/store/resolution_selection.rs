@@ -83,14 +83,14 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_content_mounts(
 
 "#;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static SELECTED_STATIC_SQL_CAPACITIES: std::cell::Cell<[usize; 17]> = const {
         std::cell::Cell::new([0; 17])
     };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(in crate::analyzer::store) fn note_selected_static_sql_capacity(index: usize, capacity: usize) {
     SELECTED_STATIC_SQL_CAPACITIES.with(|values| {
         let mut capacities = values.get();
@@ -100,8 +100,9 @@ pub(in crate::analyzer::store) fn note_selected_static_sql_capacity(index: usize
     });
 }
 
-#[cfg(test)]
-pub(super) fn selected_static_sql_capacities() -> [(&'static str, usize); 17] {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn selected_static_sql_capacities() -> [(&'static str, usize); 17] {
     let capacities = SELECTED_STATIC_SQL_CAPACITIES.with(std::cell::Cell::get);
     let names = [
         "temp_schema",
@@ -125,7 +126,8 @@ pub(super) fn selected_static_sql_capacities() -> [(&'static str, usize); 17] {
     std::array::from_fn(|index| (names[index], capacities[index]))
 }
 
-fn selected_resolution_temp_schema_sql() -> &'static str {
+#[doc(hidden)]
+pub fn selected_resolution_temp_schema_sql() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
     SQL.get_or_init(|| {
         let count_columns = RESOLUTION_MANIFEST_COUNT_COLUMNS
@@ -181,7 +183,7 @@ fn selected_resolution_temp_schema_sql() -> &'static str {
             module_placements_schema = super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL,
             go_placements = super::resolution_operation::go_context::GO_TRANSIENT_PLACEMENTS_SQL,
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         note_selected_static_sql_capacity(0, sql.capacity());
         sql
     })
@@ -192,7 +194,8 @@ DELETE FROM temp.selected_resolution_stage_producers;
 DELETE FROM temp.selected_resolution_stage_nodes;
 DELETE FROM temp.selected_resolution_admissions;
 DELETE FROM temp.selected_resolution_scope_mounts;
-DELETE FROM temp.selected_rust_module_placements;
+DELETE FROM temp.selected_rust_transient_placement_attributes;
+DELETE FROM temp.selected_resolution_transient_placements;
 DELETE FROM temp.selected_resolution_mounts;
 DELETE FROM temp.selected_resolution_typed_requests_1;
 DELETE FROM temp.selected_resolution_typed_requests_2;
@@ -338,7 +341,7 @@ fn selected_mount_status_sql(continuation: bool) -> &'static str {
                 ""
             },
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         note_selected_static_sql_capacity(if continuation { 2 } else { 1 }, sql.capacity());
         sql
     })
@@ -362,20 +365,22 @@ fn selected_content_mount_status_sql() -> &'static str {
              {status_joins}
              ORDER BY requests.storage_language, requests.persisted_relative_path"
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         note_selected_static_sql_capacity(3, sql.capacity());
         sql
     })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedResolutionLanguage {
+#[doc(hidden)]
+pub struct SelectedResolutionLanguage {
     storage_language: String,
     semantic_language: Language,
 }
 
 impl SelectedResolutionLanguage {
-    pub(crate) fn new(storage_language: impl Into<String>, semantic_language: Language) -> Self {
+    #[doc(hidden)]
+    pub fn new(storage_language: impl Into<String>, semantic_language: Language) -> Self {
         let storage_language = storage_language.into();
         assert!(
             !storage_language.is_empty(),
@@ -402,14 +407,16 @@ impl SelectedResolutionLanguage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedResolutionOverlayMask {
+#[doc(hidden)]
+pub struct SelectedResolutionOverlayMask {
     storage_language: String,
     persisted_relative_path: String,
     intent: SelectedResolutionOverlayIntent,
 }
 
 impl SelectedResolutionOverlayMask {
-    pub(crate) fn replacement(
+    #[doc(hidden)]
+    pub fn replacement(
         storage_language: impl Into<String>,
         persisted_relative_path: impl Into<String>,
     ) -> Self {
@@ -420,7 +427,8 @@ impl SelectedResolutionOverlayMask {
         )
     }
 
-    pub(crate) fn removal(
+    #[doc(hidden)]
+    pub fn removal(
         storage_language: impl Into<String>,
         persisted_relative_path: impl Into<String>,
     ) -> Self {
@@ -471,23 +479,28 @@ impl SelectedResolutionOverlayMask {
 /// digest is derived from structured workspace rows at construction time;
 /// callers cannot supply an opaque digest or fragment identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedResolutionContentMountRequest {
-    publication: super::resolution_publication::ResolutionContentWitness,
+#[doc(hidden)]
+pub struct SelectedResolutionContentMountRequest {
+    #[doc(hidden)]
+    pub publication: super::resolution_publication::ResolutionContentWitness,
     storage_language: String,
     generation: GenerationId,
     file: WorkspaceFileRow,
     projection_digest: [u8; 32],
-    overlay_authority: Option<SelectedResolutionOverlayAuthority>,
+    #[doc(hidden)]
+    pub overlay_authority: Option<SelectedResolutionOverlayAuthority>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedResolutionOverlayAuthority {
+#[doc(hidden)]
+pub enum SelectedResolutionOverlayAuthority {
     LiveOverlay { content_digest: [u8; 32] },
     Counterfactual { base_content_digest: [u8; 32] },
 }
 
 impl SelectedResolutionContentMountRequest {
-    pub(crate) fn publication(&self) -> &super::resolution_publication::ResolutionContentWitness {
+    #[doc(hidden)]
+    pub fn publication(&self) -> &super::resolution_publication::ResolutionContentWitness {
         &self.publication
     }
 
@@ -671,7 +684,8 @@ impl SelectedResolutionContentMountRequest {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         publication: super::resolution_publication::ResolutionContentWitness,
         file: WorkspaceFileRow,
         path_symbols: Vec<PathSymbolRow>,
@@ -783,16 +797,15 @@ impl SelectedResolutionContentMountRequest {
         }
     }
 
-    pub(crate) fn with_live_overlay_content_digest(self, content_digest: [u8; 32]) -> Self {
+    #[doc(hidden)]
+    pub fn with_live_overlay_content_digest(self, content_digest: [u8; 32]) -> Self {
         self.with_overlay_authority(SelectedResolutionOverlayAuthority::LiveOverlay {
             content_digest,
         })
     }
 
-    pub(crate) fn with_counterfactual_base_content_digest(
-        self,
-        base_content_digest: [u8; 32],
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn with_counterfactual_base_content_digest(self, base_content_digest: [u8; 32]) -> Self {
         self.with_overlay_authority(SelectedResolutionOverlayAuthority::Counterfactual {
             base_content_digest,
         })
@@ -814,7 +827,8 @@ impl SelectedResolutionContentMountRequest {
         self.generation
     }
 
-    pub(crate) fn persisted_relative_path(&self) -> &str {
+    #[doc(hidden)]
+    pub fn persisted_relative_path(&self) -> &str {
         &self.file.rel_path
     }
 
@@ -826,7 +840,8 @@ impl SelectedResolutionContentMountRequest {
         self.projection_digest
     }
 
-    pub(crate) fn overlay_authority(&self) -> Option<&SelectedResolutionOverlayAuthority> {
+    #[doc(hidden)]
+    pub fn overlay_authority(&self) -> Option<&SelectedResolutionOverlayAuthority> {
         self.overlay_authority.as_ref()
     }
 }
@@ -960,23 +975,31 @@ impl SelectedResolutionLanguageState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedResolutionMountRecord {
-    ordinal: SelectedResolutionMountOrdinal,
+#[doc(hidden)]
+pub struct SelectedResolutionMountRecord {
+    #[doc(hidden)]
+    pub ordinal: SelectedResolutionMountOrdinal,
     /// The mount's content key: what its `BindingFragmentId` used to be.
     ///
     /// A `BindingFragmentId` is the mount ordinal now, which is a property of
     /// this selection rather than of the blob, so the value the selection
     /// fingerprint hashes and the interior cache keys on lives here.
-    fragment_digest: SelectedResolutionFragmentDigest,
+    pub(crate) fragment_digest: SelectedResolutionFragmentDigest,
     workspace_id: String,
     revision: i64,
     generation: i64,
-    file_version_id: Option<i64>,
-    storage_language: String,
-    semantic_language: Language,
-    persisted_relative_path: String,
-    blob_id: i64,
-    blob_oid: Oid,
+    #[doc(hidden)]
+    pub file_version_id: Option<i64>,
+    #[doc(hidden)]
+    pub storage_language: String,
+    #[doc(hidden)]
+    pub semantic_language: Language,
+    #[doc(hidden)]
+    pub persisted_relative_path: String,
+    #[doc(hidden)]
+    pub blob_id: i64,
+    #[doc(hidden)]
+    pub blob_oid: Oid,
     projection_digest: [u8; 32],
     interior_digest: [u8; 32],
     producer_epoch: String,
@@ -988,7 +1011,8 @@ pub(crate) struct SelectedResolutionMountRecord {
 /// Request-owned memo. Only explicit ordinal/path reads add records; warm
 /// operation construction leaves it empty and reader checkin never owns it.
 #[derive(Default)]
-pub(crate) struct RequestedResolutionMountRows {
+#[doc(hidden)]
+pub struct RequestedResolutionMountRows {
     records: RefCell<
         HashMap<SelectedResolutionMountOrdinal, std::sync::Arc<SelectedResolutionMountRecord>>,
     >,
@@ -998,7 +1022,7 @@ fn selected_mount_record_columns() -> &'static str {
     static COLUMNS: OnceLock<String> = OnceLock::new();
     COLUMNS.get_or_init(|| {
         let sql = format!("mount_ordinal,fragment_id,workspace_id,revision,generation,file_version_id,storage_language,semantic_language,persisted_relative_path,blob_id,blob_oid,projection_digest,interior_digest,producer_epoch,logical_rows,payload_bytes,{}", RESOLUTION_MANIFEST_COUNT_COLUMNS.join(","));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         note_selected_static_sql_capacity(4, sql.capacity());
         sql
     })
@@ -1091,18 +1115,21 @@ impl RequestedResolutionMountRows {
 }
 
 impl SelectedResolutionMountRecord {
-    pub(crate) const fn ordinal(&self) -> SelectedResolutionMountOrdinal {
+    #[doc(hidden)]
+    pub const fn ordinal(&self) -> SelectedResolutionMountOrdinal {
         self.ordinal
     }
 
     /// The mount's runtime fragment, which is its ordinal.
-    pub(crate) fn fragment_id(&self) -> BindingFragmentId {
+    #[doc(hidden)]
+    pub fn fragment_id(&self) -> BindingFragmentId {
         BindingFragmentId::at_ordinal(self.ordinal.get())
     }
 
     /// The mount's content key, which keys the interior cache and the
     /// selection fingerprint.
-    pub(crate) const fn fragment_digest(&self) -> SelectedResolutionFragmentDigest {
+    #[doc(hidden)]
+    pub const fn fragment_digest(&self) -> SelectedResolutionFragmentDigest {
         self.fragment_digest
     }
 
@@ -1118,27 +1145,33 @@ impl SelectedResolutionMountRecord {
         self.generation
     }
 
-    pub(crate) const fn file_version_id(&self) -> Option<i64> {
+    #[doc(hidden)]
+    pub const fn file_version_id(&self) -> Option<i64> {
         self.file_version_id
     }
 
-    pub(crate) fn storage_language(&self) -> &str {
+    #[doc(hidden)]
+    pub fn storage_language(&self) -> &str {
         &self.storage_language
     }
 
-    pub(crate) const fn semantic_language(&self) -> Language {
+    #[doc(hidden)]
+    pub const fn semantic_language(&self) -> Language {
         self.semantic_language
     }
 
-    pub(crate) fn persisted_relative_path(&self) -> &str {
+    #[doc(hidden)]
+    pub fn persisted_relative_path(&self) -> &str {
         &self.persisted_relative_path
     }
 
-    pub(crate) const fn blob_id(&self) -> i64 {
+    #[doc(hidden)]
+    pub const fn blob_id(&self) -> i64 {
         self.blob_id
     }
 
-    pub(crate) const fn blob_oid(&self) -> Oid {
+    #[doc(hidden)]
+    pub const fn blob_oid(&self) -> Oid {
         self.blob_oid
     }
 
@@ -1168,7 +1201,8 @@ impl SelectedResolutionMountRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedResolutionUnavailable {
+#[doc(hidden)]
+pub enum SelectedResolutionUnavailable {
     GoContextUnavailable {
         persisted_relative_path: String,
     },
@@ -1217,7 +1251,8 @@ pub(crate) enum SelectedResolutionUnavailable {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedResolutionStale {
+#[doc(hidden)]
+pub enum SelectedResolutionStale {
     NativeContextPublication {
         storage_language: String,
     },
@@ -1243,7 +1278,8 @@ pub(crate) enum SelectedResolutionStale {
     },
 }
 
-pub(crate) enum SelectedResolutionMountInventoryOutcome<'store> {
+#[doc(hidden)]
+pub enum SelectedResolutionMountInventoryOutcome<'store> {
     Ready(Box<SelectedResolutionMountInventory<'store>>),
     Unavailable(SelectedResolutionUnavailable),
     Cancelled,
@@ -1251,7 +1287,8 @@ pub(crate) enum SelectedResolutionMountInventoryOutcome<'store> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedResolutionRevalidationOutcome {
+#[doc(hidden)]
+pub enum SelectedResolutionRevalidationOutcome {
     Current,
     Cancelled,
     Stale(SelectedResolutionStale),
@@ -1280,13 +1317,14 @@ fn scope_identity_of(crate_keys: &[[u8; 32]]) -> [u8; 32] {
 
 fn next_stage_request_identity() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_add(1)
     })
     .expect("selected stage request identity space exhausted")
 }
 
-pub(crate) struct SelectedResolutionMountInventory<'store> {
+#[doc(hidden)]
+pub struct SelectedResolutionMountInventory<'store> {
     conn: ReaderGuard<'store>,
     retained: Option<RetainedResolutionSelection>,
     requested_mounts: RequestedResolutionMountRows,
@@ -1319,9 +1357,11 @@ pub(crate) struct SelectedResolutionMountInventory<'store> {
     crate_access: RefCell<Option<super::resolution_operation::rust_crate_access::CrateAccessMemo>>,
     /// The current crate stage's checked publications; `None` outside a crate
     /// stage. See `resolution_authority::AuthorityValidations`.
-    authority_validations: RefCell<Option<super::resolution_authority::AuthorityValidations>>,
+    #[doc(hidden)]
+    pub authority_validations: RefCell<Option<super::resolution_authority::AuthorityValidations>>,
     /// Published authority and identity answers touched by this one operation.
-    authority_request_memo: RefCell<super::resolution_authority::AuthorityRequestMemo>,
+    #[doc(hidden)]
+    pub authority_request_memo: RefCell<super::resolution_authority::AuthorityRequestMemo>,
     /// Published site rows touched by this one operation.
     site_row_memo: RefCell<super::resolution_lexical::SiteRowMemo>,
     /// Complete header-read answers demanded by this query, never retained
@@ -1350,11 +1390,13 @@ pub(crate) struct SelectedResolutionMountInventory<'store> {
     /// family exists on its connection.
     generic_formals_schema_ready: Cell<bool>,
     generic_formal_defaults_schema_ready: Cell<bool>,
+    reverse_candidate_keys_schema_ready: Cell<bool>,
 }
 
 /// Freshness of the retained reader, excluding its private buffers and owned schema setup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SelectedResolutionReadStamp {
+#[doc(hidden)]
+pub struct SelectedResolutionReadStamp {
     main_data_version: i64,
     main_schema_version: i64,
     temp_schema_version: i64,
@@ -1624,13 +1666,15 @@ impl SelectedResolutionMountInventory<'_> {
             .expect("requested mask rows initialized"))
     }
 
-    pub(crate) fn persisted_mount_count(&self) -> usize {
+    #[doc(hidden)]
+    pub fn persisted_mount_count(&self) -> usize {
         self.retained().ready.persisted_mount_count
     }
 
     /// Explicit full-inventory consumers own this enumeration for their query.
     /// Keyed point readers must use ordinal/path APIs instead.
-    pub(crate) fn mounts(&self) -> Result<&[SelectedResolutionMountRecord]> {
+    #[doc(hidden)]
+    pub fn mounts(&self) -> Result<&[SelectedResolutionMountRecord]> {
         if self.enumerated_mounts.get().is_none() {
             let sql = format!(
                 "SELECT {} FROM temp.selected_resolution_mounts ORDER BY mount_ordinal",
@@ -1650,11 +1694,13 @@ impl SelectedResolutionMountInventory<'_> {
             .expect("explicit mount enumeration initialized"))
     }
 
-    pub(crate) fn requested_mount_rows(&self) -> &RequestedResolutionMountRows {
+    #[doc(hidden)]
+    pub fn requested_mount_rows(&self) -> &RequestedResolutionMountRows {
         &self.requested_mounts
     }
 
-    pub(crate) fn persisted_mount_record(
+    #[doc(hidden)]
+    pub fn persisted_mount_record(
         &self,
         ordinal: SelectedResolutionMountOrdinal,
     ) -> Result<Option<std::sync::Arc<SelectedResolutionMountRecord>>> {
@@ -1664,7 +1710,8 @@ impl SelectedResolutionMountInventory<'_> {
         self.requested_mounts.by_ordinal(self.connection(), ordinal)
     }
 
-    pub(crate) fn mount_record_by_ordinal(
+    #[doc(hidden)]
+    pub fn mount_record_by_ordinal(
         &self,
         ordinal: SelectedResolutionMountOrdinal,
     ) -> Result<std::sync::Arc<SelectedResolutionMountRecord>> {
@@ -1735,7 +1782,8 @@ impl SelectedResolutionMountInventory<'_> {
     /// `replace_resolution_requests_1` and `_2` account their own inserts the
     /// same way; this is the form for a write whose row count the caller does
     /// not already hold.
-    pub(super) fn with_owned_temp_write<T>(
+    #[doc(hidden)]
+    pub fn with_owned_temp_write<T>(
         &self,
         write: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
@@ -1769,7 +1817,8 @@ impl SelectedResolutionMountInventory<'_> {
         Ok(value)
     }
 
-    fn account_committed_request_changes(&self, changed: u64) {
+    // Private request-buffer writers account only their own successful writes.
+    pub(super) fn account_committed_request_changes(&self, changed: u64) {
         let committed = &self.retained().committed_request_changes;
         committed.set(
             committed
@@ -1791,7 +1840,8 @@ impl SelectedResolutionMountInventory<'_> {
         self.stage_content_epoch.get() == 0 && !self.stage_written_directly.get()
     }
 
-    pub(super) fn note_stage_content_commit(&self) {
+    #[doc(hidden)]
+    pub fn note_stage_content_commit(&self) {
         self.stage_content_epoch.set(
             self.stage_content_epoch
                 .get()
@@ -1800,8 +1850,9 @@ impl SelectedResolutionMountInventory<'_> {
         );
     }
 
-    #[cfg(test)]
-    pub(in crate::analyzer::store) fn stage_content_epoch_for_test(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stage_content_epoch_for_test(&self) -> u64 {
         self.stage_content_epoch.get()
     }
 
@@ -1813,7 +1864,8 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     /// Raw candidate coverage belongs to this request and exact committed stage.
-    pub(crate) fn candidate_coverage_fingerprint(&self) -> [u8; 32] {
+    #[doc(hidden)]
+    pub fn candidate_coverage_fingerprint(&self) -> [u8; 32] {
         let mut digest = CanonicalHasher::new(b"bifrost-selected-stage-coverage:v1");
         digest.field("selection", &self.fingerprint());
         digest.field("request", &self.stage_request_identity.to_be_bytes());
@@ -1866,8 +1918,9 @@ impl SelectedResolutionMountInventory<'_> {
     /// one mount at a time. The pin that a panicking forward request leaves the
     /// whole selection in scope has nothing else to look at, because the scope
     /// lives in a temp table and in no Rust value.
-    #[cfg(test)]
-    pub(crate) fn scope_mount_count(&self) -> Result<usize> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn scope_mount_count(&self) -> Result<usize> {
         let count: i64 = self.connection().query_row(
             "SELECT COUNT(*) FROM temp.selected_resolution_scope_mounts",
             [],
@@ -1902,7 +1955,8 @@ impl SelectedResolutionMountInventory<'_> {
             .transpose()
     }
 
-    pub(crate) fn mount_record_for_path(
+    #[doc(hidden)]
+    pub fn mount_record_for_path(
         &self,
         storage_language: &str,
         persisted_relative_path: &str,
@@ -1948,14 +2002,13 @@ impl SelectedResolutionMountInventory<'_> {
             .expected_transient_replacement_count
     }
 
-    pub(super) fn connection(&self) -> &Connection {
+    #[doc(hidden)]
+    pub fn connection(&self) -> &Connection {
         &self.conn
     }
 
-    pub(in crate::analyzer::store) fn ensure_generic_formals_schema(
-        &self,
-        connection: &Connection,
-    ) -> Result<()> {
+    #[doc(hidden)]
+    pub fn ensure_generic_formals_schema(&self, connection: &Connection) -> Result<()> {
         if self.generic_formals_schema_ready.get() {
             return Ok(());
         }
@@ -1974,10 +2027,8 @@ impl SelectedResolutionMountInventory<'_> {
         Ok(())
     }
 
-    pub(in crate::analyzer::store) fn ensure_generic_formal_defaults_schema(
-        &self,
-        connection: &Connection,
-    ) -> Result<()> {
+    #[doc(hidden)]
+    pub fn ensure_generic_formal_defaults_schema(&self, connection: &Connection) -> Result<()> {
         if self.generic_formal_defaults_schema_ready.get() {
             return Ok(());
         }
@@ -1996,7 +2047,19 @@ impl SelectedResolutionMountInventory<'_> {
         Ok(())
     }
 
-    /// Account only the two fixed, owned CREATE TABLE/INDEX batches above.
+    /// The reverse reader's keys are private buffers, not selected authority.
+    pub(super) fn ensure_reverse_candidate_keys_schema(&self) -> Result<()> {
+        if !self.reverse_candidate_keys_schema_ready.get() {
+            self.initialize_owned_temp_schema(
+                self.connection(),
+                super::resolution_operation::REVERSE_CANDIDATE_KEYS_DDL,
+            )?;
+            self.reverse_candidate_keys_schema_ready.set(true);
+        }
+        Ok(())
+    }
+
+    /// Account only the fixed, owned CREATE TABLE/INDEX batches above.
     /// These schemas do not change selected authority. Read both witnesses on
     /// this same connection around the batch so earlier unowned schema changes
     /// remain visible, as do all main-database and unowned row changes. A failed
@@ -2023,11 +2086,13 @@ impl SelectedResolutionMountInventory<'_> {
 
     /// This request's shared-name answers, for a reader that holds the table
     /// and the connection for the same lifetime.
-    pub(super) fn shared_name_table(&self) -> &super::resolution::SharedNameTable {
+    #[doc(hidden)]
+    pub fn shared_name_table(&self) -> &super::resolution::SharedNameTable {
         &self.shared_names
     }
 
-    pub(super) fn authority_validations(
+    #[doc(hidden)]
+    pub fn authority_validations(
         &self,
     ) -> &RefCell<Option<super::resolution_authority::AuthorityValidations>> {
         &self.authority_validations
@@ -2040,7 +2105,8 @@ impl SelectedResolutionMountInventory<'_> {
         )
     }
 
-    pub(super) fn authority_request_memo(
+    #[doc(hidden)]
+    pub fn authority_request_memo(
         &self,
     ) -> &RefCell<super::resolution_authority::AuthorityRequestMemo> {
         &self.authority_request_memo
@@ -2146,11 +2212,13 @@ impl SelectedResolutionMountInventory<'_> {
         &self.path_endpoint_header_memo
     }
 
-    pub(super) fn read_change_stamp(&self) -> Result<SelectedResolutionReadStamp> {
+    #[doc(hidden)]
+    pub fn read_change_stamp(&self) -> Result<SelectedResolutionReadStamp> {
         self.retained().current_stamp(self.connection())
     }
 
-    pub(super) fn replace_resolution_requests_1(
+    #[doc(hidden)]
+    pub fn replace_resolution_requests_1(
         &self,
         requests: impl IntoIterator<Item = (SelectedResolutionMountOrdinal, i64)>,
         cancellation: &CancellationToken,
@@ -2226,7 +2294,8 @@ impl SelectedResolutionMountInventory<'_> {
         Ok(!cancellation.is_cancelled())
     }
 
-    pub(crate) fn revalidate(
+    #[doc(hidden)]
+    pub fn revalidate(
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<SelectedResolutionRevalidationOutcome> {
@@ -2507,8 +2576,9 @@ enum StagedSelection {
 }
 
 impl AnalyzerStore {
-    #[cfg(test)]
-    pub(crate) fn open_selected_resolution_mount_inventory(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn open_selected_resolution_mount_inventory(
         &self,
         workspace_id: &WorkspaceId,
         snapshots: &WorkspaceSnapshots,
@@ -2659,6 +2729,7 @@ impl AnalyzerStore {
                             stage_read: Cell::new(false),
                             generic_formals_schema_ready: Cell::new(false),
                             generic_formal_defaults_schema_ready: Cell::new(false),
+                            reverse_candidate_keys_schema_ready: Cell::new(false),
                             shared_names: super::resolution::SharedNameTable::new(
                                 self.resolution_shared_name_cache().clone(),
                             ),
@@ -2819,6 +2890,7 @@ impl AnalyzerStore {
                         stage_read: Cell::new(false),
                         generic_formals_schema_ready: Cell::new(false),
                         generic_formal_defaults_schema_ready: Cell::new(false),
+                        reverse_candidate_keys_schema_ready: Cell::new(false),
                         shared_names: super::resolution::SharedNameTable::new(
                             self.resolution_shared_name_cache().clone(),
                         ),
@@ -3007,7 +3079,7 @@ fn insert_selection_input(
     }
     debug_assert_eq!(
         tx.query_row(
-            "SELECT count(*) FROM temp.selected_rust_module_placements",
+            "SELECT count(*) FROM temp.selected_rust_container_placements",
             [],
             |row| row.get::<_, i64>(0)
         )?,
@@ -3740,7 +3812,7 @@ fn persist_selected_inventory(
 ) -> Result<bool> {
     debug_assert_eq!(
         tx.query_row(
-            "SELECT count(*) FROM temp.selected_rust_module_placements",
+            "SELECT count(*) FROM temp.selected_rust_container_placements",
             [],
             |row| row.get::<_, i64>(0)
         )?,
@@ -3999,433 +4071,14 @@ fn usize_as_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 pub(super) mod tests {
+    pub(in crate::analyzer::store) use super::selection_test_support::SelectionFixture;
+    use super::selection_test_support::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    use brokk_bifrost_test_macros::hardwon;
     use rusqlite::OptionalExtension;
-    use tree_sitter::Parser;
 
-    use crate::analyzer::ProjectFile;
-    use crate::analyzer::cpp::CppAdapter;
-    use crate::analyzer::go::GoAdapter;
-    use crate::analyzer::java::JavaAdapter;
-    use crate::analyzer::rust::RustAdapter;
-    use crate::analyzer::tree_sitter_analyzer::{
-        FileState, LanguageAdapter, ParsedFile, TreeSitterAnalyzer,
-    };
-    use crate::analyzer::typescript::TypescriptAdapter;
-
-    use super::super::{GenerationId, WorkspaceSnapshotId};
+    use super::super::WorkspaceSnapshotId;
     use super::*;
-
-    const WORKSPACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    fn parsed_fixture_state<A: LanguageAdapter>(
-        adapter: &A,
-        relative_path: &str,
-        source: &str,
-    ) -> FileState {
-        let file = ProjectFile::new(
-            std::env::current_dir()
-                .expect("resolve selection fixture root")
-                .join("selected-resolution-context-does-not-touch-disk"),
-            relative_path,
-        );
-        let mut parser = Parser::new();
-        parser
-            .set_language(&adapter.parser_language_for_file(&file))
-            .expect("configure fixture grammar");
-        let tree = parser.parse(source, None).expect("parse fixture source");
-        let mut parsed: ParsedFile = adapter.parse_file(&file, source, &tree);
-        parsed.add_file_scope(&file, source);
-        let contains_tests = adapter.contains_tests(&file, source, &tree, &parsed);
-        TreeSitterAnalyzer::<A>::file_state_from_parsed(
-            source.to_owned(),
-            parsed,
-            contains_tests,
-            Some(Vec::new()),
-            true,
-        )
-    }
-
-    fn write_fixture_blob(
-        store: &AnalyzerStore,
-        oid: &str,
-        storage_language: &str,
-        semantic_language: Language,
-        generation: GenerationId,
-    ) {
-        let (relative_path, source) = match semantic_language {
-            Language::Java => ("src/Model.java", "package demo; class Model {}\n"),
-            Language::TypeScript => ("src/Model.tsx", "export class Model {}\n"),
-            Language::Cpp => ("src/Model.c", "class Model {};\n"),
-            Language::Go => ("src/model.go", "package demo\ntype Model struct {}\n"),
-            Language::Rust => ("src/model.rs", "struct Model;\n"),
-            _ => panic!("selection fixture adapter is not defined for {semantic_language:?}"),
-        };
-        let result = match semantic_language {
-            Language::Java => {
-                let state = parsed_fixture_state(&JavaAdapter, relative_path, source);
-                store.write_parsed_blob_at_generation(
-                    &crate::analyzer::store::test_blob_file(),
-                    Oid::from_str(oid).unwrap(),
-                    storage_language,
-                    generation,
-                    &JavaAdapter,
-                    &state,
-                )
-            }
-            Language::TypeScript => {
-                let state = parsed_fixture_state(&TypescriptAdapter, relative_path, source);
-                store.write_parsed_blob_at_generation(
-                    &crate::analyzer::store::test_blob_file(),
-                    Oid::from_str(oid).unwrap(),
-                    storage_language,
-                    generation,
-                    &TypescriptAdapter,
-                    &state,
-                )
-            }
-            Language::Cpp => {
-                let state = parsed_fixture_state(&CppAdapter, relative_path, source);
-                store.write_parsed_blob_at_generation(
-                    &crate::analyzer::store::test_blob_file(),
-                    Oid::from_str(oid).unwrap(),
-                    storage_language,
-                    generation,
-                    &CppAdapter,
-                    &state,
-                )
-            }
-            Language::Go => {
-                let state = parsed_fixture_state(&GoAdapter, relative_path, source);
-                store.write_parsed_blob_at_generation(
-                    &crate::analyzer::store::test_blob_file(),
-                    Oid::from_str(oid).unwrap(),
-                    storage_language,
-                    generation,
-                    &GoAdapter,
-                    &state,
-                )
-            }
-            Language::Rust => {
-                let state = parsed_fixture_state(&RustAdapter, relative_path, source);
-                store.write_parsed_blob_at_generation(
-                    &crate::analyzer::store::test_blob_file(),
-                    Oid::from_str(oid).unwrap(),
-                    storage_language,
-                    generation,
-                    &RustAdapter,
-                    &state,
-                )
-            }
-            _ => unreachable!(),
-        };
-        result.expect("persist selected-resolution fixture blob");
-    }
-
-    pub(in crate::analyzer::store) struct SelectionFixture {
-        pub(in crate::analyzer::store) store: AnalyzerStore,
-        workspace_id: WorkspaceId,
-        snapshots: WorkspaceSnapshots,
-        storage_language: String,
-        semantic_language: Language,
-    }
-
-    impl SelectionFixture {
-        pub(in crate::analyzer::store) fn retain_one_reader(&mut self) {
-            self.store.active_readers.capacity = 1;
-        }
-
-        fn content_witness(
-            &self,
-            oid: &str,
-        ) -> super::super::resolution_publication::ResolutionContentWitness {
-            use super::super::resolution_publication::{
-                ResolutionContentInput, ResolutionContentPublicationOutcome,
-            };
-            let oid = Oid::from_str(oid).unwrap();
-            let outcome = self
-                .store
-                .admit_cached_selected_content(
-                    &self.snapshots[&self.storage_language],
-                    "src/cached.java",
-                    oid,
-                    &ResolutionContentInput::Parsed {
-                        content_oid: oid,
-                        semantic_language: self.semantic_language,
-                    },
-                    &CancellationToken::default(),
-                )
-                .unwrap();
-            let ResolutionContentPublicationOutcome::Ready(content) = outcome else {
-                panic!("real fixture publication: {outcome:?}");
-            };
-            content.into_parts().0
-        }
-
-        pub(in crate::analyzer::store) fn new(mount_count: usize) -> Self {
-            Self::with_language(mount_count, "java", Language::Java, false)
-        }
-
-        pub(in crate::analyzer::store) fn shared_blob(mount_count: usize) -> Self {
-            Self::with_language(mount_count, "java", Language::Java, true)
-        }
-
-        pub(in crate::analyzer::store) fn custom_source(mount_count: usize, source: &str) -> Self {
-            Self::custom_language_source(mount_count, source, "java", Language::Java)
-        }
-
-        pub(in crate::analyzer::store) fn custom_rust_source(
-            mount_count: usize,
-            source: &str,
-        ) -> Self {
-            Self::custom_language_source(mount_count, source, "rust", Language::Rust)
-        }
-
-        pub(in crate::analyzer::store) fn shared_rust_source(
-            mount_count: usize,
-            source: &str,
-        ) -> Self {
-            Self::with_store(
-                AnalyzerStore::open_ephemeral().unwrap(),
-                mount_count,
-                "rust",
-                Language::Rust,
-                true,
-                false,
-                Some(source),
-            )
-        }
-
-        fn custom_language_source(
-            mount_count: usize,
-            source: &str,
-            storage_language: &str,
-            semantic_language: Language,
-        ) -> Self {
-            Self::with_store(
-                AnalyzerStore::open_ephemeral().unwrap(),
-                mount_count,
-                storage_language,
-                semantic_language,
-                false,
-                false,
-                Some(source),
-            )
-        }
-
-        fn bootstrap(mount_count: usize) -> Self {
-            Self::with_authority(mount_count, "java", Language::Java, false, true)
-        }
-
-        fn with_language(
-            mount_count: usize,
-            storage_language: &str,
-            semantic_language: Language,
-            shared_blob: bool,
-        ) -> Self {
-            Self::with_authority(
-                mount_count,
-                storage_language,
-                semantic_language,
-                shared_blob,
-                false,
-            )
-        }
-
-        fn with_authority(
-            mount_count: usize,
-            storage_language: &str,
-            semantic_language: Language,
-            shared_blob: bool,
-            bootstrap: bool,
-        ) -> Self {
-            Self::with_store(
-                AnalyzerStore::open_ephemeral().unwrap(),
-                mount_count,
-                storage_language,
-                semantic_language,
-                shared_blob,
-                bootstrap,
-                None,
-            )
-        }
-
-        fn persistent(mount_count: usize) -> (tempfile::TempDir, Self) {
-            let temp = tempfile::tempdir().unwrap();
-            let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
-            let fixture = Self::with_store(
-                store,
-                mount_count,
-                "java",
-                Language::Java,
-                false,
-                false,
-                None,
-            );
-            (temp, fixture)
-        }
-
-        fn with_store(
-            store: AnalyzerStore,
-            mount_count: usize,
-            storage_language: &str,
-            semantic_language: Language,
-            shared_blob: bool,
-            bootstrap: bool,
-            source: Option<&str>,
-        ) -> Self {
-            let generation = if bootstrap {
-                GenerationId::BOOTSTRAP
-            } else {
-                store
-                    .ensure_language_epoch_value(storage_language, "selection-test-v1")
-                    .unwrap()
-            };
-            store
-                .ensure_resolution_producer_epoch(storage_language, semantic_language)
-                .unwrap();
-            let workspace_id = WorkspaceId(WORKSPACE_ID.to_owned());
-            let storage_language_owned = storage_language.to_owned();
-            let blob_count = if shared_blob && mount_count > 0 {
-                1
-            } else {
-                mount_count
-            };
-            let blob_oids = (0..blob_count)
-                .map(|index| format!("{:040x}", index + 1))
-                .collect::<Vec<_>>();
-            let writer_workspace_id = workspace_id.as_str().to_owned();
-            let writer_language = storage_language_owned.clone();
-            let writer_blob_oids = blob_oids.clone();
-            store.conn.execute(move |conn| {
-                let tx = conn.transaction().unwrap();
-                tx.execute(
-                    "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
-                     VALUES(?1, ?2, ?3, 1)",
-                    params![writer_workspace_id, writer_language, generation.0],
-                )
-                .unwrap();
-                tx.execute(
-                    "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
-                     VALUES(?1, ?2, ?3, 1)",
-                    params![writer_workspace_id, writer_language, generation.0],
-                )
-                .unwrap();
-                for index in 0..mount_count {
-                    let oid = if shared_blob {
-                        &writer_blob_oids[0]
-                    } else {
-                        &writer_blob_oids[index]
-                    };
-                    tx.execute(
-                        "INSERT INTO workspace_file_versions(
-                           workspace_id, lang, generation, rel_path, blob_oid,
-                           projection_digest, valid_from
-                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)",
-                        params![
-                            writer_workspace_id,
-                            writer_language,
-                            generation.0,
-                            match semantic_language {
-                                Language::Rust => format!("src/{index:04}.rs"),
-                                _ => format!("src/{index:04}.java"),
-                            },
-                            oid,
-                            format!("{:064x}", index + 1),
-                        ],
-                    )
-                    .unwrap();
-                }
-                tx.commit().unwrap();
-            });
-
-            for oid in &blob_oids {
-                if let Some(source) = source {
-                    let result = match semantic_language {
-                        Language::Java => {
-                            let state =
-                                parsed_fixture_state(&JavaAdapter, "src/Model.java", source);
-                            store.write_parsed_blob_at_generation(
-                                &crate::analyzer::store::test_blob_file(),
-                                Oid::from_str(oid).unwrap(),
-                                storage_language,
-                                generation,
-                                &JavaAdapter,
-                                &state,
-                            )
-                        }
-                        Language::Rust => {
-                            let state = parsed_fixture_state(&RustAdapter, "src/Model.rs", source);
-                            store.write_parsed_blob_at_generation(
-                                &crate::analyzer::store::test_blob_file(),
-                                Oid::from_str(oid).unwrap(),
-                                storage_language,
-                                generation,
-                                &RustAdapter,
-                                &state,
-                            )
-                        }
-                        _ => panic!(
-                            "custom selection fixture adapter is not defined for {semantic_language:?}"
-                        ),
-                    };
-                    result.expect("persist custom selected-resolution fixture blob");
-                } else {
-                    write_fixture_blob(
-                        &store,
-                        oid,
-                        storage_language,
-                        semantic_language,
-                        generation,
-                    );
-                }
-            }
-
-            let mut snapshots = WorkspaceSnapshots::default();
-            snapshots.insert(
-                storage_language_owned.clone(),
-                WorkspaceSnapshotId {
-                    workspace_id: workspace_id.clone(),
-                    lang: storage_language_owned.clone(),
-                    generation,
-                    revision: 1,
-                },
-            );
-            Self {
-                store,
-                workspace_id,
-                snapshots,
-                storage_language: storage_language_owned,
-                semantic_language,
-            }
-        }
-
-        fn language(&self) -> SelectedResolutionLanguage {
-            SelectedResolutionLanguage::new(self.storage_language.clone(), self.semantic_language)
-        }
-
-        pub(in crate::analyzer::store) fn open_ready<'a>(
-            &'a self,
-            masks: &[SelectedResolutionOverlayMask],
-        ) -> Box<SelectedResolutionMountInventory<'a>> {
-            match self
-                .store
-                .open_selected_resolution_mount_inventory(
-                    &self.workspace_id,
-                    &self.snapshots,
-                    &[self.language()],
-                    masks,
-                    &CancellationToken::default(),
-                )
-                .unwrap()
-            {
-                SelectedResolutionMountInventoryOutcome::Ready(ready) => ready,
-                _ => panic!("complete fixture must open Ready"),
-            }
-        }
-    }
 
     #[test]
     fn selected_inventory_handles_zero_one_and_page_boundaries() {
@@ -4629,102 +4282,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[hardwon("d629d480653d: lazy generic TEMP schema discarded the first retained selection")]
-    fn single_reader_exact_selection_key_reuses_materialization_and_changed_mask_rebuilds() {
-        let mut receipts = Vec::new();
-        for (storage_language, semantic_language) in
-            [("go", Language::Go), ("rust", Language::Rust)]
-        {
-            let temp = tempfile::tempdir().unwrap();
-            // Mount reuse does not depend on unique source contents. Publish
-            // one blob so the regression measures inventory work, not parsing.
-            let mut fixture = SelectionFixture::with_store(
-                AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap(),
-                256,
-                storage_language,
-                semantic_language,
-                true,
-                false,
-                None,
-            );
-            // Force eviction to certify rematerialization separately from the
-            // multi-reader pool's retention of alternating exact selections.
-            fixture.store.active_readers.capacity = 1;
-            {
-                let conn = fixture.store.active_read_conn().unwrap();
-                ensure_revisioned_workspace_views(&conn).unwrap();
-                conn.execute_batch(selected_resolution_temp_schema_sql())
-                    .unwrap();
-                conn.execute_batch(
-                    "CREATE TEMP TABLE selection_materialization_probe(insertions INTEGER NOT NULL);
-                     CREATE TEMP TRIGGER count_selected_resolution_materialization
-                     AFTER INSERT ON selected_resolution_context
-                     BEGIN
-                       INSERT INTO selection_materialization_probe VALUES(1);
-                     END;",
-                ).unwrap();
-            }
-            let (original, formals, defaults) = {
-                let mut ready = fixture.open_ready(&[]);
-                let original = ready.read_change_stamp().unwrap();
-                ready
-                    .ensure_generic_formals_schema(ready.connection())
-                    .unwrap();
-                let formals = ready.read_change_stamp().unwrap();
-                ready
-                    .ensure_generic_formal_defaults_schema(ready.connection())
-                    .unwrap();
-                let defaults = ready.read_change_stamp().unwrap();
-                assert!(matches!(
-                    ready.revalidate(&CancellationToken::default()).unwrap(),
-                    SelectedResolutionRevalidationOutcome::Current
-                ));
-                (original, formals, defaults)
-            };
-            for run in 0..3 {
-                let start = std::time::Instant::now();
-                let ready = fixture.open_ready(&[]);
-                eprintln!(
-                    "{storage_language} open {run}: {:?}; materializations={}",
-                    start.elapsed(),
-                    ready
-                        .connection()
-                        .query_row(
-                            "SELECT COUNT(*) FROM temp.selection_materialization_probe",
-                            [],
-                            |row| row.get::<_, usize>(0)
-                        )
-                        .unwrap()
-                );
-                drop(ready);
-            }
-            eprintln!(
-                "{storage_language} generic schema stamps: original={original:?}, formals={formals:?}, defaults={defaults:?}"
-            );
-            let removal = SelectedResolutionOverlayMask::removal(storage_language, "src/0000.java");
-            drop(fixture.open_ready(std::slice::from_ref(&removal)));
-            drop(fixture.open_ready(std::slice::from_ref(&removal)));
-            let conn = fixture.store.active_read_conn().unwrap();
-            receipts.push((
-                storage_language,
-                conn.query_row(
-                    "SELECT COUNT(*) FROM temp.selection_materialization_probe",
-                    [],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap(),
-                formals == original,
-                defaults == original,
-            ));
-        }
-        assert_eq!(
-            receipts,
-            [("go", 2, true, true), ("rust", 2, true, true)],
-            "only each distinct exact selection key may materialize, including after owned generic schema initialization"
-        );
-    }
-
-    #[test]
     fn alternating_exact_selection_keys_retain_their_own_reader_and_temp_inventory() {
         let (_temp, fixture) = SelectionFixture::persistent(2);
         let removal = SelectedResolutionOverlayMask::removal("java", "src/0000.java");
@@ -4821,40 +4378,6 @@ pub(super) mod tests {
             2,
             "a main-database commit must rebuild the selected TEMP state"
         );
-    }
-
-    #[test]
-    fn requested_language_permutation_has_one_deterministic_missing_reason() {
-        let fixture = SelectionFixture::new(0);
-        for languages in [
-            vec![
-                SelectedResolutionLanguage::new("rust", Language::Rust),
-                fixture.language(),
-            ],
-            vec![
-                fixture.language(),
-                SelectedResolutionLanguage::new("rust", Language::Rust),
-            ],
-        ] {
-            let outcome = fixture
-                .store
-                .open_selected_resolution_mount_inventory(
-                    &fixture.workspace_id,
-                    &WorkspaceSnapshots::default(),
-                    &languages,
-                    &[],
-                    &CancellationToken::default(),
-                )
-                .unwrap();
-            assert!(matches!(
-                outcome,
-                SelectedResolutionMountInventoryOutcome::Unavailable(
-                    SelectedResolutionUnavailable::MissingWorkspaceSnapshot {
-                        storage_language
-                    }
-                ) if storage_language == "java"
-            ));
-        }
     }
 
     #[test]
@@ -5026,40 +4549,6 @@ pub(super) mod tests {
             0
         );
         assert_eq!(ready.expected_transient_replacement_count(), 0);
-    }
-
-    #[test]
-    fn duplicate_blob_mounts_and_storage_aliases_retain_distinct_fragment_identity() {
-        let fixture =
-            SelectionFixture::with_language(2, "typescript:tsx", Language::TypeScript, true);
-        let ready = fixture.open_ready(&[]);
-        assert_eq!(
-            ready.mounts().unwrap()[0].blob_id(),
-            ready.mounts().unwrap()[1].blob_id()
-        );
-        // Two paths holding the same blob are two mounts of one content, so
-        // what separates them is the mount's content key; the ordinal
-        // separates them too, but only because they are two positions.
-        assert_ne!(
-            ready.mounts().unwrap()[0].fragment_digest(),
-            ready.mounts().unwrap()[1].fragment_digest()
-        );
-        assert!(
-            ready
-                .mounts()
-                .unwrap()
-                .iter()
-                .all(|mount| mount.storage_language() == "typescript:tsx"
-                    && mount.semantic_language() == Language::TypeScript)
-        );
-
-        let c_fixture = SelectionFixture::with_language(1, "cpp:c", Language::Cpp, false);
-        let c_ready = c_fixture.open_ready(&[]);
-        assert_eq!(c_ready.mounts().unwrap()[0].storage_language(), "cpp:c");
-        assert_eq!(
-            c_ready.mounts().unwrap()[0].semantic_language(),
-            Language::Cpp
-        );
     }
 
     #[test]
@@ -5659,7 +5148,8 @@ pub(super) mod tests {
             "selected_resolution_overlay_masks",
             "selected_resolution_content_mounts",
             "selected_resolution_mounts",
-            "selected_rust_module_placements",
+            "selected_rust_transient_placement_attributes",
+            "selected_resolution_transient_placements",
             "selected_resolution_typed_requests_1",
             "selected_resolution_typed_requests_2",
             "selected_workspace_revisions",
@@ -6765,3 +6255,7 @@ pub(super) mod tests {
         ));
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod selection_test_support;

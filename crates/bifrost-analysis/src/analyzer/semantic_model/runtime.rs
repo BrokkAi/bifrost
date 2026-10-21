@@ -1,393 +1,28 @@
-use crate::analyzer::semantic_model::DeferredYieldsPayload;
+use crate::CancellationToken;
+
+use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
+
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::Language;
+use crate::analyzer::semantic_model::CatalogPackSourceKind;
+use crate::analyzer::semantic_model::PayloadKind;
+use crate::analyzer::semantic_model::SemanticModelOverlay;
+use crate::analyzer::semantic_model::SemanticModelOverlayBuildError;
+use crate::analyzer::semantic_model::SemanticPackCatalog;
+use crate::analyzer::semantic_model::SemanticPackSelectorQuery;
+use crate::analyzer::store::{
+    AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
+};
+use crate::hash::{HashMap, map_with_capacity};
+use brokk_bifrost_core::util::elapsed_ns;
+pub use brokk_bifrost_semantic::analyzer::semantic_model::runtime::*;
+
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-use semver::{Version, VersionReq};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
-use super::{
-    ActivationSelector, AuthoredProcedureFormal, AuthoredProcedureFormalPassingMode,
-    AuthoredProcedureFormalVariadicKind, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CatalogRuntimeSourceReader, CollectionFlowsPayload, CompiledClassDecoratorIdentity,
-    CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
-    CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledNormalReturnRefinement,
-    CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
-    CompiledProcedureSummary, CompiledProcedureTarget, CompiledResultContract,
-    CompiledResultUseObligation, CompiledShard, DeclarationGuard, GeneratorRule, MemberFact,
-    PayloadKind, RelationFact, RuleTrigger, RuntimeValuesPayload, SemanticModelOverlay,
-    SemanticModelOverlayBuildError, SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
-};
-use crate::CancellationToken;
-use crate::analyzer::canonical_hash::{is_lower_sha256, parse_lower_sha256, write_length_prefixed};
-use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
-use crate::analyzer::lexical_definitions::{
-    FormalParameterLayout, FormalParameterPassingMode, FormalParameterSlot, FormalVariadicKind,
-};
-use crate::analyzer::semantic::{
-    SemanticLocator, StableDigest, UnmaterializedExternalTarget, authored_procedure_target_identity,
-};
-use crate::analyzer::store::{
-    AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
-};
-use crate::analyzer::{IAnalyzer, Language, LanguageDialect, semantic_pack_realm};
-use crate::hash::{HashMap, map_with_capacity};
-use brokk_bifrost_core::util::elapsed_ns;
-
-/// The encoding version of the resolved semantic-model runtime.
-///
-/// Rotating this value rotates every active-set identity a workspace derives
-/// from its semantic packs. Java, Kotlin and Scala share one classpath and now
-/// one durable index key ([`semantic_pack_realm`]), so the same active pack set
-/// resolves a Kotlin or Scala call differently than the label-exact keying did.
-/// A recorded identity from before this change must not satisfy the new
-/// contract, so the version moves even though no pack changed. Version 8
-/// retained no-concurrency-effects claims; version 9 includes directional
-/// variadic summary-formal binding; version 10 retained independently
-/// accepted review receipts in the active proof identity; version 11 drops
-/// them again (#5218), so an identity recorded with a receipt byte does not
-/// satisfy the receipt-free contract.
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 11;
-
-type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SemanticModelActivationEvidence {
-    pub language: String,
-    pub ecosystem: String,
-    pub package: Option<CatalogCoordinate>,
-    pub module: Option<CatalogCoordinate>,
-    pub toolchain: Option<CatalogCoordinate>,
-    pub target: Option<String>,
-    pub configuration: Option<String>,
-    pub artifact_sha256: Option<String>,
-}
-
-/// The reviewed proof basis attached to a result-use obligation binding.
-///
-/// The label is deliberately smaller than the typed basis. Query consumers
-/// project the label, while the typed value prevents a language adapter from
-/// silently treating an unrelated builtin as the reviewed receiver. Java's
-/// existing binder continues to publish its established dispatch basis; a
-/// future Java adapter can use this shared carrier after the native-engine
-/// refactor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ReviewedObligationBasis {
-    DispatchAgreement,
-    BuiltinReceiverAssumption(ReviewedBuiltinReceiverAssumption),
-    LibcStandardDeclaration,
-    PythonStandardLibraryFunction,
-    /// A JavaScript receiver is proved from an exact literal/template or the
-    /// unshadowed builtin `String(...)` constructor result. This is proof from
-    /// source and type flow, not an ecosystem-wide receiver assumption.
-    ExactLiteralReceiver,
-}
-
-impl ReviewedObligationBasis {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::DispatchAgreement => "dispatch_agreement",
-            Self::BuiltinReceiverAssumption(_) => "builtin_receiver_assumption",
-            Self::LibcStandardDeclaration => "libc_standard_declaration",
-            Self::PythonStandardLibraryFunction => "python_stdlib_function",
-            Self::ExactLiteralReceiver => "exact_literal_receiver",
-        }
-    }
-}
-
-/// A reviewed builtin receiver assumption. The receiver detail remains typed
-/// in the runtime and is described by the semantic-pack provenance; only the
-/// stable public basis label is projected into RQL rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ReviewedBuiltinReceiverAssumption {
-    PythonStr,
-    RubyString,
-    TypeScriptString,
-}
-
-impl ReviewedBuiltinReceiverAssumption {
-    pub const fn language(self) -> &'static str {
-        match self {
-            Self::PythonStr => "python",
-            Self::RubyString => "ruby",
-            Self::TypeScriptString => "typescript",
-        }
-    }
-
-    pub const fn receiver(self) -> &'static str {
-        match self {
-            Self::PythonStr => "builtins.str",
-            Self::RubyString => "String",
-            Self::TypeScriptString => "String",
-        }
-    }
-}
-
-/// A target carrier for one reviewed result-use binding.
-///
-/// `evidence` is the exact activation row selected for the summary shard. It
-/// is carried separately from the unmaterialized call target because Python's
-/// builtin assumption is type-flow evidence rather than resolver-owned
-/// installed-artifact evidence. The same carrier supports a future adapter
-/// that selects a JVM, npm, or another language-specific artifact.
-#[derive(Debug, Clone, Copy)]
-pub struct ReviewedObligationTarget<'a> {
-    pub target: &'a UnmaterializedExternalTarget,
-    pub evidence: &'a SemanticModelActivationEvidence,
-    pub basis: ReviewedObligationBasis,
-}
-
-impl<'a> ReviewedObligationTarget<'a> {
-    pub const fn new(
-        target: &'a UnmaterializedExternalTarget,
-        evidence: &'a SemanticModelActivationEvidence,
-        basis: ReviewedObligationBasis,
-    ) -> Self {
-        Self {
-            target,
-            evidence,
-            basis,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewedObligationBindFailure {
-    NoObligation,
-    LanguageMismatch,
-    EvidenceUnselected,
-    CallShapeMismatch,
-    BasisMismatch,
-}
-
-/// The result of binding reviewed obligations to one exact call shape.
-#[derive(Debug, Clone, Copy)]
-pub struct ReviewedObligationBinding<'a> {
-    obligations: &'a [CompiledResultUseObligation],
-    basis: ReviewedObligationBasis,
-    ordinary_heap_unchanged: bool,
-    covers_overrides: bool,
-}
-
-impl<'a> ReviewedObligationBinding<'a> {
-    pub fn obligations(self) -> &'a [CompiledResultUseObligation] {
-        self.obligations
-    }
-
-    pub const fn basis(self) -> ReviewedObligationBasis {
-        self.basis
-    }
-
-    pub const fn ordinary_heap_unchanged(self) -> bool {
-        self.ordinary_heap_unchanged
-    }
-
-    pub const fn covers_overrides(self) -> bool {
-        self.covers_overrides
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SemanticModelControlScope {
-    User,
-    Workspace,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SemanticModelControlAction {
-    Enable,
-    Disable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticModelPackSelector {
-    pub pack_id: String,
-    pub version: Option<VersionReq>,
-    pub manifest_digest: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticModelActivationControl {
-    pub scope: SemanticModelControlScope,
-    pub action: SemanticModelControlAction,
-    pub selector: SemanticModelPackSelector,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SemanticModelRuntimeLimits {
-    pub max_evidence_rows: usize,
-    pub max_controls: usize,
-    pub max_catalog_candidates: usize,
-    pub max_loaded_shards: usize,
-    pub max_records: usize,
-    pub max_index_entries: usize,
-    pub max_working_bytes: u64,
-    pub max_retained_bytes: u64,
-    pub max_explanations: usize,
-}
-
-impl Default for SemanticModelRuntimeLimits {
-    fn default() -> Self {
-        Self {
-            max_evidence_rows: 4_096,
-            max_controls: 4_096,
-            max_catalog_candidates: 65_536,
-            max_loaded_shards: 16_384,
-            max_records: 4_000_000,
-            max_index_entries: 16_000_000,
-            max_working_bytes: 1 << 30,
-            max_retained_bytes: 1 << 30,
-            max_explanations: 65_536,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SemanticModelActivationRequest {
-    pub bifrost_version: Version,
-    pub evidence: Vec<SemanticModelActivationEvidence>,
-    pub controls: Vec<SemanticModelActivationControl>,
-    pub limits: SemanticModelRuntimeLimits,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticModelActivationStatus {
-    Active,
-    Disabled,
-    Incompatible,
-    ReviewRequired,
-    Shadowed,
-    Conflict,
-    Unavailable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SemanticModelActivationExplanation {
-    pub manifest_digest: String,
-    pub pack_id: Option<String>,
-    pub shard_id: String,
-    pub source_kind: CatalogPackSourceKind,
-    pub source_id: String,
-    pub status: SemanticModelActivationStatus,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SemanticModelActivationReport {
-    pub explanations: Vec<SemanticModelActivationExplanation>,
-    pub suppressed_explanations: usize,
-    pub catalog_candidates: usize,
-    pub loaded_shards: usize,
-    pub loaded_records: usize,
-    /// Individually identified declaration gaps carried by active packs.
-    #[serde(default)]
-    pub extraction_gaps: usize,
-    /// Declarations a loaded shard publishes that the pinned activation
-    /// coordinates prove absent, so the matcher never indexed them (#1899).
-    #[serde(default)]
-    pub guard_excluded_records: usize,
-    pub index_entries: usize,
-    pub working_bytes: u64,
-    pub retained_bytes: u64,
-    pub phase_measurements: SemanticModelActivationPhaseMeasurements,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SemanticModelActivationPhaseMeasurements {
-    pub selection_nanos: u64,
-    pub decode_hydration_nanos: u64,
-    pub matcher_construction_nanos: u64,
-    pub catalog_sql_statements: u64,
-}
-
-#[derive(Debug)]
-pub struct ActiveSemanticModelShard {
-    /// Shared with the catalog's decoded-manifest memo and with every other
-    /// shard of the same pack (#3101).
-    pub manifest: Arc<CompiledPackManifest>,
-    pub shard: CompiledShard,
-    pub source_kind: CatalogPackSourceKind,
-    pub source_id: String,
-    pub matched_evidence: SemanticModelActivationEvidence,
-    /// Every evidence row that satisfies a highest-rank selector. The legacy
-    /// representative above remains the ordinary matcher input; an exact
-    /// call-artifact proof must select its own row from this complete set.
-    pub matching_evidence: Vec<SemanticModelActivationEvidence>,
-    evidence_rank: EvidenceRank,
-    source_rank: u8,
-}
-
-impl ActiveSemanticModelShard {
-    /// A positive declaration does not assert that its source enumerates the
-    /// owner's complete member family. Behavior payloads have no TypeFact and
-    /// cannot enter this declaration inventory.
-    pub(crate) fn admits_jvm_owner_declaration(&self, owner: &TypeFact) -> bool {
-        owner.guard.is_none()
-            && matches!(self.manifest.language.as_str(), "java" | "kotlin" | "scala")
-    }
-
-    pub(crate) fn independently_enumerates_jvm_owner(&self, owner: &TypeFact) -> bool {
-        owner.guard.is_none()
-            && (matches!(
-                self.source_kind,
-                CatalogPackSourceKind::Generated | CatalogPackSourceKind::WorkspaceProduced
-            ) || (self.source_kind == CatalogPackSourceKind::Installed
-                && matches!(
-                    owner.locator,
-                    super::Locator::Artifact { .. } | super::Locator::Source { .. }
-                )))
-    }
-
-    /// Whether the evidence this shard activated against proves the guarded
-    /// record absent.
-    ///
-    /// This is the only place a declaration leaves an activated pack. An
-    /// unguarded record, and a guard whose constraints the pinned coordinates
-    /// satisfy or say nothing about, both stay active (#1899).
-    pub fn guard_excludes(&self, guard: Option<&DeclarationGuard>) -> bool {
-        guard.is_some_and(|guard| {
-            guard.excludes(
-                self.matched_evidence
-                    .toolchain
-                    .as_ref()
-                    .and_then(|toolchain| toolchain.version.as_ref()),
-                self.matched_evidence.target.as_deref(),
-            )
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct ResolvedActiveSemanticModels {
-    active_model_set_hash: String,
-    source_reader: Option<CatalogRuntimeSourceReader>,
-    shards: Vec<ActiveSemanticModelShard>,
-    indexes: MatcherIndexes,
-    extraction_gaps: Vec<ActivePackExtractionGap>,
-    extraction_gaps_by_declaration: HashMap<String, Vec<usize>>,
-    report: SemanticModelActivationReport,
-}
-
-/// Cost and retained size of the declaration overlay paired with one active
-/// semantic-model publication.
-///
-/// `publication_nanos` covers overlay construction and the wait to enter the
-/// publication critical section. It excludes work performed after the
-/// immutable snapshot is created. A cached acquisition returns the original
-/// measurement rather than timing a lookup as though it rebuilt the overlay.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SemanticModelOverlayMeasurement {
-    pub publication_nanos: u64,
-    pub retained_bytes: u64,
-}
 
 /// One immutable semantic-model publication captured under the runtime's
 /// publication lock.
@@ -401,7 +36,8 @@ pub struct ActiveSemanticModelSnapshot {
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
     overlay_measurement: Option<SemanticModelOverlayMeasurement>,
     jdk_artifacts_by_configured_home: Arc<HashMap<PathBuf, SemanticModelActivationEvidence>>,
-    python_runtime:
+    #[doc(hidden)]
+    pub python_runtime:
         Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
 }
 
@@ -454,7 +90,8 @@ impl ActiveSemanticModelSnapshot {
         self.overlay_measurement
     }
 
-    pub(crate) fn python_runtime(
+    #[doc(hidden)]
+    pub fn python_runtime(
         &self,
     ) -> Option<&crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication> {
         self.python_runtime.as_ref()
@@ -471,2378 +108,6 @@ impl ActiveSemanticModelSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivePackExtractionGap {
-    pub pack_id: String,
-    pub declaration: String,
-    pub reason: String,
-}
-
-impl ResolvedActiveSemanticModels {
-    /// Fixed SQL handles belonging to this activation publication. Source rows
-    /// are read on demand and remain owned by one query.
-    pub(crate) fn source_reader(&self) -> Option<&CatalogRuntimeSourceReader> {
-        self.source_reader.as_ref()
-    }
-
-    pub fn active_model_set_hash(&self) -> &str {
-        &self.active_model_set_hash
-    }
-
-    pub fn shards(&self) -> &[ActiveSemanticModelShard] {
-        &self.shards
-    }
-
-    /// Runtime-value contracts are carried by the same activated shard as
-    /// their selectors and declaration facts.  Keep the shard alongside the
-    /// payload so callers retain activation and provenance evidence.
-    pub fn runtime_values(
-        &self,
-    ) -> impl Iterator<Item = (&RuntimeValuesPayload, &ActiveSemanticModelShard)> {
-        self.shards
-            .iter()
-            .filter_map(|shard| shard.shard.runtime_values().map(|payload| (payload, shard)))
-    }
-
-    /// Portable records retain their catalog shard and provenance. Catalog
-    /// activation alone does not authorize their target-scoped runtime claims;
-    /// consumers must also evaluate the portable activation and producer evidence.
-    pub fn runtime_contracts(
-        &self,
-    ) -> impl Iterator<Item = (&super::RuntimeContractsPayload, &ActiveSemanticModelShard)> {
-        self.shards.iter().filter_map(|shard| {
-            shard
-                .shard
-                .runtime_contracts()
-                .map(|payload| (payload, shard))
-        })
-    }
-
-    /// Collection-flow contracts are carried by the same activated shard as
-    /// their selectors and declaration facts. Keeping the shard alongside the
-    /// typed payload preserves activation and provenance evidence for exact
-    /// callable lookup.
-    pub fn collection_flows(
-        &self,
-    ) -> impl Iterator<Item = (&CollectionFlowsPayload, &ActiveSemanticModelShard)> {
-        self.shards.iter().filter_map(|shard| {
-            shard
-                .shard
-                .collection_flows()
-                .map(|payload| (payload, shard))
-        })
-    }
-
-    /// Deferred-yield contracts retain their activation shard so consumers can
-    /// pair exact endpoint identities with the evidence that activated them.
-    pub fn deferred_yields(
-        &self,
-    ) -> impl Iterator<Item = (&DeferredYieldsPayload, &ActiveSemanticModelShard)> {
-        self.shards.iter().filter_map(|shard| {
-            shard
-                .shard
-                .deferred_yields()
-                .map(|payload| (payload, shard))
-        })
-    }
-
-    pub fn activation_report(&self) -> &SemanticModelActivationReport {
-        &self.report
-    }
-
-    pub fn extraction_gaps(&self) -> &[ActivePackExtractionGap] {
-        &self.extraction_gaps
-    }
-
-    pub fn gapped(&self, declaration: &str) -> Option<&ActivePackExtractionGap> {
-        self.extraction_gaps_by_declaration
-            .get(declaration)
-            .and_then(|indexes| indexes.first())
-            .map(|index| &self.extraction_gaps[*index])
-    }
-
-    pub fn gapped_member_surface(
-        &self,
-        owner: &str,
-        member: &str,
-    ) -> Option<&ActivePackExtractionGap> {
-        let member_declaration = format!("{owner}.{member}");
-        self.gapped(&member_declaration)
-            .or_else(|| self.gapped(owner))
-    }
-
-    pub fn retained_bytes(&self) -> u64 {
-        self.report.retained_bytes
-    }
-
-    pub fn types_with_id(&self, id: &str) -> SemanticModelMatch<'_, TypeFact> {
-        self.type_match(self.indexes.types_by_id.get(id))
-    }
-
-    pub fn types_named(&self, name: &str) -> SemanticModelMatch<'_, TypeFact> {
-        self.type_match(self.indexes.types_by_name.get(name))
-    }
-
-    /// All active postings, without rank selection or value deduplication.
-    /// Exhaustive runtime claims must retain each contributor's provenance.
-    /// The caller charges its query budget before retaining each record.
-    pub(crate) fn all_type_records_named<'a>(
-        &'a self,
-        name: &str,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
-        self.all_type_records(self.indexes.types_by_name.get(name))
-    }
-
-    pub(crate) fn all_type_records_with_id<'a>(
-        &'a self,
-        id: &str,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
-        self.all_type_records(self.indexes.types_by_id.get(id))
-    }
-
-    fn all_type_records<'a>(
-        &'a self,
-        posting: Option<&'a Vec<RecordAddress>>,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
-        // Each record's aliases are indexed together, so duplicate addresses
-        // in one posting are adjacent. Distinct addresses, even equal values
-        // in different shards, are distinct contributors.
-        posting
-            .into_iter()
-            .flat_map(|posting| {
-                posting
-                    .iter()
-                    .enumerate()
-                    .filter(move |(index, address)| *index == 0 || **address != posting[*index - 1])
-                    .map(|(_, address)| address)
-            })
-            .map(move |address| {
-                let shard = &self.shards[address.shard as usize];
-                let record = &shard
-                    .shard
-                    .payload()
-                    .declaration_facts()
-                    .expect("type posting addresses declarations")
-                    .0[address.record as usize];
-                ActivatedSemanticModelRecord { record, shard }
-            })
-    }
-
-    /// Whether this raw contributor agrees with the normally selected type
-    /// declaration. Lower-ranked runtime claims are not silently discarded;
-    /// their owner must still bind to an admitted declaration.
-    pub(crate) fn type_declaration_admitted<E>(
-        &self,
-        record: &TypeFact,
-        visit: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<bool, E> {
-        let mut selected = None;
-        for candidate in self.all_type_records_with_id(&record.id) {
-            visit()?;
-            let rank = (candidate.shard.evidence_rank, candidate.shard.source_rank);
-            if selected.as_ref().is_none_or(|(best, _)| rank > *best) {
-                selected = Some((rank, candidate.record));
-            }
-        }
-        Ok(selected
-            .is_some_and(|(_, selected)| super::type_declarations_equivalent(record, selected)))
-    }
-
-    pub fn members_with_id(&self, id: &str) -> SemanticModelMatch<'_, MemberFact> {
-        self.member_match(self.indexes.members_by_id.get(id))
-    }
-
-    pub fn members_named(&self, owner: &str, name: &str) -> SemanticModelMatch<'_, MemberFact> {
-        self.member_match(
-            self.indexes
-                .members_by_owner_name
-                .get(owner)
-                .and_then(|names| names.get(name)),
-        )
-    }
-
-    pub fn relations_with_id(&self, id: &str) -> SemanticModelMatch<'_, RelationFact> {
-        self.relation_match(self.indexes.relations_by_id.get(id))
-    }
-
-    pub fn relations_from(&self, from: &str) -> SemanticModelMatch<'_, RelationFact> {
-        self.relation_match(self.indexes.relations_by_from.get(from))
-    }
-
-    pub fn relations_to(&self, to: &str) -> SemanticModelMatch<'_, RelationFact> {
-        self.relation_match(self.indexes.relations_by_to.get(to))
-    }
-
-    pub fn rules_for(&self, trigger: RuleTriggerKey<'_>) -> SemanticModelMatch<'_, GeneratorRule> {
-        let posting = match trigger {
-            RuleTriggerKey::LanguageConstruct(value) => {
-                self.indexes.rules_by_language_construct.get(value)
-            }
-            RuleTriggerKey::Annotation(value) => self.indexes.rules_by_annotation.get(value),
-            RuleTriggerKey::MacroInvocation(value) => self.indexes.rules_by_macro.get(value),
-            RuleTriggerKey::GeneratorInvocation(value) => {
-                self.indexes.rules_by_generator.get(value)
-            }
-            RuleTriggerKey::ResolvedOwner(value) => self.indexes.rules_by_owner.get(value),
-            RuleTriggerKey::ResolvedCall { owner, name } => self
-                .indexes
-                .rules_by_call
-                .get(owner)
-                .and_then(|names| names.get(name)),
-        };
-        self.rule_match(posting)
-    }
-
-    pub fn rules_with_id(&self, id: &str) -> SemanticModelMatch<'_, GeneratorRule> {
-        self.rule_match(self.indexes.rules_by_id.get(id))
-    }
-
-    pub fn procedure_summaries_for(
-        &self,
-        target: ProcedureSummaryTargetKey<'_>,
-    ) -> ProcedureSummaryMatch<'_> {
-        let shapes = self
-            .indexes
-            .procedure_summaries_by_target
-            .get(semantic_pack_realm(target.language))
-            .and_then(|paths| paths.get(target.path))
-            .and_then(|symbols| symbols.get(target.symbol));
-        resolve_exact_procedure_postings(
-            &self.shards,
-            shapes,
-            target.has_receiver,
-            target.parameter_count,
-        )
-    }
-
-    /// Select an activated summary for an unmaterialized external callee by its
-    /// canonical identity (#1978).
-    pub fn procedure_summaries_for_member(
-        &self,
-        target: ProcedureSummaryMemberKey<'_>,
-    ) -> ProcedureSummaryMatch<'_> {
-        let shapes = self
-            .indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm(target.language))
-            .and_then(|owners| owners.get(target.owner))
-            .and_then(|members| members.get(target.member));
-        resolve_applicable_procedure_postings(
-            &self.shards,
-            shapes,
-            target.has_receiver,
-            target.parameter_count,
-        )
-    }
-
-    /// Select summaries for an exact unmaterialized external target, applying
-    /// Python distribution artifact evidence before evidence ranking and claim
-    /// deduplication. The member-only lookup remains available for callers
-    /// that need shape-based model-presence discovery.
-    pub fn procedure_summaries_for_external_target(
-        &self,
-        target: &UnmaterializedExternalTarget,
-    ) -> ProcedureSummaryMatch<'_> {
-        let shapes = self
-            .indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm(target.language().semantic_pack_label()))
-            .and_then(|owners| owners.get(target.owner_fqn()))
-            .and_then(|members| members.get(target.member()));
-        let mut parameter_counts = vec![target.arity()];
-        if let Some(formal_count) = target.python_formal_parameter_count() {
-            parameter_counts.push(formal_count);
-        }
-        let incomplete = std::cell::Cell::new(false);
-        let rejected_artifact = std::cell::Cell::new(false);
-        let mut matched = resolve_applicable_procedure_postings_where_for_counts(
-            &self.shards,
-            shapes,
-            target.has_receiver(),
-            &parameter_counts,
-            |shard, summary| {
-                let artifact_applies = python_artifact_applies_to_target(shard, target);
-                let actual_to_formal = procedure_summary_actual_to_formal(shard, summary, target);
-                if python_shard_requires_distribution_artifact(shard, target) && !artifact_applies {
-                    rejected_artifact.set(true);
-                }
-                if artifact_applies
-                    && actual_to_formal.is_none()
-                    && (!summary.target.formals.is_empty()
-                        || python_shard_requires_distribution_artifact(shard, target))
-                {
-                    incomplete.set(true);
-                }
-                if !artifact_applies {
-                    ProcedureSummaryAcceptance::Reject
-                } else if let Some(mapping) = actual_to_formal {
-                    ProcedureSummaryAcceptance::Accept(mapping)
-                } else {
-                    ProcedureSummaryAcceptance::Reject
-                }
-            },
-        );
-        for record in &mut matched.records {
-            record.matched_target_locator = Some(target.locator().clone());
-            record.matched_call_arguments = target
-                .call_arguments()
-                .map(|arguments| arguments.to_vec().into_boxed_slice());
-        }
-        if incomplete.get() || (matched.records.is_empty() && rejected_artifact.get()) {
-            matched.applicability = ProcedureSummaryApplicability::Incomplete;
-        }
-        matched
-    }
-
-    /// Select reviewed-JDK candidates only after pinning the exact artifact
-    /// that the Java resolver proved for this call. Filtering before rank and
-    /// claim deduplication keeps equal summaries from two JDK installations
-    /// from collapsing into the wrong artifact's representative.
-    pub fn procedure_summaries_for_selected_jdk_artifact(
-        &self,
-        target: &UnmaterializedExternalTarget,
-    ) -> ProcedureSummaryMatch<'_> {
-        if !target.has_resolver_owned_call_shape()
-            || target.language()
-                != crate::analyzer::semantic::SemanticLanguage::Standard(
-                    crate::analyzer::Language::Java,
-                )
-        {
-            return empty_procedure_match();
-        }
-        let Some(selected) = target.selected_jdk_artifact() else {
-            return empty_procedure_match();
-        };
-        let shapes = self
-            .indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm("java"))
-            .and_then(|owners| owners.get(target.owner_fqn()))
-            .and_then(|members| members.get(target.member()));
-        let mut matched = resolve_applicable_procedure_postings_where(
-            &self.shards,
-            shapes,
-            target.has_receiver(),
-            target.arity(),
-            |shard, record| {
-                if shard.manifest.language == "java"
-                    && shard.manifest.ecosystem == "jdk"
-                    && shard.matching_evidence.binary_search(selected).is_ok()
-                    && !record.result_use_obligations.is_empty()
-                {
-                    ProcedureSummaryAcceptance::Accept(None)
-                } else {
-                    ProcedureSummaryAcceptance::Reject
-                }
-            },
-        );
-        for record in &mut matched.records {
-            record.matched_target_locator = Some(target.locator().clone());
-            record.matched_call_arguments = target
-                .call_arguments()
-                .map(|arguments| arguments.to_vec().into_boxed_slice());
-        }
-        matched
-    }
-
-    /// Cheap candidate filter before resolving a receiver's exact owner. This
-    /// does not prove a binding: callers must still select the exact member.
-    pub(crate) fn has_normal_return_type_refinement_candidate(
-        &self,
-        language: &str,
-        member: &str,
-        has_receiver: bool,
-        parameter_count: u32,
-    ) -> bool {
-        self.indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm(language))
-            .into_iter()
-            .flat_map(|owners| owners.values())
-            .filter_map(|members| members.get(member))
-            .any(|shapes| {
-                resolve_applicable_procedure_postings(
-                    &self.shards,
-                    Some(shapes),
-                    has_receiver,
-                    parameter_count,
-                )
-                .records
-                .iter()
-                .any(|selected| !selected.normal_return_type_refinements().is_empty())
-            })
-    }
-
-    /// Select an activated summary from an exact external declaration locator
-    /// when the resolver proves the artifact path and member declaration but
-    /// cannot publish a canonical owner FQN. Unlike member lookup, path and
-    /// the declaration segment jointly identify the authored target without
-    /// reconstructing a source spelling.
-    pub fn procedure_summaries_for_declaration(
-        &self,
-        target: ProcedureSummaryDeclarationKey<'_>,
-    ) -> ProcedureSummaryMatch<'_> {
-        let symbols = self
-            .indexes
-            .procedure_summaries_by_target
-            .get(semantic_pack_realm(target.language))
-            .and_then(|paths| paths.get(target.path));
-        let postings = symbols.into_iter().flat_map(|symbols| {
-            symbols
-                .iter()
-                .filter(move |(symbol, _)| {
-                    authored_procedure_target_identity(target.path, symbol)
-                        .is_some_and(|(_, member)| member == target.member)
-                })
-                .flat_map(move |(_, shapes)| {
-                    fixed_and_variadic_postings(shapes, target.has_receiver, target.parameter_count)
-                })
-        });
-        resolve_procedure_postings(&self.shards, postings, procedure_declaration_claims_agree)
-    }
-
-    /// Whether this active set has any member whose exact matcher behavior can
-    /// prove an absent normal continuation for at least one call arity.
-    ///
-    /// This is a discovery hint only. A consumer must still call
-    /// [`Self::proves_normal_continuation_absent`] for the exact owner and
-    /// actual arity before changing control flow.
-    pub fn has_normal_continuation_absence_candidates(&self, language: &str) -> bool {
-        self.indexes
-            .normal_continuation_absence_candidates
-            .has_language(language)
-    }
-
-    /// Candidate owners for one external member spelling and receiver shape.
-    ///
-    /// An owner appears only when the activated matcher uniquely selects an
-    /// explicit absence claim at some applicable arity. The returned slice is
-    /// stable for this immutable active set and sorted for deterministic
-    /// traversal. It does not prove any particular call shape.
-    pub fn normal_continuation_absence_candidate_owners(
-        &self,
-        language: &str,
-        member: &str,
-        has_receiver: bool,
-    ) -> &[String] {
-        self.indexes
-            .normal_continuation_absence_candidates
-            .owners(language, member, has_receiver)
-    }
-
-    /// Whether exact active-model agreement proves that the external procedure
-    /// has no normal continuation.
-    ///
-    /// Overall summary completeness is not an extra gate: the claim is an
-    /// explicit, independently validated axis. Empty and conflicting matches
-    /// fail closed.
-    pub fn proves_normal_continuation_absent(&self, target: ProcedureSummaryMemberKey<'_>) -> bool {
-        procedure_match_proves_normal_continuation_absent(
-            &self.procedure_summaries_for_member(target),
-        )
-    }
-
-    /// Whether an activated receiverless procedure summary names this exact
-    /// language/owner/member identity, at any arity.
-    ///
-    /// Java uses this only after its structured name-resolution ladder has
-    /// established that an unshadowed method qualifier is a type name. The
-    /// query lets the implicit `java.lang` tier resolve in summary-only test
-    /// projects where no classpath declaration index exists; it never turns a
-    /// source spelling into an owner by itself.
-    pub(crate) fn has_receiverless_procedure_summary_member(
-        &self,
-        language: &str,
-        owner: &str,
-        member: &str,
-    ) -> bool {
-        self.indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm(language))
-            .and_then(|owners| owners.get(owner))
-            .and_then(|members| members.get(member))
-            .is_some_and(|shapes| {
-                shapes
-                    .fixed
-                    .iter()
-                    .chain(shapes.variadic.iter())
-                    .any(|((has_receiver, _), postings)| !has_receiver && !postings.is_empty())
-            })
-    }
-
-    fn type_match(&self, posting: Option<&Vec<RecordAddress>>) -> SemanticModelMatch<'_, TypeFact> {
-        resolve_posting(&self.shards, posting, |shard, record| {
-            shard
-                .shard
-                .payload()
-                .declaration_facts()
-                .and_then(|(types, _, _)| types.get(record))
-        })
-    }
-
-    fn member_match(
-        &self,
-        posting: Option<&Vec<RecordAddress>>,
-    ) -> SemanticModelMatch<'_, MemberFact> {
-        resolve_posting(&self.shards, posting, |shard, record| {
-            shard
-                .shard
-                .payload()
-                .declaration_facts()
-                .and_then(|(_, members, _)| members.get(record))
-        })
-    }
-
-    fn relation_match(
-        &self,
-        posting: Option<&Vec<RecordAddress>>,
-    ) -> SemanticModelMatch<'_, RelationFact> {
-        resolve_posting(&self.shards, posting, |shard, record| {
-            shard
-                .shard
-                .payload()
-                .declaration_facts()
-                .and_then(|(_, _, relations)| relations.get(record))
-        })
-    }
-
-    fn rule_match(
-        &self,
-        posting: Option<&Vec<RecordAddress>>,
-    ) -> SemanticModelMatch<'_, GeneratorRule> {
-        resolve_posting(&self.shards, posting, |shard, record| {
-            shard.shard.payload().generator_rules()?.get(record)
-        })
-    }
-}
-
-fn python_artifact_applies_to_target(
-    shard: &ActiveSemanticModelShard,
-    target: &UnmaterializedExternalTarget,
-) -> bool {
-    if !python_shard_requires_distribution_artifact(shard, target) {
-        return true;
-    }
-    target.selected_python_artifact().is_some_and(|selected| {
-        evidence_is_exact_python_distribution_artifact(selected)
-            && shard.matching_evidence.binary_search(selected).is_ok()
-            && target
-                .selected_python_model_manifest_sha256()
-                .is_some_and(|digest| digest == shard.manifest.content_sha256)
-    })
-}
-
-fn python_shard_requires_distribution_artifact(
-    shard: &ActiveSemanticModelShard,
-    target: &UnmaterializedExternalTarget,
-) -> bool {
-    target.language().semantic_pack_label() == "python"
-        && shard.manifest.language == "python"
-        && shard.shard.activation().iter().any(|selector| {
-            selector
-                .package
-                .as_ref()
-                .is_some_and(|package| package.name.starts_with("pkg:pypi/"))
-        })
-}
-
-fn procedure_summary_actual_to_formal(
-    shard: &ActiveSemanticModelShard,
-    summary: &CompiledProcedureSummary,
-    target: &UnmaterializedExternalTarget,
-) -> Option<Option<Box<[u32]>>> {
-    if python_shard_requires_distribution_artifact(shard, target) {
-        if target.python_formal_parameter_count() != Some(summary.target.parameter_count)
-            || target.python_formal_call_shape_accepts_arity(target.arity()) != Some(true)
-        {
-            return None;
-        }
-        let external_mapping = target.python_actual_to_formal()?;
-        if summary.target.formals.is_empty() {
-            // Empty formals preserve the legacy positional summary contract:
-            // Python default omission is callable, but this summary cannot
-            // prove the omitted formal's default-aware transfer semantics.
-            if summary.target.variadic || target.arity() != summary.target.parameter_count {
-                return None;
-            }
-        }
-        let summary_mapping = if summary.target.formals.is_empty() {
-            None
-        } else {
-            if summary.target.formals.len() != summary.target.parameter_count as usize
-                || target.python_defaulted_formals().is_none_or(|defaults| {
-                    defaults.len() != summary.target.formals.len()
-                        || defaults
-                            .iter()
-                            .zip(&summary.target.formals)
-                            .any(|(defaulted, formal)| *defaulted != formal.optional)
-                })
-            {
-                return None;
-            }
-            let layout = summary_formal_layout(&summary.target)?;
-            let summary_mapping =
-                crate::analyzer::usages::call_binding::bind_semantic_call_arguments(
-                    target.call_arguments()?,
-                    &layout,
-                )?;
-            if summary_mapping.as_ref() != external_mapping {
-                return None;
-            }
-            Some(summary_mapping)
-        };
-        let mapping = summary_mapping
-            .as_deref()
-            .unwrap_or(external_mapping.as_ref());
-        let reordered = mapping_reorders_fixed_formals(mapping, &summary.target.formals);
-        // The retained mapping reaches summary transfers. Other formal-input
-        // consumers do not yet carry it, so keep their claims incomplete when
-        // a keyword call reorders those inputs.
-        let mapped_claims_supported = !reordered
-            || (summary.locations.is_empty()
-                && summary.effects.is_empty()
-                && summary.concurrency_effects.is_empty()
-                && summary.preconditions.as_ref().is_none_or(Vec::is_empty)
-                && summary.result_contracts.is_empty()
-                && summary.result_use_obligations.is_empty()
-                && summary.conditional_result_refinements.is_empty()
-                && summary.conditional_indirect_writes.is_empty()
-                && summary.normal_return_refinements.is_empty()
-                && summary.normal_return_type_refinements.is_empty()
-                && summary.class_decorator_identity.is_none());
-        mapped_claims_supported.then(|| Some(mapping.to_vec().into_boxed_slice()))
-    } else if !summary.target.formals.is_empty() {
-        let layout = summary_formal_layout(&summary.target)?;
-        let mapping = crate::analyzer::usages::call_binding::bind_semantic_call_arguments(
-            target.call_arguments()?,
-            &layout,
-        )?;
-        if mapping.len() != target.arity() as usize {
-            return None;
-        }
-        let reordered = mapping_reorders_fixed_formals(&mapping, &summary.target.formals);
-        let mapped_claims_supported = !reordered
-            || (summary.locations.is_empty()
-                && summary.effects.is_empty()
-                && summary.concurrency_effects.is_empty()
-                && summary.preconditions.as_ref().is_none_or(Vec::is_empty)
-                && summary.result_contracts.is_empty()
-                && summary.result_use_obligations.is_empty()
-                && summary.conditional_result_refinements.is_empty()
-                && summary.conditional_indirect_writes.is_empty()
-                && summary.normal_return_refinements.is_empty()
-                && summary.normal_return_type_refinements.is_empty()
-                && summary.class_decorator_identity.is_none());
-        mapped_claims_supported.then_some(Some(mapping))
-    } else {
-        summary
-            .target
-            .accepts_parameter_count(target.arity())
-            .then_some(None)
-    }
-}
-
-fn summary_formal_layout(target: &CompiledProcedureTarget) -> Option<FormalParameterLayout> {
-    if target.formals.len() != target.parameter_count as usize {
-        return None;
-    }
-    let sentinel = crate::analyzer::Range {
-        start_byte: 0,
-        end_byte: 0,
-        start_line: 0,
-        end_line: 0,
-    };
-    Some(FormalParameterLayout {
-        slots: target
-            .formals
-            .iter()
-            .map(|formal| FormalParameterSlot {
-                names: vec![formal.name.clone()],
-                declaration_range: sentinel,
-                receiver: false,
-                passing_mode: match formal.passing_mode {
-                    AuthoredProcedureFormalPassingMode::PositionalOnly => {
-                        FormalParameterPassingMode::PositionalOnly
-                    }
-                    AuthoredProcedureFormalPassingMode::PositionalOrNamed => {
-                        FormalParameterPassingMode::PositionalOrNamed
-                    }
-                    AuthoredProcedureFormalPassingMode::NamedOnly => {
-                        FormalParameterPassingMode::NamedOnly
-                    }
-                },
-                variadic: formal.variadic_kind.map(|kind| match kind {
-                    AuthoredProcedureFormalVariadicKind::Positional => {
-                        FormalVariadicKind::Positional
-                    }
-                    AuthoredProcedureFormalVariadicKind::Keyword => FormalVariadicKind::Keyword,
-                    AuthoredProcedureFormalVariadicKind::Both => FormalVariadicKind::Both,
-                }),
-                default_range: formal.optional.then_some(sentinel),
-            })
-            .collect(),
-        python_binding: None,
-    })
-}
-
-fn mapping_reorders_fixed_formals(mapping: &[u32], formals: &[AuthoredProcedureFormal]) -> bool {
-    // Fixed-arity summaries without declared slots still carry the exact
-    // external mapping; only its identity permutation leaves inputs in place.
-    if formals.is_empty() {
-        return mapping
-            .iter()
-            .enumerate()
-            .any(|(actual, formal)| actual != *formal as usize);
-    }
-    let mut previous_fixed_formal = None;
-    for formal in mapping {
-        let Some(formal_shape) = formals.get(*formal as usize) else {
-            return true;
-        };
-        if formal_shape.variadic_kind.is_some() {
-            continue;
-        }
-        if previous_fixed_formal.is_some_and(|previous| *formal < previous) {
-            return true;
-        }
-        previous_fixed_formal = Some(*formal);
-    }
-    false
-}
-
-fn evidence_is_exact_python_distribution_artifact(
-    evidence: &SemanticModelActivationEvidence,
-) -> bool {
-    if evidence.language != "python" || evidence.ecosystem != "python" {
-        return false;
-    }
-    let (Some(package), Some(artifact_sha256)) = (
-        evidence.package.as_ref(),
-        evidence.artifact_sha256.as_deref(),
-    ) else {
-        return false;
-    };
-    if !package.name.starts_with("pkg:pypi/") || package.version.is_some() {
-        return false;
-    }
-    let artifact = super::csmi::CsmiArtifactSelector {
-        purl: package.name.clone(),
-        version_range: None,
-        digests: vec![super::csmi::CsmiArtifactDigest {
-            algorithm: super::csmi::CsmiDigestAlgorithm::Sha256,
-            coverage: "artifact".to_owned(),
-            canonicalization: None,
-            value: artifact_sha256.to_owned(),
-        }],
-    };
-    super::csmi::validate_python_artifact(&artifact).is_ok()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemanticModelMatchDisposition {
-    Empty,
-    Unique,
-    Conflict,
-}
-
-#[derive(Debug)]
-pub struct SemanticModelMatch<'a, T> {
-    pub records: Vec<ActivatedSemanticModelRecord<'a, T>>,
-    pub disposition: SemanticModelMatchDisposition,
-    pub candidates_examined: usize,
-    pub fallback_candidates_examined: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ActivatedSemanticModelRecord<'a, T> {
-    pub record: &'a T,
-    pub shard: &'a ActiveSemanticModelShard,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProcedureSummaryTargetKey<'a> {
-    pub language: &'a str,
-    pub path: &'a str,
-    pub symbol: &'a str,
-    pub has_receiver: bool,
-    pub parameter_count: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProcedureSummaryDeclarationKey<'a> {
-    pub language: &'a str,
-    pub path: &'a str,
-    pub member: &'a str,
-    pub has_receiver: bool,
-    pub parameter_count: u32,
-}
-
-impl<'a> ProcedureSummaryDeclarationKey<'a> {
-    pub fn new(
-        language: &'a str,
-        path: &'a str,
-        member: &'a str,
-        has_receiver: bool,
-        parameter_count: u32,
-    ) -> Self {
-        Self {
-            language,
-            path,
-            member,
-            has_receiver,
-            parameter_count,
-        }
-    }
-}
-
-impl<'a> ProcedureSummaryTargetKey<'a> {
-    pub fn new(
-        language: &'a str,
-        path: &'a str,
-        symbol: &'a str,
-        has_receiver: bool,
-        parameter_count: u32,
-    ) -> Self {
-        Self {
-            language,
-            path,
-            symbol,
-            has_receiver,
-            parameter_count,
-        }
-    }
-}
-
-/// Canonical-identity lookup key for a fully-qualified external callee that never
-/// materializes to an artifact (#1978). It selects an activated summary by owner
-/// FQN and member name rather than by artifact path and parameter-typed symbol,
-/// which an unmaterialized callee cannot present. `parameter_count` is the arity;
-/// a fixed target must have exactly that many formals, while a variadic target
-/// matches when the call has at least its non-variadic formal count. Same-arity
-/// overloads that differ only by parameter type are indistinguishable here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProcedureSummaryMemberKey<'a> {
-    pub language: &'a str,
-    pub owner: &'a str,
-    pub member: &'a str,
-    pub has_receiver: bool,
-    pub parameter_count: u32,
-}
-
-impl<'a> ProcedureSummaryMemberKey<'a> {
-    pub fn new(
-        language: &'a str,
-        owner: &'a str,
-        member: &'a str,
-        has_receiver: bool,
-        parameter_count: u32,
-    ) -> Self {
-        Self {
-            language,
-            owner,
-            member,
-            has_receiver,
-            parameter_count,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct ActivatedProcedureSummary<'a> {
-    pub record: &'a CompiledProcedureSummary,
-    pub shard: &'a ActiveSemanticModelShard,
-    pub payload: &'a [CompiledProcedureSummary],
-    actual_to_formal: Option<Box<[u32]>>,
-    matched_target_locator: Option<SemanticLocator>,
-    matched_call_arguments: Option<Box<[crate::analyzer::semantic::SemanticCallArgument]>>,
-}
-
-/// Analyzer-minted evidence that one activated authored summary applies to one
-/// exact unmaterialized-external call shape.
-///
-/// The fields stay private so a downstream consumer cannot relabel a fixed
-/// summary by manufacturing another actual arity. Flow may derive its own
-/// internal summary identity from the proven formal locator and model id, then
-/// must still check that identity against the lowered summary it publishes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnmaterializedExternalSummaryCallShapeBinding {
-    actual_locator: SemanticLocator,
-    actual_to_formal: Option<Box<[u32]>>,
-    formal_locator: SemanticLocator,
-    model_id: Box<str>,
-    content: StableDigest,
-    contract_version: u32,
-    covers_overrides: bool,
-}
-
-impl UnmaterializedExternalSummaryCallShapeBinding {
-    pub fn actual_locator(&self) -> &SemanticLocator {
-        &self.actual_locator
-    }
-
-    /// Proven formal ordinal for each actual argument. Generic runtime calls
-    /// retain their established positional binding with no explicit map.
-    pub fn actual_to_formal(&self) -> Option<&[u32]> {
-        self.actual_to_formal.as_deref()
-    }
-
-    pub fn formal_locator(&self) -> &SemanticLocator {
-        &self.formal_locator
-    }
-
-    pub fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    pub const fn content(&self) -> StableDigest {
-        self.content
-    }
-
-    pub const fn contract_version(&self) -> u32 {
-        self.contract_version
-    }
-
-    pub const fn covers_overrides(&self) -> bool {
-        self.covers_overrides
-    }
-}
-
-impl<'a> ActivatedProcedureSummary<'a> {
-    /// Prove that this activated record applies to the resolver-owned exact
-    /// call shape. This is an applicability proof, not a consumer-specific
-    /// winner selection: consumers may impose stricter conflict semantics.
-    pub fn bind_unmaterialized_call_shape(
-        &self,
-        target: &UnmaterializedExternalTarget,
-    ) -> Option<UnmaterializedExternalSummaryCallShapeBinding> {
-        let content = parse_lower_sha256(&self.record.content_sha256)?;
-        if self.record.model_id != format!("{}#{}", self.shard.manifest.pack_id, self.record.id)
-            || self.record.contract_version == 0
-            || !target
-                .language()
-                .accepts_semantic_pack_language(&self.shard.manifest.language)
-            || self.record.target.has_receiver != target.has_receiver()
-            || self.matched_target_locator.as_ref() != Some(target.locator())
-            || self.matched_call_arguments.as_deref() != target.call_arguments()
-            || target.locator_for_arity(target.arity()) != *target.locator()
-            || authored_procedure_target_identity(
-                &self.record.target.path,
-                &self.record.target.symbol,
-            )
-            .is_none_or(|(owner, member)| owner != target.owner_fqn() || member != target.member())
-            || !python_artifact_applies_to_target(self.shard, target)
-        {
-            return None;
-        }
-        Some(UnmaterializedExternalSummaryCallShapeBinding {
-            actual_locator: target.locator().clone(),
-            actual_to_formal: self.actual_to_formal.clone(),
-            formal_locator: target.formal_summary_locator(self.record.target.parameter_count),
-            model_id: self.record.model_id.clone().into_boxed_str(),
-            content: StableDigest::from_array(content),
-            contract_version: self.record.contract_version,
-            covers_overrides: self.record.covers_overrides,
-        })
-    }
-
-    pub fn summary_with_id(&self, id: &str) -> Option<&'a CompiledProcedureSummary> {
-        self.payload.iter().find(|summary| summary.id == id)
-    }
-
-    /// Whether this exact activated record explicitly claims that no normal
-    /// continuation exists.
-    pub const fn normal_continuation_absent(&self) -> bool {
-        self.record.normal_continuation_absent
-    }
-
-    /// The namespaced effects the activated pack declares for this procedure
-    /// (#2437), in the compiler's canonical order (sorted by id).
-    pub fn declared_effects(&self) -> &'a [CompiledDeclaredEffect] {
-        &self.record.declared_effects
-    }
-
-    /// Reviewed task, synchronization, and atomic semantics for this exact
-    /// procedure. Inputs are formal ports that consumers project to call-site
-    /// receiver and argument values.
-    pub fn concurrency_effects(&self) -> &'a [CompiledConcurrencyEffect] {
-        &self.record.concurrency_effects
-    }
-
-    /// Whether this exact activated record explicitly claims that the call has
-    /// no synchronization or concurrent retention effects.
-    pub const fn no_concurrency_effects(&self) -> bool {
-        self.record.no_concurrency_effects
-    }
-
-    /// Reviewed predicates required of this exact procedure invocation's
-    /// receiver and parameters. `None` means the operation was not reviewed;
-    /// `Some([])` means it was reviewed and has no input preconditions.
-    pub fn preconditions(&self) -> Option<&'a [CompiledOperationPrecondition]> {
-        self.record.preconditions.as_deref()
-    }
-
-    /// The reviewed relationships among this procedure's normal result ports,
-    /// in deterministic ordinal order.
-    pub fn result_contracts(&self) -> &'a [CompiledResultContract] {
-        &self.record.result_contracts
-    }
-
-    pub fn result_use_obligations(&self) -> &'a [CompiledResultUseObligation] {
-        &self.record.result_use_obligations
-    }
-
-    /// Reviewed JDK result-use claims for an exact resolver-owned call whose
-    /// selected declaration artifact is one of this shard's activating rows.
-    /// A model name, release version, or source toolchain alone is insufficient.
-    /// Dispatch coverage remains a separate consumer obligation.
-    pub fn bind_reviewed_jdk_result_use_obligations(
-        &self,
-        target: &UnmaterializedExternalTarget,
-    ) -> Option<&'a [CompiledResultUseObligation]> {
-        if self.record.result_use_obligations.is_empty()
-            || self.shard.manifest.language != "java"
-            || self.shard.manifest.ecosystem != "jdk"
-            || !target.has_resolver_owned_call_shape()
-        {
-            return None;
-        }
-        let selected = target.selected_jdk_artifact()?;
-        if self
-            .shard
-            .matching_evidence
-            .binary_search(selected)
-            .is_err()
-        {
-            return None;
-        }
-        self.bind_unmaterialized_call_shape(target)?;
-        Some(&self.record.result_use_obligations)
-    }
-
-    /// Bind reviewed result-use obligations to one exact call shape for any
-    /// language adapter. The caller supplies the activation row selected by
-    /// that adapter; this method verifies that the row is one of this shard's
-    /// actual matching evidence and that the analyzer-minted call shape agrees
-    /// with the authored summary. Dispatch-arm agreement remains a consumer
-    /// operation over these bindings, so the same proof can serve Java later
-    /// without changing the existing Java adapter today.
-    pub fn bind_reviewed_result_use_obligations(
-        &self,
-        target: ReviewedObligationTarget<'_>,
-    ) -> Result<ReviewedObligationBinding<'a>, ReviewedObligationBindFailure> {
-        if self.record.result_use_obligations.is_empty() {
-            return Err(ReviewedObligationBindFailure::NoObligation);
-        }
-        if !target
-            .target
-            .language()
-            .accepts_semantic_pack_language(&self.shard.manifest.language)
-        {
-            return Err(ReviewedObligationBindFailure::LanguageMismatch);
-        }
-        if self
-            .shard
-            .matching_evidence
-            .binary_search(target.evidence)
-            .is_err()
-        {
-            return Err(ReviewedObligationBindFailure::EvidenceUnselected);
-        }
-        if let ReviewedObligationBasis::BuiltinReceiverAssumption(assumption) = target.basis
-            && (target.target.language().semantic_pack_label() != assumption.language()
-                || !target.target.has_receiver()
-                || target.target.owner_fqn() != assumption.receiver())
-        {
-            return Err(ReviewedObligationBindFailure::BasisMismatch);
-        }
-        if matches!(
-            target.basis,
-            ReviewedObligationBasis::PythonStandardLibraryFunction
-        ) && (target.target.language().semantic_pack_label() != "python"
-            || !target.target.has_resolver_owned_call_shape()
-            || target.target.has_receiver()
-            || target.evidence.language != "python"
-            || target.evidence.ecosystem != "python"
-            || target
-                .evidence
-                .toolchain
-                .as_ref()
-                .map(|toolchain| toolchain.name.as_str())
-                != Some("cpython"))
-        {
-            return Err(ReviewedObligationBindFailure::BasisMismatch);
-        }
-        if matches!(target.basis, ReviewedObligationBasis::ExactLiteralReceiver)
-            && (target.target.language() != LanguageDialect::Standard(Language::JavaScript)
-                || !target.target.has_receiver()
-                || target.target.owner_fqn() != "String")
-        {
-            return Err(ReviewedObligationBindFailure::BasisMismatch);
-        }
-        if self.bind_unmaterialized_call_shape(target.target).is_none() {
-            return Err(ReviewedObligationBindFailure::CallShapeMismatch);
-        }
-        Ok(ReviewedObligationBinding {
-            obligations: &self.record.result_use_obligations,
-            basis: target.basis,
-            ordinary_heap_unchanged: self.record.ordinary_heap_unchanged,
-            covers_overrides: self.record.covers_overrides,
-        })
-    }
-
-    /// Bind reviewed result-use obligations to an artifact-backed external
-    /// declaration. The declaration locator is resolver-owned evidence, so it
-    /// supplies the path and member shape that an unmaterialized target cannot
-    /// carry. Callers still select the exact generated external artifact
-    /// before invoking this method.
-    pub fn bind_reviewed_result_use_obligations_for_declaration(
-        &self,
-        target: ProcedureSummaryDeclarationKey<'_>,
-        evidence: &SemanticModelActivationEvidence,
-        basis: ReviewedObligationBasis,
-    ) -> Result<ReviewedObligationBinding<'a>, ReviewedObligationBindFailure> {
-        if self.record.result_use_obligations.is_empty() {
-            return Err(ReviewedObligationBindFailure::NoObligation);
-        }
-        let Some(language) = LanguageDialect::from_config_label(target.language) else {
-            return Err(ReviewedObligationBindFailure::LanguageMismatch);
-        };
-        if !language.accepts_semantic_pack_language(&self.shard.manifest.language) {
-            return Err(ReviewedObligationBindFailure::LanguageMismatch);
-        }
-        if self
-            .shard
-            .matching_evidence
-            .binary_search(evidence)
-            .is_err()
-        {
-            return Err(ReviewedObligationBindFailure::EvidenceUnselected);
-        }
-        let record_target = &self.record.target;
-        if record_target.path != target.path
-            || record_target.has_receiver != target.has_receiver
-            || record_target.parameter_count != target.parameter_count
-            || authored_procedure_target_identity(&record_target.path, &record_target.symbol)
-                .is_none_or(|(_, member)| member != target.member)
-        {
-            return Err(ReviewedObligationBindFailure::CallShapeMismatch);
-        }
-        Ok(ReviewedObligationBinding {
-            obligations: &self.record.result_use_obligations,
-            basis,
-            ordinary_heap_unchanged: self.record.ordinary_heap_unchanged,
-            covers_overrides: self.record.covers_overrides,
-        })
-    }
-
-    /// Outcome-sensitive predicate effects this reviewed summary attributes to
-    /// its boolean normal results.
-    pub fn conditional_result_refinements(&self) -> &'a [CompiledConditionalResultRefinement] {
-        &self.record.conditional_result_refinements
-    }
-
-    /// Outcome-sensitive one-step indirect writes attributed to this
-    /// procedure's normal return.
-    pub fn conditional_indirect_writes(&self) -> &'a [CompiledConditionalIndirectWrite] {
-        &self.record.conditional_indirect_writes
-    }
-
-    /// Predicates this reviewed summary establishes for actual arguments on
-    /// the call's normal continuation.
-    pub fn normal_return_refinements(&self) -> &'a [CompiledNormalReturnRefinement] {
-        &self.record.normal_return_refinements
-    }
-
-    /// Reviewed class assertions this summary establishes for actual
-    /// arguments on the call's normal continuation.
-    pub fn normal_return_type_refinements(&self) -> &'a [CompiledNormalReturnTypeRefinement] {
-        &self.record.normal_return_type_refinements
-    }
-
-    /// Reviewed identity claims for a class decorator or decorator factory.
-    /// Omission means that the activated summary makes no such claim.
-    pub fn class_decorator_identity(&self) -> Option<&'a CompiledClassDecoratorIdentity> {
-        self.record.class_decorator_identity.as_ref()
-    }
-
-    /// Whether the activated pack declares the named effect for this procedure.
-    pub fn declares_effect(&self, id: &str) -> bool {
-        self.record
-            .declared_effects
-            .iter()
-            .any(|effect| effect.id == id)
-    }
-
-    /// Project the same activation provenance declaration rows expose for this
-    /// exact summary record. Consumers that trust `covers_overrides` must keep
-    /// the authored record and active pack identity beside that decision.
-    pub fn provenance(
-        &self,
-        active: &ResolvedActiveSemanticModels,
-    ) -> super::SemanticModelProvenance {
-        let mut provenance =
-            super::overlay::activated_record_provenance(active, self.shard, &self.record.id);
-        provenance.completeness = match self.record.completeness {
-            super::Completeness::Partial => super::SemanticModelCompleteness::Partial,
-            super::Completeness::Complete => super::SemanticModelCompleteness::Complete,
-        };
-        provenance
-    }
-}
-
-/// Applicability coverage is independent of selected model presence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcedureSummaryApplicability {
-    Complete,
-    Incomplete,
-}
-
-#[derive(Debug)]
-pub struct ProcedureSummaryMatch<'a> {
-    pub applicability: ProcedureSummaryApplicability,
-    pub records: Vec<ActivatedProcedureSummary<'a>>,
-    pub disposition: SemanticModelMatchDisposition,
-    pub candidates_examined: usize,
-    pub fallback_candidates_examined: usize,
-}
-
-enum ProcedureSummaryAcceptance {
-    Reject,
-    Accept(Option<Box<[u32]>>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuleTriggerKey<'a> {
-    LanguageConstruct(&'a str),
-    Annotation(&'a str),
-    MacroInvocation(&'a str),
-    GeneratorInvocation(&'a str),
-    ResolvedOwner(&'a str),
-    ResolvedCall { owner: &'a str, name: &'a str },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RecordAddress {
-    shard: u32,
-    record: u32,
-}
-
-#[derive(Debug, Default)]
-struct ProcedureSummaryShapePostings {
-    fixed: HashMap<(bool, u32), Vec<RecordAddress>>,
-    /// Variadic postings keyed by total formal count, including the final rest
-    /// formal, for exact declaration lookup.
-    variadic: BTreeMap<(bool, u32), Vec<RecordAddress>>,
-    /// Applicability postings keyed by the minimum number of direct actuals
-    /// required by structured fixed formals.
-    variadic_by_minimum_arity: BTreeMap<(bool, u32), Vec<RecordAddress>>,
-    /// Optional-formal postings are keyed by receiver shape, minimum required
-    /// actual count, and total formal count for exact external-call binding.
-    optional_fixed: BTreeMap<(bool, u32, u32), Vec<RecordAddress>>,
-    /// Coarse construction hint, split by receiver shape. A true bit says only
-    /// that some indexed record authored the claim; matcher precedence and
-    /// conflicts still decide the effective candidate index below.
-    raw_normal_continuation_absence_claim: [bool; 2],
-}
-
-type ProcedureSummaryTargetPostings =
-    HashMap<String, HashMap<String, HashMap<String, ProcedureSummaryShapePostings>>>;
-
-#[derive(Debug, Default)]
-struct NormalContinuationAbsenceMemberCandidates {
-    receiverless_owners: Vec<String>,
-    receiver_owners: Vec<String>,
-}
-
-impl NormalContinuationAbsenceMemberCandidates {
-    fn owners(&self, has_receiver: bool) -> &[String] {
-        if has_receiver {
-            &self.receiver_owners
-        } else {
-            &self.receiverless_owners
-        }
-    }
-
-    fn owners_mut(&mut self, has_receiver: bool) -> &mut Vec<String> {
-        if has_receiver {
-            &mut self.receiver_owners
-        } else {
-            &mut self.receiverless_owners
-        }
-    }
-}
-
-/// Reusable discovery candidates derived from effective matcher behavior.
-///
-/// The index deliberately stops at owner/name/receiver. Exact actual arities
-/// remain runtime lookups, avoiding an unbounded variadic-arity cache.
-///
-/// It is keyed by [`semantic_pack_realm`], the same durable key the procedure
-/// summary postings it is built from use, so a caller's own language label
-/// reaches the candidates a pack declared for any language of that realm.
-#[derive(Debug, Default)]
-struct NormalContinuationAbsenceCandidateIndex {
-    by_language: HashMap<String, HashMap<String, NormalContinuationAbsenceMemberCandidates>>,
-}
-
-impl NormalContinuationAbsenceCandidateIndex {
-    fn has_language(&self, language: &str) -> bool {
-        self.by_language
-            .get(semantic_pack_realm(language))
-            .is_some_and(|members| !members.is_empty())
-    }
-
-    fn owners(&self, language: &str, member: &str, has_receiver: bool) -> &[String] {
-        self.by_language
-            .get(semantic_pack_realm(language))
-            .and_then(|members| members.get(member))
-            .map(|candidates| candidates.owners(has_receiver))
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Default)]
-struct MatcherIndexes {
-    types_by_id: HashMap<String, Vec<RecordAddress>>,
-    types_by_name: HashMap<String, Vec<RecordAddress>>,
-    members_by_id: HashMap<String, Vec<RecordAddress>>,
-    members_by_owner_name: HashMap<String, HashMap<String, Vec<RecordAddress>>>,
-    relations_by_id: HashMap<String, Vec<RecordAddress>>,
-    relations_by_from: HashMap<String, Vec<RecordAddress>>,
-    relations_by_to: HashMap<String, Vec<RecordAddress>>,
-    rules_by_id: HashMap<String, Vec<RecordAddress>>,
-    rules_by_language_construct: HashMap<String, Vec<RecordAddress>>,
-    rules_by_annotation: HashMap<String, Vec<RecordAddress>>,
-    rules_by_macro: HashMap<String, Vec<RecordAddress>>,
-    rules_by_generator: HashMap<String, Vec<RecordAddress>>,
-    rules_by_owner: HashMap<String, Vec<RecordAddress>>,
-    rules_by_call: HashMap<String, HashMap<String, Vec<RecordAddress>>>,
-    procedure_summaries_by_target: ProcedureSummaryTargetPostings,
-    /// Parallel to `procedure_summaries_by_target`, keyed by canonical identity
-    /// (language, owner FQN, member, has_receiver, applicable arity) instead of
-    /// (language, path, parameter-typed symbol). It binds an activated summary
-    /// to a fully-qualified external callee that never materializes to an
-    /// artifact, whose path and parameter types are unrecoverable (#1978).
-    procedure_summaries_by_member: ProcedureSummaryTargetPostings,
-    normal_continuation_absence_candidates: NormalContinuationAbsenceCandidateIndex,
-}
-
-impl MatcherIndexes {
-    fn build(
-        active: &[ActiveSemanticModelShard],
-        limits: SemanticModelRuntimeLimits,
-        cancellation: &CancellationToken,
-        report: &mut SemanticModelActivationReport,
-    ) -> Result<Self, String> {
-        let mut indexes = Self {
-            types_by_id: map_with_capacity(active.len()),
-            types_by_name: map_with_capacity(active.len()),
-            members_by_id: map_with_capacity(active.len()),
-            members_by_owner_name: map_with_capacity(active.len()),
-            relations_by_id: map_with_capacity(active.len()),
-            relations_by_from: map_with_capacity(active.len()),
-            relations_by_to: map_with_capacity(active.len()),
-            rules_by_id: map_with_capacity(active.len()),
-            rules_by_language_construct: map_with_capacity(active.len()),
-            rules_by_annotation: map_with_capacity(active.len()),
-            rules_by_macro: map_with_capacity(active.len()),
-            rules_by_generator: map_with_capacity(active.len()),
-            rules_by_owner: map_with_capacity(active.len()),
-            rules_by_call: map_with_capacity(active.len()),
-            procedure_summaries_by_target: map_with_capacity(active.len()),
-            procedure_summaries_by_member: map_with_capacity(active.len()),
-            normal_continuation_absence_candidates:
-                NormalContinuationAbsenceCandidateIndex::default(),
-        };
-        let mut entries = 0usize;
-        let mut working_bytes = 0u64;
-        let mut records_visited = 0usize;
-        let mut guard_excluded_records = 0usize;
-
-        for (shard_index, active_shard) in active.iter().enumerate() {
-            let shard_index = u32::try_from(shard_index)
-                .map_err(|_| "semantic-model shard address exceeds u32".to_owned())?;
-            if let Some((types, members, relations)) =
-                active_shard.shard.payload().declaration_facts()
-            {
-                for (record_index, fact) in types.iter().enumerate() {
-                    poll_matcher_cancellation(cancellation, records_visited)?;
-                    records_visited += 1;
-                    if active_shard.guard_excludes(fact.guard.as_ref()) {
-                        guard_excluded_records += 1;
-                        continue;
-                    }
-                    let address = record_address(shard_index, record_index)?;
-                    insert_posting(
-                        &mut indexes.types_by_id,
-                        fact.id.clone(),
-                        fact.id.len(),
-                        address,
-                        &mut entries,
-                        &mut working_bytes,
-                        limits,
-                    )?;
-                    insert_posting(
-                        &mut indexes.types_by_name,
-                        fact.name.clone(),
-                        fact.name.len(),
-                        address,
-                        &mut entries,
-                        &mut working_bytes,
-                        limits,
-                    )?;
-                    for alias in &fact.aliases {
-                        insert_posting(
-                            &mut indexes.types_by_name,
-                            alias.clone(),
-                            alias.len(),
-                            address,
-                            &mut entries,
-                            &mut working_bytes,
-                            limits,
-                        )?;
-                    }
-                }
-                for (record_index, fact) in members.iter().enumerate() {
-                    poll_matcher_cancellation(cancellation, records_visited)?;
-                    records_visited += 1;
-                    if active_shard.guard_excludes(fact.guard.as_ref()) {
-                        guard_excluded_records += 1;
-                        continue;
-                    }
-                    let address = record_address(shard_index, record_index)?;
-                    insert_posting(
-                        &mut indexes.members_by_id,
-                        fact.id.clone(),
-                        fact.id.len(),
-                        address,
-                        &mut entries,
-                        &mut working_bytes,
-                        limits,
-                    )?;
-                    insert_member_name(
-                        &mut indexes.members_by_owner_name,
-                        fact,
-                        &fact.name,
-                        address,
-                        &mut entries,
-                        &mut working_bytes,
-                        limits,
-                    )?;
-                    for alias in &fact.aliases {
-                        insert_member_name(
-                            &mut indexes.members_by_owner_name,
-                            fact,
-                            alias,
-                            address,
-                            &mut entries,
-                            &mut working_bytes,
-                            limits,
-                        )?;
-                    }
-                }
-                for (record_index, fact) in relations.iter().enumerate() {
-                    poll_matcher_cancellation(cancellation, records_visited)?;
-                    records_visited += 1;
-                    let address = record_address(shard_index, record_index)?;
-                    for (map, key) in [
-                        (&mut indexes.relations_by_id, &fact.id),
-                        (&mut indexes.relations_by_from, &fact.from),
-                        (&mut indexes.relations_by_to, &fact.to),
-                    ] {
-                        insert_posting(
-                            map,
-                            key.clone(),
-                            key.len(),
-                            address,
-                            &mut entries,
-                            &mut working_bytes,
-                            limits,
-                        )?;
-                    }
-                }
-            }
-            if let Some(rules) = active_shard.shard.payload().generator_rules() {
-                for (record_index, rule) in rules.iter().enumerate() {
-                    poll_matcher_cancellation(cancellation, records_visited)?;
-                    records_visited += 1;
-                    let address = record_address(shard_index, record_index)?;
-                    insert_posting(
-                        &mut indexes.rules_by_id,
-                        rule.id.clone(),
-                        rule.id.len(),
-                        address,
-                        &mut entries,
-                        &mut working_bytes,
-                        limits,
-                    )?;
-                    insert_rule_trigger(
-                        &mut indexes,
-                        &rule.trigger,
-                        address,
-                        &mut entries,
-                        &mut working_bytes,
-                        limits,
-                    )?;
-                }
-            }
-            if let Some(summaries) = active_shard.shard.payload().procedure_summaries() {
-                for (record_index, summary) in summaries.iter().enumerate() {
-                    poll_matcher_cancellation(cancellation, records_visited)?;
-                    records_visited += 1;
-                    let address = record_address(shard_index, record_index)?;
-                    let key_bytes = active_shard
-                        .manifest
-                        .language
-                        .len()
-                        .saturating_add(summary.target.path.len())
-                        .saturating_add(summary.target.symbol.len())
-                        .saturating_add(size_of::<bool>())
-                        .saturating_add(size_of::<u32>());
-                    let paths = indexes
-                        .procedure_summaries_by_target
-                        .entry(semantic_pack_realm(&active_shard.manifest.language).to_owned())
-                        .or_default();
-                    let symbols = paths.entry(summary.target.path.clone()).or_default();
-                    let shapes = symbols.entry(summary.target.symbol.clone()).or_default();
-                    insert_procedure_posting(
-                        shapes,
-                        &summary.target,
-                        key_bytes,
-                        address,
-                        &mut entries,
-                        &mut working_bytes,
-                        limits,
-                    )?;
-                    // #1978: also index by canonical identity so an unmaterialized
-                    // external callee -- which cannot present the authored path or
-                    // parameter-typed symbol -- can still find this summary. A bare
-                    // symbol is a module-level target, so its owner is the module the
-                    // authored path names (#2610).
-                    if let Some((owner, member)) = authored_procedure_target_identity(
-                        &summary.target.path,
-                        &summary.target.symbol,
-                    ) {
-                        let member_key_bytes = active_shard
-                            .manifest
-                            .language
-                            .len()
-                            .saturating_add(owner.len())
-                            .saturating_add(member.len())
-                            .saturating_add(size_of::<bool>())
-                            .saturating_add(size_of::<u32>());
-                        let owners = indexes
-                            .procedure_summaries_by_member
-                            .entry(semantic_pack_realm(&active_shard.manifest.language).to_owned())
-                            .or_default();
-                        let members = owners.entry(owner.into_owned()).or_default();
-                        let shapes = members.entry(member.to_owned()).or_default();
-                        insert_procedure_posting(
-                            shapes,
-                            &summary.target,
-                            member_key_bytes,
-                            address,
-                            &mut entries,
-                            &mut working_bytes,
-                            limits,
-                        )?;
-                        if !summary.target.formals.is_empty()
-                            && summary.target.formals.iter().any(|formal| formal.optional)
-                        {
-                            let minimum_actual_count = u32::try_from(
-                                summary
-                                    .target
-                                    .formals
-                                    .iter()
-                                    .filter(|formal| !formal.optional)
-                                    .count(),
-                            )
-                            .expect("validated formal count fits u32");
-                            let formal_count = summary.target.parameter_count;
-                            charge_posting_entry(
-                                member_key_bytes.saturating_add(size_of::<u32>() * 2),
-                                &mut entries,
-                                &mut working_bytes,
-                                limits,
-                            )?;
-                            shapes
-                                .optional_fixed
-                                .entry((
-                                    summary.target.has_receiver,
-                                    minimum_actual_count,
-                                    formal_count,
-                                ))
-                                .or_default()
-                                .push(address);
-                        }
-                        shapes.raw_normal_continuation_absence_claim
-                            [usize::from(summary.target.has_receiver)] |=
-                            summary.normal_continuation_absent;
-                    }
-                }
-            }
-        }
-
-        indexes.normal_continuation_absence_candidates =
-            build_normal_continuation_absence_candidates(
-                active,
-                &indexes.procedure_summaries_by_member,
-                cancellation,
-                &mut entries,
-                &mut working_bytes,
-                limits,
-            )?;
-
-        let shard_bytes = active
-            .iter()
-            .try_fold(0u64, |total, active_shard| {
-                total.checked_add(
-                    active_shard
-                        .manifest
-                        .shards
-                        .iter()
-                        .find(|descriptor| descriptor.shard_id == active_shard.shard.shard_id())?
-                        .raw_size,
-                )
-            })
-            .ok_or_else(|| "semantic-model retained-byte accounting overflowed".to_owned())?;
-        let retained_bytes = working_bytes
-            .checked_add(shard_bytes)
-            .ok_or_else(|| "semantic-model retained-byte accounting overflowed".to_owned())?;
-        if retained_bytes > limits.max_retained_bytes {
-            return Err("semantic-model retained-byte budget exceeded".to_owned());
-        }
-        report.index_entries = entries;
-        report.working_bytes = working_bytes;
-        report.retained_bytes = retained_bytes;
-        report.guard_excluded_records = guard_excluded_records;
-        Ok(indexes)
-    }
-}
-
-fn record_address(shard: u32, record: usize) -> Result<RecordAddress, String> {
-    Ok(RecordAddress {
-        shard,
-        record: u32::try_from(record)
-            .map_err(|_| "semantic-model record address exceeds u32".to_owned())?,
-    })
-}
-
-fn poll_matcher_cancellation(
-    cancellation: &CancellationToken,
-    records_visited: usize,
-) -> Result<(), String> {
-    if records_visited.is_multiple_of(1_024) && cancellation.is_cancelled() {
-        return Err("semantic-model matcher construction cancelled".to_owned());
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-enum EffectiveProcedureClaims {
-    #[default]
-    Empty,
-    Unique {
-        rank: (EvidenceRank, u8),
-        representative: RecordAddress,
-    },
-    Conflict {
-        rank: (EvidenceRank, u8),
-    },
-}
-
-impl EffectiveProcedureClaims {
-    fn absorb(&mut self, active: &[ActiveSemanticModelShard], address: RecordAddress) {
-        let shard = &active[address.shard as usize];
-        let rank = (shard.evidence_rank, shard.source_rank);
-        match *self {
-            Self::Empty => {
-                *self = Self::Unique {
-                    rank,
-                    representative: address,
-                };
-            }
-            Self::Unique {
-                rank: effective_rank,
-                representative,
-            } => match rank.cmp(&effective_rank) {
-                Ordering::Less => {}
-                Ordering::Greater => {
-                    *self = Self::Unique {
-                        rank,
-                        representative: address,
-                    };
-                }
-                Ordering::Equal => {
-                    if !procedure_claims_agree(
-                        indexed_procedure_summary(active, representative),
-                        indexed_procedure_summary(active, address),
-                    ) {
-                        *self = Self::Conflict { rank };
-                    }
-                }
-            },
-            Self::Conflict {
-                rank: effective_rank,
-            } if rank > effective_rank => {
-                *self = Self::Unique {
-                    rank,
-                    representative: address,
-                };
-            }
-            Self::Conflict { .. } => {}
-        }
-    }
-
-    fn proves_normal_continuation_absent(self, active: &[ActiveSemanticModelShard]) -> bool {
-        matches!(
-            self,
-            Self::Unique { representative, .. }
-                if indexed_procedure_summary(active, representative).normal_continuation_absent
-        )
-    }
-}
-
-fn indexed_procedure_summary(
-    active: &[ActiveSemanticModelShard],
-    address: RecordAddress,
-) -> &CompiledProcedureSummary {
-    active[address.shard as usize]
-        .shard
-        .payload()
-        .procedure_summaries()
-        .expect("procedure-summary index address must resolve to its payload kind")
-        .get(address.record as usize)
-        .expect("procedure-summary index address must resolve to its record")
-}
-
-fn absorb_procedure_posting(
-    effective: &mut EffectiveProcedureClaims,
-    active: &[ActiveSemanticModelShard],
-    posting: &[RecordAddress],
-    cancellation: &CancellationToken,
-    addresses_visited: &mut usize,
-) -> Result<(), String> {
-    for &address in posting {
-        poll_matcher_cancellation(cancellation, *addresses_visited)?;
-        *addresses_visited = (*addresses_visited).saturating_add(1);
-        effective.absorb(active, address);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_normal_continuation_absence_candidates(
-    active: &[ActiveSemanticModelShard],
-    postings: &ProcedureSummaryTargetPostings,
-    cancellation: &CancellationToken,
-    entries: &mut usize,
-    working_bytes: &mut u64,
-    limits: SemanticModelRuntimeLimits,
-) -> Result<NormalContinuationAbsenceCandidateIndex, String> {
-    let mut candidates = NormalContinuationAbsenceCandidateIndex::default();
-    let mut addresses_visited = 0usize;
-    for (language, owners) in postings {
-        for (owner, members) in owners {
-            for (member, shapes) in members {
-                for has_receiver in [false, true] {
-                    if !shapes.raw_normal_continuation_absence_claim[usize::from(has_receiver)] {
-                        continue;
-                    }
-                    // This pass runs only once per immutable active set. Poll
-                    // every hinted target and arity so cancellation can never
-                    // publish a partially derived candidate inventory.
-                    poll_matcher_cancellation(cancellation, 0)?;
-
-                    // A fixed record exists only at A, while a variadic record
-                    // begins at its required fixed-formal count and remains
-                    // applicable. The candidate set changes at each fixed A,
-                    // immediately after it disappears, or at a variadic minimum.
-                    let mut representative_arities = Vec::new();
-                    for &(receiver, arity) in shapes.fixed.keys() {
-                        if receiver != has_receiver {
-                            continue;
-                        }
-                        representative_arities.push(arity);
-                        if let Some(successor) = arity.checked_add(1) {
-                            representative_arities.push(successor);
-                        }
-                    }
-                    for &(receiver, minimum_actual_count) in shapes.variadic_by_minimum_arity.keys()
-                    {
-                        if receiver != has_receiver {
-                            continue;
-                        }
-                        representative_arities.push(minimum_actual_count);
-                    }
-                    representative_arities.sort_unstable();
-                    representative_arities.dedup();
-
-                    // Sorting the shape boundaries costs O(S log S). The
-                    // merge below then visits every applicable variadic and
-                    // fixed posting address once, rather than rescanning the
-                    // full variadic prefix at every boundary.
-                    let mut variadic_postings = shapes
-                        .variadic_by_minimum_arity
-                        .range((has_receiver, 0)..=(has_receiver, u32::MAX))
-                        .peekable();
-                    let mut effective_variadic = EffectiveProcedureClaims::default();
-                    let mut effective = false;
-                    for arity in representative_arities {
-                        poll_matcher_cancellation(cancellation, 0)?;
-                        while let Some((shape, _posting)) = variadic_postings.peek() {
-                            if shape.1 > arity {
-                                break;
-                            }
-                            let (_shape, posting) = variadic_postings
-                                .next()
-                                .expect("peeked variadic posting must remain available");
-                            absorb_procedure_posting(
-                                &mut effective_variadic,
-                                active,
-                                posting,
-                                cancellation,
-                                &mut addresses_visited,
-                            )?;
-                        }
-
-                        // Fixed claims apply only at this exact arity. Start
-                        // from the accumulated variadic state so a successor
-                        // boundary removes the fixed claims without rescanning
-                        // any already-applicable variadic posting.
-                        let mut effective_at_arity = effective_variadic;
-                        if let Some(posting) = shapes.fixed.get(&(has_receiver, arity)) {
-                            absorb_procedure_posting(
-                                &mut effective_at_arity,
-                                active,
-                                posting,
-                                cancellation,
-                                &mut addresses_visited,
-                            )?;
-                        }
-                        if effective_at_arity.proves_normal_continuation_absent(active) {
-                            effective = true;
-                            break;
-                        }
-                    }
-                    if !effective {
-                        continue;
-                    }
-
-                    let retained_bytes = language
-                        .len()
-                        .saturating_add(member.len())
-                        .saturating_add(owner.len())
-                        .saturating_add(size_of::<String>().saturating_mul(3))
-                        .saturating_add(size_of::<bool>())
-                        .saturating_add(64);
-                    charge_index_entry(retained_bytes, entries, working_bytes, limits)?;
-                    candidates
-                        .by_language
-                        .entry(language.clone())
-                        .or_default()
-                        .entry(member.clone())
-                        .or_default()
-                        .owners_mut(has_receiver)
-                        .push(owner.clone());
-                }
-            }
-        }
-    }
-    for members in candidates.by_language.values_mut() {
-        for candidates in members.values_mut() {
-            candidates.receiverless_owners.sort_unstable();
-            candidates.receiver_owners.sort_unstable();
-        }
-    }
-    Ok(candidates)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_posting<K: Eq + std::hash::Hash>(
-    map: &mut HashMap<K, Vec<RecordAddress>>,
-    key: K,
-    key_bytes: usize,
-    address: RecordAddress,
-    entries: &mut usize,
-    working_bytes: &mut u64,
-    limits: SemanticModelRuntimeLimits,
-) -> Result<(), String> {
-    charge_posting_entry(key_bytes, entries, working_bytes, limits)?;
-    map.entry(key).or_default().push(address);
-    Ok(())
-}
-
-fn charge_posting_entry(
-    key_bytes: usize,
-    entries: &mut usize,
-    working_bytes: &mut u64,
-    limits: SemanticModelRuntimeLimits,
-) -> Result<(), String> {
-    charge_index_entry(
-        key_bytes
-            .saturating_add(size_of::<RecordAddress>())
-            .saturating_add(32),
-        entries,
-        working_bytes,
-        limits,
-    )
-}
-
-fn procedure_summary_minimum_actual_count(target: &CompiledProcedureTarget) -> u32 {
-    if target.formals.is_empty() {
-        return target.parameter_count.saturating_sub(1);
-    }
-    u32::try_from(
-        target
-            .formals
-            .iter()
-            .filter(|formal| !formal.optional && formal.variadic_kind.is_none())
-            .count(),
-    )
-    .expect("validated procedure formal count fits u32")
-}
-
-fn charge_index_entry(
-    retained_bytes: usize,
-    entries: &mut usize,
-    working_bytes: &mut u64,
-    limits: SemanticModelRuntimeLimits,
-) -> Result<(), String> {
-    *entries = entries
-        .checked_add(1)
-        .ok_or_else(|| "semantic-model index-entry accounting overflowed".to_owned())?;
-    if *entries > limits.max_index_entries {
-        return Err("semantic-model index-entry budget exceeded".to_owned());
-    }
-    *working_bytes = working_bytes
-        .checked_add(retained_bytes as u64)
-        .ok_or_else(|| "semantic-model working-byte accounting overflowed".to_owned())?;
-    if *working_bytes > limits.max_working_bytes {
-        return Err("semantic-model working-byte budget exceeded".to_owned());
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_procedure_posting(
-    shapes: &mut ProcedureSummaryShapePostings,
-    target: &CompiledProcedureTarget,
-    key_bytes: usize,
-    address: RecordAddress,
-    entries: &mut usize,
-    working_bytes: &mut u64,
-    limits: SemanticModelRuntimeLimits,
-) -> Result<(), String> {
-    let key = (target.has_receiver, target.parameter_count);
-    if target.variadic {
-        charge_posting_entry(key_bytes, entries, working_bytes, limits)?;
-        shapes.variadic.entry(key).or_default().push(address);
-        charge_posting_entry(
-            key_bytes.saturating_add(size_of::<u32>()),
-            entries,
-            working_bytes,
-            limits,
-        )?;
-        shapes
-            .variadic_by_minimum_arity
-            .entry((
-                target.has_receiver,
-                procedure_summary_minimum_actual_count(target),
-            ))
-            .or_default()
-            .push(address);
-        Ok(())
-    } else {
-        insert_posting(
-            &mut shapes.fixed,
-            key,
-            key_bytes,
-            address,
-            entries,
-            working_bytes,
-            limits,
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_member_name(
-    map: &mut HashMap<String, HashMap<String, Vec<RecordAddress>>>,
-    fact: &MemberFact,
-    name: &str,
-    address: RecordAddress,
-    entries: &mut usize,
-    working_bytes: &mut u64,
-    limits: SemanticModelRuntimeLimits,
-) -> Result<(), String> {
-    let names = map.entry(fact.owner.clone()).or_default();
-    insert_posting(
-        names,
-        name.to_owned(),
-        fact.owner.len() + name.len(),
-        address,
-        entries,
-        working_bytes,
-        limits,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_rule_trigger(
-    indexes: &mut MatcherIndexes,
-    trigger: &RuleTrigger,
-    address: RecordAddress,
-    entries: &mut usize,
-    working_bytes: &mut u64,
-    limits: SemanticModelRuntimeLimits,
-) -> Result<(), String> {
-    let (map, value) = match trigger {
-        RuleTrigger::LanguageConstruct { construct } => {
-            (&mut indexes.rules_by_language_construct, construct)
-        }
-        RuleTrigger::Annotation { name } => (&mut indexes.rules_by_annotation, name),
-        RuleTrigger::AnnotatedField { annotation, .. } => {
-            (&mut indexes.rules_by_annotation, annotation)
-        }
-        RuleTrigger::MacroInvocation { name } => (&mut indexes.rules_by_macro, name),
-        RuleTrigger::GeneratorInvocation { name } => (&mut indexes.rules_by_generator, name),
-        RuleTrigger::ResolvedOwner { owner } => (&mut indexes.rules_by_owner, owner),
-        RuleTrigger::ResolvedCall { owner, name } => {
-            let names = indexes.rules_by_call.entry(owner.clone()).or_default();
-            return insert_posting(
-                names,
-                name.clone(),
-                owner.len() + name.len(),
-                address,
-                entries,
-                working_bytes,
-                limits,
-            );
-        }
-    };
-    insert_posting(
-        map,
-        value.clone(),
-        value.len(),
-        address,
-        entries,
-        working_bytes,
-        limits,
-    )
-}
-
-fn resolve_posting<'a, T: Eq, F>(
-    shards: &'a [ActiveSemanticModelShard],
-    posting: Option<&Vec<RecordAddress>>,
-    mut resolve: F,
-) -> SemanticModelMatch<'a, T>
-where
-    F: FnMut(&'a ActiveSemanticModelShard, usize) -> Option<&'a T>,
-{
-    let Some(posting) = posting else {
-        return SemanticModelMatch {
-            records: Vec::new(),
-            disposition: SemanticModelMatchDisposition::Empty,
-            candidates_examined: 0,
-            fallback_candidates_examined: 0,
-        };
-    };
-    let best_rank = posting
-        .iter()
-        .map(|address| {
-            let shard = &shards[address.shard as usize];
-            (shard.evidence_rank, shard.source_rank)
-        })
-        .max()
-        .expect("non-empty semantic-model posting");
-    let mut records = Vec::new();
-    for address in posting {
-        let shard = &shards[address.shard as usize];
-        if (shard.evidence_rank, shard.source_rank) != best_rank {
-            continue;
-        }
-        let record = resolve(shard, address.record as usize)
-            .expect("semantic-model index address must resolve to its record kind");
-        if !records
-            .iter()
-            .any(|candidate: &ActivatedSemanticModelRecord<'_, T>| {
-                candidate.record == record
-                    && !(candidate.shard.matched_evidence.ecosystem == "jdk"
-                        && shard.matched_evidence.ecosystem == "jdk"
-                        && candidate.shard.matched_evidence.artifact_sha256
-                            != shard.matched_evidence.artifact_sha256)
-            })
-        {
-            records.push(ActivatedSemanticModelRecord { record, shard });
-        }
-    }
-    SemanticModelMatch {
-        disposition: if records.len() == 1 {
-            SemanticModelMatchDisposition::Unique
-        } else {
-            SemanticModelMatchDisposition::Conflict
-        },
-        records,
-        candidates_examined: posting.len(),
-        fallback_candidates_examined: 0,
-    }
-}
-
-/// Whether two activated records make all the same consumer-observable claims.
-/// Identity fields (`id`, `model_id`, `content_sha256`) and the target spelling
-/// are excluded, because they differ between records that nevertheless behave
-/// identically.
-///
-/// This is what makes a posting with several records still a unique answer. The
-/// canonical member key (#1978) is (language, owner, member, receiver, arity),
-/// so it cannot tell same-arity overloads apart: `String.valueOf(int)`,
-/// `String.valueOf(char[])`, and `String.valueOf(Object)` share one key, and a
-/// standard-library summary pack legitimately ships all three. When their claims
-/// are identical, either choice yields the same propagation, so refusing would
-/// fail a policy closed over an ambiguity that does not change any answer. A
-/// genuine disagreement still resolves to `Conflict` and still fails closed.
-fn procedure_claims_agree(
-    left: &CompiledProcedureSummary,
-    right: &CompiledProcedureSummary,
-) -> bool {
-    left.completeness == right.completeness
-        && left.ordinary_heap_unchanged == right.ordinary_heap_unchanged
-        && left.no_concurrency_effects == right.no_concurrency_effects
-        && left.covers_overrides == right.covers_overrides
-        && left.normal_continuation_absent == right.normal_continuation_absent
-        && left.normal_result_count == right.normal_result_count
-        && left.locations == right.locations
-        && left.transfers == right.transfers
-        && left.effects == right.effects
-        && left.concurrency_effects == right.concurrency_effects
-        && left.declared_effects == right.declared_effects
-        && left.preconditions == right.preconditions
-        && left.result_contracts == right.result_contracts
-        && left.result_use_obligations == right.result_use_obligations
-        && left.conditional_result_refinements == right.conditional_result_refinements
-        && left.conditional_indirect_writes == right.conditional_indirect_writes
-        && left.normal_return_refinements == right.normal_return_refinements
-        && left.normal_return_type_refinements == right.normal_return_type_refinements
-        && left.class_decorator_identity == right.class_decorator_identity
-        && left.target.formals == right.target.formals
-}
-
-fn resolve_exact_procedure_postings<'a>(
-    shards: &'a [ActiveSemanticModelShard],
-    shapes: Option<&ProcedureSummaryShapePostings>,
-    has_receiver: bool,
-    formal_parameter_count: u32,
-) -> ProcedureSummaryMatch<'a> {
-    let Some(shapes) = shapes else {
-        return empty_procedure_match();
-    };
-    let key = (has_receiver, formal_parameter_count);
-    resolve_procedure_postings(
-        shards,
-        [shapes.fixed.get(&key), shapes.variadic.get(&key)]
-            .into_iter()
-            .flatten(),
-        procedure_declaration_claims_agree,
-    )
-}
-
-fn resolve_applicable_procedure_postings<'a>(
-    shards: &'a [ActiveSemanticModelShard],
-    shapes: Option<&ProcedureSummaryShapePostings>,
-    has_receiver: bool,
-    actual_parameter_count: u32,
-) -> ProcedureSummaryMatch<'a> {
-    resolve_applicable_procedure_postings_where(
-        shards,
-        shapes,
-        has_receiver,
-        actual_parameter_count,
-        |_, _| ProcedureSummaryAcceptance::Accept(None),
-    )
-}
-
-fn resolve_applicable_procedure_postings_where<'a>(
-    shards: &'a [ActiveSemanticModelShard],
-    shapes: Option<&ProcedureSummaryShapePostings>,
-    has_receiver: bool,
-    actual_parameter_count: u32,
-    accepts_record: impl Fn(
-        &ActiveSemanticModelShard,
-        &CompiledProcedureSummary,
-    ) -> ProcedureSummaryAcceptance,
-) -> ProcedureSummaryMatch<'a> {
-    resolve_applicable_procedure_postings_where_for_counts(
-        shards,
-        shapes,
-        has_receiver,
-        &[actual_parameter_count],
-        accepts_record,
-    )
-}
-
-fn resolve_applicable_procedure_postings_where_for_counts<'a>(
-    shards: &'a [ActiveSemanticModelShard],
-    shapes: Option<&ProcedureSummaryShapePostings>,
-    has_receiver: bool,
-    actual_parameter_counts: &[u32],
-    accepts_record: impl Fn(
-        &ActiveSemanticModelShard,
-        &CompiledProcedureSummary,
-    ) -> ProcedureSummaryAcceptance,
-) -> ProcedureSummaryMatch<'a> {
-    let Some(shapes) = shapes else {
-        return empty_procedure_match();
-    };
-    let mut parameter_counts = actual_parameter_counts.to_vec();
-    parameter_counts.sort_unstable();
-    parameter_counts.dedup();
-    let mut postings = Vec::new();
-    for actual_parameter_count in parameter_counts {
-        postings.extend(fixed_and_variadic_postings(
-            shapes,
-            has_receiver,
-            actual_parameter_count,
-        ));
-        postings.extend(
-            shapes
-                .optional_fixed
-                .range(
-                    (has_receiver, 0, actual_parameter_count)
-                        ..=(has_receiver, actual_parameter_count, u32::MAX),
-                )
-                .map(|(_key, posting)| posting),
-        );
-    }
-    resolve_procedure_postings_where(shards, postings, procedure_claims_agree, accepts_record)
-}
-
-fn fixed_and_variadic_postings<'a>(
-    shapes: &'a ProcedureSummaryShapePostings,
-    has_receiver: bool,
-    parameter_count: u32,
-) -> impl Iterator<Item = &'a Vec<RecordAddress>> + 'a {
-    shapes
-        .fixed
-        .get(&(has_receiver, parameter_count))
-        .into_iter()
-        .chain(
-            shapes
-                .variadic_by_minimum_arity
-                .range((has_receiver, 0)..=(has_receiver, parameter_count))
-                .map(|(_, posting)| posting),
-        )
-}
-
-fn procedure_match_proves_normal_continuation_absent(matched: &ProcedureSummaryMatch<'_>) -> bool {
-    matched.disposition == SemanticModelMatchDisposition::Unique
-        && matches!(
-            matched.records.as_slice(),
-            [summary] if summary.normal_continuation_absent()
-        )
-}
-
-fn empty_procedure_match<'a>() -> ProcedureSummaryMatch<'a> {
-    ProcedureSummaryMatch {
-        applicability: ProcedureSummaryApplicability::Complete,
-        records: Vec::new(),
-        disposition: SemanticModelMatchDisposition::Empty,
-        candidates_examined: 0,
-        fallback_candidates_examined: 0,
-    }
-}
-
-fn resolve_procedure_postings<'a, 'posting>(
-    shards: &'a [ActiveSemanticModelShard],
-    postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
-    claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
-) -> ProcedureSummaryMatch<'a> {
-    resolve_procedure_postings_where(shards, postings, claims_agree, |_, _| {
-        ProcedureSummaryAcceptance::Accept(None)
-    })
-}
-
-fn resolve_procedure_postings_where<'a, 'posting>(
-    shards: &'a [ActiveSemanticModelShard],
-    postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
-    claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
-    accepts_record: impl Fn(
-        &ActiveSemanticModelShard,
-        &CompiledProcedureSummary,
-    ) -> ProcedureSummaryAcceptance,
-) -> ProcedureSummaryMatch<'a> {
-    let mut candidates_examined = 0usize;
-    let mut best_rank = None;
-    let mut records = Vec::<ActivatedProcedureSummary<'a>>::new();
-    for posting in postings {
-        candidates_examined = candidates_examined.saturating_add(posting.len());
-        for address in posting {
-            let shard = &shards[address.shard as usize];
-            let payload = shard
-                .shard
-                .payload()
-                .procedure_summaries()
-                .expect("procedure-summary index address must resolve to its payload kind");
-            let record = payload
-                .get(address.record as usize)
-                .expect("procedure-summary index address must resolve to its record");
-            let actual_to_formal = match accepts_record(shard, record) {
-                ProcedureSummaryAcceptance::Reject => continue,
-                ProcedureSummaryAcceptance::Accept(mapping) => mapping,
-            };
-            if records.iter().any(|candidate| {
-                claims_agree(candidate.record, record)
-                    && candidate.actual_to_formal == actual_to_formal
-            }) {
-                continue;
-            }
-            let rank = (shard.evidence_rank, shard.source_rank);
-            if best_rank.is_some_and(|best| rank < best) {
-                continue;
-            }
-            if best_rank.is_none_or(|best| rank > best) {
-                best_rank = Some(rank);
-                records.clear();
-            }
-            if records
-                .iter()
-                .any(|candidate| claims_agree(candidate.record, record))
-            {
-                continue;
-            }
-            records.push(ActivatedProcedureSummary {
-                record,
-                shard,
-                payload,
-                actual_to_formal,
-                matched_target_locator: None,
-                matched_call_arguments: None,
-            });
-        }
-    }
-    ProcedureSummaryMatch {
-        applicability: ProcedureSummaryApplicability::Complete,
-        disposition: match records.len() {
-            0 => SemanticModelMatchDisposition::Empty,
-            1 => SemanticModelMatchDisposition::Unique,
-            _ => SemanticModelMatchDisposition::Conflict,
-        },
-        records,
-        candidates_examined,
-        fallback_candidates_examined: 0,
-    }
-}
-
-fn procedure_declaration_claims_agree(
-    left: &CompiledProcedureSummary,
-    right: &CompiledProcedureSummary,
-) -> bool {
-    left.target.variadic == right.target.variadic
-        && left.target.formals == right.target.formals
-        && procedure_claims_agree(left, right)
-}
-
 #[derive(Debug)]
 pub enum SemanticModelResolutionOutcome {
     Ready(ResolvedActiveSemanticModels),
@@ -2852,14 +117,6 @@ pub enum SemanticModelResolutionOutcome {
     },
     Cancelled(SemanticModelActivationReport),
     Unavailable(SemanticModelActivationReport),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticModelRuntimeLifecycle {
-    Cached,
-    Built,
-    Uncached,
 }
 
 #[derive(Debug)]
@@ -2902,7 +159,8 @@ impl SemanticModelRuntimeOutcome {
     }
 }
 
-pub(crate) fn degrade_pack_gap_absences(
+#[doc(hidden)]
+pub fn degrade_pack_gap_absences(
     analyzer: &dyn IAnalyzer,
     mut report: crate::analyzer::SemanticDiagnosticReport,
 ) -> crate::analyzer::SemanticDiagnosticReport {
@@ -2936,9 +194,10 @@ pub(crate) struct SemanticModelRuntimeCache {
 }
 
 #[derive(Default)]
-struct PublishedSemanticModelState {
+pub(crate) struct PublishedSemanticModelState {
     snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-    dependency_evidence: HashMap<Language, Arc<super::DependencyDiscoveryEvidence>>,
+    dependency_evidence:
+        HashMap<Language, Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2981,11 +240,11 @@ impl SemanticModelRuntimeCache {
 
     /// Retain discovery evidence for trace tests without invoking discovery
     /// from the query path.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],
-        evidence: super::DependencyDiscoveryEvidence,
+        evidence: crate::analyzer::semantic_model::DependencyDiscoveryEvidence,
     ) {
         let evidence = Arc::new(evidence);
         let mut published = self
@@ -3001,7 +260,7 @@ impl SemanticModelRuntimeCache {
     pub(crate) fn dependency_discovery_evidence(
         &self,
         language: Language,
-    ) -> Option<Arc<super::DependencyDiscoveryEvidence>> {
+    ) -> Option<Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>> {
         self.published
             .lock()
             .expect("semantic-model publication mutex poisoned")
@@ -3128,16 +387,8 @@ impl SemanticModelRuntimeCache {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum EvidenceRank {
-    Language,
-    NamedCoordinate,
-    VersionedCoordinate,
-    ExactArtifact,
-}
-
 #[derive(Debug)]
-struct CandidateSelection {
+pub(crate) struct CandidateSelection {
     active: ActiveSemanticModelShard,
     semantic_sha256: String,
     payload_kind: PayloadKind,
@@ -3788,7 +1039,7 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     }
 }
 
-fn overlay_build_outcome(
+pub(crate) fn overlay_build_outcome(
     active: &ResolvedActiveSemanticModels,
     error: SemanticModelOverlayBuildError,
     limits: SemanticModelRuntimeLimits,
@@ -3816,12 +1067,12 @@ fn overlay_build_outcome(
     }
 }
 
-fn publish_active_models(
+pub(crate) fn publish_active_models(
     analyzer: &dyn IAnalyzer,
     catalog: &SemanticPackCatalog,
     persistence: Option<SemanticModelActivationPersistence<'_>>,
     active: &ResolvedActiveSemanticModels,
-) -> Result<(), super::CatalogError> {
+) -> Result<(), crate::analyzer::semantic_model::CatalogError> {
     let _scope = crate::profiling::scope("semantic_pack.publish_active_set");
     let native_store = analyzer
         .snapshot_caches()
@@ -3856,15 +1107,15 @@ fn publish_active_models(
         .map(|_| ())
 }
 
-fn publish_jvm_inventory_rows(
+pub(crate) fn publish_jvm_inventory_rows(
     store: &AnalyzerStore,
     active: &ResolvedActiveSemanticModels,
-) -> Result<(), super::CatalogError> {
+) -> Result<(), crate::analyzer::semantic_model::CatalogError> {
     for shard in &active.shards {
         store
             .publish_jvm_external_owner_inventory(shard)
             .map_err(|error| {
-                super::CatalogError::Integrity(format!(
+                crate::analyzer::semantic_model::CatalogError::Integrity(format!(
                     "JVM external owner publication failed: {error}"
                 ))
             })?;
@@ -3872,7 +1123,9 @@ fn publish_jvm_inventory_rows(
     Ok(())
 }
 
-fn activation_source_kind(kind: CatalogPackSourceKind) -> SemanticPackActivationSourceKind {
+pub(crate) fn activation_source_kind(
+    kind: CatalogPackSourceKind,
+) -> SemanticPackActivationSourceKind {
     match kind {
         CatalogPackSourceKind::Installed => SemanticPackActivationSourceKind::Installed,
         CatalogPackSourceKind::Generated => SemanticPackActivationSourceKind::Generated,
@@ -3887,10 +1140,10 @@ fn activation_source_kind(kind: CatalogPackSourceKind) -> SemanticPackActivation
     }
 }
 
-fn catalog_lifecycle_error(
+pub(crate) fn catalog_lifecycle_error(
     limits: SemanticModelRuntimeLimits,
     operation: &str,
-    error: super::CatalogError,
+    error: crate::analyzer::semantic_model::CatalogError,
 ) -> SemanticModelRuntimeOutcome {
     let mut report = SemanticModelActivationReport::default();
     push_request_explanation(
@@ -3901,7 +1154,7 @@ fn catalog_lifecycle_error(
     SemanticModelRuntimeOutcome::Unavailable(report)
 }
 
-fn with_python_provider_identity(
+pub(crate) fn with_python_provider_identity(
     mut outcome: SemanticModelResolutionOutcome,
     publication: Option<&crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
 ) -> SemanticModelResolutionOutcome {
@@ -3922,7 +1175,7 @@ fn with_python_provider_identity(
     outcome
 }
 
-fn runtime_outcome(
+pub(crate) fn runtime_outcome(
     outcome: SemanticModelResolutionOutcome,
     lifecycle: SemanticModelRuntimeLifecycle,
     jdk_artifacts_by_configured_home: Option<&HashMap<PathBuf, SemanticModelActivationEvidence>>,
@@ -3965,7 +1218,9 @@ fn runtime_outcome(
     }
 }
 
-fn stale_generation_outcome(limits: SemanticModelRuntimeLimits) -> SemanticModelRuntimeOutcome {
+pub(crate) fn stale_generation_outcome(
+    limits: SemanticModelRuntimeLimits,
+) -> SemanticModelRuntimeOutcome {
     let mut report = SemanticModelActivationReport::default();
     push_request_explanation(
         &mut report,
@@ -3975,715 +1230,7 @@ fn stale_generation_outcome(limits: SemanticModelRuntimeLimits) -> SemanticModel
     SemanticModelRuntimeOutcome::Unavailable(report)
 }
 
-fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<String, String> {
-    let evidence = validate_and_canonicalize_request(request)?;
-    let mut controls = request
-        .controls
-        .iter()
-        .map(|control| {
-            let mut hasher = Sha256::new();
-            hasher.update([match control.scope {
-                SemanticModelControlScope::User => 0,
-                SemanticModelControlScope::Workspace => 1,
-            }]);
-            hasher.update([match control.action {
-                SemanticModelControlAction::Enable => 0,
-                SemanticModelControlAction::Disable => 1,
-            }]);
-            hash_key_part(&mut hasher, &control.selector.pack_id);
-            hash_optional_key_part(
-                &mut hasher,
-                control
-                    .selector
-                    .version
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .as_deref(),
-            );
-            hash_optional_key_part(&mut hasher, control.selector.manifest_digest.as_deref());
-            hasher.finalize().to_vec()
-        })
-        .collect::<Vec<_>>();
-    controls.sort_unstable();
-    controls.dedup();
-    let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.runtime-request.v2\0");
-    hash_key_part(&mut hasher, &request.bifrost_version.to_string());
-    hasher.update((super::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.len() as u64).to_be_bytes());
-    for schema_version in super::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS {
-        hasher.update(schema_version.to_be_bytes());
-    }
-    for row in &evidence {
-        hash_activation_evidence(&mut hasher, row);
-    }
-    for control in controls {
-        hasher.update((control.len() as u64).to_be_bytes());
-        hasher.update(control);
-    }
-    for limit in [
-        request.limits.max_evidence_rows as u64,
-        request.limits.max_controls as u64,
-        request.limits.max_catalog_candidates as u64,
-        request.limits.max_loaded_shards as u64,
-        request.limits.max_records as u64,
-        request.limits.max_index_entries as u64,
-        request.limits.max_working_bytes,
-        request.limits.max_retained_bytes,
-        request.limits.max_explanations as u64,
-    ] {
-        hasher.update(limit.to_be_bytes());
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn hash_key_part(hasher: &mut Sha256, value: &str) {
-    write_length_prefixed(hasher, value.as_bytes());
-}
-
-fn hash_optional_key_part(hasher: &mut Sha256, value: Option<&str>) {
-    hasher.update([u8::from(value.is_some())]);
-    if let Some(value) = value {
-        hash_key_part(hasher, value);
-    }
-}
-
-fn hash_optional_coordinate(hasher: &mut Sha256, coordinate: Option<&CatalogCoordinate>) {
-    hasher.update([u8::from(coordinate.is_some())]);
-    if let Some(coordinate) = coordinate {
-        hash_key_part(hasher, &coordinate.name);
-        hash_optional_key_part(
-            hasher,
-            coordinate
-                .version
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-        );
-    }
-}
-
-fn hash_activation_evidence(hasher: &mut Sha256, evidence: &SemanticModelActivationEvidence) {
-    hash_key_part(hasher, &evidence.language);
-    hash_key_part(hasher, &evidence.ecosystem);
-    hash_optional_coordinate(hasher, evidence.package.as_ref());
-    hash_optional_coordinate(hasher, evidence.module.as_ref());
-    hash_optional_coordinate(hasher, evidence.toolchain.as_ref());
-    hash_optional_key_part(hasher, evidence.target.as_deref());
-    hash_optional_key_part(hasher, evidence.configuration.as_deref());
-    hash_optional_key_part(hasher, evidence.artifact_sha256.as_deref());
-}
-
-fn validate_and_canonicalize_request(
-    request: &SemanticModelActivationRequest,
-) -> Result<Vec<SemanticModelActivationEvidence>, String> {
-    if request.evidence.len() > request.limits.max_evidence_rows {
-        return Err("semantic-model activation evidence budget exceeded".to_owned());
-    }
-    if request.controls.len() > request.limits.max_controls {
-        return Err("semantic-model activation control budget exceeded".to_owned());
-    }
-    let mut evidence = request.evidence.clone();
-    for row in &evidence {
-        if row.language.is_empty() || row.ecosystem.is_empty() {
-            return Err("activation evidence language and ecosystem must not be empty".to_owned());
-        }
-        if row
-            .artifact_sha256
-            .as_deref()
-            .is_some_and(|digest| !is_lower_sha256(digest))
-        {
-            return Err("activation evidence artifact digest must be lowercase SHA-256".to_owned());
-        }
-    }
-    for control in &request.controls {
-        if control.selector.pack_id.is_empty() {
-            return Err("semantic-model control pack ID must not be empty".to_owned());
-        }
-        if control
-            .selector
-            .manifest_digest
-            .as_deref()
-            .is_some_and(|digest| !is_lower_sha256(digest))
-        {
-            return Err(
-                "semantic-model control manifest digest must be lowercase SHA-256".to_owned(),
-            );
-        }
-    }
-    let mut control_actions = BTreeMap::new();
-    for control in &request.controls {
-        let key = (
-            control.scope,
-            control.selector.pack_id.as_str(),
-            control.selector.version.as_ref().map(ToString::to_string),
-            control.selector.manifest_digest.as_deref(),
-        );
-        if control_actions
-            .insert(key, control.action)
-            .is_some_and(|previous| previous != control.action)
-        {
-            return Err("equally specific activation controls conflict".to_owned());
-        }
-    }
-    evidence.sort();
-    evidence.dedup();
-    Ok(evidence)
-}
-
-fn evidence_query(
-    evidence: &SemanticModelActivationEvidence,
-    bifrost_version: Version,
-) -> SemanticPackSelectorQuery {
-    SemanticPackSelectorQuery {
-        language: semantic_pack_language(&evidence.language).to_owned(),
-        ecosystem: evidence.ecosystem.clone(),
-        package: evidence.package.clone(),
-        module: evidence.module.clone(),
-        toolchain: evidence.toolchain.clone(),
-        target: evidence.target.clone(),
-        configuration: evidence.configuration.clone(),
-        artifact_sha256: evidence.artifact_sha256.clone(),
-        bifrost_version,
-    }
-}
-
-/// Project a source dialect label onto the language identity that owns shared
-/// semantic-pack content. The original evidence row remains untouched so
-/// activation diagnostics retain the precise source dialect.
-fn semantic_pack_language(label: &str) -> &str {
-    if LanguageDialect::from_config_label(label) == Some(LanguageDialect::TypeScriptTsx) {
-        LanguageDialect::TypeScriptTsx.semantic_pack_label()
-    } else {
-        label
-    }
-}
-
-/// One version requirement a strict activation satisfied, with the workspace
-/// version that satisfied it.
-///
-/// A pack declares the compatible range its extracted API surface serves, so
-/// "this pack activated" no longer implies "the workspace runs the exact build
-/// the pack was extracted from". The activation decision must therefore name
-/// which requirement admitted the workspace (#3465). The matcher is the only
-/// place that decides this, so it is the only place that reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MatchedVersionRequirement {
-    axis: &'static str,
-    name: String,
-    requirement: String,
-    version: Version,
-}
-
-impl MatchedVersionRequirement {
-    fn describe(&self) -> String {
-        format!(
-            "matched {} {} {} against the pack requirement {}",
-            self.axis, self.name, self.version, self.requirement
-        )
-    }
-}
-
-#[derive(Debug)]
-struct StrictActivationMatch {
-    evidence_rank: EvidenceRank,
-    matched_evidence: SemanticModelActivationEvidence,
-    matching_evidence: Vec<SemanticModelActivationEvidence>,
-    matched_requirements: Vec<MatchedVersionRequirement>,
-}
-
-fn strict_activation_match(
-    manifest: &CompiledPackManifest,
-    shard: &CompiledShard,
-    evidence: &[SemanticModelActivationEvidence],
-    bifrost_version: &Version,
-) -> Option<StrictActivationMatch> {
-    if !manifest
-        .compatibility
-        .matches_engine(manifest.schema_version, bifrost_version)
-        .ok()?
-    {
-        return None;
-    }
-    let toolchains = manifest
-        .compatibility
-        .toolchains
-        .iter()
-        .map(|constraint| {
-            VersionReq::parse(&constraint.requirement)
-                .ok()
-                .map(|requirement| (constraint, requirement))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let scoped = |row: &&SemanticModelActivationEvidence| {
-        semantic_pack_language(&row.language) == manifest.language
-            && row.ecosystem == manifest.ecosystem
-            && toolchains.iter().all(|(constraint, requirement)| {
-                row.toolchain.as_ref().is_some_and(|toolchain| {
-                    toolchain.name == constraint.name
-                        && toolchain
-                            .version
-                            .as_ref()
-                            .is_some_and(|version| requirement.matches(version))
-                })
-            })
-    };
-    let mut matched_requirements = Vec::new();
-    let (evidence_rank, matched_evidence, selector) = shard
-        .activation()
-        .iter()
-        .flat_map(|selector| {
-            evidence
-                .iter()
-                .filter(move |row| scoped(row) && strict_selector_matches(selector, row))
-                .map(move |row| (selector_rank(selector), row.clone(), selector))
-        })
-        .max_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))?;
-    let mut matching_evidence = shard
-        .activation()
-        .iter()
-        .filter(|selector| selector_rank(selector) == evidence_rank)
-        .flat_map(|selector| {
-            evidence
-                .iter()
-                .filter(move |row| scoped(row) && strict_selector_matches(selector, row))
-                .cloned()
-        })
-        .collect::<Vec<_>>();
-    matching_evidence.sort();
-    matching_evidence.dedup();
-    debug_assert!(matching_evidence.contains(&matched_evidence));
-    for (constraint, _) in &toolchains {
-        let version = matched_evidence
-            .toolchain
-            .as_ref()
-            .and_then(|toolchain| toolchain.version.as_ref())
-            .expect("a matched toolchain requirement has a version");
-        push_matched_requirement(
-            &mut matched_requirements,
-            "toolchain",
-            &constraint.name,
-            &constraint.requirement,
-            version,
-        );
-    }
-    for (axis, coordinate_selector, coordinate_evidence) in [
-        (
-            "package",
-            selector.package.as_ref(),
-            matched_evidence.package.as_ref(),
-        ),
-        (
-            "module",
-            selector.module.as_ref(),
-            matched_evidence.module.as_ref(),
-        ),
-        (
-            "toolchain",
-            selector.toolchain.as_ref(),
-            matched_evidence.toolchain.as_ref(),
-        ),
-    ] {
-        let (Some(coordinate_selector), Some(coordinate_evidence)) =
-            (coordinate_selector, coordinate_evidence)
-        else {
-            continue;
-        };
-        let (Some(requirement), Some(version)) =
-            (&coordinate_selector.version, &coordinate_evidence.version)
-        else {
-            continue;
-        };
-        push_matched_requirement(
-            &mut matched_requirements,
-            axis,
-            &coordinate_selector.name,
-            requirement,
-            version,
-        );
-    }
-    Some(StrictActivationMatch {
-        evidence_rank,
-        matched_evidence,
-        matching_evidence,
-        matched_requirements,
-    })
-}
-
-/// Record one satisfied requirement, keeping the first statement of a
-/// requirement that a manifest constraint and a shard selector both carry.
-fn push_matched_requirement(
-    matched: &mut Vec<MatchedVersionRequirement>,
-    axis: &'static str,
-    name: &str,
-    requirement: &str,
-    version: &Version,
-) {
-    if matched.iter().any(|existing| {
-        existing.axis == axis && existing.name == name && existing.requirement == requirement
-    }) {
-        return;
-    }
-    matched.push(MatchedVersionRequirement {
-        axis,
-        name: name.to_owned(),
-        requirement: requirement.to_owned(),
-        version: version.clone(),
-    });
-}
-
-fn strict_selector_matches(
-    selector: &ActivationSelector,
-    evidence: &SemanticModelActivationEvidence,
-) -> bool {
-    strict_coordinate_matches(selector.package.as_ref(), evidence.package.as_ref())
-        && strict_coordinate_matches(selector.module.as_ref(), evidence.module.as_ref())
-        && strict_coordinate_matches(selector.toolchain.as_ref(), evidence.toolchain.as_ref())
-        && (selector.targets.is_empty()
-            || evidence
-                .target
-                .as_ref()
-                .is_some_and(|target| selector.targets.contains(target)))
-        && (selector.configurations.is_empty()
-            || evidence
-                .configuration
-                .as_ref()
-                .is_some_and(|configuration| selector.configurations.contains(configuration)))
-        && selector
-            .artifact_sha256
-            .as_ref()
-            .is_none_or(|expected| evidence.artifact_sha256.as_ref() == Some(expected))
-}
-
-fn strict_coordinate_matches(
-    selector: Option<&super::NameSelector>,
-    evidence: Option<&CatalogCoordinate>,
-) -> bool {
-    match (selector, evidence) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(selector), Some(evidence))
-            if !strict_coordinate_names_match(Some(selector), Some(evidence)) =>
-        {
-            false
-        }
-        (Some(selector), Some(evidence)) => match (&selector.version, &evidence.version) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(requirement), Some(version)) => {
-                coordinate_version_matches(requirement, version).is_ok_and(std::convert::identity)
-            }
-        },
-    }
-}
-
-/// Explain a failed strict activation match. When the evidence names a
-/// required coordinate but an exact version requirement rejects it, the
-/// explanation names the workspace version and the pack requirement (#1884).
-/// When no evidence row names a coordinate the selector requires at all, the
-/// explanation names the missing coordinate and the selector's remaining
-/// predicates, so a caller can act on it (#3462). When a row names the
-/// coordinate but misses the selector's target, configuration, or artifact
-/// digest, the explanation names those predicates (#3464). Every other
-/// rejection keeps the generic statement.
-fn strict_activation_mismatch_reason(
-    manifest: &CompiledPackManifest,
-    shard: &CompiledShard,
-    evidence: &[SemanticModelActivationEvidence],
-) -> String {
-    let scoped = || {
-        evidence.iter().filter(|row| {
-            semantic_pack_language(&row.language) == manifest.language
-                && row.ecosystem == manifest.ecosystem
-        })
-    };
-    for constraint in &manifest.compatibility.toolchains {
-        let Ok(requirement) = VersionReq::parse(&constraint.requirement) else {
-            continue;
-        };
-        let satisfied = scoped().any(|row| {
-            row.toolchain.as_ref().is_some_and(|toolchain| {
-                toolchain.name == constraint.name
-                    && toolchain
-                        .version
-                        .as_ref()
-                        .is_some_and(|version| requirement.matches(version))
-            })
-        });
-        if satisfied {
-            continue;
-        }
-        if let Some(toolchain) = scoped()
-            .filter_map(|row| row.toolchain.as_ref())
-            .find(|toolchain| toolchain.name == constraint.name)
-        {
-            return match &toolchain.version {
-                Some(version) => format!(
-                    "workspace toolchain {} {version} does not satisfy the pack requirement {}",
-                    constraint.name, constraint.requirement
-                ),
-                None => format!(
-                    "workspace toolchain {} has no exact version and does not satisfy the pack requirement {}",
-                    constraint.name, constraint.requirement
-                ),
-            };
-        }
-    }
-    let mut unmet_predicates = None;
-    for selector in shard.activation() {
-        for row in scoped() {
-            if !strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
-                || !strict_coordinate_names_match(selector.module.as_ref(), row.module.as_ref())
-                || !strict_coordinate_names_match(
-                    selector.toolchain.as_ref(),
-                    row.toolchain.as_ref(),
-                )
-            {
-                continue;
-            }
-            let mut unmet = Vec::new();
-            if !selector.targets.is_empty()
-                && !row
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| selector.targets.contains(target))
-            {
-                unmet.push(format!("target {}", selector.targets.join(", ")));
-            }
-            if !selector.configurations.is_empty()
-                && !row
-                    .configuration
-                    .as_ref()
-                    .is_some_and(|configuration| selector.configurations.contains(configuration))
-            {
-                unmet.push(format!(
-                    "profile configuration {}",
-                    selector.configurations.join(", ")
-                ));
-            }
-            if let Some(expected) = &selector.artifact_sha256
-                && row.artifact_sha256.as_ref() != Some(expected)
-            {
-                unmet.push(format!("artifact sha256 {expected}"));
-            }
-            if !unmet.is_empty() {
-                unmet_predicates.get_or_insert_with(|| {
-                    named_coordinate_unmet_predicates_reason(selector, &unmet)
-                });
-                continue;
-            }
-            for (axis, coordinate_selector, coordinate_evidence) in [
-                ("package", selector.package.as_ref(), row.package.as_ref()),
-                ("module", selector.module.as_ref(), row.module.as_ref()),
-                (
-                    "toolchain",
-                    selector.toolchain.as_ref(),
-                    row.toolchain.as_ref(),
-                ),
-            ] {
-                let (Some(coordinate_selector), Some(coordinate_evidence)) =
-                    (coordinate_selector, coordinate_evidence)
-                else {
-                    continue;
-                };
-                let Some(requirement_source) = &coordinate_selector.version else {
-                    continue;
-                };
-                let Ok(requirement) = VersionReq::parse(requirement_source) else {
-                    continue;
-                };
-                let satisfied = coordinate_evidence
-                    .version
-                    .as_ref()
-                    .is_some_and(|version| requirement.matches(version));
-                if !satisfied {
-                    return match &coordinate_evidence.version {
-                        Some(version) => format!(
-                            "workspace {axis} {} {version} does not satisfy the pack requirement {requirement_source}",
-                            coordinate_selector.name
-                        ),
-                        None => format!(
-                            "workspace {axis} {} has no exact version and does not satisfy the pack requirement {requirement_source}",
-                            coordinate_selector.name
-                        ),
-                    };
-                }
-            }
-        }
-    }
-    for selector in shard.activation() {
-        let named = scoped().any(|row| {
-            strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
-                && strict_coordinate_names_match(selector.module.as_ref(), row.module.as_ref())
-                && strict_coordinate_names_match(
-                    selector.toolchain.as_ref(),
-                    row.toolchain.as_ref(),
-                )
-        });
-        if !named && let Some(reason) = missing_activation_evidence_reason(selector) {
-            return reason;
-        }
-    }
-    unmet_predicates.unwrap_or_else(|| {
-        "complete activation evidence does not satisfy the manifest and shard selector".to_owned()
-    })
-}
-
-/// Name the selector predicates an evidence row that names the selector's
-/// coordinate does not satisfy. A declared toolchain names the coordinate of a
-/// pack whose selector also binds the exact artifact it was produced from, and
-/// without this the rejection read as the generic statement.
-fn named_coordinate_unmet_predicates_reason(
-    selector: &ActivationSelector,
-    unmet: &[String],
-) -> String {
-    let named = [
-        ("package", &selector.package),
-        ("module", &selector.module),
-        ("toolchain", &selector.toolchain),
-    ]
-    .into_iter()
-    .filter_map(|(axis, coordinate)| {
-        coordinate
-            .as_ref()
-            .map(|coordinate| format!("{axis} {}", coordinate.name))
-    })
-    .collect::<Vec<_>>();
-    let evidence = if named.is_empty() {
-        "the language and ecosystem".to_owned()
-    } else {
-        named.join(" and ")
-    };
-    format!(
-        "activation evidence names {evidence}, but the shard selector also requires {}",
-        unmet.join(", ")
-    )
-}
-
-/// Name the activation evidence a selector requires when no evidence row names
-/// its coordinate, or `None` for a selector that names none.
-///
-/// A selector may additionally require exact profile configurations, artifact
-/// digests, or targets; an evidence row alone does not satisfy those, so the
-/// reason lists them beside the missing coordinate.
-fn missing_activation_evidence_reason(selector: &ActivationSelector) -> Option<String> {
-    let (axis, coordinate) = match (&selector.package, &selector.module, &selector.toolchain) {
-        (Some(package), _, _) => ("package", package),
-        (_, Some(module), _) => ("module", module),
-        (_, _, Some(toolchain)) => ("toolchain", toolchain),
-        _ => return None,
-    };
-    let mut requirements = Vec::new();
-    if !selector.targets.is_empty() {
-        requirements.push(format!("target {}", selector.targets.join(", ")));
-    }
-    if !selector.configurations.is_empty() {
-        requirements.push(format!(
-            "profile configuration {}",
-            selector.configurations.join(", ")
-        ));
-    }
-    if let Some(artifact_sha256) = &selector.artifact_sha256 {
-        requirements.push(format!("artifact sha256 {artifact_sha256}"));
-    }
-    let requirements = if requirements.is_empty() {
-        String::new()
-    } else {
-        format!("; the shard selector requires {}", requirements.join(", "))
-    };
-    Some(format!(
-        "no activation evidence names {axis} {}{requirements}",
-        coordinate.name
-    ))
-}
-
-/// The name half of `strict_coordinate_matches`: whether the evidence names
-/// the selector's coordinate at all.
-pub(super) fn strict_coordinate_names_match(
-    selector: Option<&super::NameSelector>,
-    evidence: Option<&CatalogCoordinate>,
-) -> bool {
-    match (selector, evidence) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(selector), Some(evidence)) => selector.name == evidence.name,
-    }
-}
-
-pub(super) fn coordinate_version_matches(
-    requirement: &str,
-    version: &Version,
-) -> Result<bool, semver::Error> {
-    Ok(VersionReq::parse(requirement)?.matches(version))
-}
-
-fn selector_rank(selector: &ActivationSelector) -> EvidenceRank {
-    if selector.artifact_sha256.is_some() {
-        EvidenceRank::ExactArtifact
-    } else if [&selector.package, &selector.module, &selector.toolchain]
-        .into_iter()
-        .flatten()
-        .any(|coordinate| coordinate.version.is_some())
-    {
-        EvidenceRank::VersionedCoordinate
-    } else if selector.package.is_some()
-        || selector.module.is_some()
-        || selector.toolchain.is_some()
-    {
-        EvidenceRank::NamedCoordinate
-    } else {
-        EvidenceRank::Language
-    }
-}
-
-fn effective_control(
-    manifest: &CompiledPackManifest,
-    controls: &[SemanticModelActivationControl],
-) -> Result<Option<SemanticModelControlAction>, String> {
-    let pack_version = Version::parse(&manifest.version)
-        .map_err(|error| format!("compiled pack version is invalid: {error}"))?;
-    let mut matched = controls
-        .iter()
-        .filter(|control| {
-            control.selector.pack_id == manifest.pack_id
-                && control
-                    .selector
-                    .version
-                    .as_ref()
-                    .is_none_or(|requirement| requirement.matches(&pack_version))
-                && control
-                    .selector
-                    .manifest_digest
-                    .as_ref()
-                    .is_none_or(|digest| digest == &manifest.content_sha256)
-        })
-        .map(|control| {
-            let scope = match control.scope {
-                SemanticModelControlScope::User => 0,
-                SemanticModelControlScope::Workspace => 1,
-            };
-            let specificity = u8::from(control.selector.version.is_some())
-                + 2 * u8::from(control.selector.manifest_digest.is_some());
-            (scope, specificity, control.action)
-        })
-        .collect::<Vec<_>>();
-    matched.sort();
-    let Some(&(scope, specificity, action)) = matched.last() else {
-        return Ok(None);
-    };
-    if matched
-        .iter()
-        .rev()
-        .take_while(|(other_scope, other_specificity, _)| {
-            *other_scope == scope && *other_specificity == specificity
-        })
-        .any(|(_, _, other_action)| *other_action != action)
-    {
-        return Err("equally specific activation controls conflict".to_owned());
-    }
-    Ok(Some(action))
-}
-
-fn compare_selection(left: &CandidateSelection, right: &CandidateSelection) -> Ordering {
+pub(crate) fn compare_selection(left: &CandidateSelection, right: &CandidateSelection) -> Ordering {
     left.evidence_rank
         .cmp(&right.evidence_rank)
         .then_with(|| left.source_rank.cmp(&right.source_rank))
@@ -4697,7 +1244,7 @@ fn compare_selection(left: &CandidateSelection, right: &CandidateSelection) -> O
         .then_with(|| left.active.source_id.cmp(&right.active.source_id))
 }
 
-fn active_model_set_hash(
+pub(crate) fn active_model_set_hash(
     active: &[CandidateSelection],
     extraction_gaps: &[ActivePackExtractionGap],
 ) -> String {
@@ -4759,16 +1306,7 @@ fn active_model_set_hash(
     format!("{:x}", hasher.finalize())
 }
 
-fn catalog_miss_reason(miss: &CatalogMiss) -> String {
-    match miss {
-        CatalogMiss::NotFound => "catalog candidate disappeared before verified load".to_owned(),
-        CatalogMiss::Quarantined { reason } | CatalogMiss::Incompatible { reason } => {
-            reason.clone()
-        }
-    }
-}
-
-fn push_request_explanation(
+pub(crate) fn push_request_explanation(
     report: &mut SemanticModelActivationReport,
     limits: SemanticModelRuntimeLimits,
     reason: String,
@@ -4788,10 +1326,10 @@ fn push_request_explanation(
     );
 }
 
-fn push_loaded_explanation(
+pub(crate) fn push_loaded_explanation(
     report: &mut SemanticModelActivationReport,
     limits: SemanticModelRuntimeLimits,
-    loaded: &super::LoadedCatalogShard,
+    loaded: &crate::analyzer::semantic_model::LoadedCatalogShard,
     status: SemanticModelActivationStatus,
     reason: &str,
 ) {
@@ -4810,7 +1348,7 @@ fn push_loaded_explanation(
     );
 }
 
-fn push_explanation(
+pub(crate) fn push_explanation(
     report: &mut SemanticModelActivationReport,
     limits: SemanticModelRuntimeLimits,
     explanation: SemanticModelActivationExplanation,
@@ -4823,41 +1361,81 @@ fn push_explanation(
 }
 
 #[cfg(test)]
-mod semantic_diagnostic_runtime_tests {
-    use super::*;
-    use brokk_bifrost_test_macros::hardwon;
+pub(crate) mod unmaterialized_call_shape_binding_tests {
 
-    #[test]
-    #[hardwon("#3815: cached pack activation ignored the supported schema and engine contract")]
-    fn runtime_request_key_binds_engine_and_supported_schema_contract() {
-        let request = |bifrost_version| SemanticModelActivationRequest {
-            bifrost_version,
-            evidence: Vec::new(),
-            controls: Vec::new(),
-            limits: SemanticModelRuntimeLimits::default(),
-        };
-        let version = Version::parse("0.12.0").unwrap();
-        let key = runtime_request_key(&request(version.clone())).unwrap();
-        assert_ne!(
-            key,
-            runtime_request_key(&request(Version::parse("0.13.0").unwrap())).unwrap()
-        );
-        let _supported_schemas_are_bound_by_runtime_request_key =
-            super::super::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS;
-    }
-}
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActivatedProcedureSummary;
 
-#[cfg(test)]
-mod unmaterialized_call_shape_binding_tests {
-    use super::*;
-    use crate::analyzer::semantic::{
-        DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, SemanticLanguage,
-        SemanticRole, SourceAnchor, SourcePosition, SourceSpan, unmaterialized_external_mount,
-        unmaterialized_external_path,
-    };
-    use crate::analyzer::semantic_model::{
-        CompilerOptions, DecodeLimits, SourceFormat, compile_source, decode_shard,
-    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActiveSemanticModelShard;
+
+    use std::sync::Arc;
+
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogCoordinate;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogPackSourceKind;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::EvidenceRank;
+
+    use brokk_bifrost_core::hash::HashMap;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::MatcherIndexes;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ProcedureSummaryApplicability;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ProcedureSummaryMemberKey;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ResolvedActiveSemanticModels;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::SemanticLocator;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelActivationEvidence;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelActivationReport;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelMatchDisposition;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelRuntimeLimits;
+
+    use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::UnmaterializedExternalTarget;
+
+    use semver::Version;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::procedure_summary_actual_to_formal;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::strict_activation_match;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::strict_activation_mismatch_reason;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::DeclarationLocator;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::DeclarationSegment;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::DeclarationSegmentKind;
+
+    use brokk_bifrost_core::analyzer::model::LanguageDialect as SemanticLanguage;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::SemanticRole;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::SourceAnchor;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::SourcePosition;
+
+    use brokk_bifrost_analysis::analyzer::semantic::ids::SourceSpan;
+
+    use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::unmaterialized_external_mount;
+
+    use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::unmaterialized_external_path;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::compiler::CompilerOptions;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::artifact::DecodeLimits;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::source::SourceFormat;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::compiler::compile_source;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::artifact::decode_shard;
     use brokk_bifrost_test_macros::hardwon;
 
     const PACK: &[u8] = br#"{
@@ -4913,7 +1491,7 @@ mod unmaterialized_call_shape_binding_tests {
 
     fn target(member: &str, arity: u32) -> UnmaterializedExternalTarget {
         target_for_language(
-            crate::analyzer::Language::Java,
+            brokk_bifrost_core::analyzer::model::Language::Java,
             "com.acme.Api",
             member,
             arity,
@@ -4921,7 +1499,7 @@ mod unmaterialized_call_shape_binding_tests {
     }
 
     fn target_for_language(
-        language: crate::analyzer::Language,
+        language: brokk_bifrost_core::analyzer::model::Language,
         owner: &str,
         member: &str,
         arity: u32,
@@ -5174,14 +1752,14 @@ mod unmaterialized_call_shape_binding_tests {
             report,
         };
         let direct = |id| {
-            crate::analyzer::semantic::SemanticCallArgument::direct(
-                crate::analyzer::semantic::ValueId::new(id),
-                crate::analyzer::semantic::ArgumentDomain::Positional,
+            brokk_bifrost_analysis::analyzer::semantic::SemanticCallArgument::direct(
+                brokk_bifrost_analysis::analyzer::semantic::ValueId::new(id),
+                brokk_bifrost_analysis::analyzer::semantic::ArgumentDomain::Positional,
             )
         };
         let keyword = |id, name| {
-            crate::analyzer::semantic::SemanticCallArgument::keyword(
-                crate::analyzer::semantic::ValueId::new(id),
+            brokk_bifrost_analysis::analyzer::semantic::SemanticCallArgument::keyword(
+                brokk_bifrost_analysis::analyzer::semantic::ValueId::new(id),
                 name,
             )
         };
@@ -5194,7 +1772,7 @@ mod unmaterialized_call_shape_binding_tests {
             keyword(5, "context"),
         ];
         let target = target_for_language(
-            crate::analyzer::Language::Java,
+            brokk_bifrost_core::analyzer::model::Language::Java,
             "com.acme.Api",
             "variadic",
             arguments.len() as u32,
@@ -5212,7 +1790,7 @@ mod unmaterialized_call_shape_binding_tests {
 
         let only_required = [direct(6)];
         let target = target_for_language(
-            crate::analyzer::Language::Java,
+            brokk_bifrost_core::analyzer::model::Language::Java,
             "com.acme.Api",
             "variadic",
             only_required.len() as u32,
@@ -5227,7 +1805,7 @@ mod unmaterialized_call_shape_binding_tests {
 
         let no_required = [];
         let target = target_for_language(
-            crate::analyzer::Language::Java,
+            brokk_bifrost_core::analyzer::model::Language::Java,
             "com.acme.Api",
             "variadic",
             0,
@@ -5427,7 +2005,7 @@ mod unmaterialized_call_shape_binding_tests {
         assert_eq!(compiled.manifest.schema_version, 8);
         assert_eq!(
             compiled.manifest.completeness,
-            crate::analyzer::semantic_model::Completeness::Partial
+            brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Partial
         );
         assert!(compiled.manifest.compatibility.bifrost.is_none());
         let shard = decode_shard(
@@ -5436,13 +2014,14 @@ mod unmaterialized_call_shape_binding_tests {
             &DecodeLimits::default(),
         )
         .expect("schema 8 fixture decodes");
-        let crate::analyzer::semantic_model::CompiledPayload::ProcedureSummaries { summaries } =
+        let brokk_bifrost_analysis::analyzer::semantic_model::artifact::CompiledPayload::ProcedureSummaries { summaries } =
             shard.payload()
         else {
             panic!("schema 8 fixture carries procedure summaries");
         };
         assert!(summaries.iter().all(|summary| {
-            summary.completeness == crate::analyzer::semantic_model::Completeness::Partial
+            summary.completeness
+                == brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Partial
         }));
         let evidence = |jdk_version: &str, digest: &str| SemanticModelActivationEvidence {
             language: "java".to_owned(),
@@ -5488,7 +2067,9 @@ mod unmaterialized_call_shape_binding_tests {
         );
 
         let mut unknown_schema = compiled.manifest.clone();
-        unknown_schema.schema_version = super::super::SEMANTIC_MODEL_SCHEMA_VERSION + 1;
+        unknown_schema.schema_version =
+            brokk_bifrost_analysis::analyzer::semantic_model::model::SEMANTIC_MODEL_SCHEMA_VERSION
+                + 1;
         assert!(
             strict_activation_match(
                 &unknown_schema,
@@ -5703,7 +2284,7 @@ mod unmaterialized_call_shape_binding_tests {
             report,
         };
         let selected_target = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             3,
@@ -5753,7 +2334,7 @@ mod unmaterialized_call_shape_binding_tests {
             matched_call_arguments: None,
         };
         let missing_target = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             3,
@@ -5785,7 +2366,7 @@ mod unmaterialized_call_shape_binding_tests {
         );
 
         let different_digest_target = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             3,
@@ -5855,7 +2436,7 @@ mod unmaterialized_call_shape_binding_tests {
             report: generic_report,
         };
         let generic_target = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             3,
@@ -5871,7 +2452,7 @@ mod unmaterialized_call_shape_binding_tests {
                 .is_some()
         );
         let generic_target_with_selected_distribution = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             3,
@@ -5950,7 +2531,7 @@ mod unmaterialized_call_shape_binding_tests {
         };
         let target_for_model = |manifest: &str| {
             target_for_language(
-                crate::analyzer::Language::Python,
+                brokk_bifrost_core::analyzer::model::Language::Python,
                 "com.acme.Api",
                 "fixed",
                 3,
@@ -6017,7 +2598,7 @@ mod unmaterialized_call_shape_binding_tests {
             report,
         };
         let target = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             3,
@@ -6083,7 +2664,7 @@ mod unmaterialized_call_shape_binding_tests {
         };
         let target = || {
             target_for_language(
-                crate::analyzer::Language::Python,
+                brokk_bifrost_core::analyzer::model::Language::Python,
                 "com.acme.Api",
                 "fixed",
                 3,
@@ -6139,9 +2720,9 @@ mod unmaterialized_call_shape_binding_tests {
             .unwrap();
         let mut unsupported = payload[0].clone();
         unsupported.ordinary_heap_unchanged = true;
-        unsupported.preconditions = Some(vec![super::super::CompiledOperationPrecondition {
-            input: super::super::CompiledSummaryInput::Parameter { ordinal: 0 },
-            predicate: super::super::CompiledResultPredicate::NonNull,
+        unsupported.preconditions = Some(vec![brokk_bifrost_analysis::analyzer::semantic_model::artifact::CompiledOperationPrecondition {
+            input: brokk_bifrost_analysis::analyzer::semantic_model::artifact::CompiledSummaryInput::Parameter { ordinal: 0 },
+            predicate: brokk_bifrost_analysis::analyzer::semantic_model::artifact::CompiledResultPredicate::NonNull,
         }]);
         assert!(
             procedure_summary_actual_to_formal(&active.shards[0], &unsupported, &reordered)
@@ -6179,7 +2760,7 @@ mod unmaterialized_call_shape_binding_tests {
         };
 
         let omitted_default = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             2,
@@ -6214,7 +2795,7 @@ mod unmaterialized_call_shape_binding_tests {
         );
 
         let full_positional = target_for_language(
-            crate::analyzer::Language::Python,
+            brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
             "fixed",
             3,
@@ -6341,11 +2922,50 @@ mod unmaterialized_call_shape_binding_tests {
 /// payload digests. Two activation contexts can retain the same payloads while
 /// assigning their conflicting records opposite matcher precedence.
 #[cfg(test)]
-mod active_model_set_identity_tests {
-    use super::*;
-    use crate::analyzer::semantic_model::{
-        CompilerOptions, DecodeLimits, SourceFormat, compile_source, decode_shard,
-    };
+pub(crate) mod active_model_set_identity_tests {
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActiveSemanticModelShard;
+    use sha2::Digest;
+
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::CandidateSelection;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogPackSourceKind;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::EvidenceRank;
+
+    use brokk_bifrost_core::hash::HashMap;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::MatcherIndexes;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::artifact::PayloadKind;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ProcedureSummaryMemberKey;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ResolvedActiveSemanticModels;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelActivationEvidence;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelActivationReport;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelRuntimeLimits;
+
+    use sha2::Sha256;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::active_model_set_hash;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::compiler::CompilerOptions;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::artifact::DecodeLimits;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::source::SourceFormat;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::compiler::compile_source;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::artifact::decode_shard;
 
     fn procedure_selection(
         pack_id: &str,
@@ -6546,184 +3166,15 @@ mod active_model_set_identity_tests {
     }
 }
 
-/// The conflict gate for procedure-summary lookup (#1871). The canonical member
-/// key cannot tell same-arity overloads apart, so a posting legitimately carries
-/// several records. The #2738 regression pins that conflicting override
-/// coverage cannot be resolved to whichever model was indexed first.
-#[cfg(test)]
-mod procedure_claim_agreement_tests {
-    use super::*;
-    use crate::analyzer::semantic_model::{
-        CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
-        CompiledResultPredicate, CompiledSummaryExitKind, CompiledSummaryInput,
-        CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
-    };
-    use brokk_bifrost_test_macros::hardwon;
-
-    fn transfer(input: CompiledSummaryInput) -> CompiledSummaryTransfer {
-        CompiledSummaryTransfer {
-            input,
-            exit_kind: CompiledSummaryExitKind::Normal,
-            output: CompiledSummaryOutput::NormalReturn {},
-            value_transfer: None,
-        }
-    }
-
-    /// Two records that differ in every identity field but make one claim. This
-    /// is the real shape: `String.valueOf(int)` and `String.valueOf(Object)`
-    /// share the canonical key and both carry parameter 0 to the return.
-    fn overload(id: &str, symbol: &str) -> CompiledProcedureSummary {
-        CompiledProcedureSummary {
-            id: id.to_owned(),
-            model_id: format!("model.{id}"),
-            contract_version: 1,
-            content_sha256: format!("{id:0>64}"),
-            target: CompiledProcedureTarget {
-                path: "java.base/java/lang/String.java".to_owned(),
-                symbol: symbol.to_owned(),
-                has_receiver: true,
-                variadic: false,
-                parameter_count: 1,
-                formals: Vec::new(),
-            },
-            completeness: Completeness::Complete,
-            ordinary_heap_unchanged: false,
-            no_concurrency_effects: false,
-            covers_overrides: false,
-            normal_continuation_absent: false,
-            normal_result_count: None,
-            locations: Vec::new(),
-            transfers: vec![transfer(CompiledSummaryInput::Parameter { ordinal: 0 })],
-            transfer_partitions: Vec::new(),
-            effects: Vec::new(),
-            concurrency_effects: Vec::new(),
-            returned_callables: Vec::new(),
-            declared_effects: Vec::new(),
-            preconditions: None,
-            result_contracts: Vec::new(),
-            result_use_obligations: Vec::new(),
-            conditional_result_refinements: Vec::new(),
-            conditional_indirect_writes: Vec::new(),
-            normal_return_refinements: Vec::new(),
-            normal_return_type_refinements: Vec::new(),
-            class_decorator_identity: None,
-        }
-    }
-
-    #[test]
-    #[hardwon("#2738: same-key interface contract claims disagreed on override coverage")]
-    fn a_different_override_coverage_claim_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.covers_overrides = true;
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "override coverage is a trust claim, so conflicting records must refuse"
-        );
-    }
-
-    #[test]
-    fn concurrency_claims_make_same_shape_records_disagree() {
-        let left = overload("1", "valueOf(java.lang.Object)");
-        let mut right = overload("2", "valueOf(int)");
-        right
-            .concurrency_effects
-            .push(CompiledConcurrencyEffect::TaskSpawn {
-                callable: CompiledSummaryInput::Parameter { ordinal: 0 },
-                group: None,
-                condition: None,
-                timer: None,
-            });
-        assert!(!procedure_claims_agree(&left, &right));
-    }
-
-    #[test]
-    fn a_different_normal_continuation_claim_is_a_disagreement() {
-        let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        left.normal_continuation_absent = true;
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "an explicit absence claim cannot agree with an omitted claim"
-        );
-
-        right.normal_continuation_absent = true;
-        assert!(
-            procedure_claims_agree(&left, &right),
-            "two explicit absence claims make one runtime claim"
-        );
-    }
-
-    #[test]
-    fn a_different_ordinary_heap_unchanged_claim_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.ordinary_heap_unchanged = true;
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "heap-preservation certification is a trust claim, so conflicting records must refuse"
-        );
-
-        let mut matching = left.clone();
-        matching.ordinary_heap_unchanged = true;
-        assert!(
-            procedure_claims_agree(&matching, &right),
-            "identical heap-preservation certifications still make one claim"
-        );
-    }
-
-    #[test]
-    fn a_different_no_concurrency_effects_claim_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.no_concurrency_effects = true;
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "the explicit no-concurrency claim changes whether a call boundary is modeled"
-        );
-
-        let mut matching = left.clone();
-        matching.no_concurrency_effects = true;
-        assert!(procedure_claims_agree(&matching, &right));
-    }
-
-    #[test]
-    fn a_different_conditional_result_refinement_is_a_disagreement() {
-        let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        left.normal_result_count = Some(1);
-        left.conditional_result_refinements = vec![CompiledConditionalResultRefinement {
-            result_ordinal: 0,
-            outcome: false,
-            parameter_ordinal: 0,
-            predicate: CompiledResultPredicate::Null,
-            proof_effect: CompiledPredicateProofEffect::DoesNotEstablish,
-        }];
-        let mut right = left.clone();
-        right.conditional_result_refinements[0].proof_effect =
-            CompiledPredicateProofEffect::Establishes;
-
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "opposite conditional proof effects cannot resolve as one modeled answer"
-        );
-
-        right = left.clone();
-        right.conditional_result_refinements[0].outcome = true;
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "the boolean result outcome is part of the modeled claim"
-        );
-    }
-}
+pub use crate::analyzer::store::active_models::{
+    ActivatedProcedureSummary, ActivatedSemanticModelRecord, ActiveSemanticModelShard,
+    EffectiveProcedureClaims, MatcherIndexes, ProcedureSummaryMatch, ResolvedActiveSemanticModels,
+    ReviewedObligationTarget, SemanticModelActivationExplanation, SemanticModelActivationReport,
+    SemanticModelMatch, absorb_procedure_posting, build_normal_continuation_absence_candidates,
+    empty_procedure_match, indexed_procedure_summary, insert_rule_trigger,
+    procedure_match_proves_normal_continuation_absent, procedure_summary_actual_to_formal,
+    python_artifact_applies_to_target, python_shard_requires_distribution_artifact,
+    resolve_applicable_procedure_postings, resolve_applicable_procedure_postings_where,
+    resolve_applicable_procedure_postings_where_for_counts, resolve_exact_procedure_postings,
+    resolve_posting, resolve_procedure_postings, resolve_procedure_postings_where,
+};

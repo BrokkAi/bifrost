@@ -153,7 +153,7 @@ fn completion_keeps_semantic_budget_exhaustion_typed() {
     limits.procedures = 4;
     let exceeded = SemanticBudget::new(limits)
         .expect("positive budget")
-        .check(SemanticWork {
+        .check_admission(SemanticWork {
             procedures: 5,
             ..SemanticWork::default()
         })

@@ -30,18 +30,24 @@ use super::{Result, StoreError};
 /// accidentally replace this identity with a display name or unit key while
 /// constructing a root endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RustSelectedDeclarationAuthorityFact {
-    pub(crate) mount: Option<SelectedResolutionMountOrdinal>,
-    pub(crate) source_site: ResolutionSiteId,
-    pub(crate) declaration: SourceDeclarationId,
-    pub(crate) visibility: RustVisibility,
+#[doc(hidden)]
+pub struct RustSelectedDeclarationAuthorityFact {
+    #[doc(hidden)]
+    pub mount: Option<SelectedResolutionMountOrdinal>,
+    #[doc(hidden)]
+    pub source_site: ResolutionSiteId,
+    #[doc(hidden)]
+    pub declaration: SourceDeclarationId,
+    #[doc(hidden)]
+    pub visibility: RustVisibility,
 }
 
 /// Attach the selected topology's crate and declaring-module coordinates to a
 /// source-owned authority fact. The source identity and visibility remain
 /// exactly those returned by the canonical source-site bridge; topology only
 /// supplies the lexical context needed to evaluate restricted visibility.
-pub(crate) fn rust_selected_declaration_authority(
+#[doc(hidden)]
+pub fn rust_selected_declaration_authority(
     fact: RustSelectedDeclarationAuthorityFact,
     crate_root: &Path,
     declaring_module_segments: &[String],
@@ -89,7 +95,8 @@ pub(super) fn complete_access_source_read(
 /// A caller holding a definition node translates it to its source site
 /// through the mount's interior first: the source site is the only key this
 /// authority chain admits.
-pub(crate) fn read_selected_rust_declaration_authority_with_cancellation(
+#[doc(hidden)]
+pub fn read_selected_rust_declaration_authority_with_cancellation(
     inventory: &SelectedResolutionMountInventory<'_>,
     requests: &[(SelectedResolutionMountOrdinal, ResolutionSiteId)],
     cancellation: &CancellationToken,

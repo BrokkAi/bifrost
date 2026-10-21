@@ -28,7 +28,10 @@ and cannot be combined with `--request-path` or either output path.
 The command writes the acquisition outcome to `--receipt-path`. A successful
 selection also writes selected roots to `--env-path`. A policy-only pack has no
 native semantic bundle, so its environment file omits
-`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`.
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`. A catalog release exports its rules root
+as `BIFROST_OPEN_POLICY_PACK_ROOT`. A policy-bundle release exports its
+extraction as `BIFROST_POLICY_BUNDLE_ROOT` instead; its policies run only when
+named by ID.
 
 Exit codes are:
 
@@ -112,6 +115,22 @@ pack ID with equal SemVer precedence and different manifest digests. A
 re-release with changed manifest bytes is a distinct release: preferred mode
 can select it as the current release, while a strict request or replay fails
 with an integrity error if its pinned digest no longer matches.
+
+Engine compatibility covers the engine version range, the capability contract
+version, and every schema axis that the release and its contents declare. A
+release is not rejected because a policy requires a capability the engine does
+not provide. The policy runs report it as `not_run` with the missing
+capability names, and the rest of the release runs. `bifrost
+pack-engine-profile` lists the capabilities this engine provides.
+
+Release manifest schema 3 adds a host scope beside the engine axes: a
+release-level `host_compatibility` (contract 1, host `policy_bundle` schemas,
+and required routes) and `host_schemas` on every content entry. The binary is
+the host for its own acquisition. It provides the `premium-policy-zip` route and
+policy-bundle schema 1, so a schema 3 release that needs another bundle schema
+is rejected with `engine-contract`. A release that requires the
+`premium-policy-zip` route is a policy bundle: its archive must contain
+`policy-bundle.json`, and its extraction is exported as a bundle root.
 
 A strict selection has this shape. Replace the digest placeholder with the
 64-character SHA-256 digest from the release manifest:

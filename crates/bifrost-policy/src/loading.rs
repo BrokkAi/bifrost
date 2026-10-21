@@ -117,7 +117,9 @@ pub(crate) fn load_endpoint_closure(
     let schema_resolution = parsed.schema_resolution();
     let mut definition = match parsed.document() {
         RqlpDocument::Endpoint { definition } => definition.as_ref().clone(),
-        RqlpDocument::Policy { .. } | RqlpDocument::EndpointSet { .. } => {
+        RqlpDocument::Policy { .. }
+        | RqlpDocument::EndpointSet { .. }
+        | RqlpDocument::DeclarationSelection { .. } => {
             return Err(EndpointClosureError::WrongDocumentKind);
         }
     };

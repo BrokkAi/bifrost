@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/value-transfer/0.1/schema.json",
+  "title": "CSMI value-transfer profile 0.1.0",
+  "oneOf": [
+    { "$ref": "#/$defs/transferAttachment" },
+    { "$ref": "#/$defs/typeValueSemantics" },
+    { "$ref": "#/$defs/implicitOperation" }
+  ],
+  "$defs": {
+    "localId": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "limitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["budget-exhausted", "cancelled", "unsupported", "unresolved-identity", "ambiguous-identity", "incomplete-input", "other"]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "other" } }, "required": ["kind"] },
+          "then": { "required": ["message"] }
+        }
+      ]
+    },
+    "unknown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "limitation"],
+      "properties": {
+        "kind": { "const": "unknown" },
+        "limitation": { "$ref": "#/$defs/limitation" }
+      }
+    },
+    "noneOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "none" } }
+    },
+    "implicitOperationReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "symbol"],
+      "properties": {
+        "kind": { "const": "implicit" },
+        "symbol": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "operationReference": {
+      "oneOf": [
+        { "$ref": "#/$defs/noneOperation" },
+        { "$ref": "#/$defs/unknown" },
+        { "$ref": "#/$defs/implicitOperationReference" }
+      ]
+    },
+    "simpleTransferKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "enum": ["copy", "aggregate-copy", "boxing", "unboxing"] } }
+    },
+    "moveTransferKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "invalidation"],
+      "properties": {
+        "kind": { "const": "move" },
+        "invalidation": { "enum": ["invalidated", "unknown"] }
+      }
+    },
+    "conversionTransferKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "preservation"],
+      "properties": {
+        "kind": { "const": "conversion" },
+        "preservation": { "enum": ["identity", "preserving", "changing", "unknown"] }
+      }
+    },
+    "transferKind": {
+      "oneOf": [
+        { "$ref": "#/$defs/simpleTransferKind" },
+        { "$ref": "#/$defs/moveTransferKind" },
+        { "$ref": "#/$defs/conversionTransferKind" }
+      ]
+    },
+    "transferAttachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "transferKind", "operation"],
+      "properties": {
+        "kind": { "const": "transfer" },
+        "transferKind": { "$ref": "#/$defs/transferKind" },
+        "operation": { "$ref": "#/$defs/operationReference" }
+      }
+    },
+    "trivialSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "trivial" } }
+    },
+    "copyViaMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "member"],
+      "properties": {
+        "kind": { "const": "via-member" },
+        "member": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "invalidatingSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "invalidating" }
+      }
+    },
+    "unsupported": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "unsupported" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "copySemantics": {
+      "oneOf": [
+        { "$ref": "#/$defs/trivialSemantics" },
+        { "$ref": "#/$defs/copyViaMember" },
+        { "$ref": "#/$defs/unknown" },
+        { "$ref": "#/$defs/unsupported" }
+      ]
+    },
+    "moveSemantics": {
+      "oneOf": [
+        { "$ref": "#/$defs/invalidatingSemantics" },
+        { "$ref": "#/$defs/unknown" },
+        { "$ref": "#/$defs/unsupported" }
+      ]
+    },
+    "typeValueSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "type", "aspect", "semantics"],
+      "properties": {
+        "kind": { "const": "type-value-semantics" },
+        "type": { "$ref": "#/$defs/localId" },
+        "aspect": { "enum": ["copy", "move"] },
+        "semantics": true
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "aspect": { "const": "copy" } }, "required": ["aspect"] },
+          "then": { "properties": { "semantics": { "$ref": "#/$defs/copySemantics" } } },
+          "else": { "properties": { "semantics": { "$ref": "#/$defs/moveSemantics" } } }
+        }
+      ]
+    },
+    "implicitOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "symbol", "owner", "operation"],
+      "properties": {
+        "kind": { "const": "implicit-operation" },
+        "symbol": { "$ref": "#/$defs/localId" },
+        "owner": { "$ref": "#/$defs/localId" },
+        "operation": { "enum": ["copy-constructor", "move-constructor", "copy-assignment", "move-assignment", "conversion-operator"] },
+        "target": { "$ref": "#/$defs/localId" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "conversion-operator" } }, "required": ["operation"] },
+          "then": { "required": ["target"] },
+          "else": { "not": { "required": ["target"] } }
+        }
+      ]
+    }
+  }
+}

@@ -31,7 +31,8 @@
 //! The public query is `CodeQuery` (#328); its reference-rendering contract is
 //! tracked by #449.
 
-pub(crate) mod adapter_helpers;
+#[doc(hidden)]
+pub mod adapter_helpers;
 pub mod branch_relations;
 pub mod derived_cache;
 pub mod extract;
@@ -47,8 +48,9 @@ pub mod provider;
 pub mod qualified_paths;
 pub mod reference_edges;
 pub mod rewrite_paths;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 
 /// Add an incompleteness reason once, preserving its first-seen order.
 fn note_once<T: PartialEq>(reasons: &mut Vec<T>, reason: T) {

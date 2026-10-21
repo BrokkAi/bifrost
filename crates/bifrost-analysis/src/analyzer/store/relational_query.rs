@@ -33,7 +33,8 @@ const SET_QUERY_MIN_REQUESTS: usize = 64;
 // views are ready-only and therefore cannot witness a matching blob that was
 // excluded by the source-facts readiness boundary. The candidate view keeps
 // that row with a persisted availability bit for this bounded preflight.
-pub(super) const CALLABLE_CANDIDATE_AVAILABILITY_SQL: &str = "SELECT EXISTS(
+#[doc(hidden)]
+pub const CALLABLE_CANDIDATE_AVAILABILITY_SQL: &str = "SELECT EXISTS(
      SELECT 1
      FROM callable_candidate_definition_names AS names
      WHERE names.lang = ?1
@@ -45,7 +46,8 @@ pub(super) const CALLABLE_CANDIDATE_AVAILABILITY_SQL: &str = "SELECT EXISTS(
      LIMIT 1
    )";
 
-fn content_sql(view: &str, predicate: &str) -> String {
+#[doc(hidden)]
+pub fn content_sql(view: &str, predicate: &str) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS}, names.rel_path
          FROM {view} AS names
@@ -57,7 +59,11 @@ fn content_sql(view: &str, predicate: &str) -> String {
     )
 }
 
-fn render_name<A: LanguageAdapter>(adapter: &A, name: &RelationalName) -> (String, String, String) {
+#[doc(hidden)]
+pub fn render_name<A: LanguageAdapter>(
+    adapter: &A,
+    name: &RelationalName,
+) -> (String, String, String) {
     let interner = crate::analyzer::fq_name::segment_interner();
     (
         name.prefix().display_native(adapter.language(), interner),
@@ -162,7 +168,8 @@ fn batched_request_rows_sql(request_values: &str) -> String {
     format!("SELECT CAST(key AS INTEGER), {request_values}\n             FROM json_each(?1)")
 }
 
-fn batched_content_sql(
+#[doc(hidden)]
+pub fn batched_content_sql(
     view: &str,
     request_columns: &str,
     request_values: &str,
@@ -182,7 +189,8 @@ fn batched_content_sql(
     )
 }
 
-fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> String {
+#[doc(hidden)]
+pub fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> String {
     format!(
         "WITH requests(request_index, lookup_key) AS MATERIALIZED (
              SELECT CAST(key AS INTEGER), json_array({request_values})
@@ -198,7 +206,8 @@ fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> S
     )
 }
 
-fn batched_definition_order_sql(view: &str) -> String {
+#[doc(hidden)]
+pub fn batched_definition_order_sql(view: &str) -> String {
     format!(
         "WITH requests(request_index, prefix, parent_tail, identifier) AS MATERIALIZED (
              SELECT CAST(key AS INTEGER),
@@ -363,7 +372,8 @@ fn query_batched_definition_order_candidates(
 /// There is no `source_kind` filter and no content join: this view holds only
 /// path rows, and a path row's unit comes from
 /// `adapter.path_synthetic_module_unit` on the file, not from `code_units`.
-fn batched_path_sql(request_columns: &str, request_values: &str, predicate: &str) -> String {
+#[doc(hidden)]
+pub fn batched_path_sql(request_columns: &str, request_values: &str, predicate: &str) -> String {
     format!(
         "WITH requests(request_index, {request_columns}) AS ({})
          SELECT requests.request_index, names.rel_path
@@ -377,26 +387,33 @@ fn batched_path_sql(request_columns: &str, request_values: &str, predicate: &str
 /// The request-relation shape one set executor hands
 /// [`query_batched_path_units`]. Named so the query-plan pin can build the SQL
 /// the executor builds rather than a copy of it.
-struct BatchedPathRequest {
-    columns: &'static str,
-    values: &'static str,
-    predicate: &'static str,
+#[doc(hidden)]
+pub struct BatchedPathRequest {
+    #[doc(hidden)]
+    pub columns: &'static str,
+    #[doc(hidden)]
+    pub values: &'static str,
+    #[doc(hidden)]
+    pub predicate: &'static str,
 }
 
-const EXACT_PATH_REQUEST: BatchedPathRequest = BatchedPathRequest {
+#[doc(hidden)]
+pub const EXACT_PATH_REQUEST: BatchedPathRequest = BatchedPathRequest {
     columns: "prefix, parent_tail, identifier",
     values: "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
     predicate: "requests.prefix = '' AND names.package_name = requests.parent_tail
                 AND names.short_name = requests.identifier",
 };
 
-const NORMALIZED_PATH_REQUEST: BatchedPathRequest = BatchedPathRequest {
+#[doc(hidden)]
+pub const NORMALIZED_PATH_REQUEST: BatchedPathRequest = BatchedPathRequest {
     columns: "prefix, tail",
     values: "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
     predicate: "requests.prefix = '' AND names.normalized_fqn = requests.tail",
 };
 
-const STRUCTURAL_MEMBER_PATH_REQUEST: BatchedPathRequest = BatchedPathRequest {
+#[doc(hidden)]
+pub const STRUCTURAL_MEMBER_PATH_REQUEST: BatchedPathRequest = BatchedPathRequest {
     columns: "prefix, tail, identifier",
     values: "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
     predicate: "requests.prefix = '' AND names.package_name = requests.tail
@@ -798,7 +815,8 @@ fn set_structural_member_values<A: LanguageAdapter>(
 ///
 /// `PackageTypes` and `PackageTypesInPackage` add `names.kind = 0` because the
 /// path arm of `live_package_types` carries `WHERE symbols.kind = 0`.
-fn path_view_predicate<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn path_view_predicate<A: LanguageAdapter>(
     adapter: &A,
     request: &RelationalDefinitionRequest,
     prefix: &str,
@@ -877,7 +895,8 @@ fn path_view_predicate<A: LanguageAdapter>(
 ///
 /// There is no `ORDER BY`: `definition_values` sorts and dedups every shape's
 /// merged result already, and the SQL sort only adds a temp B-tree.
-fn path_view_sql(predicate: &str) -> String {
+#[doc(hidden)]
+pub fn path_view_sql(predicate: &str) -> String {
     format!(
         "SELECT names.rel_path
          FROM live_path_symbol_names AS names
@@ -1010,7 +1029,8 @@ fn query_view_candidates<A: LanguageAdapter>(
 ///
 /// Returns `None` for shapes that have no split-view equivalent (they keep
 /// using the wide view through the fallback path in `definition_values`).
-fn split_view_sources<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn split_view_sources<A: LanguageAdapter>(
     adapter: &A,
     request: &RelationalDefinitionRequest,
     prefix: &str,
@@ -1411,7 +1431,8 @@ fn package_exists(
 // its active-generation equality here gives SQLite all three leading columns
 // of the membership primary key; without it, SQLite seeks only `lang` and
 // walks every package membership for that language.
-const PACKAGE_EXISTS_SQL: &str = "SELECT 1 FROM live_workspace_package_files
+#[doc(hidden)]
+pub const PACKAGE_EXISTS_SQL: &str = "SELECT 1 FROM live_workspace_package_files
      WHERE lang = ?1
        AND generation = COALESCE(
          (SELECT generation FROM analysis_epochs WHERE lang = ?1), 0
@@ -1545,15 +1566,15 @@ impl AnalyzerStore {
         if cancellation.is_cancelled() {
             return Ok(RelationalStoreOutcome::Cancelled);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.relational_batch_reader_checkouts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut connection = self.read_conn_for_workspace(workspace_snapshots)?;
         let tx = connection.transaction()?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.relational_batch_generation_validations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.relational_batch_distinct_requests
             .fetch_add(requests.len(), std::sync::atomic::Ordering::Relaxed);
         require_generation_map(
@@ -1567,7 +1588,7 @@ impl AnalyzerStore {
             .collect::<Vec<_>>();
         let mut handled = vec![false; requests.len()];
         let live_unit_counts = if set_queries_need_live_unit_counts(requests) {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.relational_live_unit_count_queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             live_unit_counts(&tx, storage_languages)?
@@ -1771,8 +1792,9 @@ impl AnalyzerStore {
         Ok(Some(values))
     }
 
-    #[cfg(test)]
-    pub(crate) fn relational_batch_counts_for_test(&self) -> (usize, usize, usize) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn relational_batch_counts_for_test(&self) -> (usize, usize, usize) {
         (
             self.relational_batch_reader_checkouts
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1783,8 +1805,9 @@ impl AnalyzerStore {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn relational_live_unit_count_queries_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn relational_live_unit_count_queries_for_test(&self) -> usize {
         self.relational_live_unit_count_queries
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1796,16 +1819,15 @@ mod tests {
     use rusqlite::params;
 
     use super::{
-        AnalyzerStore, CALLABLE_CANDIDATE_AVAILABILITY_SQL, EXACT_PATH_REQUEST,
-        NORMALIZED_PATH_REQUEST, PACKAGE_EXISTS_SQL, STRUCTURAL_MEMBER_PATH_REQUEST,
-        batched_content_sql, batched_definition_order_sql, batched_path_sql, content_sql,
-        path_view_predicate, path_view_sql, render_name, scanned_content_sql, split_view_sources,
+        AnalyzerStore, CALLABLE_CANDIDATE_AVAILABILITY_SQL, PACKAGE_EXISTS_SQL,
+        batched_content_sql, batched_definition_order_sql, content_sql, render_name,
+        scanned_content_sql, split_view_sources,
     };
     use crate::analyzer::Language;
     use crate::analyzer::ProjectFile;
     use crate::analyzer::fq_name::segment_interner;
     use crate::analyzer::java::JavaAdapter;
-    use crate::analyzer::python::PythonAdapter;
+
     use crate::analyzer::store::REVISIONED_WORKSPACE_VIEWS_SQL;
     use brokk_bifrost_core::analyzer::{
         DefinitionLanguageScope, RelationalDefinitionQuery, RelationalDefinitionRequest,
@@ -2304,208 +2326,6 @@ mod tests {
             )
             .is_none(),
             "VisibleMembers has no split-view equivalent and must stay on the wide-view fallback"
-        );
-    }
-
-    /// Query-plan pin for the path-derived arm (Part 2 of the issue #2588
-    /// plan). A path-derived module unit is a declaration the analyzer invents
-    /// for a file whose module name comes from its path: `pkg/service.py` is
-    /// the module `pkg.service` although no line in it says so. Python,
-    /// JavaScript, and TypeScript have them.
-    ///
-    /// Before Part 2, both the point query and (by exclusion) the batched
-    /// query read the wide three-arm views with `source_kind = 'path'`. SQLite
-    /// materialized the whole compound as a co-routine, ran the two content
-    /// arms whose rows it then discarded, and had no index for the columns the
-    /// path predicate names, so it drove the arm from
-    /// `idx_workspace_file_versions_snapshot_blob` on (workspace, lang,
-    /// generation) -- every live file of the language -- once per request.
-    ///
-    /// This test calls the real `path_view_predicate` and the real SQL
-    /// builders, so it fails if production stops routing a shape through the
-    /// lean view or changes a predicate to one that cannot seek. Removing the
-    /// `short_name` term from the identifier shape, for example, leaves the
-    /// query with nothing but `lang`, and the index assertion fails.
-    #[test]
-    #[hardwon("3932076e7002: path-derived policy queries scanned every live file per request")]
-    fn path_unit_queries_seek_path_symbol_indexes() {
-        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
-        let connection = store.conn.lock().expect("store mutex");
-        let explain = |sql: String, bindings: &[&str]| {
-            let mut statement = connection
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .expect("prepare path query plan");
-            statement
-                .query_map(rusqlite::params_from_iter(bindings), |row| {
-                    row.get::<_, String>(3)
-                })
-                .expect("read path query plan")
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .expect("collect path query plan")
-        };
-        let assert_seeks_path_index = |case_name: &str, index: &str, plan: &[String]| {
-            assert!(
-                plan.iter().any(|detail| detail.contains(index)),
-                "{case_name} must seek {index}: {plan:#?}"
-            );
-            assert!(
-                plan.iter().all(|detail| !detail.contains("SCAN rows")),
-                "{case_name} must not scan workspace_file_path_symbol_rows: {plan:#?}"
-            );
-            assert!(
-                plan.iter().all(|detail| !detail.contains("CO-ROUTINE")),
-                "{case_name} must not materialize a compound view: {plan:#?}"
-            );
-            assert!(
-                plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
-                "{case_name} must not sort in SQL: {plan:#?}"
-            );
-        };
-
-        let module_name = RelationalName::stable(parse_symbol_path_fq(
-            Language::Python,
-            "pkg.service",
-            segment_interner(),
-        ));
-        let decorated_name = RelationalName::stable(parse_symbol_path_fq(
-            Language::Python,
-            "pkg.service`",
-            segment_interner(),
-        ));
-        let file = ProjectFile::new(
-            std::env::current_dir().expect("test working directory must be available"),
-            "pkg/service.py".to_string(),
-        );
-        let adapter = PythonAdapter::for_test_file(&file);
-        let short = "idx_workspace_file_path_symbol_rows_short";
-        let package = "idx_workspace_file_path_symbol_rows_package";
-        let normalized = "idx_workspace_file_path_symbol_rows_normalized";
-
-        let point_cases: [(&str, &RelationalName, RelationalDefinitionQuery, &str); 10] = [
-            (
-                "exact name",
-                &module_name,
-                RelationalDefinitionQuery::ExactName,
-                package,
-            ),
-            (
-                "normalized name",
-                &module_name,
-                RelationalDefinitionQuery::NormalizedName,
-                normalized,
-            ),
-            (
-                "structural children",
-                &module_name,
-                RelationalDefinitionQuery::StructuralChildren,
-                package,
-            ),
-            (
-                "structural members",
-                &module_name,
-                RelationalDefinitionQuery::StructuralMembers {
-                    identifier: "service".to_string(),
-                },
-                package,
-            ),
-            (
-                "visible members",
-                &module_name,
-                RelationalDefinitionQuery::VisibleMembers {
-                    identifier: "service".to_string(),
-                },
-                package,
-            ),
-            (
-                "identifier",
-                &module_name,
-                RelationalDefinitionQuery::Identifier { file: None },
-                short,
-            ),
-            (
-                "file identifier",
-                &module_name,
-                RelationalDefinitionQuery::Identifier {
-                    file: Some(file.clone()),
-                },
-                short,
-            ),
-            (
-                "identifier prefix",
-                &decorated_name,
-                RelationalDefinitionQuery::IdentifierPrefix { file: None },
-                short,
-            ),
-            (
-                "package types",
-                &module_name,
-                RelationalDefinitionQuery::PackageTypes {
-                    simple_name: "service".to_string(),
-                },
-                package,
-            ),
-            (
-                "package types in package",
-                &module_name,
-                RelationalDefinitionQuery::PackageTypesInPackage,
-                package,
-            ),
-        ];
-
-        for (case_name, name, query, index) in point_cases {
-            let request = RelationalDefinitionRequest {
-                ordinal: 0,
-                language_scope: DefinitionLanguageScope::Language(Language::Python),
-                name: name.clone(),
-                query,
-            };
-            let (prefix, tail, _) = render_name(&adapter, &request.name);
-            let (predicate, values) = path_view_predicate(&adapter, &request, &prefix, &tail)
-                .unwrap_or_else(|| panic!("{case_name} must reach the path view"));
-            let bindings: Vec<&str> = std::iter::once("python")
-                .chain(values.iter().map(String::as_str))
-                .collect();
-            let plan = explain(path_view_sql(&predicate), &bindings);
-            assert_seeks_path_index(case_name, index, &plan);
-        }
-
-        // The batched half. The request relation is bound as one JSON text
-        // parameter; an empty array is enough for the planner, which never
-        // reads the values.
-        for (case_name, request, index) in [
-            ("batched exact name", &EXACT_PATH_REQUEST, package),
-            (
-                "batched normalized name",
-                &NORMALIZED_PATH_REQUEST,
-                normalized,
-            ),
-            (
-                "batched structural members",
-                &STRUCTURAL_MEMBER_PATH_REQUEST,
-                package,
-            ),
-        ] {
-            let sql = batched_path_sql(request.columns, request.values, request.predicate);
-            let plan = explain(sql, &["[]", "python"]);
-            assert_seeks_path_index(case_name, index, &plan);
-        }
-
-        // A request with a non-empty prefix cannot match a path row, whose
-        // prefix is always empty, so no query is issued at all.
-        let anchored_name = RelationalName::new(
-            parse_symbol_path_fq(Language::Python, "vendor", segment_interner()),
-            parse_symbol_path_fq(Language::Python, "pkg.service", segment_interner()),
-        );
-        let anchored_request = RelationalDefinitionRequest {
-            ordinal: 0,
-            language_scope: DefinitionLanguageScope::Language(Language::Python),
-            name: anchored_name,
-            query: RelationalDefinitionQuery::ExactName,
-        };
-        let (prefix, tail, _) = render_name(&adapter, &anchored_request.name);
-        assert!(
-            path_view_predicate(&adapter, &anchored_request, &prefix, &tail).is_none(),
-            "a prefixed request must not issue a path query"
         );
     }
 

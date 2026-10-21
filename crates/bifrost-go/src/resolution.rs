@@ -37,10 +37,9 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionMemberKind, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
     ResolutionNameId, ResolutionNamespace, ResolutionPackageMemberFact,
     ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
-    ResolutionRootImportDemandTarget, ResolutionRootImportDemandTargetFact,
     ResolutionRootImportFact, ResolutionRootImportKind, ResolutionRootImportKindFact,
     ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
-    ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
+    ResolutionRootReferenceSegmentFact, ResolutionRouteGap, ResolutionScopeFact, ResolutionScopeId,
     ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
     ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
     ResolutionTypeComponentFact, ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
@@ -535,10 +534,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             start_byte: placement_range.start_byte,
             end_byte: placement_range.end_byte,
         });
-        self.facts.gaps.push(ResolutionGapFact {
-            site: placement,
-            kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-        });
+        self.facts.gaps.push(ResolutionGapFact::new(
+            placement,
+            ResolutionGapKind::UnsupportedPlacementBoundary,
+        ));
         validate_facts(&self.facts);
         assert_eq!(self.site_occurrences.len(), self.facts.sites.len());
         let mut go_source_facts = self.source_properties.finish();
@@ -583,11 +582,19 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         {
             // Named, blank, and dot imports all have exact structured rows;
             // dot-import export demands are emitted after references are lowered.
-            self.gap_and_skip(
-                node,
-                ResolutionSiteKind::UnsupportedRoute,
-                ResolutionGapKind::UnsupportedRoute,
-            )
+            {
+                let site = self.add_site(node, ResolutionSiteKind::UnsupportedRoute);
+                self.add_route_gap(
+                    site,
+                    ResolutionRouteGap::UnknownBinder {
+                        scope: self.current_scope(),
+                        name: None,
+                        namespace: None,
+                        may_publish: false,
+                    },
+                );
+                TreeWalkAction::Skip
+            }
         } else {
             // Retain the whole declaration range alongside per-spec routes.
             self.add_site(node, ResolutionSiteKind::ImportDeclaration);
@@ -1124,7 +1131,14 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             }
             _ => {
                 let site = self.add_site(communication, ResolutionSiteKind::UnsupportedExpression);
-                self.add_gap(site, ResolutionGapKind::UnsupportedRoute);
+                self.add_route_gap(
+                    site,
+                    ResolutionRouteGap::OmittedReference {
+                        scope: self.current_scope(),
+                        terminal: None,
+                        namespace: None,
+                    },
+                );
             }
         }
         TreeWalkAction::DescendWithExit
@@ -1463,6 +1477,12 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             ));
     }
 
+    fn add_route_gap(&mut self, site: ResolutionSiteId, route: ResolutionRouteGap) {
+        self.facts.add_route_gap(site, route);
+        self.facts
+            .add_reference_enumeration_gap(site, ResolutionGapKind::UnsupportedRoute);
+    }
+
     fn add_gap(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
         self.facts.add_gap(site, kind);
         if go_gap_blocks_reference_enumeration(kind) {
@@ -1589,19 +1609,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .map(|import| import.import_site)
             .collect::<Vec<_>>();
         self.facts
-            .extend_root_import_demands(&import_sites, &demanded_names);
-        for import_site in import_sites {
-            for &(namespace, name) in &demanded_names {
-                self.facts
-                    .root_import_demand_targets
-                    .push(ResolutionRootImportDemandTargetFact {
-                        import_site,
-                        namespace,
-                        name,
-                        target: ResolutionRootImportDemandTarget::SameNameGlob,
-                    });
-            }
-        }
+            .extend_same_name_glob_demands(&import_sites, &demanded_names);
     }
 
     fn finish_package_relations(&mut self) {
@@ -3072,7 +3080,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .copied()
             .map(|value| self.lower_expression(value))
             .collect::<Vec<_>>();
-        let one_to_one = value_slots.is_empty() || value_slots.len() == names.len();
+        let multiple_results = self.assignment_results(&values, names.len());
+        let one_to_one = value_slots.is_empty()
+            || value_slots.len() == names.len()
+            || multiple_results.is_some();
         for (index, name) in names.into_iter().enumerate() {
             if name.kind() != "identifier" || !is_spelled_identifier(name) {
                 let site = self.add_site(name, ResolutionSiteKind::UnsupportedDeclaration);
@@ -3085,7 +3096,12 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             let Some(declaration) = self.lower_value_binding(node, name) else {
                 continue;
             };
-            let mut assignment_input = value_slots.get(index).copied();
+            let input = multiple_results
+                .as_ref()
+                .and_then(|results| results.get(index))
+                .copied()
+                .or_else(|| value_slots.get(index).copied());
+            let mut assignment_input = input;
             if let Some(type_node) = type_node {
                 let declared = self.attach_declaration_type(
                     declaration,
@@ -3096,7 +3112,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 if let (Some(&input), Some(&value)) = (value_slots.get(index), values.get(index)) {
                     self.contextualize_declared_initializer(value, input, declared, type_node);
                 }
-            } else if one_to_one && let Some(&input) = value_slots.get(index) {
+            } else if one_to_one && let Some(input) = input {
                 let default_type = values
                     .get(index)
                     .and_then(|value| go_untyped_constant_type(*value, self.source, false))
@@ -3222,7 +3238,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .map(|value| self.lower_expression(value))
             .collect::<Vec<_>>();
         let one_to_one = lhs.len() == rhs_slots.len();
-        let multi_result_slots = self.assignment_call_results(&rhs, lhs_count);
+        let multi_result_slots = self.assignment_results(&rhs, lhs_count);
         let binding_scope = self.current_scope();
         let scope = *self.scope(binding_scope);
         for (index, name) in lhs.into_iter().enumerate() {
@@ -3236,14 +3252,19 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             }
             if !is_spelled_identifier(name) {
                 let site = self.add_site(name, ResolutionSiteKind::UnsupportedDeclaration);
-                self.add_gap(
-                    site,
-                    if name.is_missing() {
-                        ResolutionGapKind::MalformedSyntax
-                    } else {
-                        ResolutionGapKind::UnsupportedRoute
-                    },
-                );
+                if name.is_missing() {
+                    self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+                } else {
+                    self.add_route_gap(
+                        site,
+                        ResolutionRouteGap::UnknownBinder {
+                            scope: binding_scope,
+                            name: None,
+                            namespace: Some(ResolutionNamespace::Value),
+                            may_publish: false,
+                        },
+                    );
+                }
                 continue;
             }
             let spelling = go_node_text(name, self.source).trim();
@@ -3484,7 +3505,14 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
         let Some(callable) = self.callable_contexts.last().copied() else {
             let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
-            self.add_gap(site, ResolutionGapKind::UnsupportedRoute);
+            self.add_route_gap(
+                site,
+                ResolutionRouteGap::OmittedReference {
+                    scope: self.current_scope(),
+                    terminal: None,
+                    namespace: None,
+                },
+            );
             return;
         };
         let values = first_named_child(node)
@@ -3541,14 +3569,39 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         );
     }
 
-    // Go permits a single call to supply multiple assignment positions. Preserve
-    // those result ordinals instead of copying the first result to every target.
-    fn assignment_call_results(
+    // Go permits a call or comma-ok index to supply multiple assignment
+    // positions. Preserve those results instead of duplicating the first.
+    fn assignment_results(
         &mut self,
         rhs: &[Node<'tree>],
         lhs_count: usize,
     ) -> Option<Vec<ResolutionTypeSlotId>> {
-        if rhs.len() != 1 || lhs_count <= 1 || rhs[0].kind() != "call_expression" {
+        if rhs.len() != 1 || lhs_count <= 1 {
+            return None;
+        }
+        if rhs[0].kind() == "index_expression" && lhs_count == 2 {
+            let node = rhs[0];
+            let operand = node.child_by_field_name("operand")?;
+            let site = self.slot(self.expression_slot(node)).site;
+            let first = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            self.add_transfer(
+                self.expression_slot(operand),
+                first,
+                ResolutionTypeTransferKind::ComponentCommaOkValue,
+                0,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+            );
+            let second = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            self.add_transfer(
+                self.expression_slot(operand),
+                second,
+                ResolutionTypeTransferKind::ComponentIndexOk,
+                0,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+            );
+            return Some(vec![first, second]);
+        }
+        if rhs[0].kind() != "call_expression" {
             return None;
         }
         let call_node = rhs[0];
@@ -3626,7 +3679,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             }
         }
         let multi_result_slots = simple_assignment
-            .then(|| self.assignment_call_results(&right, left.len()))
+            .then(|| self.assignment_results(&right, left.len()))
             .flatten();
         let supported_arity = left.len() == right_count || multi_result_slots.is_some();
         for (index, target) in left.iter().copied().enumerate() {
@@ -4231,12 +4284,43 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 .value_names_by_scope
                 .get(&current)
                 .is_some_and(|names| names.contains(spelling))
+                || self
+                    .visible_type_scope(current, spelling, node.start_byte())
+                    .is_some()
             {
                 return false;
             }
             scope = self.scope(current).parent;
         }
         false
+    }
+
+    fn visible_type_scope(
+        &self,
+        mut scope: ResolutionScopeId,
+        spelling: &str,
+        source_offset: usize,
+    ) -> Option<ResolutionScopeId> {
+        loop {
+            if self.facts.binders.iter().any(|binder| {
+                if binder.scope != scope
+                    || binder.kind != ResolutionBinderKind::Type
+                    || source_offset < binder.activation_start
+                    || source_offset > binder.activation_end
+                {
+                    return false;
+                }
+                self.facts.identifiers.iter().any(|identifier| {
+                    identifier.site == binder.declaration
+                        && identifier.role == ResolutionIdentifierRole::Declaration
+                        && identifier.namespace == ResolutionNamespace::Type
+                        && self.facts.names[identifier.name.index()].spelling == spelling
+                })
+            }) {
+                return Some(scope);
+            }
+            scope = self.scope(scope).parent?;
+        }
     }
 
     fn add_qualified_root_reference(&mut self, prefix: Node<'_>, reference: ResolutionSiteId) {
@@ -4457,6 +4541,66 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .expect("expression postorder always publishes its root slot")
     }
 
+    fn finish_index_expression(&mut self, node: Node<'tree>) {
+        let Some(operand) = node.child_by_field_name("operand") else {
+            self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+        self.add_transfer(
+            self.expression_slot(operand),
+            output,
+            ResolutionTypeTransferKind::ComponentIndex,
+            0,
+            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+        );
+        self.expression_slots_by_node.insert(node.id(), output);
+    }
+
+    fn finish_slice_expression(&mut self, node: Node<'tree>) {
+        let Some(operand) = node.child_by_field_name("operand") else {
+            self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+        let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+        let element = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+        // Array slicing constructs this slice shape. Slice and string slicing
+        // instead preserve the operand type, selected by the shared evaluator.
+        self.facts
+            .type_components
+            .push(ResolutionTypeComponentFact {
+                container,
+                constructor: ResolutionTypeConstructorKind::Slice,
+                kind: ResolutionTypeComponentKind::Element,
+                component: element,
+            });
+        self.add_transfer(
+            self.expression_slot(operand),
+            element,
+            ResolutionTypeTransferKind::ComponentIndex,
+            0,
+            ResolutionTypeTransferValueTransform::Preserve,
+        );
+        self.add_transfer(
+            self.expression_slot(operand),
+            container,
+            ResolutionTypeTransferKind::ComponentSlice,
+            0,
+            ResolutionTypeTransferValueTransform::Preserve,
+        );
+        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+        self.add_transfer(
+            container,
+            output,
+            ResolutionTypeTransferKind::Construction,
+            0,
+            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+        );
+        self.expression_slots_by_node.insert(node.id(), output);
+    }
+
     fn finish_expression(&mut self, node: Node<'tree>) {
         if self.expression_slots_by_node.contains_key(&node.id()) {
             return;
@@ -4536,7 +4680,8 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             "call_expression" => self.finish_call(node),
             "type_conversion_expression" => self.finish_type_conversion_expression(node),
             "binary_expression" => self.lower_binary_expression(node),
-            "index_expression" | "slice_expression" => self.lower_unsupported_expression_type(node),
+            "index_expression" => self.finish_index_expression(node),
+            "slice_expression" => self.finish_slice_expression(node),
             "type_assertion_expression" => {
                 let Some(asserted_type) = node.child_by_field_name("type") else {
                     self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
@@ -5083,12 +5228,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
         let (callee, receiver) = match function {
             Some(function) if is_spelled_identifier(function) => {
-                let Some(callee) = self.add_identifier_site(
+                let Some(callee) = self.add_go_call_or_conversion_reference(
                     function,
                     ResolutionSiteKind::CallableReference,
                     self.current_scope(),
-                    ResolutionIdentifierRole::Reference,
-                    ResolutionNamespace::TypeOrValue,
                     None,
                 ) else {
                     self.finish_unsupported_call(node, call);
@@ -5413,25 +5556,69 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             0,
             ResolutionTypeTransferValueTransform::Preserve,
         );
-        let callee = self.add_identifier_site(
-            field,
-            ResolutionSiteKind::MemberReference,
-            self.current_scope(),
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::Callable,
-            Some(receiver),
-        )?;
-        let origin = self.callable_receiver_origin(operand);
-        self.facts
-            .callable_receiver_origins
-            .push(ResolutionCallableReceiverOriginFact {
-                reference: callee,
-                origin,
-            });
+        let spelling = go_node_text(operand, self.source).trim();
+        let shadowed = self
+            .visible_value_scope(self.current_scope(), spelling)
+            .is_some()
+            || self
+                .visible_type_scope(self.current_scope(), spelling, operand.start_byte())
+                .is_some();
+        let has_named_import = self
+            .facts
+            .go_package_imports
+            .iter()
+            .any(|import| import.kind == ResolutionGoPackageImportKind::Named);
+        let package_qualified = has_named_import
+            && !shadowed
+            && (operand.kind() == "package_identifier"
+                || self.is_explicit_package_import_qualifier(operand)
+                || operand.kind() == "identifier");
+        let callee = if package_qualified {
+            self.add_go_call_or_conversion_reference(
+                field,
+                ResolutionSiteKind::CallableReference,
+                self.current_scope(),
+                Some(receiver),
+            )?
+        } else {
+            let origin = self.callable_receiver_origin(operand);
+            let callee = self.add_identifier_site(
+                field,
+                ResolutionSiteKind::MemberReference,
+                self.current_scope(),
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::Callable,
+                Some(receiver),
+            )?;
+            self.facts
+                .callable_receiver_origins
+                .push(ResolutionCallableReceiverOriginFact {
+                    reference: callee,
+                    origin,
+                });
+            callee
+        };
         if matches!(operand.kind(), "identifier" | "package_identifier") {
             self.add_qualified_root_reference(operand, callee);
         }
         Some((callee, Some(receiver)))
+    }
+
+    fn add_go_call_or_conversion_reference(
+        &mut self,
+        node: Node<'tree>,
+        kind: ResolutionSiteKind,
+        scope: ResolutionScopeId,
+        qualifier: Option<ResolutionTypeSlotId>,
+    ) -> Option<ResolutionSiteId> {
+        self.add_identifier_site(
+            node,
+            kind,
+            scope,
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::TypeOrValue,
+            qualifier,
+        )
     }
 
     fn callable_receiver_origin(&self, operand: Node<'_>) -> ResolutionCallableReceiverOrigin {
@@ -6666,7 +6853,7 @@ fn validate_facts(facts: &FileResolutionFacts) {
     for target in &facts.root_import_demand_targets {
         assert_eq!(
             target.target,
-            ResolutionRootImportDemandTarget::SameNameGlob
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportDemandTarget::SameNameGlob
         );
         assert_eq!(kinds[&target.import_site], ResolutionRootImportKind::Glob);
         assert!(targets.insert((target.import_site, target.namespace, target.name)));
@@ -6838,10 +7025,12 @@ fn validate_facts(facts: &FileResolutionFacts) {
     for gap in &facts.reference_enumeration_gaps {
         assert!(gap.site.index() < facts.sites.len());
         assert!(go_gap_blocks_reference_enumeration(gap.kind));
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: gap.site,
-            kind: gap.kind,
-        }));
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .any(|point| point.site == gap.site && point.kind == gap.kind)
+        );
         assert!(enumeration_rows.insert(*gap));
     }
 }
@@ -7337,10 +7526,10 @@ func namedResult() (result string) {
             .collect::<Vec<_>>();
         assert_eq!(repeated_parameters.len(), 2);
         for parameter in repeated_parameters {
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: parameter.parameter,
-                kind: ResolutionGapKind::UnsupportedExpressionType,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                parameter.parameter,
+                ResolutionGapKind::UnsupportedExpressionType
+            )));
             assert!(
                 !facts
                     .reference_enumeration_gaps
@@ -8053,7 +8242,18 @@ func use(values []int, outer int) {
             ResolutionGapKind::UnsupportedPlacementBoundary,
             ResolutionGapKind::MalformedSyntax,
         ] {
-            builder.add_gap(site, kind);
+            if kind == ResolutionGapKind::UnsupportedRoute {
+                builder.add_route_gap(
+                    site,
+                    ResolutionRouteGap::OmittedReference {
+                        scope: builder.current_scope(),
+                        terminal: None,
+                        namespace: None,
+                    },
+                );
+            } else {
+                builder.add_gap(site, kind);
+            }
         }
 
         assert_eq!(
@@ -8698,10 +8898,10 @@ func use(x int, y int, text string, enabled bool, pointer *int) {
                 name(&facts, terminal.name),
             );
             if is_call_callee {
-                assert!(facts.gaps.contains(&ResolutionGapFact {
-                    site: route.reference,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                }));
+                assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                    route.reference,
+                    ResolutionGapKind::UnsupportedCallApplicability
+                )));
             }
             observed.push((
                 name(&facts, prefix_id.name),
@@ -8714,7 +8914,7 @@ func use(x int, y int, text string, enabled bool, pointer *int) {
             [
                 ("pkg", "Item", ResolutionNamespace::Type),
                 ("pkg", "Member", ResolutionNamespace::Value),
-                ("pkg", "Call", ResolutionNamespace::Callable),
+                ("pkg", "Call", ResolutionNamespace::TypeOrValue),
                 ("pkg", "Widget", ResolutionNamespace::Type),
                 ("local", "Member", ResolutionNamespace::Value),
             ]
@@ -9127,9 +9327,9 @@ func use(values []int, channel chan int, box *Box, pointer *int) {
     value--
     for value = range values { }
     select { case value = <-channel: }
-    value, other = values[0]
-    value, fresh := values[0]
-    value = values[0]
+    value, other = 1
+    value, fresh := 1
+    value = any(value).(int)
     box.field = 1
     *pointer = 1
     box.field += 1
@@ -9387,10 +9587,10 @@ func use(incoming Base) {
             facts.sites[unknown_site.index()].kind,
             ResolutionSiteKind::UnsupportedExpression
         );
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: unknown_site,
-            kind: ResolutionGapKind::UnsupportedExpressionType,
-        }));
+        assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            unknown_site,
+            ResolutionGapKind::UnsupportedExpressionType
+        )));
         assert_ne!(unknown_site, current);
         assert!(!facts.gaps.iter().any(|gap| gap.site == current));
 
@@ -9572,10 +9772,10 @@ func use() {
                 && transfer.kind == ResolutionTypeTransferKind::Receiver
                 && transfer.value_transform == ResolutionTypeTransferValueTransform::Preserve
         }));
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: field_reference.site,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
+        assert!(
+            !facts.gaps.iter().any(|gap| gap.site == field_reference.site
+                && gap.kind == ResolutionGapKind::UnsupportedRoute)
+        );
     }
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -9900,10 +10100,10 @@ func use(v Typ, p *Typ) {
             .collect::<Vec<_>>();
         assert_eq!(method_sites.len(), 2);
         assert!(method_sites.iter().all(|method| {
-            facts.gaps.contains(&ResolutionGapFact {
-                site: *method,
-                kind: ResolutionGapKind::UnsupportedCallApplicability,
-            })
+            facts.gaps.contains(&ResolutionGapFact::new(
+                *method,
+                ResolutionGapKind::UnsupportedCallApplicability,
+            ))
         }));
         assert!(
             facts
@@ -9963,14 +10163,13 @@ func use(v Typ, p *Typ) {
         assert_eq!(method_references.len(), 5);
         assert!(method_references.iter().all(|reference| {
             reference.qualifier.is_some()
-                && !facts.gaps.contains(&ResolutionGapFact {
-                    site: reference.site,
-                    kind: ResolutionGapKind::UnsupportedRoute,
+                && !facts.gaps.iter().any(|gap| {
+                    gap.site == reference.site && gap.kind == ResolutionGapKind::UnsupportedRoute
                 })
-                && facts.gaps.contains(&ResolutionGapFact {
-                    site: reference.site,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                })
+                && facts.gaps.contains(&ResolutionGapFact::new(
+                    reference.site,
+                    ResolutionGapKind::UnsupportedCallApplicability,
+                ))
         }));
         let construction = facts
             .type_transfers
@@ -10127,14 +10326,17 @@ func use(x *Typ) {
             output: call.result,
             kind: BindingProjectionKind::TargetCallableResultType,
         }));
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: call.callee,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: call.callee,
-            kind: ResolutionGapKind::UnsupportedCallApplicability,
-        }));
+        assert!(
+            !facts
+                .gaps
+                .iter()
+                .any(|gap| gap.site == call.callee
+                    && gap.kind == ResolutionGapKind::UnsupportedRoute)
+        );
+        assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            call.callee,
+            ResolutionGapKind::UnsupportedCallApplicability
+        )));
 
         let y_declared = declaration_slot(&facts, y, DeclarationTypeRole::Value);
         let initialization = transfer_to(&facts, y_declared);
@@ -10161,10 +10363,11 @@ func use(x *Typ) {
             assignment.value_transform,
             ResolutionTypeTransferValueTransform::ToRuntime { addressable: true }
         );
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: y,
-            kind: ResolutionGapKind::InferredType,
-        }));
+        assert!(
+            !facts
+                .gaps
+                .contains(&ResolutionGapFact::new(y, ResolutionGapKind::InferredType))
+        );
     }
 
     #[test]
@@ -10234,19 +10437,29 @@ func caller(w *Widget) {
                             && identifier.role == ResolutionIdentifierRole::Reference
                     })
                     .expect("positioned selector callee");
+                let package_qualified = identifier.namespace == ResolutionNamespace::TypeOrValue;
                 assert_eq!(
                     facts.sites[call.callee.index()].kind,
-                    ResolutionSiteKind::MemberReference
+                    if package_qualified {
+                        ResolutionSiteKind::CallableReference
+                    } else {
+                        ResolutionSiteKind::MemberReference
+                    }
                 );
-                assert_eq!(identifier.namespace, ResolutionNamespace::Callable);
-                assert!(!facts.gaps.contains(&ResolutionGapFact {
-                    site: call.callee,
-                    kind: ResolutionGapKind::UnsupportedRoute,
-                }));
-                assert!(facts.gaps.contains(&ResolutionGapFact {
-                    site: call.callee,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                }));
+                assert_eq!(
+                    identifier.namespace,
+                    if package_qualified {
+                        ResolutionNamespace::TypeOrValue
+                    } else {
+                        ResolutionNamespace::Callable
+                    }
+                );
+                assert!(!facts.gaps.iter().any(|gap| gap.site == call.callee
+                    && gap.kind == ResolutionGapKind::UnsupportedRoute));
+                assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                    call.callee,
+                    ResolutionGapKind::UnsupportedCallApplicability
+                )));
                 (
                     facts.sites[call.call.index()].start_byte,
                     name(&facts, identifier.name),
@@ -10260,10 +10473,25 @@ func caller(w *Widget) {
         );
 
         assert!(facts.calls.iter().all(|call| {
-            facts.callable_receiver_origins.iter().any(|origin| {
-                origin.reference == call.callee
-                    && origin.origin == ResolutionCallableReceiverOrigin::ExplicitExpression
-            })
+            let namespace = facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.site == call.callee
+                        && identifier.role == ResolutionIdentifierRole::Reference
+                })
+                .expect("positioned selector callee")
+                .namespace;
+            let has_explicit_receiver_origin =
+                facts.callable_receiver_origins.iter().any(|origin| {
+                    origin.reference == call.callee
+                        && origin.origin == ResolutionCallableReceiverOrigin::ExplicitExpression
+                });
+            if namespace == ResolutionNamespace::TypeOrValue {
+                !has_explicit_receiver_origin
+            } else {
+                has_explicit_receiver_origin
+            }
         }));
 
         for selector in ["model.Widget.Method", "(*model.Widget).Method"] {
@@ -10325,7 +10553,7 @@ func caller() { _ = lib.New[int]() }
             })
             .expect("a generic package call keeps its terminal reference");
         assert_eq!(name(&facts, callee.name), "New");
-        assert_eq!(callee.namespace, ResolutionNamespace::Callable);
+        assert_eq!(callee.namespace, ResolutionNamespace::TypeOrValue);
         let route = facts
             .root_references
             .iter()
@@ -10564,10 +10792,10 @@ func New[T any]() Item[T] { return Item[T]{} }
                     && site.end_byte == application_end
             })
             .expect("generic application has a structured frontier");
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: application.id,
-            kind: ResolutionGapKind::UnsupportedExpressionType,
-        }));
+        assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            application.id,
+            ResolutionGapKind::UnsupportedExpressionType
+        )));
         assert!(facts.reference_enumeration_gaps.is_empty());
     }
 
@@ -11136,10 +11364,10 @@ func (*T) UnnamedMethod(int) {}
             }
         }
         let unnamed = declaration(&facts, "Unnamed");
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: unnamed,
-            kind: ResolutionGapKind::UnsupportedCallApplicability,
-        }));
+        assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+            unnamed,
+            ResolutionGapKind::UnsupportedCallApplicability
+        )));
         for spelling in ["NamedMethod", "UnnamedMethod"] {
             let method = declaration(&facts, spelling);
             let owner = facts
@@ -11170,10 +11398,10 @@ func (*T) UnnamedMethod(int) {}
                         .any(|binder| binder.declaration == receiver_site)
                 );
             }
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: method,
-                kind: ResolutionGapKind::UnsupportedCallApplicability,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                method,
+                ResolutionGapKind::UnsupportedCallApplicability
+            )));
         }
         for (spelling, expected_result_count) in [
             ("Zero", 0),
@@ -11205,10 +11433,10 @@ func (*T) UnnamedMethod(int) {}
                     "{spelling} result {ordinal}"
                 );
             }
-            assert!(!facts.gaps.contains(&ResolutionGapFact {
-                site: callable,
-                kind: ResolutionGapKind::UnsupportedTypeSyntax,
-            }));
+            assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+                callable,
+                ResolutionGapKind::UnsupportedTypeSyntax
+            )));
         }
     }
 
@@ -11305,10 +11533,10 @@ type Constraint interface { ~int | string }
         }));
 
         let constraint = declaration(&facts, "Constraint");
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: constraint,
-            kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-        }));
+        assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            constraint,
+            ResolutionGapKind::UnsupportedHierarchyTraversal
+        )));
         let term_references = facts
             .identifiers
             .iter()
@@ -11420,15 +11648,15 @@ func Consume(value any) {
             })
             .expect("function type alias declaration")
             .site;
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: declaration,
-            kind: ResolutionGapKind::UnsupportedTypeSyntax,
-        }));
+        assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+            declaration,
+            ResolutionGapKind::UnsupportedTypeSyntax
+        )));
         assert!(!parameter_site.is_some_and(|site| {
-            facts.gaps.contains(&ResolutionGapFact {
+            facts.gaps.contains(&ResolutionGapFact::new(
                 site,
-                kind: ResolutionGapKind::UnsupportedScopeOrBinder,
-            })
+                ResolutionGapKind::UnsupportedScopeOrBinder,
+            ))
         }));
         let signature = facts
             .callable_signatures
@@ -11467,10 +11695,7 @@ func Consume(value any) {
             let facts = facts(&source);
             let method = declaration(&facts, "Method");
             assert!(
-                facts.gaps.contains(&ResolutionGapFact {
-                    site: method,
-                    kind: gap
-                }),
+                facts.gaps.contains(&ResolutionGapFact::new(method, gap)),
                 "{receiver}"
             );
             assert!(facts.deferred_member_owners.is_empty(), "{receiver}");
@@ -11483,10 +11708,10 @@ func Consume(value any) {
             assert_eq!(parameters.len(), 1, "{receiver}");
             assert_eq!(parameters[0].ordinal, 0);
             assert_eq!(parameters[0].parameter, declaration(&facts, "input"));
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: method,
-                kind: ResolutionGapKind::UnsupportedCallApplicability,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                method,
+                ResolutionGapKind::UnsupportedCallApplicability
+            )));
         }
     }
 
@@ -11515,10 +11740,10 @@ func Consume(value any) {
                         && gap.kind == ResolutionGapKind::UnsupportedTypeSyntax
                 }));
             } else {
-                assert!(facts.gaps.contains(&ResolutionGapFact {
-                    site: owner_slot.site,
-                    kind: ResolutionGapKind::UnsupportedExpressionType,
-                }));
+                assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                    owner_slot.site,
+                    ResolutionGapKind::UnsupportedExpressionType
+                )));
             }
             assert!(facts.member_owners.is_empty());
             assert_eq!(facts.callable_parameters.len(), 1);
@@ -11539,10 +11764,10 @@ func U(...int) {}
         let facts = facts(source);
         for spelling in ["V", "U"] {
             let callable = declaration(&facts, spelling);
-            assert!(!facts.gaps.contains(&ResolutionGapFact {
-                site: callable,
-                kind: ResolutionGapKind::UnsupportedCallApplicability,
-            }));
+            assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+                callable,
+                ResolutionGapKind::UnsupportedCallApplicability
+            )));
             let parameters = facts
                 .callable_parameters
                 .iter()
@@ -11550,10 +11775,10 @@ func U(...int) {}
                 .collect::<Vec<_>>();
             assert_eq!(parameters.len(), 1);
             assert!(parameters[0].repeated);
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: parameters[0].parameter,
-                kind: ResolutionGapKind::UnsupportedExpressionType,
-            }));
+            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                parameters[0].parameter,
+                ResolutionGapKind::UnsupportedExpressionType
+            )));
             assert!(
                 !facts
                     .reference_enumeration_gaps
@@ -11668,10 +11893,10 @@ func (p *Remote) Method() *Remote { return p }
         let facts = facts(source);
         let method = declaration(&facts, "Method");
         assert!(facts.member_owners.is_empty());
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: method,
-            kind: ResolutionGapKind::UnsupportedCallApplicability,
-        }));
+        assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            method,
+            ResolutionGapKind::UnsupportedCallApplicability
+        )));
         assert!(!facts.identifiers.iter().any(|identifier| {
             identifier.role == ResolutionIdentifierRole::Declaration
                 && name(&facts, identifier.name) == "Remote"
@@ -11739,14 +11964,12 @@ func use(x int) {
                     .find(|identifier| identifier.site == call.callee)
                     .expect("positioned call callee");
                 assert_eq!(identifier.namespace, ResolutionNamespace::TypeOrValue);
-                assert!(!facts.gaps.contains(&ResolutionGapFact {
-                    site: call.callee,
-                    kind: ResolutionGapKind::UnsupportedRoute,
-                }));
-                assert!(facts.gaps.contains(&ResolutionGapFact {
-                    site: call.callee,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                }));
+                assert!(!facts.gaps.iter().any(|gap| gap.site == call.callee
+                    && gap.kind == ResolutionGapKind::UnsupportedRoute));
+                assert!(facts.gaps.contains(&ResolutionGapFact::new(
+                    call.callee,
+                    ResolutionGapKind::UnsupportedCallApplicability
+                )));
                 name(&facts, identifier.name)
             })
             .collect::<Vec<_>>();

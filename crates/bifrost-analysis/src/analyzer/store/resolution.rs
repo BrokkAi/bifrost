@@ -7,31 +7,54 @@
 //! context.
 
 use std::cell::RefCell;
+
 use std::cmp::Ordering;
+
 use std::fmt::Display;
+
 use std::hash::Hash;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Arc, Mutex};
+
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+use std::panic::resume_unwind;
+
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use moka::sync::Cache;
-use rusqlite::types::{ToSqlOutput, ValueRef};
-use rusqlite::{
-    Connection, OptionalExtension, Row, ToSql, Transaction, TransactionBehavior, params,
-    params_from_iter,
-};
 
-use brokk_bifrost_core::analyzer::{Language, canonical_hash::CanonicalHasher};
+use rusqlite::types::ToSqlOutput;
+use rusqlite::types::ValueRef;
+
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use rusqlite::Row;
+use rusqlite::ToSql;
+use rusqlite::Transaction;
+use rusqlite::TransactionBehavior;
+use rusqlite::params;
+use rusqlite::params_from_iter;
+
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 use crate::CancellationToken;
+
 use crate::hash::HashMap;
-#[cfg(test)]
 use crate::hash::HashSet;
 
-use crate::analyzer::resolution::{SharedNameId, SharedNameInterner};
+use crate::analyzer::resolution::SharedNameId;
+use crate::analyzer::resolution::SharedNameInterner;
 
 use super::resolution_manifest;
-use super::resolution_prepare::{resolution_rows, typed_rows};
-use super::{AnalyzerStore, Result, StoreError, usize_to_i64};
+
+use super::resolution_prepare::resolution_rows;
+use super::resolution_prepare::typed_rows;
+
+use super::AnalyzerStore;
+use super::Result;
+use super::StoreError;
+use super::usize_to_i64;
 
 pub(crate) const NODE_CATALOG_PAYLOAD_BY_KEY_SQL: &str =
     "SELECT kind,semantic_local_key,semantic_shared_identity,target_local_key,target_boundary_key
@@ -254,19 +277,22 @@ macro_rules! typed_fact_relations {
     ($($variant:ident = $code:literal,)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[repr(i64)]
-        pub(super) enum TypedFactRelation {
+        #[doc(hidden)]
+        pub enum TypedFactRelation {
             $($variant = $code,)*
         }
 
         impl TypedFactRelation {
             /// Every relation, in discriminant order. The pins walk it, so a
             /// variant added here is measured without being listed twice.
-            pub(super) const ALL: &'static [Self] = &[$(Self::$variant,)*];
+            #[doc(hidden)]
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
 
             /// How many there are, as an array length.
             pub(super) const COUNT: usize = Self::ALL.len();
 
-            pub(super) const fn label(self) -> &'static str {
+            #[doc(hidden)]
+            pub const fn label(self) -> &'static str {
                 match self {
                     $(Self::$variant => stringify!($variant),)*
                 }
@@ -321,7 +347,8 @@ typed_fact_relations! {
 
 impl TypedFactRelation {
     /// The integer the family stores and every statement predicates on.
-    pub(super) const fn code(self) -> i64 {
+    #[doc(hidden)]
+    pub const fn code(self) -> i64 {
         self as i64
     }
 }
@@ -332,6 +359,9 @@ impl TypedFactRelation {
 macro_rules! resolution_bundle_families {
     ($macro:ident) => {
         $macro! {
+            root_imports => ("root_imports", "resolution_root_imports", "expected_root_import_count", "import_site, root_scope, anchor, position, kind, bound_name", 6, 1),
+            root_import_segments => ("root_import_segments", "resolution_root_import_segments", "expected_root_import_segment_count", "import_site, position, segment", 3, 2),
+            root_import_demands => ("root_import_demands", "resolution_root_import_demands", "expected_root_import_demand_count", "import_site, namespace, name, target_kind, target_reference, target_name", 6, 3),
             rust_reference_contexts => ("rust_reference_contexts", "resolution_rust_reference_contexts", "expected_rust_reference_context_count", "semantic_key, source_site, source_occurrence, module_context, module_declaration, cfg_condition", 6, 1),
             rust_declaration_authorities => ("rust_declaration_authorities", "resolution_rust_declaration_authorities", "expected_rust_declaration_authority_count", "semantic_key, source_site, declaration, visibility, module_context, module_declaration, cfg_condition, activation_reason", 8, 1),
             semantic_catalog => ("semantic_catalog", "resolution_semantic_catalog", "expected_semantic_catalog_count", "local_key, identity_digest, shared_identity, import_source_site, import_start_byte, import_end_byte, import_route_kind", 7, 1),
@@ -407,7 +437,8 @@ resolution_bundle_families!(define_bundle_rows);
 
 macro_rules! define_manifest_counts {
     ($($field:ident => ($name:literal, $table:literal, $count_column:literal, $columns:literal, $arity:literal, $key_arity:literal),)*) => {
-        pub(super) const RESOLUTION_MANIFEST_COUNT_COLUMNS: &[&str] = &{
+        #[doc(hidden)]
+        pub const RESOLUTION_MANIFEST_COUNT_COLUMNS: &[&str] = &{
             let header_count = ResolutionManifestFamilyIndex::FamilyCount as usize;
             let mut columns = [""; ResolutionManifestFamilyIndex::FamilyCount as usize
                 + resolution_manifest::BODY_MANIFEST_COLUMNS.len()];
@@ -656,7 +687,8 @@ fn prepared_row_order(
 /// resolution table outside it is reading something the writer stopped
 /// producing. Two pins hold it, one over the live schema and one over the
 /// statement registry.
-pub(super) const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
+#[doc(hidden)]
+pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_additional_definition_namespaces",
     // Milestone 6 port block 4 (lane TF): the typed facts, one table per fact
     // type, written by the tier-1 writer at index time and read by the typed
@@ -720,6 +752,9 @@ pub(super) const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_qualified_routes",
     "resolution_reference_lookup_identities",
     "resolution_root_route_segments",
+    "resolution_root_imports",
+    "resolution_root_import_segments",
+    "resolution_root_import_demands",
     "resolution_rust_reverse_gap_candidates",
     "resolution_rust_declaration_authorities",
     "resolution_rust_reference_contexts",
@@ -743,11 +778,14 @@ pub(super) const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     // The per-unit summary (derivation contract, kind 2): written by the
     // language reconcile after the bundles, read by keyed lookups.
     "resolution_unit_summaries",
+    "resolution_unit_summary_containers",
     "resolution_unit_summary_dependencies",
+    "resolution_unit_summary_dependency_names",
     "resolution_unit_summary_exports",
     "resolution_unit_summary_gaps",
     "resolution_unit_summary_imports",
     "resolution_unit_summary_members",
+    "resolution_unit_summary_placements",
     "resolution_unit_summary_reads",
     "resolution_unit_summary_versions",
 ];
@@ -755,7 +793,8 @@ pub(super) const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
 /// One sole producer-identity bump point for the complete persisted bundle.
 /// Changes to shared lowering invalidate every language, including producers
 /// whose source facts are unchanged.
-pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str {
+#[doc(hidden)]
+pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
     match language {
         // Reconciled above both parents: shared observed-value properties and
         // local write joins compose with the current producer and gap facts.
@@ -766,10 +805,10 @@ pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str 
         // warm bundles from v46 lack those facts for casts and qualified
         // assignments.
         Language::Java => {
-            "resolution-bundle-java-v47-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v51-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
         Language::Go => {
-            "resolution-bundle-go-v63-receiver-applicability-binding-result-separation-2026-10"
+            "resolution-bundle-go-v67-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10"
         }
         Language::Cpp => {
             "resolution-bundle-cpp-v25-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
@@ -787,7 +826,7 @@ pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str 
         // argument uncertainty on guessed reference sites. Only unenumerable input
         // groups open reverse inventory (#5517).
         Language::Rust => {
-            "resolution-bundle-rust-v116-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10"
+            "resolution-bundle-rust-v118-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10"
         }
         Language::Php => {
             "resolution-bundle-php-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
@@ -804,7 +843,7 @@ pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str 
         // identity, and an abstract or opaque type alias projects itself
         // instead of publishing an unproduced identity slot (#5685).
         Language::Scala => {
-            "resolution-bundle-scala-v76-super-receivers-and-alias-identities-2026-10"
+            "resolution-bundle-scala-v80-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
         }
         Language::CSharp => {
             "resolution-bundle-csharp-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
@@ -813,20 +852,25 @@ pub(crate) const fn resolution_bundle_epoch(language: Language) -> &'static str 
             "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         Language::Kotlin => {
-            "resolution-bundle-kotlin-v47-function-type-arguments-local-write-joins-5015-2026-10"
+            "resolution-bundle-kotlin-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
         }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedResolutionBundle {
+#[doc(hidden)]
+pub struct PreparedResolutionBundle {
     semantic_language: Language,
     producer_epoch: &'static str,
-    interior_digest: [u8; 32],
-    family_counts: [usize; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()],
-    logical_rows: usize,
-    payload_bytes: usize,
+    #[doc(hidden)]
+    pub interior_digest: [u8; 32],
+    #[doc(hidden)]
+    pub family_counts: [usize; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()],
+    #[doc(hidden)]
+    pub logical_rows: usize,
+    #[doc(hidden)]
+    pub payload_bytes: usize,
     rows: PreparedResolutionBundleRows,
     // Complete producer families retain shared-name slots until the transaction
     // interns them. Their canonical digest hashes producer digests, never slots.
@@ -941,17 +985,20 @@ impl PreparedResolutionBundle {
         self.producer_epoch
     }
 
-    pub(crate) const fn interior_digest(&self) -> [u8; 32] {
+    #[doc(hidden)]
+    pub const fn interior_digest(&self) -> [u8; 32] {
         self.interior_digest
     }
 
-    pub(crate) const fn logical_rows(&self) -> usize {
+    #[doc(hidden)]
+    pub const fn logical_rows(&self) -> usize {
         self.logical_rows
     }
 
     /// Pre-write batching estimate; committed witnesses carry measured SQLite
     /// payload bytes after interning and JSONB encoding.
-    pub(crate) const fn payload_bytes(&self) -> usize {
+    #[doc(hidden)]
+    pub const fn payload_bytes(&self) -> usize {
         self.payload_bytes
     }
 
@@ -987,8 +1034,9 @@ impl PreparedResolutionBundle {
         Some((rows.len(), bytes))
     }
 
-    #[cfg(test)]
-    pub(super) fn family_counts(&self) -> [usize; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()] {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn family_counts(&self) -> [usize; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()] {
         self.family_counts
     }
 }
@@ -997,7 +1045,8 @@ impl AnalyzerStore {
     /// Install the code-owned complete-bundle epoch for one storage language.
     /// Dialect storage keys (for example `typescript:tsx` and `cpp:c`) retain
     /// their own active row while sharing the semantic producer implementation.
-    pub(crate) fn ensure_resolution_producer_epoch(
+    #[doc(hidden)]
+    pub fn ensure_resolution_producer_epoch(
         &self,
         storage_language: &str,
         semantic_language: Language,
@@ -1390,6 +1439,7 @@ pub(super) fn insert_prepared_bundle_tx(
     assert_eq!(manifest_values.len(), value_count);
     tx.execute(&manifest_sql, params_from_iter(&manifest_values))?;
 
+    let mut interner = IdentityInterner::default();
     for (spec, rows) in PreparedResolutionBundleRows::family_specs()
         .into_iter()
         .zip(bundle.rows.families())
@@ -1401,8 +1451,15 @@ pub(super) fn insert_prepared_bundle_tx(
             continue;
         }
         if let Some(digest_column) = interned_identity_column(spec.name) {
-            if !insert_interned_header_family(tx, blob_id, spec, digest_column, rows, cancellation)?
-            {
+            if !insert_interned_header_family(
+                tx,
+                blob_id,
+                spec,
+                digest_column,
+                rows,
+                &mut interner,
+                cancellation,
+            )? {
                 return Ok(false);
             }
             continue;
@@ -1414,13 +1471,13 @@ pub(super) fn insert_prepared_bundle_tx(
     if cancellation.is_cancelled() {
         return Ok(false);
     }
-    if !insert_row_families(tx, blob_id, bundle, cancellation)? {
+    if !insert_row_families(tx, blob_id, bundle, &mut interner, cancellation)? {
         return Ok(false);
     }
-    if !insert_gap_rows(tx, blob_id, bundle, cancellation)? {
+    if !insert_gap_rows(tx, blob_id, bundle, &mut interner, cancellation)? {
         return Ok(false);
     }
-    if !insert_typed_fact_rows(tx, blob_id, bundle, cancellation)? {
+    if !insert_typed_fact_rows(tx, blob_id, bundle, &mut interner, cancellation)? {
         return Ok(false);
     }
     let boundary_spec = PreparedResolutionBundleRows::family_specs()
@@ -1485,6 +1542,7 @@ fn insert_row_families(
     tx: &Transaction<'_>,
     blob_id: i64,
     bundle: &PreparedResolutionBundle,
+    interner: &mut IdentityInterner,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
     // Every shared name of the blob's catalog, not only the ones a header
@@ -1494,23 +1552,18 @@ fn insert_row_families(
         if cancellation.is_cancelled() {
             return Ok(false);
         }
-        tx.prepare_cached(
-            "INSERT INTO resolution_identities(identity_digest) VALUES(?1)
-             ON CONFLICT(identity_digest) DO NOTHING",
-        )?
-        .execute([digest.as_slice()])?;
+        interner.intern(tx, digest)?;
     }
-    for recipe in &bundle.recipe_rows {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
+    {
         // One statement, no read: a name's recipe is the same wherever it is
         // seen, so the first blob that interns it fills the columns and every
         // later blob's write is a no-op the `WHERE` clause drops. Tract has
         // 484,527 recipe entries over 183 interiors and 22,206 distinct shared
         // names, so an unconditional UPDATE would be twenty-two writes per
-        // name that change nothing.
-        tx.prepare_cached(
+        // name that change nothing. A name the interner has already seen
+        // filled, in the store or by an earlier recipe row of this blob, is
+        // one of those no-ops and is not even sent.
+        let mut recipes = tx.prepare_cached(
             "INSERT INTO resolution_identities(
                identity_digest, semantic_language, namespace, spelling
              ) VALUES(?1, ?2, ?3, ?4)
@@ -1519,20 +1572,28 @@ fn insert_row_families(
                    namespace = excluded.namespace,
                    spelling = excluded.spelling
                WHERE resolution_identities.semantic_language IS NULL",
-        )?
-        .execute(rusqlite::params![
-            recipe.identity_digest.as_slice(),
-            recipe.semantic_language,
-            recipe.namespace,
-            recipe.spelling,
-        ])?;
+        )?;
+        for recipe in &bundle.recipe_rows {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            if !interner.recipes_filled.insert(recipe.identity_digest) {
+                continue;
+            }
+            recipes.execute(rusqlite::params![
+                recipe.identity_digest.as_slice(),
+                recipe.semantic_language,
+                recipe.namespace,
+                recipe.spelling,
+            ])?;
+        }
     }
     let mut shared_ids = Vec::with_capacity(bundle.path_rows.shared.len());
     for digest in &bundle.path_rows.shared {
         if cancellation.is_cancelled() {
             return Ok(false);
         }
-        shared_ids.push(intern_resolution_identity(tx, digest)?);
+        shared_ids.push(interner.intern(tx, digest)?);
     }
     let mut sites = tx.prepare_cached(
         "INSERT INTO resolution_sites(
@@ -1627,6 +1688,7 @@ fn insert_gap_rows(
     tx: &Transaction<'_>,
     blob_id: i64,
     bundle: &PreparedResolutionBundle,
+    interner: &mut IdentityInterner,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
     let mut lookup_ids = Vec::with_capacity(bundle.gap_rows.shared.len());
@@ -1634,7 +1696,7 @@ fn insert_gap_rows(
         if cancellation.is_cancelled() {
             return Ok(false);
         }
-        lookup_ids.push(intern_resolution_identity(tx, digest)?);
+        lookup_ids.push(interner.intern(tx, digest)?);
     }
     let mut reasons = tx.prepare_cached(
         "INSERT INTO resolution_gap_reasons(blob_id, reason, site, origin)
@@ -1684,6 +1746,7 @@ fn insert_typed_fact_rows(
     tx: &Transaction<'_>,
     blob_id: i64,
     bundle: &PreparedResolutionBundle,
+    interner: &mut IdentityInterner,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
     let rows = &bundle.typed_fact_rows;
@@ -1692,7 +1755,7 @@ fn insert_typed_fact_rows(
         if cancellation.is_cancelled() {
             return Ok(false);
         }
-        shared_ids.push(intern_resolution_identity(tx, digest)?);
+        shared_ids.push(interner.intern(tx, digest)?);
     }
     let shared_id = |slot: u32| shared_ids[usize::try_from(slot).expect("a slot fits usize")];
     let body = |tokens: &[resolution_rows::PathBodyToken]| {
@@ -1702,363 +1765,414 @@ fn insert_typed_fact_rows(
         tokens.as_ref().map(|tokens| body(tokens))
     };
 
-    for row in &rows.type_frontiers {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        tx.prepare_cached(
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_type_frontiers(blob_id, slot, role, identity_reference)
-             VALUES(?1, ?2, ?3, ?4)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.slot,
-            row.role,
-            row.identity_reference
-        ])?;
-    }
-    for row in &rows.type_transfers {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+         VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in &rows.type_frontiers {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.slot,
+                row.role,
+                row.identity_reference
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_type_transfers(
-               blob_id, source_slot, rule, target_slot, kind, indirection_delta,
-               reference_indirection_delta, value_transform, completion
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, jsonb(?9))",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.source_slot,
-            row.rule,
-            row.target_slot,
-            row.kind,
-            row.indirection_delta,
-            row.reference_indirection_delta,
-            row.value_transform,
-            optional_body(&row.completion),
-        ])?;
-    }
-    for row in &rows.type_productions {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, source_slot, rule, target_slot, kind, indirection_delta,
+           reference_indirection_delta, value_transform, completion
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, jsonb(?9))",
+        )?;
+        for row in &rows.type_transfers {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.source_slot,
+                row.rule,
+                row.target_slot,
+                row.kind,
+                row.indirection_delta,
+                row.reference_indirection_delta,
+                row.value_transform,
+                optional_body(&row.completion),
+            ])?;
         }
-        tx.prepare_cached("INSERT INTO resolution_type_productions(blob_id, output_slot, constructor, length_token, element_slot) VALUES(?1, ?2, ?3, ?4, ?5)")?
-            .execute(rusqlite::params![blob_id, row.output_slot, row.constructor, row.length_token, row.element_slot])?;
     }
-    for row in &rows.type_components {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+    {
+        let mut statement = tx.prepare_cached("INSERT INTO resolution_type_productions(blob_id, output_slot, constructor, length_token, element_slot) VALUES(?1, ?2, ?3, ?4, ?5)")?;
+        for row in &rows.type_productions {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.output_slot,
+                row.constructor,
+                row.length_token,
+                row.element_slot
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_type_components(
-               blob_id, container_slot, constructor, kind, component_slot
-             ) VALUES(?1, ?2, ?3, ?4, ?5)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.container_slot,
-            row.constructor,
-            row.kind,
-            row.component_slot,
-        ])?;
-    }
-    for row in &rows.type_arguments {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, container_slot, constructor, kind, component_slot
+         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for row in &rows.type_components {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.container_slot,
+                row.constructor,
+                row.kind,
+                row.component_slot,
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_type_arguments(
-               blob_id, application_slot, ordinal, argument_slot, indirection_delta,
-               reference_indirection_delta
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.application_slot,
-            row.ordinal,
-            row.argument_slot,
-            row.indirection_delta,
-            row.reference_indirection_delta,
-        ])?;
-    }
-    for row in &rows.declared_type_arguments {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, application_slot, ordinal, argument_slot, indirection_delta,
+           reference_indirection_delta
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in &rows.type_arguments {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.application_slot,
+                row.ordinal,
+                row.argument_slot,
+                row.indirection_delta,
+                row.reference_indirection_delta,
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_declared_type_arguments(
-               blob_id, owner_slot, ordinal, argument_slot
-             ) VALUES(?1, ?2, ?3, ?4)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.owner_slot,
-            row.ordinal,
-            row.argument_slot,
-        ])?;
-    }
-    for row in &rows.underlying_types {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, owner_slot, ordinal, argument_slot
+         ) VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in &rows.declared_type_arguments {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.owner_slot,
+                row.ordinal,
+                row.argument_slot,
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_underlying_types(blob_id, definition, slot)
-             VALUES(?1, ?2, ?3)",
-        )?
-        .execute(rusqlite::params![blob_id, row.definition, row.slot])?;
-    }
-    for row in &rows.generic_type_alias_parameters {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+         VALUES(?1, ?2, ?3)",
+        )?;
+        for row in &rows.underlying_types {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![blob_id, row.definition, row.slot])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_generic_type_alias_parameters(
-               blob_id, alias_definition, ordinal, parameter_definition, target_slot,
-               indirection_delta, reference_indirection_delta
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.alias_definition,
-            row.ordinal,
-            row.parameter_definition,
-            row.target_slot,
-            row.indirection_delta,
-            row.reference_indirection_delta,
-        ])?;
-    }
-    for row in &rows.generic_formal_defaults {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, alias_definition, ordinal, parameter_definition, target_slot,
+           indirection_delta, reference_indirection_delta
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for row in &rows.generic_type_alias_parameters {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.alias_definition,
+                row.ordinal,
+                row.parameter_definition,
+                row.target_slot,
+                row.indirection_delta,
+                row.reference_indirection_delta,
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_generic_formal_defaults(
-               blob_id, owner_definition, ordinal, default_slot
-             ) VALUES(?1, ?2, ?3, ?4)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.owner_definition,
-            row.ordinal,
-            row.default_slot,
-        ])?;
+           blob_id, owner_definition, ordinal, default_slot
+         ) VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in &rows.generic_formal_defaults {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.owner_definition,
+                row.ordinal,
+                row.default_slot,
+            ])?;
+        }
     }
 
-    for row in &rows.generic_formals {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        tx.prepare_cached(
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_generic_formals(
-               blob_id, owner_definition, ordinal, parameter_definition
-             ) VALUES(?1, ?2, ?3, ?4)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.owner_definition,
-            row.ordinal,
-            row.parameter_definition,
-        ])?;
-    }
-    for row in &rows.intrinsic_seeds {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, owner_definition, ordinal, parameter_definition
+         ) VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in &rows.generic_formals {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.owner_definition,
+                row.ordinal,
+                row.parameter_definition,
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_intrinsic_seeds(
-               blob_id, slot, kind, spelling, possible_values, completion
-             ) VALUES(?1, ?2, ?3, ?4, jsonb(?5), jsonb(?6))",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.slot,
-            row.kind,
-            row.spelling,
-            body(&row.possible_values),
-            optional_body(&row.completion),
-        ])?;
-    }
-    for row in &rows.intrinsic_seed_identities {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, slot, kind, spelling, possible_values, completion
+         ) VALUES(?1, ?2, ?3, ?4, jsonb(?5), jsonb(?6))",
+        )?;
+        for row in &rows.intrinsic_seeds {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.slot,
+                row.kind,
+                row.spelling,
+                body(&row.possible_values),
+                optional_body(&row.completion),
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_intrinsic_seed_identities(blob_id, identity_id, slot)
-             VALUES(?1, ?2, ?3)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            shared_id(row.identity),
-            row.slot
-        ])?;
-    }
-    for row in &rows.binding_projections {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+         VALUES(?1, ?2, ?3)",
+        )?;
+        for row in &rows.intrinsic_seed_identities {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                shared_id(row.identity),
+                row.slot
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_binding_projections(blob_id, reference, output_slot, kind)
-             VALUES(?1, ?2, ?3, ?4)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.reference,
-            row.output_slot,
-            row.kind
-        ])?;
-    }
-    for row in &rows.qualified_routes {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+         VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in &rows.binding_projections {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.reference,
+                row.output_slot,
+                row.kind
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_qualified_routes(
-               blob_id, reference, precedence_ordinal, qualifier_slot, lookup,
-               source_lookup, namespace, projection_output_slot, projection_kind,
-               coarse_gap_reason, open_member_surface
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.reference,
-            row.precedence_ordinal,
-            row.qualifier_slot,
-            shared_id(row.lookup),
-            shared_id(row.source_lookup),
-            row.namespace,
-            row.projection_output_slot,
-            row.projection_kind,
-            row.coarse_gap_reason,
-            row.open_member_surface,
-        ])?;
-    }
-    for row in &rows.declaration_types {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, reference, precedence_ordinal, qualifier_slot, lookup,
+           source_lookup, namespace, projection_output_slot, projection_kind,
+           coarse_gap_reason, open_member_surface
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+        for row in &rows.qualified_routes {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.reference,
+                row.precedence_ordinal,
+                row.qualifier_slot,
+                shared_id(row.lookup),
+                shared_id(row.source_lookup),
+                row.namespace,
+                row.projection_output_slot,
+                row.projection_kind,
+                row.coarse_gap_reason,
+                row.open_member_surface,
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_declaration_types(blob_id, definition, role, slot)
-             VALUES(?1, ?2, ?3, ?4)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.definition,
-            row.role,
-            row.slot
-        ])?;
-    }
-    for row in &rows.deferred_member_owners {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+         VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in &rows.declaration_types {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.definition,
+                row.role,
+                row.slot
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_deferred_member_owners(blob_id, definition, seq, lookup, body)
-             VALUES(?1, ?2, ?3, ?4, jsonb(?5))",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.definition,
-            row.seq,
-            shared_id(row.lookup),
-            body(&row.body),
-        ])?;
-    }
-    for row in &rows.construction_requirements {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+         VALUES(?1, ?2, ?3, ?4, jsonb(?5))",
+        )?;
+        for row in &rows.deferred_member_owners {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.definition,
+                row.seq,
+                shared_id(row.lookup),
+                body(&row.body),
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_construction_requirements(
-               blob_id, definition, required_owner_definition, kind
-             ) VALUES(?1, ?2, ?3, ?4)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.definition,
-            row.required_owner_definition,
-            row.kind
-        ])?;
-    }
-    for row in &rows.supertypes {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, definition, required_owner_definition, kind
+         ) VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in &rows.construction_requirements {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.definition,
+                row.required_owner_definition,
+                row.kind
+            ])?;
         }
-        tx.prepare_cached(
-            "INSERT INTO resolution_supertypes(blob_id, definition, reference, frontier, kind, parent_ordinal)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.definition,
-            row.reference,
-            row.frontier,
-            row.kind,
-            row.parent_ordinal
-        ])?;
     }
-    for row in &rows.definition_property_gaps {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+    {
+        let mut statement = tx.prepare_cached("INSERT INTO resolution_supertypes(blob_id, definition, reference, frontier, kind, parent_ordinal)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?;
+        for row in &rows.supertypes {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.definition,
+                row.reference,
+                row.frontier,
+                row.kind,
+                row.parent_ordinal
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_definition_property_gaps(
-               blob_id, definition, seq, kind, frontier, reason, site
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.definition,
-            row.seq,
-            row.kind,
-            row.frontier,
-            row.reason,
-            row.site
-        ])?;
-    }
-    for row in &rows.call_obligations {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, definition, seq, kind, frontier, reason, site
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for row in &rows.definition_property_gaps {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.definition,
+                row.seq,
+                row.kind,
+                row.frontier,
+                row.reason,
+                row.site
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_call_obligations(
-               blob_id, callee_reference, call, receiver_slot, result_slot,
-               explicit_type_argument_count, applicability_reason, argument_slots,
-               type_argument_slots, eligible_rules, completion
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9), jsonb(?10), jsonb(?11))",
-        )?
-        .execute(rusqlite::params![
-            blob_id,
-            row.callee_reference,
-            row.call,
-            row.receiver_slot,
-            row.result_slot,
-            row.explicit_type_argument_count,
-            row.applicability_reason,
-            body(&row.argument_slots),
-            body(&row.type_argument_slots),
-            body(&row.eligible_rules),
-            optional_body(&row.completion),
-        ])?;
-    }
-    for row in &rows.callable_parameter_owners {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+           blob_id, callee_reference, call, receiver_slot, result_slot,
+           explicit_type_argument_count, applicability_reason, argument_slots,
+           type_argument_slots, eligible_rules, completion
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9), jsonb(?10), jsonb(?11))",
+        )?;
+        for row in &rows.call_obligations {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.callee_reference,
+                row.call,
+                row.receiver_slot,
+                row.result_slot,
+                row.explicit_type_argument_count,
+                row.applicability_reason,
+                body(&row.argument_slots),
+                body(&row.type_argument_slots),
+                body(&row.eligible_rules),
+                optional_body(&row.completion),
+            ])?;
         }
-        tx.prepare_cached(
-            "INSERT INTO resolution_callable_parameter_owners(blob_id, parameter_definition, signature_definition)
-             VALUES(?1, ?2, ?3)",
-        )?.execute(rusqlite::params![blob_id, row.parameter_definition, row.signature_definition])?;
     }
-    for row in &rows.callable_signatures {
-        if cancellation.is_cancelled() {
-            return Ok(false);
+    {
+        let mut statement = tx.prepare_cached("INSERT INTO resolution_callable_parameter_owners(blob_id, parameter_definition, signature_definition)
+         VALUES(?1, ?2, ?3)")?;
+        for row in &rows.callable_parameter_owners {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![
+                blob_id,
+                row.parameter_definition,
+                row.signature_definition
+            ])?;
         }
-        tx.prepare_cached(
+    }
+    {
+        let mut statement = tx.prepare_cached(
             "INSERT INTO resolution_callable_signatures(blob_id, definition, body)
-             VALUES(?1, ?2, jsonb(?3))",
-        )?
-        .execute(rusqlite::params![blob_id, row.definition, body(&row.body)])?;
+         VALUES(?1, ?2, jsonb(?3))",
+        )?;
+        for row in &rows.callable_signatures {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            statement.execute(rusqlite::params![blob_id, row.definition, body(&row.body)])?;
+        }
     }
     Ok(!cancellation.is_cancelled())
 }
@@ -2079,20 +2193,56 @@ const fn interned_identity_column(family: &str) -> Option<usize> {
     }
 }
 
-/// Intern one shared identity digest on the writer thread and return its id.
-///
-/// The identity table is workspace-wide and immutable: a digest keeps its id
-/// for the life of the cache, so the insert is idempotent and the select that
-/// follows is the authority.
+/// The shared identities one bundle's write names, each read from the store
+/// once. The identity table is workspace-wide and immutable: a digest keeps
+/// its id for the life of the cache, so the first read is the authority for
+/// every later cell, path body, gap or typed row of the bundle that names the
+/// same digest. The map lives for one bundle's write and is dropped with it.
+#[derive(Default)]
+struct IdentityInterner {
+    ids: HashMap<[u8; 32], i64>,
+    /// Names whose lookup recipe is filled: in the store when the name was
+    /// read, or by a recipe row of this bundle.
+    recipes_filled: HashSet<[u8; 32]>,
+}
+
+impl IdentityInterner {
+    fn intern(&mut self, tx: &Transaction<'_>, digest: &[u8; 32]) -> Result<i64> {
+        if let Some(id) = self.ids.get(digest) {
+            return Ok(*id);
+        }
+        let stored = tx
+            .prepare_cached(
+                "SELECT id, semantic_language IS NOT NULL
+                 FROM resolution_identities WHERE identity_digest = ?1",
+            )?
+            .query_row([digest.as_slice()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
+            .optional()?;
+        let id = match stored {
+            Some((id, recipe_filled)) => {
+                if recipe_filled {
+                    self.recipes_filled.insert(*digest);
+                }
+                id
+            }
+            None => tx
+                .prepare_cached(
+                    "INSERT INTO resolution_identities(identity_digest) VALUES(?1) RETURNING id",
+                )?
+                .query_row([digest.as_slice()], |row| row.get::<_, i64>(0))?,
+        };
+        self.ids.insert(*digest, id);
+        Ok(id)
+    }
+}
+
+/// Intern one shared identity digest and return its id, for tests that
+/// publish names without a bundle.
+#[cfg(test)]
 fn intern_resolution_identity(tx: &Transaction<'_>, digest: &[u8; 32]) -> Result<i64> {
-    tx.prepare_cached(
-        "INSERT INTO resolution_identities(identity_digest) VALUES(?1)
-         ON CONFLICT(identity_digest) DO NOTHING",
-    )?
-    .execute([digest.as_slice()])?;
-    Ok(tx
-        .prepare_cached("SELECT id FROM resolution_identities WHERE identity_digest = ?1")?
-        .query_row([digest.as_slice()], |row| row.get::<_, i64>(0))?)
+    IdentityInterner::default().intern(tx, digest)
 }
 
 fn insert_interned_header_family(
@@ -2101,10 +2251,22 @@ fn insert_interned_header_family(
     spec: ResolutionFamilySpec,
     digest_column: usize,
     rows: &[PreparedResolutionRow],
+    interner: &mut IdentityInterner,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
     if rows.is_empty() {
         return Ok(!cancellation.is_cancelled());
+    }
+    let mut identities = Vec::with_capacity(rows.len());
+    for row in rows {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        identities.push(match &row.values[digest_column] {
+            PreparedResolutionValue::Digest(digest) => Some(interner.intern(tx, digest)?),
+            PreparedResolutionValue::Null => None,
+            other => panic!("{} identity column holds {other:?}", spec.name),
+        });
     }
     let placeholders = (1..=spec.arity + 1)
         .map(|position| format!("?{position}"))
@@ -2114,28 +2276,22 @@ fn insert_interned_header_family(
         "INSERT INTO {}(blob_id, {}) VALUES({placeholders})",
         spec.table, spec.columns
     );
-    let mut values = Vec::<PreparedResolutionValue>::with_capacity(spec.arity + 1);
-    for row in rows {
+    let mut statement = tx.prepare_cached(&sql)?;
+    let mut values = Vec::<&dyn ToSql>::with_capacity(spec.arity + 1);
+    for (row, identity) in rows.iter().zip(&identities) {
         if cancellation.is_cancelled() {
             return Ok(false);
         }
         values.clear();
-        values.push(PreparedResolutionValue::Integer(blob_id));
+        values.push(&blob_id);
         for (position, value) in row.values.iter().enumerate() {
-            if position != digest_column {
-                values.push(value.clone());
-                continue;
+            if position == digest_column {
+                values.push(identity);
+            } else {
+                values.push(value);
             }
-            values.push(match value {
-                PreparedResolutionValue::Digest(digest) => {
-                    PreparedResolutionValue::Integer(intern_resolution_identity(tx, digest)?)
-                }
-                PreparedResolutionValue::Null => PreparedResolutionValue::Null,
-                other => panic!("{} identity column holds {other:?}", spec.name),
-            });
         }
-        tx.prepare_cached(&sql)?
-            .execute(params_from_iter(values.iter()))?;
+        statement.execute(values.as_slice())?;
     }
     Ok(true)
 }
@@ -2184,7 +2340,10 @@ fn insert_resolution_family(
 #[cfg(test)]
 mod tests {
     use super::super::resolution_prepare::ResolutionInteriorPreparation;
-    use crate::analyzer::resolution::{BindingFragmentId, rich_java_resolution_facts_for_test};
+
+    use crate::analyzer::resolution::BindingFragmentId;
+    use crate::analyzer::resolution::rich_java_resolution_facts_for_test;
+
     use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
@@ -2617,7 +2776,8 @@ mod tests {
 /// distinct name that request mints from a spelling; the names repeat across
 /// requests, so the seek belongs to the store and not to the request.
 #[derive(Clone, Debug)]
-pub(crate) struct SharedNameCache {
+#[doc(hidden)]
+pub struct SharedNameCache {
     entries: Cache<[u8; 32], SharedNameId>,
     /// What this cache has allocated, as the heap pin's own counter sees it.
     ///
@@ -2627,7 +2787,7 @@ pub(crate) struct SharedNameCache {
     /// file. This is that subtraction for this cache, measured rather than
     /// estimated: moka's per-entry cost is its own and an entry's 36 bytes of
     /// payload do not predict it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     allocated: Arc<std::sync::atomic::AtomicI64>,
 }
 
@@ -2639,27 +2799,29 @@ impl SharedNameCache {
     /// one; an entry is a 32-byte digest and a `u32`.
     const ENTRIES: u64 = 65_536;
 
-    pub(crate) fn new() -> Self {
+    #[doc(hidden)]
+    pub fn new() -> Self {
         Self {
             entries: Cache::builder().max_capacity(Self::ENTRIES).build(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             allocated: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
     /// What this cache has allocated on this thread since it was built.
-    #[cfg(test)]
-    pub(crate) fn allocated_bytes(&self) -> i64 {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn allocated_bytes(&self) -> i64 {
         self.allocated.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Run one cache operation, charging what it allocates to this cache.
     fn charged<T>(&self, operation: impl FnOnce(&Cache<[u8; 32], SharedNameId>) -> T) -> T {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         {
             operation(&self.entries)
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let before = super::resolution_operation::heap_pin_bytes();
             let result = operation(&self.entries);
@@ -2699,7 +2861,8 @@ impl Default for SharedNameCache {
 /// request minted for names the store has not interned, and those must not
 /// outlive it.
 #[derive(Debug)]
-pub(crate) struct SharedNameTable {
+#[doc(hidden)]
+pub struct SharedNameTable {
     ids: RefCell<HashMap<[u8; 32], SharedNameId>>,
     digests_by_id: RefCell<HashMap<SharedNameId, [u8; 32]>>,
     /// Only names first encountered before their committed publication differ.
@@ -2717,7 +2880,8 @@ struct SharedNameAliases {
 }
 
 impl SharedNameTable {
-    pub(crate) fn new(cache: SharedNameCache) -> Self {
+    #[doc(hidden)]
+    pub fn new(cache: SharedNameCache) -> Self {
         Self {
             ids: RefCell::default(),
             digests_by_id: RefCell::default(),
@@ -2728,7 +2892,8 @@ impl SharedNameTable {
     }
 
     /// An interner that answers from this store and this request's table.
-    pub(crate) fn interner<'a>(&'a self, connection: &'a Connection) -> StoreSharedNames<'a> {
+    #[doc(hidden)]
+    pub fn interner<'a>(&'a self, connection: &'a Connection) -> StoreSharedNames<'a> {
         StoreSharedNames {
             table: self,
             connection,
@@ -2776,7 +2941,8 @@ impl SharedNameTable {
     // B2 projection will call admission before exposing stored rows. Remove
     // this allowance when that separately owned integration lands.
     #[allow(dead_code)]
-    pub(crate) fn admit_persisted_names(
+    #[doc(hidden)]
+    pub fn admit_persisted_names(
         &self,
         membership: &[([u8; 32], SharedNameId)],
         cancellation: &CancellationToken,
@@ -2846,7 +3012,8 @@ impl SharedNameTable {
 /// The interner one request uses: `resolution_identities` first, this
 /// request's own range for a name the store has not interned.
 #[derive(Debug)]
-pub(crate) struct StoreSharedNames<'a> {
+#[doc(hidden)]
+pub struct StoreSharedNames<'a> {
     table: &'a SharedNameTable,
     connection: &'a Connection,
 }

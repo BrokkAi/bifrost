@@ -16,7 +16,7 @@
 //! [`graph_support::PythonUsageSource`] once the usage index exists) -- a core
 //! [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus the memoized per-file
 //! products Python resolves through. `analyzer/python/` in
-//! `brokk-bifrost-analysis` keeps the shim: the `PythonAnalyzer` struct and its
+//! `brokk-bifrost-python-analysis` keeps the shim: the `PythonAnalyzer` struct and its
 //! six moka caches and two `OnceLock`s, the accessors that implement those two
 //! traits, the `PythonAdapter` forwarding shell, the SPI block, and the
 //! downcasts that produce the arguments.
@@ -27,6 +27,7 @@ pub mod clones;
 pub mod declarations;
 pub mod diagnostics;
 pub mod distribution;
+pub mod exception_identity;
 pub mod format_string;
 pub mod graph;
 pub mod graph_support;
@@ -34,6 +35,7 @@ pub mod imports;
 pub mod queries;
 mod regex;
 pub use regex::{decode_python_fstring_literal_segments, decode_python_string_value};
+mod resolution;
 pub mod runtime_values;
 pub mod source_facts;
 mod source_properties;
@@ -41,3 +43,6 @@ pub mod structural;
 pub mod syntax;
 pub mod test_detection;
 pub mod usage_index;
+
+mod knowledge;
+pub use knowledge::PythonKnowledge;

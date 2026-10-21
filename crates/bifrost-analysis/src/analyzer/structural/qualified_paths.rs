@@ -33,21 +33,39 @@
 //! underneath them is the cached part.
 
 use super::facts::FileFacts;
-use super::occurrence_rows::{ast_id, declared_fact_kind};
+
+use super::occurrence_rows::ast_id;
+use super::occurrence_rows::declared_fact_kind;
+
 use super::occurrences::Namespace;
-use super::routes::{IdentityAxis, SegmentResolutionStatus};
+
+use super::routes::IdentityAxis;
+use super::routes::SegmentResolutionStatus;
+
 use super::spec::StructuralSpec;
+
 use crate::analyzer::common::language_for_file;
+
 use crate::analyzer::semantic::ContentIdentity;
+
 use crate::analyzer::structural_spec_for;
-use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
-    resolve_definition_batch_with_source_and_cancellation,
-};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+
+use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
+use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
+use crate::analyzer::usages::get_definition::parse_tree_for_language;
+use crate::analyzer::usages::get_definition::resolve_definition_batch_with_source_and_cancellation;
+
+use crate::analyzer::CodeUnit;
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::ProjectFile;
+use crate::analyzer::Range;
+
 use crate::cancellation::CancellationToken;
+
 use crate::hash::HashMap;
+
 use std::sync::Arc;
+
 use tree_sitter::Node;
 
 /// The axes this producer answers. Route relations and canonical identity are
@@ -560,154 +578,9 @@ fn namespace_from_targets(targets: &[CodeUnit]) -> Option<Namespace> {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests {}
 
-    use super::*;
-    use crate::analyzer::structural::routes::ALL_IDENTITY_AXES;
-    use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    struct Fixture {
-        _temp: TempDir,
-        workspace: WorkspaceAnalyzer,
-        file: ProjectFile,
-        source: String,
-    }
-
-    impl Fixture {
-        fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            Self::with_files(language, &[(relative_path, source)])
-        }
-
-        /// The first file is the one rows are derived for.
-        fn with_files(language: Language, files: &[(&str, &str)]) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let mut subject = None;
-            for (relative_path, source) in files {
-                let file = ProjectFile::new(root.clone(), *relative_path);
-                file.write(source).expect("write fixture source");
-                subject.get_or_insert(file);
-            }
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                AnalyzerConfig::default(),
-            )
-            .expect("ephemeral workspace should build");
-            Self {
-                _temp: temp,
-                workspace,
-                file: subject.expect("at least one fixture file"),
-                source: files[0].1.to_owned(),
-            }
-        }
-
-        fn rows(&self, options: QualifiedPathDerivationOptions) -> QualifiedPathsFileResult {
-            qualified_paths_for_file(
-                self.workspace.analyzer(),
-                &self.file,
-                options,
-                &CancellationToken::new(),
-            )
-            .expect("derivation not cancelled")
-        }
-
-        fn at(&self, needle: &str) -> usize {
-            crate::test_support::fixture_marker(&self.source, needle)
-        }
-    }
-
-    /// The segments of the one path whose first segment starts at `start`,
-    /// ordinal-ordered, with the ordering asserted.
-    fn path_segments_at(result: &QualifiedPathsFileResult, start: usize) -> Vec<&PathSegmentRow> {
-        let path = result
-            .paths
-            .iter()
-            .find(|path| path.range.start_byte == start)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no path starting at byte {start}; paths: {:?}",
-                    result.paths
-                )
-            });
-        let segments: Vec<_> = result.segments_of(path.terminal_node).collect();
-        assert_eq!(segments.len(), path.segment_count as usize);
-        for (position, segment) in segments.iter().enumerate() {
-            assert_eq!(segment.ordinal as usize, position);
-            assert_eq!(segment.path_terminal_node, path.terminal_node);
-        }
-        segments
-    }
-
-    /// A Java import chain is one path: ordered segments, each its own row,
-    /// the terminal anchoring the path, and — because Java cannot say whether
-    /// a scope segment is a package or a type from the token alone — the
-    /// qualifier namespace stated on each scope segment rather than a guessed
-    /// `Module` or `Type` (#3064).
-
-    #[test]
-    fn rust_path_keywords_and_raw_identifiers_stay_honest_segments() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            "src/lib.rs",
-            concat!(
-                "pub mod util {\n",
-                "    pub struct r#type;\n",
-                "}\n",
-                "pub fn build() -> crate::util::r#type {\n",
-                "    crate::util::r#type\n",
-                "}\n",
-            ),
-        );
-        let result = fixture.rows(QualifiedPathDerivationOptions::ROWS_ONLY);
-
-        let segments = path_segments_at(&result, fixture.at("crate::util::r#type {"));
-        assert_eq!(
-            segments
-                .iter()
-                .map(|s| (s.text.as_str(), s.node.is_some()))
-                .collect::<Vec<_>>(),
-            [("crate", false), ("util", true), ("type", true)],
-        );
-    }
-
-    #[test]
-    fn typescript_qualified_type_chain_with_generics() {
-        let fixture = Fixture::new(
-            Language::TypeScript,
-            "app.ts",
-            concat!(
-                "namespace api { export namespace types { export type Box<T> = { value: T }; } }\n",
-                "let boxed: api.types.Box<string> | null = null;\n",
-            ),
-        );
-        let result = fixture.rows(QualifiedPathDerivationOptions::ROWS_ONLY);
-
-        let segments = path_segments_at(&result, fixture.at("api.types.Box<string>"));
-        assert_eq!(
-            segments
-                .iter()
-                .map(|s| (s.text.as_str(), s.generic_arity))
-                .collect::<Vec<_>>(),
-            [("api", None), ("types", None), ("Box", Some(1))],
-        );
-    }
-
-    #[test]
-    fn unclaimed_language_reports_incomplete_axes() {
-        let fixture = Fixture::new(Language::Go, "main.go", "package main\n\nfunc main() {}\n");
-        let result = fixture.rows(QualifiedPathDerivationOptions::WITH_SEGMENT_RESOLUTION);
-
-        assert!(result.paths.is_empty());
-        assert!(!result.completeness.is_complete());
-        for &axis in ALL_IDENTITY_AXES {
-            assert!(
-                !result.completeness.covers(axis),
-                "an unclaimed adapter must not cover {axis}"
-            );
-        }
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "qualified_paths/js_ts_tests_support.rs"]
+pub mod js_ts_tests_support;

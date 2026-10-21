@@ -51,7 +51,7 @@ A profile has format `bifrost_code_query_profile/v2`. Its `result` field is the 
 - `explain` contains the selected public plan described above.
 - `timings_ns` separates planning, execution, result rendering, and the execution-core total elapsed wall time.
 - `request_timings_ns` measures the whole tool request around the query: transport queueing, workspace readiness, analyzer admission, preparation, input decoding, query execution, and rendering. The MCP server fills every field. `bifrost --tool query_code`, `bifrost --query-file`, and the Rust `SearchToolsService::query_code_result` method also fill them, but report zero for the three transport wait fields; `query_code_result` also reports zero for `rendering_serialization`. Lower-level Rust execution functions such as `execute_workspace` leave every field at zero.
-- `work` reports budget-accounted files, source bytes, fact nodes, pipeline rows, references, provenance steps, resolved import files and edges, and semantic work. Its nested `semantic` object reports materialization, semantic IR element counts, retained bytes, traversal steps, and whether the separate semantic budget was exhausted. When typestate, value-flow, or class-set type-flow analysis runs, `semantic.typestate`, `semantic.value_flow`, or `semantic.type_flow` adds that solver's counters. A pure `witness` projection adds no solve work.
+- `work` reports budget-accounted files, source bytes, fact nodes, pipeline rows, references, provenance steps, resolved import files and edges, and semantic work. Its nested `semantic` object reports materialization, semantic IR element counts, cumulative work and resident and per-root work peaks across the semantic lanes, retained bytes, traversal steps, and whether the separate semantic budget was exhausted. When typestate, value-flow, or class-set type-flow analysis runs, `semantic.typestate`, `semantic.value_flow`, or `semantic.type_flow` adds that solver's counters. A pure `witness` projection adds no solve work.
 - `cache_layers` reports deterministic, completeness-sensitive outcomes for request-local seed results, seed-path structural facts, reference and call relations, forward and reverse import relations, and the snapshot-local complete direct-import topology. The topology layer includes build files, edges, elapsed time, retained bytes, cancellation and unavailability, and request-local fallbacks. Only complete immutable topology values are reused; unsupported reverse domains and failed or bounded builds fall back to the request-local resolver.
 - `access_path` separates compatibility-budget work from physical structural access. It reports the selected positive posting terms and their pre-intersection candidate counts, provider, scoped, and candidate facts, compatibility-admitted fact nodes, whether exact source-anchor verification remained necessary, cache readiness, materialization and source inspection, index lifecycle and build cost, fallback, and uniquely retained bytes. `scoped_fact_nodes` is exact when indexed metadata is available and zero for scan-only execution; `admitted_fact_nodes` is comparable on both paths. A narrow scope may reuse a ready snapshot index. Bifrost does not build a whole-provider index for a query on its own when the scoped files are fewer than eight or less than one quarter of that provider. For a viable scope, the first use scans and records reuse interest; a later use builds the snapshot index. This avoids whole-workspace index construction for one-shot queries.
 - `scheduling` reports peak concurrency and, when bounded dispatch actually occurred, queue, coordinator, budget-wait, and dispatch observations.
@@ -268,11 +268,27 @@ Counters are unsigned 64-bit integers that saturate at their maximum instead of 
 | `control_edges` | Control-flow edges materialized. |
 | `nested_entries` | Nested entries materialized. |
 | `retained_bytes` | Bytes retained by materialized semantic artifacts. |
+| `cumulative` | Object. Cumulative semantic work per lane: retained admissions plus performed work. Holding and scanning the same bytes can count them twice, so this telemetry is not a bound. |
+| `resident_peaks` | Object. Largest live resident census per lane. |
+| `root_work_peaks` | Object. Largest work balance of any one root or prepass per lane. |
+| `resident_nested_entries_peak` | Largest resident nested-entry count. |
+| `resident_retained_bytes_peak` | Largest resident retained-artifact byte count. |
 | `traversal_steps` | Semantic traversal steps taken. |
 | `budget_exhausted` | Boolean. `true` when the separate semantic budget ran out. |
 | `typestate` | Object, present only when typestate work happened. |
 | `value_flow` | Object, present only when value-flow work happened. |
 | `type_flow` | Object, present only when class-set type-flow work happened. |
+
+`cumulative`, `resident_peaks`, and `root_work_peaks` each carry the same sixteen
+lane keys: `source_bytes`, `procedures`, `blocks`, `program_points`, `values`,
+`allocations`, `call_sites`, `memory_locations`, `captures`, `source_mappings`,
+`evidence`, `gaps`, `events`, `control_edges`, `nested_entries`, and
+`owned_text_bytes`. In these objects, `source_bytes` counts admitted or scanned
+source bytes rather than the materialization reads in the top-level
+`source_bytes` field, and `owned_text_bytes` counts artifact-owned text bytes.
+`resident_nested_entries_peak` is the `nested_entries` lane of `resident_peaks`,
+and `resident_retained_bytes_peak` repeats the retained-artifact peak that
+`retained_bytes` reports.
 
 `work.semantic.typestate` fields:
 

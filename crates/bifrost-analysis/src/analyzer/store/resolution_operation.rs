@@ -6,40 +6,56 @@
 //! lease after return: `Current` is authorization at that final boundary, not
 //! a long transaction or workspace lock.
 
-pub(super) mod go_context;
-pub(super) mod go_named;
+#[doc(hidden)]
+pub mod go_context;
+#[doc(hidden)]
+pub mod go_named;
 pub(crate) use go_named::GoPreparedImportContext;
+
 pub(crate) use go_named::GoPreparedImportContextOutcome;
-mod go_demand;
+
+#[doc(hidden)]
+pub mod go_demand;
 use go_demand::GoForwardOperationContext;
-pub(crate) use go_named::{GoExternalPackageProvenance, GoSelectedExternalImport};
-// Keep these operation extensions beside their language's native graph code;
-// their module parent retains access to selected-operation internals.
-#[path = "../go/selected_graph_stage.rs"]
-mod go_graph;
-pub(crate) mod go_method_family;
-pub(crate) mod go_receiver_anchor;
-pub(crate) mod go_reverse_rows;
-pub(super) mod go_same_package;
+
+#[doc(hidden)]
+pub mod go_method_family;
+#[doc(hidden)]
+pub mod go_receiver_anchor;
+#[doc(hidden)]
+pub mod go_reverse_rows;
+#[doc(hidden)]
+pub mod go_same_package;
 mod java_access;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod java_reverse_rows;
 pub(super) mod jvm_context;
 mod jvm_demand;
-mod source_demand;
+#[doc(hidden)]
+pub mod source_demand;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use jvm_context::{
-    JavaExternalStaticImportBoundary, JavaImportContext, JvmImportContext, JvmImportContextGap,
-};
+pub(crate) use jvm_context::JavaExternalStaticImportBoundary;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use jvm_context::JavaImportContext;
+
+pub(crate) use jvm_context::JvmImportContext;
+pub(crate) use jvm_context::JvmImportContextGap;
+
 pub(crate) use source_demand::RootSourceHorizon;
-pub(super) mod native_units;
+
+#[doc(hidden)]
+pub mod native_units;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use native_units::SelectedNativeAssignmentValue;
-pub(crate) use native_units::{
-    NativeExternalMemberTarget, ProjectedNativeMemberContext, SelectedNativeDefinition,
-    SelectedNativeDefinitions, SelectedNativeNamedArgument, SelectedNativeReferenceTypes,
-    SelectedNativeReferenceUnits, SelectedNativeTypes,
-};
+
+pub(crate) use native_units::NativeExternalMemberTarget;
+pub(crate) use native_units::ProjectedNativeMemberContext;
+pub(crate) use native_units::SelectedNativeDefinition;
+pub(crate) use native_units::SelectedNativeDefinitions;
+pub(crate) use native_units::SelectedNativeNamedArgument;
+pub(crate) use native_units::SelectedNativeReferenceTypes;
+pub(crate) use native_units::SelectedNativeReferenceUnits;
+pub(crate) use native_units::SelectedNativeTypes;
 
 pub(super) struct NativeReferenceQuery<'a> {
     context: SelectedResolutionContextSet,
@@ -54,155 +70,289 @@ pub(super) struct NativeReferenceQuery<'a> {
     query_result_slot: Option<SemanticId>,
     point_metrics: Option<&'a mut ResolutionBatchMetrics>,
 }
-pub(super) mod package_context;
+
+#[doc(hidden)]
+pub mod package_context;
 use package_context::PackageReferenceReadKey;
-pub(super) mod rust_crate_access;
+
+#[doc(hidden)]
+pub mod rust_crate_access;
 pub(crate) use rust_crate_access::RustBlobActivity;
-pub(super) mod rust_crate_context;
+
+#[doc(hidden)]
+pub mod rust_crate_context;
 pub(super) mod rust_derive_helpers;
 use super::resolution_stage::SelectedResolutionStageOutcome;
+
 use crate::analyzer::resolution::SeamProfiled;
-#[cfg(test)]
-pub(crate) use rust_crate_context::{
-    reset_rust_context_bridge_peak_for_test, rust_context_bridge_peak_for_test,
-};
-mod demand;
-mod demand_closure;
-pub(crate) mod graph_stage;
-pub(super) mod rust_crate_rows;
-mod rust_demand;
-use demand::{ClosedForwardSource, ClosedRelations, DemandProvider};
-use rust_demand::forward::{ForwardProvider, PreparedForwardSource, RustDemandPreparation};
-mod rust_forward;
+
+mod context_preparation;
+#[doc(hidden)]
+pub mod demand;
+#[doc(hidden)]
+pub mod demand_closure;
+#[doc(hidden)]
+pub mod graph_stage;
+#[doc(hidden)]
+pub mod imports;
+mod placement_access;
+#[path = "reverse.rs"]
+#[doc(hidden)]
+pub mod reverse;
+#[path = "reverse_candidates.rs"]
+mod reverse_candidates;
+#[path = "reverse_nomination.rs"]
+#[doc(hidden)]
+pub mod reverse_nomination;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use reverse::selected_reverse_reference_file;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use reverse::selected_reverse_reference_owner;
+
+pub(crate) use reverse_candidates::REVERSE_CANDIDATE_KEYS_DDL;
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use reverse_candidates::REVERSE_CANDIDATE_KEYS_CLEAR_SQL;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use reverse_candidates::REVERSE_CANDIDATE_KEYS_INSERT_SQL;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use reverse_candidates::REVERSE_CANDIDATES_SQL;
+
+#[doc(hidden)]
+pub mod rust_crate_rows;
+#[doc(hidden)]
+pub mod rust_demand;
+use demand::ClosedForwardSource;
+use demand::ClosedRelations;
+use demand::DemandProvider;
+
+use rust_demand::forward::ForwardProvider;
+use rust_demand::forward::PreparedForwardSource;
+use rust_demand::forward::RustDemandPreparation;
+
+#[doc(hidden)]
+pub mod rust_forward;
 // The Rust graph stage follows the same language-owned source boundary.
-#[path = "../rust/selected_graph_stage.rs"]
-mod rust_graph;
+#[doc(hidden)]
+pub use crate::analyzer::store_bridge::rust_graph;
 mod rust_prefix;
-mod rust_privacy;
-mod rust_reverse;
-pub(super) mod rust_reverse_rows;
+#[doc(hidden)]
+pub mod rust_privacy;
+#[doc(hidden)]
+pub mod rust_reverse;
+#[doc(hidden)]
+pub mod rust_reverse_rows;
 use rust_prefix::RustPrefixResolutionBatch;
-pub(crate) use rust_prefix::{resolve_rust_type_prefixes, rust_qualified_prefix};
-pub(crate) use rust_reverse_rows::{RustReverseCandidateSet, RustReverseConfirmation};
-#[cfg(test)]
-pub(crate) use rust_reverse_rows::{
-    candidate_set_enumerations_for_test, reset_candidate_set_enumerations_for_test,
-};
+
+pub(crate) use rust_prefix::resolve_rust_type_prefixes;
+pub(crate) use rust_prefix::rust_qualified_prefix;
+
+pub(crate) use rust_reverse_rows::RustReverseConfirmation;
+
 // The planner-statistics pin that shares this builder with the bounded reader
 // lives in a test-support module, so the re-export follows that gate.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use rust_privacy::selected_rust_declaration_authority_sql;
-pub(crate) use rust_privacy::{
-    RustSelectedDeclarationAuthorityFact,
-    read_selected_rust_declaration_authority_with_cancellation,
-};
-pub(crate) use rust_reverse::{
-    ReferenceOmission, ReferenceResolution, RustReverseRequest, SelectedRustReverseBatchOutcome,
-    SelectedRustReverseQueries, SelectedRustTargetReferences,
-};
 
-use std::cell::{OnceCell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+pub(crate) use rust_privacy::RustSelectedDeclarationAuthorityFact;
+pub(crate) use rust_privacy::read_selected_rust_declaration_authority_with_cancellation;
+
+pub(crate) use rust_reverse::ReferenceOmission;
+pub(crate) use rust_reverse::ReferenceResolution;
+pub(crate) use rust_reverse::RustReverseRequest;
+pub(crate) use rust_reverse::SelectedRustReverseBatchOutcome;
+pub(crate) use rust_reverse::SelectedRustReverseQueries;
+pub(crate) use rust_reverse::SelectedRustTargetReferences;
+
+use std::cell::OnceCell;
+use std::cell::RefCell;
+
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+
+use std::path::Path;
+use std::path::PathBuf;
+
 use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::Language;
+
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+
 use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
+
 use brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent;
-use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionNamespace, ResolutionRootImportAnchor, ResolutionScopeId, ResolutionSiteId,
-    ResolutionSiteKind,
-};
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportAnchor;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind;
+
 use brokk_bifrost_core::analyzer::rust_facts;
-use brokk_bifrost_core::analyzer::rust_facts::{
-    RustDeclarationPropertyFact, RustImportTargetFact, RustSourceContextKind, RustUsageFacts,
-};
-use brokk_bifrost_core::analyzer::source_facts::{
-    SourceDeclarationId, SourceOccurrenceId, SourceOccurrenceProvenance,
-};
+
+use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationPropertyFact;
+use brokk_bifrost_core::analyzer::rust_facts::RustImportTargetFact;
+use brokk_bifrost_core::analyzer::rust_facts::RustSourceContextKind;
+use brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
+use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
+use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
+
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-use brokk_bifrost_core::analyzer::usages::resolution_session::{
-    BoundedResolution, ResolutionSession,
-};
-use brokk_bifrost_rust::selected_context::{
-    RustSelectedBuildOutcome, RustSelectedContext, RustSelectedContextGap,
-    RustSelectedDeclarationAuthority, RustSelectedDependencyEdge, RustSelectedRootBridge,
-    RustSelectedRootBridgeTopology, RustSelectedRootRoute, RustSelectedTargetMembership,
-};
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+use brokk_bifrost_rust::selected_context::RustSelectedBuildOutcome;
+use brokk_bifrost_rust::selected_context::RustSelectedContext;
+use brokk_bifrost_rust::selected_context::RustSelectedContextGap;
+use brokk_bifrost_rust::selected_context::RustSelectedDeclarationAuthority;
+use brokk_bifrost_rust::selected_context::RustSelectedDependencyEdge;
+use brokk_bifrost_rust::selected_context::RustSelectedRootBridge;
+use brokk_bifrost_rust::selected_context::RustSelectedRootBridgeTopology;
+use brokk_bifrost_rust::selected_context::RustSelectedRootRoute;
+use brokk_bifrost_rust::selected_context::RustSelectedTargetMembership;
+
 use moka::sync::Cache;
+
 use rusqlite::OptionalExtension;
 
 use crate::CancellationToken;
-use crate::analyzer::lexical_definitions::LexicalDefinition;
-use crate::analyzer::resolution::SUPPLEMENTAL_LOCAL_KEY_BASE;
-#[cfg(test)]
-use crate::analyzer::resolution::SelectedNodeProvenance;
-use crate::analyzer::resolution::{
-    BatchResolutionFragmentSource, BindingFragmentId, BindingNodeId, BindingNodeKind,
-    CandidatePathIdentity, DemandClosureDischarges, FactDemandResolution, FactPageVisitor,
-    FactProjectedTypeNodeForm, FactReferenceBatchAnswer, FactReferenceSiteMetadata,
-    FactResolutionAnswer, FactResolutionBatchSummary, FactReverseResolutionMetrics,
-    ForwardOperationArtifactContext, LoweredRustDeclarationAuthority, LoweredRustReferenceContext,
-    LoweredSemanticRole, MAX_REFERENCE_SEEDS_PER_BATCH, MAX_SOURCE_ROWS_PER_BATCH,
-    MAX_TYPED_FACT_REQUESTS_PER_BATCH, PartialPath, ReferenceSearchAnswer, ResolutionBatchMetrics,
-    ResolutionCompletion, ResolutionIncompleteReason, ResolutionLocalKey,
-    ResolutionLookupSemanticRecipe, ResolutionQuery, ResolutionSemanticIdentity,
-    ResolutionSlotValue, RustDeclarationContextSource, RustReferenceContextSource,
-    SelectedContextIdentities, SelectedFactOperationBlueprint,
-    SelectedFactOperationBlueprintConstruction, SelectedResolutionContextInputs,
-    SelectedResolutionContextSet, SelectedResolutionContextValidationOutcome,
-    SelectedResolutionMountContext, SelectedResolutionMountOrdinal, SelectedRootBridgeDescriptor,
-    SelectedRootPathHalf, SelectedSemanticLocator, SelectedSemanticMount,
-    SelectedSemanticProvenance, SelectedTypedFactSource, SelectedTypedRow, SemanticId,
-    TypedFactRequest, cancelled_completion, classify_selected_root_path_half,
-    language_identity_domain, visit_selected_root_export_half_pages,
-    visit_selected_root_import_half_pages,
-};
-use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range};
-use crate::hash::{HashMap, HashSet};
 
-use super::resolution_lexical::{
-    BoundaryCandidateReadMemo, ReverseCandidateRowsMemo, SelectedLookupRecipeReadOutcome,
-    SelectedLookupRecipeRequest, SelectedResolutionLexicalSource, SelectedSemanticLookupOutcome,
-    UnconditionalCandidateBox, UnconditionalCandidateCache, UnconditionalCandidateReadKey,
-};
-use super::resolution_selection::{
-    SelectedResolutionContentMountRequest, SelectedResolutionLanguage,
-    SelectedResolutionMountInventory, SelectedResolutionMountInventoryOutcome,
-    SelectedResolutionOverlayAuthority, SelectedResolutionOverlayIntent,
-    SelectedResolutionOverlayMask, SelectedResolutionRevalidationOutcome, SelectedResolutionStale,
-    SelectedResolutionUnavailable,
-};
+use crate::analyzer::resolution::lexical_definition::LexicalDefinition;
+
+use crate::analyzer::resolution::SUPPLEMENTAL_LOCAL_KEY_BASE;
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::analyzer::resolution::SelectedNodeProvenance;
+
+use crate::analyzer::resolution::BatchResolutionFragmentSource;
+use crate::analyzer::resolution::BindingFragmentId;
+use crate::analyzer::resolution::BindingNodeId;
+use crate::analyzer::resolution::BindingNodeKind;
+use crate::analyzer::resolution::CandidatePathIdentity;
+use crate::analyzer::resolution::DemandClosureDischarges;
+use crate::analyzer::resolution::FactDemandResolution;
+use crate::analyzer::resolution::FactPageVisitor;
+use crate::analyzer::resolution::FactProjectedTypeNodeForm;
+use crate::analyzer::resolution::FactReferenceBatchAnswer;
+use crate::analyzer::resolution::FactReferenceSiteMetadata;
+use crate::analyzer::resolution::FactResolutionAnswer;
+use crate::analyzer::resolution::FactResolutionBatchSummary;
+use crate::analyzer::resolution::FactReverseResolutionMetrics;
+use crate::analyzer::resolution::ForwardOperationArtifactContext;
+use crate::analyzer::resolution::LoweredRustDeclarationAuthority;
+use crate::analyzer::resolution::LoweredRustReferenceContext;
+use crate::analyzer::resolution::LoweredSemanticRole;
+use crate::analyzer::resolution::MAX_REFERENCE_SEEDS_PER_BATCH;
+use crate::analyzer::resolution::MAX_SOURCE_ROWS_PER_BATCH;
+use crate::analyzer::resolution::MAX_TYPED_FACT_REQUESTS_PER_BATCH;
+use crate::analyzer::resolution::PartialPath;
+use crate::analyzer::resolution::ReferenceSearchAnswer;
+use crate::analyzer::resolution::ResolutionBatchMetrics;
+use crate::analyzer::resolution::ResolutionCompletion;
+use crate::analyzer::resolution::ResolutionIncompleteReason;
+use crate::analyzer::resolution::ResolutionLocalKey;
+use crate::analyzer::resolution::ResolutionLookupSemanticRecipe;
+use crate::analyzer::resolution::ResolutionQuery;
+use crate::analyzer::resolution::ResolutionSemanticIdentity;
+use crate::analyzer::resolution::ResolutionSlotValue;
+use crate::analyzer::resolution::RustDeclarationContextSource;
+use crate::analyzer::resolution::RustReferenceContextSource;
+use crate::analyzer::resolution::SelectedContextIdentities;
+use crate::analyzer::resolution::SelectedFactOperationBlueprint;
+use crate::analyzer::resolution::SelectedFactOperationBlueprintConstruction;
+use crate::analyzer::resolution::SelectedResolutionContextInputs;
+use crate::analyzer::resolution::SelectedResolutionContextSet;
+use crate::analyzer::resolution::SelectedResolutionContextValidationOutcome;
+use crate::analyzer::resolution::SelectedResolutionMountContext;
+use crate::analyzer::resolution::SelectedResolutionMountOrdinal;
+use crate::analyzer::resolution::SelectedRootBridgeDescriptor;
+use crate::analyzer::resolution::SelectedRootPathHalf;
+use crate::analyzer::resolution::SelectedSemanticLocator;
+use crate::analyzer::resolution::SelectedSemanticMount;
+use crate::analyzer::resolution::SelectedSemanticProvenance;
+use crate::analyzer::resolution::SelectedTypedFactSource;
+use crate::analyzer::resolution::SelectedTypedRow;
+use crate::analyzer::resolution::SemanticId;
+use crate::analyzer::resolution::TypedFactRequest;
+use crate::analyzer::resolution::cancelled_completion;
+use crate::analyzer::resolution::classify_selected_root_path_half;
+use crate::analyzer::resolution::language_identity_domain;
+use crate::analyzer::resolution::visit_selected_root_export_half_pages;
+use crate::analyzer::resolution::visit_selected_root_import_half_pages;
+
+use crate::analyzer::CodeUnit;
+use crate::analyzer::IAnalyzer;
+use crate::analyzer::Project;
+use crate::analyzer::ProjectFile;
+use crate::analyzer::Range;
+
+use crate::hash::HashMap;
+use crate::hash::HashSet;
+
+use super::resolution_lexical::BoundaryCandidateReadMemo;
+use super::resolution_lexical::ReverseCandidateRowsMemo;
+use super::resolution_lexical::SelectedLookupRecipeReadOutcome;
+use super::resolution_lexical::SelectedLookupRecipeRequest;
+use super::resolution_lexical::SelectedResolutionLexicalSource;
+use super::resolution_lexical::SelectedSemanticLookupOutcome;
+use super::resolution_lexical::UnconditionalCandidateBox;
+use super::resolution_lexical::UnconditionalCandidateCache;
+use super::resolution_lexical::UnconditionalCandidateReadKey;
+
+use super::resolution_selection::SelectedResolutionContentMountRequest;
+use super::resolution_selection::SelectedResolutionLanguage;
+use super::resolution_selection::SelectedResolutionMountInventory;
+use super::resolution_selection::SelectedResolutionMountInventoryOutcome;
+use super::resolution_selection::SelectedResolutionOverlayAuthority;
+use super::resolution_selection::SelectedResolutionOverlayIntent;
+use super::resolution_selection::SelectedResolutionOverlayMask;
+use super::resolution_selection::SelectedResolutionRevalidationOutcome;
+use super::resolution_selection::SelectedResolutionStale;
+use super::resolution_selection::SelectedResolutionUnavailable;
+
 use super::resolution_typed::SelectedResolutionTypedSource;
-use super::selected_definition::{
-    SelectedDeclarationDefinition, SelectedDefinitionSemanticReadOutcome,
-    SelectedDefinitionUnitReadOutcome, SelectedLexicalDefinitionReadOutcome,
-};
+
+use super::selected_definition::SelectedDeclarationDefinition;
+use super::selected_definition::SelectedDefinitionSemanticReadOutcome;
+use super::selected_definition::SelectedDefinitionUnitReadOutcome;
+use super::selected_definition::SelectedLexicalDefinitionReadOutcome;
+
 use super::selected_read_memo::ExactReadMemo;
-use super::{AnalyzerStore, Result, StoreError, WorkspaceId, WorkspaceSnapshots};
+
+use super::AnalyzerStore;
+use super::Result;
+use super::StoreError;
+use super::WorkspaceId;
+use super::WorkspaceSnapshots;
 
 pub(super) const SELECTED_MACRO_OCCURRENCE_LINES_SQL: &str = "SELECT CAST(entry.key AS INTEGER), json_extract(entry.value, '$[2]') FROM source_occurrence_arenas AS arena, json_each(arena.spans) AS entry WHERE arena.blob_id = ?1";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static SELECTED_MACRO_OCCURRENCE_LINE_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_selected_macro_occurrence_line_query_count_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_selected_macro_occurrence_line_query_count_for_test() {
     SELECTED_MACRO_OCCURRENCE_LINE_QUERY_COUNT.with(|count| count.set(0));
 }
 
-#[cfg(test)]
-pub(crate) fn selected_macro_occurrence_line_query_count_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn selected_macro_occurrence_line_query_count_for_test() -> usize {
     SELECTED_MACRO_OCCURRENCE_LINE_QUERY_COUNT.with(std::cell::Cell::get)
 }
 
 /// Project only the compact source identities required by transient Rust
 /// reference-context reads. The parsed source facts remain producer-owned;
 /// resolution retains no source arena or parallel range extraction.
-pub(crate) fn rust_reference_context_sources(
+#[doc(hidden)]
+pub fn rust_reference_context_sources(
     source_facts: &ParsedSourceFacts,
     cancellation: &CancellationToken,
 ) -> Result<Vec<RustReferenceContextSource>> {
@@ -602,7 +752,8 @@ pub(crate) fn rust_declaration_context_sources(
 
 /// Exact selection inputs plus the live overlay authority captured before any
 /// selected database read.
-pub(crate) struct SelectedResolutionOperationInput<'project, 'selection> {
+#[doc(hidden)]
+pub struct SelectedResolutionOperationInput<'project, 'selection> {
     project: &'project dyn Project,
     analyzer: Option<&'project dyn IAnalyzer>,
     analysis_generation: u64,
@@ -615,7 +766,8 @@ pub(crate) struct SelectedResolutionOperationInput<'project, 'selection> {
 
 /// A worker recreates exactly the enclosing query's authority inputs.
 /// Owned selection descriptors die with that query; project/analyzer remain borrowed.
-pub(crate) struct CapturedSelectedResolutionInput<'project> {
+#[doc(hidden)]
+pub struct CapturedSelectedResolutionInput<'project> {
     project: &'project dyn Project,
     analyzer: Option<&'project dyn IAnalyzer>,
     analysis_generation: u64,
@@ -627,7 +779,8 @@ pub(crate) struct CapturedSelectedResolutionInput<'project> {
 }
 
 impl<'project> CapturedSelectedResolutionInput<'project> {
-    fn capture(input: &SelectedResolutionOperationInput<'project, '_>) -> Self {
+    #[doc(hidden)]
+    pub fn capture(input: &SelectedResolutionOperationInput<'project, '_>) -> Self {
         Self {
             project: input.project,
             analyzer: input.analyzer,
@@ -640,7 +793,8 @@ impl<'project> CapturedSelectedResolutionInput<'project> {
         }
     }
 
-    pub(crate) fn input(&self) -> SelectedResolutionOperationInput<'project, '_> {
+    #[doc(hidden)]
+    pub fn input(&self) -> SelectedResolutionOperationInput<'project, '_> {
         SelectedResolutionOperationInput {
             project: self.project,
             analyzer: self.analyzer,
@@ -655,7 +809,8 @@ impl<'project> CapturedSelectedResolutionInput<'project> {
 }
 
 impl<'project, 'selection> SelectedResolutionOperationInput<'project, 'selection> {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         project: &'project dyn Project,
         workspace_id: &'selection WorkspaceId,
         snapshots: &'selection WorkspaceSnapshots,
@@ -674,7 +829,8 @@ impl<'project, 'selection> SelectedResolutionOperationInput<'project, 'selection
         }
     }
 
-    pub(crate) fn with_content_mounts(
+    #[doc(hidden)]
+    pub fn with_content_mounts(
         mut self,
         content_mounts: Vec<SelectedResolutionContentMountRequest>,
     ) -> Self {
@@ -694,7 +850,8 @@ pub(crate) enum SelectedResolutionFallbackReason {
     Stale(SelectedResolutionStale),
 }
 
-pub(crate) enum SelectedResolutionOperationOutcome<T> {
+#[doc(hidden)]
+pub enum SelectedResolutionOperationOutcome<T> {
     Native(T),
     Unavailable(SelectedResolutionUnavailable),
     Stale(SelectedResolutionStale),
@@ -768,7 +925,8 @@ impl<T> SelectedResolutionOperationOutcome<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedResolutionLocated<T> {
+#[doc(hidden)]
+pub enum SelectedResolutionLocated<T> {
     Found(T),
     Missing,
 }
@@ -787,10 +945,12 @@ pub(crate) trait SelectedResolutionBroadStager {
 
 /// Generated macro-reference facts staged for this crate operation.
 #[derive(Default)]
-struct MacroOverlaySlot {
+#[doc(hidden)]
+pub struct MacroOverlaySlot {
     /// Caller files already covered. Reverse confirmation adds callers in
     /// batches, so a crate-wide prepared bit can hide later files' facts.
-    prepared_files: HashSet<String>,
+    #[doc(hidden)]
+    pub prepared_files: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -830,11 +990,12 @@ struct PreparedMacroIncludeGlob {
 /// Reuses immutable include-splice planning across identical selected macro
 /// inputs. The SQL stage remains request-local and each request republishes
 /// the cached plan into its own transaction.
-pub(crate) struct SelectedRustMacroIncludeOverlayCache {
+#[doc(hidden)]
+pub struct SelectedRustMacroIncludeOverlayCache {
     entries: Cache<[u8; 32], Arc<PreparedMacroIncludeOverlay>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     hits: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     inserts: std::sync::atomic::AtomicUsize,
 }
 
@@ -844,16 +1005,16 @@ impl SelectedRustMacroIncludeOverlayCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: Cache::builder().max_capacity(Self::ENTRIES).build(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             hits: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             inserts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn get(&self, key: &[u8; 32]) -> Option<Arc<PreparedMacroIncludeOverlay>> {
         let value = self.entries.get(key);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if value.is_some() {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -863,28 +1024,33 @@ impl SelectedRustMacroIncludeOverlayCache {
     fn insert(&self, key: [u8; 32], overlay: Arc<PreparedMacroIncludeOverlay>) {
         if overlay.path_count <= 20_000 {
             self.entries.insert(key, overlay);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.inserts
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn hit_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn hit_count_for_test(&self) -> usize {
         self.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn insert_count_for_test(&self) -> usize {
         self.inserts.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 /// Preparation owned by one selected query; reader checkin retains only SQL state.
-pub(super) struct QueryResolutionPreparation {
+#[doc(hidden)]
+pub struct QueryResolutionPreparation {
     /// Scalar preparation state for the current SQL crate stage.
-    macro_overlay: RefCell<MacroOverlaySlot>,
-    prepared_macro_files: RefCell<HashSet<PathBuf>>,
+    #[doc(hidden)]
+    pub macro_overlay: RefCell<MacroOverlaySlot>,
+    #[doc(hidden)]
+    pub prepared_macro_files: RefCell<HashSet<PathBuf>>,
     /// Caller and macro-host files already checked for frontiers, including
     /// files with no macro input rows. These facts belong to this operation.
     checked_macro_frontier_files: RefCell<HashSet<PathBuf>>,
@@ -997,6 +1163,431 @@ pub(crate) struct RustCallerDemand {
     demand: RustDemandPreparation,
 }
 
+struct RustReversePrepared {
+    demand: Arc<RustCallerDemand>,
+    contexts: SelectedResolutionContextSet,
+}
+
+struct RustReverseLifecycle<'a, 'store, 'input, T, Setup, Project> {
+    selected: &'a mut SelectedResolutionOperation<'store, 'input>,
+    caller: &'a Path,
+    access: RustDeclarationAccessKind,
+    cancellation: &'a CancellationToken,
+    session: &'a ResolutionSession,
+    context_metrics: &'a SelectedResolutionContextMetrics,
+    setup: Setup,
+    project: Project,
+    marker: std::marker::PhantomData<T>,
+}
+
+struct RustReverseScoped<'a, 'store, 'input, T, Setup, Project> {
+    ready: &'a ReadySelectedResolution<'store, 'input>,
+    prepared: &'a RustCallerDemand,
+    caller: &'a Path,
+    access: RustDeclarationAccessKind,
+    cancellation: &'a CancellationToken,
+    session: &'a ResolutionSession,
+    setup: &'a mut Setup,
+    project: &'a mut Project,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'store, 'input, T, Setup, Project> reverse::ReverseLifecycle
+    for RustReverseLifecycle<'_, 'store, 'input, T, Setup, Project>
+where
+    Setup: FnMut(
+        &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        SemanticId,
+    ) -> Result<()>,
+    Project: FnMut(
+        &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        &FactResolutionAnswer,
+        &ReadySelectedResolution<'_, '_>,
+        SelectedMountTable<'_, '_>,
+        &ResolutionSession,
+        &CancellationToken,
+    ) -> Result<SelectedResolutionOperationOutcome<T>>,
+{
+    type Answer = SelectedRustReferenceAnswer<T>;
+    type Limit = std::convert::Infallible;
+    type Prepared = RustReversePrepared;
+    type Scoped<'a>
+        = RustReverseScoped<'a, 'store, 'input, T, Setup, Project>
+    where
+        Self: 'a;
+
+    fn prepare(
+        &mut self,
+        locators: &[&SelectedSemanticLocator],
+    ) -> Result<reverse::ReverseBatch<Self::Prepared, Self::Limit>> {
+        use reverse::{ReverseBatch, ReverseCancellationStage};
+        let selected = &mut self.selected;
+        let caller = self.caller;
+        let cancellation = self.cancellation;
+        let session = self.session;
+        if selected
+            .mount_table()
+            .mount_for_path("rust", &selected_path_key(caller))?
+            .is_none()
+        {
+            return Ok(ReverseBatch::UnsupportedContext);
+        }
+        let mut macro_callers = vec![caller];
+        for path in locators
+            .iter()
+            .map(|locator| Path::new(locator.relative_path()))
+        {
+            if path != caller && !macro_callers.contains(&path) {
+                macro_callers.push(path);
+            }
+        }
+        match selected.prepare_selected_macro_frontiers_for_files(&macro_callers, cancellation)? {
+            SelectedResolutionStageOutcome::Ready => {}
+            SelectedResolutionStageOutcome::Cancelled => {
+                return Ok(ReverseBatch::Cancelled {
+                    stage: ReverseCancellationStage::Prepare,
+                    completion: cancelled_completion(),
+                });
+            }
+            SelectedResolutionStageOutcome::Stale(reason) => {
+                return Ok(ReverseBatch::Stale(reason));
+            }
+            SelectedResolutionStageOutcome::Unavailable(reason) => {
+                return Ok(ReverseBatch::Unavailable(reason));
+            }
+        }
+        let _timing = crate::profiling::scope("rust_caller::demand_preparation");
+        let demand = match selected.rust_demand_preparation_for_caller_in_session(
+            caller,
+            cancellation,
+            Some(session),
+        )? {
+            SelectedRustCallerDemandOutcome::Ready(demand) => demand,
+            SelectedRustCallerDemandOutcome::Unavailable => {
+                return Ok(ReverseBatch::UnsupportedContext);
+            }
+            SelectedRustCallerDemandOutcome::Cancelled => {
+                return Ok(ReverseBatch::Cancelled {
+                    stage: ReverseCancellationStage::Prepare,
+                    completion: cancelled_completion(),
+                });
+            }
+        };
+        let contexts = demand.contexts.clone().with_declaration_access_source(
+            self.access.source(selected, demand.crate_keys.clone())?,
+        );
+        Ok(ReverseBatch::Ready(RustReversePrepared {
+            demand,
+            contexts,
+        }))
+    }
+
+    fn validate(
+        &mut self,
+        prepared: &Self::Prepared,
+    ) -> Result<reverse::ReverseBatch<SelectedResolutionContextInputs, Self::Limit>> {
+        use reverse::{ReverseBatch, ReverseCancellationStage};
+        if !self
+            .selected
+            .ensure_selected_rust_inputs_in_session(self.cancellation, self.session)?
+        {
+            return Ok(ReverseBatch::Cancelled {
+                stage: ReverseCancellationStage::Prepare,
+                completion: cancelled_completion(),
+            });
+        }
+        note_rust_point_work("search_entry_inputs", self.session);
+        let _timing = crate::profiling::scope("rust_caller::prepare_context");
+        let context = match self.selected.prepare_context_in_session(
+            prepared.contexts.clone(),
+            self.cancellation,
+            self.context_metrics,
+            self.session,
+        )? {
+            SelectedResolutionContextValidationOutcome::Ready(context) => context,
+            SelectedResolutionContextValidationOutcome::Cancelled => {
+                return Ok(ReverseBatch::Cancelled {
+                    stage: ReverseCancellationStage::Prepare,
+                    completion: cancelled_completion(),
+                });
+            }
+        };
+        note_rust_point_work("search_validate_mounts", self.session);
+        Ok(ReverseBatch::Ready(context))
+    }
+
+    fn with_scope<'a, V>(
+        &'a mut self,
+        prepared: &'a Self::Prepared,
+        run: impl FnOnce(&mut Self::Scoped<'a>) -> Result<reverse::ReverseBatch<V, Self::Limit>>,
+    ) -> Result<reverse::ReverseBatch<V, Self::Limit>> {
+        let ready = &self.selected.ready;
+        // The crate closure and its query-lived memos cover blueprint and demand
+        // reads, then drop before final selected authority is checked (#3761).
+        let _memos = ready.crate_stage_memos()?;
+        let _scope =
+            ready.narrow_forward_scope_to_crates(&prepared.demand.crate_keys, self.cancellation)?;
+        run(&mut RustReverseScoped {
+            ready,
+            prepared: &prepared.demand,
+            caller: self.caller,
+            access: self.access,
+            cancellation: self.cancellation,
+            session: self.session,
+            setup: &mut self.setup,
+            project: &mut self.project,
+            marker: std::marker::PhantomData,
+        })
+    }
+
+    fn finish(
+        &mut self,
+        reports: Vec<reverse::ReverseSessionReport<Self::Answer>>,
+    ) -> reverse::ReverseSessionOutcome<Self::Answer, Self::Limit> {
+        use reverse::{ReverseBatch, ReverseCancellationStage, ReverseSessionReport};
+        let mut completion = ResolutionCompletion::Complete;
+        for report in &reports {
+            if let ReverseSessionReport::Found { meanings, .. } = report {
+                for (_, answers) in meanings {
+                    for answer in answers {
+                        completion = completion.combine(answer.resolution.completion());
+                    }
+                }
+            }
+        }
+        note_rust_point_work("search_answers", self.session);
+        if !self.session.scope_step() {
+            return Ok(ReverseBatch::Cancelled {
+                stage: ReverseCancellationStage::Projection,
+                completion: completion.combine(&cancelled_completion()),
+            });
+        }
+        note_rust_point_work("search_final_authority", self.session);
+        Ok(self
+            .selected
+            .ready
+            .finish(reports, &completion, self.cancellation)?
+            .into())
+    }
+}
+
+impl<T, Setup, Project> reverse::ReverseScopedLifecycle
+    for RustReverseScoped<'_, '_, '_, T, Setup, Project>
+where
+    Setup: FnMut(
+        &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        SemanticId,
+    ) -> Result<()>,
+    Project: FnMut(
+        &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        &FactResolutionAnswer,
+        &ReadySelectedResolution<'_, '_>,
+        SelectedMountTable<'_, '_>,
+        &ResolutionSession,
+        &CancellationToken,
+    ) -> Result<SelectedResolutionOperationOutcome<T>>,
+{
+    type Answer = SelectedRustReferenceAnswer<T>;
+    type Limit = std::convert::Infallible;
+
+    fn blueprint(
+        &mut self,
+        context: SelectedResolutionContextInputs,
+    ) -> Result<reverse::ReverseBatch<SelectedFactOperationBlueprint, Self::Limit>> {
+        use reverse::{ReverseBatch, ReverseCancellationStage};
+        let _timing = crate::profiling::scope("rust_caller::collect_blueprint");
+        let blueprint = match self.ready.collect_blueprint_in_session(
+            context,
+            self.cancellation,
+            self.session,
+        )? {
+            SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
+            SelectedFactOperationBlueprintConstruction::Cancelled {
+                cancellation_completion,
+                ..
+            } => {
+                return Ok(ReverseBatch::Cancelled {
+                    stage: ReverseCancellationStage::Blueprint,
+                    completion: cancellation_completion,
+                });
+            }
+        };
+        note_rust_point_work("search_collect_blueprint", self.session);
+        Ok(ReverseBatch::Ready(blueprint))
+    }
+
+    fn register(
+        &mut self,
+        blueprint: &SelectedFactOperationBlueprint,
+    ) -> Result<reverse::ReverseBatch<(), Self::Limit>> {
+        use reverse::{ReverseBatch, ReverseCancellationStage};
+        if matches!(
+            register_selected_rust_caller_context_in_session(
+                self.ready,
+                self.caller,
+                &self.prepared.crate_keys,
+                self.access,
+                blueprint,
+                self.cancellation,
+                self.session,
+            )?,
+            ContextRegistrationOutcome::Cancelled
+        ) {
+            return Ok(ReverseBatch::Cancelled {
+                stage: ReverseCancellationStage::Register,
+                completion: cancelled_completion(),
+            });
+        }
+        note_rust_point_work("search_register_context", self.session);
+        Ok(ReverseBatch::Ready(()))
+    }
+
+    fn locate(
+        &mut self,
+        locator: &SelectedSemanticLocator,
+    ) -> Result<reverse::ReverseBatch<LocatedSemantics, Self::Limit>> {
+        use reverse::{ReverseBatch, ReverseCancellationStage};
+        match self.ready.lookup_locators_in_session(
+            &self.ready.lexical_source(),
+            locator,
+            self.cancellation,
+            self.session,
+        )? {
+            LocatedSemantics::Cancelled => Ok(ReverseBatch::Cancelled {
+                stage: ReverseCancellationStage::Locator,
+                completion: cancelled_completion(),
+            }),
+            found => Ok(ReverseBatch::Ready(found)),
+        }
+    }
+
+    fn with_evaluator<V>(
+        &mut self,
+        blueprint: &SelectedFactOperationBlueprint,
+        run: impl FnOnce(
+            &mut dyn reverse::ReverseSessionEvaluator<Answer = Self::Answer, Limit = Self::Limit>,
+        ) -> Result<reverse::ReverseBatch<V, Self::Limit>>,
+    ) -> Result<reverse::ReverseBatch<V, Self::Limit>> {
+        use reverse::{ReverseBatch, ReverseCancellationStage, ReverseEvaluatorFn};
+        let Self {
+            ready,
+            prepared,
+            cancellation,
+            session,
+            setup,
+            project,
+            access,
+            ..
+        } = self;
+        let ready = *ready;
+        let cancellation = *cancellation;
+        let session = *session;
+        note_rust_point_work("search_lookup_locators", session);
+        let persisted_lexical = ready.lexical_source();
+        let persisted_typed = ready.typed_source();
+        let observed_lexical = SeamProfiled::observing(&persisted_lexical);
+        let observed_typed = SeamProfiled::observing(&persisted_typed);
+        let arena = RefCell::new(ClosedRelations::default());
+        let source = ClosedForwardSource::new(
+            &observed_lexical,
+            &persisted_lexical,
+            &arena,
+            session,
+            crate::analyzer::resolution::CALLER_ENVIRONMENT,
+        );
+        let forward = PreparedForwardSource::new(
+            ready,
+            &prepared.demand,
+            &observed_lexical,
+            &persisted_lexical,
+        );
+        let mut provider = DemandProvider::new(ForwardProvider::new(
+            &forward,
+            &arena,
+            session,
+            cancellation,
+        ));
+        blueprint.with_forward_operation_in_session(
+            &source,
+            &persisted_lexical,
+            &observed_typed,
+            cancellation,
+            session,
+            |operation| {
+                operation
+                    .enable_completed_root_reuse(&ready.operation_demand_state, *access as u64);
+                let mut evaluator = ReverseEvaluatorFn {
+                    marker: std::marker::PhantomData,
+                    run: |locator: &SelectedSemanticLocator, reference: SemanticId| {
+                        if !session.scope_step() || cancellation.is_cancelled() {
+                            return Ok(ReverseBatch::Cancelled {
+                                stage: ReverseCancellationStage::Locator,
+                                completion: cancelled_completion(),
+                            });
+                        }
+                        setup(operation, reference)?;
+                        let resolution = match operation
+                            .resolve_reference_by_demand(reference, &mut provider)?
+                        {
+                            FactDemandResolution::Ready(resolution) => *resolution,
+                            FactDemandResolution::Cancelled(completion) => {
+                                return Ok(ReverseBatch::Cancelled {
+                                    stage: ReverseCancellationStage::Projection,
+                                    completion,
+                                });
+                            }
+                        };
+                        if !session.observe_cancellation() || cancellation.is_cancelled() {
+                            return Ok(ReverseBatch::Cancelled {
+                                stage: ReverseCancellationStage::Projection,
+                                completion: cancelled_completion(),
+                            });
+                        }
+                        Ok(
+                            match assemble_rust_reference_answer(
+                                &RustReferenceAnswerContext {
+                                    ready,
+                                    mounts: SelectedMountTable::new(&ready.inventory),
+                                    reference,
+                                    locator,
+                                    session,
+                                    cancellation,
+                                },
+                                operation,
+                                resolution,
+                                &mut |operation, reference| {
+                                    operation.resolve_reference_by_demand(reference, &mut provider)
+                                },
+                                project,
+                            )? {
+                                SelectedResolutionOperationOutcome::Native(answer) => {
+                                    ReverseBatch::Ready(vec![answer])
+                                }
+                                other => match other {
+                                    SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                                        ReverseBatch::Unavailable(reason)
+                                    }
+                                    SelectedResolutionOperationOutcome::Stale(reason) => {
+                                        ReverseBatch::Stale(reason)
+                                    }
+                                    SelectedResolutionOperationOutcome::Cancelled(completion) => {
+                                        ReverseBatch::Cancelled {
+                                            stage: ReverseCancellationStage::Projection,
+                                            completion,
+                                        }
+                                    }
+                                    SelectedResolutionOperationOutcome::Native(_) => unreachable!(),
+                                },
+                            },
+                        )
+                    },
+                };
+                run(&mut evaluator)
+            },
+        )
+    }
+}
+
 pub(crate) enum SelectedRustCallerDemandOutcome {
     Ready(Arc<RustCallerDemand>),
     /// No selected Cargo target owns this caller.
@@ -1010,9 +1601,11 @@ enum SelectedContentValidationOutcome {
     Cancelled,
 }
 
-struct ReadySelectedResolution<'store, 'input> {
+#[doc(hidden)]
+pub struct ReadySelectedResolution<'store, 'input> {
     store: &'store AnalyzerStore,
-    inventory: Box<SelectedResolutionMountInventory<'store>>,
+    #[doc(hidden)]
+    pub inventory: Box<SelectedResolutionMountInventory<'store>>,
     query_preparation: Option<Box<QueryResolutionPreparation>>,
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
     project: &'input dyn Project,
@@ -1035,10 +1628,12 @@ struct ReadySelectedResolution<'store, 'input> {
     /// stream: two compilations of one gap have to agree. One table per
     /// request is what makes them agree across the contexts a request builds,
     /// and it is dropped with the request.
-    context_identities: crate::analyzer::resolution::SelectedContextIdentities,
+    #[doc(hidden)]
+    pub context_identities: crate::analyzer::resolution::SelectedContextIdentities,
     /// Demand answers and minting authority touched by this operation only.
     /// Blueprints lend the identity registry to otherwise fresh fact arenas.
-    operation_demand_state: Arc<crate::analyzer::resolution::SelectedDemandState>,
+    #[doc(hidden)]
+    pub operation_demand_state: Arc<crate::analyzer::resolution::SelectedDemandState>,
     // One scalar publication identity for this request, never a package index.
     go_publication: RefCell<Option<super::GoContextIdentity>>,
     /// Whether this request encountered any complete selected Go package.
@@ -1131,7 +1726,8 @@ impl std::ops::DerefMut for ReadySelectedResolution<'_, '_> {
 }
 
 impl<'store> ReadySelectedResolution<'store, '_> {
-    fn identity_content_digest(
+    #[doc(hidden)]
+    pub fn identity_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
         cancellation: &CancellationToken,
@@ -1168,11 +1764,13 @@ impl<'store> ReadySelectedResolution<'store, '_> {
     /// Where this request's lowerings and its own demands get a shared name's
     /// id. The table lives on the inventory, which is built for one request
     /// and dropped with it.
-    pub(super) fn shared_names(&self) -> super::resolution::StoreSharedNames<'_> {
+    #[doc(hidden)]
+    pub fn shared_names(&self) -> super::resolution::StoreSharedNames<'_> {
         self.inventory.shared_names()
     }
 
-    pub(super) fn lexical_source(&self) -> SelectedResolutionLexicalSource<'_, 'store> {
+    #[doc(hidden)]
+    pub fn lexical_source(&self) -> SelectedResolutionLexicalSource<'_, 'store> {
         if let Some(cache) = self.graph_stage_candidate_cache.borrow().as_ref() {
             return SelectedResolutionLexicalSource::new_on_demand_with_unconditional_cache(
                 &self.inventory,
@@ -1207,7 +1805,8 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         }
     }
 
-    pub(super) fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
+    #[doc(hidden)]
+    pub fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
         let mut providers = self
             .analyzer
             .map(crate::analyzer::languages::selected_external_inventory_providers)
@@ -1251,7 +1850,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// The fragment-local identity counts one query's rebaser held when the
     /// query ended, by kind: semantics, nodes, paths, stack variables.
@@ -1263,8 +1862,9 @@ thread_local! {
         const { std::cell::Cell::new([0; 4]) };
 }
 
-#[cfg(test)]
-pub(crate) fn take_rebaser_identities_at_handback_for_test() -> [usize; 4] {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_rebaser_identities_at_handback_for_test() -> [usize; 4] {
     REBASER_IDENTITIES_AT_HANDBACK.with(std::cell::Cell::take)
 }
 
@@ -1274,7 +1874,7 @@ impl Drop for ReadySelectedResolution<'_, '_> {
             .query_preparation
             .take()
             .expect("ready selected resolution drops operation preparation exactly once");
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         REBASER_IDENTITIES_AT_HANDBACK.with(|identities| {
             identities.set(
                 self.inventory
@@ -1308,10 +1908,14 @@ impl Drop for ReadySelectedResolution<'_, '_> {
 /// One selected Rust path's macro capsule: the mount this query holds the path
 /// at, and the persisted blob whose parsed macro definitions, invocations and
 /// inputs describe that mount's bytes.
-pub(super) struct SelectedMacroCapsule {
-    mount: SelectedResolutionOperationMount,
-    blob_id: i64,
-    content_oid: git2::Oid,
+#[doc(hidden)]
+pub struct SelectedMacroCapsule {
+    #[doc(hidden)]
+    pub mount: SelectedResolutionOperationMount,
+    #[doc(hidden)]
+    pub blob_id: i64,
+    #[doc(hidden)]
+    pub content_oid: git2::Oid,
 }
 
 impl SelectedMacroCapsule {
@@ -1339,15 +1943,18 @@ impl SelectedMacroCapsule {
         }
     }
 
-    pub(super) const fn mount(&self) -> &SelectedResolutionOperationMount {
+    #[doc(hidden)]
+    pub const fn mount(&self) -> &SelectedResolutionOperationMount {
         &self.mount
     }
 
-    pub(super) const fn blob_id(&self) -> i64 {
+    #[doc(hidden)]
+    pub const fn blob_id(&self) -> i64 {
         self.blob_id
     }
 
-    pub(super) const fn content_oid(&self) -> git2::Oid {
+    #[doc(hidden)]
+    pub const fn content_oid(&self) -> git2::Oid {
         self.content_oid
     }
 
@@ -1358,7 +1965,8 @@ impl SelectedMacroCapsule {
     /// registers. The capsule exists only because that language publishes
     /// macro rows at all, which is why a missing reader is an assertion here
     /// rather than an outcome each caller below would have to interpret.
-    pub(super) fn macro_rows(&self) -> &'static dyn SelectedMacroSourceRows {
+    #[doc(hidden)]
+    pub fn macro_rows(&self) -> &'static dyn SelectedMacroSourceRows {
         let language = self.mount.semantic_language();
         crate::analyzer::languages::language_support(language)
             .expect("every selected mount's language has registered support")
@@ -1386,7 +1994,8 @@ impl SelectedMacroCapsule {
 /// that grows a macro replay brings its own rows, and that is the point at
 /// which these signatures become generic over them; inventing that abstraction
 /// now would only guess at the second shape.
-pub(crate) trait SelectedMacroSourceRows: Send + Sync {
+#[doc(hidden)]
+pub trait SelectedMacroSourceRows: Send + Sync {
     /// The canonical matcher arms sealed in `blob_id`, or `None` when
     /// `keep_going` reported cancellation part way through the read.
     fn definition_rows(
@@ -1405,6 +2014,20 @@ pub(crate) trait SelectedMacroSourceRows: Send + Sync {
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<rust_facts::RustMacroInvocationInputSourceFact>>>;
 
+    /// Whether any invocation input is sealed in the blob, without decoding
+    /// its cfg, source payload, frontier or tokens.
+    fn has_inputs(&self, connection: &rusqlite::Connection, blob_id: i64) -> Result<bool>;
+
+    /// The first canonical input at the stored token-tree start, with only
+    /// that invocation's tokens. `None` reports cancellation, as in `input_rows`.
+    fn invocation_input_rows(
+        &self,
+        connection: &rusqlite::Connection,
+        blob_id: i64,
+        arguments_start: usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<rust_facts::RustMacroInvocationInputSourceFact>>>;
+
     /// Where the item-position invocation `invocation` sealed in `blob_id`
     /// expands to: an associated-item body or a lexical scope. An invocation
     /// that is not in item position answers `Lexical`.
@@ -1417,32 +2040,43 @@ pub(crate) trait SelectedMacroSourceRows: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedResolutionOperationMount {
-    ordinal: SelectedResolutionMountOrdinal,
-    storage_language: String,
-    persisted_relative_path: String,
-    semantic_language: Language,
-    fragment: BindingFragmentId,
+#[doc(hidden)]
+pub struct SelectedResolutionOperationMount {
+    #[doc(hidden)]
+    pub ordinal: SelectedResolutionMountOrdinal,
+    #[doc(hidden)]
+    pub storage_language: String,
+    #[doc(hidden)]
+    pub persisted_relative_path: String,
+    #[doc(hidden)]
+    pub semantic_language: Language,
+    #[doc(hidden)]
+    pub fragment: BindingFragmentId,
 }
 
 impl SelectedResolutionOperationMount {
-    pub(crate) const fn ordinal(&self) -> SelectedResolutionMountOrdinal {
+    #[doc(hidden)]
+    pub const fn ordinal(&self) -> SelectedResolutionMountOrdinal {
         self.ordinal
     }
 
-    pub(crate) fn storage_language(&self) -> &str {
+    #[doc(hidden)]
+    pub fn storage_language(&self) -> &str {
         &self.storage_language
     }
 
-    pub(crate) fn persisted_relative_path(&self) -> &str {
+    #[doc(hidden)]
+    pub fn persisted_relative_path(&self) -> &str {
         &self.persisted_relative_path
     }
 
-    pub(crate) const fn semantic_language(&self) -> Language {
+    #[doc(hidden)]
+    pub const fn semantic_language(&self) -> Language {
         self.semantic_language
     }
 
-    pub(crate) const fn fragment(&self) -> BindingFragmentId {
+    #[doc(hidden)]
+    pub const fn fragment(&self) -> BindingFragmentId {
         self.fragment
     }
 }
@@ -1453,11 +2087,12 @@ impl SelectedResolutionOperationMount {
 /// spelling the temp table's path index is sorted on, so a `Path` key is
 /// normalized once here instead of being compared component by component
 /// against every mount.
-fn selected_path_key(path: &Path) -> String {
+#[doc(hidden)]
+pub fn selected_path_key(path: &Path) -> String {
     crate::path_utils::normalize_pattern(&path.to_string_lossy())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Mount-table entries the readers below examined, counted for the
     /// acceptance test that a request's mount lookups do not scale with the
@@ -1470,7 +2105,7 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn note_selected_mount_table_visits(examined: usize) {
     SELECTED_MOUNT_TABLE_VISITS.with(|visits| {
         visits.set(
@@ -1482,8 +2117,9 @@ fn note_selected_mount_table_visits(examined: usize) {
     });
 }
 
-#[cfg(test)]
-pub(crate) fn take_selected_mount_table_visits_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_selected_mount_table_visits_for_test() -> usize {
     SELECTED_MOUNT_TABLE_VISITS.with(|visits| visits.replace(0))
 }
 
@@ -1491,16 +2127,20 @@ pub(crate) fn take_selected_mount_table_visits_for_test() -> usize {
 /// indexes. Explicit query-owned enumeration is separate from point reads
 /// and never occurs at warm operation construction.
 #[derive(Clone, Copy)]
-pub(crate) struct SelectedMountTable<'a, 'store> {
-    inventory: &'a SelectedResolutionMountInventory<'store>,
+#[doc(hidden)]
+pub struct SelectedMountTable<'a, 'store> {
+    #[doc(hidden)]
+    pub inventory: &'a SelectedResolutionMountInventory<'store>,
 }
 
 impl<'a, 'store> SelectedMountTable<'a, 'store> {
-    pub(crate) fn new(inventory: &'a SelectedResolutionMountInventory<'store>) -> Self {
+    #[doc(hidden)]
+    pub fn new(inventory: &'a SelectedResolutionMountInventory<'store>) -> Self {
         Self { inventory }
     }
 
-    pub(crate) fn mount_count(&self) -> usize {
+    #[doc(hidden)]
+    pub fn mount_count(&self) -> usize {
         self.inventory.persisted_mount_count()
     }
 
@@ -1513,17 +2153,19 @@ impl<'a, 'store> SelectedMountTable<'a, 'store> {
             .collect())
     }
 
-    pub(crate) fn mount_by_ordinal(
+    #[doc(hidden)]
+    pub fn mount_by_ordinal(
         &self,
         ordinal: SelectedResolutionMountOrdinal,
     ) -> Result<SelectedResolutionOperationMount> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         note_selected_mount_table_visits(1);
         let record = self.inventory.mount_record_by_ordinal(ordinal)?;
         Ok(operation_mount_record(&record))
     }
 
-    pub(crate) fn mount_for_fragment(
+    #[doc(hidden)]
+    pub fn mount_for_fragment(
         &self,
         fragment: BindingFragmentId,
     ) -> Result<Option<SelectedResolutionOperationMount>> {
@@ -1539,7 +2181,8 @@ impl<'a, 'store> SelectedMountTable<'a, 'store> {
     }
 
     /// The selected blob ID for one path in this inventory.
-    pub(crate) fn blob_for_path(
+    #[doc(hidden)]
+    pub fn blob_for_path(
         &self,
         storage_language: &str,
         persisted_relative_path: &str,
@@ -1550,7 +2193,8 @@ impl<'a, 'store> SelectedMountTable<'a, 'store> {
             .map(|mount| mount.blob_id()))
     }
 
-    pub(crate) fn mount_for_path(
+    #[doc(hidden)]
+    pub fn mount_for_path(
         &self,
         storage_language: &str,
         persisted_relative_path: &str,
@@ -1619,7 +2263,8 @@ fn operation_mount_record(
     }
 }
 
-pub(crate) enum SelectedResolutionOperationOpenOutcome<'store, 'input> {
+#[doc(hidden)]
+pub enum SelectedResolutionOperationOpenOutcome<'store, 'input> {
     Ready(Box<SelectedResolutionOperation<'store, 'input>>),
     Unavailable(SelectedResolutionUnavailable),
     Stale(SelectedResolutionStale),
@@ -1685,9 +2330,11 @@ impl<'store, 'input> SelectedResolutionOperationOpenOutcome<'store, 'input> {
 
 /// Non-clone selected owner retained for one query lifetime. A Rust definition
 /// batch may use it for several bounded point requests.
-pub(crate) struct SelectedResolutionOperation<'store, 'input> {
+#[doc(hidden)]
+pub struct SelectedResolutionOperation<'store, 'input> {
     captured_input: CapturedSelectedResolutionInput<'input>,
-    ready: ReadySelectedResolution<'store, 'input>,
+    #[doc(hidden)]
+    pub ready: ReadySelectedResolution<'store, 'input>,
     enumerated_mounts: OnceCell<Vec<SelectedResolutionOperationMount>>,
     /// Same-package peer mounts and grouped member rows, retained only for
     /// this selected operation while it prepares multiple Go source files.
@@ -1697,18 +2344,26 @@ pub(crate) struct SelectedResolutionOperation<'store, 'input> {
     go_context_selections: RefCell<HashMap<(i64, String), Option<go_context::GoContextSelection>>>,
     /// Import bindings and selected import rows of the Go files this operation
     /// prepares, read one statement per batch of files and dropped with it.
-    go_import_inputs: RefCell<go_named::GoImportInputCache>,
+    #[doc(hidden)]
+    pub go_import_inputs: RefCell<go_named::GoImportInputCache>,
     /// Prepared Go file contexts admitted by point, graph, or forward-fallback
     /// demand. Values die with this selected operation.
-    go_prepared_contexts: RefCell<HashMap<GoPreparedContextKey, go_named::GoPreparedImportContext>>,
+    go_prepared_contexts: go_named::GoPreparedContextMemo,
+    /// Provider cell deltas shared by Go preparation, closure and nested evaluation.
+    go_context_registrations: RefCell<go_demand::GoContextRegistrationMemo>,
     /// Declared receiver types demanded by this selected query. Keys include
     /// the exact anchor and staged selection; member names do not affect it.
     go_receiver_anchor_types_memo: RefCell<go_receiver_anchor::GoReceiverAnchorTypesMemo>,
     /// Completed file contexts for distinct inputs over this query's selection.
     jvm_file_contexts: RefCell<jvm_context::JvmFileContextMemo>,
+    jvm_context_preparations: jvm_context::JvmContextPreparationMemo,
+    jvm_context_blueprints: jvm_context::JvmContextBlueprintMemo,
+    /// Provider registrations shared by named contexts in this query only.
+    jvm_context_registrations: RefCell<jvm_demand::JvmContextRegistrationMemo>,
     /// Visibility evidence for exact source pairs in this query's selection.
     jvm_source_access_memo: RefCell<jvm_context::JvmSourceAccessMemo>,
-    jvm_implicit_project_memo: RefCell<jvm_context::JvmImplicitProjectMemo>,
+    jvm_implicit_project_memo: jvm_context::JvmImplicitProjectMemo,
+    jvm_implicit_project_contexts: jvm_context::JvmImplicitProjectContextMemo,
     /// Exact recipe rows requested in this query, independent of batch layout.
     jvm_lookup_recipe_memo: RefCell<jvm_context::JvmLookupRecipeMemo>,
     /// Full export reads for mounts demanded by this query, including evidence.
@@ -1718,7 +2373,8 @@ pub(crate) struct SelectedResolutionOperation<'store, 'input> {
     /// Raw alias facts and generated names demanded by this query only.
     jvm_alias_rows_memo: RefCell<jvm_context::JvmAliasRowsMemo>,
     jvm_generated_lookup_memo: RefCell<jvm_context::JvmGeneratedLookupMemo>,
-    jvm_package_member_memo: RefCell<jvm_context::JvmPackageMemberMemo>,
+    jvm_package_member_memo: jvm_context::JvmPackageMemberMemo,
+    jvm_package_indexes: RefCell<jvm_context::JvmPackageIndexMemo>,
     /// Complete node/visibility reads for distinct selected JVM inputs.
     jvm_endpoint_memo: RefCell<jvm_context::JvmEndpointMemo>,
     jvm_visibility_memo: RefCell<jvm_context::JvmVisibilityMemo>,
@@ -1729,11 +2385,13 @@ pub(crate) struct SelectedResolutionOperation<'store, 'input> {
 }
 
 impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
-    pub(crate) fn worker_input(&self) -> &CapturedSelectedResolutionInput<'input> {
+    #[doc(hidden)]
+    pub fn worker_input(&self) -> &CapturedSelectedResolutionInput<'input> {
         &self.captured_input
     }
 
-    pub(crate) fn worker_store(&self) -> &'store AnalyzerStore {
+    #[doc(hidden)]
+    pub fn worker_store(&self) -> &'store AnalyzerStore {
         self.ready.store
     }
 
@@ -1769,17 +2427,9 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
     }
 }
 
-/// Context kind, context id, caller mount, caller path, and source role.
-type GoPreparedContextKey = (
-    go_named::GoPreparedContextKind,
-    i64,
-    SelectedResolutionMountOrdinal,
-    String,
-    String,
-);
-
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum SelectedRustContextOutcome {
+#[doc(hidden)]
+pub enum SelectedRustContextOutcome {
     Ready(SelectedResolutionContextSet),
     Cancelled,
 }
@@ -1790,7 +2440,8 @@ pub(crate) enum SelectedRustContextOutcome {
 /// crates, and it installs that scope before it collects its blueprint. The
 /// crates are read while the context is built, so the caller that installs the
 /// scope takes them from here instead of asking the crate rows again.
-pub(crate) enum SelectedRustFileContextOutcome {
+#[doc(hidden)]
+pub enum SelectedRustFileContextOutcome {
     Ready {
         context: Box<SelectedResolutionContextSet>,
         crate_keys: Vec<[u8; 32]>,
@@ -1857,7 +2508,8 @@ pub(crate) enum SelectedRustCallerContextOutcome {
 }
 
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum SelectedRustCallerReferenceOutcome<T = ()> {
+#[doc(hidden)]
+pub enum SelectedRustCallerReferenceOutcome<T = ()> {
     Operation(
         SelectedResolutionOperationOutcome<
             SelectedResolutionLocated<Vec<SelectedRustReferenceAnswer<T>>>,
@@ -1928,19 +2580,22 @@ fn repeat_bounded_resolution<T>(
     }
 }
 
-pub(crate) enum SelectedRustDefinitionProjection {
+#[doc(hidden)]
+pub enum SelectedRustDefinitionProjection {
     Complete(Vec<CodeUnit>),
     Unavailable,
     Cancelled,
 }
 
-pub(crate) enum SelectedRustSourceDefinitionProjection {
+#[doc(hidden)]
+pub enum SelectedRustSourceDefinitionProjection {
     Complete(Vec<(SemanticId, SelectedRustSourceDefinition)>),
     Unavailable,
     Cancelled,
 }
 
-pub(crate) enum SelectedRustSourceDefinition {
+#[doc(hidden)]
+pub enum SelectedRustSourceDefinition {
     Unit(CodeUnit),
     Lexical(LexicalDefinition),
     /// A resolved target that is an entry of the language's fixed universe
@@ -1986,25 +2641,29 @@ pub(crate) enum SelectedRustSourceDefinition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedRustDefinitionSemanticOutcome {
+#[doc(hidden)]
+pub enum SelectedRustDefinitionSemanticOutcome {
     Found(SemanticId),
     Missing,
     Cancelled,
 }
 
-pub(crate) enum SelectedRustDefinitionSemanticMapOutcome {
+#[doc(hidden)]
+pub enum SelectedRustDefinitionSemanticMapOutcome {
     Ready(HashMap<CodeUnit, SemanticId>),
     Cancelled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedRustBindingDefinitionOutcome {
+#[doc(hidden)]
+pub enum SelectedRustBindingDefinitionOutcome {
     Found(SelectedRustBindingDefinition),
     Missing,
     Cancelled,
 }
 
-pub(crate) enum SelectedRustBindingDefinitionUnitsOutcome {
+#[doc(hidden)]
+pub enum SelectedRustBindingDefinitionUnitsOutcome {
     Ready(BTreeMap<SelectedRustBindingDefinition, CodeUnit>),
     Cancelled,
 }
@@ -2013,10 +2672,14 @@ pub(crate) enum SelectedRustBindingDefinitionUnitsOutcome {
 ///
 /// Declared beside the answer that carries it: the point route is its only
 /// producer and the native definition adapter its only reader.
-pub(crate) struct SelectedRustMemberAttribution {
-    pub(crate) target: SemanticId,
-    pub(crate) owner: CodeUnit,
-    pub(crate) reach: SelectedRustMemberReach,
+#[doc(hidden)]
+pub struct SelectedRustMemberAttribution {
+    #[doc(hidden)]
+    pub target: SemanticId,
+    #[doc(hidden)]
+    pub owner: CodeUnit,
+    #[doc(hidden)]
+    pub reach: SelectedRustMemberReach,
 }
 
 /// The typed producer frontier for one gap retained by this Rust lookup.
@@ -2024,7 +2687,8 @@ pub(crate) struct SelectedRustMemberAttribution {
 /// attribute frontier is the generated-item or scope/binder gap that does not
 /// join an invocation input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedRustGapFrontierKind {
+#[doc(hidden)]
+pub enum SelectedRustGapFrontierKind {
     ExplicitMacroInvocation,
     GeneratedItemSurface,
     UnsupportedScopeOrBinder,
@@ -2032,14 +2696,16 @@ pub(crate) enum SelectedRustGapFrontierKind {
 }
 
 impl SelectedRustGapFrontierKind {
-    pub(crate) const fn is_attribute_macro_frontier(self) -> bool {
+    #[doc(hidden)]
+    pub const fn is_attribute_macro_frontier(self) -> bool {
         matches!(
             self,
             Self::GeneratedItemSurface | Self::UnsupportedScopeOrBinder
         )
     }
 
-    pub(crate) const fn evidence_name(self) -> &'static str {
+    #[doc(hidden)]
+    pub const fn evidence_name(self) -> &'static str {
         match self {
             Self::ExplicitMacroInvocation => "explicit_macro_invocation",
             Self::GeneratedItemSurface => "GeneratedItemSurface",
@@ -2050,13 +2716,17 @@ impl SelectedRustGapFrontierKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedRustGapFrontier {
-    pub(crate) semantic: SemanticId,
-    pub(crate) kind: SelectedRustGapFrontierKind,
+#[doc(hidden)]
+pub struct SelectedRustGapFrontier {
+    #[doc(hidden)]
+    pub semantic: SemanticId,
+    #[doc(hidden)]
+    pub kind: SelectedRustGapFrontierKind,
 }
 
 /// How the Rust member lookup got from the qualifier's own type to the owner.
-pub(crate) enum SelectedRustMemberReach {
+#[doc(hidden)]
+pub enum SelectedRustMemberReach {
     /// The qualifier's own type declares the member. `declared_by_trait_implementation`
     /// says whether the declaration sits in an `impl Trait for Type` block,
     /// which is what makes a direct find a trait dispatch rather than an
@@ -2077,13 +2747,20 @@ pub(crate) enum SelectedRustMemberReach {
 /// activated model can account for that exact expansion without parsing a
 /// diagnostic string or discharging unrelated incomplete bindings.
 #[derive(Clone, Debug)]
-pub(crate) struct SelectedRustMacroExpansionGap {
-    pub(crate) semantic: SemanticId,
-    pub(crate) relative_path: String,
-    pub(crate) start_byte: usize,
-    pub(crate) end_byte: usize,
-    pub(crate) macro_name: String,
-    pub(crate) private_module_route: bool,
+#[doc(hidden)]
+pub struct SelectedRustMacroExpansionGap {
+    #[doc(hidden)]
+    pub semantic: SemanticId,
+    #[doc(hidden)]
+    pub relative_path: String,
+    #[doc(hidden)]
+    pub start_byte: usize,
+    #[doc(hidden)]
+    pub end_byte: usize,
+    #[doc(hidden)]
+    pub macro_name: String,
+    #[doc(hidden)]
+    pub private_module_route: bool,
 }
 
 /// Whether a Rust reference that reached a block-local item is decided.
@@ -2111,7 +2788,8 @@ pub(crate) struct SelectedRustMacroExpansionGap {
 /// an `UnsupportedSemantic`, which is the shape the producer's gap takes. An
 /// answer that also reached a workspace definition, or that carries a
 /// boundary or any other reason kind, keeps its incompleteness.
-pub(crate) fn rust_block_local_binding_is_decided(
+#[doc(hidden)]
+pub fn rust_block_local_binding_is_decided(
     definitions: &[CodeUnit],
     lexical: &[LexicalDefinition],
     completion: &ResolutionCompletion,
@@ -2126,30 +2804,80 @@ pub(crate) fn rust_block_local_binding_is_decided(
         )))
 }
 
-pub(crate) struct SelectedRustReferenceAnswer<T = ()> {
-    pub(crate) macro_expansion_gaps: Vec<SelectedRustMacroExpansionGap>,
-    pub(crate) generated_surface_gaps: Vec<SemanticId>,
-    pub(crate) retained_gap_frontiers: Vec<SelectedRustGapFrontier>,
-    pub(crate) enumeration: Option<(ProjectFile, ResolutionCompletion)>,
-    pub(crate) inventory_details: Vec<String>,
+#[doc(hidden)]
+pub struct SelectedRustReferenceAnswer<T = ()> {
+    #[doc(hidden)]
+    pub macro_expansion_gaps: Vec<SelectedRustMacroExpansionGap>,
+    #[doc(hidden)]
+    pub generated_surface_gaps: Vec<SemanticId>,
+    #[doc(hidden)]
+    pub retained_gap_frontiers: Vec<SelectedRustGapFrontier>,
+    #[doc(hidden)]
+    pub enumeration: Option<(ProjectFile, ResolutionCompletion)>,
+    #[doc(hidden)]
+    pub inventory_details: Vec<String>,
     /// The stable name and evidence of each named reason the binding's
     /// completion carries (`SelectedContextIdentities::named_semantic`), so a
     /// reply can say which dead end an incomplete answer stopped at.
-    pub(crate) named_reasons: Vec<(&'static str, String)>,
-    pub(crate) resolution: FactResolutionAnswer,
-    pub(crate) definitions: Vec<CodeUnit>,
-    pub(crate) lexical_definitions: Vec<LexicalDefinition>,
+    #[doc(hidden)]
+    pub named_reasons: Vec<(&'static str, String)>,
+    #[doc(hidden)]
+    pub resolution: FactResolutionAnswer,
+    #[doc(hidden)]
+    pub definitions: Vec<CodeUnit>,
+    #[doc(hidden)]
+    pub lexical_definitions: Vec<LexicalDefinition>,
     /// The name each of the binding's own targets projects to, in the order
     /// `project_rust_source_definitions` returned them. A diagnostic that
     /// names a semantic can spell it when it is one of these; the presentation
     /// vocabularies below deliberately drop the semantic each row came from.
-    pub(crate) definition_names: Vec<(SemanticId, String)>,
+    #[doc(hidden)]
+    pub definition_names: Vec<(SemanticId, String)>,
     /// Original structured import paths for external-boundary reasons.
-    pub(crate) boundary_import_names: Vec<String>,
+    #[doc(hidden)]
+    pub boundary_import_names: Vec<String>,
     /// Member attribution for the targets the member lookup itself selected.
     /// A target reached lexically or through a module route has no row.
-    pub(crate) member_attributions: Vec<SelectedRustMemberAttribution>,
-    pub(crate) projection: T,
+    #[doc(hidden)]
+    pub member_attributions: Vec<SelectedRustMemberAttribution>,
+    #[doc(hidden)]
+    pub projection: T,
+}
+
+impl<T> SelectedRustReferenceAnswer<T> {
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        boundary_import_names: Vec<String>,
+        macro_expansion_gaps: Vec<SelectedRustMacroExpansionGap>,
+        generated_surface_gaps: Vec<SemanticId>,
+        retained_gap_frontiers: Vec<SelectedRustGapFrontier>,
+        enumeration: Option<(ProjectFile, ResolutionCompletion)>,
+        inventory_details: Vec<String>,
+        named_reasons: Vec<(&'static str, String)>,
+        resolution: FactResolutionAnswer,
+        definitions: Vec<CodeUnit>,
+        lexical_definitions: Vec<LexicalDefinition>,
+        definition_names: Vec<(SemanticId, String)>,
+        member_attributions: Vec<SelectedRustMemberAttribution>,
+        projection: T,
+    ) -> Self {
+        Self {
+            boundary_import_names,
+            macro_expansion_gaps,
+            generated_surface_gaps,
+            retained_gap_frontiers,
+            enumeration,
+            inventory_details,
+            named_reasons,
+            resolution,
+            definitions,
+            lexical_definitions,
+            definition_names,
+            member_attributions,
+            projection,
+        }
+    }
 }
 
 /// The vocabularies a point route publishes one projected Rust definition
@@ -2212,14 +2940,19 @@ fn split_projected_rust_definitions(
     })
 }
 
-pub(crate) struct SelectedRustTypeProjection {
-    pub(crate) named_reasons: Vec<(&'static str, String)>,
-    pub(crate) nominal_types: Vec<(SemanticId, SelectedRustSourceDefinition)>,
-    pub(crate) intrinsic_types: Box<[crate::analyzer::resolution::FactIntrinsicTypeDescriptor]>,
+#[doc(hidden)]
+pub struct SelectedRustTypeProjection {
+    #[doc(hidden)]
+    pub named_reasons: Vec<(&'static str, String)>,
+    #[doc(hidden)]
+    pub nominal_types: Vec<(SemanticId, SelectedRustSourceDefinition)>,
+    #[doc(hidden)]
+    pub intrinsic_types: Box<[crate::analyzer::resolution::FactIntrinsicTypeDescriptor]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedReferenceSourceSite {
+#[doc(hidden)]
+pub struct SelectedReferenceSourceSite {
     reference: SemanticId,
     file: ProjectFile,
     metadata: Option<FactReferenceSiteMetadata>,
@@ -2227,15 +2960,18 @@ pub(crate) struct SelectedReferenceSourceSite {
 }
 
 impl SelectedReferenceSourceSite {
-    pub(crate) const fn reference(&self) -> SemanticId {
+    #[doc(hidden)]
+    pub const fn reference(&self) -> SemanticId {
         self.reference
     }
 
-    pub(crate) fn file(&self) -> &ProjectFile {
+    #[doc(hidden)]
+    pub fn file(&self) -> &ProjectFile {
         &self.file
     }
 
-    pub(crate) const fn metadata(&self) -> Option<FactReferenceSiteMetadata> {
+    #[doc(hidden)]
+    pub const fn metadata(&self) -> Option<FactReferenceSiteMetadata> {
         self.metadata
     }
 
@@ -2245,46 +2981,61 @@ impl SelectedReferenceSourceSite {
     /// means the reference has no enclosing unit -- the file root owns it, or
     /// its enclosing declaration is one the parser publishes no `CodeUnit` for,
     /// such as a block-local `fn`. `Some(Some(_))` is one exact declaration.
-    pub(crate) fn enclosing(&self) -> Option<Option<&CodeUnit>> {
+    #[doc(hidden)]
+    pub fn enclosing(&self) -> Option<Option<&CodeUnit>> {
         self.enclosing.as_ref().map(Option::as_ref)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedReferenceSearchAnswer {
-    answer: ReferenceSearchAnswer,
-    source_sites: Box<[SelectedReferenceSourceSite]>,
+#[doc(hidden)]
+pub struct SelectedReferenceSearchAnswer {
+    #[doc(hidden)]
+    pub answer: ReferenceSearchAnswer,
+    #[doc(hidden)]
+    pub source_sites: Box<[SelectedReferenceSourceSite]>,
 }
 
 impl SelectedReferenceSearchAnswer {
-    pub(crate) fn answer(&self) -> &ReferenceSearchAnswer {
+    #[doc(hidden)]
+    pub fn answer(&self) -> &ReferenceSearchAnswer {
         &self.answer
     }
 
-    pub(crate) fn references(&self) -> &[SemanticId] {
+    #[doc(hidden)]
+    pub fn references(&self) -> &[SemanticId] {
         self.answer.references()
     }
 
-    pub(crate) fn completion(&self) -> &ResolutionCompletion {
+    #[doc(hidden)]
+    pub fn completion(&self) -> &ResolutionCompletion {
         self.answer.completion()
     }
 
-    pub(crate) fn source_sites(&self) -> &[SelectedReferenceSourceSite] {
+    #[doc(hidden)]
+    pub fn source_sites(&self) -> &[SelectedReferenceSourceSite] {
         &self.source_sites
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedRustBindingSite {
-    file: ProjectFile,
-    metadata: Option<FactReferenceSiteMetadata>,
-    owner: SelectedRustBindingOwner,
-    definitions: Box<[SelectedRustBindingDefinition]>,
-    completion: ResolutionCompletion,
+#[doc(hidden)]
+pub struct SelectedRustBindingSite {
+    #[doc(hidden)]
+    pub file: ProjectFile,
+    #[doc(hidden)]
+    pub metadata: Option<FactReferenceSiteMetadata>,
+    #[doc(hidden)]
+    pub owner: SelectedRustBindingOwner,
+    #[doc(hidden)]
+    pub definitions: Box<[SelectedRustBindingDefinition]>,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SelectedRustBindingOwner {
+#[doc(hidden)]
+pub enum SelectedRustBindingOwner {
     Unknown,
     FileRoot,
     Definition(CodeUnit),
@@ -2292,62 +3043,77 @@ pub(crate) enum SelectedRustBindingOwner {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum SelectedRustBindingDefinition {
+#[doc(hidden)]
+pub enum SelectedRustBindingDefinition {
     Stable(SemanticId),
 }
 
 impl SelectedRustBindingSite {
-    pub(crate) fn file(&self) -> &ProjectFile {
+    #[doc(hidden)]
+    pub fn file(&self) -> &ProjectFile {
         &self.file
     }
 
-    pub(crate) const fn metadata(&self) -> Option<FactReferenceSiteMetadata> {
+    #[doc(hidden)]
+    pub const fn metadata(&self) -> Option<FactReferenceSiteMetadata> {
         self.metadata
     }
 
-    pub(crate) const fn owner(&self) -> &SelectedRustBindingOwner {
+    #[doc(hidden)]
+    pub const fn owner(&self) -> &SelectedRustBindingOwner {
         &self.owner
     }
 
-    pub(crate) fn definitions(&self) -> &[SelectedRustBindingDefinition] {
+    #[doc(hidden)]
+    pub fn definitions(&self) -> &[SelectedRustBindingDefinition] {
         &self.definitions
     }
 
-    pub(crate) const fn completion(&self) -> &ResolutionCompletion {
+    #[doc(hidden)]
+    pub const fn completion(&self) -> &ResolutionCompletion {
         &self.completion
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedRustBindingWorld {
-    target: SelectedRustBindingDefinition,
-    sites: Box<[SelectedRustBindingSite]>,
-    completion: ResolutionCompletion,
+#[doc(hidden)]
+pub struct SelectedRustBindingWorld {
+    #[doc(hidden)]
+    pub target: SelectedRustBindingDefinition,
+    #[doc(hidden)]
+    pub sites: Box<[SelectedRustBindingSite]>,
+    #[doc(hidden)]
+    pub completion: ResolutionCompletion,
 }
 
 impl SelectedRustBindingWorld {
-    pub(crate) const fn target(&self) -> &SelectedRustBindingDefinition {
+    #[doc(hidden)]
+    pub const fn target(&self) -> &SelectedRustBindingDefinition {
         &self.target
     }
 
-    pub(crate) fn sites(&self) -> &[SelectedRustBindingSite] {
+    #[doc(hidden)]
+    pub fn sites(&self) -> &[SelectedRustBindingSite] {
         &self.sites
     }
 
-    pub(crate) const fn completion(&self) -> &ResolutionCompletion {
+    #[doc(hidden)]
+    pub const fn completion(&self) -> &ResolutionCompletion {
         &self.completion
     }
 }
 
 impl<'store> SelectedResolutionOperation<'store, '_> {
-    pub(crate) fn go_point_candidate_read_stats(&self) -> Option<(usize, usize)> {
+    #[doc(hidden)]
+    pub fn go_point_candidate_read_stats(&self) -> Option<(usize, usize)> {
         self.ready
             .go_candidate_gap_cache
             .as_ref()
             .map(|cache| cache.offered_row_stats())
     }
 
-    pub(crate) fn mounts(&self) -> Result<&[SelectedResolutionOperationMount]> {
+    #[doc(hidden)]
+    pub fn mounts(&self) -> Result<&[SelectedResolutionOperationMount]> {
         if self.enumerated_mounts.get().is_none() {
             assert!(
                 self.enumerated_mounts
@@ -2363,7 +3129,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
 
     /// This operation's mount table, with the three readers every mount
     /// question goes through.
-    pub(crate) fn mount_table(&self) -> SelectedMountTable<'_, 'store> {
+    #[doc(hidden)]
+    pub fn mount_table(&self) -> SelectedMountTable<'_, 'store> {
         SelectedMountTable::new(&self.ready.inventory)
     }
 
@@ -2373,7 +3140,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// A root-less Rust graph build stages one crate at a time and combines
     /// their summaries, so the revalidation that used to end a single staging
     /// call belongs to the caller that owns the whole result.
-    pub(crate) fn finish_native<T>(
+    #[doc(hidden)]
+    pub fn finish_native<T>(
         &mut self,
         value: T,
         completion: &ResolutionCompletion,
@@ -2383,7 +3151,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     }
 
     /// The context set that carries none of this operation's own relations.
-    pub(crate) fn empty_contexts(
+    #[doc(hidden)]
+    pub fn empty_contexts(
         &self,
         reverse_inventory_completion: &ResolutionCompletion,
     ) -> Result<SelectedResolutionContextSet> {
@@ -2395,7 +3164,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         )
     }
 
-    pub(crate) fn project_rust_definitions(
+    #[doc(hidden)]
+    pub fn project_rust_definitions(
         &self,
         definitions: &[SemanticId],
         cancellation: &CancellationToken,
@@ -2409,7 +3179,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         )
     }
 
-    pub(crate) fn rust_definition_mount_for_target(
+    #[doc(hidden)]
+    pub fn rust_definition_mount_for_target(
         &self,
         target: &CodeUnit,
     ) -> Result<Option<SelectedResolutionMountOrdinal>> {
@@ -2426,7 +3197,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(Some(mount.ordinal()))
     }
 
-    pub(crate) fn selected_rust_definition_semantics_for_mount(
+    #[doc(hidden)]
+    pub fn selected_rust_definition_semantics_for_mount(
         &self,
         mount_ordinal: SelectedResolutionMountOrdinal,
         cancellation: &CancellationToken,
@@ -2480,7 +3252,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// This is the target-side counterpart of a source-site locator. Read the
     /// exact selected blob's crosswalk before comparing hydrated structured
     /// `CodeUnit` identity, including published replacement content.
-    pub(crate) fn locate_rust_definition(
+    #[doc(hidden)]
+    pub fn locate_rust_definition(
         &self,
         target: &CodeUnit,
         cancellation: &CancellationToken,
@@ -2567,7 +3340,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(true)
     }
 
-    pub(crate) fn locate_rust_binding_definition(
+    #[doc(hidden)]
+    pub fn locate_rust_binding_definition(
         &self,
         target: &CodeUnit,
         cancellation: &CancellationToken,
@@ -2592,7 +3366,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// reopening one definition query per graph node. Definitions without a
     /// parser-unit row, including locals and parameters, are intentionally
     /// absent.
-    pub(crate) fn rust_binding_definition_units(
+    #[doc(hidden)]
+    pub fn rust_binding_definition_units(
         &self,
         cancellation: &CancellationToken,
     ) -> Result<SelectedRustBindingDefinitionUnitsOutcome> {
@@ -2748,7 +3523,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
 
     /// Read macro input authority from the actual selected content mount.
     /// Replacements publish their own complete parsed source before opening.
-    fn rust_macro_capsule(&self, path: &str) -> Result<Option<SelectedMacroCapsule>> {
+    #[doc(hidden)]
+    pub fn rust_macro_capsule(&self, path: &str) -> Result<Option<SelectedMacroCapsule>> {
         let Some(mount) = self.mount_table().mount_for_path("rust", path)? else {
             return Ok(None);
         };
@@ -2766,7 +3542,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         )))
     }
 
-    fn selected_rust_usage_facts(
+    #[doc(hidden)]
+    pub fn selected_rust_usage_facts(
         &self,
         file: &Path,
         cancellation: &CancellationToken,
@@ -2838,7 +3615,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// The answer is held for this request (`SelectedTextualMacroWalkMemo`),
     /// because the overlay asks the identical question twice per invocation
     /// and the frontier asks it a third time.
-    fn select_textual_macro_definition(
+    #[doc(hidden)]
+    pub fn select_textual_macro_definition(
         &self,
         caller: &Path,
         invocation_start: usize,
@@ -3233,7 +4011,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(())
     }
 
-    pub(crate) fn match_selected_textual_macro(
+    #[doc(hidden)]
+    pub fn match_selected_textual_macro(
         &self,
         caller: &std::path::Path,
         invocation_start: usize,
@@ -3288,9 +4067,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                     "selected textual macro has no canonical definition: {file:?}, {declaration:?}"
                 ))
             })?;
-        let Some(inputs) = invocation_mount.macro_rows().input_rows(
+        let Some(inputs) = invocation_mount.macro_rows().invocation_input_rows(
             connection,
             invocation_mount.blob_id(),
+            arguments_start,
             &|| !cancellation.is_cancelled(),
         )?
         else {
@@ -3353,7 +4133,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(outcome)
     }
 
-    fn clear_selected_macro_overlay(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn clear_selected_macro_overlay(&self) -> Result<()> {
         super::resolution_stage::SelectedResolutionStage::new(&self.ready.inventory)
             .clear_facts()?;
         let mut slot = self.ready.macro_overlay.borrow_mut();
@@ -3768,6 +4549,18 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 let Some(provenance) = persisted.node_provenance(checkpoint, cancellation)? else {
                     return Ok(SelectedResolutionStageOutcome::Cancelled);
                 };
+                let Some(checkpoint_scopes) =
+                    persisted.node_scope_ordinals(std::iter::once(checkpoint), cancellation)?
+                else {
+                    return Ok(SelectedResolutionStageOutcome::Cancelled);
+                };
+                let checkpoint_scope = checkpoint_scopes[&checkpoint].map(|(owner, scope)| {
+                    assert_eq!(
+                        owner, fragment,
+                        "a macro checkpoint scope belongs to the capsule's host"
+                    );
+                    scope
+                });
                 let checkpoint = match provenance {
                     Some(SelectedNodeProvenance::FragmentLocal(local)) => local.identity(),
                     Some(SelectedNodeProvenance::Stage(stage)) => stage.identity(),
@@ -3800,6 +4593,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 let Some(artifact) = artifact.instantiate_macro_input(
                     selected_macro_capture_digest(input.invocation, &input.tree, &arm),
                     checkpoint,
+                    checkpoint_scope,
                     module_scope,
                     cancellation,
                 ) else {
@@ -3923,7 +4717,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                             .collect::<Vec<_>>()
                     };
                     occurrence_start_lines = Some(loaded_occurrence_start_lines);
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     SELECTED_MACRO_OCCURRENCE_LINE_QUERY_COUNT
                         .with(|count| count.set(count.get() + 1));
                 }
@@ -4398,12 +5192,14 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// otherwise accumulate one `RustUsageFacts` per file every stage's walks
     /// read. Nothing else in the request refers to these answers, so dropping
     /// them can only cost a reread.
-    fn clear_selected_macro_walk_answers(&self) {
+    #[doc(hidden)]
+    pub fn clear_selected_macro_walk_answers(&self) {
         *self.ready.macro_walk.borrow_mut() = SelectedTextualMacroWalkMemo::default();
     }
 
     /// Prepare generated frontiers only for files admitted by this query.
-    fn prepare_selected_macro_frontiers_for_files(
+    #[doc(hidden)]
+    pub fn prepare_selected_macro_frontiers_for_files(
         &self,
         files: &[&Path],
         cancellation: &CancellationToken,
@@ -4482,15 +5278,13 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             let Some(mount) = self.rust_macro_capsule(&selected_path_key(caller))? else {
                 continue;
             };
-            let Some(inputs) = mount.macro_rows().input_rows(
-                self.ready.inventory.connection(),
-                mount.blob_id(),
-                &|| !cancellation.is_cancelled(),
-            )?
-            else {
+            if cancellation.is_cancelled() {
                 return Ok(SelectedResolutionStageOutcome::Cancelled);
-            };
-            if !inputs.is_empty() {
+            }
+            if mount
+                .macro_rows()
+                .has_inputs(self.ready.inventory.connection(), mount.blob_id())?
+            {
                 macro_files.push(mount.mount().persisted_relative_path().to_owned());
             }
         }
@@ -4530,7 +5324,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(SelectedResolutionStageOutcome::Ready)
     }
 
-    fn prepare_selected_macro_frontiers(
+    #[doc(hidden)]
+    pub fn prepare_selected_macro_frontiers(
         &self,
         caller: &Path,
         cancellation: &CancellationToken,
@@ -4770,7 +5565,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         )))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn attach_active_reverse_sql_work_trace(&self) {
         if !rust_reverse_rows::reverse_sql_work_trace_active() {
             return;
@@ -4778,7 +5573,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         rust_reverse_rows::attach_reverse_sql_work_trace(self.ready.inventory.connection());
     }
 
-    fn ensure_selected_rust_inputs(&self, cancellation: &CancellationToken) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn ensure_selected_rust_inputs(&self, cancellation: &CancellationToken) -> Result<bool> {
         Ok(!cancellation.is_cancelled())
     }
 
@@ -4884,7 +5680,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// The scope's sources own the import and reference halves a bridge can
     /// leave from; its targets own the export halves a bridge can land on.
     /// Nothing outside those two mount sets is probed.
-    fn rust_root_halves(
+    #[doc(hidden)]
+    pub fn rust_root_halves(
         &self,
         scope: &RustRootHalfScope,
         cancellation: &CancellationToken,
@@ -5177,10 +5974,27 @@ fn unexpanded_item_macro_gaps(
     });
     let connection = ready.inventory.connection();
     let mut names = Vec::new();
+    let mut inventories = HashSet::default();
     for reason in reasons.iter() {
-        let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason else {
-            continue;
+        let semantic = match reason {
+            ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+            | ResolutionIncompleteReason::OpenBoundary {
+                semantic,
+                status: crate::analyzer::structural::BoundaryStatus::WorkspaceLocal,
+            } => semantic,
+            _ => continue,
         };
+        if let Some(("UnsupportedMacroGeneratedModule", detail)) =
+            ready.context_identities.named_reason(*semantic)
+        {
+            if inventories.insert(*semantic) {
+                names.extend(inventory_macro_gaps(ready, &detail, *semantic)?);
+            }
+            continue;
+        }
+        if !matches!(reason, ResolutionIncompleteReason::UnsupportedSemantic(_)) {
+            continue;
+        }
         let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
             continue;
         };
@@ -5628,7 +6442,8 @@ fn project_rust_definitions(
     )
 }
 
-fn project_rust_source_definitions(
+#[doc(hidden)]
+pub fn project_rust_source_definitions(
     ready: &ReadySelectedResolution<'_, '_>,
     mounts: SelectedMountTable<'_, '_>,
     definitions: &[SemanticId],
@@ -5991,6 +6806,115 @@ fn boundary_import_names(
     Ok(names)
 }
 
+/// Project the parser-selected site; source text is used only to render its spelling.
+fn obligation_site_details(
+    ready: &ReadySelectedResolution<'_, '_>,
+    ordinal: u32,
+    site: i64,
+) -> Result<Option<serde_json::Value>> {
+    let mount = ready
+        .inventory
+        .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+    let range = ready.inventory.connection().prepare_cached(
+        "SELECT COALESCE(site.start_byte, declaration.name_start_byte, declaration.start_byte),
+                COALESCE(site.end_byte, declaration.name_end_byte, declaration.end_byte)
+         FROM resolution_sites AS site
+         LEFT JOIN source_native_declaration_bridges AS bridge
+           ON bridge.blob_id=site.blob_id AND bridge.source_site=site.site
+         LEFT JOIN source_declarations AS declaration
+           ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
+         WHERE site.blob_id=?1 AND site.site=?2"
+    )?.query_row(rusqlite::params![mount.blob_id(), site], |row| {
+        Ok((row.get::<_, Option<usize>>(0)?, row.get::<_, Option<usize>>(1)?))
+    }).optional()?;
+    let Some((Some(start), Some(end))) = range else {
+        return Ok(None);
+    };
+    let file = ProjectFile::new(ready.project.root(), mount.persisted_relative_path());
+    let source = ready.project.read_source(&file)?;
+    let spelling = source.get(start..end).ok_or_else(|| {
+        StoreError::corrupt(format!(
+            "obligation site range {start}..{end} is invalid in {}",
+            mount.persisted_relative_path()
+        ))
+    })?;
+    let starts = brokk_bifrost_core::text_utils::compute_line_starts(&source);
+    let (line, column) =
+        brokk_bifrost_core::text_utils::line_column_for_offset(&source, &starts, start);
+    Ok(Some(
+        serde_json::json!({"path": mount.persisted_relative_path(), "line": line,
+        "column": column, "spelling": spelling}),
+    ))
+}
+
+fn persisted_obligation_details(
+    ready: &ReadySelectedResolution<'_, '_>,
+    semantic: SemanticId,
+) -> Result<Option<(&'static str, String)>> {
+    let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
+        return Ok(None);
+    };
+    let mount = ready
+        .inventory
+        .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+    // Preserve other frontends' existing diagnostic contracts.
+    if !matches!(
+        mount.semantic_language(),
+        Language::Kotlin | Language::Java | Language::Scala
+    ) {
+        return Ok(None);
+    }
+    let gap = ready
+        .inventory
+        .connection()
+        .prepare_cached(
+            "SELECT site, origin FROM resolution_gap_reasons WHERE blob_id=?1 AND reason=?2",
+        )?
+        .query_row(rusqlite::params![mount.blob_id(), key], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .optional()?;
+    let (site, origin) = if let Some((site, origin)) = gap {
+        (
+            site,
+            super::resolution_prepare::resolution_rows::gap_origin_from_code(origin),
+        )
+    } else {
+        let property = ready.inventory.connection().prepare_cached(
+            "SELECT site, kind FROM resolution_definition_property_gaps WHERE blob_id=?1 AND reason=?2"
+        )?.query_row(rusqlite::params![mount.blob_id(), key], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        }).optional()?;
+        let Some((site, kind)) = property else {
+            return Ok(None);
+        };
+        let property = super::resolution_prepare::typed_rows::decode_definition_property_gap_fields(
+            semantic, kind, semantic, semantic, site,
+        );
+        (
+            site,
+            crate::analyzer::resolution::LoweringGapOrigin::Extracted(property.kind()),
+        )
+    };
+    use crate::analyzer::resolution::LoweringGapOrigin;
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+    let kind = match origin {
+        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability) => {
+            "UnsupportedCallApplicability"
+        }
+        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedHierarchyTraversal) => {
+            "UnsupportedHierarchyTraversal"
+        }
+        _ => "UnsupportedSemantic",
+    };
+    Ok(Some((
+        kind,
+        serde_json::json!({"kind": kind, "semantic": origin.kind().label(),
+        "site": obligation_site_details(ready, ordinal, site)?})
+        .to_string(),
+    )))
+}
+
 /// The named reasons among a completion's incompleteness reasons, sorted:
 /// those a context minted by name, and the request-staged reasons, which carry
 /// supplemental coordinates no persisted row names.
@@ -6019,6 +6943,10 @@ fn named_reason_details(
         };
         if let Some((name, evidence)) = ready.context_identities.named_reason(*semantic) {
             named.push((name, evidence.to_string()));
+            continue;
+        }
+        if let Some(detail) = persisted_obligation_details(ready, *semantic)? {
+            named.push(detail);
             continue;
         }
         let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
@@ -6060,9 +6988,30 @@ fn named_reason_details(
             .to_string(),
         ));
     }
+    for (_, evidence) in &mut named {
+        *evidence = feature_invariant_reason_json(std::mem::take(evidence));
+    }
     named.sort_unstable();
     named.dedup();
     Ok(named)
+}
+
+/// Render reason evidence with sorted object keys when it is JSON.
+///
+/// `serde_json` orders object keys by insertion only under its
+/// `preserve_order` feature, and Cargo unifies that feature into this crate
+/// whenever a build also selects a crate that enables it (the policy crate's
+/// tests do). Messages built with `json!` would otherwise render differently
+/// in a workspace build and a single-crate build (#6112). Plain-text evidence
+/// is returned unchanged.
+pub(super) fn feature_invariant_reason_json(evidence: String) -> String {
+    match serde_json::from_str::<serde_json::Value>(&evidence) {
+        Ok(mut value) => {
+            value.sort_all_objects();
+            value.to_string()
+        }
+        Err(_) => evidence,
+    }
 }
 
 /// Turn one resolved reference into a projected answer.
@@ -6260,8 +7209,13 @@ fn assemble_rust_reference_answer<T>(
                 let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason else {
                     unreachable!("inventory reasons are unsupported semantic identities")
                 };
-                macro_expansion_gaps.extend(inventory_macro_gaps(ready, &detail, semantic)?);
-                inventory_details.push(detail);
+                // Named completion evidence already publishes this identity.
+                // Keep its invocation coordinates without publishing the same
+                // inventory again through a differently ordered JSON object.
+                if ready.context_identities.named_reason(semantic).is_none() {
+                    macro_expansion_gaps.extend(inventory_macro_gaps(ready, &detail, semantic)?);
+                    inventory_details.push(detail);
+                }
             }
         }
     }
@@ -6446,7 +7400,8 @@ fn project_rust_member_attributions(
 /// Resolve selected membership and language for one requested fragment.
 /// Persisted metadata uses the request-owned keyed row memo; SQL failure is
 /// distinct from a fragment that is not selected.
-fn selected_mount_lookup<'a>(
+#[doc(hidden)]
+pub fn selected_mount_lookup<'a>(
     mounts: SelectedMountTable<'a, '_>,
 ) -> impl Fn(BindingFragmentId) -> Result<Option<(SelectedResolutionMountOrdinal, Language)>> + 'a {
     move |fragment| {
@@ -6513,7 +7468,8 @@ fn empty_contexts_for(
 /// this crate or one of its dependencies mounts, so the rest cannot land a
 /// bridge either. Reading the workspace's halves in order to use this many is
 /// the crate-sized context R8.6 removes.
-pub(crate) struct RustRootHalfScope {
+#[doc(hidden)]
+pub struct RustRootHalfScope {
     sources: RustRootHalfMounts,
     targets: RustRootHalfMounts,
 }
@@ -6544,7 +7500,8 @@ impl RustRootHalfMounts {
 }
 
 impl RustRootHalfScope {
-    pub(crate) fn new<'mount>(
+    #[doc(hidden)]
+    pub fn new<'mount>(
         sources: impl IntoIterator<Item = &'mount SelectedResolutionOperationMount>,
         targets: impl IntoIterator<Item = &'mount SelectedResolutionOperationMount>,
     ) -> Self {
@@ -7271,13 +8228,14 @@ struct SelectedMacroBindingTarget {
     node: BindingNodeId,
 }
 
-enum LocatedSemantic {
+#[doc(hidden)]
+pub enum LocatedSemantic {
     Found(SemanticId),
     Missing,
     Cancelled,
 }
 
-enum LocatedSemantics {
+pub(crate) enum LocatedSemantics {
     Found(Vec<SemanticId>),
     Missing,
     Cancelled,
@@ -7291,7 +8249,16 @@ enum SelectedDefinitionRoot<'locator> {
     },
 }
 
-enum ContextRegistrationOutcome {
+/// Borrowed cells to register for one context; full consumers pass the whole
+/// blueprint, while named contexts pass only their operation-owned delta.
+struct SelectedContextRegistrationCells<'a> {
+    shared: &'a [ResolutionSemanticIdentity],
+    boundaries: &'a [BindingNodeId],
+    gaps: &'a BTreeSet<SemanticId>,
+}
+
+#[doc(hidden)]
+pub enum ContextRegistrationOutcome {
     Ready,
     Cancelled,
 }
@@ -7348,7 +8315,8 @@ fn register_selected_rust_caller_context_in_session(
 
 /// Operation-local work used to validate and compile selected context.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SelectedResolutionContextMetrics;
+#[doc(hidden)]
+pub struct SelectedResolutionContextMetrics;
 
 impl SelectedResolutionContextMetrics {
     fn assert_fresh(&self) {
@@ -7359,49 +8327,59 @@ impl SelectedResolutionContextMetrics {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SelectedResolutionBoundarySnapshotForTest {
-    universal_root: SelectedNodeProvenance,
-    boundaries: Box<[(BindingNodeId, SelectedNodeProvenance)]>,
-    callable_static_import_boundaries: Box<[BindingNodeId]>,
+#[doc(hidden)]
+pub struct SelectedResolutionBoundarySnapshotForTest {
+    #[doc(hidden)]
+    pub universal_root: SelectedNodeProvenance,
+    #[doc(hidden)]
+    pub boundaries: Box<[(BindingNodeId, SelectedNodeProvenance)]>,
+    #[doc(hidden)]
+    pub callable_static_import_boundaries: Box<[BindingNodeId]>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl SelectedResolutionBoundarySnapshotForTest {
-    pub(crate) const fn universal_root(&self) -> SelectedNodeProvenance {
+    #[doc(hidden)]
+    pub const fn universal_root(&self) -> SelectedNodeProvenance {
         self.universal_root
     }
 
-    pub(crate) fn boundaries(&self) -> &[(BindingNodeId, SelectedNodeProvenance)] {
+    #[doc(hidden)]
+    pub fn boundaries(&self) -> &[(BindingNodeId, SelectedNodeProvenance)] {
         &self.boundaries
     }
 
-    pub(crate) fn callable_static_import_boundaries(&self) -> &[BindingNodeId] {
+    #[doc(hidden)]
+    pub fn callable_static_import_boundaries(&self) -> &[BindingNodeId] {
         &self.callable_static_import_boundaries
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static SELECTED_RESOLUTION_BOUNDARY_SNAPSHOT: std::cell::RefCell<
         Option<SelectedResolutionBoundarySnapshotForTest>
     > = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_selected_resolution_boundary_snapshot_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_selected_resolution_boundary_snapshot_for_test() {
     SELECTED_RESOLUTION_BOUNDARY_SNAPSHOT.with(|snapshot| *snapshot.borrow_mut() = None);
 }
 
-#[cfg(test)]
-pub(crate) fn selected_resolution_boundary_snapshot_for_test()
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn selected_resolution_boundary_snapshot_for_test()
 -> Option<SelectedResolutionBoundarySnapshotForTest> {
     SELECTED_RESOLUTION_BOUNDARY_SNAPSHOT.with(|snapshot| snapshot.borrow().clone())
 }
 
 impl AnalyzerStore {
-    pub(crate) fn open_selected_resolution_operation<'store, 'project, 'selection>(
+    #[doc(hidden)]
+    pub fn open_selected_resolution_operation<'store, 'project, 'selection>(
         &'store self,
         input: SelectedResolutionOperationInput<'project, 'selection>,
         cancellation: &CancellationToken,
@@ -7421,17 +8399,23 @@ impl AnalyzerStore {
                             go_package_member_indexes: RefCell::default(),
                             go_context_selections: RefCell::default(),
                             go_import_inputs: RefCell::default(),
-                            go_prepared_contexts: RefCell::default(),
+                            go_prepared_contexts: go_named::GoPreparedContextMemo::default(),
+                            go_context_registrations: RefCell::default(),
                             go_receiver_anchor_types_memo: RefCell::default(),
                             jvm_file_contexts: RefCell::default(),
+                            jvm_context_preparations: Default::default(),
+                            jvm_context_blueprints: Default::default(),
+                            jvm_context_registrations: RefCell::default(),
                             jvm_source_access_memo: RefCell::default(),
-                            jvm_implicit_project_memo: RefCell::default(),
+                            jvm_implicit_project_memo: Default::default(),
+                            jvm_implicit_project_contexts: Default::default(),
                             jvm_lookup_recipe_memo: RefCell::default(),
                             jvm_root_exports_memo: RefCell::default(),
                             jvm_import_target_memo: RefCell::default(),
                             jvm_alias_rows_memo: RefCell::default(),
                             jvm_generated_lookup_memo: RefCell::default(),
-                            jvm_package_member_memo: RefCell::default(),
+                            jvm_package_member_memo: Default::default(),
+                            jvm_package_indexes: RefCell::default(),
                             jvm_endpoint_memo: RefCell::default(),
                             jvm_visibility_memo: RefCell::default(),
                             jvm_member_import_memo: RefCell::default(),
@@ -7801,7 +8785,8 @@ fn validate_selected_overlay_authority(
 }
 
 impl SelectedResolutionOperation<'_, '_> {
-    pub(crate) fn resolve_reference(
+    #[doc(hidden)]
+    pub fn resolve_reference(
         mut self,
         context: SelectedResolutionContextSet,
         locator: &SelectedSemanticLocator,
@@ -7887,7 +8872,17 @@ impl SelectedResolutionOperation<'_, '_> {
             let persisted_typed = ready.typed_source();
             let observed_lexical = SeamProfiled::observing(&persisted_lexical);
             let observed_typed = SeamProfiled::observing(&persisted_typed);
-            let blueprint = match ready.collect_blueprint(context, cancellation)? {
+            let construction =
+                if jvm_demand::jvm_demand_storage_language(locator.storage_language()) {
+                    self.collect_jvm_blueprint_in_session(
+                        context,
+                        cancellation,
+                        &ResolutionSession::unbounded(),
+                    )?
+                } else {
+                    ready.collect_blueprint(context, cancellation)?
+                };
+            let blueprint = match construction {
                 SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
                 SelectedFactOperationBlueprintConstruction::Cancelled {
                     cancellation_completion,
@@ -7921,13 +8916,22 @@ impl SelectedResolutionOperation<'_, '_> {
                                 operation.set_go_receiver_slot_type_overlay(overlay);
                             }
                             if let Some(slot) = query_result_slot {
-                                operation.set_query_result_slot(reference, slot);
+                                if locator.role()
+                                    == crate::analyzer::resolution::LoweredSemanticRole::Definition
+                                {
+                                    operation.set_query_value_slot(reference, slot);
+                                } else {
+                                    operation.set_query_result_slot(reference, slot);
+                                }
                             }
                             setup(operation, reference)?;
                             let answer = operation.resolve_reference_with_metrics(
                                 reference,
                                 &mut resolution_metrics,
                             )?;
+                            if jvm_demand::jvm_demand_storage_language(locator.storage_language()) {
+                                self.profile_jvm_read("native_point_answer", (reference, &answer));
+                            }
                             let completion = answer.completion().clone();
                             Ok((
                                 SelectedResolutionLocated::Found(project(
@@ -7943,6 +8947,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             &observed_lexical,
                             &observed_typed,
                             locator.relative_path(),
+                            None,
                             cancellation,
                             session,
                             selected_import_gap,
@@ -8031,7 +9036,8 @@ impl SelectedResolutionOperation<'_, '_> {
         self.ready.finish(projected, &completion, cancellation)
     }
 
-    pub(crate) fn resolve_rust_reference(
+    #[doc(hidden)]
+    pub fn resolve_rust_reference(
         self,
         context: SelectedResolutionContextSet,
         locator: &SelectedSemanticLocator,
@@ -8053,7 +9059,8 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     /// Resolve and project one Rust reference while retaining exact lexical work.
-    pub(crate) fn resolve_rust_reference_with_metrics(
+    #[doc(hidden)]
+    pub fn resolve_rust_reference_with_metrics(
         self,
         context: SelectedResolutionContextSet,
         locator: &SelectedSemanticLocator,
@@ -8076,7 +9083,8 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
-    pub(crate) fn resolve_rust_reference_bounded(
+    #[doc(hidden)]
+    pub fn resolve_rust_reference_bounded(
         self,
         context: SelectedResolutionContextSet,
         locator: &SelectedSemanticLocator,
@@ -8111,7 +9119,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// semantic without building a reference context, for retained and dirty files.
     /// Selected crate prelude evidence for one caller. Multiple compilation
     /// contexts must agree; callers cannot assume std from the file's spelling.
-    pub(crate) fn rust_prelude_for_caller(
+    #[doc(hidden)]
+    pub fn rust_prelude_for_caller(
         &self,
         caller: &Path,
         cancellation: &CancellationToken,
@@ -8179,7 +9188,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Evaluate a reference site's cfg by searching assignments to its
     /// undecidable literals. The Boolean reports whether the answer depends
     /// on one of those assignments.
-    pub(crate) fn rust_cfg_activation_for_caller_under_site_cfg(
+    #[doc(hidden)]
+    pub fn rust_cfg_activation_for_caller_under_site_cfg(
         &self,
         caller: &Path,
         condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
@@ -8235,7 +9245,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// them in a `ResolutionConditionalBinderFact`. Which one the token is, is
     /// exactly what the reference route decides, so a range that also carries
     /// a reference has no declaration answer here and this route stands down.
-    pub(crate) fn rust_declaration_at_range_bounded(
+    #[doc(hidden)]
+    pub fn rust_declaration_at_range_bounded(
         &mut self,
         locator: &SelectedSemanticLocator,
         budget: ReceiverAnalysisBudget,
@@ -8310,22 +9321,48 @@ impl SelectedResolutionOperation<'_, '_> {
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
         point_metrics: &mut ResolutionBatchMetrics,
-    ) -> Result<BoundedResolution<SelectedRustCallerReferencesOutcome>> {
+    ) -> Result<
+        BoundedResolution<
+            reverse::ReverseBatch<
+                Vec<reverse::ReverseSessionReport<SelectedRustReferenceAnswer>>,
+                std::convert::Infallible,
+            >,
+        >,
+    > {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
-        let outcome = self.resolve_rust_references_for_caller_in_session(
-            caller,
-            locators,
-            cancellation,
-            context_metrics,
+        assert_eq!(
             point_metrics,
-            &session,
-            RustDeclarationAccessKind::CrateSet,
-            |_, _, _, _, _, _| Ok(SelectedResolutionOperationOutcome::Native(())),
-        )?;
+            &ResolutionBatchMetrics::default(),
+            "selected Rust point metrics must be fresh and default-valued"
+        );
+        let cancellation = session.cancellation().unwrap_or(cancellation);
+        let outcome = {
+            let mut lifecycle = RustReverseLifecycle {
+                selected: self,
+                caller,
+                access: RustDeclarationAccessKind::CrateSet,
+                cancellation,
+                session: &session,
+                context_metrics,
+                setup: |_: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+                        _: SemanticId| Ok(()),
+                project: |_: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+                          _: &FactResolutionAnswer,
+                          _: &ReadySelectedResolution<'_, '_>,
+                          _: SelectedMountTable<'_, '_>,
+                          _: &ResolutionSession,
+                          _: &CancellationToken| {
+                    Ok(SelectedResolutionOperationOutcome::Native(()))
+                },
+                marker: std::marker::PhantomData::<()>,
+            };
+            reverse::confirm_reverse_session(locators, &mut lifecycle)?
+        };
         Ok(session.finish(outcome))
     }
 
-    pub(crate) fn resolve_rust_reference_for_caller_bounded(
+    #[doc(hidden)]
+    pub fn resolve_rust_reference_for_caller_bounded(
         &mut self,
         caller: &std::path::Path,
         locator: &SelectedSemanticLocator,
@@ -8352,7 +9389,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// context once. Each locator carries its own bounded session, seeded with
     /// the work shared by the file operation, so one exhausted target cannot
     /// stop its siblings.
-    pub(crate) fn resolve_rust_references_for_caller_bounded_per_locator(
+    #[doc(hidden)]
+    pub fn resolve_rust_references_for_caller_bounded_per_locator(
         &mut self,
         caller: &Path,
         locators: &[&SelectedSemanticLocator],
@@ -8463,7 +9501,8 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
-    pub(crate) fn resolve_rust_reference_for_caller(
+    #[doc(hidden)]
+    pub fn resolve_rust_reference_for_caller(
         mut self,
         caller: &Path,
         locator: &SelectedSemanticLocator,
@@ -8485,7 +9524,8 @@ impl SelectedResolutionOperation<'_, '_> {
             .into_single())
     }
 
-    pub(crate) fn resolve_rust_binding_site_for_caller(
+    #[doc(hidden)]
+    pub fn resolve_rust_binding_site_for_caller(
         mut self,
         caller: &Path,
         locator: &SelectedSemanticLocator,
@@ -8548,7 +9588,8 @@ impl SelectedResolutionOperation<'_, '_> {
             .into_single())
     }
 
-    pub(crate) fn finish_rust_row_binding_world(
+    #[doc(hidden)]
+    pub fn finish_rust_row_binding_world(
         mut self,
         target: SelectedRustBindingDefinition,
         mut sites: Vec<SelectedRustBindingSite>,
@@ -8573,7 +9614,8 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
-    pub(crate) fn resolve_rust_type_for_caller_bounded(
+    #[doc(hidden)]
+    pub fn resolve_rust_type_for_caller_bounded(
         &mut self,
         caller: &Path,
         locator: &SelectedSemanticLocator,
@@ -8616,7 +9658,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// only), so a head that names one finds nothing lexically. It exists all
     /// the same, which is what the point route's route-head boundary claim
     /// must not deny.
-    pub(crate) fn rust_reference_names_macro_module(
+    #[doc(hidden)]
+    pub fn rust_reference_names_macro_module(
         &self,
         locator: &SelectedSemanticLocator,
         cancellation: &CancellationToken,
@@ -8660,7 +9703,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// (`forc_pkg` in `forc_pkg::Built`, or an alias bound to its root) finds
     /// nothing lexically. The crate is compiled by this workspace all the
     /// same, which is what the route-head boundary claim must not deny.
-    pub(crate) fn rust_reference_names_workspace_crate(
+    #[doc(hidden)]
+    pub fn rust_reference_names_workspace_crate(
         &self,
         locator: &SelectedSemanticLocator,
         cancellation: &CancellationToken,
@@ -8700,7 +9744,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// export lookup reach the item. A request whose files reach the item only
     /// under another name finds no staged definition and answers incomplete
     /// (`rust_crate_context::unstaged_macro_item`).
-    fn rust_macro_item_hosts(&self, files: &[&Path]) -> Result<Vec<PathBuf>> {
+    #[doc(hidden)]
+    pub fn rust_macro_item_hosts(&self, files: &[&Path]) -> Result<Vec<PathBuf>> {
         let connection = self.ready.inventory.connection();
         if !connection
             .prepare_cached(rust_crate_context::MACRO_ITEMS_PRESENT)?
@@ -8790,86 +9835,54 @@ impl SelectedResolutionOperation<'_, '_> {
             &CancellationToken,
         ) -> Result<SelectedResolutionOperationOutcome<T>>,
     ) -> Result<SelectedRustCallerReferencesOutcome<T>> {
-        // Each point request owns a fresh metric sink. Crate-context preparation
-        // is outside its receiver budget; native stitching charges this request.
         assert_eq!(
             point_metrics,
             &ResolutionBatchMetrics::default(),
             "selected Rust point metrics must be fresh and default-valued"
         );
-        if self
-            .mount_table()
-            .mount_for_path("rust", &selected_path_key(caller))?
-            .is_none()
-        {
-            return Ok(SelectedRustCallerReferencesOutcome::UnsupportedCallerProfile);
-        }
-        let operation_cancellation = session.cancellation().unwrap_or(cancellation);
-        // One preparation for every file this request asks about. Preparing
-        // them one at a time left all but the first without an overlay,
-        // because the preparer answers "already done" for whatever is set.
-        let mut macro_callers = vec![caller];
-        for path in locators
-            .iter()
-            .map(|locator| Path::new(locator.relative_path()))
-        {
-            if path != caller && !macro_callers.contains(&path) {
-                macro_callers.push(path);
-            }
-        }
-        match self
-            .prepare_selected_macro_frontiers_for_files(&macro_callers, operation_cancellation)?
-        {
-            SelectedResolutionStageOutcome::Ready => {}
-            SelectedResolutionStageOutcome::Cancelled => {
-                return Ok(SelectedRustCallerReferencesOutcome::Operation(
-                    SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                ));
-            }
-            SelectedResolutionStageOutcome::Stale(reason) => {
-                return Ok(SelectedRustCallerReferencesOutcome::Operation(
-                    SelectedResolutionOperationOutcome::Stale(reason),
-                ));
-            }
-            SelectedResolutionStageOutcome::Unavailable(reason) => {
-                return Ok(SelectedRustCallerReferencesOutcome::Operation(
-                    SelectedResolutionOperationOutcome::Unavailable(reason),
-                ));
-            }
-        }
-        let demand_timing = crate::profiling::scope("rust_caller::demand_preparation");
-        let prepared = match self.rust_demand_preparation_for_caller_in_session(
-            caller,
-            operation_cancellation,
-            Some(session),
-        )? {
-            SelectedRustCallerDemandOutcome::Ready(prepared) => prepared,
-            SelectedRustCallerDemandOutcome::Unavailable => {
-                return Ok(SelectedRustCallerReferencesOutcome::UnsupportedCallerProfile);
-            }
-            SelectedRustCallerDemandOutcome::Cancelled => {
-                return Ok(SelectedRustCallerReferencesOutcome::Operation(
-                    SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                ));
-            }
-        };
-        let contexts = prepared
-            .contexts
-            .clone()
-            .with_declaration_access_source(access.source(self, prepared.crate_keys.clone())?);
-        drop(demand_timing);
-        let outcome = self.resolve_rust_reference_demand_projection_in_session(
+        let cancellation = session.cancellation().unwrap_or(cancellation);
+        let mut lifecycle = RustReverseLifecycle {
+            selected: self,
             caller,
             access,
-            &prepared,
-            contexts,
-            locators,
-            operation_cancellation,
-            context_metrics,
+            cancellation,
             session,
+            context_metrics,
             setup,
             project,
-        )?;
+            marker: std::marker::PhantomData,
+        };
+        use reverse::{ReverseBatch, ReverseSessionReport};
+        let outcome = match reverse::confirm_reverse_session(locators, &mut lifecycle)? {
+            ReverseBatch::Ready(reports) => SelectedResolutionOperationOutcome::Native(
+                reports
+                    .into_iter()
+                    .map(|report| match report {
+                        ReverseSessionReport::Found { meanings, .. } => {
+                            SelectedResolutionLocated::Found(
+                                meanings
+                                    .into_iter()
+                                    .flat_map(|(_, answers)| answers)
+                                    .collect(),
+                            )
+                        }
+                        ReverseSessionReport::Missing { .. } => SelectedResolutionLocated::Missing,
+                    })
+                    .collect(),
+            ),
+            ReverseBatch::Stale(reason) => SelectedResolutionOperationOutcome::Stale(reason),
+            ReverseBatch::Unavailable(reason) => {
+                SelectedResolutionOperationOutcome::Unavailable(reason)
+            }
+            ReverseBatch::Cancelled { completion, .. } => {
+                SelectedResolutionOperationOutcome::Cancelled(completion)
+            }
+            ReverseBatch::UnsupportedContext => {
+                return Ok(SelectedRustCallerReferencesOutcome::UnsupportedCallerProfile);
+            }
+            ReverseBatch::Bounded(limit) => match limit {},
+            ReverseBatch::TimeStopped => unreachable!("caller session has no file deadline"),
+        };
         Ok(SelectedRustCallerReferencesOutcome::Operation(outcome))
     }
 
@@ -9269,6 +10282,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             &persisted_lexical,
                             &arena,
                             &point_session,
+                            crate::analyzer::resolution::CALLER_ENVIRONMENT,
                         );
                         let forward = PreparedForwardSource::new(
                             ready,
@@ -9459,265 +10473,8 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(results)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_rust_reference_demand_projection_in_session<T>(
-        &mut self,
-        caller: &Path,
-        access: RustDeclarationAccessKind,
-        prepared: &RustCallerDemand,
-        contexts: SelectedResolutionContextSet,
-        locators: &[&SelectedSemanticLocator],
-        cancellation: &CancellationToken,
-        context_metrics: &mut SelectedResolutionContextMetrics,
-        session: &ResolutionSession,
-        mut setup: impl FnMut(
-            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
-            SemanticId,
-        ) -> Result<()>,
-        mut project: impl FnMut(
-            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
-            &FactResolutionAnswer,
-            &ReadySelectedResolution<'_, '_>,
-            SelectedMountTable<'_, '_>,
-            &ResolutionSession,
-            &CancellationToken,
-        ) -> Result<SelectedResolutionOperationOutcome<T>>,
-    ) -> Result<SelectedResolutionOperationOutcome<LocatedRustReferenceAnswers<T>>> {
-        let cancellation = session.cancellation().unwrap_or(cancellation);
-        if !self.ensure_selected_rust_inputs_in_session(cancellation, session)? {
-            return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                cancelled_completion(),
-            ));
-        }
-        note_rust_point_work("search_entry_inputs", session);
-        let context_timing = crate::profiling::scope("rust_caller::prepare_context");
-        let context = match self.prepare_context_in_session(
-            contexts,
-            cancellation,
-            context_metrics,
-            session,
-        )? {
-            SelectedResolutionContextValidationOutcome::Ready(context) => context,
-            SelectedResolutionContextValidationOutcome::Cancelled => {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
-            }
-        };
-        drop(context_timing);
-        note_rust_point_work("search_validate_mounts", session);
-        let ready = &mut self.ready;
-        let attempts = {
-            // The crates that compile the caller bound the mounts this request
-            // may bind into, exactly as the graph route's staged crate does: a
-            // reference written in this file resolves inside its crate's
-            // dependency closure or nowhere, and a gap in a blob outside that
-            // closure was never about this request. The scope is installed
-            // where the graph stage installs it -- after the context has been
-            // validated and before the blueprint is collected -- so every read
-            // the request's own resolution makes is inside it, including the
-            // candidate gap boxes the lexical source memoizes per direction.
-            // `rust_demand_preparation_for_caller_in_session` already read the
-            // caller's crates, so this costs no extra read.
-            //
-            // The request's crates are fixed for the rest of this block, as a
-            // graph stage's crate is, so it keeps the same stage memos: export,
-            // placement and membership answers and the publications it has
-            // checked. They drop at the end of the block, before `finish`
-            // revalidates the whole selection. A reverse confirmation of one
-            // candidate blob of tract's `name` checked the same publications
-            // about 2,300 times without them (#3761).
-            let _crate_memos = ready.crate_stage_memos()?;
-            let _scope =
-                ready.narrow_forward_scope_to_crates(&prepared.crate_keys, cancellation)?;
-            let persisted_lexical = ready.lexical_source();
-            let persisted_typed = ready.typed_source();
-            let observed_lexical = SeamProfiled::observing(&persisted_lexical);
-            let observed_typed = SeamProfiled::observing(&persisted_typed);
-            let blueprint_timing = crate::profiling::scope("rust_caller::collect_blueprint");
-            let blueprint =
-                match ready.collect_blueprint_in_session(context, cancellation, session)? {
-                    SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
-                    SelectedFactOperationBlueprintConstruction::Cancelled {
-                        cancellation_completion,
-                        ..
-                    } => {
-                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                            cancellation_completion,
-                        ));
-                    }
-                };
-            drop(blueprint_timing);
-            note_rust_point_work("search_collect_blueprint", session);
-            let _resolve_timing = crate::profiling::scope("rust_caller::register_and_resolve");
-            if matches!(
-                register_selected_rust_caller_context_in_session(
-                    ready,
-                    caller,
-                    &prepared.crate_keys,
-                    access,
-                    &blueprint,
-                    cancellation,
-                    session,
-                )?,
-                ContextRegistrationOutcome::Cancelled
-            ) {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
-            }
-            note_rust_point_work("search_register_context", session);
-            let mut located = Vec::with_capacity(locators.len());
-            for locator in locators {
-                match ready.lookup_locators_in_session(
-                    &persisted_lexical,
-                    locator,
-                    cancellation,
-                    session,
-                )? {
-                    LocatedSemantics::Found(references) => {
-                        located.push((*locator, Some(references)))
-                    }
-                    LocatedSemantics::Missing => located.push((*locator, None)),
-                    LocatedSemantics::Cancelled => {
-                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                            cancelled_completion(),
-                        ));
-                    }
-                }
-            }
-            note_rust_point_work("search_lookup_locators", session);
-            // One arena per request. A closed relation is immutable for
-            // the request that closed it and is never shared with
-            // another request, because the answers it justifies are the
-            // ones this request's own prefixes established.
-            let arena = RefCell::new(ClosedRelations::default());
-            let source =
-                ClosedForwardSource::new(&observed_lexical, &persisted_lexical, &arena, session);
-            let forward = PreparedForwardSource::new(
-                ready,
-                &prepared.demand,
-                &observed_lexical,
-                &persisted_lexical,
-            );
-            let mut provider = DemandProvider::new(ForwardProvider::new(
-                &forward,
-                &arena,
-                session,
-                cancellation,
-            ));
-            let attempts = blueprint.with_forward_operation_in_session(
-                &source,
-                &persisted_lexical,
-                &observed_typed,
-                cancellation,
-                session,
-                |operation| {
-                    operation
-                        .enable_completed_root_reuse(&ready.operation_demand_state, access as u64);
-                    let mut attempts = Vec::with_capacity(located.len());
-                    for (locator, references) in &located {
-                        let Some(references) = references else {
-                            attempts.push(SelectedResolutionLocated::Missing);
-                            continue;
-                        };
-                        let mut answers = Vec::new();
-                        for &reference in references {
-                            if !session.scope_step() || cancellation.is_cancelled() {
-                                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                    cancelled_completion(),
-                                ));
-                            }
-                            setup(operation, reference)?;
-                            let resolution = match operation
-                                .resolve_reference_by_demand(reference, &mut provider)?
-                            {
-                                FactDemandResolution::Ready(resolution) => *resolution,
-                                FactDemandResolution::Cancelled(completion) => {
-                                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                        completion,
-                                    ));
-                                }
-                            };
-                            if !session.observe_cancellation() || cancellation.is_cancelled() {
-                                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                    cancelled_completion(),
-                                ));
-                            }
-                            match assemble_rust_reference_answer(
-                                &RustReferenceAnswerContext {
-                                    ready,
-                                    mounts: SelectedMountTable::new(&ready.inventory),
-                                    reference,
-                                    locator,
-                                    session,
-                                    cancellation,
-                                },
-                                operation,
-                                resolution,
-                                &mut |operation, reference| {
-                                    operation.resolve_reference_by_demand(reference, &mut provider)
-                                },
-                                &mut project,
-                            )? {
-                                SelectedResolutionOperationOutcome::Native(answer) => {
-                                    answers.push(answer)
-                                }
-                                SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                                    return Ok(SelectedResolutionOperationOutcome::Unavailable(
-                                        reason,
-                                    ));
-                                }
-                                SelectedResolutionOperationOutcome::Stale(reason) => {
-                                    return Ok(SelectedResolutionOperationOutcome::Stale(reason));
-                                }
-                                SelectedResolutionOperationOutcome::Cancelled(completion) => {
-                                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                        completion,
-                                    ));
-                                }
-                            }
-                        }
-                        attempts.push(SelectedResolutionLocated::Found(answers));
-                    }
-                    Ok(SelectedResolutionOperationOutcome::Native(attempts))
-                },
-            )?;
-            match attempts {
-                SelectedResolutionOperationOutcome::Native(attempts) => attempts,
-                SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                    return Ok(SelectedResolutionOperationOutcome::Unavailable(reason));
-                }
-                SelectedResolutionOperationOutcome::Stale(reason) => {
-                    return Ok(SelectedResolutionOperationOutcome::Stale(reason));
-                }
-                SelectedResolutionOperationOutcome::Cancelled(completion) => {
-                    return Ok(SelectedResolutionOperationOutcome::Cancelled(completion));
-                }
-            }
-        };
-        let completion = attempts.iter().fold(
-            ResolutionCompletion::Complete,
-            |completion, attempt| match attempt {
-                SelectedResolutionLocated::Found(answers) => {
-                    answers.iter().fold(completion, |completion, answer| {
-                        completion.combine(answer.resolution.completion())
-                    })
-                }
-                SelectedResolutionLocated::Missing => completion,
-            },
-        );
-        note_rust_point_work("search_answers", session);
-        if !session.scope_step() {
-            return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                completion.combine(&cancelled_completion()),
-            ));
-        }
-        note_rust_point_work("search_final_authority", session);
-        ready.finish(attempts, &completion, cancellation)
-    }
-
-    pub(crate) fn references_to_selected_definition(
+    #[doc(hidden)]
+    pub fn references_to_selected_definition(
         self,
         context: SelectedResolutionContextSet,
         maximum_batch_size: usize,
@@ -9740,7 +10497,8 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
-    pub(crate) fn references_to_rust_definition(
+    #[doc(hidden)]
+    pub fn references_to_rust_definition(
         self,
         context: SelectedResolutionContextSet,
         maximum_batch_size: usize,
@@ -10079,7 +10837,8 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(blueprint))
     }
 
-    fn prepare_context(
+    #[doc(hidden)]
+    pub fn prepare_context(
         &self,
         context: SelectedResolutionContextSet,
         cancellation: &CancellationToken,
@@ -10110,20 +10869,78 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
+/// A complete projection may refer to a previously committed request-owned
+/// cell. Its full derivation was validated before granting that authority.
+struct SelectedContextCellProjection<T> {
+    value: T,
+    published: Option<crate::analyzer::resolution::SelectedContextPathToken>,
+}
+
 impl ReadySelectedResolution<'_, '_> {
-    /// Compile and publish one descriptor at a time. Request metadata remains
-    /// separate from token-specific candidate authority and reverse evidence.
-    fn publish_context_paths(
+    #[doc(hidden)]
+    pub fn publish_context_paths(
         &self,
         context: SelectedResolutionContextInputs,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<crate::analyzer::resolution::SelectedContextPathPublicationOutcome> {
+        let names = self.shared_names();
+        self.publish_context_paths_with_compilers(
+            context,
+            cancellation,
+            session,
+            |identities, bridge| {
+                Ok(crate::analyzer::resolution::compile_selected_root_bridge(
+                    &self.lexical_source(),
+                    identities,
+                    bridge,
+                    &names,
+                    cancellation,
+                    session,
+                )?
+                .map(|value| SelectedContextCellProjection {
+                    value,
+                    published: None,
+                }))
+            },
+            |identities, bridge| {
+                Ok(bridge
+                    .compile(identities, &self.lexical_source(), cancellation, session)?
+                    .map(|value| SelectedContextCellProjection {
+                        value,
+                        published: None,
+                    }))
+            },
+        )
+    }
+
+    /// Compile and publish one descriptor at a time. Request metadata remains
+    /// separate from token-specific candidate authority and reverse evidence.
+    fn publish_context_paths_with_compilers<R, P>(
+        &self,
+        context: SelectedResolutionContextInputs,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+        mut root_compiler: impl FnMut(
+            &SelectedContextIdentities,
+            &crate::analyzer::resolution::SelectedRootBridgeDescriptor,
+        ) -> Result<Option<SelectedContextCellProjection<R>>>,
+        mut package_compiler: impl FnMut(
+            &SelectedContextIdentities,
+            &crate::analyzer::resolution::SelectedPackageBridgeDescriptor,
+        ) -> Result<Option<SelectedContextCellProjection<P>>>,
+    ) -> Result<crate::analyzer::resolution::SelectedContextPathPublicationOutcome>
+    where
+        R: std::borrow::Borrow<crate::analyzer::resolution::SelectedRootBridgeProjection>,
+        P: std::borrow::Borrow<(
+                CandidatePathIdentity,
+                crate::analyzer::resolution::PartialPath,
+            )>,
+    {
         use crate::analyzer::resolution::{
             SelectedContextPathPublication, SelectedContextPathPublicationOutcome,
-            compile_selected_root_bridge,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let work_before = tests::context_publication_work(session);
         let (
             bridges,
@@ -10134,6 +10951,35 @@ impl ReadySelectedResolution<'_, '_> {
             package_bridges,
             go_import_bindings,
         ) = context.into_parts();
+        // Resolve descriptor content before SQL publication installs its parent
+        // cancellation handler. These immutable keys then remain available to
+        // construction and rollback without confusing cancellation with missing
+        // authority. The query-owned authority memo retains only demanded keys.
+        let source = self.lexical_source();
+        for bridge in &bridges {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
+                    contextual_reverse_inventory_completion: completion,
+                });
+            }
+            bridge.validate_content_authority(&identities, &source, cancellation)?;
+        }
+        for bridge in &package_bridges {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
+                    contextual_reverse_inventory_completion: completion,
+                });
+            }
+            bridge.validate_content_authority(&identities, &source, cancellation)?;
+        }
+        for bridge in &go_import_bindings {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
+                    contextual_reverse_inventory_completion: completion,
+                });
+            }
+            bridge.validate_content_authority(&identities, &source, cancellation)?;
+        }
         let go_package_inventory_complete = *self.go_package_inventory_complete.borrow();
         let go_package_inventory_fragments = self.go_package_inventory_fragments.borrow().clone();
         if completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
@@ -10174,11 +11020,8 @@ impl ReadySelectedResolution<'_, '_> {
         let token = super::resolution_stage::SelectedResolutionStage::new(&self.inventory)
             .publish_context_paths(cancellation, |writer| {
                 for bridge in bridges.iter() {
-                    let Some(projected) = compile_selected_root_bridge(
-                        &self.lexical_source(), &identities, bridge, &names, cancellation, session,
-                    )? else {
-                        return Ok(false);
-                    };
+                    let Some(projection) = root_compiler(&identities, bridge)? else { return Ok(false); };
+                    let projected: &crate::analyzer::resolution::SelectedRootBridgeProjection = std::borrow::Borrow::borrow(&projection.value);
                     let paths = projected.lexical.paths();
                     assert_eq!(paths.len(), 1, "one context descriptor produces one path");
                     let (path_id, path) = &paths[0];
@@ -10194,15 +11037,17 @@ impl ReadySelectedResolution<'_, '_> {
                         shared.insert(recipe.identity(&names));
                     }
                     (candidate, path).hash(&mut signature);
-                    if !writer.insert(candidate, path)? {
-                        return Ok(false);
-                    }
+                    let offered = match projection.published {
+                        Some(source) => writer.reuse(source, candidate)?,
+                        None => writer.insert(candidate, path)?,
+                    };
+                    if !offered { return Ok(false); }
                 }
                 let mut package_derivations = HashMap::default();
                 for bridge in &package_bridges {
-                    let Some((candidate, path)) = bridge.compile(&identities, &self.lexical_source(), cancellation, session)? else {
-                        return Ok(false);
-                    };
+                    let Some(projection) = package_compiler(&identities, bridge)? else { return Ok(false); };
+                    let (candidate, path): &(CandidatePathIdentity, crate::analyzer::resolution::PartialPath) = std::borrow::Borrow::borrow(&projection.value);
+                    let candidate = *candidate;
                     if let Some(previous) = package_derivations.insert(candidate, bridge)
                         && previous != bridge {
                             return Err(StoreError::new(format!(
@@ -10211,9 +11056,11 @@ impl ReadySelectedResolution<'_, '_> {
                         }
                     shared.extend(bridge.shared_identities());
                     (candidate, &path).hash(&mut signature);
-                    if !writer.insert(candidate, &path)? {
-                        return Ok(false);
-                    }
+                    let offered = match projection.published {
+                        Some(source) => writer.reuse(source, candidate)?,
+                        None => writer.insert(candidate, path)?,
+                    };
+                    if !offered { return Ok(false); }
                 }
                 let mut go_import_derivations = HashMap::default();
                 for bridge in &go_import_bindings {
@@ -10239,7 +11086,7 @@ impl ReadySelectedResolution<'_, '_> {
                 contextual_reverse_inventory_completion: completion,
             });
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(work_before) = work_before {
             let incomplete_evidence = match &completion {
                 ResolutionCompletion::Complete => 0,
@@ -10273,7 +11120,8 @@ impl ReadySelectedResolution<'_, '_> {
         ))
     }
 
-    fn collect_blueprint(
+    #[doc(hidden)]
+    pub fn collect_blueprint(
         &self,
         context: SelectedResolutionContextInputs,
         cancellation: &CancellationToken,
@@ -10413,7 +11261,8 @@ impl ReadySelectedResolution<'_, '_> {
         Ok(Some(()))
     }
 
-    fn register_context(
+    #[doc(hidden)]
+    pub fn register_context(
         &self,
         blueprint: &SelectedFactOperationBlueprint,
         cancellation: &CancellationToken,
@@ -10461,7 +11310,7 @@ impl ReadySelectedResolution<'_, '_> {
             return Ok(ContextRegistrationOutcome::Cancelled);
         }
         *self.inventory.mount_rebaser().borrow_mut() = staged;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let rebaser = self.inventory.mount_rebaser().borrow();
             let snapshot = SelectedResolutionBoundarySnapshotForTest {
@@ -10497,6 +11346,25 @@ impl ReadySelectedResolution<'_, '_> {
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<ContextRegistrationOutcome> {
+        self.register_context_cells_in_session(
+            blueprint,
+            SelectedContextRegistrationCells {
+                shared: blueprint.shared_semantic_identities(),
+                boundaries: blueprint.boundary_nodes(),
+                gaps: blueprint.context_owned_gap_identities(),
+            },
+            cancellation,
+            session,
+        )
+    }
+
+    fn register_context_cells_in_session(
+        &self,
+        blueprint: &SelectedFactOperationBlueprint,
+        cells: SelectedContextRegistrationCells<'_>,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<ContextRegistrationOutcome> {
         if cancellation.is_cancelled() {
             return Ok(ContextRegistrationOutcome::Cancelled);
         }
@@ -10516,11 +11384,11 @@ impl ReadySelectedResolution<'_, '_> {
         // Only the registrations this phase still performs are charged: the
         // persisted anchors need no key translation and no registration now
         // that their runtime IDs name their own mounts.
-        let registration_work = blueprint
-            .shared_semantic_identities()
+        let registration_work = cells
+            .shared
             .len()
-            .checked_add(blueprint.boundary_nodes().len())
-            .and_then(|count| count.checked_add(blueprint.context_owned_gap_identities().len()))
+            .checked_add(cells.boundaries.len())
+            .and_then(|count| count.checked_add(cells.gaps.len()))
             .expect("selected context registration work must fit usize");
         if !(0..registration_work).all(|_| session.scope_step()) {
             return Ok(ContextRegistrationOutcome::Cancelled);
@@ -10532,24 +11400,25 @@ impl ReadySelectedResolution<'_, '_> {
             return Ok(ContextRegistrationOutcome::Cancelled);
         }
         let mut rebaser = self.inventory.mount_rebaser().borrow_mut();
-        for &identity in blueprint.shared_semantic_identities() {
+        for &identity in cells.shared {
             rebaser.register_shared_semantic(identity);
         }
         let names = self.inventory.shared_names();
-        for &reason in blueprint.context_owned_gap_identities() {
+        for &reason in cells.gaps {
             rebaser.register_context_owned_semantic(
                 reason,
                 blueprint.context_owned_semantic_digest(reason)?,
                 &names,
             );
         }
-        for &node in blueprint.boundary_nodes() {
+        for &node in cells.boundaries {
             rebaser.register_context_boundary(node);
         }
         Ok(ContextRegistrationOutcome::Ready)
     }
 
-    fn lookup_locator(
+    #[doc(hidden)]
+    pub fn lookup_locator(
         &self,
         persisted: &SelectedResolutionLexicalSource<'_, '_>,
         locator: &SelectedSemanticLocator,
@@ -10952,7 +11821,8 @@ pub(super) fn lower_rust_context_rows(
     }))
 }
 
-fn selected_macro_capture_digest(
+#[doc(hidden)]
+pub fn selected_macro_capture_digest(
     invocation: brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId,
     input: &brokk_bifrost_core::analyzer::rust_facts::RustMacroTokenTree,
     arm: &brokk_bifrost_rust::macro_matcher::MacroArmMatch,
@@ -10986,9 +11856,14 @@ fn selected_macro_capture_digest(
     identity.finish()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod selected_sql_trace;
+
+#[cfg(any(test, feature = "test-support"))]
 #[path = "resolution_operation_tests.rs"]
-mod tests;
+#[doc(hidden)]
+pub mod tests;
 
 #[cfg(test)]
 #[path = "resolution_operation_context_tests.rs"]
@@ -10997,12 +11872,6 @@ mod context_path_tests;
 #[cfg(test)]
 #[path = "resolution_operation_unit_summary_tests.rs"]
 mod unit_summary_tests;
-
-#[cfg(test)]
-pub(super) use tests::{DenseSelectedMacroFixture, with_dense_selected_macro_fixture};
-
-#[cfg(test)]
-pub(crate) use tests::point_latency::heap_pin_bytes;
 
 impl ReadySelectedResolution<'_, '_> {
     #[allow(clippy::too_many_arguments)]
@@ -11018,8 +11887,13 @@ impl ReadySelectedResolution<'_, '_> {
         let demand = RustDemandPreparation::new(Box::new([]));
         let paths = self.lexical_source();
         let prepared = PreparedForwardSource::new(self, &demand, lexical, &paths);
-        let source =
-            ClosedForwardSource::new(lexical, &paths, &self.rust_workspace_relations, session);
+        let source = ClosedForwardSource::new(
+            lexical,
+            &paths,
+            &self.rust_workspace_relations,
+            session,
+            crate::analyzer::resolution::CALLER_ENVIRONMENT,
+        );
         let provider = DemandProvider::new(ForwardProvider::new(
             &prepared,
             &self.rust_workspace_relations,
@@ -11051,7 +11925,8 @@ impl ReadySelectedResolution<'_, '_> {
         self.with_workspace_fact_operation(blueprint, lexical, typed, cancellation, session, run)
     }
 
-    fn with_rust_workspace_fact_operation<T>(
+    #[doc(hidden)]
+    pub fn with_rust_workspace_fact_operation<T>(
         &self,
         blueprint: &SelectedFactOperationBlueprint,
         lexical: &dyn BatchResolutionFragmentSource,
@@ -11104,3 +11979,27 @@ pub(super) const RUST_GRAPH_DEFINITIONS_SQL: &str =
   ON site.blob_id=member.blob_id AND site.semantic_role='definition'
  CROSS JOIN main.resolution_definition_unit_crosswalks AS unit
   ON unit.blob_id=site.blob_id AND unit.definition_semantic_key=site.semantic_key";
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod heap_pin;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use heap_pin::heap_pin_bytes;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "resolution_operation_tests_go_support.rs"]
+pub mod resolution_operation_tests_go_support;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "native_query_plan_go_support.rs"]
+pub mod native_query_plan_go_support;
+
+impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
+    #[doc(hidden)]
+    pub fn ready(&self) -> &ReadySelectedResolution<'store, 'input> {
+        &self.ready
+    }
+}

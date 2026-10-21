@@ -18,17 +18,20 @@ const LINE_LIMIT: usize = brokk_bifrost_core::analyzer::common::DEFAULT_MAX_LINE
 
 /// Version covers the finite envelope as well as the shared accounting rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SourceAdmissionPolicy {
+#[doc(hidden)]
+pub struct SourceAdmissionPolicy {
     version: u8,
     explicit_line_limit: Option<usize>,
 }
 
 impl SourceAdmissionPolicy {
-    pub(crate) fn current() -> Self {
+    #[doc(hidden)]
+    pub fn current() -> Self {
         Self::from_setting(std::env::var("BIFROST_MAX_LINE_LENGTH").ok().as_deref())
     }
 
-    pub(crate) fn from_setting(setting: Option<&str>) -> Self {
+    #[doc(hidden)]
+    pub fn from_setting(setting: Option<&str>) -> Self {
         Self {
             version: 1,
             explicit_line_limit: setting.and_then(|value| value.trim().parse().ok()),
@@ -110,41 +113,9 @@ impl SourceAdmissionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdmissionDimension {
-    SourceBytes,
-    Nodes,
-    Depth,
-    SpanBytes,
-    ExcludedNodes,
-}
+pub use crate::analyzer::semantic::source_admission::AdmissionDimension;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SourceAdmissionRefusal {
-    Binary,
-    ProofRejected,
-    StructuralLine {
-        limit: usize,
-        observed: usize,
-    },
-    Budget {
-        dimension: AdmissionDimension,
-        limit: usize,
-        observed: usize,
-    },
-}
-
-impl std::fmt::Display for SourceAdmissionRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "source admission refused: {self:?}")
-    }
-}
-
-impl SourceAdmissionRefusal {
-    pub(crate) fn is_intrinsic_source_rejection(&self) -> bool {
-        matches!(self, Self::Binary | Self::StructuralLine { .. })
-    }
-}
+pub use crate::analyzer::semantic::source_admission::SourceAdmissionRefusal;
 
 fn check_limit(
     dimension: AdmissionDimension,

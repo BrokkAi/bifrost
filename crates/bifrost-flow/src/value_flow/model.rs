@@ -22,13 +22,109 @@ define_dense_id! {
 }
 
 define_dense_id! {
-    /// Run-local identity for one resolved flow source.
+    /// Plan-local insertion identity for one resolved flow source.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ValueFlowSourceId {
         new: pub(crate),
         get: pub,
         index: pub(crate),
         try_from_index: pub(crate),
+    }
+}
+
+define_dense_id! {
+    /// Plan-local identity for one shared source-ID set.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct ValueFlowSourceListId {
+        new: pub(crate),
+        get: pub,
+        index: pub(crate),
+        try_from_index: pub(crate),
+    }
+}
+
+/// Source-ID sets owned once by a plan. The hash index stores only IDs;
+/// collisions are resolved by comparing the complete list content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValueFlowSourceLists {
+    lists: Vec<Box<[ValueFlowSourceId]>>,
+    index: crate::hash::HashMap<u64, Vec<ValueFlowSourceListId>>,
+}
+
+impl ValueFlowSourceLists {
+    pub fn intern(&mut self, mut sources: Vec<ValueFlowSourceId>) -> ValueFlowSourceListId {
+        use std::hash::BuildHasher;
+        sources.sort_unstable();
+        sources.dedup();
+        let hash = self.index.hasher().hash_one(&sources);
+        let candidates = self.index.entry(hash).or_default();
+        if let Some(id) = candidates
+            .iter()
+            .find(|id| self.lists[id.index()].as_ref() == sources.as_slice())
+        {
+            return *id;
+        }
+        let id = ValueFlowSourceListId::try_from_index(self.lists.len())
+            .expect("source list ID fits u32");
+        self.lists.push(sources.into_boxed_slice());
+        candidates.push(id);
+        id
+    }
+
+    pub fn get(&self, id: ValueFlowSourceListId) -> &[ValueFlowSourceId] {
+        &self.lists[id.index()]
+    }
+
+    pub(crate) fn into_lists(self) -> Box<[Box<[ValueFlowSourceId]>]> {
+        self.lists.into_boxed_slice()
+    }
+}
+
+/// Mutable root-local source table. IDs follow insertion order and are used
+/// directly by guard builders and the solver.
+#[derive(Debug, Clone, Default)]
+pub struct ValueFlowSources {
+    pub(crate) specs: Vec<ValueFlowSourceSpec>,
+    pub(crate) lists: ValueFlowSourceLists,
+}
+
+impl From<Vec<ValueFlowSourceSpec>> for ValueFlowSources {
+    fn from(specs: Vec<ValueFlowSourceSpec>) -> Self {
+        Self {
+            specs,
+            lists: ValueFlowSourceLists::default(),
+        }
+    }
+}
+
+impl ValueFlowSources {
+    pub fn from_parts(specs: Vec<ValueFlowSourceSpec>, lists: ValueFlowSourceLists) -> Self {
+        Self { specs, lists }
+    }
+
+    pub fn len(&self) -> usize {
+        self.specs.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.specs.is_empty()
+    }
+    pub fn push(&mut self, spec: ValueFlowSourceSpec) -> ValueFlowSourceId {
+        let id = ValueFlowSourceId::try_from_index(self.specs.len()).expect("source ID fits u32");
+        self.specs.push(spec);
+        id
+    }
+    pub fn ids(&self) -> impl Iterator<Item = ValueFlowSourceId> {
+        (0..self.specs.len())
+            .map(|index| ValueFlowSourceId::try_from_index(index).expect("source ID fits u32"))
+    }
+    pub fn intern_list(&mut self, ids: Vec<ValueFlowSourceId>) -> ValueFlowSourceListId {
+        self.lists.intern(ids)
+    }
+    pub fn id_for_key(&self, key: &ValueFlowEventKey) -> Option<ValueFlowSourceId> {
+        self.specs
+            .iter()
+            .position(|source| source.key() == key)
+            .map(|index| ValueFlowSourceId::try_from_index(index).expect("source ID fits u32"))
     }
 }
 
@@ -858,7 +954,7 @@ pub struct ValueFlowSourceSpec {
     /// Source events that must already reach this source's carrier at its
     /// observation point before this source can be activated. `None` keeps
     /// the historical unconditional source behavior.
-    conditional_triggers: Option<Box<[ValueFlowEventKey]>>,
+    conditional_triggers: Option<ValueFlowSourceListId>,
     /// Exact invocations whose dispatch is required by endpoint selection.
     dispatch_obligations: Box<[CallSiteHandle]>,
 }
@@ -903,14 +999,10 @@ impl ValueFlowSourceSpec {
     /// Make this source conditional on one of the supplied source events
     /// already reaching the same carrier at this observation point.
     ///
-    /// The plan validates that every trigger names a source in the plan. The
-    /// builder canonicalizes the set so source identity and summary behavior
-    /// do not depend on caller ordering or duplicate entries.
-    pub fn when_sources_reach(mut self, mut triggers: Vec<ValueFlowEventKey>) -> Self {
-        triggers.sort_unstable();
-        triggers.dedup();
-        assert!(!triggers.is_empty(), "a conditional source needs a trigger");
-        self.conditional_triggers = Some(triggers.into_boxed_slice());
+    /// The plan validates that every trigger names a source in the plan.
+    /// Intern the ID set in the source table before attaching it here.
+    pub fn when_sources_reach(mut self, triggers: ValueFlowSourceListId) -> Self {
+        self.conditional_triggers = Some(triggers);
         self
     }
 
@@ -956,19 +1048,8 @@ impl ValueFlowSourceSpec {
 
     /// Source events that activate this source, or `None` for an
     /// unconditional source.
-    pub fn activation_triggers(&self) -> Option<&[ValueFlowEventKey]> {
-        self.conditional_triggers.as_deref()
-    }
-
-    pub(crate) fn activation_triggers_retained_bytes(&self) -> usize {
-        self.conditional_triggers.as_ref().map_or(0, |triggers| {
-            std::mem::size_of_val(triggers.as_ref()).saturating_add(
-                triggers
-                    .iter()
-                    .map(ValueFlowEventKey::retained_bytes)
-                    .fold(0usize, usize::saturating_add),
-            )
-        })
+    pub fn activation_triggers(&self) -> Option<ValueFlowSourceListId> {
+        self.conditional_triggers
     }
 }
 

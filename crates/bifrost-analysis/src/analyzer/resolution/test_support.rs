@@ -1,18 +1,99 @@
-use brokk_bifrost_core::analyzer::resolution_facts::{
-    FileResolutionFacts, PositionedIdentifierFact, ResolutionBinderFact, ResolutionBinderKind,
-    ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole, ResolutionNameFact,
-    ResolutionNameId, ResolutionNamespace, ResolutionScopeFact, ResolutionScopeId,
-    ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
-    ResolutionSiteKind, ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
-    ResolutionTypeTransferFact, ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
-};
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::PositionedIdentifierFact;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinderFact;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinderKind;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapFact;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameFact;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameId;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeFact;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeInheritance;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteFact;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotFact;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotId;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotRole;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferFact;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind;
+
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferValueTransform;
+
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::structural::resolution::HoistingClass;
 
-use super::model::{
-    BindingFragmentId, BindingNodeId, EndpointSignature, PartialPath, PrecedenceStep,
-    ResolutionCompletion, SemanticId, StackPattern, TypeTransferRule, TypeTransferValueTransform,
-    WitnessStep,
-};
+#[cfg(any(test, feature = "test-support"))]
+use super::model::BindingFragmentId;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::BindingNodeId;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::EndpointSignature;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::PartialPath;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::PrecedenceStep;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::ResolutionCompletion;
+
+use super::model::SemanticId;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::StackPattern;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::TypeTransferRule;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::TypeTransferValueTransform;
+
+#[cfg(any(test, feature = "test-support"))]
+use super::model::WitnessStep;
 
 pub(crate) fn lowered_semantic_at(
     semantics: &[super::fact_lowering::LoweredSemanticSite],
@@ -26,6 +107,7 @@ pub(crate) fn lowered_semantic_at(
         .semantic()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn unsupported_expression_gap_facts() -> FileResolutionFacts {
     FileResolutionFacts {
         scopes: vec![ResolutionScopeFact {
@@ -44,34 +126,42 @@ pub(crate) fn unsupported_expression_gap_facts() -> FileResolutionFacts {
             start_byte: 20,
             end_byte: 21,
         }],
-        gaps: vec![ResolutionGapFact {
-            site: ResolutionSiteId::new(0),
-            kind: ResolutionGapKind::UnsupportedExpression,
-        }],
+        gaps: vec![ResolutionGapFact::new(
+            ResolutionSiteId::new(0),
+            ResolutionGapKind::UnsupportedExpression,
+        )],
         ..FileResolutionFacts::default()
     }
 }
 
-pub(crate) fn semantic(value: &str) -> SemanticId {
+#[doc(hidden)]
+pub fn semantic(value: &str) -> SemanticId {
     SemanticId::for_test(value.as_bytes())
 }
 
-pub(crate) fn fragment(value: &str) -> BindingFragmentId {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fragment(value: &str) -> BindingFragmentId {
     BindingFragmentId::for_test(value.as_bytes())
 }
 
-pub(crate) fn node(value: &str) -> BindingNodeId {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn node(value: &str) -> BindingNodeId {
     BindingNodeId::for_test(value.as_bytes())
 }
 
-pub(crate) fn name(id: u32, spelling: &str) -> ResolutionNameFact {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn name(id: u32, spelling: &str) -> ResolutionNameFact {
     ResolutionNameFact {
         id: ResolutionNameId::new(id),
         spelling: spelling.into(),
     }
 }
 
-pub(crate) fn scope(
+#[doc(hidden)]
+pub fn scope(
     id: u32,
     parent: Option<u32>,
     owner: Option<u32>,
@@ -90,12 +180,8 @@ pub(crate) fn scope(
     }
 }
 
-pub(crate) fn site(
-    id: u32,
-    scope: u32,
-    kind: ResolutionSiteKind,
-    position: usize,
-) -> ResolutionSiteFact {
+#[doc(hidden)]
+pub fn site(id: u32, scope: u32, kind: ResolutionSiteKind, position: usize) -> ResolutionSiteFact {
     ResolutionSiteFact {
         id: ResolutionSiteId::new(id),
         scope: ResolutionScopeId::new(scope),
@@ -105,7 +191,9 @@ pub(crate) fn site(
     }
 }
 
-pub(crate) fn identifier(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn identifier(
     site: u32,
     name: u32,
     role: ResolutionIdentifierRole,
@@ -121,7 +209,9 @@ pub(crate) fn identifier(
     }
 }
 
-pub(crate) fn transfer(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn transfer(
     input: u32,
     output: u32,
     kind: ResolutionTypeTransferKind,
@@ -138,6 +228,7 @@ pub(crate) fn transfer(
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn selected_transfer(
     owner: BindingFragmentId,
     semantic: SemanticId,
@@ -155,6 +246,7 @@ pub(crate) fn selected_transfer(
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn selected_transfer_with(
     owner: BindingFragmentId,
@@ -181,7 +273,9 @@ pub(crate) fn selected_transfer_with(
     )
 }
 
-pub(crate) fn binder(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn binder(
     declaration: u32,
     scope: u32,
     kind: ResolutionBinderKind,
@@ -199,6 +293,7 @@ pub(crate) fn binder(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn slot(id: u32, site: u32, role: ResolutionTypeSlotRole) -> ResolutionTypeSlotFact {
     ResolutionTypeSlotFact {
         id: ResolutionTypeSlotId::new(id),
@@ -207,6 +302,7 @@ pub(crate) fn slot(id: u32, site: u32, role: ResolutionTypeSlotRole) -> Resoluti
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn endpoint(
     node: BindingNodeId,
     symbols: impl Into<Box<[SemanticId]>>,
@@ -219,6 +315,7 @@ pub(crate) fn endpoint(
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn partial_path(
     start: BindingNodeId,
     end: BindingNodeId,

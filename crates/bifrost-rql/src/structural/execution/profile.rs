@@ -1396,6 +1396,24 @@ mod public_contract_tests {
                 "total": 66
             })
         );
+        let zero_semantic_lanes = json!({
+            "source_bytes": 0,
+            "procedures": 0,
+            "blocks": 0,
+            "program_points": 0,
+            "values": 0,
+            "allocations": 0,
+            "call_sites": 0,
+            "memory_locations": 0,
+            "captures": 0,
+            "source_mappings": 0,
+            "evidence": 0,
+            "gaps": 0,
+            "events": 0,
+            "control_edges": 0,
+            "nested_entries": 0,
+            "owned_text_bytes": 0
+        });
         assert_eq!(
             value["work"],
             json!({
@@ -1427,6 +1445,11 @@ mod public_contract_tests {
                     "control_edges": 0,
                     "nested_entries": 0,
                     "retained_bytes": 0,
+                    "cumulative": zero_semantic_lanes.clone(),
+                    "resident_peaks": zero_semantic_lanes.clone(),
+                    "root_work_peaks": zero_semantic_lanes,
+                    "resident_nested_entries_peak": 0,
+                    "resident_retained_bytes_peak": 0,
                     "traversal_steps": 0,
                     "budget_exhausted": false
                 }

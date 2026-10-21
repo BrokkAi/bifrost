@@ -63,7 +63,7 @@ A second source is rejected. Unknown fields are rejected.
 | `where` | `(where "glob" ... Q)` | array of globs, or array of glob arrays | whole workspace | Workspace-relative path globs. A flat list means any glob. Nested lists mean every group, with any glob inside a group. Repeated RQL `where` forms combine like nested lists. |
 | `languages` | `(language label ... Q)`, `(languages label ... Q)` | array of language labels | every language | Restrict to these languages. Repeated RQL forms intersect. Disjoint sets are rejected. `configuration_facts` rejects this field. |
 | `inside` | `(inside P Q)` | pattern | none | The root match must be lexically inside a node that matches `P`. Only with `match`. |
-| `inside_decl` | `(inside-decl P Q)`, `(inside_decl P Q)` | pattern | none | Like `inside`, but the search stops at a nested callable declaration. A Rust `impl` member can also match the type that owns the `impl`. Only with `match`. |
+| `inside_decl` | `(inside-decl P Q)`, `(inside_decl P Q)` | pattern | none | Like `inside`, but the search stops at a nested callable declaration. A Rust `impl` member can also match the type that owns the `impl`, and an out-of-line C++ member definition can match the class that declares it. Only with `match`. |
 | `not_inside` | `(not-inside P Q)` | pattern | none | Reject the root match when a matching ancestor exists. Only with `match`. |
 | `steps` | wrapper forms such as `(file-of Q)` | array of step objects | no steps | Ordered typed steps. At most 16 per plan node. |
 | `limit` | `(limit N Q)` | integer 1 to 1000 | `100` | Maximum terminal results. Root only. |
@@ -1242,18 +1242,24 @@ with `--workspace-scaled-limits`, scale some execution limits by source volume.
 
 ### Semantic analysis
 
-Semantic limits apply only when a semantic step reads a source file. Structural
-queries and `explain` mode do not use them. Exhaustion reports
+Semantic limits bound source and rows held by semantic steps, including replay,
+and file discovery. Structural queries and `explain` mode do not use them.
+Exhaustion reports
 `semantic_budget_exhausted` and names one of the lanes `source`, `rows`,
-`retained_bytes`, `steps`, or `files`.
+`retained_bytes`, or `files`.
 
 | Limit | Value | Lane |
 | --- | --- | --- |
 | Materialized files | 256 | `files` |
-| Source bytes | 16 MiB | `source` |
-| Rows per semantic dimension | 1,000,000 | `rows` |
+| Resident source bytes | 16 MiB | `source` |
+| Resident rows per semantic dimension | 1,000,000 | `rows` |
 | Retained artifact and source bytes | 256 MiB | `retained_bytes` |
-| Traversal steps | 1,000,000 | `steps` |
+
+Source scans, lowering traversal and visits to existing rows are work telemetry,
+including outside a root and on replay. They never cause a semantic refusal;
+receipts report cumulative admissions plus work and largest per-root work
+balances alongside resident peaks. The same bytes can count twice. Solver step
+limits remain separate.
 
 ### Registered analyses
 

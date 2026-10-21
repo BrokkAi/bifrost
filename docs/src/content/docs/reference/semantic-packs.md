@@ -1296,16 +1296,18 @@ The optional `ACTIVATION.json` argument of `list`:
 ### Pinned pack specs
 
 `generate` reads one pinned spec per artifact. A spec is JSON with
-`schema_version` `1` and rejects unknown fields.
+`schema_version` `1` or `2` and rejects unknown fields. Version `1` is the
+legacy pinned input schema. Version `2` adds optional per-shard activation
+pins for authored semantic models.
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Must be `1`. |
+| `schema_version` | Must be `1` or `2`. Version `1` does not accept `shard_activation_pins`. |
 | `pack_id`, `pack_version`, `ecosystem` | The pack identity. |
 | `kind` | The producer family, tagged by `artifact_kind` (table below). |
 | `artifact` | `{file_name, sha256, url?, container?}`. `container` is `{file_name, sha256, url, artifact_path}` when the artifact is inside another archive. |
 | `compatibility` | As in the pack envelope. Generated packs use schema version 14, so every spec except `authored_semantic_model` must omit `bifrost`. `generate` rejects a generated spec that sets it. |
-| `activation` | Activation selectors for the generated shards. |
+| `activation` | Required, bounded activation selectors. Generated shards use these selectors. Authored shards without per-shard pins must repeat this selector vector exactly. When pins are present, they state the authored shards' exact selectors. |
 | `provenance`, `license`, `safety` | As in the pack envelope. |
 | `notices` | Notice files to include. |
 | `measurement_activation` | One activation selector used for measurement. |
@@ -1315,6 +1317,20 @@ Every version requirement in `compatibility.toolchains` and in activation
 selector coordinates must have an upper bound. `generate` rejects an open
 requirement such as `>=21.0.0`. This check applies only to pinned specs. It
 does not apply to authored packs checked with `validate`.
+
+Version `2` authored specs may add `kind.shard_activation_pins`, a nonempty
+array of closed `{shard_id, activation}` entries. The IDs must be nonempty,
+unique, and cover the authored pack's complete shard set exactly. Each entry
+must have at least one selector, and each shard's selector vector must equal
+its pin exactly, including selector order, coordinates, targets,
+configurations, and artifact digest. Every version requirement in these
+selectors must also have an upper bound. A missing field keeps the legacy
+rule: every authored shard repeats the spec's global `activation` vector
+exactly. A `null` or empty pin array is invalid; pins in a version `1` spec
+are rejected. The global activation remains required for version `2` specs.
+The exact pin comparison checks the authored input before compilation. The
+compiler then applies its existing canonical ordering of selectors, targets
+and configurations to the compiled output; this does not relax input matching.
 
 | `artifact_kind` | Extra fields | Input |
 | --- | --- | --- |
@@ -1329,7 +1345,7 @@ does not apply to authored packs checked with `validate`.
 | `rustdoc_json` | none | One rustdoc JSON file. |
 | `rustdoc_json_set` | `crates` (`[{name, path}]`) | Several rustdoc JSON files. |
 | `python_stub` | `stubs` (relative seed `.pyi` paths) | A pinned stub tree; local imports determine the loaded closure. |
-| `authored_semantic_model` | none | An authored pack source, compiled directly. |
+| `authored_semantic_model` | `shard_activation_pins` (optional in spec version `2`; exact complete per-shard selector list) | An authored pack source, compiled directly. |
 | `npm_package` | `manifest`, `declarations` (`[{module, path}]`) | An npm package manifest and its declaration files. |
 | `go_module` | `packages` (`[{import_path, name, files}]`) | A Go module source set. |
 | `ruby_gem_archive` | none | A `.gem` archive. |
@@ -1412,6 +1428,6 @@ These variables change pack behavior. The
 | --- | --- |
 | `BIFROST_SEMANTIC_PACK_CACHE_ROOT` | Root of the default catalog and of the shared generated-pack cache. |
 | `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` | An extracted release bundle that replaces the embedded packs. Bifrost installs it when it opens a catalog for activation. An empty value, a malformed bundle, or a bundle with no compatible pack makes that activation fail. A policy report then carries `pack-activation-failed` and the run exits 2. |
-| `BIFROST_OPEN_POLICY_PACK_ROOT` | An extracted policy rules directory that replaces the embedded policy catalog. See the [policy reference](/reference/policies/). |
+| `BIFROST_POLICY_PACK_ROOT` | An extracted policy rules directory that replaces the embedded policy catalog. See the [policy reference](/reference/policies/). |
 | `BIFROST_WORKSPACE_SEMANTIC_MODELS` | Read by every `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries. `on`, `1`, or `enabled` registers `.bifrost/semantic-models/` when the session activates packs; `off`, `0`, or `disabled` (the default) does not. Any other value is an error. A CLI policy run without `--sources` reads the directory whether or not this variable is set. |
 | `BIFROST_SEMANTIC_PACK_CATALOG`, `BIFROST_SEMANTIC_PACK_EVIDENCE` | Legacy. Read by every `SearchToolsService` session. Set both or neither. The catalog is opened read-only. The evidence is a non-empty JSON array of rows with `language`, `ecosystem`, and optional `package`, `module`, `toolchain` (`{name, version?}`), `target`, `configuration`, and `artifactSha256`. This route supplies no `enable` controls, and it fails when `.bifrost/packs.json` exists. |

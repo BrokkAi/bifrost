@@ -98,8 +98,19 @@ struct ParameterRow {
     function_path_present: bool,
 }
 
-impl AnalyzerStore {
-    pub(crate) fn scala_source_facts<A: LanguageAdapter>(
+pub(crate) trait ScalaSourceStorage {
+    fn scala_source_facts<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        generation: GenerationId,
+        adapter: &A,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Option<ScalaFileSourceFacts>>;
+}
+
+impl ScalaSourceStorage for AnalyzerStore {
+    fn scala_source_facts<A: LanguageAdapter>(
         &self,
         oid: Oid,
         generation: GenerationId,

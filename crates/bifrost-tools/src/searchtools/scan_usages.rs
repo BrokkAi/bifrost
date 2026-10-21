@@ -1,0 +1,9390 @@
+use crate::searchtools::selectors::*;
+use brokk_bifrost_cpp_analysis::analyzer::usages::cpp_graph::macro_lexical;
+
+use crate::searchtools::*;
+
+use brokk_bifrost_core::analyzer::fq_name::segment_interner;
+
+use brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend;
+
+use brokk_bifrost_analysis::analyzer::languages::language_support;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalDefinition;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::c_label_usage_ranges;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding;
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::analyzer::resolution::fact_reference_edges::FactReferenceEdgeCatalog;
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::SelectedFactResolutionSnapshot;
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::analyzer::resolution::fact_source::FactResolutionSource;
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::analyzer::store::Result as StoreResult;
+
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq;
+
+use brokk_bifrost_analysis::analyzer::symbol_lookup::resolve_codeunit_fuzzy_bounded_with;
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::build_selected_workspace_usage_graph_projection;
+
+use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageGraphProjection;
+
+use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
+
+use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+use brokk_bifrost_core::analyzer::model::DeclarationId;
+
+use brokk_bifrost_core::analyzer::query_token::QueryScope;
+
+use brokk_bifrost_core::analyzer::BoundedDefinitionLookup;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::cancellation::CancellationToken;
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn default_usage_graph_depth() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanUsagesByReferenceParams {
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub include_tests: bool,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// List the same-owner usage sites (self/this receiver and own-type static
+    /// calls) that are otherwise only counted, not shown. Default false: these
+    /// sites are excluded from external usage counts but reported as
+    /// `same_owner_sites`. See #1014 facet B.
+    #[serde(default)]
+    pub include_same_owner: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanUsagesByLocationParams {
+    pub targets: Vec<ScanUsagesTarget>,
+    #[serde(default)]
+    pub include_tests: bool,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// See [`ScanUsagesByReferenceParams::include_same_owner`].
+    #[serde(default)]
+    pub include_same_owner: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanUsagesTarget {
+    pub path: String,
+    pub line: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    /// Optional exact declaration selector used to disambiguate overlapping
+    /// declaration ranges at this location. The selector must name a declaration
+    /// in `path` that contains the requested location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+}
+
+/// Parameters for [`usage_graph`].
+///
+/// These fields mirror the scope controls on the scan-usage APIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageGraphParams {
+    /// Include references that live in detected test files.
+    #[serde(default)]
+    pub include_tests: bool,
+    /// Optional project-relative file paths or globs whose declarations are the
+    /// graph roots. `None` makes every workspace declaration a root.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// Maximum number of outbound caller-to-callee hops to expand from the roots.
+    #[serde(default = "default_usage_graph_depth")]
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesResult {
+    #[serde(skip)]
+    pub(crate) surface: ScanUsagesSurface,
+    pub scope: ScanUsagesScope,
+    pub summary: ScanUsagesSummary,
+    pub results: Vec<ScanUsagesEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanUsagesSurface {
+    Reference,
+    Location,
+}
+
+impl ScanUsagesSurface {
+    pub(crate) fn tool_name(self) -> &'static str {
+        match self {
+            Self::Reference => "scan_usages_by_reference",
+            Self::Location => "scan_usages_by_location",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesScope {
+    pub include_tests: bool,
+    /// Whether the *request* named paths. This stays request-level: it also
+    /// gates whether the semantic-model overlay contributes authored
+    /// references, so it is not a statement about the session's file set. A
+    /// scoped session that names no paths still answers `true` here and names
+    /// its file set in `session_subset` instead (#2770).
+    pub whole_workspace: bool,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case this answer is relative to that many files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths_omitted: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored_paths: Option<usize>,
+    /// Requested `paths` selectors that name no workspace file and no
+    /// workspace directory, spelled as the caller wrote them. A selector that
+    /// selects nothing cannot support an absence claim, so every entry of a
+    /// response carrying this list is reported incomplete (#3092). Bounded
+    /// like `paths`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unmatched_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmatched_paths_omitted: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesSummary {
+    pub requested: usize,
+    pub resolved: usize,
+    pub total_hits: usize,
+    pub partial: bool,
+    pub found: usize,
+    pub verified_absent: usize,
+    pub no_external_usages: usize,
+    pub unverified_absent: usize,
+    pub not_found: usize,
+    pub ambiguous: usize,
+    pub failure: usize,
+    pub too_many_callsites: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ScanUsagesInput {
+    Symbol(String),
+    Target(ScanUsagesTarget),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanUsagesInputKind {
+    Symbol,
+    Target,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanUsagesStatus {
+    Found,
+    VerifiedAbsent,
+    /// Resolved with zero external usage sites, but one or more same-owner
+    /// (self/this receiver or own-type static) sites exist within the declaring
+    /// container. Distinct from `verified_absent` so the caller never reads a
+    /// confident "no callers" claim when internal callers exist (#1014 facet B).
+    NoExternalUsages,
+    UnverifiedAbsent,
+    NotFound,
+    Ambiguous,
+    Failure,
+    TooManyCallsites,
+}
+
+impl ScanUsagesStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::VerifiedAbsent => "verified_absent",
+            Self::NoExternalUsages => "no_external_usages",
+            Self::UnverifiedAbsent => "unverified_absent",
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::Failure => "failure",
+            Self::TooManyCallsites => "too_many_callsites",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanUsagesAbsenceCaveat {
+    UnprovenMatches,
+    CandidateFilesTruncated,
+    ReferenceOnlySiblings,
+    ScanIncomplete,
+}
+
+impl ScanUsagesAbsenceCaveat {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UnprovenMatches => "unproven_matches",
+            Self::CandidateFilesTruncated => "candidate_files_truncated",
+            Self::ReferenceOnlySiblings => "reference_only_siblings",
+            Self::ScanIncomplete => "scan_incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanUsagesIncompleteReason {
+    Cancelled,
+    TimeBudget,
+    CandidateFiles,
+    SourceBytes,
+    /// An admitted source file or its syntax could not be loaded.
+    SourceUnavailable,
+    /// Structured resolution could not enumerate every semantic reference.
+    SemanticAnalysis,
+    Callsites,
+    ResponseBudget,
+    /// The selector matched more declarations than the tool will resolve, so
+    /// no candidate list was produced. See [`TooManyResolutionCandidates`].
+    ResolutionCandidates,
+    /// One or more `paths` selectors selected no file the scan could search, so
+    /// the answer covers less of the workspace than the request named and
+    /// cannot prove absence there (#3092).
+    UnmatchedPaths,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesEntry {
+    pub input: ScanUsagesInput,
+    pub input_kind: ScanUsagesInputKind,
+    pub status: ScanUsagesStatus,
+    #[serde(skip_serializing_if = "is_true")]
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<ScanUsagesIncompleteReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_hits: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unproven_hits: Option<usize>,
+    /// Count of usage sites within the declaring container (self/this receiver
+    /// and own-type static calls) that are excluded from external usage counts.
+    /// Omitted when zero. Set `include_same_owner` to list them in
+    /// `same_owner_files`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_owner_sites: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendering: Option<UsageRendering>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub same_owner_files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unproven_files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_relations:
+        Vec<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelRelation>,
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub model_relations_omitted: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_enclosing: Vec<UsageEnclosingCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_sites_excluded: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_truncated: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub absence_caveats: Vec<ScanUsagesAbsenceCaveat>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidate_targets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidate_details: Vec<AmbiguousUsageCandidateDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_details_total: Option<usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub candidate_details_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidates: Vec<AmbiguousUsageCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_many_candidates: Option<TooManyResolutionCandidates>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fq_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_callsites: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageRendering {
+    Full,
+    Lines,
+    Summary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolUsages {
+    pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fq_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_line: Option<usize>,
+    pub total_hits: usize,
+    pub unproven_hits: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_owner_sites: Option<usize>,
+    pub rendering: UsageRendering,
+    /// True when the candidate file set exceeded the analyzer's per-query cap
+    /// and an arbitrary subset was scanned. Results are partial when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub reference_only_siblings: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_sites_excluded: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_truncated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_enclosing: Vec<UsageEnclosingCount>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub same_owner_files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unproven_files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_relations:
+        Vec<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelRelation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageFileGroup {
+    pub path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub hits: Vec<UsageLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hit_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageLocation {
+    pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<usize>,
+    pub enclosing: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "is_full_confidence")]
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousUsageSymbol {
+    pub symbol: String,
+    pub short_name: String,
+    pub candidate_targets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidate_details: Vec<AmbiguousUsageCandidateDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_details_total: Option<usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub candidate_details_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidates: Vec<AmbiguousUsageCandidate>,
+    /// True when the candidate file set exceeded the analyzer's per-query cap
+    /// and an arbitrary subset was scanned. Results are partial when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_sites_excluded: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_many_candidates: Option<TooManyResolutionCandidates>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The selector matched more declarations than `scan_usages` will resolve.
+/// The candidate list was skipped, not truncated, so `candidate_targets` is
+/// empty and `total_candidates` is the true count of matched declarations --
+/// taken from the deduplicated match set before any per-declaration store
+/// read. Mirrors `search_symbols`' `too_many_matches` block (#1839).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TooManyResolutionCandidates {
+    pub total_candidates: usize,
+    pub cap: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousUsageCandidate {
+    pub target: String,
+    pub total_hits: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousUsageCandidateDetail {
+    pub target: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub scan_usages_by_location_target: ScanUsagesTargetSuggestion,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesTargetSuggestion {
+    pub path: String,
+    pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageEnclosingCount {
+    pub enclosing: String,
+    pub hits: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageFailureInfo {
+    /// Symbol requested by the caller.
+    pub symbol: String,
+    /// Fully qualified symbol reported by the analyzer failure, when available.
+    pub fq_name: String,
+    /// Stable machine-readable failure category, when available.
+    pub reason_kind: String,
+    /// Analyzer-provided reason. This is separate from `not_found` because the symbol
+    /// resolved, but usage analysis could not produce a trustworthy answer.
+    pub reason: String,
+    /// True when the candidate file set exceeded the analyzer's per-query cap
+    /// and an arbitrary subset was scanned before the failure was produced.
+    pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesCandidateFilesSample {
+    pub scanned: Vec<String>,
+    pub omitted: Vec<String>,
+    pub omitted_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TooManyCallsitesInfo {
+    pub symbol: String,
+    pub short_name: String,
+    pub total_callsites: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The detected-test-file exclusion for one request, or `None` when test files
+/// should be kept. Both `scan_usages` and `usage_graph` filter at the source
+/// (before the regex scan and the call-site cap) rather than dropping test hits
+/// after the fact: filtering post-hoc would let test hits eat into the cap and
+/// turn production-only queries into `TooManyCallsites` errors.
+pub(crate) fn test_file_exclusion(
+    analyzer: &dyn IAnalyzer,
+    include_tests: bool,
+) -> Option<Arc<TestFileExclusion<'_>>> {
+    (!include_tests).then(|| Arc::new(TestFileExclusion::new(analyzer)))
+}
+
+/// Answers "is this file excluded from a non-test scan?" one file at a time,
+/// memoized for the life of the request.
+///
+/// A file is excluded exactly when its classification is `Test` or
+/// `TestSupport`. Both kinds require — and are fully determined by — the
+/// `test_like` predicate in `classify_resolved_test_file`: a `Test` file is
+/// `test_like && contains_test_code`, a `TestSupport` file is
+/// `test_like && !contains_test_code`, and every non-`test_like` file lands in
+/// `Production`/`Ambiguous`. So membership is decided by [`is_test_like_file`]
+/// alone; the `contains_test_code` signal only splits `Test` from
+/// `TestSupport`, and both are excluded. That avoids hydrating a file's
+/// `FileState` (a full store read + decode of all declarations) solely to read
+/// a boolean that cannot change the verdict.
+///
+/// The per-file verdict is exactly what it was when this was a pre-built set
+/// over `analyzer.analyzed_files()`. What changed is *who* gets classified.
+/// Pre-classifying every analyzed file also invokes test-file detection for
+/// files the search will never read. Consumers only ever ask about files they
+/// are about to read: the scan's
+/// candidate files and the usage-graph walk's caller files.
+/// Every one of those comes from analyzer-indexed declarations, which is the
+/// same population the pre-built set was drawn from.
+pub(crate) struct TestFileExclusion<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    /// `file -> is_test_like`. A scan asks about the same candidate file once
+    /// per overload and once per requested symbol, so the memo is what keeps
+    /// the classification O(distinct candidates) rather than O(asks).
+    verdicts: std::sync::Mutex<HashMap<ProjectFile, bool>>,
+}
+
+impl<'a> TestFileExclusion<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            analyzer,
+            verdicts: std::sync::Mutex::new(HashMap::default()),
+        }
+    }
+
+    /// Whether `file` is dropped from a non-test scan.
+    pub(crate) fn excludes(&self, file: &ProjectFile) -> bool {
+        if let Some(verdict) = self
+            .verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(file)
+        {
+            return *verdict;
+        }
+        // Classify with the lock released: `file_is_test_only` can build a
+        // language's route index, and holding the memo lock across it would
+        // serialize the whole-workspace usage-graph walk behind one file.
+        // A racing duplicate classification is harmless because the predicate is pure.
+        let verdict = is_test_like_file(
+            self.analyzer,
+            file,
+            &rel_path_string(file),
+            language_for_file(file),
+        );
+        self.verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(file.clone(), verdict);
+        verdict
+    }
+}
+
+/// The `test_like` predicate shared by [`classify_resolved_test_file`] and
+/// [`TestFileExclusion`]: a file rooted under a test directory, carrying a
+/// test filename convention, or reachable only from test-gated code.
+///
+/// The third disjunct is the structural one (#1546): Rust's sibling test module
+/// is declared `#[cfg(test)] mod tests;` by its parent, so neither path rule
+/// fires. It is a lookup into the per-language module index rather than a
+/// per-file hydration, so it keeps the membership set cheap to build.
+pub(crate) fn is_test_like_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    path: &str,
+    language: Language,
+) -> bool {
+    test_paths::is_test_like_path(path, language) || analyzer.file_is_test_only(file)
+}
+
+/// Build a [`UsageFinder`] whose file filter drops the excluded test files and
+/// applies the optional path filter — the workspace scoping that both
+/// `scan_usages` and `usage_graph` run before querying call sites.
+pub(crate) fn scoped_usage_finder<'a>(
+    test_files: Option<&Arc<TestFileExclusion<'a>>>,
+    path_filter: Option<&Arc<ScanUsagesPathFilter>>,
+) -> UsageFinder<'a> {
+    let mut finder = UsageFinder::new();
+    if let Some(test_files) = test_files {
+        // The same verdict twice, on purpose. The retain below is the
+        // correctness backstop over every candidate the walk produced; this
+        // one reaches *into* the walk, so the type-hierarchy index it triggers
+        // is never built over classes this request has already excluded
+        // (#1748). Only the test verdict crosses -- see
+        // `UsageFinder::with_test_file_exclusion` for why the path filter
+        // cannot.
+        let excluded = Arc::clone(test_files);
+        finder = finder.with_test_file_exclusion(move |file| excluded.excludes(file));
+
+        let test_files = Arc::clone(test_files);
+        let path_filter = path_filter.map(Arc::clone);
+        // The candidate files reaching this filter are the only files the scan
+        // will read, so this is where the test classification is paid for --
+        // per candidate, not per workspace file.
+        finder = finder.with_file_filter(move |file| {
+            !test_files.excludes(file)
+                && path_filter
+                    .as_ref()
+                    .map(|filter| filter.matches(file))
+                    .unwrap_or(true)
+        });
+    } else if let Some(path_filter) = path_filter.map(Arc::clone) {
+        finder = finder.with_file_filter(move |file| path_filter.matches(file));
+    }
+    finder
+}
+
+pub(crate) fn ambiguous_usage_symbol_from_groups(
+    analyzer: &dyn IAnalyzer,
+    surface: ScanUsagesSurface,
+    symbol: String,
+    short_name: String,
+    groups: Vec<(String, Vec<CodeUnit>)>,
+    note: impl Into<String>,
+) -> AmbiguousUsageSymbol {
+    let note = note.into();
+    let total = groups.len();
+    let candidate_targets: Vec<String> = groups
+        .iter()
+        .map(|(selector, _)| selector.clone())
+        .collect();
+    let candidate_details: Vec<AmbiguousUsageCandidateDetail> =
+        if surface == ScanUsagesSurface::Location {
+            groups
+                .iter()
+                .take(SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT)
+                .filter_map(|(selector, units)| {
+                    let unit = units.first()?;
+                    // `unit` and `range` below both come from the analyzer's
+                    // own declaration data, so read the same analyzed
+                    // snapshot rather than the live file on disk.
+                    let source = analyzer.indexed_source(unit.source())?;
+                    let range =
+                        code_unit_declaration_name_range(analyzer, unit.source(), &source, unit)?;
+                    let path = rel_path_string(unit.source());
+                    let line = range.start_line + 1;
+                    let column = character_column_for_byte(&source, line, range.start_byte);
+                    Some(AmbiguousUsageCandidateDetail {
+                        target: selector.clone(),
+                        path: path.clone(),
+                        start_line: line,
+                        end_line: range.end_line + 1,
+                        scan_usages_by_location_target: ScanUsagesTargetSuggestion {
+                            path,
+                            line,
+                            column,
+                        },
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    let has_candidate_details = !candidate_details.is_empty();
+    AmbiguousUsageSymbol {
+        symbol,
+        short_name,
+        candidate_targets,
+        candidate_details,
+        candidate_details_total: has_candidate_details.then_some(total),
+        candidate_details_truncated: has_candidate_details
+            && total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT,
+        candidates: Vec::new(),
+        candidate_files_truncated: false,
+        definition_sites_excluded: None,
+        too_many_candidates: None,
+        note: Some(
+            if surface == ScanUsagesSurface::Location && total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
+            {
+                format!(
+                    "{} Showing first {} of {total} candidate locations.",
+                    note, SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
+                )
+            } else {
+                note
+            },
+        ),
+    }
+}
+
+/// The reply for a selector that matched more declarations than the tool will
+/// resolve. `candidate_targets` is empty on purpose: producing it is the work
+/// that was skipped, and an arbitrary subset of twenty thousand namesakes
+/// would read as the answer while being meaningless. The count and the cap
+/// carry the honest part (#1839).
+fn too_many_resolution_candidates_symbol(
+    symbol: String,
+    total_candidates: usize,
+    cap: usize,
+) -> AmbiguousUsageSymbol {
+    AmbiguousUsageSymbol {
+        short_name: symbol.clone(),
+        symbol,
+        candidate_targets: Vec::new(),
+        candidate_details: Vec::new(),
+        candidate_details_total: None,
+        candidate_details_truncated: false,
+        candidates: Vec::new(),
+        candidate_files_truncated: false,
+        definition_sites_excluded: None,
+        too_many_candidates: Some(TooManyResolutionCandidates {
+            total_candidates,
+            cap,
+        }),
+        note: Some(too_many_resolution_candidates_note(total_candidates, cap)),
+    }
+}
+
+pub(crate) fn too_many_resolution_candidates_note(total_candidates: usize, cap: usize) -> String {
+    format!(
+        "The symbol matched {total_candidates} declarations, over the {cap}-declaration resolution limit for one selector, so no candidate list was produced. Qualify the symbol (add its owner or module), or pick one declaration with `path#symbol`, and re-call."
+    )
+}
+
+pub(crate) fn scan_usages_ambiguity_note(surface: ScanUsagesSurface) -> &'static str {
+    match surface {
+        ScanUsagesSurface::Reference => {
+            "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets."
+        }
+        ScanUsagesSurface::Location => {
+            "Ambiguous location; refine the line/column target and re-call scan_usages_by_location."
+        }
+    }
+}
+
+pub(crate) enum ScanUsageTargetResolution {
+    Lexical {
+        symbol: String,
+        file: ProjectFile,
+        definition: LexicalDefinition,
+    },
+    Resolved {
+        symbol: String,
+        overloads: Vec<CodeUnit>,
+    },
+    Modeled {
+        symbol: String,
+        definition: ResolvedUsageDefinition,
+    },
+    NotFound(NotFoundInput),
+    Ambiguous(AmbiguousUsageSymbol),
+    Failure(UsageFailureInfo),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScanUsagesLocationSelection {
+    Point(usize),
+    Line(usize),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsageRequest {
+    index: usize,
+    input: ScanUsagesInput,
+    input_kind: ScanUsagesInputKind,
+    label: String,
+    surface: ScanUsagesSurface,
+}
+
+impl ScanUsageRequest {
+    pub(crate) fn symbol(index: usize, symbol: String) -> Self {
+        Self {
+            index,
+            input: ScanUsagesInput::Symbol(symbol.clone()),
+            input_kind: ScanUsagesInputKind::Symbol,
+            label: symbol,
+            surface: ScanUsagesSurface::Reference,
+        }
+    }
+
+    fn target(index: usize, target: ScanUsagesTarget) -> Self {
+        let label = scan_usages_target_label(&target);
+        Self {
+            index,
+            input: ScanUsagesInput::Target(target),
+            input_kind: ScanUsagesInputKind::Target,
+            label,
+            surface: ScanUsagesSurface::Location,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ScanUsagesQueryScope {
+    path_filter: Option<Arc<ScanUsagesPathFilter>>,
+    include_tests: bool,
+    ignored_paths: usize,
+    session_subset: Option<SubsetCoverage>,
+    /// Selectors that name nothing in this workspace: no file, no directory,
+    /// and, for a glob, no path it matches (#3092).
+    unmatched_paths: Vec<String>,
+}
+
+impl ScanUsagesQueryScope {
+    fn new(analyzer: &dyn IAnalyzer, paths: Option<&[String]>, include_tests: bool) -> Self {
+        let built = build_scan_usages_path_filter(analyzer, paths);
+        Self {
+            path_filter: built.filter,
+            include_tests,
+            ignored_paths: built.ignored_paths,
+            session_subset: session_subset(analyzer),
+            unmatched_paths: built.unmatched_paths,
+        }
+    }
+
+    fn whole_workspace(&self) -> bool {
+        self.path_filter.is_none()
+    }
+
+    fn result_scope(&self) -> ScanUsagesScope {
+        let (paths, paths_omitted) = self
+            .path_filter
+            .as_deref()
+            .map(ScanUsagesPathFilter::summarized_paths)
+            .unwrap_or_default();
+        let (unmatched_paths, unmatched_paths_omitted) =
+            bounded_scope_paths(self.unmatched_paths.iter().map(String::as_str));
+        ScanUsagesScope {
+            include_tests: self.include_tests,
+            whole_workspace: self.whole_workspace(),
+            session_subset: self.session_subset,
+            paths,
+            paths_omitted,
+            ignored_paths: some_if_nonzero(self.ignored_paths),
+            unmatched_paths,
+            unmatched_paths_omitted,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedResolvedScanTarget {
+    request: ScanUsageRequest,
+    symbol: String,
+    overloads: Vec<CodeUnit>,
+    location_selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesExecutionContext {
+    cancellation: CancellationToken,
+    max_candidate_files: usize,
+    max_path_scoped_candidate_files: usize,
+    max_source_bytes: usize,
+    max_callsites: usize,
+}
+
+impl ScanUsagesExecutionContext {
+    pub(crate) fn for_composite_query(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..Self::default()
+        }
+    }
+
+    fn interruption_reason(&self) -> ScanUsagesIncompleteReason {
+        if self.cancellation.is_timed_out() {
+            ScanUsagesIncompleteReason::TimeBudget
+        } else {
+            ScanUsagesIncompleteReason::Cancelled
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(
+        cancellation: CancellationToken,
+        max_candidate_files: usize,
+        max_path_scoped_candidate_files: usize,
+        max_source_bytes: usize,
+        max_callsites: usize,
+    ) -> Self {
+        Self {
+            cancellation,
+            max_candidate_files,
+            max_path_scoped_candidate_files,
+            max_source_bytes,
+            max_callsites,
+        }
+    }
+}
+
+impl Default for ScanUsagesExecutionContext {
+    fn default() -> Self {
+        Self {
+            cancellation: CancellationToken::default(),
+            max_candidate_files: DEFAULT_MAX_FILES,
+            max_path_scoped_candidate_files: SCAN_USAGES_PATH_SCOPED_MAX_FILES,
+            max_source_bytes: SCAN_USAGES_MAX_SOURCE_BYTES,
+            max_callsites: SCAN_USAGES_MAX_CALLSITES,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ScanUsagesWorkEntry {
+    Usage {
+        request: ScanUsageRequest,
+        state: SymbolUsageRenderState,
+        candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
+        target_is_method: bool,
+        incomplete_reason: Option<ScanUsagesIncompleteReason>,
+    },
+    NotFound {
+        request: ScanUsageRequest,
+        item: NotFoundInput,
+    },
+    Ambiguous {
+        request: ScanUsageRequest,
+        item: AmbiguousUsageSymbol,
+        incomplete_reason: Option<ScanUsagesIncompleteReason>,
+    },
+    Failure {
+        request: ScanUsageRequest,
+        failure: UsageFailureInfo,
+        incomplete_reason: Option<ScanUsagesIncompleteReason>,
+    },
+    Incomplete {
+        request: ScanUsageRequest,
+        symbol: Option<String>,
+        reason: ScanUsagesIncompleteReason,
+        message: String,
+    },
+    TooManyCallsites {
+        request: ScanUsageRequest,
+        state: SymbolUsageRenderState,
+        short_name: String,
+        total_callsites: usize,
+        limit: usize,
+        target_is_method: bool,
+    },
+}
+
+/// Raw reference sites collected before the interactive response renderer.
+///
+/// This is crate-private because the public scan result remains bounded for
+/// interactive callers. Consumers that need source-backed evidence can use
+/// this result without inheriting the presentation renderer's file and byte
+/// limits.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesReferenceSites {
+    pub(crate) input: ScanUsagesTarget,
+    pub(crate) files: Vec<ScanUsagesReferenceFile>,
+    pub(crate) incomplete_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesReferenceFile {
+    pub(crate) path: String,
+    pub(crate) hits: usize,
+    pub(crate) lines: Vec<usize>,
+}
+
+fn macro_lexical_usage_rows(
+    analyzer: &dyn IAnalyzer,
+    target_file: &ProjectFile,
+    target_definition: &LexicalDefinition,
+    path_filter: Option<&ScanUsagesPathFilter>,
+    include_tests: bool,
+    context: &ScanUsagesExecutionContext,
+) -> (Vec<UsageHitRow>, Option<ScanUsagesIncompleteReason>, bool) {
+    let test_files = (!include_tests).then(|| TestFileExclusion::new(analyzer));
+    let mut files =
+        macro_lexical::macro_lexical_candidate_files(analyzer, target_file, &context.cancellation);
+    files.retain(|file| {
+        path_filter.is_none_or(|filter| filter.matches(file))
+            && test_files
+                .as_ref()
+                .is_none_or(|tests| !tests.excludes(file))
+    });
+    files.sort_by_key(|file| (file != target_file, file.clone()));
+    if files.len() > context.max_candidate_files {
+        return (
+            Vec::new(),
+            Some(ScanUsagesIncompleteReason::CandidateFiles),
+            false,
+        );
+    }
+    let mut rows = Vec::new();
+    let mut source_bytes = 0usize;
+    for file in files {
+        if context.cancellation.is_cancelled() {
+            return (rows, Some(context.interruption_reason()), false);
+        }
+        let Some(source) = analyzer.indexed_source(&file) else {
+            return (
+                rows,
+                Some(ScanUsagesIncompleteReason::SourceUnavailable),
+                false,
+            );
+        };
+        source_bytes = source_bytes.saturating_add(source.len());
+        if source_bytes > context.max_source_bytes {
+            return (rows, Some(ScanUsagesIncompleteReason::SourceBytes), false);
+        }
+        let syntax = DeclarationNameRangeContext::new(&file, source);
+        let source = syntax.content();
+        let Some(root) = syntax.root_node() else {
+            return (
+                rows,
+                Some(ScanUsagesIncompleteReason::SourceUnavailable),
+                false,
+            );
+        };
+        let usages = macro_lexical::macro_lexical_references(
+            analyzer,
+            &file,
+            root,
+            source,
+            usize::MAX,
+            || context.cancellation.is_cancelled(),
+        );
+        if usages.cancelled {
+            return (rows, Some(context.interruption_reason()), false);
+        }
+        if usages.truncated {
+            return (rows, Some(ScanUsagesIncompleteReason::Callsites), true);
+        }
+        let line_starts = syntax.line_starts();
+        for (range, binding) in usages.references {
+            if binding.definition != *target_file
+                || binding.name_range.start != target_definition.name_range.start_byte
+                || binding.name_range.end != target_definition.name_range.end_byte
+            {
+                continue;
+            }
+            if rows.len() == context.max_callsites {
+                return (rows, None, true);
+            }
+            let start = brokk_bifrost_core::text_utils::line_column_for_offset(
+                source,
+                line_starts,
+                range.start,
+            );
+            let end = brokk_bifrost_core::text_utils::line_column_for_offset(
+                source,
+                line_starts,
+                range.end,
+            );
+            let line_start = line_starts[start.0 - 1];
+            let line_end = line_starts.get(start.0).copied().unwrap_or(source.len());
+            let source_range = Range {
+                start_byte: range.start,
+                end_byte: range.end,
+                start_line: start.0 - 1,
+                end_line: end.0 - 1,
+            };
+            let enclosing = analyzer
+                .enclosing_code_unit(&file, &source_range)
+                .map(|unit| unit.fq_name())
+                .unwrap_or_else(|| rel_path_string(&file));
+            rows.push(UsageHitRow {
+                path: rel_path_string(&file),
+                line: start.0,
+                column: Some(start.1),
+                end_line: Some(end.0),
+                end_column: Some(end.1),
+                start_offset: range.start,
+                end_offset: range.end,
+                enclosing,
+                kind: UsageHitKind::Reference,
+                reason_kind: None,
+                snippet: source[line_start..line_end].trim_end().to_owned(),
+                confidence: 1.0,
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        (&left.path, left.start_offset).cmp(&(&right.path, right.start_offset))
+    });
+    rows.dedup_by(|left, right| {
+        left.path == right.path
+            && left.start_offset == right.start_offset
+            && left.end_offset == right.end_offset
+    });
+    (rows, None, false)
+}
+
+fn lexical_label_usage_rows(
+    analyzer: &dyn IAnalyzer,
+    target_file: &ProjectFile,
+    target_definition: &LexicalDefinition,
+    path_filter: Option<&ScanUsagesPathFilter>,
+    include_tests: bool,
+    context: &ScanUsagesExecutionContext,
+) -> (Vec<UsageHitRow>, Option<ScanUsagesIncompleteReason>, bool) {
+    let test_files = (!include_tests).then(|| TestFileExclusion::new(analyzer));
+    if context.cancellation.is_cancelled()
+        || language_for_file(target_file) != Language::Cpp
+        || path_filter.is_some_and(|filter| !filter.matches(target_file))
+        || test_files
+            .as_ref()
+            .is_some_and(|tests| tests.excludes(target_file))
+    {
+        return (
+            Vec::new(),
+            context
+                .cancellation
+                .is_cancelled()
+                .then(|| context.interruption_reason()),
+            false,
+        );
+    }
+    let Some(source) = analyzer.indexed_source(target_file) else {
+        return (Vec::new(), None, false);
+    };
+    if source.len() > context.max_source_bytes {
+        return (
+            Vec::new(),
+            Some(ScanUsagesIncompleteReason::SourceBytes),
+            false,
+        );
+    }
+    let mut rows = Vec::new();
+    let syntax_context = DeclarationNameRangeContext::new(target_file, source);
+    let source = syntax_context.content();
+    let Some(root) = syntax_context.root_node() else {
+        return (rows, None, false);
+    };
+    let line_starts = syntax_context.line_starts();
+    let usages = c_label_usage_ranges(
+        root,
+        source,
+        target_definition,
+        context.max_callsites,
+        || context.cancellation.is_cancelled(),
+    );
+    if usages.cancelled {
+        return (rows, Some(context.interruption_reason()), false);
+    }
+    for range in usages.ranges {
+        let start = brokk_bifrost_core::text_utils::line_column_for_offset(
+            source,
+            line_starts,
+            range.start_byte,
+        );
+        let end = brokk_bifrost_core::text_utils::line_column_for_offset(
+            source,
+            line_starts,
+            range.end_byte,
+        );
+        let line_start = line_starts[start.0.saturating_sub(1)];
+        let line_end = line_starts.get(start.0).copied().unwrap_or(source.len());
+        let snippet = source[line_start..line_end].trim_end().to_owned();
+        let enclosing = analyzer
+            .enclosing_code_unit(target_file, &range)
+            .map(|unit| unit.fq_name().to_owned())
+            .unwrap_or_else(|| rel_path_string(target_file));
+        rows.push(UsageHitRow {
+            path: rel_path_string(target_file),
+            line: start.0,
+            column: Some(start.1),
+            end_line: Some(end.0),
+            end_column: Some(end.1),
+            start_offset: range.start_byte,
+            end_offset: range.end_byte,
+            enclosing,
+            kind: UsageHitKind::Reference,
+            reason_kind: None,
+            snippet,
+            confidence: 1.0,
+        });
+    }
+    rows.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_offset.cmp(&right.start_offset))
+    });
+    (rows, None, usages.truncated)
+}
+
+impl ScanUsagesWorkEntry {
+    fn index(&self) -> usize {
+        match self {
+            ScanUsagesWorkEntry::Usage { request, .. }
+            | ScanUsagesWorkEntry::NotFound { request, .. }
+            | ScanUsagesWorkEntry::Ambiguous { request, .. }
+            | ScanUsagesWorkEntry::Failure { request, .. }
+            | ScanUsagesWorkEntry::Incomplete { request, .. }
+            | ScanUsagesWorkEntry::TooManyCallsites { request, .. } => request.index,
+        }
+    }
+}
+
+/// Whether an interrupted query still carries sites worth reporting.
+fn fuzzy_result_has_hits(result: &FuzzyResult) -> bool {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        }
+        | FuzzyResult::Incomplete {
+            hits_by_overload, ..
+        }
+        | FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => hits_by_overload.values().any(|hits| !hits.is_empty()),
+        FuzzyResult::TooManyCallsites { sample_hits, .. } => !sample_hits.is_empty(),
+        FuzzyResult::Failure { .. } => false,
+    }
+}
+
+fn query_incomplete_reason(
+    completion: UsageQueryCompletion,
+    interruption_reason: ScanUsagesIncompleteReason,
+) -> Option<ScanUsagesIncompleteReason> {
+    match completion {
+        UsageQueryCompletion::Complete => None,
+        UsageQueryCompletion::Cancelled => Some(interruption_reason),
+        UsageQueryCompletion::CandidateFilesBudgetExhausted => {
+            Some(ScanUsagesIncompleteReason::CandidateFiles)
+        }
+        UsageQueryCompletion::SourceBytesBudgetExhausted => {
+            Some(ScanUsagesIncompleteReason::SourceBytes)
+        }
+    }
+}
+
+fn incomplete_recovery_message(
+    reason: ScanUsagesIncompleteReason,
+    surface: ScanUsagesSurface,
+) -> String {
+    match reason {
+        ScanUsagesIncompleteReason::Cancelled => format!(
+            "usage analysis was cancelled; after cancellation clears, re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::TimeBudget => {
+            format!(
+                "usage analysis exhausted its wall-clock time budget; narrow `paths` or use a more specific selector, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::CandidateFiles => {
+            format!(
+                "usage analysis exhausted its candidate-file budget; narrow `paths`, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::SourceBytes => {
+            format!(
+                "usage analysis exhausted its source-byte budget; narrow `paths`, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::SourceUnavailable => format!(
+            "Source or syntax was unavailable for an admitted file; {} could not complete the reference scan.",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::SemanticAnalysis => {
+            "Usage analysis did not complete semantic enumeration; absence is unverified."
+                .to_string()
+        }
+        ScanUsagesIncompleteReason::Callsites => format!(
+            "usage analysis exhausted its callsite budget; narrow `paths` or use a more specific selector, then re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::ResponseBudget => format!(
+            "usage results were summarized to fit the response budget; re-call {} with one target to maximize retained detail, but exhaustive modeled relation retrieval is unavailable",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::ResolutionCandidates => format!(
+            "the selector matched more declarations than usage analysis will resolve; qualify it (or use `path#symbol` from a previous ambiguous reply), then re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::UnmatchedPaths => format!(
+            "one or more `paths` selectors selected no searchable file, so this answer covers less than the request named; check the spelling in `scope.unmatched_paths` against the workspace tree, then re-call {}",
+            surface.tool_name()
+        ),
+    }
+}
+
+fn mark_incomplete(
+    entry: &mut ScanUsagesEntry,
+    reason: ScanUsagesIncompleteReason,
+    surface: ScanUsagesSurface,
+) -> bool {
+    let mut changed = entry.complete || entry.incomplete_reason != Some(reason);
+    entry.complete = false;
+    entry.incomplete_reason = Some(reason);
+    let recovery = incomplete_recovery_message(reason, surface);
+    if entry.message.is_none() {
+        entry.message = Some(recovery);
+        changed = true;
+    } else if entry.message.as_deref() != Some(recovery.as_str())
+        && !entry.notes.contains(&recovery)
+    {
+        entry.notes.push(recovery);
+        changed = true;
+    }
+    changed
+}
+
+fn incomplete_work_entry(
+    request: ScanUsageRequest,
+    symbol: Option<String>,
+    reason: ScanUsagesIncompleteReason,
+) -> ScanUsagesWorkEntry {
+    let message = incomplete_recovery_message(reason, request.surface);
+    ScanUsagesWorkEntry::Incomplete {
+        request,
+        symbol,
+        reason,
+        message,
+    }
+}
+
+fn incomplete_requests(
+    symbols: Vec<ScanUsageRequest>,
+    targets: Vec<ScanUsageRequest>,
+    reason: ScanUsagesIncompleteReason,
+) -> Vec<ScanUsagesWorkEntry> {
+    targets
+        .into_iter()
+        .chain(symbols)
+        .map(|request| {
+            let symbol = matches!(request.input_kind, ScanUsagesInputKind::Symbol)
+                .then(|| request.label.clone());
+            incomplete_work_entry(request, symbol, reason)
+        })
+        .collect()
+}
+
+pub fn scan_usages_target_label(target: &ScanUsagesTarget) -> String {
+    match target.column {
+        Some(column) => format!("{}:{}:{column}", target.path, target.line),
+        None => format!("{}:{}", target.path, target.line),
+    }
+}
+
+pub(crate) fn location_selector_failure(
+    target: &ScanUsagesTarget,
+    reason_kind: &str,
+    reason: impl Into<String>,
+) -> ScanUsageTargetResolution {
+    let hint = usage_failure_hint(ScanUsagesSurface::Location, reason_kind, None, true, false);
+    ScanUsageTargetResolution::Failure(UsageFailureInfo {
+        symbol: scan_usages_target_label(target),
+        fq_name: String::new(),
+        reason_kind: reason_kind.to_string(),
+        reason: reason.into(),
+        candidate_files_truncated: false,
+        candidate_files_sample: None,
+        hint,
+    })
+}
+
+pub(crate) fn usage_failure_hint(
+    surface: ScanUsagesSurface,
+    reason_kind: &str,
+    target: Option<&CodeUnit>,
+    location_selected: bool,
+    candidate_files_truncated: bool,
+) -> Option<String> {
+    if reason_kind == "unsupported_target_shape" {
+        return Some(unsupported_target_shape_guidance(target));
+    }
+
+    if candidate_files_truncated {
+        return Some(format!(
+            "The candidate file set exceeded the per-query cap; re-call {} with narrower `paths` to reduce the scan scope.",
+            surface.tool_name()
+        ));
+    }
+
+    match (reason_kind, location_selected) {
+        ("no_graph_seed", true) => Some(
+            "No export seed was resolved for this selected definition. Use search_symbols or get_symbol_sources to choose an exported declaration, or narrow `paths` to likely callers."
+                .to_string(),
+        ),
+        ("no_graph_seed", false) => Some(
+            "No export seed was resolved for this symbol. Use search_symbols or get_symbol_sources to choose an exported declaration, then re-call scan_usages_by_reference with that symbol."
+                .to_string(),
+        ),
+        ("unsupported_target_language", _)
+        | ("missing_analyzer_capability", _)
+        | ("unsupported_target_shape", _) => None,
+        _ => None,
+    }
+}
+
+pub(crate) fn unsupported_target_shape_message(target: Option<&CodeUnit>) -> String {
+    let Some(target) = target else {
+        return "`scan_usages` cannot resolve this declaration kind yet".to_string();
+    };
+    format!(
+        "`scan_usages` cannot resolve {} {} declarations yet",
+        scan_usages_language_name(language_for_target(target)),
+        target.kind().display_lowercase(),
+    )
+}
+
+pub(crate) const UNSUPPORTED_TARGET_SHAPE_GUIDANCE: &str = "Use `get_symbol_sources` to inspect the declaration, then `query_code` to find syntactic candidates; `query_code` does not resolve references.";
+
+pub(crate) fn unsupported_target_shape_guidance(target: Option<&CodeUnit>) -> String {
+    let Some(target) = target else {
+        return UNSUPPORTED_TARGET_SHAPE_GUIDANCE.to_string();
+    };
+
+    if target.is_macro() {
+        return function_like_macro_query_guidance(
+            language_for_target(target),
+            target.identifier(),
+        );
+    }
+
+    UNSUPPORTED_TARGET_SHAPE_GUIDANCE.to_string()
+}
+
+pub(crate) fn function_like_macro_query_guidance(language: Language, identifier: &str) -> String {
+    let query = function_like_macro_query(language, identifier);
+    format!(
+        "Use `get_symbol_sources` to inspect the macro. For a function-like macro, call `query_code` with `{query}` to find syntactic invocation candidates; `query_code` does not resolve references."
+    )
+}
+
+pub(crate) fn function_like_macro_query(language: Language, identifier: &str) -> String {
+    serde_json::json!({
+        "languages": [language.config_label()],
+        "match": { "kind": "call", "callee": { "name": identifier } }
+    })
+    .to_string()
+}
+
+pub(crate) fn scan_usages_language_name(language: Language) -> &'static str {
+    match language {
+        Language::None => "this language",
+        Language::Java => "Java",
+        Language::Go => "Go",
+        Language::Cpp => "C/C++",
+        Language::JavaScript => "JavaScript",
+        Language::TypeScript => "TypeScript",
+        Language::Python => "Python",
+        Language::Rust => "Rust",
+        Language::Php => "PHP",
+        Language::Scala => "Scala",
+        Language::CSharp => "C#",
+        Language::Ruby => "Ruby",
+        Language::Kotlin => "Kotlin",
+    }
+}
+
+pub(crate) fn scan_usages_anchor_not_found_input(
+    input: impl Into<String>,
+    anchor: &str,
+    name: &str,
+    resolved_targets: &[CodeUnit],
+) -> NotFoundInput {
+    if resolved_targets
+        .iter()
+        .all(|target| language_for_target(target) == Language::Cpp && target.is_macro())
+        && !resolved_targets.is_empty()
+    {
+        let target = &resolved_targets[0];
+        return not_found_input(
+            input,
+            Some(format!(
+                "`{name}` has no definition in `{anchor}`. It resolves elsewhere as a C/C++ macro, which `scan_usages` cannot resolve. {}",
+                unsupported_target_shape_guidance(Some(target)),
+            )),
+        );
+    }
+
+    anchor_not_found_input(input, anchor, name)
+}
+
+pub(crate) fn character_column_for_byte(source: &str, line: usize, byte: usize) -> Option<usize> {
+    if line == 0 || byte > source.len() || !source.is_char_boundary(byte) {
+        return None;
+    }
+    let line_starts = compute_line_starts(source);
+    let line_start = *line_starts.get(line - 1)?;
+    let line_end = line_starts.get(line).copied().unwrap_or(source.len());
+    let slice = source.get(line_start..byte.min(line_end))?;
+    Some(slice.chars().count() + 1)
+}
+
+fn c_label_on_line(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    line: usize,
+    selector: Option<&str>,
+) -> Option<(String, LexicalDefinition)> {
+    let mut candidates = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "labeled_statement"
+            && node.start_position().row + 1 == line
+            && let Some(label) = node.child_by_field_name("label")
+            && let Some(identifier) = source.get(label.byte_range())
+            && selector.is_none_or(|requested| requested == identifier)
+            && let Some(definition) = resolve_lexical_binding(
+                Language::Cpp,
+                root,
+                source,
+                label.start_byte(),
+                label.end_byte(),
+                identifier,
+            )
+            && let LexicalBindingResolution::OtherLocal(definition) = definition
+            && definition.kind == DeclarationKind::StatementLabel
+        {
+            candidates.push((identifier.to_owned(), definition));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
+}
+
+pub(crate) fn resolve_scan_usages_target(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    resolver: &WorkspaceFileResolver,
+    target: ScanUsagesTarget,
+) -> ScanUsageTargetResolution {
+    let file = match resolver.resolve_literal(target.path.trim()) {
+        ResolvedFileInput::File(file) => file,
+        ResolvedFileInput::Ambiguous(item) => {
+            return location_selector_failure(
+                &target,
+                "ambiguous_path",
+                format!(
+                    "`{}` is ambiguous; matches: {}",
+                    item.input,
+                    item.matches.join(", ")
+                ),
+            );
+        }
+        ResolvedFileInput::NotFound(path) => {
+            return ScanUsageTargetResolution::NotFound(file_not_found_input(format!(
+                "{} ({path} does not resolve to a workspace file)",
+                scan_usages_target_label(&target)
+            )));
+        }
+    };
+
+    // Location ranges use the current source projection. Read the same
+    // working-tree source for line and column conversion, then fall back to
+    // the indexed snapshot when the file is not readable.
+    let source = match analyzer.project().read_source(&file) {
+        Ok(source) => source,
+        Err(_) => match analyzer.indexed_source(&file) {
+            Some(source) => source,
+            None => {
+                return location_selector_failure(
+                    &target,
+                    "read_failed",
+                    format!(
+                        "failed to read `{}`: not indexed by analyzer",
+                        rel_path_string(&file)
+                    ),
+                );
+            }
+        },
+    };
+
+    if target.column == Some(0) {
+        return location_selector_failure(
+            &target,
+            "invalid_location",
+            scan_usages_location_diagnostic(&target, &source, "column must be 1-based"),
+        );
+    }
+
+    let line_starts = compute_line_starts(&source);
+    let line = target.line;
+    if line == 0 || line > line_starts.len() {
+        return location_selector_failure(
+            &target,
+            "invalid_location",
+            scan_usages_location_diagnostic(
+                &target,
+                &source,
+                &format!(
+                    "line {line} is outside 1..={} for this file",
+                    line_starts.len()
+                ),
+            ),
+        );
+    }
+    let selection = if let Some(column) = target.column {
+        let line_start = line_starts[line - 1];
+        let line_end = line_starts.get(line).copied().unwrap_or(source.len());
+        match brokk_bifrost_core::analyzer::usages::reference_site::byte_offset_for_character_column(
+            &source, line_start, line_end, line, column,
+        ) {
+            Ok(point) => ScanUsagesLocationSelection::Point(point),
+            Err(reason) => {
+                return location_selector_failure(
+                    &target,
+                    "invalid_location",
+                    scan_usages_location_diagnostic(&target, &source, &reason),
+                );
+            }
+        }
+    } else {
+        ScanUsagesLocationSelection::Line(line)
+    };
+
+    let selector = match target.symbol.as_deref() {
+        None => None,
+        Some(symbol) => match split_definition_selector_with_workspace_files(resolver, symbol) {
+            DefinitionSelector::Name(name) => Some(name),
+            DefinitionSelector::FileAnchored { anchor, lookup } => {
+                let anchor_file = match resolver.resolve_literal(&anchor) {
+                    ResolvedFileInput::File(file) => file,
+                    ResolvedFileInput::Ambiguous(item) => {
+                        return location_selector_failure(
+                            &target,
+                            "ambiguous_path",
+                            format!(
+                                "selector anchor `{}` is ambiguous; matches: {}",
+                                item.input,
+                                item.matches.join(", ")
+                            ),
+                        );
+                    }
+                    ResolvedFileInput::NotFound(path) => {
+                        return ScanUsageTargetResolution::NotFound(not_found_input(
+                            scan_usages_target_label(&target),
+                            Some(format!(
+                                "selector anchor `{path}` does not resolve to a workspace file"
+                            )),
+                        ));
+                    }
+                };
+                if anchor_file != file {
+                    return ScanUsageTargetResolution::NotFound(not_found_input(
+                        scan_usages_target_label(&target),
+                        Some(format!(
+                            "selector anchor `{anchor}` does not match target path `{}`",
+                            rel_path_string(&file)
+                        )),
+                    ));
+                }
+                Some(lookup)
+            }
+        },
+    };
+
+    let range_context = DeclarationNameRangeContext::new(&file, source);
+    let source = range_context.content();
+
+    if let ScanUsagesLocationSelection::Point(point) = selection
+        && language_for_file(&file) == Language::Cpp
+        && let Some(root) = range_context.root_node()
+        && let Some(definition) = macro_lexical::macro_lexical_definition(
+            analyzer,
+            &file,
+            root,
+            source,
+            point,
+            point.saturating_add(1),
+        )
+        && selector.is_none_or(|requested| requested == definition.identifier)
+    {
+        return ScanUsageTargetResolution::Lexical {
+            symbol: definition.identifier.clone(),
+            file: definition.source_file.clone().unwrap_or(file),
+            definition,
+        };
+    }
+
+    if let ScanUsagesLocationSelection::Point(point) = selection
+        && let Some(root) = range_context.root_node()
+        && let Some(node) = root.named_descendant_for_byte_range(point, point.saturating_add(1))
+        && let Some(identifier) = source.get(node.byte_range())
+        && let Some(LexicalBindingResolution::OtherLocal(definition)) = resolve_lexical_binding(
+            Language::Cpp,
+            root,
+            source,
+            node.start_byte(),
+            node.end_byte(),
+            identifier,
+        )
+        && definition.kind == DeclarationKind::StatementLabel
+        && selector.is_none_or(|requested| requested == identifier)
+    {
+        return ScanUsageTargetResolution::Lexical {
+            symbol: identifier.to_owned(),
+            file,
+            definition,
+        };
+    }
+    if let ScanUsagesLocationSelection::Line(line) = selection
+        && let Some(root) = range_context.root_node()
+        && let Some((symbol, definition)) = c_label_on_line(root, source, line, selector)
+    {
+        return ScanUsageTargetResolution::Lexical {
+            symbol,
+            file,
+            definition,
+        };
+    }
+
+    if let Some(overlay) = analyzer.semantic_model_overlay() {
+        let path = rel_path_string(&file);
+        let mut modeled = overlay
+            .symbols_at_authored_path(&path)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                let brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) =
+                    &symbol.location
+                else {
+                    return false;
+                };
+                // Semantic-model authored anchors carry the analyzer's 1-based
+                // stored-range line convention (built from `facts.line_of_byte`
+                // and `analyzer.ranges`); normalize to the 0-based rows
+                // `scan_usages_target_matches_range` compares against (#2709).
+                let range = brokk_bifrost_core::analyzer::model::Range {
+                    start_byte: anchor.range.start_byte,
+                    end_byte: anchor.range.end_byte,
+                    start_line: anchor.range.start_line.saturating_sub(1),
+                    end_line: anchor.range.end_line.saturating_sub(1),
+                };
+                scan_usages_target_matches_range(selection, range)
+                    && selector.is_none_or(|requested| {
+                        symbol.id == requested
+                            || symbol.name == requested
+                            || symbol.qualified_name == requested
+                    })
+            })
+            .collect::<Vec<_>>();
+        modeled.sort_by(|left, right| left.id.cmp(&right.id));
+        modeled.dedup_by(|left, right| left.id == right.id);
+        if modeled.len() == 1 && !modeled[0].provenance.ambiguous {
+            let symbol = modeled[0];
+            return ScanUsageTargetResolution::Modeled {
+                symbol: symbol.qualified_name.clone(),
+                definition: ResolvedUsageDefinition {
+                    fq_name: symbol.qualified_name.clone(),
+                    path,
+                    line: symbol.location.range().start_line,
+                },
+            };
+        }
+        if !modeled.is_empty() {
+            let candidate_targets = modeled
+                .iter()
+                .map(|symbol| symbol.qualified_name.clone())
+                .collect::<Vec<_>>();
+            return ScanUsageTargetResolution::Ambiguous(AmbiguousUsageSymbol {
+                symbol: scan_usages_target_label(&target),
+                short_name: target.symbol.clone().unwrap_or_default(),
+                candidate_targets,
+                candidate_details: Vec::new(),
+                candidate_details_total: None,
+                candidate_details_truncated: false,
+                candidates: Vec::new(),
+                candidate_files_truncated: false,
+                definition_sites_excluded: None,
+                too_many_candidates: None,
+                note: Some(
+                    "Ambiguous modeled location; provide an exact model declaration selector."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
+    // The selector to match is an explicit parameter (not closed over) so the
+    // same pool computation can be re-run with `selector_arg: None` below for
+    // the not_found corrective hint, which asks "what's actually here" rather
+    // than "what matches the caller's spelling".
+    let location_units =
+        |units: Vec<CodeUnit>,
+         selector_arg: Option<&str>,
+         accept_declaration_range: bool,
+         matches_selector: &dyn Fn(&CodeUnit, &str) -> bool| {
+            units
+                .into_iter()
+                .filter_map(|unit| {
+                    let selector_matches =
+                        selector_arg.is_some_and(|symbol| matches_selector(&unit, symbol));
+                    let mut ranges = if selector_matches || selector_arg.is_none() {
+                        range_context.location_name_ranges(analyzer, &unit)
+                    } else {
+                        return None;
+                    };
+                    if selector_matches && (accept_declaration_range || unit.is_module()) {
+                        // `location_ranges` carries the analyzer's 1-based
+                        // stored-range line convention (#2428), while the
+                        // derived name ranges above are 0-based tree-sitter
+                        // rows and `scan_usages_target_matches_range` compares
+                        // against the 0-based family. Normalize where the two
+                        // families meet so a probe at the declaration's own
+                        // reported start line (e.g. an annotation line) is
+                        // accepted and one line past end is rejected (#2709).
+                        ranges.extend(analyzer.location_ranges(&unit).into_iter().map(|range| {
+                            Range {
+                                start_line: range.start_line.saturating_sub(1),
+                                end_line: range.end_line.saturating_sub(1),
+                                ..range
+                            }
+                        }));
+                        ranges.sort_unstable();
+                        ranges.dedup();
+                    }
+                    let best_span = ranges
+                        .into_iter()
+                        .filter(|range| scan_usages_target_matches_range(selection, *range))
+                        .map(|range| range.end_byte.saturating_sub(range.start_byte))
+                        .min()?;
+                    Some((unit, best_span))
+                })
+                .collect::<Vec<_>>()
+        };
+
+    // Exact selector forms (fq_name, definition_selector, and the display
+    // symbol) are tried first; a bare identifier is accepted as a
+    // location-pinned short name only in a second pass, and only when no
+    // exact form matched anything at this location. This ordering is the
+    // fix for #1231: without it, a short-name coincidence elsewhere in the
+    // matching_units pool could out-narrow (or otherwise interfere with) a
+    // genuine exact-selector match at the same location.
+    // The display spelling is accepted here, not printed: it is a spelling a
+    // reader plausibly types, and this check asks what the caller may have
+    // meant, not which selector a result offers. `display_symbol_for_target`
+    // answers the printing question instead and keeps index decoration when
+    // the stripped spelling belongs to a sibling (#3302).
+    let selector_matches_exact_form = |unit: &CodeUnit, symbol: &str| {
+        unit.fq_name() == symbol
+            || definition_selector(unit) == symbol
+            || display_symbol_name(language_for_target(unit), unit.fq_name_str()) == symbol
+    };
+    // The location pins a single declaration, so a selector may omit leading
+    // namespace or aggregate segments. Parse the selector with the language's
+    // structured name reader and compare its segment texts with the candidate's
+    // FQ suffix. This admits both a bare nested type (`BL_TYPE`) and a member
+    // with a partially-qualified owner (`Big.x`) even when C++ renders the
+    // omitted aggregate prefix with `$` (`PBlock$BL_TYPE`, `nk_alignof$Big.x`).
+    // Exact selectors still get the first pass above, before this location-pinned
+    // suffix match can consider them.
+    let selector_matches_short_name = |unit: &CodeUnit, symbol: &str| {
+        let language = language_for_target(unit);
+        let selector = parse_symbol_path_fq(language, symbol, segment_interner());
+        let fq = unit.fq();
+        !selector.is_empty()
+            && selector.len() <= fq.len()
+            && fq
+                .suffix_from(fq.len() - selector.len())
+                .same_segment_texts(&selector)
+    };
+
+    let declarations_here = declarations_in_file(analyzer, &file);
+    let mut matching_units = location_units(
+        declarations_here.clone(),
+        selector,
+        true,
+        &selector_matches_exact_form,
+    );
+    // Lookup-only units also need the location-pinned suffix match below.
+    // Seek the selector's terminal identifier in this file, rather than its
+    // full FQ: a source-written receiver can omit the creating binding's scope
+    // (#3864). Exact matches still precede suffix matches, including module
+    // surfaces whose source spelling differs from their declaration identity.
+    let lookup_only_candidates = if matching_units.is_empty()
+        && let Some(symbol) = selector
+    {
+        let language = language_for_file(&file);
+        let name = parse_symbol_path_fq(language, symbol, segment_interner());
+        let declarations = analyzer.location_declarations(&file);
+        let lookup = AnalyzerDefinitionLookup::new(analyzer, language);
+        name.last()
+            .into_iter()
+            .flat_map(|segment| {
+                let identifier = segment_interner().resolve(segment).0;
+                lookup.file_identifier(&file, identifier)
+            })
+            .filter(|unit| {
+                unit.source() == &file
+                    && unit.is_field()
+                    && analyzer.parent_of(unit).is_none()
+                    && !declarations.contains(unit)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if matching_units.is_empty()
+        && !lookup_only_candidates.is_empty()
+        && UsageEcosystem::of(language_for_file(&file)).is_module_scoped()
+    {
+        matching_units = location_units(
+            lookup_only_candidates.clone(),
+            selector,
+            true,
+            &selector_matches_exact_form,
+        );
+    }
+    if matching_units.is_empty() && selector.is_some() {
+        matching_units = location_units(
+            declarations_here.clone(),
+            selector,
+            false,
+            &selector_matches_short_name,
+        );
+    }
+    if matching_units.is_empty() && !lookup_only_candidates.is_empty() {
+        matching_units = location_units(
+            lookup_only_candidates.clone(),
+            selector,
+            true,
+            &selector_matches_exact_form,
+        );
+        if matching_units.is_empty() {
+            matching_units = location_units(
+                lookup_only_candidates,
+                selector,
+                false,
+                &selector_matches_short_name,
+            );
+        }
+    }
+
+    if matching_units.is_empty() && selector.is_none() {
+        return ScanUsageTargetResolution::NotFound(not_found_input(
+            scan_usages_target_label(&target),
+            Some(scan_usages_location_diagnostic(
+                &target,
+                range_context.content(),
+                "no declaration at location",
+            )),
+        ));
+    }
+
+    if matching_units.is_empty()
+        && let Some(symbol) = target.symbol.as_deref()
+    {
+        // The location itself resolves to a declaration, just not under this
+        // spelling. Name the resolvable candidate so the corrective message
+        // never reads as a bare refusal (I5-honesty, #1231): state that
+        // selectors are fully-qualified, and offer what a line-only request
+        // at this same location would have resolved to.
+        let here = resolve_location_groups(
+            analyzer,
+            token,
+            location_units(declarations_here, None, false, &selector_matches_exact_form),
+            true,
+        );
+        let reason = match here.first() {
+            Some((candidate, _)) => format!(
+                "no declaration matching `{symbol}` at location; the declaration here is `{candidate}` \u{2014} selectors use fully-qualified names"
+            ),
+            None => format!(
+                "no declaration matching `{symbol}` at location; selectors use fully-qualified names"
+            ),
+        };
+        return ScanUsageTargetResolution::NotFound(not_found_input(
+            scan_usages_target_label(&target),
+            Some(scan_usages_location_diagnostic(
+                &target,
+                range_context.content(),
+                &reason,
+            )),
+        ));
+    }
+
+    let groups = resolve_location_groups(analyzer, token, matching_units, selector.is_none());
+    if groups.len() > 1 {
+        let label = scan_usages_target_label(&target);
+        return ScanUsageTargetResolution::Ambiguous(ambiguous_usage_symbol_from_groups(
+            analyzer,
+            ScanUsagesSurface::Location,
+            label.clone(),
+            label,
+            groups,
+            "Ambiguous location; refine the line/column target.",
+        ));
+    }
+
+    let (_, overloads) = groups
+        .into_iter()
+        .next()
+        .expect("non-empty target groups: matching_units was checked non-empty above");
+    let symbol = definition_selector(&overloads[0]);
+    ScanUsageTargetResolution::Resolved { symbol, overloads }
+}
+
+/// Narrow a location-matched pool (`CodeUnit`, byte-span-of-narrowest-matching-range)
+/// to the narrowest span, optionally drop synthetic identities that share a
+/// source declaration's name range (see the doc comment at the call site),
+/// and partition what remains into distinct selectable definitions via
+/// [`distinct_definitions`]. Shared by the main resolution path and the
+/// not_found corrective hint so both report exactly the same candidate for
+/// the same location.
+fn resolve_location_groups(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    pool: Vec<(CodeUnit, usize)>,
+    filter_synthetic: bool,
+) -> Vec<(String, Vec<CodeUnit>)> {
+    let Some(narrowest_span) = pool.iter().map(|(_, span)| *span).min() else {
+        return Vec::new();
+    };
+    let mut matches: Vec<CodeUnit> = pool
+        .into_iter()
+        .filter_map(|(unit, span)| (span == narrowest_span).then_some(unit))
+        .collect();
+
+    // A source-backed synthetic identity may intentionally share its declaration
+    // name range with the source declaration that owns it. Scala primary
+    // constructors are the current example: `class Service(value: String)`
+    // defines both the `Service` type and a synthetic `Service.Service`
+    // constructor at the `Service` token. A plain location target selects the
+    // source declaration, while an explicit `symbol` selector can still request
+    // the synthetic identity.
+    if filter_synthetic && matches.iter().any(|unit| !unit.is_synthetic()) {
+        matches.retain(|unit| !unit.is_synthetic());
+    }
+
+    matches.sort_by(|left, right| {
+        primary_range(analyzer, left)
+            .map(|range| (range.start_line, range.start_byte))
+            .cmp(&primary_range(analyzer, right).map(|range| (range.start_line, range.start_byte)))
+            .then_with(|| left.fq_name().cmp(&right.fq_name()))
+    });
+
+    distinct_definitions(analyzer, token, matches)
+}
+
+pub(crate) fn scan_usages_location_diagnostic(
+    target: &ScanUsagesTarget,
+    source: &str,
+    reason: &str,
+) -> String {
+    render_location_diagnostic(
+        source,
+        &target.path,
+        target.line,
+        target.column,
+        reason,
+        "move the target to a declaration name token and retry scan_usages_by_location; use get_summaries on the file or search_symbols if the declaration location is unknown.",
+    )
+}
+
+/// Every declaration `file` owns, each listed once.
+///
+/// The member walk enumerates declarations, not paths to them. A nested
+/// declaration is reachable from every enclosing declaration the analyzer also
+/// lists at file scope -- a C++ method is reachable as itself, through its
+/// class, and through its namespace -- so a walk without a visited set emits
+/// one copy per path and the count grows with nesting depth. Those copies are
+/// the same `CodeUnit`, so every consumer downstream repeats identical work:
+/// `resolve_location_target` hands three identical overloads to the usage
+/// query, and the C++ inverse scan then scans every candidate file once per
+/// copy (#1496).
+pub(crate) fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {
+    let mut declarations: Vec<CodeUnit> = Vec::new();
+    let mut seen: HashSet<CodeUnit> = HashSet::default();
+    let mut stack: Vec<CodeUnit> = Vec::new();
+    for unit in analyzer.location_declarations(file) {
+        if unit.source() == file && seen.insert(unit.clone()) {
+            stack.push(unit.clone());
+            declarations.push(unit);
+        }
+    }
+    while let Some(unit) = stack.pop() {
+        for child in analyzer.get_members_in_class(&unit) {
+            if child.source() != file || !seen.insert(child.clone()) {
+                continue;
+            }
+            stack.push(child.clone());
+            declarations.push(child);
+        }
+    }
+    declarations
+}
+
+pub(crate) fn scan_usages_target_matches_range(
+    selection: ScanUsagesLocationSelection,
+    range: Range,
+) -> bool {
+    match selection {
+        ScanUsagesLocationSelection::Point(point) => {
+            range.start_byte <= point && range.end_byte > point
+        }
+        ScanUsagesLocationSelection::Line(line) => {
+            let zero_based_line = line - 1;
+            range.start_line <= zero_based_line && range.end_line >= zero_based_line
+        }
+    }
+}
+
+pub(crate) fn retain_hits_resolving_to_overloads(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    overloads: &[CodeUnit],
+    hits: Vec<UsageHit>,
+    cancellation: &CancellationToken,
+) -> (Vec<UsageHit>, bool) {
+    if hits.is_empty() || overloads.is_empty() {
+        return (hits, true);
+    }
+
+    let mut retained = Vec::new();
+    // Keep the non-cancellable definition resolver slices deliberately small;
+    // the shared request token is checked between slices.
+    for chunk in hits.chunks(8) {
+        if cancellation.is_cancelled() {
+            return (retained, false);
+        }
+        let requests = chunk
+            .iter()
+            .map(|hit| {
+                brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
+                    file: hit.file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(hit.start_offset),
+                    end_byte: Some(hit.end_offset),
+                }
+            })
+            .collect();
+        let outcomes =
+            brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch(
+                analyzer, token, requests,
+            );
+        retained.extend(
+            chunk
+                .iter()
+                .cloned()
+                .zip(outcomes)
+                .filter_map(|(hit, outcome)| {
+                    (!outcome.definitions.is_empty()
+                        && outcome
+                            .definitions
+                            .iter()
+                            .any(|definition| overloads.contains(definition))
+                        || (outcome.definitions.is_empty()
+                            && unresolved_hit_matches_target_shape(analyzer, overloads, &hit)))
+                    .then_some(hit)
+                }),
+        );
+    }
+    (retained, !cancellation.is_cancelled())
+}
+
+pub(crate) fn resolved_usage_definition(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+) -> Option<ResolvedUsageDefinition> {
+    overloads
+        .iter()
+        .filter_map(|unit| {
+            let range = primary_range(analyzer, unit)?;
+            Some((unit, range))
+        })
+        .min_by(|(left, left_range), (right, right_range)| {
+            rel_path_string(left.source())
+                .cmp(&rel_path_string(right.source()))
+                .then_with(|| left_range.start_line.cmp(&right_range.start_line))
+                .then_with(|| left_range.start_byte.cmp(&right_range.start_byte))
+                .then_with(|| left.fq_name().cmp(&right.fq_name()))
+        })
+        .map(|(unit, range)| ResolvedUsageDefinition {
+            fq_name: unit.fq_name(),
+            path: rel_path_string(unit.source()),
+            line: range.start_line,
+        })
+}
+
+pub(crate) fn unresolved_hit_matches_target_shape(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    hit: &UsageHit,
+) -> bool {
+    let hit_is_member_access = usage_hit_is_member_access(analyzer, hit);
+    overloads.iter().any(|unit| {
+        declaration_is_member_access(analyzer, unit)
+            .map(|is_member| is_member == hit_is_member_access)
+            .unwrap_or(true)
+    })
+}
+
+pub(crate) fn usage_hit_is_member_access(analyzer: &dyn IAnalyzer, hit: &UsageHit) -> bool {
+    // `hit.start_offset` was produced by the analyzer's own usage scan, so
+    // it is only meaningful against the same analyzed snapshot.
+    source_has_dot_before(
+        analyzer.indexed_source(&hit.file).as_deref(),
+        hit.start_offset,
+    )
+}
+
+pub(crate) fn declaration_is_member_access(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<bool> {
+    let range = primary_range(analyzer, unit)?;
+    let source = analyzer.indexed_source(unit.source())?;
+    let identifier_offset = source
+        .get(range.start_byte..range.end_byte)?
+        .find(unit.identifier())
+        .map(|offset| range.start_byte + offset)?;
+    Some(source_has_dot_before(Some(&source), identifier_offset))
+}
+
+pub(crate) fn source_has_dot_before(source: Option<&str>, byte: usize) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    source
+        .get(..byte.min(source.len()))
+        .and_then(|prefix| prefix.chars().rev().find(|ch| !ch.is_whitespace()))
+        == Some('.')
+}
+
+pub(crate) fn present_reference_only_sibling_extensions_by_language(
+    analyzer: &dyn IAnalyzer,
+) -> BTreeMap<Language, Vec<&'static str>> {
+    let mut present = BTreeMap::new();
+    // `all_files_shared`, not `all_files`: this reads each path's extension and
+    // keeps nothing, so deep-cloning the project's whole listing to do it is
+    // pure waste (the same swap as `route_summary_targets_with_cancellation`).
+    let Ok(files) = analyzer.project().all_files_shared() else {
+        return present;
+    };
+
+    let mut workspace_extensions = HashSet::default();
+    for file in files.iter() {
+        if let Some(extension) = file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            workspace_extensions.insert(extension.to_ascii_lowercase());
+        }
+    }
+
+    for language in Language::ANALYZABLE {
+        let language_present = language
+            .reference_only_sibling_extensions()
+            .iter()
+            .copied()
+            .filter(|extension| workspace_extensions.contains(*extension))
+            .collect::<Vec<_>>();
+        if !language_present.is_empty() {
+            present.insert(language, language_present);
+        }
+    }
+
+    present
+}
+
+pub(crate) fn reference_only_absence_note(
+    overloads: &[CodeUnit],
+    present_by_language: &BTreeMap<Language, Vec<&'static str>>,
+) -> Option<String> {
+    let language = overloads.first().map(language_for_target)?;
+    let extensions = present_by_language.get(&language)?;
+    let extension_list = extensions
+        .iter()
+        .map(|extension| format!(".{extension}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(format!(
+        "workspace contains {extension_list} files that may reference this symbol but are not analyzed; inspect or analyze those files separately before concluding absence"
+    ))
+}
+
+pub fn scan_usages_by_reference(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByReferenceParams,
+) -> ScanUsagesResult {
+    scan_usages_by_reference_with_cancellation(analyzer, params, CancellationToken::default())
+}
+
+pub fn scan_usages_by_reference_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByReferenceParams,
+    cancellation: CancellationToken,
+) -> ScanUsagesResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    scan_usages_by_reference_with_context(
+        analyzer,
+        token,
+        params,
+        &ScanUsagesExecutionContext::with_cancellation(cancellation),
+    )
+}
+
+pub(crate) fn scan_usages_by_reference_with_context(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    params: ScanUsagesByReferenceParams,
+    context: &ScanUsagesExecutionContext,
+) -> ScanUsagesResult {
+    let symbols = params
+        .symbols
+        .into_iter()
+        .enumerate()
+        .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol))
+        .collect();
+    let mut result = scan_usages_backend(
+        analyzer,
+        token,
+        ScanUsagesSurface::Reference,
+        params.include_tests,
+        params.paths.as_deref(),
+        symbols,
+        Vec::new(),
+        params.include_same_owner,
+        context,
+    );
+    attach_model_relations(analyzer, &mut result);
+    result
+}
+
+pub fn scan_usages_by_location(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByLocationParams,
+) -> ScanUsagesResult {
+    scan_usages_by_location_with_cancellation(analyzer, params, CancellationToken::default())
+}
+
+pub fn scan_usages_by_location_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByLocationParams,
+    cancellation: CancellationToken,
+) -> ScanUsagesResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    scan_usages_by_location_with_context(
+        analyzer,
+        token,
+        params,
+        &ScanUsagesExecutionContext::with_cancellation(cancellation),
+    )
+}
+
+pub(crate) fn scan_usages_by_location_with_context(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    params: ScanUsagesByLocationParams,
+    context: &ScanUsagesExecutionContext,
+) -> ScanUsagesResult {
+    let targets = params
+        .targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| ScanUsageRequest::target(index, target))
+        .collect();
+    let mut result = scan_usages_backend(
+        analyzer,
+        token,
+        ScanUsagesSurface::Location,
+        params.include_tests,
+        params.paths.as_deref(),
+        Vec::new(),
+        targets,
+        params.include_same_owner,
+        context,
+    );
+    attach_model_relations(analyzer, &mut result);
+    result
+}
+
+/// Dedicated rayon pool for usage-scan fan-out.
+///
+/// A scan's per-candidate work saturates whichever pool runs it. On the
+/// global pool that starves every concurrent light request whose own
+/// resolution injects nested parallel work from a non-worker thread: the
+/// injected job parks on a latch until a worker frees, and none frees until
+/// the scan finishes. The `mcp_fairness` scenario in
+/// benchmark/interactive-latency.toml measures exactly this overlap. Scans
+/// therefore fan out on their own pool, sized one thread below the machine so
+/// interactive queries keep idle global workers and CPU headroom. The analyzer
+/// parallelism setting remains an upper bound so batch consumers can prevent
+/// this dedicated pool from defeating their process-wide concurrency budget.
+static HEAVY_SCAN_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    let machine_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let threads = AnalyzerConfig::default()
+        .parallelism()
+        .min(machine_threads.saturating_sub(1).max(1));
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("bifrost-scan-{index}"))
+        .build()
+        .expect("failed to build the usage-scan thread pool")
+});
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_usages_backend(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    surface: ScanUsagesSurface,
+    include_tests: bool,
+    paths: Option<&[String]>,
+    symbols: Vec<ScanUsageRequest>,
+    targets: Vec<ScanUsageRequest>,
+    include_same_owner: bool,
+    context: &ScanUsagesExecutionContext,
+) -> ScanUsagesResult {
+    HEAVY_SCAN_POOL.install(|| {
+        let (entries, scope) = scan_usages_backend_on_pool(
+            analyzer,
+            token,
+            include_tests,
+            paths,
+            symbols,
+            targets,
+            include_same_owner,
+            context,
+        );
+        render_scan_usages_with_budget(entries, scope, surface)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_usages_backend_on_pool(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    include_tests: bool,
+    paths: Option<&[String]>,
+    symbols: Vec<ScanUsageRequest>,
+    targets: Vec<ScanUsageRequest>,
+    include_same_owner: bool,
+    context: &ScanUsagesExecutionContext,
+) -> (Vec<ScanUsagesWorkEntry>, ScanUsagesScope) {
+    let _scope = profiling::scope("searchtools::scan_usages_on_pool");
+    // A batch is one read-only analyzer request. Keep the read cache alive across
+    // target resolution and every per-target UsageFinder query so later targets
+    // reuse hydrated file states and prepared syntax from earlier targets. The
+    // finder's nested query scopes remain useful for standalone callers; nested
+    // scopes do not clear the cache while this outer scope is active.
+    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+
+    let query_scope = ScanUsagesQueryScope::new(analyzer, paths, include_tests);
+    if context.cancellation.is_cancelled() {
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return (entries, query_scope.result_scope());
+    }
+
+    // When the caller scopes the query to `paths`, the answer can only live in those files, so
+    // resolve the candidate set straight from them instead of enumerating references across the
+    // whole workspace and filtering after the fact. This bounds the search by the number of
+    // `paths`, not by how common the symbols are — a single high-fan-in name (`Context`, `func`)
+    // no longer drags an O(workspace) reference scan behind it. The set is built once and reused
+    // for every symbol; the finder's file filter still drops excluded test files on top.
+    let path_scoped_candidates = query_scope.path_filter.as_ref().map(|filter| {
+        let _scope = profiling::scope("searchtools::scan_usages_path_candidates");
+        let mut files = HashSet::default();
+        for file in analyzer.analyzed_files() {
+            if context.cancellation.is_cancelled() {
+                break;
+            }
+            if filter.matches(&file) {
+                files.insert(file);
+            }
+        }
+        ExplicitCandidateProvider::new(Arc::new(files))
+    });
+
+    if context.cancellation.is_cancelled() {
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return (entries, query_scope.result_scope());
+    }
+
+    let test_files = test_file_exclusion(analyzer, include_tests);
+    if context.cancellation.is_cancelled() {
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return (entries, query_scope.result_scope());
+    }
+    let reference_only_sibling_extensions =
+        present_reference_only_sibling_extensions_by_language(analyzer);
+    if context.cancellation.is_cancelled() {
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return (entries, query_scope.result_scope());
+    }
+
+    let mut work_entries = Vec::new();
+    let mut resolved_targets = Vec::new();
+
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    for request in targets {
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                None,
+                context.interruption_reason(),
+            ));
+            continue;
+        }
+        let target = match &request.input {
+            ScanUsagesInput::Target(target) => target.clone(),
+            ScanUsagesInput::Symbol(_) => unreachable!("target request has target input"),
+        };
+        let resolution = {
+            let _scope = profiling::scope("searchtools::scan_usages_target_resolution");
+            resolve_scan_usages_target(analyzer, token, &resolver, target)
+        };
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                None,
+                context.interruption_reason(),
+            ));
+            continue;
+        }
+        match resolution {
+            ScanUsageTargetResolution::Lexical {
+                symbol,
+                file,
+                definition,
+            } => {
+                let scan = if definition.kind == DeclarationKind::StatementLabel {
+                    lexical_label_usage_rows
+                } else {
+                    macro_lexical_usage_rows
+                };
+                let (rows, incomplete_reason, truncated) = scan(
+                    analyzer,
+                    &file,
+                    &definition,
+                    query_scope.path_filter.as_deref(),
+                    include_tests,
+                    context,
+                );
+                if let Some(reason) = incomplete_reason {
+                    work_entries.push(incomplete_work_entry(request, Some(symbol), reason));
+                    continue;
+                }
+                let resolved_definition = ResolvedUsageDefinition {
+                    fq_name: symbol.clone(),
+                    path: rel_path_string(&file),
+                    line: definition.name_range.start_line,
+                };
+                let state = SymbolUsageRenderState::new(
+                    symbol.clone(),
+                    Some(resolved_definition),
+                    false,
+                    0,
+                    rows,
+                    0,
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                    include_same_owner,
+                );
+                if truncated {
+                    work_entries.push(ScanUsagesWorkEntry::TooManyCallsites {
+                        request,
+                        state,
+                        short_name: symbol,
+                        total_callsites: context.max_callsites.saturating_add(1),
+                        limit: context.max_callsites,
+                        target_is_method: false,
+                    });
+                } else {
+                    work_entries.push(ScanUsagesWorkEntry::Usage {
+                        request,
+                        state,
+                        candidate_files_sample: None,
+                        target_is_method: false,
+                        incomplete_reason: None,
+                    });
+                }
+            }
+            ScanUsageTargetResolution::Resolved { symbol, overloads } => {
+                resolved_targets.push(IndexedResolvedScanTarget {
+                    request,
+                    symbol,
+                    overloads,
+                    location_selected: true,
+                });
+            }
+            ScanUsageTargetResolution::Modeled { symbol, definition } => {
+                work_entries.push(ScanUsagesWorkEntry::Usage {
+                    request,
+                    state: SymbolUsageRenderState::new(
+                        symbol,
+                        Some(definition),
+                        false,
+                        0,
+                        Vec::new(),
+                        0,
+                        Vec::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                        include_same_owner,
+                    ),
+                    candidate_files_sample: None,
+                    target_is_method: false,
+                    incomplete_reason: None,
+                });
+            }
+            ScanUsageTargetResolution::NotFound(item) => {
+                work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
+            }
+            ScanUsageTargetResolution::Ambiguous(item) => {
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason: None,
+                });
+            }
+            ScanUsageTargetResolution::Failure(failure) => {
+                work_entries.push(ScanUsagesWorkEntry::Failure {
+                    request,
+                    failure,
+                    incomplete_reason: None,
+                });
+            }
+        }
+    }
+
+    for request in symbols {
+        let symbol = request.label.clone();
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                context.interruption_reason(),
+            ));
+            continue;
+        }
+        if symbol.trim().is_empty() {
+            work_entries.push(ScanUsagesWorkEntry::NotFound {
+                request,
+                item: NotFoundInput {
+                    input: symbol,
+                    note: Some("symbol must not be empty".to_string()),
+                },
+            });
+            continue;
+        }
+        let (anchor, lookup) = match split_workspace_definition_selector(analyzer, &symbol) {
+            DefinitionSelector::Name(name) => (None, name),
+            DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
+        };
+        let (kind, bare_lookup) = split_kind_qualified_lookup(lookup);
+        // Resolution is inside the scan's budget, not beside it. A file anchor
+        // is part of resolution itself: filter candidates to that file before
+        // the resolver decides whether the spelling is ambiguous. Otherwise a
+        // global namesake can reject the path#symbol recovery before the later
+        // anchor narrowing ever runs.
+        //
+        // An anchored miss still runs the global lookup once for the existing
+        // "defined elsewhere" diagnostic. Normalize its ambiguous candidates
+        // into one candidate list; the anchor branch below will find that none
+        // live in the requested file and report the scoped miss rather than a
+        // global ambiguity.
+        let keep_scanning = || !context.cancellation.is_cancelled();
+        let resolution_budget =
+            FuzzyResolveBudget::new(&keep_scanning, SCAN_USAGES_MAX_RESOLUTION_CANDIDATES);
+        let resolution = {
+            let _scope = profiling::scope("searchtools::scan_usages_symbol_resolution");
+            match anchor.as_deref() {
+                Some(anchor) => match resolve_codeunit_fuzzy_bounded_with(
+                    analyzer,
+                    bare_lookup,
+                    |unit| {
+                        rel_path_string(unit.source()) == anchor
+                            && kind.is_none_or(|kind| unit.kind() == kind)
+                    },
+                    resolution_budget,
+                ) {
+                    Ok(CodeUnitResolution::NotFound) => {
+                        resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget)
+                            .map(|global| match global {
+                                CodeUnitResolution::Ambiguous(candidates) => {
+                                    CodeUnitResolution::Resolved(candidates)
+                                }
+                                other => other,
+                            })
+                    }
+                    scoped => scoped,
+                },
+                None => resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget),
+            }
+        };
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            // The budget expired mid-resolution. Reported through the same
+            // incomplete entry a budget expiry anywhere else in the scan uses.
+            Err(FuzzyResolveStop::Cancelled) => {
+                work_entries.push(incomplete_work_entry(
+                    request,
+                    Some(symbol),
+                    context.interruption_reason(),
+                ));
+                continue;
+            }
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                let item = too_many_resolution_candidates_symbol(symbol, total, limit);
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason: Some(ScanUsagesIncompleteReason::ResolutionCandidates),
+                });
+                continue;
+            }
+        };
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                context.interruption_reason(),
+            ));
+            continue;
+        }
+        let overloads = match resolution {
+            CodeUnitResolution::Resolved(overloads) => overloads,
+            CodeUnitResolution::Ambiguous(candidate_targets) => {
+                let groups = distinct_definitions(analyzer, token, candidate_targets);
+                let item = ambiguous_usage_symbol_from_groups(
+                    analyzer,
+                    ScanUsagesSurface::Reference,
+                    symbol.clone(),
+                    symbol,
+                    groups,
+                    "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
+                );
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason: None,
+                });
+                continue;
+            }
+            CodeUnitResolution::NotFound => {
+                let item = unsupported_path_qualified_scan_symbol(&resolver, &symbol)
+                    .unwrap_or_else(|| {
+                        path_like_symbol_not_found_input(
+                            symbol.clone(),
+                            PathLikeSymbolGuidanceContext::ScanUsages,
+                        )
+                    });
+                work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
+                continue;
+            }
+        };
+
+        let overloads = match anchor {
+            // A file-anchored selector picks one definition from a prior
+            // ambiguous result; narrow to that file before scanning.
+            Some(anchor) => {
+                let not_found =
+                    scan_usages_anchor_not_found_input(symbol.clone(), &anchor, lookup, &overloads);
+                let narrowed: Vec<CodeUnit> = overloads
+                    .into_iter()
+                    .filter(|unit| rel_path_string(unit.source()) == anchor)
+                    .collect();
+                let narrowed = prefer_exact_lookup_matches(narrowed, lookup);
+                if narrowed.is_empty() {
+                    work_entries.push(ScanUsagesWorkEntry::NotFound {
+                        request,
+                        item: not_found,
+                    });
+                    continue;
+                }
+                narrowed
+            }
+            // A bare name resolving to module-scoped definitions in different
+            // files (two JS/TS files exporting `Anchor`) is several distinct
+            // symbols, not one with overloads; surface them as selectable
+            // candidates rather than scanning a conflation of all of them.
+            None => {
+                let groups = distinct_definitions(analyzer, token, overloads);
+                if groups.len() > 1 {
+                    let item = ambiguous_usage_symbol_from_groups(
+                        analyzer,
+                        ScanUsagesSurface::Reference,
+                        symbol.clone(),
+                        symbol,
+                        groups,
+                        "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
+                    );
+                    work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                        request,
+                        item,
+                        incomplete_reason: None,
+                    });
+                    continue;
+                }
+                groups.into_iter().flat_map(|(_, units)| units).collect()
+            }
+        };
+
+        resolved_targets.push(IndexedResolvedScanTarget {
+            request,
+            symbol,
+            overloads,
+            location_selected: false,
+        });
+    }
+
+    // Resolved symbols in one request are independent semantic questions over
+    // the same immutable analyzer snapshot. Running them serially makes a
+    // multi-symbol path-scoped request spend its entire wall budget on the
+    // first broad target and report every later target as unexamined. Fan them
+    // out on the dedicated heavy-scan pool that already owns this call; each
+    // UsageFinder retains its own replay frontier and result state.
+    let resolved_queries: Vec<_> = resolved_targets
+        .into_par_iter()
+        .map(|mut resolved| {
+            if context.cancellation.is_cancelled() {
+                return (resolved, None);
+            }
+            // Location selection starts from physical extraction rows. Give
+            // both scan entry points the same structural target before usage
+            // resolution, while range and signature reads retain provenance.
+            for unit in &mut resolved.overloads {
+                *unit = analyzer.canonical_code_unit(unit, Some(&context.cancellation));
+            }
+            let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref())
+                .with_cancellation(context.cancellation.clone());
+            let max_candidate_files = if path_scoped_candidates.is_some() {
+                context.max_path_scoped_candidate_files
+            } else {
+                context.max_candidate_files
+            };
+            let query = finder.query_with_provider_and_source_budget(
+                analyzer,
+                &resolved.overloads,
+                path_scoped_candidates
+                    .as_ref()
+                    .map(|provider| provider as &dyn CandidateFileProvider),
+                max_candidate_files,
+                context.max_callsites,
+                Some(context.max_source_bytes),
+            );
+            let interrupted = context.cancellation.is_cancelled();
+            (resolved, Some((query, interrupted)))
+        })
+        .collect();
+
+    for (resolved, query) in resolved_queries {
+        let IndexedResolvedScanTarget {
+            request,
+            symbol,
+            overloads,
+            location_selected,
+        } = resolved;
+        let Some((query, interrupted)) = query else {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                context.interruption_reason(),
+            ));
+            continue;
+        };
+        let resolved_definition = resolved_usage_definition(analyzer, &overloads);
+        let target_is_method = overloads
+            .iter()
+            .any(|unit| unit.is_function() && parent_fq_name_for_target(unit).is_some());
+        let interruption_reason = context.interruption_reason();
+        let mut incomplete_reason = if interrupted {
+            Some(interruption_reason)
+        } else {
+            query_incomplete_reason(query.completion, interruption_reason)
+        };
+        let soft_time_budget_incomplete = !interrupted
+            && matches!(
+                &query.result,
+                FuzzyResult::Incomplete { diagnostics, .. }
+                    if diagnostics.iter().any(|diagnostic| diagnostic.reason_kind == "time_budget")
+            );
+        if soft_time_budget_incomplete {
+            incomplete_reason = Some(ScanUsagesIncompleteReason::TimeBudget);
+        }
+        // An interrupted scan that already proved sites reports them as a
+        // partial usage entry. Collapsing to an Incomplete entry here would
+        // render "0 usages" for a symbol we know is referenced.
+        if matches!(
+            incomplete_reason,
+            Some(ScanUsagesIncompleteReason::Cancelled | ScanUsagesIncompleteReason::TimeBudget)
+        ) && !fuzzy_result_has_hits(&query.result)
+            && !soft_time_budget_incomplete
+        {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                incomplete_reason.expect("interruption reason is present"),
+            ));
+            continue;
+        }
+        let truncated = query.candidate_files_truncated;
+        let candidate_files_sample =
+            query
+                .candidate_files_sample
+                .as_ref()
+                .map(|sample| ScanUsagesCandidateFilesSample {
+                    scanned: sample.scanned.iter().map(rel_path_string).collect(),
+                    omitted: sample.omitted.iter().map(rel_path_string).collect(),
+                    omitted_count: sample.omitted_count,
+                });
+
+        let semantic_note = if let FuzzyResult::Incomplete { diagnostics, .. } = &query.result {
+            incomplete_reason.get_or_insert(ScanUsagesIncompleteReason::SemanticAnalysis);
+            Some(format!("Usage analysis is incomplete: {diagnostics:?}"))
+        } else {
+            None
+        };
+        match query.result {
+            FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+            }
+            | FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                ..
+            } => {
+                let hits: Vec<UsageHit> = hits_by_overload
+                    .into_values()
+                    .flat_map(BTreeSet::into_iter)
+                    .collect();
+                let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
+                let unproven_total = unproven_total_by_overload.values().sum();
+                let unproven_hits: Vec<UsageHit> = unproven_by_overload
+                    .into_values()
+                    .flat_map(BTreeSet::into_iter)
+                    .collect();
+                let filtered_unproven = filter_and_dedupe_hits(analyzer, &overloads, unproven_hits);
+                let definition_sites_excluded = filtered
+                    .definition_sites_excluded
+                    .saturating_add(filtered_unproven.definition_sites_excluded);
+
+                let state = SymbolUsageRenderState::new(
+                    symbol,
+                    resolved_definition.clone(),
+                    truncated,
+                    definition_sites_excluded,
+                    filtered.hits,
+                    unproven_total,
+                    filtered_unproven.hits,
+                    semantic_note,
+                    reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
+                    filtered.same_owner,
+                    include_same_owner,
+                );
+                work_entries.push(ScanUsagesWorkEntry::Usage {
+                    request,
+                    state,
+                    candidate_files_sample,
+                    target_is_method,
+                    incomplete_reason,
+                });
+            }
+            FuzzyResult::Ambiguous {
+                short_name,
+                candidate_targets,
+                hits_by_overload,
+            } => {
+                if location_selected {
+                    let hits: Vec<UsageHit> = overloads
+                        .iter()
+                        .flat_map(|code_unit| {
+                            hits_by_overload
+                                .get(code_unit)
+                                .into_iter()
+                                .flat_map(|hits| hits.iter().cloned())
+                        })
+                        .collect();
+                    let (hits, resolution_complete) = retain_hits_resolving_to_overloads(
+                        analyzer,
+                        token,
+                        &overloads,
+                        hits,
+                        &context.cancellation,
+                    );
+                    if !resolution_complete {
+                        incomplete_reason = Some(context.interruption_reason());
+                        if hits.is_empty() {
+                            work_entries.push(incomplete_work_entry(
+                                request,
+                                Some(symbol),
+                                incomplete_reason.expect("interruption reason is present"),
+                            ));
+                            continue;
+                        }
+                    }
+                    let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
+                    let state = SymbolUsageRenderState::new(
+                        symbol,
+                        resolved_definition.clone(),
+                        truncated,
+                        filtered.definition_sites_excluded,
+                        filtered.hits,
+                        0,
+                        Vec::new(),
+                        None,
+                        reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
+                        filtered.same_owner,
+                        include_same_owner,
+                    );
+                    work_entries.push(ScanUsagesWorkEntry::Usage {
+                        request,
+                        state,
+                        candidate_files_sample,
+                        target_is_method,
+                        incomplete_reason,
+                    });
+                    continue;
+                }
+                let groups = distinct_definitions(
+                    analyzer,
+                    token,
+                    candidate_targets.iter().cloned().collect(),
+                );
+                let surface = request.surface;
+                let detail_source = ambiguous_usage_symbol_from_groups(
+                    analyzer,
+                    surface,
+                    symbol.clone(),
+                    short_name.clone(),
+                    groups.clone(),
+                    scan_usages_ambiguity_note(surface),
+                );
+                let deduped_targets: Vec<String> = groups
+                    .iter()
+                    .map(|(selector, _)| selector.clone())
+                    .collect();
+                let mut candidates = Vec::new();
+                let mut definition_sites_excluded = 0usize;
+                for (target, grouped_overloads) in groups {
+                    let grouped_hits: Vec<UsageHit> = grouped_overloads
+                        .iter()
+                        .flat_map(|code_unit| {
+                            hits_by_overload
+                                .get(code_unit)
+                                .into_iter()
+                                .flat_map(|hits| hits.iter().cloned())
+                        })
+                        .filter(|hit| hit.confidence >= CONFIDENCE_THRESHOLD)
+                        .collect();
+                    let filtered =
+                        filter_and_dedupe_hits(analyzer, &grouped_overloads, grouped_hits);
+                    definition_sites_excluded += filtered.definition_sites_excluded;
+                    candidates.push(AmbiguousUsageCandidate {
+                        target,
+                        total_hits: filtered.hits.len(),
+                    });
+                }
+                let item = AmbiguousUsageSymbol {
+                    symbol,
+                    short_name,
+                    candidate_targets: deduped_targets,
+                    candidate_details: detail_source.candidate_details,
+                    candidate_details_total: detail_source.candidate_details_total,
+                    candidate_details_truncated: detail_source.candidate_details_truncated,
+                    candidates,
+                    candidate_files_truncated: truncated,
+                    definition_sites_excluded: some_if_nonzero(definition_sites_excluded),
+                    too_many_candidates: None,
+                    note: detail_source.note,
+                };
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason,
+                });
+            }
+            FuzzyResult::Failure {
+                fq_name,
+                reason_kind,
+                reason,
+            } => {
+                let reason = if reason_kind == "unsupported_target_shape" {
+                    unsupported_target_shape_message(overloads.first())
+                } else {
+                    reason
+                };
+                let failure = UsageFailureInfo {
+                    symbol,
+                    fq_name,
+                    hint: usage_failure_hint(
+                        request.surface,
+                        &reason_kind,
+                        overloads.first(),
+                        location_selected,
+                        truncated,
+                    ),
+                    reason_kind,
+                    reason,
+                    candidate_files_truncated: truncated,
+                    candidate_files_sample,
+                };
+                work_entries.push(ScanUsagesWorkEntry::Failure {
+                    request,
+                    failure,
+                    incomplete_reason,
+                });
+            }
+            FuzzyResult::TooManyCallsites {
+                short_name,
+                total_callsites,
+                limit,
+                sample_hits,
+            } => {
+                let filtered =
+                    filter_and_dedupe_hits(analyzer, &overloads, sample_hits.into_iter().collect());
+                let state = SymbolUsageRenderState::partial_summary(
+                    symbol.clone(),
+                    resolved_definition.clone(),
+                    total_callsites,
+                    truncated,
+                    filtered.definition_sites_excluded,
+                    filtered.hits,
+                    0,
+                    Vec::new(),
+                    Some(too_many_callsites_summary_note(limit)),
+                    reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
+                    filtered.same_owner,
+                    include_same_owner,
+                );
+                work_entries.push(ScanUsagesWorkEntry::TooManyCallsites {
+                    request,
+                    state,
+                    short_name,
+                    total_callsites,
+                    limit,
+                    target_is_method,
+                });
+            }
+        }
+    }
+
+    work_entries.sort_by_key(ScanUsagesWorkEntry::index);
+    (work_entries, query_scope.result_scope())
+}
+
+/// Collect source-backed reference sites for location-selected targets before
+/// interactive rendering applies its response budget.
+pub(crate) fn scan_usage_reference_sites_by_location(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByLocationParams,
+    cancellation: CancellationToken,
+) -> Vec<ScanUsagesReferenceSites> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let targets = params
+        .targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| ScanUsageRequest::target(index, target))
+        .collect();
+    let context = ScanUsagesExecutionContext::with_cancellation(cancellation);
+    let (entries, scope) = HEAVY_SCAN_POOL.install(|| {
+        scan_usages_backend_on_pool(
+            analyzer,
+            token,
+            params.include_tests,
+            params.paths.as_deref(),
+            Vec::new(),
+            targets,
+            params.include_same_owner,
+            &context,
+        )
+    });
+    collect_scan_usages_reference_sites(analyzer, entries, scope, &context)
+}
+
+fn collect_scan_usages_reference_sites(
+    analyzer: &dyn IAnalyzer,
+    entries: Vec<ScanUsagesWorkEntry>,
+    scope: ScanUsagesScope,
+    context: &ScanUsagesExecutionContext,
+) -> Vec<ScanUsagesReferenceSites> {
+    let mut classified: Vec<_> = entries
+        .iter()
+        .map(classify_scan_usages_reference_entry)
+        .collect();
+    // Models can contribute authored reference sites (for example generated
+    // accessors). Keep that evidence without fitting it to an interactive reply.
+    if !context.cancellation.is_cancelled()
+        && let Some(overlay) = analyzer.semantic_model_overlay()
+    {
+        attach_model_relations_to_entries(analyzer, &overlay, &scope, &mut classified);
+    }
+    entries
+        .into_iter()
+        .zip(classified)
+        .map(|(entry, mut classified)| {
+            if !scope.unmatched_paths.is_empty() {
+                downgrade_for_unmatched_paths(&mut classified, ScanUsagesSurface::Location);
+            }
+            if context.cancellation.is_cancelled() {
+                mark_incomplete(
+                    &mut classified,
+                    context.interruption_reason(),
+                    ScanUsagesSurface::Location,
+                );
+            }
+            let incomplete_reason = raw_reference_incomplete_reason(&classified);
+            let files = raw_reference_files(&entry, &classified.files);
+            let input = match classified.input {
+                ScanUsagesInput::Target(target) => target,
+                ScanUsagesInput::Symbol(symbol) => {
+                    unreachable!("location reference scan produced a symbol input: {symbol}")
+                }
+            };
+            ScanUsagesReferenceSites {
+                input,
+                files,
+                incomplete_reason,
+            }
+        })
+        .collect()
+}
+
+fn classify_scan_usages_reference_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
+    match entry {
+        ScanUsagesWorkEntry::Usage {
+            request,
+            state,
+            candidate_files_sample,
+            target_is_method,
+            incomplete_reason,
+        } => classify_usage_entry(
+            request,
+            raw_symbol_usages(state),
+            candidate_files_sample.clone(),
+            false,
+            None,
+            *target_is_method,
+            *incomplete_reason,
+        ),
+        ScanUsagesWorkEntry::TooManyCallsites {
+            request,
+            state,
+            short_name,
+            total_callsites,
+            limit,
+            target_is_method,
+        } => classify_usage_entry(
+            request,
+            raw_symbol_usages(state),
+            None,
+            true,
+            Some((short_name.clone(), *total_callsites, *limit)),
+            *target_is_method,
+            Some(ScanUsagesIncompleteReason::Callsites),
+        ),
+        _ => classify_scan_usages_entry(entry),
+    }
+}
+
+fn raw_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
+    let mut usages = symbol_usages_base(state);
+    usages.rendering = UsageRendering::Full;
+    usages.unproven_files = raw_summary_file_groups(&state.unproven_rows);
+    usages
+}
+
+fn symbol_usages_base(state: &SymbolUsageRenderState) -> SymbolUsages {
+    SymbolUsages {
+        symbol: state.symbol.clone(),
+        fq_name: state.fq_name.clone(),
+        definition_path: state.definition_path.clone(),
+        definition_line: state.definition_line,
+        total_hits: state.total_hits,
+        unproven_hits: state.unproven_hits,
+        same_owner_sites: some_if_nonzero(state.same_owner_sites),
+        rendering: state.rendering,
+        candidate_files_truncated: state.candidate_files_truncated,
+        reference_only_siblings: state.reference_only_absence_note.is_some(),
+        definition_sites_excluded: some_if_nonzero(state.definition_sites_excluded),
+        files_truncated: None,
+        note: state.base_note.clone(),
+        top_enclosing: Vec::new(),
+        files: Vec::new(),
+        same_owner_files: Vec::new(),
+        unproven_files: Vec::new(),
+        model_relations: Vec::new(),
+    }
+}
+
+fn raw_summary_file_groups(rows: &[UsageHitRow]) -> Vec<UsageFileGroup> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for row in rows {
+        *counts.entry(row.path.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(path, hit_count)| UsageFileGroup {
+            path,
+            hits: Vec::new(),
+            hit_count: Some(hit_count),
+        })
+        .collect()
+}
+
+fn raw_reference_files(
+    entry: &ScanUsagesWorkEntry,
+    modeled_files: &[UsageFileGroup],
+) -> Vec<ScanUsagesReferenceFile> {
+    let mut grouped: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    if let Some(state) = entry_render_state(entry) {
+        for hit in &state.hits {
+            grouped.entry(&hit.path).or_default().push(hit.line);
+        }
+    }
+    for file in modeled_files {
+        assert!(
+            file.hit_count.is_none(),
+            "model source sites must retain lines"
+        );
+        grouped
+            .entry(&file.path)
+            .or_default()
+            .extend(file.hits.iter().map(|hit| hit.line));
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut lines)| {
+            lines.sort_unstable();
+            ScanUsagesReferenceFile {
+                hits: lines.len(),
+                path: path.to_owned(),
+                lines,
+            }
+        })
+        .collect()
+}
+
+fn raw_reference_incomplete_reason(entry: &ScanUsagesEntry) -> Option<String> {
+    match entry.status {
+        ScanUsagesStatus::Found
+        | ScanUsagesStatus::VerifiedAbsent
+        | ScanUsagesStatus::NoExternalUsages => {
+            entry.incomplete_reason.map(|reason| format!("{reason:?}"))
+        }
+        status => Some(match entry.message.as_deref() {
+            Some(message) => format!("scan status {status:?}: {message}"),
+            None => format!("scan status {status:?}"),
+        }),
+    }
+}
+
+/// A definition node in the workspace usage graph.
+///
+/// Nodes are the classes and functions (methods included) that a consumer can
+/// run PageRank or another centrality analysis over. Fields, modules, and
+/// macros are intentionally excluded to keep the graph focused on the
+/// call/reference structure a code map cares about. `id` is the exact stable
+/// declaration identity. `fqn`, `language`, and `path` are display and lookup
+/// metadata, not identity, so overloads and otherwise duplicate names remain
+/// distinct nodes. `fqn` matches the names returned by [`search_symbols`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphNode {
+    pub id: DeclarationId,
+    pub fqn: String,
+    /// The language ecosystem the node belongs to (JS and TS share one). Part of
+    /// the node identity so the same fqn in two languages stays two nodes; for
+    /// file-scoped ecosystems (JavaScript/TypeScript) the `path` also
+    /// participates, so two files exporting the same name stay two nodes.
+    pub language: String,
+    pub path: String,
+    pub start_line: usize,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// One concrete reference site behind a [`UsageGraphEdge`]: the workspace-relative
+/// file `path` and the 1-based `line` where the reference occurs. Lines match the
+/// `line` of a [`scan_usages`] hit and a node's `start_line`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UsageGraphCallSite {
+    pub path: String,
+    pub line: usize,
+}
+
+/// A directed edge from a caller to a callee, aggregated across call sites.
+///
+/// `from_id` and `to_id` identify the exact endpoint declarations. `from` and
+/// `to` are their fully qualified display names: `from` is the enclosing
+/// definition of each reference, `to` is the symbol being referenced. `weight`
+/// is the number of distinct `(file, line, caller)` reference sites, which
+/// mirrors the reference-count weighting an aider-style repo map uses (two
+/// references to the same callee on one line count once).
+///
+/// `sites` lists those reference locations (`{path, line}`), so a consumer can
+/// build a caller→callee map *with* call sites instead of re-scraping them;
+/// `sites.len() == weight`. Per-site snippets remain the domain of [`scan_usages`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphEdge {
+    pub from_id: DeclarationId,
+    pub to_id: DeclarationId,
+    pub from: String,
+    pub to: String,
+    /// The language ecosystem both endpoints belong to — disambiguates `from`/`to`
+    /// when the same fqn exists in more than one language.
+    pub language: String,
+    pub weight: usize,
+    /// Reference locations for this edge, sorted by `(path, line)`. One per distinct
+    /// `(file, line, caller)` site, so `sites.len() == weight`.
+    pub sites: Vec<UsageGraphCallSite>,
+}
+
+/// A symbol whose call sites exceeded the analyzer's enumeration guardrail.
+///
+/// These symbols still appear in `nodes`; only their inbound edges are omitted,
+/// because the analyzer stopped before enumerating every caller. Surfacing them
+/// lets a consumer decide whether to re-query the hot symbol with a narrower
+/// `paths` scope. Mirrors the `too_many_callsites` signal from [`scan_usages`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphTruncatedSymbol {
+    pub node_id: DeclarationId,
+    pub fqn: String,
+    pub language: String,
+    pub total_callsites: usize,
+    pub limit: usize,
+}
+
+pub use brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason;
+
+/// A requested file deliberately omitted from the selected graph, with evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphFileNote {
+    pub path: String,
+    #[serde(flatten)]
+    pub reason: GraphFileSkipReason,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphIncompleteReason {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_error: Option<String>,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_path: Option<String>,
+}
+
+/// The resolved definition/reference graph for the whole workspace.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphResult {
+    pub complete: bool,
+    /// Present only when this session covers an explicitly named subset of the
+    /// workspace, in which case the graph spans that many files (#2770).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_subset: Option<SubsetCoverage>,
+    pub nodes: Vec<UsageGraphNode>,
+    pub edges: Vec<UsageGraphEdge>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub truncated_symbols: Vec<UsageGraphTruncatedSymbol>,
+    pub incomplete_reasons: Vec<UsageGraphIncompleteReason>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_notes: Vec<UsageGraphFileNote>,
+}
+
+/// Atomic selected-Java result for the exact whole-workspace usage-graph
+/// boundary used by the private comparison harness.
+///
+/// The scope is deliberately fixed to the incumbent unscoped
+/// `include_tests=true, depth=1` operation. `Incomplete` retains sound positive
+/// nodes and proven edge sites but cannot certify absence. Cancellation,
+/// generation drift, and store failure publish no `UsageGraphResult` prefix.
+#[cfg(any(test, feature = "test-support"))]
+pub enum SelectedUsageGraphBuildOutcome {
+    Complete(UsageGraphResult),
+    Incomplete(UsageGraphResult),
+    Cancelled,
+    Stale,
+}
+
+/// Stable operation-local work and output counts for one selected graph build.
+///
+/// The sink is published atomically with a complete public result. Cancelled,
+/// stale, and failed operations leave the caller-provided default value
+/// unchanged, so telemetry can never describe a discarded graph prefix.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectedUsageGraphTelemetry {
+    pub published: bool,
+    pub complete: bool,
+    pub generation: u64,
+    pub reference_count: usize,
+    pub projected_edge_count: usize,
+    pub batch_count: usize,
+    pub root_binding_metrics: ResolutionBatchMetrics,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub site_count: usize,
+    pub truncated_symbol_count: usize,
+    pub incomplete_reason_count: usize,
+}
+
+/// Build the selected-Java counterpart of
+/// `usage_graph(include_tests=true, paths=None, depth=1)`.
+///
+/// Snapshot collection and canonical catalog construction remain explicit
+/// inputs so a benchmark can include them inside the same timer without
+/// exposing a second graph implementation. The canonical workspace reducer
+/// remains the only admission, proof, cap, and topology authority.
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_selected_unscoped_usage_graph<S>(
+    analyzer: &dyn IAnalyzer,
+    selected: &SelectedFactResolutionSnapshot<'_, S>,
+    edge_catalog: &FactReferenceEdgeCatalog<'_>,
+    maximum_batch_size: usize,
+    cancellation: &CancellationToken,
+    telemetry: &mut SelectedUsageGraphTelemetry,
+) -> StoreResult<SelectedUsageGraphBuildOutcome>
+where
+    S: FactResolutionSource,
+{
+    assert_eq!(
+        *telemetry,
+        SelectedUsageGraphTelemetry::default(),
+        "selected Java usage-graph telemetry is one-operation state"
+    );
+    let projection = build_selected_workspace_usage_graph_projection(
+        analyzer,
+        selected,
+        edge_catalog,
+        maximum_batch_size,
+        cancellation,
+    )?;
+    let (projection_complete, projection) = match projection {
+        SelectedWorkspaceUsageGraphProjectionOutcome::Complete(projection) => (true, projection),
+        SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(projection) => (false, projection),
+        SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled => {
+            return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+        }
+        SelectedWorkspaceUsageGraphProjectionOutcome::Stale => {
+            return Ok(SelectedUsageGraphBuildOutcome::Stale);
+        }
+        SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(reason) => {
+            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                reason,
+            ));
+        }
+    };
+    let pending_telemetry = SelectedUsageGraphTelemetry {
+        published: true,
+        complete: false,
+        generation: projection.generation,
+        reference_count: projection.reference_count,
+        projected_edge_count: projection.projected_edge_count,
+        batch_count: projection.batch_count,
+        root_binding_metrics: projection.root_binding_metrics,
+        ..SelectedUsageGraphTelemetry::default()
+    };
+    let generation = pending_telemetry.generation;
+    let Some(result) = selected_usage_graph_result(projection, projection_complete, cancellation)
+    else {
+        return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+    };
+    if cancellation.is_cancelled() {
+        return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return Ok(SelectedUsageGraphBuildOutcome::Stale);
+    }
+    let mut site_count = 0_usize;
+    for edge in &result.edges {
+        if cancellation.is_cancelled() {
+            return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+        }
+        site_count = site_count
+            .checked_add(edge.sites.len())
+            .expect("selected Java usage-graph site count must fit usize");
+    }
+    let pending_telemetry = SelectedUsageGraphTelemetry {
+        complete: result.complete,
+        node_count: result.nodes.len(),
+        edge_count: result.edges.len(),
+        site_count,
+        truncated_symbol_count: result.truncated_symbols.len(),
+        incomplete_reason_count: result.incomplete_reasons.len(),
+        ..pending_telemetry
+    };
+    if cancellation.is_cancelled() {
+        return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return Ok(SelectedUsageGraphBuildOutcome::Stale);
+    }
+    *telemetry = pending_telemetry;
+    if result.complete {
+        Ok(SelectedUsageGraphBuildOutcome::Complete(result))
+    } else {
+        Ok(SelectedUsageGraphBuildOutcome::Incomplete(result))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn selected_usage_graph_result(
+    projection: SelectedWorkspaceUsageGraphProjection,
+    projection_complete: bool,
+    cancellation: &CancellationToken,
+) -> Option<UsageGraphResult> {
+    let SelectedWorkspaceUsageGraphProjection {
+        nodes,
+        edges,
+        forward_completeness,
+        kind_projection_complete,
+        unresolved_names,
+        skipped_callers,
+        build_selection_unavailable,
+        ..
+    } = projection;
+    let mut incomplete = BTreeSet::new();
+    if !projection_complete
+        && ((build_selection_unavailable.is_none()
+            && !skipped_callers
+                .values()
+                .any(GraphFileSkipReason::opens_incompleteness))
+            || !forward_completeness.is_complete()
+            || !kind_projection_complete)
+    {
+        incomplete.insert((
+            "selected_reference_graph_incomplete".to_string(),
+            format!(
+                "selected canonical forward graph is incomplete: forward={forward_completeness:?}, kind_projection_complete={kind_projection_complete}, unresolved_names={unresolved_names:?}"
+            ),
+        ));
+    }
+    let mut unproven_inbound = 0_usize;
+    for node in &nodes {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        unproven_inbound = unproven_inbound
+            .checked_add(node.unproven_inbound)
+            .expect("selected Java unproven inbound count must fit usize");
+    }
+    if unproven_inbound > 0 {
+        incomplete.insert((
+            "unproven_reference_edges".to_string(),
+            format!(
+                "selected canonical graph retained {unproven_inbound} unproven inbound reference sites"
+            ),
+        ));
+    }
+    let catalog = WorkspaceUsageCatalog::from_reduced_nodes(nodes, cancellation)?;
+    // The ranking reducer's raw cap counts distinct byte offsets. The public
+    // contract caps distinct `(path, line)` sites, so its finalizer must derive
+    // truncation from the retained site inventory rather than importing the
+    // ranking-only `truncated_inbound` marker.
+    let truncated_by_id = BTreeMap::new();
+    let mut edge_sites = BTreeMap::new();
+    for edge in edges {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let from = catalog.nodes[edge.from].primary.clone();
+        let to = catalog.nodes[edge.to].primary.clone();
+        let mut sites = Vec::with_capacity(edge.sites.len());
+        for (file, line) in edge.sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            sites.push(UsageGraphCallSite {
+                path: rel_path_string(&file),
+                line,
+            });
+        }
+        let previous = edge_sites.insert(
+            (from.declaration_id(), to.declaration_id()),
+            (from, to, sites),
+        );
+        assert!(
+            previous.is_none(),
+            "one reduced selected graph edge exists per exact endpoint pair"
+        );
+    }
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    let mut result = finalize_selected_usage_graph_result(
+        catalog,
+        edge_sites,
+        truncated_by_id,
+        incomplete,
+        cancellation,
+    )?;
+    record_graph_build_selection_unavailable(&mut result, build_selection_unavailable);
+    record_graph_skipped_callers(&mut result, skipped_callers, cancellation).then_some(result)
+}
+
+type UsageGraphSiteKey = (String, usize, String, String);
+type UsageGraphEndpointPair = (DeclarationId, DeclarationId);
+type UsageGraphExactSites = HashMap<UsageGraphSiteKey, BTreeSet<UsageGraphEndpointPair>>;
+
+/// Resolve the selected one-based reference start lines, not whole caller files.
+/// The occurrence inventory and graph reduction remain query-local. Parsing and
+/// occurrence classification still read a whole file; only target resolution is
+/// proportional to the selected sites. This is a different scope from a rooted
+/// outbound graph and does not certify relationships at unvisited sites.
+pub(crate) fn usage_graph_at_lines(
+    analyzer: &dyn IAnalyzer,
+    demanded: &BTreeMap<String, BTreeSet<usize>>,
+    include_tests: bool,
+    cancellation: &CancellationToken,
+) -> UsageGraphResult {
+    use brokk_bifrost_analysis::analyzer::structural::occurrence_rows::occurrences_for_file_at_lines;
+
+    use brokk_bifrost_analysis::analyzer::structural::reference_edges::forward_axis_gate;
+
+    use brokk_bifrost_analysis::analyzer::structural::reference_edges::forward_edges_from_occurrences;
+
+    use brokk_bifrost_core::analyzer::usages::model::UsageProof;
+
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
+
+    let _timing = profiling::scope("usage_graph::selected_lines");
+    let _query = AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
+    let generation = analyzer.project().analysis_generation();
+    let excluded = test_file_exclusion(analyzer, include_tests);
+    let files = analyzer
+        .analyzed_files()
+        .into_iter()
+        .map(|file| (rel_path_string(&file), file))
+        .collect::<HashMap<_, _>>();
+    let mut incomplete = BTreeSet::new();
+    let mut rows = Vec::new();
+    let mut selected_references = 0usize;
+    for (path, lines) in demanded {
+        if lines.is_empty() {
+            continue;
+        }
+        let Some(file) = files.get(path) else {
+            incomplete.insert((
+                "unavailable_canonical_facts".to_string(),
+                format!("selected reference lines have no analyzed file: {path}"),
+            ));
+            continue;
+        };
+        if excluded
+            .as_ref()
+            .is_some_and(|filter| filter.excludes(file))
+        {
+            continue;
+        }
+        if let Some(unsupported) = forward_axis_gate(analyzer, file, generation) {
+            incomplete.insert((
+                "forward_reference_unsupported".into(),
+                format!("{path}: {:?}", unsupported.completeness),
+            ));
+            continue;
+        }
+        let occurrences = match occurrences_for_file_at_lines(analyzer, file, lines, cancellation) {
+            Ok(occurrences) => occurrences,
+            Err(_) => {
+                return unavailable_usage_graph_result(
+                    analyzer,
+                    &[],
+                    "cancelled",
+                    "selected-line reference resolution was cancelled".into(),
+                );
+            }
+        };
+        for row in &occurrences.rows {
+            if !lines.contains(&row.range.start_line) {
+                continue;
+            }
+            if row.class
+                == brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceClass::Reference
+            {
+                selected_references += 1;
+            }
+            if let Some(status) = row.resolution_status
+                && !matches!(
+                    status,
+                    DefinitionLookupStatus::Resolved | DefinitionLookupStatus::NoDefinition
+                )
+            {
+                incomplete.insert((
+                    status.as_str().to_string(),
+                    format!("{path}:{:?}: {status:?}", row.range),
+                ));
+            }
+        }
+        let derived = forward_edges_from_occurrences(analyzer, file, occurrences, generation)
+            .expect("forward edge conversion does not perform cancellable work");
+        if !derived.completeness.is_complete() {
+            incomplete.insert((
+                "forward_reference_incomplete".into(),
+                format!("{path}: {:?}", derived.completeness),
+            ));
+        }
+        rows.extend(derived.edges);
+    }
+    profiling::note_with(|| {
+        format!(
+            "selected-line graph files={} selected_references={} retained_edges={}",
+            demanded.len(),
+            selected_references,
+            rows.len()
+        )
+    });
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line graph was cancelled".into(),
+        );
+    }
+    let units_by_id = rows
+        .iter()
+        .flat_map(|row| {
+            row.site
+                .enclosing
+                .iter()
+                .chain(std::iter::once(&row.target))
+        })
+        .map(|unit| (unit.declaration_id(), unit.clone()))
+        .collect::<HashMap<_, _>>();
+    let declarations = units_by_id
+        .values()
+        .filter(|unit| {
+            is_graph_declaration(unit)
+                && excluded
+                    .as_ref()
+                    .is_none_or(|filter| !filter.excludes(unit.source()))
+        })
+        .map(|unit| (unit.clone(), primary_range(analyzer, unit)))
+        .collect();
+    let Some(catalog) = WorkspaceUsageCatalog::from_declarations(declarations, cancellation) else {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line catalog was cancelled".into(),
+        );
+    };
+    let target_spans = catalog
+        .nodes
+        .iter()
+        .map(|node| {
+            node.declaration_ids
+                .iter()
+                .filter_map(|id| units_by_id.get(id))
+                .flat_map(|unit| {
+                    analyzer
+                        .ranges(unit)
+                        .into_iter()
+                        .map(|range| (unit.source().clone(), range))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut edge_sites = BTreeMap::new();
+    for row in rows {
+        let Some(source_id) = row.source_id() else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (
+            catalog.index_for_id(&source_id),
+            catalog.index_for_id(&row.target_id()),
+        ) else {
+            continue;
+        };
+        let source = &catalog.nodes[from];
+        let target = &catalog.nodes[to];
+        if source.key.id == target.key.id
+            || !row.included_in_external_usage_graph(&target_spans[to])
+        {
+            continue;
+        }
+        if row.proof != UsageProof::Proven {
+            incomplete.insert((
+                "unproven_reference_edges".into(),
+                format!(
+                    "selected site {:?} has unproven target {:?}",
+                    row.site,
+                    row.target_id()
+                ),
+            ));
+            continue;
+        }
+        edge_sites
+            .entry((source.key.id.clone(), target.key.id.clone()))
+            .or_insert_with(|| (source.primary.clone(), target.primary.clone(), Vec::new()))
+            .2
+            .push(UsageGraphCallSite {
+                path: rel_path_string(&row.site.file),
+                line: row.site.range.start_line,
+            });
+    }
+    if generation != analyzer.project().analysis_generation() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "stale_generation",
+            "workspace changed during selected-line graph resolution".into(),
+        );
+    }
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line graph was cancelled".into(),
+        );
+    }
+    if let Some(error) = _query.store_error() {
+        return unavailable_usage_graph_result(analyzer, &[], "query_failed", error.to_string());
+    }
+    let result = finalize_usage_graph_result(
+        analyzer,
+        &[],
+        catalog,
+        edge_sites,
+        BTreeMap::new(),
+        incomplete,
+    );
+    if let Some(error) = _query.store_error() {
+        return unavailable_usage_graph_result(analyzer, &[], "query_failed", error.to_string());
+    }
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "selected-line graph was cancelled during finalization".into(),
+        );
+    }
+    if generation != analyzer.project().analysis_generation() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "stale_generation",
+            "workspace changed during selected-line graph finalization".into(),
+        );
+    }
+    result
+}
+
+/// Build the whole-workspace resolved usage graph: classes and functions as
+/// nodes, caller -> callee references as weighted edges.
+///
+/// This is the bulk counterpart to [`scan_usages`]. Where `scan_usages` answers
+/// "who calls this one symbol" with per-call-site detail, `usage_graph` walks
+/// every class and function once and returns the aggregated graph, so a consumer
+/// can run PageRank (or another ranking) to build a code map without issuing one
+/// `scan_usages` call per symbol.
+///
+/// Edges reuse the same graph-backed resolution path as `scan_usages` and the
+/// same definition-site exclusion, so a
+/// definition's own declaration never counts as a reference to itself. Self
+/// references (a recursive call whose enclosing definition *is* the callee) are
+/// dropped because they do not affect centrality ranking. Every edge endpoint
+/// is guaranteed to be a node: a reference whose enclosing caller is not itself
+/// a class or function (a module- or field-level call site) is dropped, so the
+/// nodes and edges can be loaded into a graph library without phantom nodes.
+///
+/// With `paths`, work starts from declarations in those files and expands only
+/// resolved endpoints up to `depth`; it does not hydrate the workspace's full
+/// declaration inventory. Without `paths`, every workspace declaration is a
+/// root and depth one is the complete graph.
+pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageGraphResult {
+    usage_graph_with_cancellation(analyzer, params, CancellationToken::default())
+}
+
+/// Build a usage graph under the caller's cooperative cancellation authority.
+pub fn usage_graph_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: UsageGraphParams,
+    cancellation: CancellationToken,
+) -> UsageGraphResult {
+    usage_graph_with_passes(
+        analyzer,
+        params,
+        &brokk_bifrost_analysis::analyzer::languages::edge_passes(),
+        &cancellation,
+    )
+}
+
+fn usage_graph_with_passes(
+    analyzer: &dyn IAnalyzer,
+    params: UsageGraphParams,
+    passes: &[brokk_bifrost_analysis::analyzer::languages::EdgePassEntry],
+    cancellation: &CancellationToken,
+) -> UsageGraphResult {
+    let _scope = profiling::scope("searchtools::usage_graph");
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "usage graph was cancelled".into(),
+        );
+    }
+    // One request boundary for the whole scan. The exact layer resolves every
+    // file's occurrence batch through the definition resolver, and each batch
+    // opens its own nested AnalyzerQueryScope; without this outer scope the
+    // per-request memos (definition candidates by fq name, prepared syntax,
+    // parent units, query file states) are discarded at every file boundary,
+    // and the shrinking-scope walk re-issues the same definitions(fqn) SQL
+    // lookups across files -- 32.5k calls for 2.7k distinct names on the
+    // issue #2679 reproduction, 12x pure repetition.
+    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+    let generation = analyzer.project().analysis_generation();
+    assert!(params.depth > 0, "usage_graph depth must be positive");
+
+    let rooted = params.paths.is_some();
+    let built_path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
+    let unmatched_paths = built_path_filter.unmatched_paths;
+    let cancelled = || {
+        unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "cancelled",
+            "usage graph was cancelled".into(),
+        )
+    };
+    let path_filter = built_path_filter.filter;
+    let test_files = test_file_exclusion(analyzer, params.include_tests);
+
+    let eligible_files: Vec<ProjectFile> = analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            test_files
+                .as_ref()
+                .is_none_or(|exclusion| !exclusion.excludes(file))
+        })
+        .collect();
+    let root_files: Vec<ProjectFile> = if rooted {
+        eligible_files
+            .iter()
+            .filter(|file| {
+                path_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.matches(file))
+            })
+            .cloned()
+            .collect()
+    } else {
+        eligible_files.clone()
+    };
+
+    // An unavailable declaration catalog may be empty. Check input authority
+    // before the catalog build, without building any edge indexes.
+    //
+    // The question is asked of the files this request will resolve. A rooted
+    // request resolves the files it named, so it neither pays for nor is
+    // failed by a file it never named. An unrooted request resolves the
+    // workspace, and there the set has to be the *analyzable* inventory
+    // rather than `analyzed_files`: publication readiness is part of the
+    // analyzed-file predicate, so a file whose canonical facts were never
+    // published is missing from that listing for exactly the reason the
+    // preflight exists to report. `source_file_inventory` is the listing that
+    // keeps it -- "source files owned by this analyzer, including files whose
+    // parse products are unavailable" -- and it reads the project's shared
+    // file listing, not the store.
+    let preflight_files: Vec<ProjectFile> = if rooted {
+        root_files.clone()
+    } else {
+        analyzer
+            .source_file_inventory()
+            .rows
+            .into_iter()
+            .filter(|file| {
+                test_files
+                    .as_ref()
+                    .is_none_or(|exclusion| !exclusion.excludes(file))
+            })
+            .collect()
+    };
+    let mut unavailable_passes = HashSet::default();
+    let mut incomplete: BTreeSet<(String, String)> = BTreeSet::new();
+    for entry in passes {
+        if cancellation.is_cancelled() {
+            return cancelled();
+        }
+        if rooted
+            && !root_files.iter().any(|file| {
+                UsageEcosystem::of(brokk_bifrost_core::analyzer::common::language_for_file(
+                    file,
+                )) == entry.ecosystem
+            })
+        {
+            continue;
+        }
+        if let Some(failure) = entry.backend.input_failure(analyzer, &preflight_files) {
+            unavailable_passes.insert(entry.id);
+            incomplete.insert((
+                "unavailable_canonical_facts".to_string(),
+                format!(
+                    "{}: {}; files: {:?}",
+                    entry.id.as_str(),
+                    failure.reason,
+                    failure.files
+                ),
+            ));
+        }
+    }
+
+    let root_catalog = {
+        let _scope = profiling::scope("usage_graph::root_catalog_build");
+        if rooted {
+            let Some(catalog) = WorkspaceUsageCatalog::build_for_files_with_cancellation(
+                analyzer,
+                &root_files,
+                cancellation,
+            ) else {
+                return cancelled();
+            };
+            catalog
+        } else {
+            let Some(catalog) =
+                WorkspaceUsageCatalog::build_with_cancellation(analyzer, cancellation)
+            else {
+                if cancellation.is_cancelled() {
+                    return cancelled();
+                }
+                if incomplete.is_empty() {
+                    incomplete.insert((
+                        "unavailable_canonical_facts".to_string(),
+                        "the workspace declaration catalog was unavailable".to_string(),
+                    ));
+                }
+                let catalog = WorkspaceUsageCatalog::from_declarations(
+                    Vec::new(),
+                    &CancellationToken::default(),
+                )
+                .expect("uncancelled unavailable usage graph catalog construction");
+                return finalize_usage_graph_result(
+                    analyzer,
+                    &unmatched_paths,
+                    catalog,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    incomplete,
+                );
+            };
+            catalog
+        }
+    };
+
+    let mut declarations: Vec<(CodeUnit, Option<Range>)> = root_catalog
+        .nodes
+        .iter()
+        .map(|node| (node.primary.clone(), node.primary_range))
+        .collect();
+    let mut files_by_id: HashMap<DeclarationId, HashSet<ProjectFile>> = HashMap::default();
+    // `declarations` holds one primary per node, so each layer catalog groups
+    // only primaries. The other members of a merged C++ or C# node are joined
+    // back to it through this map (#3671).
+    let mut merged_members: HashMap<DeclarationId, DeclarationId> = HashMap::default();
+    let mut frontier: BTreeSet<DeclarationId> = BTreeSet::new();
+    for node in &root_catalog.nodes {
+        frontier.insert(node.key.id.clone());
+        files_by_id
+            .entry(node.key.id.clone())
+            .or_default()
+            .extend(node.declaration_files.iter().cloned());
+        merged_members.extend(
+            node.declaration_ids
+                .iter()
+                .filter(|id| **id != node.key.id)
+                .map(|id| (id.clone(), node.key.id.clone())),
+        );
+    }
+    let mut visited = frontier.clone();
+
+    // Exact identities are retained from semantic resolution through
+    // aggregation. The mature language plugins produce location-bearing FQN
+    // edges; the common engine joins those sites to exact declarations. When
+    // an FQN is overloaded or duplicated, the structural occurrence relation
+    // is used only to disambiguate that exact site. A closed ambiguity keeps
+    // each exact target as an unproven candidate edge. Other incomplete
+    // bindings keep their existing proof and completeness behavior.
+    let mut edge_sites: BTreeMap<
+        (DeclarationId, DeclarationId),
+        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
+    > = BTreeMap::new();
+    let mut truncated_by_id: BTreeMap<DeclarationId, usize> = BTreeMap::new();
+    let definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
+    let mut endpoints_by_name: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
+        HashMap::default();
+    // `declarations` only grows within the depth loop (newly-discovered
+    // targets are pushed onto it as the frontier expands), so the catalog
+    // built from it is stable within one iteration and only needs rebuilding
+    // once a later iteration has appended more entries -- not on every
+    // iteration of `params.depth`, which just re-clones and re-sorts the
+    // same, unchanged prefix each time.
+    let mut layer_catalog_once: Option<(usize, WorkspaceUsageCatalog)> = None;
+    let mut native_projections: Vec<SelectedWorkspaceUsageGraphProjection> = Vec::new();
+    let mut native_admitted_callers = HashSet::default();
+    let mut skipped_callers = std::collections::BTreeMap::new();
+    let mut build_selection_unavailable = None;
+
+    for layer in 0..params.depth {
+        if cancellation.is_cancelled() {
+            return cancelled();
+        }
+        if frontier.is_empty() && layer > 0 {
+            break;
+        }
+        let mut scan_files = BTreeSet::new();
+        if layer == 0 {
+            // Empty files still need a native reference-inventory certificate.
+            scan_files.extend(root_files.iter().cloned());
+        }
+        for id in &frontier {
+            if let Some(files) = files_by_id.get(id) {
+                scan_files.extend(files.iter().cloned());
+            }
+        }
+        let scan_files = scan_files.into_iter().collect::<Vec<_>>();
+        let scan_files_by_path = scan_files
+            .iter()
+            .map(|file| (rel_path_string(file), file.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut exact_by_site = UsageGraphExactSites::default();
+        let mut point_exact_by_site = UsageGraphExactSites::default();
+        let mut structural_exact_by_site = UsageGraphExactSites::default();
+        let mut inverse_exact_by_site = UsageGraphExactSites::default();
+        let mut authoritative_exact_sites: HashSet<UsageGraphSiteKey> = HashSet::default();
+        let mut inverse_exact_targets: HashSet<(UsageEcosystem, String)> = HashSet::default();
+        if layer_catalog_once
+            .as_ref()
+            .is_none_or(|(built_len, _)| *built_len != declarations.len())
+        {
+            let _scope = profiling::scope("usage_graph::layer_catalog_build");
+            let Some(mut catalog) = WorkspaceUsageCatalog::from_declarations(
+                declarations
+                    .iter()
+                    .map(|(unit, _)| (unit.clone(), None))
+                    .collect(),
+                cancellation,
+            ) else {
+                return cancelled();
+            };
+            catalog.join_members(&merged_members);
+            layer_catalog_once = Some((declarations.len(), catalog));
+        }
+        let layer_catalog = &layer_catalog_once.as_ref().unwrap().1;
+
+        let mut legacy_edges: BTreeMap<
+            (UsageEcosystem, String, String),
+            Vec<brokk_bifrost_core::analyzer::usages::inverted_edges::CallSite>,
+        > = BTreeMap::new();
+        let mut logical_family_edges: HashSet<(UsageEcosystem, String, String)> =
+            HashSet::default();
+        let mut legacy_truncated: BTreeMap<(UsageEcosystem, String), usize> = BTreeMap::new();
+        for entry in passes {
+            if cancellation.is_cancelled() {
+                return cancelled();
+            }
+            if unavailable_passes.contains(&entry.id) {
+                continue;
+            }
+            let _scope = profiling::scope(format!("usage_graph::resolve_{}", entry.id.as_str()));
+            let pass = match entry.backend {
+                LanguageGraphBackend::Legacy(pass) => pass,
+                LanguageGraphBackend::Native(provider) => {
+                    let files = scan_files
+                        .iter()
+                        .filter(|file| {
+                            entry.languages.contains(
+                                &brokk_bifrost_core::analyzer::common::language_for_file(file),
+                            ) && !native_admitted_callers.contains(*file)
+                                && test_files
+                                    .as_ref()
+                                    .is_none_or(|exclusion| !exclusion.excludes(file))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if files.is_empty() {
+                        continue;
+                    }
+                    let (complete, projection) =
+                        match provider.project(analyzer, &files, cancellation) {
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Complete(
+                                projection,
+                            )) => (true, projection),
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(
+                                projection,
+                            )) => (false, projection),
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled) => {
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "cancelled",
+                                    "native graph projection was cancelled".into(),
+                                );
+                            }
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale) => {
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "stale_generation",
+                                    "native graph projection lost selected generation authority"
+                                        .into(),
+                                );
+                            }
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
+                                reason,
+                            )) => {
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "unavailable_canonical_facts",
+                                    reason,
+                                );
+                            }
+                            Err(error) => {
+                                analyzer.record_query_failure(error.clone());
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "native_graph_failed",
+                                    error.to_string(),
+                                );
+                            }
+                        };
+                    if cancellation.is_cancelled() {
+                        return cancelled();
+                    }
+                    if projection.generation != generation
+                        || analyzer.project().analysis_generation() != generation
+                    {
+                        return unavailable_usage_graph_result(
+                            analyzer,
+                            &unmatched_paths,
+                            "stale_generation",
+                            "workspace changed during native graph projection".into(),
+                        );
+                    }
+                    let expected_callers = files.into_iter().collect::<HashSet<_>>();
+                    projection.certify_callers(&expected_callers);
+                    native_admitted_callers.extend(expected_callers);
+                    skipped_callers.extend(projection.skipped_callers.clone());
+                    if let Some(reason) = &projection.build_selection_unavailable {
+                        if let Some(previous) = &build_selection_unavailable {
+                            assert_eq!(
+                                previous, reason,
+                                "one selected build supplies graph admission"
+                            );
+                        }
+                        build_selection_unavailable = Some(reason.clone());
+                    }
+                    // Skipped modules have dedicated structured reasons below.
+                    if !complete
+                        && ((projection.build_selection_unavailable.is_none()
+                            && !projection
+                                .skipped_callers
+                                .values()
+                                .any(GraphFileSkipReason::opens_incompleteness))
+                            || !projection.forward_completeness.is_complete()
+                            || !projection.kind_projection_complete)
+                    {
+                        incomplete.insert((
+                            "selected_reference_graph_incomplete".into(),
+                            format!(
+                                "{}: forward={:?}; kind_projection_complete={}; unresolved_names={:?}",
+                                entry.id.as_str(),
+                                projection.forward_completeness,
+                                projection.kind_projection_complete,
+                                projection.unresolved_names
+                            ),
+                        ));
+                    }
+                    let unproven = projection
+                        .nodes
+                        .iter()
+                        .filter(|node| node.unproven_inbound > 0)
+                        .map(|node| (node.key.id.clone(), node.unproven_inbound))
+                        .collect::<Vec<_>>();
+                    if !unproven.is_empty() {
+                        incomplete.insert((
+                            "unproven_reference_edges".into(),
+                            format!("{}: unproven inbound sites {unproven:?}", entry.id.as_str()),
+                        ));
+                    }
+                    for node in &projection.nodes {
+                        if layer == 0
+                            && projection
+                                .admitted_callers()
+                                .contains(node.primary.source())
+                            && visited.insert(node.key.id.clone())
+                        {
+                            frontier.insert(node.key.id.clone());
+                            files_by_id
+                                .entry(node.key.id.clone())
+                                .or_default()
+                                .extend(node.declaration_files.iter().cloned());
+                            declarations.push((node.primary.clone(), node.primary_range));
+                        }
+                    }
+                    native_projections.push(projection);
+                    continue;
+                }
+            };
+            let plugin_callers = declarations
+                .iter()
+                .map(|(unit, _)| unit)
+                .filter(|unit| {
+                    UsageEcosystem::of(language_for_target(unit)) == entry.ecosystem
+                        && frontier.contains(&unit.declaration_id())
+                })
+                .collect::<Vec<_>>();
+            if plugin_callers.is_empty() {
+                continue;
+            }
+            let fqns = plugin_callers
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<HashSet<_>>();
+            let scoped_callers = plugin_callers
+                .iter()
+                .map(|unit| {
+                    brokk_bifrost_core::analyzer::usages::inverted_edges::UsageNodeKey::new(
+                        unit.source().clone(),
+                        unit.fq_name(),
+                    )
+                })
+                .collect::<HashSet<_>>();
+            let keep_file = |file: &ProjectFile| {
+                scan_files.contains(file)
+                    && test_files
+                        .as_ref()
+                        .is_none_or(|exclusion| !exclusion.excludes(file))
+            };
+            let ctx = brokk_bifrost_analysis::analyzer::languages::EdgeSiteScanCtx {
+                analyzer,
+                fqns: &fqns,
+                scoped_callers: &scoped_callers,
+                keep_file: &keep_file,
+            };
+            match pass.edge_sites(&ctx) {
+                Some(brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites::Fqn(
+                    result,
+                )) => {
+                    for ((from, to), sites) in result.edges {
+                        if pass.permits_logical_family_targets() {
+                            logical_family_edges.insert((
+                                entry.ecosystem,
+                                from.clone(),
+                                to.clone(),
+                            ));
+                        }
+                        legacy_edges
+                            .entry((entry.ecosystem, from, to))
+                            .or_default()
+                            .extend(sites);
+                    }
+                    for (target, count) in result.truncated {
+                        legacy_truncated
+                            .entry((entry.ecosystem, target))
+                            .and_modify(|current| *current = (*current).max(count))
+                            .or_insert(count);
+                    }
+                }
+                Some(brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites::Scoped(
+                    result,
+                )) => {
+                    // This branch has the same two costs the `Fqn` branch above was
+                    // just fixed for: a store round trip per edge target, and a
+                    // linear scan of `declarations` per edge for the caller. Batch
+                    // and index once per pass instead of once per edge (bifrost#15).
+                    let target_fqns = result
+                        .edges
+                        .keys()
+                        .map(|(_, to)| to.fqn.clone())
+                        .collect::<Vec<_>>();
+                    for language in [Language::TypeScript, Language::JavaScript] {
+                        definitions.prefetch_fqn_in_language(language, &target_fqns);
+                    }
+                    let mut callers_by_key: HashMap<(ProjectFile, String), Vec<CodeUnit>> =
+                        HashMap::default();
+                    for (unit, _) in &declarations {
+                        callers_by_key
+                            .entry((unit.source().clone(), unit.fq_name()))
+                            .or_default()
+                            .push(unit.clone());
+                    }
+                    for ((from, to), sites) in result.edges {
+                        let callers = callers_by_key
+                            .get(&(from.file.clone(), from.fqn.clone()))
+                            .cloned()
+                            .unwrap_or_default();
+                        let targets = [Language::TypeScript, Language::JavaScript]
+                            .into_iter()
+                            .flat_map(|language| definitions.fqn_in_language(&to.fqn, language))
+                            .filter(|unit| unit.source() == &to.file)
+                            .filter(is_graph_declaration)
+                            .collect::<Vec<_>>();
+                        let Some(caller) = unique_graph_unit(&callers) else {
+                            incomplete.insert((
+                                "ambiguous_reference_source".to_string(),
+                                format!(
+                                    "module-scoped source {} in {} was not one exact declaration",
+                                    from.fqn,
+                                    rel_path_string(&from.file)
+                                ),
+                            ));
+                            continue;
+                        };
+                        let Some(target) = unique_graph_unit(&targets) else {
+                            incomplete.insert((
+                                "ambiguous_reference_target".to_string(),
+                                format!(
+                                    "module-scoped target {} in {} was not one exact declaration",
+                                    to.fqn,
+                                    rel_path_string(&to.file)
+                                ),
+                            ));
+                            continue;
+                        };
+                        for site in &sites {
+                            let site_key = (
+                                site.path.clone(),
+                                site.line,
+                                from.fqn.clone(),
+                                to.fqn.clone(),
+                            );
+                            authoritative_exact_sites.insert(site_key.clone());
+                            exact_by_site
+                                .entry(site_key)
+                                .or_default()
+                                .insert((caller.declaration_id(), target.declaration_id()));
+                        }
+                        legacy_edges
+                            .entry((entry.ecosystem, from.fqn, to.fqn))
+                            .or_default()
+                            .extend(sites);
+                    }
+                    for (target, count) in result.truncated {
+                        legacy_truncated
+                            .entry((entry.ecosystem, target.fqn))
+                            .and_modify(|current| *current = (*current).max(count))
+                            .or_insert(count);
+                    }
+                }
+                Some(
+                    brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites::Unavailable(
+                        failure,
+                    ),
+                ) => {
+                    incomplete.insert((
+                        "unavailable_canonical_facts".to_string(),
+                        format!(
+                            "{}: {}; files: {:?}",
+                            entry.id.as_str(),
+                            failure.reason,
+                            failure.files
+                        ),
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        let endpoint_keys = legacy_edges
+            .keys()
+            .map(|(ecosystem, _, target)| (*ecosystem, target.clone()))
+            .chain(legacy_truncated.keys().cloned())
+            .collect::<BTreeSet<_>>();
+
+        // Names with no local-layer match fall back to the relational store,
+        // one exact-name round trip per distinct name. On a large workspace
+        // that is thousands of sequential round trips; batch them into one
+        // call per language instead. See bifrost issue #15.
+        //
+        // Grouping every declaration by (ecosystem, fq_name) once turns both
+        // the "does this exist locally" check below and the endpoint lookup
+        // further down into O(1) map lookups instead of an O(declarations)
+        // scan repeated per endpoint key -- O(endpoint_keys * declarations)
+        // on a large workspace otherwise. See bifrost issue #15.
+        let mut declarations_by_key: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
+            HashMap::default();
+        {
+            let _scope = profiling::scope("usage_graph::declarations_by_key_build");
+            for (unit, _) in &declarations {
+                declarations_by_key
+                    .entry((
+                        UsageEcosystem::of(language_for_target(unit)),
+                        unit.fq_name(),
+                    ))
+                    .or_default()
+                    .push(unit.clone());
+            }
+        }
+        let mut store_fallback_names: HashMap<Language, Vec<String>> = HashMap::default();
+        for (ecosystem, to_name) in &endpoint_keys {
+            if !declarations_by_key.contains_key(&(*ecosystem, to_name.clone())) {
+                for language in ecosystem_languages(*ecosystem) {
+                    store_fallback_names
+                        .entry(*language)
+                        .or_default()
+                        .push(to_name.clone());
+                }
+            }
+        }
+        for (language, names) in store_fallback_names {
+            definitions.prefetch_fqn_in_language(language, &names);
+        }
+
+        {
+            let _scope = profiling::scope("usage_graph::endpoint_keys_resolution");
+            for endpoint_key in endpoint_keys {
+                endpoints_by_name
+                    .entry(endpoint_key)
+                    .or_insert_with_key(|(ecosystem, to_name)| {
+                        let mut endpoints = declarations_by_key
+                            .get(&(*ecosystem, to_name.clone()))
+                            .cloned()
+                            .unwrap_or_default();
+                        if endpoints.is_empty() {
+                            endpoints.extend(
+                                ecosystem_languages(*ecosystem)
+                                    .iter()
+                                    .flat_map(|language| {
+                                        definitions.fqn_in_language(to_name, *language)
+                                    })
+                                    .filter(is_graph_declaration)
+                                    .filter(|unit| {
+                                        test_files.as_ref().is_none_or(|exclusion| {
+                                            !exclusion.excludes(unit.source())
+                                        })
+                                    }),
+                            );
+                        }
+                        endpoints
+                    });
+            }
+        }
+
+        // The structural exact table below is only ever probed at the site
+        // keys of AMBIGUOUS legacy edges (unique_graph_unit is None), so the
+        // fallback scan only needs those sites' lines. Scanning every
+        // admitted file resolved every occurrence in the workspace to serve
+        // those probes -- 41.8k occurrence resolutions on the issue #2679
+        // reproduction, most of the diff's whole cost.
+        let structural_exact_sites: Vec<(ProjectFile, BTreeSet<usize>)> = {
+            let mut by_file: BTreeMap<ProjectFile, BTreeSet<usize>> = BTreeMap::new();
+            for ((ecosystem, _from_name, to_name), sites) in &legacy_edges {
+                let endpoint_key = (*ecosystem, to_name.clone());
+                if unique_graph_unit(&endpoints_by_name[&endpoint_key]).is_none() {
+                    for site in sites {
+                        if let Some(file) = scan_files_by_path.get(&site.path) {
+                            by_file.entry(file.clone()).or_default().insert(site.line);
+                        }
+                    }
+                }
+            }
+            by_file.into_iter().collect()
+        };
+
+        let mut next = BTreeSet::new();
+
+        // Retain file-major native products across layers: a later frontier
+        // can reach another caller in an already scanned file without asking
+        // the provider to resolve that file a second time.
+        for projection in &native_projections {
+            for edge in &projection.edges {
+                let source = &projection.nodes[edge.from];
+                let target = &projection.nodes[edge.to];
+                if !frontier.contains(&source.key.id) {
+                    continue;
+                }
+                if visited.insert(target.key.id.clone()) {
+                    next.insert(target.key.id.clone());
+                    files_by_id
+                        .entry(target.key.id.clone())
+                        .or_default()
+                        .extend(target.declaration_files.iter().cloned());
+                    declarations.push((target.primary.clone(), target.primary_range));
+                }
+                let sites = &mut edge_sites
+                    .entry((source.key.id.clone(), target.key.id.clone()))
+                    .or_insert_with(|| (source.primary.clone(), target.primary.clone(), Vec::new()))
+                    .2;
+                sites.extend(edge.sites.iter().map(|(file, line)| UsageGraphCallSite {
+                    path: rel_path_string(file),
+                    line: *line,
+                }));
+            }
+        }
+
+        // A file referenced by many ambiguous edges was hitting the slow
+        // `get_definition` fallback once per edge, and each call built a
+        // fresh `DefinitionBatchContext` with empty tree/source caches --
+        // re-parsing that file's AST once per edge instead of once total. On
+        // the k8s reproduction, files touched by the fallback averaged
+        // 9-17x as many calls as distinct files (and climbing). Deferring
+        // the slow path and batching it per file below collapses that back
+        // to one call per file; the fast-path scan (this pass) and the
+        // per-site finalization (the last pass, below) are unchanged. See
+        // bifrost#15.
+        struct DeferredSlowPathSite {
+            site_key: UsageGraphSiteKey,
+            from_name: String,
+            to_name: String,
+            line: usize,
+            spans: Vec<(usize, usize)>,
+            endpoints_snapshot: Vec<CodeUnit>,
+        }
+        let mut pending_slow_path: HashMap<ProjectFile, Vec<DeferredSlowPathSite>> =
+            HashMap::default();
+
+        // Every ambiguous target's fast-path scan and exact-reference scan is
+        // independent of every other target's: site keys embed `to_name`, so
+        // two different targets can never write the same key, and `endpoints`
+        // starts fresh from `endpoints_by_name` for each one. On a workspace
+        // the size of a large monorepo this loop ran hundreds of these scans
+        // sequentially, each taking anywhere from single-digit milliseconds
+        // to several seconds -- collectively most of usage_graph's remaining
+        // runtime after the fixes above. Select the ambiguous targets first
+        // (cheap, sequential, and must preserve today's "first edge in
+        // BTreeMap order wins" semantics for a to_name shared by several
+        // edges), run each target's scan in parallel on the shared heavy-scan
+        // pool, then merge every result back in sequentially. See bifrost#15.
+        struct AmbiguousTarget<'a> {
+            ecosystem: UsageEcosystem,
+            from_name: &'a str,
+            to_name: &'a str,
+            sites: &'a [brokk_bifrost_core::analyzer::usages::inverted_edges::CallSite],
+        }
+        let mut ambiguous_targets: Vec<AmbiguousTarget<'_>> = Vec::new();
+        for ((ecosystem, from_name, to_name), sites) in &legacy_edges {
+            let endpoint_key = (*ecosystem, to_name.clone());
+            if unique_graph_unit(&endpoints_by_name[&endpoint_key]).is_none()
+                && inverse_exact_targets.insert(endpoint_key)
+            {
+                ambiguous_targets.push(AmbiguousTarget {
+                    ecosystem: *ecosystem,
+                    from_name,
+                    to_name,
+                    sites,
+                });
+            }
+        }
+
+        if !ambiguous_targets.is_empty() {
+            let structural =
+                ReferenceEngine::new().scan_file_edges_at_lines(analyzer, &structural_exact_sites);
+            if !structural.completeness.is_complete() {
+                incomplete.insert((
+                    "exact_reference_join_incomplete".to_string(),
+                    "structural exact reference attribution was incomplete".to_string(),
+                ));
+            }
+            for row in structural.edges {
+                let Some(source) = row.site.enclosing.as_ref() else {
+                    continue;
+                };
+                let site_key = (
+                    rel_path_string(&row.site.file),
+                    row.site.range.start_line,
+                    source.fq_name(),
+                    row.target.fq_name(),
+                );
+                if authoritative_exact_sites.contains(&site_key) {
+                    continue;
+                }
+                structural_exact_by_site
+                    .entry(site_key)
+                    .or_default()
+                    .insert((source.declaration_id(), row.target_id()));
+            }
+        }
+
+        struct AmbiguousTargetResult {
+            ecosystem: UsageEcosystem,
+            to_name: String,
+            endpoints: Vec<CodeUnit>,
+            new_authoritative_sites: Vec<UsageGraphSiteKey>,
+            new_exact_by_site: Vec<(UsageGraphSiteKey, BTreeSet<UsageGraphEndpointPair>)>,
+            new_pending_slow_path: Vec<(ProjectFile, DeferredSlowPathSite)>,
+            new_inverse_exact_by_site: UsageGraphExactSites,
+            incomplete_reasons: Vec<(String, String)>,
+        }
+        // The bounded semantic pass deliberately aggregates by its legacy
+        // graph key. When that key names multiple exact declarations, ask
+        // the same language plugin's target side to retain the overload
+        // identity for only this layer's admitted files. This is a rare
+        // ambiguity join, not a second unconditional workspace scan.
+        let admitted_files = scan_files.iter().cloned().collect::<HashSet<_>>();
+        // `authoritative_exact_sites` as it stands before this parallel
+        // section is safe to share read-only: nothing below writes into it
+        // until the sequential merge, and a key any worker below could ever
+        // query embeds that worker's own `to_name`, so no worker can
+        // possibly need to see another worker's (still pending) insertion.
+        let authoritative_exact_sites_snapshot = &authoritative_exact_sites;
+        let results: Vec<AmbiguousTargetResult> = HEAVY_SCAN_POOL.install(|| {
+            ambiguous_targets
+                .par_iter()
+                .map(|target| {
+                    let endpoint_key = (target.ecosystem, target.to_name.to_string());
+                    let mut endpoints = endpoints_by_name[&endpoint_key].clone();
+                    let mut new_authoritative_sites = Vec::new();
+                    let mut new_exact_by_site = Vec::new();
+                    let mut new_pending_slow_path = Vec::new();
+                    for site in target.sites {
+                        let site_key = (
+                            site.path.clone(),
+                            site.line,
+                            target.from_name.to_string(),
+                            target.to_name.to_string(),
+                        );
+                        if authoritative_exact_sites_snapshot.contains(&site_key)
+                            || site.spans.is_empty()
+                        {
+                            continue;
+                        }
+                        let Some(file) = scan_files_by_path.get(&site.path) else {
+                            continue;
+                        };
+                        if !site.exact_targets.is_empty() {
+                            let (start, end) = site.spans[0];
+                            let range = Range {
+                                start_byte: start,
+                                end_byte: end,
+                                start_line: site.line,
+                                end_line: site.line,
+                            };
+                            if let Some(source_unit) = analyzer
+                                .enclosing_code_unit(file, &range)
+                                .filter(|unit| unit.fq_name() == target.from_name)
+                                && let Some(source_index) =
+                                    layer_catalog.index_for_id(&source_unit.declaration_id())
+                            {
+                                let source_id = layer_catalog.nodes[source_index].key.id.clone();
+                                let pairs = site
+                                    .exact_targets
+                                    .iter()
+                                    .filter(|candidate| {
+                                        candidate.fq_name() == target.to_name
+                                            && is_graph_declaration(candidate)
+                                    })
+                                    .map(|candidate| {
+                                        if !endpoints.iter().any(|endpoint| {
+                                            endpoint.declaration_id()
+                                                == candidate.declaration_id()
+                                        }) {
+                                            endpoints.push(candidate.clone());
+                                        }
+                                        candidate.clone()
+                                    })
+                                    .map(|candidate| (source_id.clone(), candidate.declaration_id()))
+                                    .collect::<BTreeSet<_>>();
+                                if !pairs.is_empty() {
+                                    new_authoritative_sites.push(site_key.clone());
+                                    new_exact_by_site.push((site_key, pairs));
+                                    continue;
+                                }
+                            }
+                        }
+                        new_pending_slow_path.push((
+                            file.clone(),
+                            DeferredSlowPathSite {
+                                site_key,
+                                from_name: target.from_name.to_string(),
+                                to_name: target.to_name.to_string(),
+                                line: site.line,
+                                spans: site.spans.clone(),
+                                endpoints_snapshot: endpoints.clone(),
+                            },
+                        ));
+                    }
+
+                    // Keep the indexed import candidate provider while allowing
+                    // the request token to interrupt reference resolution.
+                    let exact = ReferenceEngine::new()
+                        .with_cancellation(cancellation.clone())
+                        .with_file_filter(|file| admitted_files.contains(file))
+                        .references_to_edges_with_provider(
+                            analyzer,
+                            &endpoints,
+                            Some(&brokk_bifrost_analysis::analyzer::usages::candidates::ImportGraphCandidateProvider::new()),
+                            scan_files.len(),
+                            brokk_bifrost_analysis::analyzer::usages::inverted_edges::MAX_CALLSITES
+                                .saturating_mul(endpoints.len()),
+                            None,
+                        );
+                    let mut incomplete_reasons = Vec::new();
+                    if !exact.completeness.is_complete() {
+                        incomplete_reasons.push((
+                            "exact_reference_join_incomplete".to_string(),
+                            format!(
+                                "exact reference attribution was incomplete for ambiguous target {}",
+                                target.to_name
+                            ),
+                        ));
+                    }
+                    let mut new_inverse_exact_by_site = UsageGraphExactSites::default();
+                    for row in exact.edges {
+                        let Some(source) = row.site.enclosing.as_ref() else {
+                            continue;
+                        };
+                        let site_key = (
+                            rel_path_string(&row.site.file),
+                            row.site.range.start_line,
+                            source.fq_name(),
+                            row.target.fq_name(),
+                        );
+                        if authoritative_exact_sites_snapshot.contains(&site_key) {
+                            continue;
+                        }
+                        new_inverse_exact_by_site
+                            .entry(site_key)
+                            .or_default()
+                            .insert((source.declaration_id(), row.target_id()));
+                    }
+
+                    AmbiguousTargetResult {
+                        ecosystem: target.ecosystem,
+                        to_name: target.to_name.to_string(),
+                        endpoints,
+                        new_authoritative_sites,
+                        new_exact_by_site,
+                        new_pending_slow_path,
+                        new_inverse_exact_by_site,
+                        incomplete_reasons,
+                    }
+                })
+                .collect()
+        });
+
+        let mut endpoints_by_target: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
+            HashMap::default();
+        for result in results {
+            for site_key in result.new_authoritative_sites {
+                authoritative_exact_sites.insert(site_key);
+            }
+            for (site_key, pairs) in result.new_exact_by_site {
+                exact_by_site.insert(site_key, pairs);
+            }
+            for (file, pending) in result.new_pending_slow_path {
+                pending_slow_path.entry(file).or_default().push(pending);
+            }
+            for (site_key, pairs) in result.new_inverse_exact_by_site {
+                inverse_exact_by_site
+                    .entry(site_key)
+                    .or_default()
+                    .extend(pairs);
+            }
+            for reason in result.incomplete_reasons {
+                incomplete.insert(reason);
+            }
+            endpoints_by_target.insert((result.ecosystem, result.to_name), result.endpoints);
+        }
+
+        // Batch every deferred slow-path site, one `resolve_definition_batch_with_source`
+        // call per file instead of one per edge (see the comment above
+        // `pending_slow_path`'s declaration).
+        for (file, pending_sites) in &pending_slow_path {
+            let Some(source) = analyzer.indexed_source(file) else {
+                continue;
+            };
+            let mut all_requests = Vec::new();
+            let mut request_counts = Vec::with_capacity(pending_sites.len());
+            for pending in pending_sites {
+                let before = all_requests.len();
+                all_requests.extend(pending.spans.iter().map(|(start, end)| {
+                    brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
+                        file: file.clone(),
+                        line: None,
+                        column: None,
+                        start_byte: Some(*start),
+                        end_byte: Some(*end),
+                    }
+                }));
+                request_counts.push(all_requests.len() - before);
+            }
+            let all_outcomes =
+                brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_legacy_usage_graph_definition_batch_with_source(
+                    analyzer,
+                    all_requests,
+                    file.clone(),
+                    source.into(),
+                );
+            let mut offset = 0;
+            for (pending, count) in pending_sites.iter().zip(&request_counts) {
+                let outcomes_slice = &all_outcomes[offset..offset + count];
+                offset += count;
+                let mut point_pairs = BTreeSet::new();
+                for ((start, end), outcome) in pending.spans.iter().zip(outcomes_slice) {
+                    if outcome.status
+                        != brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Resolved
+                    {
+                        continue;
+                    }
+                    let range = Range {
+                        start_byte: *start,
+                        end_byte: *end,
+                        start_line: pending.line,
+                        end_line: pending.line,
+                    };
+                    let Some(source_unit) = analyzer
+                        .enclosing_code_unit(file, &range)
+                        .filter(|unit| unit.fq_name() == pending.from_name)
+                    else {
+                        continue;
+                    };
+                    let Some(source_index) =
+                        layer_catalog.index_for_id(&source_unit.declaration_id())
+                    else {
+                        continue;
+                    };
+                    let source_id = layer_catalog.nodes[source_index].key.id.clone();
+                    let mut resolved_targets = outcome
+                        .definitions
+                        .iter()
+                        .filter(|unit| unit.fq_name() == pending.to_name)
+                        .filter_map(|unit| {
+                            canonical_graph_unit_for_id(
+                                &pending.endpoints_snapshot,
+                                &unit.declaration_id(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    resolved_targets.sort_by_key(CodeUnit::declaration_id);
+                    resolved_targets.dedup_by_key(|unit| unit.declaration_id());
+                    if let Some(target) = resolved_targets.first() {
+                        point_pairs.insert((source_id.clone(), target.declaration_id()));
+                    }
+                }
+                if point_pairs.len() == 1 {
+                    point_exact_by_site
+                        .entry(pending.site_key.clone())
+                        .or_default()
+                        .extend(point_pairs);
+                }
+            }
+        }
+
+        for ((ecosystem, from_name, to_name), sites) in legacy_edges {
+            let endpoints = endpoints_by_target
+                .remove(&(ecosystem, to_name.clone()))
+                .unwrap_or_else(|| {
+                    endpoints_by_name
+                        .get(&(ecosystem, to_name.clone()))
+                        .cloned()
+                        .unwrap_or_default()
+                });
+            for site in sites {
+                let site_key = (
+                    site.path.clone(),
+                    site.line,
+                    from_name.clone(),
+                    to_name.clone(),
+                );
+                // Exact targets carried by the language edge pass are
+                // authoritative. Otherwise prefer the bounded inverse engine,
+                // then point-definition evidence, then structural occurrence
+                // evidence. Keeping these evidence classes separate prevents a
+                // lower-fidelity fallback from both overriding an ambiguity and
+                // poisoning a stronger unique result.
+                let candidate_pairs = if authoritative_exact_sites.contains(&site_key) {
+                    exact_by_site.get(&site_key)
+                } else if let Some(pairs) = inverse_exact_by_site.get(&site_key) {
+                    pairs
+                        .iter()
+                        .next()
+                        .filter(|(_, target_id)| {
+                            inverse_target_has_unique_callable_shape(
+                                analyzer, &endpoints, target_id,
+                            )
+                        })
+                        .map(|_| pairs)
+                } else {
+                    point_exact_by_site
+                        .get(&site_key)
+                        .or_else(|| structural_exact_by_site.get(&site_key))
+                };
+                let mut resolved_pairs = candidate_pairs
+                    .filter(|pairs| pairs.len() == 1)
+                    .into_iter()
+                    .flat_map(|pairs| pairs.iter().cloned())
+                    .collect::<Vec<_>>();
+                let has_exact_evidence = exact_by_site.contains_key(&site_key)
+                    || inverse_exact_by_site.contains_key(&site_key)
+                    || point_exact_by_site.contains_key(&site_key)
+                    || structural_exact_by_site.contains_key(&site_key);
+                let resolve_caller = || {
+                    site.spans
+                        .first()
+                        .and_then(|(start, end)| {
+                            let file = scan_files_by_path.get(&site.path)?;
+                            analyzer
+                                .enclosing_code_unit(
+                                    file,
+                                    &Range {
+                                        start_byte: *start,
+                                        end_byte: *end,
+                                        start_line: site.line,
+                                        end_line: site.line,
+                                    },
+                                )
+                                .filter(|unit| unit.fq_name() == from_name)
+                        })
+                        .or_else(|| {
+                            // A merged node declares in every member's file,
+                            // not only in its primary's.
+                            let callers = declarations
+                                .iter()
+                                .map(|(unit, _)| unit)
+                                .filter(|unit| {
+                                    UsageEcosystem::of(language_for_target(unit)) == ecosystem
+                                        && unit.fq_name() == from_name
+                                        && files_by_id.get(&unit.declaration_id()).is_some_and(
+                                            |files| {
+                                                files
+                                                    .iter()
+                                                    .any(|file| rel_path_string(file) == site.path)
+                                            },
+                                        )
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            unique_graph_unit(&callers)
+                        })
+                        .and_then(|caller| {
+                            layer_catalog
+                                .index_for_id(&caller.declaration_id())
+                                .map(|index| layer_catalog.nodes[index].primary.clone())
+                        })
+                };
+                if resolved_pairs.is_empty()
+                    && logical_family_edges.contains(&(
+                        ecosystem,
+                        from_name.clone(),
+                        to_name.clone(),
+                    ))
+                    && let Some(caller) = resolve_caller()
+                    && frontier.contains(&caller.declaration_id())
+                {
+                    resolved_pairs.extend(
+                        endpoints
+                            .iter()
+                            .map(|target| (caller.declaration_id(), target.declaration_id())),
+                    );
+                    incomplete.insert((
+                        "logical_reference_family".to_string(),
+                        format!(
+                            "semantic resolution selected logical family {to_name} without one physical declaration"
+                        ),
+                    ));
+                }
+                if resolved_pairs.is_empty() && !has_exact_evidence {
+                    let fallback = (|| {
+                        let caller = resolve_caller()?;
+                        if !frontier.contains(&caller.declaration_id()) {
+                            return None;
+                        }
+                        let target = unique_graph_unit(&endpoints)?;
+                        Some((caller.declaration_id(), target.declaration_id()))
+                    })();
+                    resolved_pairs.extend(fallback);
+                }
+                if resolved_pairs.is_empty() {
+                    incomplete.insert((
+                        "ambiguous_reference_target".to_string(),
+                        "one or more semantic edges could not be joined to one exact declaration; ambiguous edges were omitted".to_string(),
+                    ));
+                    continue;
+                }
+                for (resolved_from_id, resolved_to_id) in resolved_pairs {
+                    let Some(source) = layer_catalog
+                        .index_for_id(&resolved_from_id)
+                        .map(|index| layer_catalog.nodes[index].primary.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(target_node) = graph_node_for_id(&endpoints, &resolved_to_id) else {
+                        continue;
+                    };
+                    let target = target_node.primary;
+                    let from_id = source.declaration_id();
+                    let to_id = target.declaration_id();
+                    if !frontier.contains(&from_id) || from_id == to_id {
+                        continue;
+                    }
+                    if visited.insert(to_id.clone()) {
+                        next.insert(to_id.clone());
+                        files_by_id
+                            .entry(to_id.clone())
+                            .or_default()
+                            .extend(target_node.declaration_files);
+                        merged_members.extend(
+                            target_node
+                                .declaration_ids
+                                .into_iter()
+                                .filter(|id| *id != to_id)
+                                .map(|id| (id, to_id.clone())),
+                        );
+                        let range = analyzer
+                            .ranges(&target)
+                            .into_iter()
+                            .min_by_key(|range| (range.start_line, range.start_byte));
+                        declarations.push((target.clone(), range));
+                    }
+                    edge_sites
+                        .entry((from_id, to_id))
+                        .or_insert_with(|| (source, target, Vec::new()))
+                        .2
+                        .push(UsageGraphCallSite {
+                            path: site.path.clone(),
+                            line: site.line,
+                        });
+                }
+            }
+        }
+        for ((ecosystem, target_name), count) in legacy_truncated {
+            let endpoints = endpoints_by_name
+                .get(&(ecosystem, target_name.clone()))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(target) = unique_graph_unit(&endpoints) {
+                truncated_by_id
+                    .entry(target.declaration_id())
+                    .and_modify(|current| *current = (*current).max(count))
+                    .or_insert(count);
+            } else {
+                incomplete.insert((
+                    "callsites_truncated".to_string(),
+                    format!("call sites were truncated for ambiguous target {target_name}"),
+                ));
+            }
+        }
+        frontier = next;
+    }
+
+    if cancellation.is_cancelled() {
+        return cancelled();
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "stale_generation",
+            "workspace changed during usage graph construction".into(),
+        );
+    }
+    declarations.retain(|(unit, _)| !skipped_callers.contains_key(unit.source()));
+    let Some(catalog) = WorkspaceUsageCatalog::from_declarations(declarations, cancellation) else {
+        return cancelled();
+    };
+    let mut result = finalize_usage_graph_result(
+        analyzer,
+        &unmatched_paths,
+        catalog,
+        edge_sites,
+        truncated_by_id,
+        incomplete,
+    );
+    record_graph_build_selection_unavailable(&mut result, build_selection_unavailable);
+    if !record_graph_skipped_callers(&mut result, skipped_callers, cancellation) {
+        return cancelled();
+    }
+    if let Some(error) = _analyzer_query.store_error() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "graph_input_failed",
+            error.to_string(),
+        );
+    }
+    if cancellation.is_cancelled() {
+        return cancelled();
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "stale_generation",
+            "workspace changed while finalizing usage graph".into(),
+        );
+    }
+    result
+}
+
+fn record_graph_build_selection_unavailable(
+    result: &mut UsageGraphResult,
+    reason: Option<
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphBuildSelectionUnavailable,
+    >,
+) {
+    if let Some(reason) = reason {
+        result.complete = false;
+        result.incomplete_reasons.push(UsageGraphIncompleteReason {
+            code: "build_selection_unavailable".into(),
+            message: "Go build selection is unavailable; build directives could not be evaluated"
+                .into(),
+            discovery_error: Some(reason.discovery_error),
+            path: None,
+            module_path: None,
+        });
+    }
+}
+
+fn record_graph_skipped_callers(
+    result: &mut UsageGraphResult,
+    skipped_callers: brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphSkippedCallers,
+    cancellation: &CancellationToken,
+) -> bool {
+    let mut missing_modules = HashSet::default();
+    for (file, reason) in skipped_callers {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let path = rel_path_string(&file);
+        match &reason {
+            GraphFileSkipReason::ExcludedBuildSelection => {}
+            GraphFileSkipReason::OutsideSelectedModules { module_path } => {
+                if missing_modules.insert(module_path.clone()) {
+                    result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                        discovery_error: None,
+                        code: "outside_selected_modules".into(),
+                        message: "module has no packages in the selected tool context (#5664)"
+                            .into(),
+                        path: None,
+                        module_path: Some(module_path.clone()),
+                    });
+                }
+            }
+            GraphFileSkipReason::Unplaced => {
+                result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                    discovery_error: None,
+                    code: "unplaced_graph_caller".into(),
+                    message: "requested file has no selected graph placement".into(),
+                    path: Some(path.clone()),
+                    module_path: None,
+                })
+            }
+        }
+        result.file_notes.push(UsageGraphFileNote { path, reason });
+    }
+    result.complete = result.incomplete_reasons.is_empty();
+    true
+}
+
+fn unavailable_usage_graph_result(
+    analyzer: &dyn IAnalyzer,
+    unmatched_paths: &[String],
+    reason_kind: &str,
+    reason: String,
+) -> UsageGraphResult {
+    let catalog =
+        WorkspaceUsageCatalog::from_declarations(Vec::new(), &CancellationToken::default())
+            .expect("uncancelled empty graph catalog construction");
+    finalize_usage_graph_result(
+        analyzer,
+        unmatched_paths,
+        catalog,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeSet::from([(reason_kind.to_string(), reason)]),
+    )
+}
+
+fn finalize_usage_graph_result(
+    analyzer: &dyn IAnalyzer,
+    unmatched_paths: &[String],
+    catalog: WorkspaceUsageCatalog,
+    edge_sites: BTreeMap<
+        (DeclarationId, DeclarationId),
+        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
+    >,
+    mut truncated_by_id: BTreeMap<DeclarationId, usize>,
+    mut incomplete: BTreeSet<(String, String)>,
+) -> UsageGraphResult {
+    let mut nodes: Vec<UsageGraphNode> = catalog
+        .nodes
+        .iter()
+        .map(|node| UsageGraphNode {
+            id: node.key.id.clone(),
+            fqn: node.key.fqn.clone(),
+            language: node.language_label().to_string(),
+            path: rel_path_string(node.primary.source()),
+            start_line: node
+                .primary_range
+                .map(|range| range.start_line)
+                .unwrap_or(0),
+            kind: code_unit_kind_name(node.primary.kind()).to_string(),
+            signature: node.primary.signature().map(str::to_string),
+        })
+        .collect();
+    let mut truncated_symbols: Vec<UsageGraphTruncatedSymbol> = Vec::new();
+
+    // Deterministic output order, independent of ecosystem enum order: nodes and
+    // the truncated list by (language, fqn), edges by (language, from, to).
+    nodes.sort_by(|left, right| {
+        left.language
+            .cmp(&right.language)
+            .then_with(|| left.fqn.cmp(&right.fqn))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let max_callsites = brokk_bifrost_analysis::analyzer::usages::inverted_edges::MAX_CALLSITES;
+    let mut inbound_sites: HashMap<DeclarationId, HashSet<(String, usize)>> = HashMap::default();
+    for ((_, to_id), (_, _, sites)) in &edge_sites {
+        inbound_sites
+            .entry(to_id.clone())
+            .or_default()
+            .extend(sites.iter().map(|site| (site.path.clone(), site.line)));
+    }
+    for (id, sites) in &inbound_sites {
+        if sites.len() > max_callsites {
+            truncated_by_id
+                .entry(id.clone())
+                .and_modify(|current| *current = (*current).max(sites.len()))
+                .or_insert(sites.len());
+        }
+    }
+    let truncated_ids = truncated_by_id.keys().cloned().collect::<HashSet<_>>();
+    for (id, total_callsites) in &truncated_by_id {
+        // Not every truncated id is a graph node. Inbound edge endpoints were pushed into
+        // `declarations` and are cataloged, but `legacy_truncated` targets are resolved by name and
+        // may have had every edge dropped by the call-site cap. Preserve the incompleteness signal
+        // when such a target has no node instead of aborting the caller.
+        let Some(index) = catalog.index_for_id(id) else {
+            incomplete.insert((
+                "callsites_truncated".to_string(),
+                format!("call sites were truncated for {id:?}, which is not a usage-graph node"),
+            ));
+            continue;
+        };
+        let node = &catalog.nodes[index];
+        truncated_symbols.push(UsageGraphTruncatedSymbol {
+            node_id: id.clone(),
+            fqn: node.key.fqn.clone(),
+            language: node.language_label().to_string(),
+            total_callsites: *total_callsites,
+            limit: max_callsites,
+        });
+    }
+    truncated_symbols.sort_by(|left, right| {
+        left.language
+            .cmp(&right.language)
+            .then_with(|| left.fqn.cmp(&right.fqn))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+
+    let mut edges = Vec::new();
+    for ((from_id, to_id), (from, to, mut sites)) in edge_sites {
+        if truncated_ids.contains(&to_id) {
+            continue;
+        }
+        sites.sort();
+        sites.dedup();
+        edges.push(UsageGraphEdge {
+            from_id,
+            to_id,
+            from: from.fq_name(),
+            to: to.fq_name(),
+            language: UsageEcosystem::of(language_for_target(&to))
+                .as_str()
+                .to_string(),
+            weight: sites.len(),
+            sites,
+        });
+    }
+    edges.sort_by(|left, right| {
+        left.language
+            .cmp(&right.language)
+            .then_with(|| left.from.cmp(&right.from))
+            .then_with(|| left.to.cmp(&right.to))
+            .then_with(|| left.from_id.cmp(&right.from_id))
+            .then_with(|| left.to_id.cmp(&right.to_id))
+    });
+
+    let mut incomplete_reasons = incomplete
+        .into_iter()
+        .map(|(code, message)| UsageGraphIncompleteReason {
+            discovery_error: None,
+            code,
+            message,
+            path: None,
+            module_path: None,
+        })
+        .collect::<Vec<_>>();
+    if !truncated_symbols.is_empty() {
+        incomplete_reasons.push(UsageGraphIncompleteReason {
+            discovery_error: None,
+            path: None,
+            module_path: None,
+            code: "callsites_truncated".to_string(),
+            message: "one or more symbols exceeded the call-site enumeration limit".to_string(),
+        });
+    }
+    // Roots come from `paths`, so a selector that names nothing in the
+    // workspace silently removes part of the graph the caller asked for
+    // (#3092).
+    if !unmatched_paths.is_empty() {
+        let (listed, omitted) = bounded_scope_paths(unmatched_paths.iter().map(String::as_str));
+        let more = omitted
+            .map(|count| format!(" (+{count} more)"))
+            .unwrap_or_default();
+        incomplete_reasons.push(UsageGraphIncompleteReason {
+            discovery_error: None,
+            path: None, module_path: None,
+            code: "unmatched_paths".to_string(),
+            message: format!(
+                "these `paths` selectors name no workspace file or directory, so they contributed no graph roots: {}{more}",
+                listed.join(", ")
+            ),
+        });
+    }
+    let mut result = UsageGraphResult {
+        complete: incomplete_reasons.is_empty(),
+        session_subset: session_subset(analyzer),
+        nodes,
+        edges,
+        truncated_symbols,
+        incomplete_reasons,
+        file_notes: Vec::new(),
+    };
+    record_unnamed_module_exclusions(&mut result, analyzer);
+    result
+}
+
+fn record_unnamed_module_exclusions(result: &mut UsageGraphResult, analyzer: &dyn IAnalyzer) {
+    let mut seen_roots = HashSet::default();
+    let mut files = analyzer.source_file_inventory().rows;
+    files.sort();
+    for file in files {
+        let Some(root) = language_support(brokk_bifrost_core::analyzer::common::language_for_file(
+            &file,
+        ))
+        .and_then(|support| support.unnamed_module_root_for_file(analyzer, &file)) else {
+            continue;
+        };
+        let root_path = root.to_string_lossy().replace('\\', "/");
+        let path = rel_path_string(&file);
+        result.file_notes.push(UsageGraphFileNote {
+            path,
+            reason: GraphFileSkipReason::OutsideSelectedModules {
+                module_path: root_path.clone(),
+            },
+        });
+        if seen_roots.insert(root_path.clone()) {
+            result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                discovery_error: None,
+                code: "outside_selected_modules".into(),
+                message: "module has no packages in the selected tool context (#5664)".into(),
+                path: None,
+                module_path: Some(root_path),
+            });
+        }
+    }
+    result.complete = result.incomplete_reasons.is_empty();
+}
+
+/// Cancellation-polled twin of the incumbent result finalizer.
+///
+/// The production legacy operation remains byte-for-byte on its established
+/// vector/sort path above. The selected comparison path uses ordered insertion
+/// instead, which provides a deterministic poll between every node, site, and
+/// edge without publishing a partially sorted public result.
+#[cfg(any(test, feature = "test-support"))]
+fn finalize_selected_usage_graph_result(
+    catalog: WorkspaceUsageCatalog,
+    edge_sites: BTreeMap<
+        (DeclarationId, DeclarationId),
+        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
+    >,
+    mut truncated_by_id: BTreeMap<DeclarationId, usize>,
+    incomplete: BTreeSet<(String, String)>,
+    cancellation: &CancellationToken,
+) -> Option<UsageGraphResult> {
+    let mut nodes_by_order = BTreeMap::new();
+    for node in &catalog.nodes {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let node = UsageGraphNode {
+            id: node.key.id.clone(),
+            fqn: node.key.fqn.clone(),
+            language: node.language_label().to_string(),
+            path: rel_path_string(node.primary.source()),
+            start_line: node
+                .primary_range
+                .map(|range| range.start_line)
+                .unwrap_or(0),
+            kind: code_unit_kind_name(node.primary.kind()).to_string(),
+            signature: node.primary.signature().map(str::to_string),
+        };
+        let previous = nodes_by_order.insert(
+            (node.language.clone(), node.fqn.clone(), node.id.clone()),
+            node,
+        );
+        assert!(previous.is_none(), "usage graph node ordering key is exact");
+    }
+    let mut nodes = Vec::with_capacity(nodes_by_order.len());
+    for node in nodes_by_order.into_values() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        nodes.push(node);
+    }
+
+    let max_callsites = brokk_bifrost_analysis::analyzer::usages::inverted_edges::MAX_CALLSITES;
+    let mut inbound_sites: HashMap<DeclarationId, HashSet<(String, usize)>> = HashMap::default();
+    for ((_, to_id), (_, _, sites)) in &edge_sites {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let target_sites = inbound_sites.entry(to_id.clone()).or_default();
+        for site in sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            target_sites.insert((site.path.clone(), site.line));
+        }
+    }
+    for (id, sites) in &inbound_sites {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if sites.len() > max_callsites {
+            truncated_by_id
+                .entry(id.clone())
+                .and_modify(|current| *current = (*current).max(sites.len()))
+                .or_insert(sites.len());
+        }
+    }
+    let mut truncated_ids = HashSet::default();
+    for id in truncated_by_id.keys() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        truncated_ids.insert(id.clone());
+    }
+    let mut truncated_by_order = BTreeMap::new();
+    for (id, total_callsites) in &truncated_by_id {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let index = catalog
+            .index_for_id(id)
+            .expect("every exact edge endpoint is cataloged");
+        let node = &catalog.nodes[index];
+        let symbol = UsageGraphTruncatedSymbol {
+            node_id: id.clone(),
+            fqn: node.key.fqn.clone(),
+            language: node.language_label().to_string(),
+            total_callsites: *total_callsites,
+            limit: max_callsites,
+        };
+        let previous = truncated_by_order.insert(
+            (
+                symbol.language.clone(),
+                symbol.fqn.clone(),
+                symbol.node_id.clone(),
+            ),
+            symbol,
+        );
+        assert!(
+            previous.is_none(),
+            "usage graph truncation ordering key is exact"
+        );
+    }
+    let mut truncated_symbols = Vec::with_capacity(truncated_by_order.len());
+    for symbol in truncated_by_order.into_values() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        truncated_symbols.push(symbol);
+    }
+
+    let mut edges_by_order = BTreeMap::new();
+    for ((from_id, to_id), (from, to, sites)) in edge_sites {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if truncated_ids.contains(&to_id) {
+            continue;
+        }
+        let mut canonical_sites = BTreeSet::new();
+        for site in sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            canonical_sites.insert(site);
+        }
+        let mut sites = Vec::with_capacity(canonical_sites.len());
+        for site in canonical_sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            sites.push(site);
+        }
+        let edge = UsageGraphEdge {
+            from_id,
+            to_id,
+            from: from.fq_name(),
+            to: to.fq_name(),
+            language: UsageEcosystem::of(language_for_target(&to))
+                .as_str()
+                .to_string(),
+            weight: sites.len(),
+            sites,
+        };
+        let previous = edges_by_order.insert(
+            (
+                edge.language.clone(),
+                edge.from.clone(),
+                edge.to.clone(),
+                edge.from_id.clone(),
+                edge.to_id.clone(),
+            ),
+            edge,
+        );
+        assert!(previous.is_none(), "usage graph edge ordering key is exact");
+    }
+    let mut edges = Vec::with_capacity(edges_by_order.len());
+    for edge in edges_by_order.into_values() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        edges.push(edge);
+    }
+
+    let mut incomplete_reasons =
+        Vec::with_capacity(incomplete.len() + usize::from(!truncated_symbols.is_empty()));
+    for (code, message) in incomplete {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        incomplete_reasons.push(UsageGraphIncompleteReason {
+            discovery_error: None,
+            code,
+            message,
+            path: None,
+            module_path: None,
+        });
+    }
+    if !truncated_symbols.is_empty() {
+        incomplete_reasons.push(UsageGraphIncompleteReason {
+            discovery_error: None,
+            path: None,
+            module_path: None,
+            code: "callsites_truncated".to_string(),
+            message: "one or more symbols exceeded the call-site enumeration limit".to_string(),
+        });
+    }
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    Some(UsageGraphResult {
+        session_subset: None,
+        complete: incomplete_reasons.is_empty(),
+        nodes,
+        edges,
+        truncated_symbols,
+        incomplete_reasons,
+        file_notes: Vec::new(),
+    })
+}
+
+fn ecosystem_languages(ecosystem: UsageEcosystem) -> &'static [Language] {
+    match ecosystem {
+        UsageEcosystem::JavaScriptTypeScript => &[Language::JavaScript, Language::TypeScript],
+        UsageEcosystem::Python => &[Language::Python],
+        UsageEcosystem::Go => &[Language::Go],
+        UsageEcosystem::Rust => &[Language::Rust],
+        UsageEcosystem::Jvm => &[Language::Java, Language::Scala, Language::Kotlin],
+        UsageEcosystem::CSharp => &[Language::CSharp],
+        UsageEcosystem::Cpp => &[Language::Cpp],
+        UsageEcosystem::Php => &[Language::Php],
+        UsageEcosystem::Ruby => &[Language::Ruby],
+        UsageEcosystem::Unknown => &[],
+    }
+}
+
+fn unique_graph_unit(units: &[CodeUnit]) -> Option<CodeUnit> {
+    let catalog = WorkspaceUsageCatalog::from_declarations(
+        units.iter().cloned().map(|unit| (unit, None)).collect(),
+        &CancellationToken::default(),
+    )?;
+    (catalog.nodes.len() == 1).then(|| catalog.nodes[0].primary.clone())
+}
+
+fn canonical_graph_unit_for_id(units: &[CodeUnit], id: &DeclarationId) -> Option<CodeUnit> {
+    graph_node_for_id(units, id).map(|node| node.primary)
+}
+
+/// The graph node among `units` that the declaration `id` belongs to.
+fn graph_node_for_id(units: &[CodeUnit], id: &DeclarationId) -> Option<WorkspaceUsageNode> {
+    let mut catalog = WorkspaceUsageCatalog::from_declarations(
+        units.iter().cloned().map(|unit| (unit, None)).collect(),
+        &CancellationToken::default(),
+    )?;
+    let index = catalog.index_for_id(id)?;
+    Some(catalog.nodes.swap_remove(index))
+}
+
+fn inverse_target_has_unique_callable_shape(
+    analyzer: &dyn IAnalyzer,
+    units: &[CodeUnit],
+    target_id: &DeclarationId,
+) -> bool {
+    let catalog = WorkspaceUsageCatalog::from_declarations(
+        units.iter().cloned().map(|unit| (unit, None)).collect(),
+        &CancellationToken::default(),
+    );
+    let Some(catalog) = catalog else {
+        return false;
+    };
+    if catalog.nodes.len() == 1 {
+        return true;
+    }
+    let Some(target_index) = catalog.index_for_id(target_id) else {
+        return false;
+    };
+    let target_arities = analyzer
+        .signature_metadata(&catalog.nodes[target_index].primary)
+        .into_iter()
+        .filter_map(|metadata| metadata.callable_arity())
+        .collect::<Vec<_>>();
+    !target_arities.is_empty()
+        && catalog
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != target_index)
+            .all(|(_, node)| {
+                analyzer
+                    .signature_metadata(&node.primary)
+                    .into_iter()
+                    .filter_map(|metadata| metadata.callable_arity())
+                    .all(|other| {
+                        target_arities
+                            .iter()
+                            .all(|target| !callable_arities_overlap(*target, other))
+                    })
+            })
+}
+
+fn callable_arities_overlap(
+    left: brokk_bifrost_core::analyzer::model::CallableArity,
+    right: brokk_bifrost_core::analyzer::model::CallableArity,
+) -> bool {
+    let lower = left.required().max(right.required());
+    let left_upper = if left.is_repeated() {
+        usize::MAX
+    } else {
+        left.total()
+    };
+    let right_upper = if right.is_repeated() {
+        usize::MAX
+    } else {
+        right.total()
+    };
+    lower <= left_upper.min(right_upper)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilteredUsageHits {
+    hits: Vec<UsageHitRow>,
+    /// Same-owner usage sites (self/this receiver, own-type static) deduped like
+    /// `hits` but excluded from the external usage surface. Counted always;
+    /// listed only when the caller passes `include_same_owner`.
+    same_owner: Vec<UsageHitRow>,
+    definition_sites_excluded: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageHitRow {
+    pub(crate) path: String,
+    pub(crate) line: usize,
+    pub(crate) column: Option<usize>,
+    pub(crate) end_line: Option<usize>,
+    pub(crate) end_column: Option<usize>,
+    pub(crate) start_offset: usize,
+    pub(crate) end_offset: usize,
+    pub(crate) enclosing: String,
+    pub(crate) kind: UsageHitKind,
+    pub(crate) reason_kind: Option<String>,
+    pub(crate) snippet: String,
+    pub(crate) confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedUsageDefinition {
+    fq_name: String,
+    path: String,
+    line: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SummaryFileCount {
+    path: String,
+    hits: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SymbolUsageRenderState {
+    symbol: String,
+    fq_name: Option<String>,
+    definition_path: Option<String>,
+    definition_line: Option<usize>,
+    total_hits: usize,
+    unproven_hits: usize,
+    same_owner_sites: usize,
+    same_owner_rows: Vec<UsageHitRow>,
+    include_same_owner: bool,
+    candidate_files_truncated: bool,
+    definition_sites_excluded: usize,
+    hits: Vec<UsageHitRow>,
+    unproven_rows: Vec<UsageHitRow>,
+    summary_files: Vec<SummaryFileCount>,
+    top_enclosing: Vec<UsageEnclosingCount>,
+    base_note: Option<String>,
+    reference_only_absence_note: Option<String>,
+    rendering: UsageRendering,
+    file_limit: Option<usize>,
+    top_enclosing_limit: usize,
+}
+
+impl SymbolUsageRenderState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        symbol: String,
+        resolved_definition: Option<ResolvedUsageDefinition>,
+        candidate_files_truncated: bool,
+        definition_sites_excluded: usize,
+        hits: Vec<UsageHitRow>,
+        unproven_hits: usize,
+        unproven_rows: Vec<UsageHitRow>,
+        base_note: Option<String>,
+        reference_only_absence_note: Option<String>,
+        same_owner_rows: Vec<UsageHitRow>,
+        include_same_owner: bool,
+    ) -> Self {
+        let total_hits = hits.len();
+        let same_owner_sites = same_owner_rows.len();
+        let rendering = if total_hits <= 10 {
+            UsageRendering::Full
+        } else if total_hits <= 100 {
+            UsageRendering::Lines
+        } else {
+            UsageRendering::Summary
+        };
+        let mut file_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut enclosing_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for hit in &hits {
+            *file_counts.entry(hit.path.clone()).or_default() += 1;
+            *enclosing_counts.entry(hit.enclosing.clone()).or_default() += 1;
+        }
+        let mut summary_files: Vec<SummaryFileCount> = file_counts
+            .into_iter()
+            .map(|(path, hits)| SummaryFileCount { path, hits })
+            .collect();
+        summary_files.sort_by(|left, right| {
+            right
+                .hits
+                .cmp(&left.hits)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let mut top_enclosing: Vec<UsageEnclosingCount> = enclosing_counts
+            .into_iter()
+            .map(|(enclosing, hits)| UsageEnclosingCount { enclosing, hits })
+            .collect();
+        top_enclosing.sort_by(|left, right| {
+            right
+                .hits
+                .cmp(&left.hits)
+                .then_with(|| left.enclosing.cmp(&right.enclosing))
+        });
+
+        let file_limit = (rendering == UsageRendering::Summary
+            && summary_files.len() > SCAN_USAGES_SUMMARY_FILE_LIMIT)
+            .then_some(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+
+        Self {
+            symbol,
+            fq_name: resolved_definition
+                .as_ref()
+                .map(|definition| definition.fq_name.clone()),
+            definition_path: resolved_definition
+                .as_ref()
+                .map(|definition| definition.path.clone()),
+            definition_line: resolved_definition.map(|definition| definition.line),
+            total_hits,
+            unproven_hits,
+            same_owner_sites,
+            same_owner_rows,
+            include_same_owner,
+            candidate_files_truncated,
+            definition_sites_excluded,
+            hits,
+            unproven_rows,
+            summary_files,
+            top_enclosing,
+            base_note,
+            reference_only_absence_note,
+            rendering,
+            file_limit,
+            top_enclosing_limit: SCAN_USAGES_TOP_ENCLOSING_LIMIT,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn partial_summary(
+        symbol: String,
+        resolved_definition: Option<ResolvedUsageDefinition>,
+        total_hits: usize,
+        candidate_files_truncated: bool,
+        definition_sites_excluded: usize,
+        hits: Vec<UsageHitRow>,
+        unproven_hits: usize,
+        unproven_rows: Vec<UsageHitRow>,
+        base_note: Option<String>,
+        reference_only_absence_note: Option<String>,
+        same_owner_rows: Vec<UsageHitRow>,
+        include_same_owner: bool,
+    ) -> Self {
+        let mut state = Self::new(
+            symbol,
+            resolved_definition,
+            candidate_files_truncated,
+            definition_sites_excluded,
+            hits,
+            unproven_hits,
+            unproven_rows,
+            base_note,
+            reference_only_absence_note,
+            same_owner_rows,
+            include_same_owner,
+        );
+        state.total_hits = total_hits;
+        state.rendering = UsageRendering::Summary;
+        state.file_limit = (state.summary_files.len() > SCAN_USAGES_SUMMARY_FILE_LIMIT)
+            .then_some(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+        state
+    }
+}
+
+pub(crate) fn filter_and_dedupe_hits(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    hits: Vec<UsageHit>,
+) -> FilteredUsageHits {
+    let mut definition_ranges: BTreeMap<ProjectFile, Vec<Range>> = BTreeMap::new();
+    for overload in overloads {
+        definition_ranges
+            .entry(overload.source().clone())
+            .or_default()
+            .extend(external_usage_definition_ranges(analyzer, overload));
+    }
+    let mut rows: BTreeMap<(String, usize, usize, String, UsageHitKind), UsageHitRow> =
+        BTreeMap::new();
+    // Same-owner (self/this receiver, own-type static) sites, deduped by the same
+    // key. Excluded from the external usage surface (`rows`) but counted and,
+    // on request, listed — the honest-reporting half of #1014 facet B.
+    let mut same_owner_rows: BTreeMap<(String, usize, usize, String, UsageHitKind), UsageHitRow> =
+        BTreeMap::new();
+    let mut source_positions: HashMap<ProjectFile, Option<(String, Vec<usize>)>> =
+        HashMap::default();
+    let mut definition_sites_excluded = 0usize;
+    for hit in hits {
+        if hit.kind == UsageHitKind::Definition {
+            definition_sites_excluded += 1;
+            continue;
+        }
+        // Import/re-export bindings are editor-only noise dropped here. Self/this
+        // receiver hits are also excluded from the external surface, but instead
+        // of dropping them silently we route them to `same_owner_rows`.
+        let is_same_owner = hit.kind == UsageHitKind::SelfReceiver;
+        if !is_same_owner && !hit.kind.included_in(UsageHitSurface::ExternalUsages) {
+            continue;
+        }
+        if hit.kind == UsageHitKind::Reference
+            && definition_ranges.get(&hit.file).is_some_and(|ranges| {
+                ranges.iter().any(|range| {
+                    brokk_bifrost_core::util::byte_ranges_overlap(
+                        range.start_byte,
+                        range.end_byte,
+                        hit.start_offset,
+                        hit.end_offset,
+                    )
+                })
+            })
+        {
+            definition_sites_excluded += 1;
+            continue;
+        }
+
+        let path = rel_path_string(&hit.file);
+        let enclosing = hit.enclosing.fq_name();
+        let exact_position = source_positions
+            .entry(hit.file.clone())
+            .or_insert_with(|| {
+                analyzer
+                    .project()
+                    .read_source(&hit.file)
+                    .ok()
+                    .map(|source| {
+                        let line_starts = compute_line_starts(&source);
+                        (source, line_starts)
+                    })
+            })
+            .as_ref()
+            .and_then(|(source, line_starts)| {
+                (hit.start_offset <= hit.end_offset
+                    && hit.end_offset <= source.len()
+                    && source.is_char_boundary(hit.start_offset)
+                    && source.is_char_boundary(hit.end_offset))
+                .then(|| {
+                    let start = brokk_bifrost_core::text_utils::line_column_for_offset(
+                        source,
+                        line_starts,
+                        hit.start_offset,
+                    );
+                    let end = brokk_bifrost_core::text_utils::line_column_for_offset(
+                        source,
+                        line_starts,
+                        hit.end_offset,
+                    );
+                    (start, end)
+                })
+            });
+        let row = UsageHitRow {
+            path: path.clone(),
+            line: exact_position.map_or(hit.line, |(start, _)| start.0),
+            column: exact_position.map(|(start, _)| start.1),
+            end_line: exact_position.map(|(_, end)| end.0),
+            end_column: exact_position.map(|(_, end)| end.1),
+            start_offset: hit.start_offset,
+            end_offset: hit.end_offset,
+            enclosing: enclosing.clone(),
+            kind: hit.kind,
+            reason_kind: hit.reason_kind.clone(),
+            snippet: hit.snippet.trim_end().to_string(),
+            confidence: hit.confidence,
+        };
+        let key = (path, hit.start_offset, hit.end_offset, enclosing, hit.kind);
+        let target_map = if is_same_owner {
+            &mut same_owner_rows
+        } else {
+            &mut rows
+        };
+        target_map
+            .entry(key)
+            .and_modify(|existing| {
+                if row.confidence > existing.confidence
+                    || (row.confidence == existing.confidence
+                        && row.snippet.len() > existing.snippet.len())
+                {
+                    *existing = row.clone();
+                }
+            })
+            .or_insert(row);
+    }
+
+    let sort_rows = |rows: &mut Vec<UsageHitRow>| {
+        rows.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.start_offset.cmp(&right.start_offset))
+                .then_with(|| left.end_offset.cmp(&right.end_offset))
+                .then_with(|| left.enclosing.cmp(&right.enclosing))
+        });
+    };
+    let mut hits: Vec<_> = rows.into_values().collect();
+    sort_rows(&mut hits);
+    let mut same_owner: Vec<_> = same_owner_rows.into_values().collect();
+    sort_rows(&mut same_owner);
+
+    FilteredUsageHits {
+        hits,
+        same_owner,
+        definition_sites_excluded,
+    }
+}
+
+pub(crate) fn external_usage_definition_ranges(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+) -> Vec<Range> {
+    let mut ranges = analyzer.ranges_of(target);
+    if language_for_target(target) == Language::Cpp
+        && target.is_callable()
+        && ranges.len() > 1
+        && let Some(occurrences) = declaration_navigation_occurrences(analyzer, target)
+    {
+        let physical_definitions: Vec<_> = occurrences
+            .iter()
+            .filter(|occurrence| {
+                ranges.contains(&occurrence.range)
+                    && matches!(
+                        occurrence.role,
+                        brokk_bifrost_analysis::analyzer::languages::DeclarationNavigationRole::Definition
+                            | brokk_bifrost_analysis::analyzer::languages::DeclarationNavigationRole::Both
+                    )
+            })
+            .map(|occurrence| occurrence.range)
+            .collect();
+        if !physical_definitions.is_empty() {
+            ranges = physical_definitions;
+        }
+    }
+    let narrow_to_name = target.is_class()
+        || (language_for_file(target.source()) == Language::JavaScript
+            && target.is_field()
+            && analyzer.parent_of(target).is_none()
+            && !analyzer.declarations(target.source()).contains(target));
+    if !narrow_to_name {
+        return ranges;
+    }
+
+    // `target`'s ranges above already come from the analyzer, so name-range
+    // refinement must read the same analyzed snapshot to stay consistent.
+    let Some(source) = analyzer.indexed_source(target.source()) else {
+        return ranges;
+    };
+    let exact_ranges =
+        DeclarationNameRangeContext::new(target.source(), source).name_ranges(analyzer, target);
+    if exact_ranges.is_empty() {
+        ranges
+    } else {
+        exact_ranges
+    }
+}
+
+pub(crate) fn render_scan_usages_with_budget(
+    entries: Vec<ScanUsagesWorkEntry>,
+    scope: ScanUsagesScope,
+    surface: ScanUsagesSurface,
+) -> ScanUsagesResult {
+    let mut entries = entries;
+    loop {
+        let mut results: Vec<ScanUsagesEntry> =
+            entries.iter().map(classify_scan_usages_entry).collect();
+        if !scope.unmatched_paths.is_empty() {
+            for entry in &mut results {
+                downgrade_for_unmatched_paths(entry, surface);
+            }
+        }
+        let summary = build_scan_usages_summary(&results);
+        let result = ScanUsagesResult {
+            surface,
+            scope: scope.clone(),
+            summary,
+            results,
+        };
+        if serde_json::to_string(&result)
+            .map(|text| text.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES)
+            .unwrap_or(true)
+        {
+            return result;
+        }
+
+        if !demote_largest_scan_usage_entry(&mut entries)
+            && !truncate_largest_summary_scan_usage_entry(&mut entries)
+        {
+            return result;
+        }
+    }
+}
+
+/// Withdraw an entry's proof claim because part of the requested scope was
+/// never searched.
+///
+/// A `paths` selector that selects no file leaves a hole in the scan, and a
+/// hole is exactly what an absence verdict must not be built on: a request
+/// scoped to a directory whose spelling matched nothing used to answer
+/// `verified_absent` over zero files (#3092). Absence-shaped statuses drop to
+/// `unverified_absent` with the same `scan_incomplete` caveat every other
+/// short scan uses; a hit that was actually found stays found, since an
+/// unsearched selector cannot unfind it.
+fn downgrade_for_unmatched_paths(entry: &mut ScanUsagesEntry, surface: ScanUsagesSurface) {
+    if matches!(
+        entry.status,
+        ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::NoExternalUsages
+    ) {
+        entry.status = ScanUsagesStatus::UnverifiedAbsent;
+    }
+    if entry.status == ScanUsagesStatus::UnverifiedAbsent
+        && !entry
+            .absence_caveats
+            .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete)
+    {
+        entry
+            .absence_caveats
+            .push(ScanUsagesAbsenceCaveat::ScanIncomplete);
+    }
+    // A scan that also ran out of time or budget keeps that reason: it is the
+    // more specific account of what was not searched, and the entry is already
+    // incomplete either way.
+    if entry.incomplete_reason.is_none() {
+        mark_incomplete(entry, ScanUsagesIncompleteReason::UnmatchedPaths, surface);
+    }
+}
+
+pub(crate) fn build_scan_usages_summary(results: &[ScanUsagesEntry]) -> ScanUsagesSummary {
+    let requested = results.len();
+    let found = scan_usages_status_count(results, ScanUsagesStatus::Found);
+    let verified_absent = scan_usages_status_count(results, ScanUsagesStatus::VerifiedAbsent);
+    let no_external_usages = scan_usages_status_count(results, ScanUsagesStatus::NoExternalUsages);
+    let unverified_absent = scan_usages_status_count(results, ScanUsagesStatus::UnverifiedAbsent);
+    let not_found = scan_usages_status_count(results, ScanUsagesStatus::NotFound);
+    let ambiguous = scan_usages_status_count(results, ScanUsagesStatus::Ambiguous);
+    let failure = scan_usages_status_count(results, ScanUsagesStatus::Failure);
+    let too_many_callsites = scan_usages_status_count(results, ScanUsagesStatus::TooManyCallsites);
+    let resolved = results
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.status,
+                ScanUsagesStatus::Found
+                    | ScanUsagesStatus::VerifiedAbsent
+                    | ScanUsagesStatus::NoExternalUsages
+                    | ScanUsagesStatus::UnverifiedAbsent
+                    | ScanUsagesStatus::TooManyCallsites
+            )
+        })
+        .count();
+    let total_hits = results
+        .iter()
+        .filter_map(|entry| match entry.status {
+            ScanUsagesStatus::Found => entry.total_hits,
+            ScanUsagesStatus::TooManyCallsites => entry.total_callsites,
+            _ => None,
+        })
+        .sum();
+    let partial = results.iter().any(|entry| !entry.complete);
+    ScanUsagesSummary {
+        requested,
+        resolved,
+        total_hits,
+        partial,
+        found,
+        verified_absent,
+        no_external_usages,
+        unverified_absent,
+        not_found,
+        ambiguous,
+        failure,
+        too_many_callsites,
+    }
+}
+
+pub(crate) fn scan_usages_status_count(
+    results: &[ScanUsagesEntry],
+    status: ScanUsagesStatus,
+) -> usize {
+    results
+        .iter()
+        .filter(|entry| entry.status == status)
+        .count()
+}
+
+pub(crate) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
+    match entry {
+        ScanUsagesWorkEntry::Usage {
+            request,
+            state,
+            candidate_files_sample,
+            target_is_method,
+            incomplete_reason,
+        } => {
+            let usage = render_symbol_usages(state);
+            classify_usage_entry(
+                request,
+                usage,
+                candidate_files_sample.clone(),
+                false,
+                None,
+                *target_is_method,
+                *incomplete_reason,
+            )
+        }
+        ScanUsagesWorkEntry::TooManyCallsites {
+            request,
+            state,
+            short_name,
+            total_callsites,
+            limit,
+            target_is_method,
+        } => {
+            let usage = render_symbol_usages(state);
+            classify_usage_entry(
+                request,
+                usage,
+                None,
+                true,
+                Some((short_name.clone(), *total_callsites, *limit)),
+                *target_is_method,
+                Some(ScanUsagesIncompleteReason::Callsites),
+            )
+        }
+        ScanUsagesWorkEntry::NotFound { request, item } => {
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::NotFound, true);
+            result.message = Some(match item.note.as_deref() {
+                Some(note) => format!("{}: {note}", item.input),
+                None => item.input.clone(),
+            });
+            result
+        }
+        ScanUsagesWorkEntry::Ambiguous {
+            request,
+            item,
+            incomplete_reason,
+        } => {
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Ambiguous, true);
+            result.symbol = Some(item.symbol.clone());
+            result.short_name = Some(item.short_name.clone());
+            result.candidate_targets = item.candidate_targets.clone();
+            result.candidate_details = item.candidate_details.clone();
+            result.candidate_details_total = item.candidate_details_total;
+            result.candidate_details_truncated = item.candidate_details_truncated;
+            result.candidates = item.candidates.clone();
+            result.too_many_candidates = item.too_many_candidates;
+            result.definition_sites_excluded = item.definition_sites_excluded;
+            result.complete = incomplete_reason.is_none() && !item.candidate_files_truncated;
+            result.incomplete_reason = incomplete_reason.or_else(|| {
+                item.candidate_files_truncated
+                    .then_some(ScanUsagesIncompleteReason::CandidateFiles)
+            });
+            result.message = Some(item.note.clone().unwrap_or_else(|| {
+                match request.surface {
+                    ScanUsagesSurface::Reference => "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.".to_string(),
+                    ScanUsagesSurface::Location => "Ambiguous location; refine the line/column target and re-call scan_usages_by_location.".to_string(),
+                }
+            }));
+            result
+        }
+        ScanUsagesWorkEntry::Failure {
+            request,
+            failure,
+            incomplete_reason,
+        } => {
+            let mut result = scan_usages_entry_base(
+                request,
+                ScanUsagesStatus::Failure,
+                incomplete_reason.is_none() && !failure.candidate_files_truncated,
+            );
+            result.incomplete_reason = incomplete_reason.or_else(|| {
+                failure
+                    .candidate_files_truncated
+                    .then_some(ScanUsagesIncompleteReason::CandidateFiles)
+            });
+            result.symbol = Some(failure.symbol.clone());
+            result.fq_name = Some(failure.fq_name.clone());
+            result.reason_kind = Some(failure.reason_kind.clone());
+            result.candidate_files_sample = failure.candidate_files_sample.clone();
+            result.message = Some(match failure.hint.as_deref() {
+                Some(hint) => format!("{}; {hint}", failure.reason),
+                None => failure.reason.clone(),
+            });
+            result
+        }
+        ScanUsagesWorkEntry::Incomplete {
+            request,
+            symbol,
+            reason,
+            message,
+        } => {
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Failure, false);
+            result.symbol.clone_from(symbol);
+            result.incomplete_reason = Some(*reason);
+            result.reason_kind = Some(
+                match reason {
+                    ScanUsagesIncompleteReason::Cancelled => "cancelled",
+                    ScanUsagesIncompleteReason::TimeBudget => "time_budget",
+                    ScanUsagesIncompleteReason::CandidateFiles => "candidate_files_budget",
+                    ScanUsagesIncompleteReason::SourceBytes => "source_bytes_budget",
+                    ScanUsagesIncompleteReason::SourceUnavailable => "source_unavailable",
+                    ScanUsagesIncompleteReason::SemanticAnalysis => "semantic_incomplete",
+                    ScanUsagesIncompleteReason::Callsites => "callsites_budget",
+                    ScanUsagesIncompleteReason::ResponseBudget => "response_budget",
+                    ScanUsagesIncompleteReason::ResolutionCandidates => {
+                        "resolution_candidates_budget"
+                    }
+                    ScanUsagesIncompleteReason::UnmatchedPaths => "unmatched_paths",
+                }
+                .to_string(),
+            );
+            result.message = Some(message.clone());
+            result
+        }
+    }
+}
+
+pub(crate) fn classify_usage_entry(
+    request: &ScanUsageRequest,
+    usage: SymbolUsages,
+    candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
+    too_many_callsites: bool,
+    callsite_cap: Option<(String, usize, usize)>,
+    target_is_method: bool,
+    incomplete_reason: Option<ScanUsagesIncompleteReason>,
+) -> ScanUsagesEntry {
+    let incomplete_reason = incomplete_reason.or_else(|| {
+        usage
+            .candidate_files_truncated
+            .then_some(ScanUsagesIncompleteReason::CandidateFiles)
+    });
+    let incomplete_reason = incomplete_reason.or_else(|| {
+        usage
+            .files_truncated
+            .is_some()
+            .then_some(ScanUsagesIncompleteReason::ResponseBudget)
+    });
+    let complete = !too_many_callsites && incomplete_reason.is_none();
+
+    if too_many_callsites {
+        let (short_name, total_callsites, limit) =
+            callsite_cap.expect("too_many_callsites entry includes cap details");
+        let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
+        populate_usage_payload(&mut result, usage, target_is_method, &[], request.surface);
+        result.short_name = Some(short_name);
+        result.total_callsites = Some(total_callsites);
+        result.limit = Some(limit);
+        result.message = Some(too_many_callsites_note(limit));
+        mark_incomplete(
+            &mut result,
+            ScanUsagesIncompleteReason::Callsites,
+            request.surface,
+        );
+        return result;
+    }
+
+    let mut caveats = Vec::new();
+    if usage.unproven_hits > 0 {
+        caveats.push(ScanUsagesAbsenceCaveat::UnprovenMatches);
+    }
+    if usage.candidate_files_truncated {
+        caveats.push(ScanUsagesAbsenceCaveat::CandidateFilesTruncated);
+    }
+    if usage.reference_only_siblings {
+        caveats.push(ScanUsagesAbsenceCaveat::ReferenceOnlySiblings);
+    }
+    // A scan that stopped early never proves absence, whatever stopped it.
+    if incomplete_reason.is_some() {
+        caveats.push(ScanUsagesAbsenceCaveat::ScanIncomplete);
+    }
+
+    // HARD RULE (#1014 facet B): never emit `verified_absent` when same-owner
+    // sites exist. Zero external hits with same-owner sites present is its own
+    // status, so a consumer never reads a confident "no callers" claim when
+    // internal callers exist. Same-owner presence also outranks the softer
+    // unverified-absence caveats.
+    let status = if usage.total_hits > 0 {
+        ScanUsagesStatus::Found
+    } else if incomplete_reason == Some(ScanUsagesIncompleteReason::TimeBudget) {
+        ScanUsagesStatus::UnverifiedAbsent
+    } else if usage.same_owner_sites.is_some_and(|count| count > 0) {
+        ScanUsagesStatus::NoExternalUsages
+    } else if caveats.is_empty() {
+        ScanUsagesStatus::VerifiedAbsent
+    } else {
+        ScanUsagesStatus::UnverifiedAbsent
+    };
+
+    let mut result = scan_usages_entry_base(request, status, complete);
+    if usage.candidate_files_truncated {
+        result.candidate_files_sample = candidate_files_sample;
+    }
+    populate_usage_payload(
+        &mut result,
+        usage,
+        target_is_method,
+        &caveats,
+        request.surface,
+    );
+    if status == ScanUsagesStatus::UnverifiedAbsent {
+        result.absence_caveats = caveats;
+    }
+    if let Some(reason) = incomplete_reason {
+        mark_incomplete(&mut result, reason, request.surface);
+    }
+    result
+}
+
+pub(crate) fn populate_usage_payload(
+    entry: &mut ScanUsagesEntry,
+    usage: SymbolUsages,
+    target_is_method: bool,
+    absence_caveats: &[ScanUsagesAbsenceCaveat],
+    surface: ScanUsagesSurface,
+) {
+    let guidance = scan_usages_absence_guidance(
+        entry.status,
+        target_is_method,
+        &usage,
+        absence_caveats,
+        surface,
+    );
+    entry.symbol = Some(usage.symbol);
+    entry.fq_name = usage.fq_name;
+    entry.definition_path = usage.definition_path;
+    entry.definition_line = usage.definition_line;
+    entry.total_hits = Some(usage.total_hits);
+    entry.unproven_hits = Some(usage.unproven_hits);
+    entry.same_owner_sites = usage.same_owner_sites;
+    entry.rendering = Some(usage.rendering);
+    entry.files = usage.files;
+    entry.same_owner_files = usage.same_owner_files;
+    entry.unproven_files = usage.unproven_files;
+    entry.model_relations = usage.model_relations;
+    entry.top_enclosing = usage.top_enclosing;
+    entry.definition_sites_excluded = usage.definition_sites_excluded;
+    entry.files_truncated = usage.files_truncated;
+    if let Some(note) = usage.note {
+        entry.notes.push(note);
+    }
+    if usage.candidate_files_truncated && entry.status == ScanUsagesStatus::Found {
+        entry.notes.push(format!(
+            "Candidate file set was truncated; additional usage sites may exist. Re-call {} with narrower `paths` for exhaustive coverage.",
+            surface.tool_name()
+        ));
+    }
+    if entry.message.is_none() {
+        entry.message = guidance.message;
+    }
+    entry.notes.extend(guidance.notes);
+}
+
+pub(crate) struct ScanUsagesAbsenceGuidance {
+    message: Option<String>,
+    notes: Vec<String>,
+}
+
+pub(crate) fn scan_usages_absence_guidance(
+    status: ScanUsagesStatus,
+    target_is_method: bool,
+    usage: &SymbolUsages,
+    caveats: &[ScanUsagesAbsenceCaveat],
+    surface: ScanUsagesSurface,
+) -> ScanUsagesAbsenceGuidance {
+    let notes = if matches!(
+        status,
+        ScanUsagesStatus::VerifiedAbsent
+            | ScanUsagesStatus::NoExternalUsages
+            | ScanUsagesStatus::UnverifiedAbsent
+    ) && target_is_method
+    {
+        vec!["if this is a framework-invoked entrypoint (e.g. servlet filters, DI callbacks), direct callers may not exist: scan the enclosing type or search for its registration.".to_string()]
+    } else {
+        Vec::new()
+    };
+    let message = match status {
+        ScanUsagesStatus::VerifiedAbsent => {
+            Some("resolved symbol; no external usage sites found.".to_string())
+        }
+        ScanUsagesStatus::NoExternalUsages => Some(
+            "resolved symbol; no external usage sites found, but same-owner (self/this receiver or own-type static) sites exist within the declaring container.".to_string(),
+        ),
+        ScanUsagesStatus::UnverifiedAbsent => {
+            scan_usages_unverified_absence_message(usage, caveats, surface)
+        }
+        _ => None,
+    };
+    ScanUsagesAbsenceGuidance { message, notes }
+}
+
+pub(crate) fn scan_usages_unverified_absence_message(
+    usage: &SymbolUsages,
+    caveats: &[ScanUsagesAbsenceCaveat],
+    surface: ScanUsagesSurface,
+) -> Option<String> {
+    if usage.unproven_hits > 0 {
+        let file_count = usage.unproven_files.len();
+        let recovery = match surface {
+            ScanUsagesSurface::Reference => {
+                "narrow `paths` to a relevant candidate file or choose a more specific exported symbol"
+            }
+            ScanUsagesSurface::Location => {
+                "narrow `paths` to a relevant candidate file or refine the declaration line/column"
+            }
+        };
+        return Some(format!(
+            "no PROVEN usage sites, but {} unproven candidate usage(s) found across {} file(s); inspect these before concluding absence. Next step: {recovery} and re-call {}.",
+            usage.unproven_hits,
+            file_count,
+            surface.tool_name()
+        ));
+    }
+    if caveats.contains(&ScanUsagesAbsenceCaveat::CandidateFilesTruncated) {
+        return Some(
+            "no PROVEN usage sites in the scanned candidate sample; candidate files were truncated, so narrow paths and retry before concluding absence."
+                .to_string(),
+        );
+    }
+    None
+}
+
+pub(crate) fn scan_usages_entry_base(
+    request: &ScanUsageRequest,
+    status: ScanUsagesStatus,
+    complete: bool,
+) -> ScanUsagesEntry {
+    ScanUsagesEntry {
+        input: request.input.clone(),
+        input_kind: request.input_kind,
+        status,
+        complete,
+        incomplete_reason: None,
+        symbol: None,
+        short_name: None,
+        total_hits: None,
+        unproven_hits: None,
+        same_owner_sites: None,
+        rendering: None,
+        files: Vec::new(),
+        same_owner_files: Vec::new(),
+        unproven_files: Vec::new(),
+        model_relations: Vec::new(),
+        model_relations_omitted: 0,
+        top_enclosing: Vec::new(),
+        definition_sites_excluded: None,
+        files_truncated: None,
+        absence_caveats: Vec::new(),
+        notes: Vec::new(),
+        message: None,
+        candidate_targets: Vec::new(),
+        candidate_details: Vec::new(),
+        candidate_details_total: None,
+        candidate_details_truncated: false,
+        candidates: Vec::new(),
+        too_many_candidates: None,
+        fq_name: None,
+        definition_path: None,
+        definition_line: None,
+        reason_kind: None,
+        candidate_files_sample: None,
+        total_callsites: None,
+        limit: None,
+    }
+}
+
+pub(crate) fn entry_render_state(entry: &ScanUsagesWorkEntry) -> Option<&SymbolUsageRenderState> {
+    match entry {
+        ScanUsagesWorkEntry::Usage { state, .. }
+        | ScanUsagesWorkEntry::TooManyCallsites { state, .. } => Some(state),
+        _ => None,
+    }
+}
+
+pub(crate) fn entry_render_state_mut(
+    entry: &mut ScanUsagesWorkEntry,
+) -> Option<&mut SymbolUsageRenderState> {
+    match entry {
+        ScanUsagesWorkEntry::Usage { state, .. }
+        | ScanUsagesWorkEntry::TooManyCallsites { state, .. } => Some(state),
+        _ => None,
+    }
+}
+
+pub(crate) fn demote_largest_scan_usage_entry(entries: &mut [ScanUsagesWorkEntry]) -> bool {
+    let any_full = entries.iter().any(|entry| {
+        entry_render_state(entry).is_some_and(|state| state.rendering == UsageRendering::Full)
+    });
+    let mut best_index = None;
+    let mut best_size = 0usize;
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(state) = entry_render_state(entry) else {
+            continue;
+        };
+        let eligible = match state.rendering {
+            UsageRendering::Full => true,
+            UsageRendering::Lines => !any_full,
+            UsageRendering::Summary => false,
+        };
+        if !eligible {
+            continue;
+        }
+        let size = serialized_char_count(&render_symbol_usages(state));
+        if size > best_size {
+            best_size = size;
+            best_index = Some(idx);
+        }
+    }
+    let Some(idx) = best_index else {
+        return false;
+    };
+    let state = entry_render_state_mut(&mut entries[idx]).expect("selected render state");
+    state.rendering = match state.rendering {
+        UsageRendering::Full => UsageRendering::Lines,
+        UsageRendering::Lines => UsageRendering::Summary,
+        UsageRendering::Summary => UsageRendering::Summary,
+    };
+    true
+}
+
+pub(crate) fn truncate_largest_summary_scan_usage_entry(
+    entries: &mut [ScanUsagesWorkEntry],
+) -> bool {
+    let mut best_index = None;
+    let mut best_size = 0usize;
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(state) = entry_render_state(entry) else {
+            continue;
+        };
+        if state.rendering != UsageRendering::Summary {
+            continue;
+        }
+        let can_limit_files =
+            state.summary_files.len() > state.file_limit.unwrap_or(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+        let can_reduce_files = state.file_limit.is_some_and(|limit| limit > 1);
+        let can_reduce_enclosing = state.top_enclosing_limit > 0;
+        if !(can_limit_files || can_reduce_files || can_reduce_enclosing) {
+            continue;
+        }
+        let size = serialized_char_count(&render_symbol_usages(state));
+        if size > best_size {
+            best_size = size;
+            best_index = Some(idx);
+        }
+    }
+    let Some(idx) = best_index else {
+        return false;
+    };
+    let state = entry_render_state_mut(&mut entries[idx]).expect("selected render state");
+    if state.file_limit.is_none() && state.summary_files.len() > SCAN_USAGES_SUMMARY_FILE_LIMIT {
+        state.file_limit = Some(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+        return true;
+    }
+    if let Some(limit) = state.file_limit
+        && limit > 1
+    {
+        state.file_limit = Some((limit / 2).max(1));
+        return true;
+    }
+    if state.top_enclosing_limit > 0 {
+        state.top_enclosing_limit /= 2;
+        return true;
+    }
+    false
+}
+
+pub(crate) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
+    let (files, files_truncated, top_enclosing) = match state.rendering {
+        UsageRendering::Full => (
+            render_usage_file_groups(&state.hits, true),
+            None,
+            Vec::new(),
+        ),
+        UsageRendering::Lines => (
+            render_usage_file_groups(&state.hits, false),
+            None,
+            Vec::new(),
+        ),
+        UsageRendering::Summary => {
+            let limit = state.file_limit.unwrap_or(state.summary_files.len());
+            let kept = state
+                .summary_files
+                .iter()
+                .take(limit)
+                .map(|item| UsageFileGroup {
+                    path: item.path.clone(),
+                    hits: Vec::new(),
+                    hit_count: Some(item.hits),
+                })
+                .collect::<Vec<_>>();
+            let truncated = state.summary_files.len().saturating_sub(kept.len());
+            (
+                kept,
+                some_if_nonzero(truncated),
+                state
+                    .top_enclosing
+                    .iter()
+                    .take(state.top_enclosing_limit)
+                    .cloned()
+                    .collect(),
+            )
+        }
+    };
+
+    let mut notes = Vec::new();
+    if let Some(base) = state.base_note.clone() {
+        notes.push(base);
+    }
+    match state.rendering {
+        UsageRendering::Full => {}
+        UsageRendering::Lines => notes.push(format!(
+            "{} hits; showing every exact location without snippets.",
+            state.total_hits
+        )),
+        UsageRendering::Summary => notes.push(format!(
+            "{} hits; showing bounded per-file counts instead of line-level callers. Re-call with narrower `paths` or a more specific symbol for line detail.",
+            state.total_hits
+        )),
+    }
+    if files_truncated.is_some() {
+        notes.push("Summary file list truncated to fit the response budget.".to_string());
+    }
+    let reference_only_siblings = state.reference_only_absence_note.is_some();
+    let absence_would_be_verified = !state.candidate_files_truncated
+        && state.total_hits == 0
+        && state.unproven_hits == 0
+        && state.same_owner_sites == 0;
+    if absence_would_be_verified && let Some(note) = &state.reference_only_absence_note {
+        notes.push(note.clone());
+    }
+    if state.same_owner_sites > 0 {
+        let sites = state.same_owner_sites;
+        let plural = if sites == 1 { "site" } else { "sites" };
+        if state.include_same_owner {
+            notes.push(format!(
+                "{sites} usage {plural} within the declaring container (self/this receiver or own-type static calls) are excluded from external usage counts and listed under same_owner_files."
+            ));
+        } else {
+            notes.push(format!(
+                "{sites} usage {plural} within the declaring container (self/this receiver or own-type static calls) are excluded from external usage counts. Re-call with include_same_owner: true to list them."
+            ));
+        }
+    }
+
+    let same_owner_files = if state.include_same_owner {
+        render_same_owner_file_groups(&state.same_owner_rows)
+    } else {
+        Vec::new()
+    };
+
+    let mut usages = symbol_usages_base(state);
+    usages.reference_only_siblings = reference_only_siblings;
+    usages.files_truncated = files_truncated;
+    usages.note = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(" "))
+    };
+    usages.top_enclosing = top_enclosing;
+    usages.files = files;
+    usages.same_owner_files = same_owner_files;
+    usages.unproven_files = render_usage_file_groups(&state.unproven_rows, true);
+    usages
+}
+
+fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResult) {
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return;
+    };
+    attach_model_relations_to_entries(analyzer, &overlay, &result.scope, &mut result.results);
+    fit_model_relations_to_response_budget(result);
+    result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn attach_model_relations_to_entries(
+    analyzer: &dyn IAnalyzer,
+    overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+    scope: &ScanUsagesScope,
+    entries: &mut [ScanUsagesEntry],
+) {
+    const MAX_MODEL_RELATIONS_PER_SYMBOL: usize = 256;
+
+    let whole_workspace = scope.whole_workspace;
+    for entry in entries {
+        let input = match &entry.input {
+            ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
+            ScanUsagesInput::Target(_) => entry
+                .fq_name
+                .as_deref()
+                .or(entry.symbol.as_deref())
+                .unwrap_or_default(),
+        };
+        let authored_target = entry.fq_name.is_some()
+            && !matches!(
+                entry.status,
+                ScanUsagesStatus::NotFound
+                    | ScanUsagesStatus::Ambiguous
+                    | ScanUsagesStatus::Failure
+            );
+        let mut symbol = if input.starts_with("bifrost-model://") {
+            overlay.symbols_at_uri(input)
+        } else {
+            entry
+                .fq_name
+                .as_deref()
+                .map(|name| overlay.symbols_named(name))
+                .filter(|matched| !matched.records.is_empty())
+                .unwrap_or_else(|| overlay.symbols_named(input))
+        };
+        if symbol.records.is_empty() {
+            symbol = overlay.symbols_with_id(input);
+        }
+        if symbol.disposition
+            != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        {
+            if symbol.disposition
+                == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                && authored_target
+                && whole_workspace
+            {
+                let authored_name = entry.fq_name.as_deref().unwrap_or_default();
+                let mut inverse_relations = overlay
+                    .relations()
+                    .iter()
+                    // Navigation locates a modeled declaration's authored anchor; only an
+                    // explicit reference relation makes that declaration an inverse usage.
+                    .filter(|relation| {
+                        relation.kind == "references" && relation.to == authored_name
+                    })
+                    .collect::<Vec<_>>();
+                inverse_relations.sort_by(|left, right| left.id.cmp(&right.id));
+                if inverse_relations
+                    .iter()
+                    .any(|relation| relation.provenance.ambiguous)
+                {
+                    entry.notes.push(
+                        "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let mut modeled_references = BTreeMap::<String, Vec<UsageLocation>>::new();
+                for relation in &inverse_relations {
+                    let source = overlay.symbols_with_id(&relation.from);
+                    if source.disposition
+                        != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    {
+                        continue;
+                    }
+                    for file in authored_model_references(analyzer, overlay, source.records[0]) {
+                        modeled_references
+                            .entry(file.path)
+                            .or_default()
+                            .extend(file.hits);
+                    }
+                }
+                let mut modeled_references = modeled_references
+                    .into_iter()
+                    .map(|(path, mut hits)| {
+                        hits.sort_by_key(|hit| (hit.line, hit.column));
+                        hits.dedup_by(|left, right| {
+                            left.line == right.line && left.column == right.column
+                        });
+                        UsageFileGroup {
+                            path,
+                            hits,
+                            hit_count: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let authored_hits = modeled_references
+                    .iter()
+                    .map(|file| file.hits.len())
+                    .sum::<usize>();
+                if authored_hits != 0 {
+                    entry.files.append(&mut modeled_references);
+                    entry
+                        .files
+                        .sort_by(|left, right| left.path.cmp(&right.path));
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(authored_hits),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                    entry.notes.push(
+                        "Generated declarations were matched through modeled reference relations."
+                            .to_owned(),
+                    );
+                }
+                let total_model_relations = inverse_relations.len();
+                entry.model_relations = inverse_relations
+                    .into_iter()
+                    .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
+                    .cloned()
+                    .collect();
+                entry.model_relations_omitted =
+                    total_model_relations.saturating_sub(entry.model_relations.len());
+                if !entry.model_relations.is_empty() {
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(entry.model_relations.len()),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                }
+                continue;
+            }
+            if symbol.disposition
+                == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+            {
+                if authored_target {
+                    entry.notes.push(
+                        "Conflicting modeled declarations were omitted; authored usage resolution retained precedence."
+                            .to_string(),
+                    );
+                } else {
+                    entry.status = ScanUsagesStatus::Ambiguous;
+                    entry.message = Some(
+                        "conflicting active semantic-model declarations prevent an authoritative usage target"
+                            .to_string(),
+                    );
+                }
+            }
+            continue;
+        }
+        let model_symbol = symbol.records[0];
+        if whole_workspace {
+            let authored_references = authored_model_references(analyzer, overlay, model_symbol);
+            let authored_hits = authored_references
+                .iter()
+                .map(|file| file.hits.len())
+                .sum::<usize>();
+            if authored_hits != 0 {
+                entry.files.extend(authored_references);
+                entry
+                    .files
+                    .sort_by(|left, right| left.path.cmp(&right.path));
+                entry.symbol = Some(model_symbol.qualified_name.clone());
+                entry.fq_name = Some(model_symbol.qualified_name.clone());
+                entry.total_hits = Some(
+                    entry
+                        .total_hits
+                        .unwrap_or_default()
+                        .saturating_add(authored_hits),
+                );
+                entry.status = ScanUsagesStatus::Found;
+                entry.message = None;
+                entry.notes.push(
+                    "Workspace references were matched through structured definition resolution."
+                        .to_owned(),
+                );
+            }
+        }
+        let relations = overlay.relations_to(&model_symbol.id);
+        if relations
+            .records
+            .iter()
+            .any(|relation| relation.provenance.ambiguous)
+        {
+            if authored_target {
+                entry.notes.push(
+                    "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
+                        .to_string(),
+                );
+            } else {
+                entry.status = ScanUsagesStatus::Ambiguous;
+                entry.message = Some(
+                    "conflicting active semantic-model relations prevent an authoritative usage result"
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+        let total_model_relations = relations.records.len();
+        entry.model_relations = relations
+            .records
+            .into_iter()
+            .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
+            .cloned()
+            .collect();
+        entry.model_relations_omitted =
+            total_model_relations.saturating_sub(entry.model_relations.len());
+        if !entry.model_relations.is_empty() {
+            entry.symbol = Some(model_symbol.qualified_name.clone());
+            entry.fq_name = Some(model_symbol.qualified_name.clone());
+            entry.total_hits = Some(
+                entry
+                    .total_hits
+                    .unwrap_or_default()
+                    .saturating_add(entry.model_relations.len()),
+            );
+            entry.status = ScanUsagesStatus::Found;
+            entry.notes.push(
+                "Model relations are semantic facts and do not claim authored source hit text."
+                    .to_string(),
+            );
+        } else if entry.status == ScanUsagesStatus::NotFound {
+            entry.status = ScanUsagesStatus::UnverifiedAbsent;
+            entry.symbol = Some(model_symbol.qualified_name.clone());
+            entry.fq_name = Some(model_symbol.qualified_name.clone());
+            entry.message = Some(
+                "the semantic-model declaration resolved, but the active packs contain no modeled inbound relation"
+                    .to_string(),
+            );
+        }
+    }
+}
+
+fn authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+    symbol: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+
+    use brokk_bifrost_core::analyzer::structural::kinds::Role;
+
+    use crate::searchtools::navigation::DefinitionReferenceQuery;
+
+    use crate::searchtools::navigation::GetDefinitionParams;
+
+    use crate::searchtools::navigation::get_definitions_by_location;
+
+    if symbol.language == "go" {
+        return go_authored_model_references(analyzer, overlay, symbol);
+    }
+    if !symbol.externally_visible() {
+        return Vec::new();
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    for provider in analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .filter(|provider| provider.structural_language().config_label() == symbol.language)
+    {
+        let mut files = provider.structural_files();
+        files.sort();
+        files.dedup();
+        for file in files {
+            let Some(facts) = provider.structural_facts(&file) else {
+                continue;
+            };
+            let mut spans = Vec::new();
+            for (index, node) in facts.nodes().iter().enumerate() {
+                if !node.kind.satisfies(NormalizedKind::Call)
+                    && node.kind != NormalizedKind::FieldAccess
+                {
+                    continue;
+                }
+                if let Some(name) = node.name
+                    && (brokk_bifrost_rust_analysis::analyzer::rust::generated_model::is_generated_function(symbol)
+                        || name.text(facts.source()) == symbol.name)
+                {
+                    spans.push(name);
+                }
+                let node_id = u32::try_from(index).expect("structural fact IDs fit u32");
+                spans.extend(
+                    facts
+                        .roles(node_id)
+                        .iter()
+                        .filter(|target| target.role == Role::Kwarg)
+                        .filter_map(|target| target.keyword)
+                        .filter(|keyword| keyword.text(facts.source()) == symbol.name),
+                );
+            }
+            spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+            spans.dedup();
+            let lines = facts.source().lines().collect::<Vec<_>>();
+            for span in spans {
+                let (line, column) = facts.line_column_of_byte(span.start_byte);
+                let result = get_definitions_by_location(
+                    analyzer,
+                    GetDefinitionParams {
+                        references: vec![DefinitionReferenceQuery {
+                            path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                            line: Some(line),
+                            column: Some(column),
+                        }],
+                    },
+                );
+                let resolves_to_symbol = result.results.first().is_some_and(|result| {
+                    result.definitions.iter().any(|candidate| {
+                        candidate
+                            .semantic_model
+                            .as_ref()
+                            .is_some_and(|provenance| provenance.record_id == symbol.id)
+                    })
+                });
+                if !resolves_to_symbol {
+                    continue;
+                }
+                let range = brokk_bifrost_core::analyzer::model::Range {
+                    start_byte: span.start_byte,
+                    end_byte: span.end_byte,
+                    start_line: line,
+                    end_line: facts.line_of_byte(span.end_byte),
+                };
+                let enclosing = analyzer
+                    .enclosing_code_unit(&file, &range)
+                    .map(|unit| unit.fq_name())
+                    .unwrap_or_default();
+                grouped
+                    .entry(brokk_bifrost_core::path_utils::rel_path_string(&file))
+                    .or_default()
+                    .push(UsageLocation {
+                        line,
+                        column: Some(column),
+                        end_line: Some(range.end_line),
+                        end_column: Some(column.saturating_add(span.end_byte - span.start_byte)),
+                        enclosing,
+                        kind: None,
+                        reason_kind: None,
+                        snippet: lines
+                            .get(line.saturating_sub(1))
+                            .map(|line| (*line).to_owned()),
+                        confidence: 1.0,
+                    });
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
+}
+
+fn go_authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    _overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+    symbol: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use brokk_bifrost_core::analyzer::tree_walk::WalkControl;
+
+    use brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder;
+
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest;
+
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch_with_source;
+
+    if symbol.language != "go" || !symbol.externally_visible() {
+        return Vec::new();
+    }
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    let Ok(files) = analyzer.project().all_files() else {
+        return Vec::new();
+    };
+    for file in files.into_iter().filter(|file| {
+        file.rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("go")
+    }) {
+        let Some(source) = analyzer.indexed_source(&file) else {
+            continue;
+        };
+        let Some(tree) = brokk_bifrost_go::parse::parse_go(&source) else {
+            continue;
+        };
+        let mut candidates = Vec::new();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if matches!(
+                node.kind(),
+                "identifier" | "field_identifier" | "type_identifier"
+            ) && source.get(node.byte_range()) == Some(symbol.name.as_str())
+            {
+                candidates.push(node.range());
+            }
+            WalkControl::Continue
+        });
+        if candidates.is_empty() {
+            continue;
+        }
+        let requests = candidates
+            .iter()
+            .map(|range| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(range.start_byte),
+                end_byte: Some(range.end_byte),
+            })
+            .collect();
+        let outcomes = resolve_definition_batch_with_source(
+            analyzer,
+            requests,
+            file.clone(),
+            std::sync::Arc::from(source.as_str()),
+        );
+        let lines = source.lines().collect::<Vec<_>>();
+        for (tree_range, outcome) in candidates.into_iter().zip(outcomes) {
+            if outcome.resolved_reference_target() != Some(symbol.qualified_name.as_str()) {
+                continue;
+            }
+            let position = tree_range.start_point;
+            let range = brokk_bifrost_core::analyzer::model::Range {
+                start_byte: tree_range.start_byte,
+                end_byte: tree_range.end_byte,
+                start_line: position.row + 1,
+                end_line: tree_range.end_point.row + 1,
+            };
+            let enclosing = analyzer
+                .enclosing_code_unit(&file, &range)
+                .map(|unit| unit.fq_name())
+                .unwrap_or_default();
+            grouped
+                .entry(brokk_bifrost_core::path_utils::rel_path_string(&file))
+                .or_default()
+                .push(UsageLocation {
+                    line: position.row + 1,
+                    column: Some(position.column + 1),
+                    end_line: Some(range.end_line),
+                    end_column: Some(tree_range.end_point.column + 1),
+                    enclosing,
+                    kind: None,
+                    reason_kind: None,
+                    snippet: lines.get(position.row).map(|line| (*line).to_owned()),
+                    confidence: 1.0,
+                });
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
+}
+
+fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {
+    let mut relation_sizes = result
+        .results
+        .iter()
+        .map(|entry| {
+            entry
+                .model_relations
+                .iter()
+                .map(|relation| {
+                    serde_json::to_vec(relation)
+                        .expect("semantic-model relations are serializable")
+                        .len()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let surface = result.surface;
+    loop {
+        trim_model_relations_to_serialized_budget(
+            result,
+            &mut relation_sizes,
+            SCAN_USAGES_RESPONSE_BUDGET_BYTES,
+        );
+        let mut guidance_changed = false;
+        for entry in result
+            .results
+            .iter_mut()
+            .filter(|entry| entry.model_relations_omitted != 0)
+        {
+            guidance_changed |=
+                mark_incomplete(entry, ScanUsagesIncompleteReason::ResponseBudget, surface);
+        }
+        if !guidance_changed {
+            break;
+        }
+    }
+}
+
+fn trim_model_relations_to_serialized_budget(
+    result: &mut ScanUsagesResult,
+    relation_sizes: &mut [Vec<usize>],
+    budget: usize,
+) {
+    let mut serialized_bytes = serde_json::to_vec(result)
+        .expect("scan-usages results are serializable")
+        .len();
+    while serialized_bytes > budget {
+        let Some((entry_index, _)) = result
+            .results
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.model_relations.is_empty())
+            .max_by_key(|(_, entry)| entry.model_relations.len())
+        else {
+            break;
+        };
+        let entry = &mut result.results[entry_index];
+        let relation_count = entry.model_relations.len();
+        let relation_bytes = relation_sizes[entry_index]
+            .pop()
+            .expect("serialized relation sizes track retained relations");
+        let old_omitted_digits = decimal_digits(entry.model_relations_omitted);
+        entry.model_relations.pop();
+        entry.model_relations_omitted = entry.model_relations_omitted.saturating_add(1);
+        let new_omitted_digits = decimal_digits(entry.model_relations_omitted);
+        serialized_bytes = serialized_bytes
+            .saturating_sub(relation_bytes)
+            .saturating_sub(usize::from(relation_count > 1))
+            .saturating_add(new_omitted_digits.saturating_sub(old_omitted_digits));
+    }
+}
+
+fn decimal_digits(value: usize) -> usize {
+    value.checked_ilog10().unwrap_or(0) as usize + 1
+}
+
+/// Render same-owner usage sites as file groups, kind-tagged (`self_receiver`)
+/// so a consumer can distinguish them from external hits. Unlike
+/// [`render_usage_file_groups`], which omits the label for internal kinds, this
+/// always emits the kind so the excluded-but-listed sites are unambiguous.
+pub(crate) fn render_same_owner_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGroup> {
+    render_grouped_usage_locations(hits.iter().map(|hit| {
+        (
+            hit.path.clone(),
+            UsageLocation {
+                line: hit.line,
+                column: hit.column,
+                end_line: hit.end_line,
+                end_column: hit.end_column,
+                enclosing: hit.enclosing.clone(),
+                kind: Some(hit.kind.wire_label().to_string()),
+                reason_kind: hit.reason_kind.clone(),
+                snippet: Some(hit.snippet.clone()),
+                confidence: hit.confidence,
+            },
+        )
+    }))
+}
+
+fn render_grouped_usage_locations(
+    locations: impl IntoIterator<Item = (String, UsageLocation)>,
+) -> Vec<UsageFileGroup> {
+    let mut grouped: BTreeMap<String, Vec<UsageLocation>> = BTreeMap::new();
+    for (path, location) in locations {
+        grouped.entry(path).or_default().push(location);
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by(|left, right| {
+                left.line
+                    .cmp(&right.line)
+                    .then_with(|| left.enclosing.cmp(&right.enclosing))
+            });
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn render_usage_file_groups(
+    hits: &[UsageHitRow],
+    include_snippets: bool,
+) -> Vec<UsageFileGroup> {
+    render_grouped_usage_locations(hits.iter().map(|hit| {
+        (
+            hit.path.clone(),
+            UsageLocation {
+                line: hit.line,
+                column: hit.column,
+                end_line: hit.end_line,
+                end_column: hit.end_column,
+                enclosing: hit.enclosing.clone(),
+                kind: hit.kind.external_label().map(str::to_string),
+                reason_kind: hit.reason_kind.clone(),
+                snippet: include_snippets.then(|| hit.snippet.clone()),
+                confidence: hit.confidence,
+            },
+        )
+    }))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesPathFilter {
+    rules: Vec<ScanUsagesPathRule>,
+}
+
+pub(crate) struct BuiltScanUsagesPathFilter {
+    filter: Option<Arc<ScanUsagesPathFilter>>,
+    ignored_paths: usize,
+    /// Selectors that name no workspace file and no workspace directory. They
+    /// select nothing, so an absence they "prove" is an absence over zero
+    /// files (#3092).
+    unmatched_paths: Vec<String>,
+}
+
+/// One `paths` entry: what the caller wrote, and what this workspace makes of
+/// it. The spelling is kept so a selector that selects nothing can be named
+/// back to the caller as the caller wrote it.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesPathRule {
+    selector: String,
+    matcher: WorkspacePathSelector,
+}
+
+impl ScanUsagesPathFilter {
+    fn matches(&self, file: &ProjectFile) -> bool {
+        let rel = rel_path_string(file);
+        self.rules.iter().any(|rule| rule.matcher.matches(&rel))
+    }
+
+    fn summarized_paths(&self) -> (Vec<String>, Option<usize>) {
+        let mut seen = HashSet::default();
+        // A selector that resolved to nothing still names the scope the caller
+        // asked for, so it stays listed here as written; `unmatched_paths`
+        // is what says it selected no file.
+        bounded_scope_paths(
+            self.rules
+                .iter()
+                .flat_map(|rule| {
+                    let paths: Vec<&str> = rule
+                        .matcher
+                        .scope_paths()
+                        .into_iter()
+                        .filter(|path| !path.is_empty())
+                        .collect();
+                    // Nothing displayable: an unmatched selector, or the
+                    // workspace root, whose prefix is the empty string. Either
+                    // way the caller's own spelling is the honest answer.
+                    if paths.is_empty() {
+                        vec![rule.selector.as_str()]
+                    } else {
+                        paths
+                    }
+                })
+                .filter(|path| seen.insert(*path)),
+        )
+    }
+}
+
+/// Fit a reported selector list into the response: every entry truncated to
+/// the scope path budget, the list capped, and the count left out returned
+/// alongside.
+///
+/// A request may name hundreds of selectors, each of any length, so any list
+/// echoed back has to be bounded the same way or one request's `paths` becomes
+/// the whole response.
+fn bounded_scope_paths<'a>(paths: impl Iterator<Item = &'a str>) -> (Vec<String>, Option<usize>) {
+    let mut bounded = Vec::new();
+    let mut total = 0usize;
+    for path in paths {
+        total += 1;
+        if bounded.len() < SCAN_USAGES_SCOPE_PATH_LIMIT {
+            bounded.push(truncate_scan_usages_scope_path(path));
+        }
+    }
+    let omitted = total.checked_sub(bounded.len()).and_then(some_if_nonzero);
+    (bounded, omitted)
+}
+
+pub(crate) fn truncate_scan_usages_scope_path(path: &str) -> String {
+    if path.len() <= SCAN_USAGES_SCOPE_PATH_MAX_BYTES {
+        return path.to_string();
+    }
+    let mut cut = SCAN_USAGES_SCOPE_PATH_MAX_BYTES;
+    while !path.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &path[..cut])
+}
+
+pub(crate) fn build_scan_usages_path_filter(
+    analyzer: &dyn IAnalyzer,
+    paths: Option<&[String]>,
+) -> BuiltScanUsagesPathFilter {
+    let Some(paths) = paths else {
+        return BuiltScanUsagesPathFilter {
+            filter: None,
+            ignored_paths: 0,
+            unmatched_paths: Vec::new(),
+        };
+    };
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    let mut rules = Vec::new();
+    let mut ignored_paths = 0;
+    let mut unmatched_paths = Vec::new();
+    for raw in paths {
+        let selector = raw.trim().to_string();
+        let matcher = resolver.classify_selector(&selector);
+        match matcher {
+            // A blank entry or an uncompilable glob narrows nothing and is
+            // reported as an ignored path, exactly as before the shared
+            // classifier existed.
+            WorkspacePathSelector::Invalid => {
+                ignored_paths += 1;
+                continue;
+            }
+            // Kept as a rule even though it selects nothing: dropping it would
+            // widen the scope to the whole workspace, which is the opposite of
+            // what the caller asked for.
+            WorkspacePathSelector::Unmatched => unmatched_paths.push(selector.clone()),
+            WorkspacePathSelector::Glob(_)
+            | WorkspacePathSelector::Files(_)
+            | WorkspacePathSelector::Directory(_) => {}
+        }
+        rules.push(ScanUsagesPathRule { selector, matcher });
+    }
+    unmatched_paths.extend(unmatched_globs(analyzer, &rules));
+    BuiltScanUsagesPathFilter {
+        filter: (!rules.is_empty()).then(|| Arc::new(ScanUsagesPathFilter { rules })),
+        ignored_paths,
+        unmatched_paths,
+    }
+}
+
+/// The glob selectors in `rules` that no workspace path matches.
+///
+/// A file or directory selector proves itself while it is classified, but a
+/// glob is well formed whatever it names, so the only way to learn that it
+/// selects nothing is to try it against the workspace. That costs one pass
+/// over the session's already-cached listing, and only when the request
+/// carries a glob at all. The universe is the workspace listing rather than
+/// the analyzed set on purpose: a glob that matches a file this analyzer does
+/// not analyze still selected what the caller named, and absence in a file no
+/// language frontend reads is not in doubt.
+fn unmatched_globs(analyzer: &dyn IAnalyzer, rules: &[ScanUsagesPathRule]) -> Vec<String> {
+    let mut pending: Vec<usize> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| matches!(rule.matcher, WorkspacePathSelector::Glob(_)))
+        .map(|(index, _)| index)
+        .collect();
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let Ok(listing) = analyzer.project().all_files_shared() else {
+        // A workspace whose listing failed cannot say what a glob matches.
+        // `resolve_literal` records that failure on the request boundary; do
+        // not turn it into an invented "this selector names nothing".
+        return Vec::new();
+    };
+    for file in listing.iter() {
+        if pending.is_empty() {
+            break;
+        }
+        let rel = rel_path_string(file);
+        pending.retain(|index| !rules[*index].matcher.matches(&rel));
+    }
+    pending
+        .into_iter()
+        .map(|index| rules[index].selector.clone())
+        .collect()
+}
+
+pub(crate) fn serialized_char_count<T: Serialize>(value: &T) -> usize {
+    serde_json::to_string(value)
+        .map(|text| text.chars().count())
+        .unwrap_or(0)
+}
+
+pub(crate) fn some_if_nonzero(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
+}
+
+pub(crate) fn is_true(value: &bool) -> bool {
+    *value
+}
+
+pub(crate) fn too_many_callsites_note(limit: usize) -> String {
+    format!(
+        "Stopped after the {limit}-callsite cap for this high-fanout symbol. Re-call with narrower `paths` or a more specific declaration; exhaustive output is intentionally suppressed for this query."
+    )
+}
+
+pub(crate) fn too_many_callsites_summary_note(limit: usize) -> String {
+    format!(
+        "Callsite cap exceeded for this high-fanout symbol (limit {limit}); this is an incomplete summary of observed hits before stopping. Re-call with `paths` from the files list for line-level detail."
+    )
+}
+
+pub(crate) fn is_full_confidence(confidence: &f64) -> bool {
+    (*confidence - 1.0).abs() < f64::EPSILON
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassifyTestFilesParams {
+    pub file_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestFileKind {
+    Test,
+    TestSupport,
+    Production,
+    Ambiguous,
+}
+
+impl TestFileKind {
+    /// The serialized spelling, for text renderings that carry the same verdict
+    /// as the JSON payload.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::TestSupport => "test_support",
+            Self::Production => "production",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestFileClassification {
+    pub kind: TestFileKind,
+    /// Semantic runnable-test detection for the same file, reported so callers
+    /// can separate file-level test surface from files that contain test code.
+    pub contains_test_code: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifyTestFilesResult {
+    pub classifications: BTreeMap<String, TestFileClassification>,
+    pub unresolved: Vec<String>,
+}
+
+pub fn classify_test_files(
+    analyzer: &dyn IAnalyzer,
+    params: ClassifyTestFilesParams,
+) -> ClassifyTestFilesResult {
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    let mut classifications = BTreeMap::new();
+    let mut unresolved = Vec::new();
+    for input in params.file_paths.iter() {
+        match resolver.resolve_literal(input.trim()) {
+            ResolvedFileInput::File(file) if file.exists() => {
+                classifications.insert(
+                    rel_path_string(&file),
+                    classify_resolved_test_file(analyzer, &file),
+                );
+            }
+            _ => unresolved.push(input.clone()),
+        }
+    }
+    ClassifyTestFilesResult {
+        classifications,
+        unresolved,
+    }
+}
+
+pub(crate) fn classify_resolved_test_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> TestFileClassification {
+    let path = rel_path_string(file);
+    let language = language_for_file(file);
+    let path_verdict = test_paths::path_test_verdict(&path);
+    let contains_test_code = analyzer.contains_tests(file);
+    let test_like = is_test_like_file(analyzer, file, &path, language);
+    let kind = if test_like && contains_test_code {
+        TestFileKind::Test
+    } else if test_like {
+        TestFileKind::TestSupport
+    } else if path_verdict == test_paths::PathTestVerdict::ProductionRoot {
+        TestFileKind::Production
+    } else {
+        TestFileKind::Ambiguous
+    };
+    TestFileClassification {
+        kind,
+        contains_test_code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::searchtools::scan_usages::*;
+
+    use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
+
+    use brokk_bifrost_analysis::analyzer::usages::inverted_edges::MAX_CALLSITES;
+
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceCounts;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::CanonicalWorkspaceUsageProjectedEdge;
+
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageGraphProjection;
+
+    use brokk_bifrost_core::analyzer::model::Language;
+
+    use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
+
+    use brokk_bifrost_core::analyzer::project::TestProject;
+
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// A rooted `usage_graph` naming only Rust files must not make the Rust
+    /// provider demand canonical Rust facts for a file the Rust adapter does
+    /// not own.
+    ///
+    /// The native preflight walks the live mounts. A mixed-language workspace
+    /// puts C++ and Python paths in the same snapshot, and reaching one of
+    /// them records "canonical Rust source is absent from the live snapshot"
+    /// and fails the whole request.
+    #[test]
+    fn rooted_rust_usage_graph_ignores_other_languages_in_a_mixed_workspace() {
+        let (_temp, workspace) =
+            brokk_bifrost_analysis::test_support::mixed_language_rust_workspace();
+        let analyzer = workspace.analyzer();
+
+        let graph = usage_graph(
+            analyzer,
+            UsageGraphParams {
+                include_tests: true,
+                paths: Some(vec!["src/lib.rs".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(graph.complete, "{graph:#?}");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from.ends_with("caller") && edge.to.ends_with("target")),
+            "{graph:#?}"
+        );
+        assert!(
+            graph.incomplete_reasons.is_empty(),
+            "a Rust-rooted request must not read a non-Rust file as a Rust source: {:?}",
+            graph.incomplete_reasons
+        );
+    }
+
+    #[test]
+    fn semantic_incomplete_scan_retains_hits_and_never_verifies_absence() {
+        let hit = UsageHitRow {
+            path: "src/lib.rs".to_string(),
+            line: 2,
+            column: None,
+            end_line: None,
+            end_column: None,
+            start_offset: 10,
+            end_offset: 16,
+            enclosing: "caller".to_string(),
+            kind: UsageHitKind::Reference,
+            reason_kind: None,
+            snippet: "target()".to_string(),
+            confidence: 1.0,
+        };
+        for (hits, status) in [
+            (Vec::new(), ScanUsagesStatus::UnverifiedAbsent),
+            (vec![hit], ScanUsagesStatus::Found),
+        ] {
+            let count = hits.len();
+            let state = SymbolUsageRenderState::new(
+                "target".to_string(),
+                None,
+                false,
+                0,
+                hits,
+                0,
+                Vec::new(),
+                Some("Unresolved structured reference in another file".to_string()),
+                None,
+                Vec::new(),
+                false,
+            );
+            let entry = classify_scan_usages_entry(&ScanUsagesWorkEntry::Usage {
+                request: ScanUsageRequest::symbol(0, "target".to_string()),
+                state,
+                candidate_files_sample: None,
+                target_is_method: false,
+                incomplete_reason: Some(ScanUsagesIncompleteReason::SemanticAnalysis),
+            });
+            assert_eq!(entry.status, status);
+            assert_eq!(entry.total_hits, Some(count));
+            assert!(!entry.complete);
+            assert_eq!(
+                entry.incomplete_reason,
+                Some(ScanUsagesIncompleteReason::SemanticAnalysis)
+            );
+            assert!(
+                entry
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("Unresolved structured reference"))
+            );
+        }
+    }
+
+    fn selected_usage_graph_projection(
+        site_lines: impl IntoIterator<Item = usize>,
+        raw_truncated_inbound: Option<usize>,
+        unproven_inbound: usize,
+    ) -> SelectedWorkspaceUsageGraphProjection {
+        let root = std::env::current_dir().expect("the test working directory must exist");
+        let caller_file = ProjectFile::new(root.clone(), "src/Caller.java");
+        let target_file = ProjectFile::new(root, "src/Target.java");
+        let caller = CodeUnit::new(
+            caller_file.clone(),
+            CodeUnitType::Function,
+            "fixture",
+            "Caller.run",
+        );
+        let target = CodeUnit::new(target_file, CodeUnitType::Function, "fixture", "Target.run");
+        let range = Range {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 3,
+        };
+        let catalog = WorkspaceUsageCatalog::from_declarations(
+            vec![(caller.clone(), Some(range)), (target.clone(), Some(range))],
+            &CancellationToken::default(),
+        )
+        .expect("the selected public-result fixture catalog must build");
+        let mut nodes = catalog.nodes;
+        let caller_index = nodes
+            .iter()
+            .position(|node| node.declaration_ids.contains(&caller.declaration_id()))
+            .expect("the caller must be cataloged");
+        let target_index = nodes
+            .iter()
+            .position(|node| node.declaration_ids.contains(&target.declaration_id()))
+            .expect("the target must be cataloged");
+        nodes[target_index].truncated_inbound = raw_truncated_inbound;
+        nodes[target_index].unproven_inbound = unproven_inbound;
+        let sites = site_lines
+            .into_iter()
+            .map(|line| (caller_file.clone(), line))
+            .collect::<Vec<_>>();
+        let mut raw_proven_inbound = vec![0; nodes.len()];
+        raw_proven_inbound[target_index] = raw_truncated_inbound.unwrap_or(sites.len());
+        SelectedWorkspaceUsageGraphProjection {
+            nodes,
+            raw_proven_inbound,
+            admitted_callers: HashSet::from_iter([caller_file]),
+            skipped_callers: Default::default(),
+            build_selection_unavailable: None,
+            unresolved_names: Some(std::collections::BTreeSet::new()),
+            edges: vec![CanonicalWorkspaceUsageProjectedEdge {
+                from: caller_index,
+                to: target_index,
+                counts: UsageReferenceCounts {
+                    calls: 1,
+                    ..UsageReferenceCounts::default()
+                },
+                sites,
+            }],
+            forward_completeness: EdgeCompleteness::Complete,
+            kind_projection_complete: true,
+            generation: 11,
+            reference_count: 1,
+            projected_edge_count: 1,
+            batch_count: 1,
+            root_binding_metrics: ResolutionBatchMetrics::default(),
+            resolved_ecosystems: vec![UsageEcosystem::Jvm],
+        }
+    }
+
+    #[test]
+    fn selected_public_graph_caps_exactly_after_max_distinct_lines_and_cancels_atomically() {
+        let at_cap = selected_usage_graph_result(
+            selected_usage_graph_projection(1..=MAX_CALLSITES, None, 0),
+            true,
+            &CancellationToken::default(),
+        )
+        .expect("the exact-cap selected public result must finish");
+        assert!(at_cap.complete);
+        assert_eq!(1, at_cap.edges.len());
+        assert_eq!(MAX_CALLSITES, at_cap.edges[0].weight);
+        assert!(at_cap.truncated_symbols.is_empty());
+
+        let past_cap = selected_usage_graph_result(
+            selected_usage_graph_projection(1..=MAX_CALLSITES + 1, None, 0),
+            true,
+            &CancellationToken::default(),
+        )
+        .expect("the over-cap selected public result must finish");
+        assert!(!past_cap.complete);
+        assert!(past_cap.edges.is_empty());
+        assert_eq!(1, past_cap.truncated_symbols.len());
+        assert_eq!(
+            MAX_CALLSITES + 1,
+            past_cap.truncated_symbols[0].total_callsites
+        );
+        assert_eq!(
+            vec!["callsites_truncated"],
+            past_cap
+                .incomplete_reasons
+                .iter()
+                .map(|reason| reason.code.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(
+            selected_usage_graph_result(
+                selected_usage_graph_projection([7], None, 0),
+                true,
+                &cancellation,
+            )
+            .is_none(),
+            "cancellation publishes no public graph prefix"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "924f2b098379: Creates more than MAX_CALLSITES Java calls and verifies truncation is still reported when the dropped target never enters the result catalog"
+    )]
+    fn usage_graph_returns_when_a_truncated_target_is_not_a_graph_node() {
+        // Java uses the FQN edge arm that fills `legacy_truncated`. A callee over the cap has all of
+        // its call sites dropped and therefore may never be inserted into the result catalog.
+        let callsites = brokk_bifrost_analysis::analyzer::usages::inverted_edges::MAX_CALLSITES + 1;
+        let mut body = String::new();
+        for _ in 0..callsites {
+            body.push_str("    new Target().call();\n");
+        }
+        let root = format!("package app; class Root {{ void run() {{\n{body}  }} }}\n");
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[
+                ("app/Root.java", root.as_str()),
+                (
+                    "app/Target.java",
+                    "package app; class Target { void call() {} }\n",
+                ),
+            ],
+        );
+
+        let graph = usage_graph(
+            fixture.analyzer.analyzer(),
+            UsageGraphParams {
+                include_tests: false,
+                paths: Some(vec!["app/Root.java".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(
+            !graph.complete,
+            "a target past MAX_CALLSITES must be reported as incomplete"
+        );
+        assert!(
+            graph
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.code == "callsites_truncated"),
+            "the uncataloged truncated target must retain its incompleteness signal: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn rooted_rust_usage_graph_preserves_exact_edge_sites_on_caller_thread() {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"rooted_shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { left() }\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+
+        let graph = usage_graph(
+            &analyzer,
+            UsageGraphParams {
+                include_tests: true,
+                paths: Some(vec!["src/lib.rs".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(graph.complete, "rooted Rust usage graph: {graph:#?}");
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.from.ends_with(".caller") && edge.to.ends_with(".left"))
+            .expect("rooted Rust graph must retain the exact caller-to-left edge");
+        assert_eq!(edge.weight, 1);
+        assert_eq!(
+            edge.sites,
+            vec![UsageGraphCallSite {
+                path: "src/lib.rs".to_string(),
+                line: 3,
+            }]
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2428: Selects a Go method by its indexed declaration start line and verifies the location query resolves the intended FQN"
+    )]
+    fn exact_location_selector_accepts_the_indexed_declaration_range_start() {
+        let source = "package repro\n\ntype Error struct{}\n\nfunc (e *Error) Error() string { return \"\" }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("errors.go", source),
+            ],
+        );
+
+        let result = scan_usages_by_location(
+            fixture.analyzer.analyzer(),
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: "errors.go".to_string(),
+                    line: 5,
+                    column: Some(10),
+                    symbol: Some("example.com/repro.Error.Error".to_string()),
+                }],
+                include_tests: false,
+                paths: None,
+                include_same_owner: false,
+            },
+        );
+
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("example.com/repro.Error.Error"),
+            "{result:#?}"
+        );
+    }
+
+    /// #2709: `analyzer.location_ranges()` returns the analyzer's 1-based
+    /// stored ranges while the derived declaration-name ranges are 0-based
+    /// tree-sitter rows. Before the families were normalized where they meet,
+    /// an exact-selector probe at an annotated declaration's own reported
+    /// start line (the annotation line) was rejected, and one line past the
+    /// declaration's end was wrongly accepted.
+    fn scan_location(
+        fixture: &AnalyzerFixture,
+        path: &str,
+        line: usize,
+        symbol: &str,
+    ) -> ScanUsagesResult {
+        scan_usages_by_location(
+            fixture.analyzer.analyzer(),
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: path.to_string(),
+                    line,
+                    column: None,
+                    symbol: Some(symbol.to_string()),
+                }],
+                include_tests: false,
+                paths: None,
+                include_same_owner: false,
+            },
+        )
+    }
+
+    fn assert_annotated_declaration_range(language: Language, path: &str, source: &str) {
+        let fixture = AnalyzerFixture::new_for_language(language, &[(path, source)]);
+        let result = scan_location(&fixture, path, 4, "repro.Service.call");
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("repro.Service.call"),
+            "{result:#?}"
+        );
+
+        let past_end = scan_location(&fixture, path, 6, "repro.Service.call");
+        assert_eq!(
+            ScanUsagesStatus::NotFound,
+            past_end.results[0].status,
+            "{past_end:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2709: Fix regression #2709: Kotlin annotated method selection accepts the reported annotation line and rejects the line beyond the declaration end"
+    )]
+    fn issue_2709_annotated_kotlin_declaration_resolves_at_its_reported_start_line() {
+        assert_annotated_declaration_range(
+            Language::Kotlin,
+            "Service.kt",
+            "package repro\n\nclass Service {\n    @Deprecated(\"use other\")\n    fun call() {}\n}\n",
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2709: Fix regression #2709: Java annotated method selection accepts the annotation start line and rejects a line past its declaration range"
+    )]
+    fn issue_2709_annotated_java_declaration_resolves_at_its_reported_start_line() {
+        assert_annotated_declaration_range(
+            Language::Java,
+            "Service.java",
+            "package repro;\n\nclass Service {\n    @Deprecated\n    void call() {}\n}\n",
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2709: Fix regression #2709: an unnamed Kotlin companion resolves at its reported declaration line despite lacking a name token"
+    )]
+    fn issue_2709_companion_object_resolves_at_its_declaration_line() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Kotlin,
+            &[(
+                "WithCompanion.kt",
+                "package repro\n\nclass WithCompanion {\n    companion object {\n        fun create() {}\n    }\n}\n",
+            )],
+        );
+
+        // An unnamed companion has no name token, so the declaration-range
+        // fallback is the only acceptance path; its reported start line is the
+        // `companion object {` line (4).
+        let result = scan_location(
+            &fixture,
+            "WithCompanion.kt",
+            4,
+            "repro.WithCompanion.Companion",
+        );
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("repro.WithCompanion.Companion"),
+            "{result:#?}"
+        );
+    }
+
+    /// The text rendering of a ranked file spells its verdict out by hand, so
+    /// the two spellings must not drift from the JSON contract.
+    #[test]
+    #[hardwon("#1575: rendered test-file verdict diverged from its serialized value")]
+    fn test_file_kind_label_matches_its_serialized_spelling() {
+        for kind in [
+            TestFileKind::Test,
+            TestFileKind::TestSupport,
+            TestFileKind::Production,
+            TestFileKind::Ambiguous,
+        ] {
+            assert_eq!(
+                serde_json::Value::String(kind.label().to_string()),
+                serde_json::to_value(kind).unwrap(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A crate whose caller module holds enough proved sites that a mid-scan
+    /// cancellation can land after some of them are recorded.
+    fn partial_scan_fixture() -> (tempfile::TempDir, RustAnalyzer) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"partial\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod target;\npub mod caller;\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join("src/target.rs"),
+            "pub fn collect_it() -> i32 {\n    1\n}\n",
+        )
+        .expect("write target");
+        let mut caller = String::from("use crate::target::collect_it;\n");
+        for index in 0..60 {
+            caller.push_str(&format!(
+                "pub fn call_{index}() -> i32 {{\n    collect_it()\n}}\n"
+            ));
+        }
+        std::fs::write(root.join("src/caller.rs"), caller).expect("write caller");
+
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        (temp, analyzer)
+    }
+
+    fn soft_deadline_partial_fixture()
+    -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"soft_budget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod target;\npub mod caller_a;\npub mod caller_b;\n",
+            )
+            .file("src/target.rs", "pub fn collect_it() -> i32 { 1 }\n")
+            .file(
+                "src/caller_a.rs",
+                "use crate::target::collect_it;\npub fn call_a() -> i32 { collect_it() }\n",
+            )
+            .file(
+                "src/caller_b.rs",
+                "use crate::target::collect_it;\npub fn call_b() -> i32 { collect_it() }\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        (fixture, analyzer)
+    }
+
+    fn scan_with(analyzer: &RustAnalyzer, cancellation: CancellationToken) -> ScanUsagesResult {
+        // Interrupted scans pin a deterministic proven set at one worker.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_usages_by_reference_with_cancellation(
+                    analyzer,
+                    ScanUsagesByReferenceParams {
+                        symbols: vec!["collect_it".to_string()],
+                        include_tests: true,
+                        paths: None,
+                        include_same_owner: false,
+                    },
+                    cancellation,
+                )
+            })
+    }
+
+    fn scan_location_with(
+        analyzer: &RustAnalyzer,
+        cancellation: CancellationToken,
+    ) -> ScanUsagesResult {
+        // Interrupted scans pin a deterministic proven set at one worker.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_usages_by_location_with_cancellation(
+                    analyzer,
+                    ScanUsagesByLocationParams {
+                        targets: vec![ScanUsagesTarget {
+                            path: "src/target.rs".to_string(),
+                            line: 1,
+                            column: None,
+                            symbol: None,
+                        }],
+                        include_tests: true,
+                        paths: None,
+                        include_same_owner: false,
+                    },
+                    cancellation,
+                )
+            })
+    }
+
+    fn assert_partial_scan_retains_proven_hits(
+        complete: &ScanUsagesResult,
+        partial: &ScanUsagesResult,
+    ) {
+        let complete_entry = &complete.results[0];
+        assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
+        assert!(complete_entry.complete);
+        let complete_hits = complete_entry
+            .total_hits
+            .expect("complete scan counts hits");
+        assert!(complete_hits > 0, "fixture must produce hits");
+
+        let entry = &partial.results[0];
+        assert_eq!(ScanUsagesStatus::Found, entry.status);
+        assert!(!entry.complete);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::TimeBudget),
+            entry.incomplete_reason
+        );
+        assert!(
+            entry.total_hits.is_some_and(|hits| hits <= complete_hits),
+            "a partial hit list cannot exceed the complete one"
+        );
+    }
+
+    /// A request budget returns the first complete caller blob and marks later
+    /// blobs incomplete, preserving its proven call site and retry guidance.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1416: Runs complete and soft-deadline Rust reference scans, ensuring a partial result retains proven hits, a time-budget reason, and retry guidance"
+    )]
+    fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+
+        let complete = scan_with(&analyzer, CancellationToken::default());
+        let partial = scan_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(3),
+        );
+        assert_partial_scan_retains_proven_hits(&complete, &partial);
+
+        let entry = &partial.results[0];
+        assert_eq!(
+            ScanUsagesStatus::Found,
+            entry.status,
+            "a scan holding proved sites is not a failure"
+        );
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_reference")),
+            "a partial result must give structured recovery guidance"
+        );
+        assert!(
+            partial.summary.partial,
+            "summary must mark the batch partial"
+        );
+    }
+
+    /// Location scans follow the same budget contract and retain recovery
+    /// guidance for a partial result.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1634: Compares complete and soft-deadline location scans and verifies retained hit counts and location-specific recovery guidance"
+    )]
+    fn issue_1630_location_partial_scan_gives_structured_recovery_guidance() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+        let complete = scan_location_with(&analyzer, CancellationToken::default());
+        let partial = scan_location_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(3),
+        );
+        assert_partial_scan_retains_proven_hits(&complete, &partial);
+
+        let entry = &partial.results[0];
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_location")),
+            "a partial location result must give structured recovery guidance"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3761: Cancels before any source blob is scanned and verifies empty evidence is explicitly unverified with time-budget caveats and retry guidance"
+    )]
+    fn issue_3761_time_budget_before_any_blob_is_unverified_absent() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+        let result = scan_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(0),
+        );
+        let entry = &result.results[0];
+
+        assert_eq!(
+            ScanUsagesStatus::UnverifiedAbsent,
+            entry.status,
+            "{result:#?}"
+        );
+        assert!(!entry.complete);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::TimeBudget),
+            entry.incomplete_reason
+        );
+        assert!(result.summary.partial);
+        assert!(!entry.absence_caveats.is_empty());
+        assert!(
+            entry.message.iter().chain(&entry.notes).any(|guidance| {
+                guidance.contains("wall-clock time budget")
+                    && guidance.contains("scan_usages_by_reference")
+            }),
+            "an empty partial result must include time-budget recovery guidance: {entry:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1416: Sweeps many cancellation points in a real Rust scan and ensures no incomplete execution can report VerifiedAbsent"
+    )]
+    fn issue_1416_an_incomplete_scan_never_claims_proven_absence() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        // Whatever an interrupted scan reports, it must never be the status that
+        // asserts the symbol has no callers.
+        for checks in 1..=600 {
+            let result = scan_with(
+                &analyzer,
+                CancellationToken::cancel_after_checks_for_test(checks),
+            );
+            let entry = &result.results[0];
+            if entry.complete {
+                continue;
+            }
+            assert_ne!(
+                ScanUsagesStatus::VerifiedAbsent,
+                entry.status,
+                "an incomplete scan claimed proven absence at checks={checks}"
+            );
+            if entry.status == ScanUsagesStatus::UnverifiedAbsent {
+                assert!(
+                    entry
+                        .absence_caveats
+                        .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete),
+                    "an incomplete absence must carry the scan_incomplete caveat at checks={checks}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn usage_graph_observes_request_cancellation_during_native_projection() {
+        use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+
+        use brokk_bifrost_analysis::analyzer::languages::EdgePassEntry;
+
+        use brokk_bifrost_analysis::analyzer::languages::EdgePassId;
+
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::analyzer::languages::NativeWorkspaceGraphProvider;
+        use std::sync::Mutex;
+
+        struct CancellingProvider;
+        static REQUEST: Mutex<Option<CancellationToken>> = Mutex::new(None);
+        impl NativeWorkspaceGraphProvider for CancellingProvider {
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Java
+            }
+            fn project(
+                &self,
+                _analyzer: &dyn IAnalyzer,
+                _admitted_callers: &[ProjectFile],
+                cancellation: &CancellationToken,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                SelectedWorkspaceUsageGraphProjectionOutcome,
+            > {
+                REQUEST.lock().unwrap().as_ref().unwrap().cancel();
+                Ok(if cancellation.is_cancelled() {
+                    SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled
+                } else {
+                    SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
+                        "native provider received an unrelated request token".into(),
+                    )
+                })
+            }
+        }
+        static PROVIDER: CancellingProvider = CancellingProvider;
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("A.java", "class A { static void call() {} }")
+            .build();
+        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+        let cancellation = CancellationToken::new();
+        *REQUEST.lock().unwrap() = Some(cancellation.clone());
+        let result = usage_graph_with_passes(
+            &analyzer,
+            UsageGraphParams {
+                paths: None,
+                include_tests: true,
+                depth: 1,
+            },
+            &[EdgePassEntry {
+                id: EdgePassId::Java,
+                ecosystem: UsageEcosystem::Jvm,
+                languages: vec![Language::Java],
+                backend: LanguageGraphBackend::Native(&PROVIDER),
+            }],
+            &cancellation,
+        );
+        assert!(cancellation.is_cancelled());
+        assert!(!result.complete);
+        assert!(result.nodes.is_empty() && result.edges.is_empty());
+        assert!(
+            result
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.code == "cancelled"),
+            "{result:?}"
+        );
+        *REQUEST.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn native_graph_dispatch_reuses_files_across_depth_and_preserves_ranking_edges() {
+        use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+
+        use brokk_bifrost_analysis::analyzer::languages::EdgePassEntry;
+
+        use brokk_bifrost_analysis::analyzer::languages::EdgePassId;
+
+        use brokk_bifrost_analysis::analyzer::languages::NativeWorkspaceGraphProvider;
+
+        use brokk_bifrost_analysis::analyzer::usages::workspace_graph::WorkspaceUsageGraphBuildOutcome;
+
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::analyzer::usages::workspace_graph::build_workspace_usage_graph_with_passes;
+        use std::sync::Mutex;
+
+        struct NativeChain {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl NativeWorkspaceGraphProvider for NativeChain {
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Java
+            }
+
+            fn project(
+                &self,
+                analyzer: &dyn IAnalyzer,
+                admitted_callers: &[ProjectFile],
+                cancellation: &CancellationToken,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                SelectedWorkspaceUsageGraphProjectionOutcome,
+            > {
+                let mut files = admitted_callers
+                    .iter()
+                    .map(rel_path_string)
+                    .collect::<Vec<_>>();
+                files.sort();
+                self.calls.lock().unwrap().push(files);
+                let catalog = WorkspaceUsageCatalog::from_declarations(
+                    analyzer
+                        .all_declarations()
+                        .filter(|unit| unit.is_function())
+                        .map(|unit| {
+                            let range = analyzer.ranges(&unit).first().copied();
+                            (unit, range)
+                        })
+                        .collect(),
+                    cancellation,
+                )
+                .unwrap();
+                let index = |name: &str| {
+                    catalog
+                        .nodes
+                        .iter()
+                        .position(|node| node.primary.identifier() == name)
+                        .unwrap()
+                };
+                let mut edges = Vec::new();
+                let mut raw_proven_inbound = vec![0; catalog.nodes.len()];
+                for (caller, target) in [("start", "mid"), ("mid", "late"), ("late", "end")] {
+                    let from = index(caller);
+                    let to = index(target);
+                    let source = catalog.nodes[from].primary.source();
+                    if !admitted_callers.contains(source) {
+                        continue;
+                    }
+                    raw_proven_inbound[to] += 1;
+                    edges.push(CanonicalWorkspaceUsageProjectedEdge {
+                        from,
+                        to,
+                        counts: UsageReferenceCounts {
+                            calls: 1,
+                            ..Default::default()
+                        },
+                        sites: vec![(source.clone(), 1)],
+                    });
+                }
+                let edge_count = edges.len();
+                Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Complete(
+                    SelectedWorkspaceUsageGraphProjection {
+                        nodes: catalog.nodes,
+                        edges,
+                        raw_proven_inbound,
+                        admitted_callers: HashSet::from_iter(admitted_callers.iter().cloned()),
+                        skipped_callers: Default::default(),
+                        build_selection_unavailable: None,
+                        unresolved_names: Some(std::collections::BTreeSet::new()),
+                        forward_completeness: EdgeCompleteness::Complete,
+                        kind_projection_complete: true,
+                        generation: analyzer.project().analysis_generation(),
+                        reference_count: edge_count,
+                        projected_edge_count: edge_count,
+                        batch_count: 1,
+                        root_binding_metrics: ResolutionBatchMetrics::default(),
+                        resolved_ecosystems: vec![UsageEcosystem::Jvm],
+                    },
+                ))
+            }
+        }
+        static PROVIDER: NativeChain = NativeChain {
+            calls: Mutex::new(Vec::new()),
+        };
+        struct UnavailableDependency;
+        impl NativeWorkspaceGraphProvider for UnavailableDependency {
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Java
+            }
+
+            fn project(
+                &self,
+                analyzer: &dyn IAnalyzer,
+                admitted_callers: &[ProjectFile],
+                cancellation: &CancellationToken,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                SelectedWorkspaceUsageGraphProjectionOutcome,
+            > {
+                if admitted_callers
+                    .iter()
+                    .any(|file| file.rel_path() == std::path::Path::new("B.java"))
+                {
+                    Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
+                        "fixture dependency unavailable".into(),
+                    ))
+                } else {
+                    PROVIDER.project(analyzer, admitted_callers, cancellation)
+                }
+            }
+        }
+        static UNAVAILABLE: UnavailableDependency = UnavailableDependency;
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("A.java", "class A { static void start() { B.mid(); } }\n")
+            .file(
+                "B.java",
+                "class B { static void mid() { late(); } static void late() { C.end(); } }\n",
+            )
+            .file("C.java", "class C { static void end() {} }\n")
+            .build();
+        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+        let passes = [EdgePassEntry {
+            id: EdgePassId::Java,
+            ecosystem: UsageEcosystem::Jvm,
+            languages: vec![Language::Java],
+            backend: LanguageGraphBackend::Native(&PROVIDER),
+        }];
+        PROVIDER.calls.lock().unwrap().clear();
+        let public = usage_graph_with_passes(
+            &analyzer,
+            UsageGraphParams {
+                paths: Some(vec!["A.java".into()]),
+                include_tests: true,
+                depth: 3,
+            },
+            &passes,
+            &CancellationToken::default(),
+        );
+        assert!(public.complete, "{:?}", public.incomplete_reasons);
+        assert_eq!(public.edges.len(), 3);
+        assert_eq!(
+            *PROVIDER.calls.lock().unwrap(),
+            vec![vec!["A.java".to_string()], vec!["B.java".to_string()]]
+        );
+
+        PROVIDER.calls.lock().unwrap().clear();
+        let WorkspaceUsageGraphBuildOutcome::Complete(ranking) =
+            build_workspace_usage_graph_with_passes(
+                &analyzer,
+                WorkspaceUsageCatalog::build(&analyzer),
+                &BTreeSet::from([UsageEcosystem::Jvm]),
+                &CancellationToken::default(),
+                &passes,
+            )
+        else {
+            panic!("complete native inventory must build a ranking graph");
+        };
+        assert_eq!(ranking.edges.len(), 3);
+        assert_eq!(
+            *PROVIDER.calls.lock().unwrap(),
+            vec![vec![
+                "A.java".to_string(),
+                "B.java".to_string(),
+                "C.java".to_string()
+            ]]
+        );
+        let ranked_pairs = ranking
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    &ranking.nodes[edge.from].key.id,
+                    &ranking.nodes[edge.to].key.id,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let public_pairs = public
+            .edges
+            .iter()
+            .map(|edge| (&edge.from_id, &edge.to_id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ranked_pairs, public_pairs);
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(matches!(
+            build_workspace_usage_graph_with_passes(
+                &analyzer,
+                WorkspaceUsageCatalog::build(&analyzer),
+                &BTreeSet::from([UsageEcosystem::Jvm]),
+                &cancellation,
+                &passes,
+            ),
+            WorkspaceUsageGraphBuildOutcome::Cancelled
+        ));
+        assert_eq!(
+            PROVIDER.calls.lock().unwrap().len(),
+            1,
+            "cancelled admission never invokes a provider"
+        );
+
+        let failed = usage_graph_with_passes(
+            &analyzer,
+            UsageGraphParams {
+                paths: Some(vec!["A.java".into()]),
+                include_tests: true,
+                depth: 3,
+            },
+            &[EdgePassEntry {
+                id: EdgePassId::Java,
+                ecosystem: UsageEcosystem::Jvm,
+                languages: vec![Language::Java],
+                backend: LanguageGraphBackend::Native(&UNAVAILABLE),
+            }],
+            &CancellationToken::default(),
+        );
+        assert!(!failed.complete);
+        assert!(
+            failed.nodes.is_empty() && failed.edges.is_empty(),
+            "operational failure discards the earlier successful layer"
+        );
+        assert!(
+            failed
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.message.contains("fixture dependency unavailable"))
+        );
+    }
+
+    #[test]
+    fn selected_public_graph_preserves_sites_and_ignores_the_raw_ranking_cap() {
+        let projection = selected_usage_graph_projection([9, 7, 7], Some(MAX_CALLSITES + 1), 1);
+        let result = selected_usage_graph_result(projection, true, &CancellationToken::default())
+            .expect("an uncancelled selected public result must finish");
+
+        assert!(!result.complete, "unproven rows make absence inconclusive");
+        assert_eq!(1, result.edges.len());
+        assert_eq!(2, result.edges[0].weight);
+        assert_eq!(
+            vec![
+                UsageGraphCallSite {
+                    path: "src/Caller.java".to_string(),
+                    line: 7,
+                },
+                UsageGraphCallSite {
+                    path: "src/Caller.java".to_string(),
+                    line: 9,
+                },
+            ],
+            result.edges[0].sites
+        );
+        assert!(result.truncated_symbols.is_empty());
+        assert_eq!(
+            vec!["unproven_reference_edges"],
+            result
+                .incomplete_reasons
+                .iter()
+                .map(|reason| reason.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(result.nodes.windows(2).all(|nodes| {
+            (&nodes[0].language, &nodes[0].fqn, &nodes[0].id)
+                < (&nodes[1].language, &nodes[1].fqn, &nodes[1].id)
+        }));
+    }
+
+    #[test]
+    fn batch_reference_sites_preserve_files_beyond_interactive_limit() {
+        let mut sources = vec![(
+            "app.py".to_string(),
+            "def target():\n    pass\n".to_string(),
+        )];
+        for index in 0..25 {
+            sources.push((
+                format!("caller_{index:02}.py"),
+                "from app import target\n\ndef call():\n".to_string() + &"    target()\n".repeat(5),
+            ));
+        }
+        let files: Vec<_> = sources
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let fixture = AnalyzerFixture::new_for_language(Language::Python, &files);
+        let analyzer = fixture.analyzer.analyzer();
+        let params = ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "app.py".to_string(),
+                line: 1,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: false,
+        };
+        let interactive = scan_usages_by_location(analyzer, params.clone());
+        assert_eq!(
+            interactive.results[0].rendering,
+            Some(UsageRendering::Summary)
+        );
+        assert!(
+            interactive.results[0].files_truncated.is_some(),
+            "{interactive:?}"
+        );
+        let raw =
+            scan_usage_reference_sites_by_location(analyzer, params, CancellationToken::default());
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0].incomplete_reason.is_none(), "{raw:?}");
+        assert_eq!(raw[0].files.len(), 25, "{raw:?}");
+        for (index, file) in raw[0].files.iter().enumerate() {
+            assert_eq!(file.path, format!("caller_{index:02}.py"));
+            assert_eq!(file.hits, file.lines.len());
+            assert!((4..=8).all(|line| file.lines.contains(&line)), "{file:?}");
+        }
+    }
+
+    #[test]
+    fn rooted_usage_graph_never_scans_the_workspace_declaration_inventory() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[
+                (
+                    "app/Root.java",
+                    "package app; class Root { void run() { new Target().call(); } }\n",
+                ),
+                (
+                    "app/Target.java",
+                    "package app; class Target { void call() {} }\n",
+                ),
+                (
+                    "app/Unrelated.java",
+                    "package app; class Unrelated { void unused() {} }\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+
+        let graph = usage_graph(
+            analyzer,
+            UsageGraphParams {
+                include_tests: false,
+                paths: Some(vec!["app/Root.java".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == "app.Root.run" && edge.to == "app.Target.call"),
+            "the bounded graph must still resolve its direct endpoint"
+        );
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0,
+            "a rooted usage graph must not hydrate the workspace declaration inventory"
+        );
+    }
+
+    #[test]
+    fn go_import_infos_for_files_batches_instead_of_defaulting_to_none() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("helpers/alpha.go", "package helpers\n\nfunc Alpha() {}\n"),
+                (
+                    "caller/main.go",
+                    "package caller\n\nimport \"example.com/repro/helpers\"\n\nfunc Run() {\n\thelpers.Alpha()\n}\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let files: Vec<ProjectFile> = analyzer
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| {
+                let path = rel_path_string(file);
+                path == "helpers/alpha.go" || path == "caller/main.go"
+            })
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "the fixture's two Go files must both be analyzed"
+        );
+
+        let provider = analyzer
+            .import_analysis_provider()
+            .expect("GoAnalyzer must expose an ImportAnalysisProvider");
+
+        // Before this fix, Go fell through to the trait's `None` default here,
+        // forcing find_direct_importers_with_cancellation to call
+        // `import_info_of` once per file inside its per-candidate parallel
+        // loop instead of one batched store read (bifrost#15).
+        let batched = provider
+            .import_infos_for_files(&files)
+            .expect("Go must implement the batched import-facts read, not fall back to None");
+        assert_eq!(
+            batched.len(),
+            2,
+            "the batch must return an entry for every requested file"
+        );
+
+        let caller = files
+            .iter()
+            .find(|file| rel_path_string(file) == "caller/main.go")
+            .expect("caller/main.go must be in the fixture");
+        let caller_imports = batched
+            .get(caller)
+            .expect("caller/main.go must have a batched entry");
+        assert!(
+            caller_imports
+                .iter()
+                .any(|info| info.raw_snippet.contains("example.com/repro/helpers")),
+            "the batched import facts for caller/main.go must include its real import, got {caller_imports:?}"
+        );
+
+        let helpers = files
+            .iter()
+            .find(|file| rel_path_string(file) == "helpers/alpha.go")
+            .expect("helpers/alpha.go must be in the fixture");
+        assert!(
+            batched
+                .get(helpers)
+                .expect("helpers/alpha.go must have a batched entry")
+                .is_empty(),
+            "helpers/alpha.go declares no imports of its own"
+        );
+    }
+
+    #[test]
+    fn native_graph_retains_ambiguous_candidates_without_incumbent_fallback() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                // Duplicate declarations make each target genuinely
+                // ambiguous. Native projection must retain both exact target
+                // identities for every imported call.
+                ("dup/a.go", "package dup\n\nfunc Widget() {}\n"),
+                ("dup/b.go", "package dup\n\nfunc Widget() {}\n"),
+                ("dup2/a.go", "package dup2\n\nfunc Gadget() {}\n"),
+                ("dup2/b.go", "package dup2\n\nfunc Gadget() {}\n"),
+                ("dup3/a.go", "package dup3\n\nfunc Sprocket() {}\n"),
+                ("dup3/b.go", "package dup3\n\nfunc Sprocket() {}\n"),
+                (
+                    "caller/main.go",
+                    "package caller\n\nimport (\n\t\"example.com/repro/dup\"\n\t\"example.com/repro/dup2\"\n\t\"example.com/repro/dup3\"\n)\n\nfunc RunMany() {\n\tdup.Widget()\n\tdup.Widget()\n\tdup2.Gadget()\n\tdup2.Gadget()\n\tdup3.Sprocket()\n\tdup3.Sprocket()\n}\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+
+        // Read through this exact analyzer instance's own test-hook counter,
+        // not a process-wide static: a static here was inflated by any other
+        // test calling resolve_definition_batch_with_source concurrently
+        // (issue #3010).
+        analyzer
+            .test_hooks()
+            .reset_resolve_definition_batch_with_source_call_count_for_test();
+        // This is a native-provider control, independent of the production
+        // backend selected for Go's staged graph rollout.
+        let graph = usage_graph_with_passes(
+            analyzer,
+            UsageGraphParams {
+                include_tests: false,
+                paths: None,
+                depth: 1,
+            },
+            &[brokk_bifrost_analysis::analyzer::languages::EdgePassEntry {
+                id: brokk_bifrost_analysis::analyzer::languages::EdgePassId::Go,
+                ecosystem: UsageEcosystem::Go,
+                languages: vec![Language::Go],
+                backend: brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Native(
+                    &brokk_bifrost_go_analysis::analyzer::go::native_graph::GoNativeWorkspaceGraphProvider,
+                ),
+            }],
+            &CancellationToken::default(),
+        );
+        let calls = analyzer
+            .test_hooks()
+            .resolve_definition_batch_with_source_call_count_for_test();
+
+        // The native graph route resolves each ambiguous reference to both
+        // exact declarations without invoking the incumbent source fallback.
+        assert_eq!(
+            calls, 0,
+            "native graph projection must not call resolve_definition_batch_with_source"
+        );
+        for (target, first_path, second_path) in [
+            ("example.com/repro/dup.Widget", "dup/a.go", "dup/b.go"),
+            ("example.com/repro/dup2.Gadget", "dup2/a.go", "dup2/b.go"),
+            ("example.com/repro/dup3.Sprocket", "dup3/a.go", "dup3/b.go"),
+        ] {
+            let edges = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from == "example.com/repro/caller.RunMany" && edge.to == target)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                edges.len(),
+                2,
+                "both {target} candidates must be edges: {graph:#?}"
+            );
+            let mut paths = edges
+                .iter()
+                .map(|edge| {
+                    graph
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == edge.to_id)
+                        .expect("edge target has a graph node")
+                        .path
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+            assert_eq!(paths, [first_path, second_path], "{target}: {graph:#?}");
+        }
+    }
+
+    #[test]
+    fn prefetch_definitions_reaches_the_go_analyzer_through_the_ianalyzer_trait() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("helpers/alpha.go", "package helpers\n\nfunc Alpha() {}\n"),
+                ("helpers/beta.go", "package helpers\n\nfunc Beta() {}\n"),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let names = ["Alpha", "Beta"]
+            .map(|name| format!("example.com/repro/helpers.{name}"))
+            .to_vec();
+
+        let scope = std::sync::Arc::new(
+            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default(),
+        );
+        analyzer.begin_query(&scope);
+        analyzer
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
+
+        // usage_graph() only has `&dyn IAnalyzer`, so the batched prefetch it
+        // calls before resolving structural-exact sites must actually reach
+        // GoAnalyzer's inner analyzer through the trait, not silently no-op
+        // against the trait's own default (bifrost#15).
+        IAnalyzer::prefetch_definitions(analyzer, &names);
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .definition_prefetch_batch_count_for_test(),
+            1,
+            "one batched prefetch call through the IAnalyzer trait must reach \
+             GoAnalyzer's inner analyzer"
+        );
+
+        for name in &names {
+            assert_eq!(
+                analyzer.definitions(name).count(),
+                1,
+                "{name} must resolve to its declaration after the trait-level prefetch"
+            );
+        }
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .definition_candidates_query_count_for_test(),
+            0,
+            "a name warmed by prefetch_definitions must not fall back to a point lookup"
+        );
+        analyzer.end_query(&scope);
+    }
+
+    #[test]
+    fn prefetch_fqn_in_language_resolves_many_names_in_one_relational_store_call() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("helpers/alpha.go", "package helpers\n\nfunc Alpha() {}\n"),
+                ("helpers/beta.go", "package helpers\n\nfunc Beta() {}\n"),
+                ("helpers/gamma.go", "package helpers\n\nfunc Gamma() {}\n"),
+                ("helpers/delta.go", "package helpers\n\nfunc Delta() {}\n"),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let names = ["Alpha", "Beta", "Gamma", "Delta"]
+            .map(|name| format!("example.com/repro/helpers.{name}"))
+            .to_vec();
+        let definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
+
+        analyzer
+            .test_hooks()
+            .reset_relational_definition_batch_call_count_for_test();
+        definitions.prefetch_fqn_in_language(Language::Go, &names);
+
+        // Four distinct cross-package names in one language: resolving them
+        // one at a time takes 8 round trips (an exact-name attempt plus an
+        // identifier-candidate fallback per name, since a package-qualified
+        // reference like this misses the exact-name store index). Batching
+        // both phases collapses that to one round trip per phase regardless
+        // of how many distinct names a `usage_graph` request resolves
+        // (bifrost#15).
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .relational_definition_batch_call_count_for_test(),
+            2,
+            "prefetching four names in one language must batch both the exact-name attempt \
+             and the identifier-candidate fallback into one round trip each"
+        );
+
+        for name in &names {
+            assert_eq!(
+                definitions.fqn_in_language(name, Language::Go).len(),
+                1,
+                "{name} must resolve to its declaration after the prefetch populated the cache"
+            );
+        }
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .relational_definition_batch_call_count_for_test(),
+            2,
+            "a cache hit after the prefetch must not issue another store round trip"
+        );
+    }
+}

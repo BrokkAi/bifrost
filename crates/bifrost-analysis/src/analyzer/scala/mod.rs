@@ -1,4 +1,5 @@
-mod adapter;
+#[doc(hidden)]
+pub mod adapter;
 mod call_conversion;
 mod clones;
 pub(crate) mod diagnostics;
@@ -14,6 +15,7 @@ pub(crate) mod source_storage;
 mod structural;
 mod syntax;
 
+use self::source_facts::ScalaSourceFacts;
 pub use scalar::scala_declared_scalar_types;
 
 use super::analyzer_definition_lookup::package_exists_value;
@@ -62,7 +64,7 @@ use crate::analyzer::languages::{
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
+    BoundedResolution, DefinitionLookupOutcome, scala::resolve_scala_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
 use crate::analyzer::usages::inverted_edges::{UsageEdgesCache, weight_usage_edges};
@@ -86,7 +88,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use brokk_bifrost_core::CancellationToken;
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, DefinitionLanguageScope, PackageRelationKind, PackageRelationValue,
@@ -859,7 +861,6 @@ pub struct ScalaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn tree_sitter_analyzer(&self) -> &TreeSitterAnalyzer<ScalaAdapter> {
         &self.inner
     }
@@ -2376,9 +2377,203 @@ impl crate::analyzer::AnalyzerTestHooks for ScalaAnalyzer {
 
 static SCALA_USAGE_STRATEGY: ScalaUsageGraphStrategy = ScalaUsageGraphStrategy::new();
 
+impl crate::analyzer::multi_analyzer::LanguageAnalyzer for ScalaAnalyzer {
+    fn analyzer(&self) -> &dyn IAnalyzer {
+        self
+    }
+
+    fn program_semantics_provider(
+        &self,
+    ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
+        self
+    }
+
+    fn clone_with_project(
+        &self,
+        project: Arc<dyn Project>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(ScalaAnalyzer::clone_with_project(self, project))
+    }
+
+    fn clone_for_index_warm(
+        &self,
+        project: Arc<dyn Project>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(ScalaAnalyzer::clone_for_index_warm(self, project))
+    }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        IAnalyzer::import_analysis_provider(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn crate::analyzer::TypeHierarchyProvider> {
+        IAnalyzer::type_hierarchy_provider(self)
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn crate::analyzer::TypeAliasProvider> {
+        IAnalyzer::type_alias_provider(self)
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        Some(self)
+    }
+
+    fn update(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(IAnalyzer::update(self, changed_files))
+    }
+
+    fn update_all_with_progress(
+        &self,
+        progress: Option<BuildProgress>,
+    ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(ScalaAnalyzer::update_all_with_progress(self, progress))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+        Box::new(Clone::clone(self))
+    }
+}
+
 pub(crate) struct ScalaSupport;
 
 impl LanguageSupport for ScalaSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn probe_assignment_value(
+        &self,
+        query: crate::analyzer::languages::BoundedReceiverQuery<'_>,
+        _request: &brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest,
+        _cancellation: &crate::CancellationToken,
+    ) -> Result<
+        Option<
+            crate::analyzer::usages::get_definition::BoundedResolution<
+                crate::analyzer::native_points::NativeAssignmentValueProbe,
+            >,
+        >,
+        String,
+    > {
+        use crate::analyzer::native_points::probe_jvm_assignment_value;
+        use crate::analyzer::resolve_analyzer;
+        let analyzer = query.analyzer;
+
+        Ok(Some(probe_jvm_assignment_value(
+            resolve_analyzer::<crate::analyzer::scala::ScalaAnalyzer>(analyzer)
+                .ok_or("assignment-value probe has no Scala analyzer")?
+                .tree_sitter_analyzer(),
+            query,
+        )))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn selected_reverse_reference_file<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+        _target_analyzer: &'a dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> crate::analyzer::store::Result<
+        crate::analyzer::structural::reference_edges::SelectedReferenceFileProjection<'a>,
+    > {
+        let caller = resolve_analyzer::<ScalaAnalyzer>(analyzer).ok_or_else(|| {
+            crate::analyzer::store::StoreError::new(format!(
+                "selected reverse caller analyzer is unavailable: {file}"
+            ))
+        })?;
+        crate::analyzer::structural::reference_edges::SelectedReferenceFileProjection::new(
+            caller,
+            analyzer,
+            file,
+            |source| {
+                caller
+                    .inner
+                    .source_matches_selected_native_content(file, source)
+            },
+        )
+    }
+
+    fn workspace_external_member_family(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        identity: &brokk_bifrost_jvm::realm::JvmExternalMemberIdentity,
+        max_visits: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
+        if let Some(language) = [Language::Java, Language::Kotlin]
+            .into_iter()
+            .find(|language| workspace.languages().contains(language))
+        {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
+                crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
+                    language,
+                ),
+                0,
+            );
+        }
+        let Some(scala) = crate::analyzer::resolve_analyzer::<ScalaAnalyzer>(workspace) else {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
+        };
+        scala.resolve_external_member_family(workspace, identity, max_visits, cancellation)
+    }
+
+    fn workspace_semantic_diagnostics(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<crate::analyzer::SemanticDiagnosticReport> {
+        // Scala's own ladder is delegate-resident, but the active dependency
+        // model it must not claim absence past is published on the dispatcher.
+        Some(diagnostics::collect_scala_semantic_diagnostics(
+            workspace, file, source,
+        ))
+    }
+
+    fn knowledge(
+        &self,
+    ) -> &'static dyn brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge {
+        &brokk_bifrost_jvm::ScalaKnowledge
+    }
+
+    fn build_analyzer(
+        &self,
+        project: Arc<dyn crate::analyzer::Project>,
+        config: crate::analyzer::AnalyzerConfig,
+        store_context: crate::analyzer::AnalyzerStoreContext,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Result<crate::analyzer::multi_analyzer::AnalyzerDelegate, crate::analyzer::store::StoreError>
+    {
+        Ok(crate::analyzer::multi_analyzer::AnalyzerDelegate::new(
+            ScalaAnalyzer::new_with_config_store_context(project, config, store_context, progress)?,
+        ))
+    }
+
+    fn is_configuration_input(&self, file: &ProjectFile) -> bool {
+        crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
+    }
+
+    fn workspace_member_family_capability(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        crate::analyzer::usages::scala_member_family_capability(workspace, member)
+    }
+
+    fn workspace_member_family(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        member: &CodeUnit,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::scala_member_family(workspace, workspace, member, cancellation)
+    }
+
     fn native_member_attribution(
         &self,
         context: &crate::analyzer::store::resolution_operation::ProjectedNativeMemberContext,
@@ -2387,7 +2582,6 @@ impl LanguageSupport for ScalaSupport {
         Some(crate::analyzer::jvm::native_member_attribution(context))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn native_non_reference_site(&self, node: tree_sitter::Node<'_>) -> bool {
         crate::analyzer::jvm::native_points::scala_non_reference_site(node)
     }
@@ -2408,34 +2602,6 @@ impl LanguageSupport for ScalaSupport {
 
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
         crate::analyzer::jvm::is_jvm_configuration_input_path(path)
-    }
-
-    fn language(&self) -> Language {
-        Language::Scala
-    }
-
-    fn call_may_apply_value(&self) -> bool {
-        true
-    }
-
-    fn native_local_binding_diagnostic(&self) -> bool {
-        true
-    }
-
-    fn call_target_lookup_routes(
-        &self,
-    ) -> Option<
-        &'static [(
-            u32,
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
-        )],
-    > {
-        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
-        Some(&[
-            (0, ResolutionNamespace::Callable),
-            (0, ResolutionNamespace::Value),
-            (1, ResolutionNamespace::Type),
-        ])
     }
 
     fn explicit_import_model_target(
@@ -2466,43 +2632,6 @@ impl LanguageSupport for ScalaSupport {
     ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
     {
         Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
-    }
-
-    /// The trailing `$` marks a companion object in the indexed name and is not part of
-    /// how anyone writes or reads the type.
-    ///
-    /// This is the string-only reading, for callers that hold a spelling rather than a
-    /// declaration: it accepts a name a reader plausibly typed. Anything that *prints* a
-    /// name holds the declaration and must go through [`Self::undecorated_fq_name`],
-    /// whose structured answer keeps a `$` the source itself wrote (#3505).
-    fn display_symbol_name(&self, symbol: &str) -> String {
-        symbol
-            .split('.')
-            .map(|segment| segment.trim_end_matches('$'))
-            .collect::<Vec<_>>()
-            .join(".")
-    }
-
-    /// Scala's only `$` decoration is the suffix [`FqName::render_native`] appends to a
-    /// [`SegmentKind::Companion`] segment, so demoting that kind to `Type` removes
-    /// exactly one `$` per object segment and nothing else. `object ConstellationNode$`
-    /// renders `org.constellation.ConstellationNode$$` and undecorates to
-    /// `org.constellation.ConstellationNode$`, the spelling its source writes and the
-    /// index answers.
-    fn undecorated_fq_name(&self, fq: &FqName) -> Option<FqName> {
-        let interner = segment_interner();
-        fq.segments()
-            .iter()
-            .any(|&id| interner.resolve(id).1 == SegmentKind::Companion)
-            .then(|| brokk_bifrost_jvm::scala::scala_normalize_fq_name(fq))
-    }
-
-    /// The same decoration, read off a single identifier: an object is indexed
-    /// as `Name$` but declared as `Name`. Without this override the
-    /// seek-then-verify lookup of a source-spelled object name fails
-    /// verification against the persisted identifier (#2419).
-    fn source_identifier<'s>(&self, identifier: &'s str) -> &'s str {
-        identifier.strip_suffix('$').unwrap_or(identifier)
     }
 
     fn signature_metadata_limited(
@@ -2557,6 +2686,80 @@ impl LanguageSupport for ScalaSupport {
         crate::analyzer::languages::LanguageGraphBackend::Legacy(&ScalaEdgePass)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_definition_dispatch<'a>(
+        &self,
+        analyzer: &'a dyn crate::analyzer::IAnalyzer,
+        token: crate::analyzer::QueryToken<'_>,
+        context: &mut crate::analyzer::usages::get_definition::DefinitionBatchContext<'a, '_>,
+        request: &crate::analyzer::usages::get_definition::DefinitionLookupRequest,
+        source: &std::sync::Arc<str>,
+        tree: &Option<tree_sitter::Tree>,
+        site: &crate::analyzer::usages::get_definition::ResolvedReferenceSite,
+        operation: Option<crate::navigation::NavigationOperation>,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+        go_session: Option<&crate::analyzer::usages::get_definition::ResolutionSession>,
+    ) -> std::ops::ControlFlow<
+        crate::analyzer::usages::get_definition::DefinitionResolution,
+        crate::analyzer::usages::get_definition::DefinitionResolution,
+    > {
+        crate::analyzer::usages::get_definition::scala::resolve_definition_dispatch(
+            analyzer,
+            token,
+            context,
+            request,
+            source,
+            tree,
+            site,
+            operation,
+            cancellation,
+            go_session,
+        )
+    }
+
+    fn definition_call_reference_candidate(&self, node: tree_sitter::Node<'_>) -> bool {
+        crate::analyzer::usages::get_definition::scala::scala_call_reference_candidate(node)
+    }
+
+    fn definition_call_callee<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        crate::analyzer::usages::get_definition::scala::scala_callee_node_for_call(node)
+    }
+
+    fn definition_call_signature_context(
+        &self,
+        node: tree_sitter::Node<'_>,
+        byte_offset: usize,
+    ) -> Option<crate::analyzer::usages::get_definition::call_sites::CallSignatureContext> {
+        crate::analyzer::usages::get_definition::scala::scala_call_signature_context_for_node(
+            node,
+            byte_offset,
+        )
+    }
+
+    fn definition_nested_callable(&self, node: tree_sitter::Node<'_>) -> bool {
+        node.kind() == "given_definition"
+            || (node.kind() == "case_block" && case_block_is_partial_function(node))
+    }
+
+    fn definition_boundary_evidence(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        token: crate::analyzer::QueryToken<'_>,
+        file: &crate::analyzer::ProjectFile,
+        name: &str,
+    ) -> Option<(
+        crate::analyzer::structural::resolution::BoundaryStatus,
+        Option<String>,
+    )> {
+        use crate::analyzer::{ScalaAnalyzer, resolve_analyzer};
+        resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|scala| {
+            scala.external_boundary_evidence(token, analyzer.semantic_model_overlay(), file, name)
+        })
+    }
+
     fn dead_code(&self) -> DeadCodeSupport {
         DeadCodeSupport {
             strategy: Some(&SCALA_USAGE_STRATEGY),
@@ -2566,18 +2769,6 @@ impl LanguageSupport for ScalaSupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&ScalaSupport)
-    }
-
-    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
-        language::LANGUAGE.into()
-    }
-
-    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &brokk_bifrost_jvm::scala::structural::SCALA_STRUCTURAL_SPEC
-    }
-
-    fn highlight_query(&self) -> Option<&'static str> {
-        Some(brokk_bifrost_jvm::queries::SCALA_HIGHLIGHTS_QUERY)
     }
 }
 

@@ -19,7 +19,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.13.1"
+brokk-bifrost = "0.14.0"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -34,7 +34,7 @@ The package name uses a hyphen, but Rust imports use the crate name with an unde
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 ```
 
-The crates need Rust 1.97 or later.
+The crates need Rust 1.99 or later.
 
 ## Choose a Package
 

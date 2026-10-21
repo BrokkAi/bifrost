@@ -5,16 +5,18 @@
 
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, BIFROST_IGNORE_FILE_NAME, CancellationToken, FilesystemProject, Project,
-    ProjectFile, SubsetCoverage, WorkspaceAnalyzer, WorkspaceFileListingCache, analyzer,
-    blast_radius, cache_db, cache_gc, cancellation, code_quality, collect_workspace_files,
-    cyclomatic_complexity_diff, diff_analysis, diff_scoring, file_tools, git_file, gitblob, hash,
-    panic_report, path_normalization, path_utils, profiling, searchtools, searchtools_render,
-    symbol_rename, workspace_document,
+    ProjectFile, SubsetCoverage, WorkspaceAnalyzer, WorkspaceFileListingCache, analyzer, cache_db,
+    cache_gc, cancellation, collect_workspace_files, git_file, gitblob, hash, panic_report,
+    path_normalization, path_utils, profiling, workspace_document,
 };
 pub use brokk_bifrost_flow as flow;
 pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_rql::{self as rql, sexp};
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
+pub use brokk_bifrost_tools::{
+    blast_radius, code_quality, cyclomatic_complexity_diff, diff_analysis, diff_scoring,
+    file_tools, searchtools, searchtools_render, symbol_rename,
+};
 
 pub mod analyzer_pool;
 pub mod mcp_cli;

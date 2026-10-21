@@ -9,7 +9,8 @@ use brokk_bifrost_core::analyzer::source_facts::{
 };
 use rusqlite::Transaction;
 
-pub(in crate::analyzer) fn read_source_identity_rows(
+#[doc(hidden)]
+pub fn read_source_identity_rows(
     tx: &Transaction<'_>,
     blob_id: i64,
     expected_occurrences: usize,

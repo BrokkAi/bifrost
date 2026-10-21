@@ -395,10 +395,8 @@ fn execute_detailed_selector_unit(
     row_keys: &mut Vec<UnitRowKey>,
 ) -> DetailedCodeQueryResult {
     let parent_scope = parent_semantic.scope_snapshot();
-    let (execution_before, execution_child) = parent_execution.fork_with_additional_limits(
-        limits.semantic.max_materialized_files,
-        limits.semantic.max_traversal_steps,
-    );
+    let (execution_before, execution_child) =
+        parent_execution.fork_with_materialized_file_limit(limits.semantic.max_materialized_files);
     let query_scope = AnalyzerQueryScope::new(workspace.analyzer());
     let token = query_scope.token();
     let access_mode = super::eager_structural_access_mode();
@@ -848,6 +846,15 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
 /// than its mount-bearing durable key.
 fn semantic_unit_row_key(key_value: &SemanticPipelineKey) -> UnitRowKey {
     match key_value {
+        SemanticPipelineKey::ProgramPointReference(id) => {
+            key("semantic_program_point").text(id.clone()).finish()
+        }
+        SemanticPipelineKey::ControlEdgeReference(id) => {
+            key("semantic_control_edge").text(id.clone()).finish()
+        }
+        SemanticPipelineKey::ProcedureReference(reference) => key("semantic_procedure")
+            .text(reference.public_digest().to_string())
+            .finish(),
         SemanticPipelineKey::Procedure(handle) => key("semantic_procedure")
             .text(semantic::procedure_wire_id(handle))
             .finish(),
@@ -2728,7 +2735,6 @@ pub enum MergedLimit {
     SemanticMaterializedFiles,
     SemanticSourceBytes,
     SemanticRetainedBytes,
-    SemanticTraversalSteps,
     SemanticRows(SemanticBudgetDimension),
     SemanticBudgetExhausted,
 }
@@ -2747,7 +2753,6 @@ impl MergedLimit {
             Self::SemanticMaterializedFiles => "semantic_materialized_files",
             Self::SemanticSourceBytes => "semantic_source_bytes",
             Self::SemanticRetainedBytes => "semantic_retained_bytes",
-            Self::SemanticTraversalSteps => "semantic_traversal_steps",
             Self::SemanticRows(_) => "semantic_rows",
             Self::SemanticBudgetExhausted => "semantic_budget_exhausted",
         }
@@ -2844,15 +2849,19 @@ impl MergedUnitRows {
         ) {
             return Some(MergedLimit::SemanticMaterializedFiles);
         }
-        if reached(semantic.source_bytes, limits.max_source_bytes) {
+        if reached(
+            semantic.resident_peaks.source_bytes as u64,
+            limits.max_source_bytes,
+        ) {
             return Some(MergedLimit::SemanticSourceBytes);
         }
-        if reached(semantic.retained_bytes, limits.max_retained_bytes) {
+        if reached(
+            semantic.resident_retained_bytes_peak,
+            limits.max_retained_bytes,
+        ) {
             return Some(MergedLimit::SemanticRetainedBytes);
         }
-        if reached(semantic.traversal_steps, limits.max_traversal_steps) {
-            return Some(MergedLimit::SemanticTraversalSteps);
-        }
+
         for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
             let cap = limits
                 .rows_per_dimension
@@ -2870,26 +2879,8 @@ impl MergedUnitRows {
 ///
 /// The two byte dimensions are not row lanes: `SourceBytes` is capped by
 /// `max_source_bytes` and `OwnedTextBytes` by `max_retained_bytes`, both
-/// checked by name above. They are matched here rather than caught by a
-/// wildcard so that a new dimension fails to compile until it is priced.
+/// checked by name above. Independent units contribute the largest resident
+/// or root-work balance, never the sum of visits across unrelated roots.
 fn semantic_row_work(work: &CodeQuerySemanticWork, dimension: SemanticBudgetDimension) -> u64 {
-    use SemanticBudgetDimension as Dimension;
-    match dimension {
-        Dimension::SourceBytes => work.source_bytes,
-        Dimension::Procedures => work.procedures,
-        Dimension::Blocks => work.blocks,
-        Dimension::ProgramPoints => work.program_points,
-        Dimension::Values => work.values,
-        Dimension::Allocations => work.allocations,
-        Dimension::CallSites => work.call_sites,
-        Dimension::MemoryLocations => work.memory_locations,
-        Dimension::Captures => work.captures,
-        Dimension::SourceMappings => work.source_mappings,
-        Dimension::Evidence => work.evidence,
-        Dimension::Gaps => work.gaps,
-        Dimension::Events => work.events,
-        Dimension::ControlEdges => work.control_edges,
-        Dimension::NestedEntries => work.nested_entries,
-        Dimension::OwnedTextBytes => work.retained_bytes,
-    }
+    work.resident_peaks.get(dimension) as u64
 }

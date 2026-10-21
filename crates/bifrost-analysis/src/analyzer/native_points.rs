@@ -2,13 +2,11 @@
 
 use crate::CancellationToken;
 use crate::analyzer::Language;
-#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::languages::BoundedReceiverQuery;
 use crate::analyzer::resolution::{
     FactProjectedTypeNodeForm, FactProjectedTypeShape, FactResolutionAnswer, ResolutionCompletion,
     ResolutionIncompleteReason, ResolutionSlotValue,
 };
-#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::resolution::{SelectedResolutionContextSet, SelectedSemanticLocator};
 use crate::analyzer::store::WorkspaceSnapshots;
 use crate::analyzer::store::resolution_operation::{
@@ -16,7 +14,6 @@ use crate::analyzer::store::resolution_operation::{
     SelectedNativeNamedArgument, SelectedNativeReferenceTypes, SelectedNativeReferenceUnits,
     SelectedNativeTypes, SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
 };
-#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::store::resolution_operation::{
     SelectedResolutionContextMetrics, SelectedResolutionLocated, SelectedResolutionOperation,
     SelectedResolutionOperationOutcome,
@@ -25,7 +22,6 @@ use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInp
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 use crate::analyzer::structural::resolution::RejectionReason;
 use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
-#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::usages::get_definition::BoundedResolution;
 use crate::analyzer::usages::get_definition::trace::{
     self, CallableApplicabilityRecord, TraceCandidate, TraceCandidateRef,
@@ -38,17 +34,14 @@ use crate::analyzer::usages::get_type::{
     TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus, TypeLookupType,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-#[cfg(any(test, feature = "test-support"))]
 use crate::path_utils::rel_path_string;
 use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
-#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) enum NativePointContext {
     Ready {
         context: Box<SelectedResolutionContextSet>,
@@ -58,7 +51,6 @@ pub(crate) enum NativePointContext {
     Cancelled,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub(crate) struct SelectedNativeImportModel {
     pub(crate) symbol: crate::analyzer::semantic_model::SemanticModelSymbol,
@@ -66,7 +58,6 @@ pub(crate) struct SelectedNativeImportModel {
     pub(crate) gap_reason: crate::analyzer::resolution::SemanticId,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 struct NativePointReference<'a> {
     query: BoundedReceiverQuery<'a>,
     namespace: Option<ResolutionNamespace>,
@@ -118,26 +109,29 @@ pub(crate) fn native_point_operation_inputs<A: LanguageAdapter>(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static NATIVE_POINT_OPERATION_OPEN_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_native_point_operation_open_count_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_native_point_operation_open_count_for_test() {
     NATIVE_POINT_OPERATION_OPEN_COUNT.with(|count| count.set(0));
 }
 
-#[cfg(test)]
-pub(crate) fn native_point_operation_open_count_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn native_point_operation_open_count_for_test() -> usize {
     NATIVE_POINT_OPERATION_OPEN_COUNT.with(Cell::get)
 }
 
-pub(crate) fn open_native_point_operation<'a, A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn open_native_point_operation<'a, A: LanguageAdapter>(
     inner: &'a TreeSitterAnalyzer<A>,
     cancellation: &CancellationToken,
 ) -> crate::analyzer::store::Result<SelectedResolutionOperationOpenOutcome<'a, 'a>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     NATIVE_POINT_OPERATION_OPEN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     let language = inner.adapter().language();
     let (snapshots, languages) = native_point_operation_inputs(inner)?;
@@ -180,7 +174,6 @@ pub(crate) fn open_native_point_operation<'a, A: LanguageAdapter>(
         .open_selected_resolution_operation(input, cancellation)
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn resolve_native_definition_bounded<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
@@ -268,7 +261,6 @@ fn state_absent_member(
     });
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
     inner: &TreeSitterAnalyzer<A>,
     reference: NativePointReference<'_>,
@@ -465,7 +457,8 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
     }
 }
 
-pub(crate) fn unavailable_definition(
+#[doc(hidden)]
+pub fn unavailable_definition(
     site: &ResolvedReferenceSite,
     kind: &str,
     message: String,
@@ -484,7 +477,18 @@ pub(crate) fn unavailable_definition(
     }
 }
 
-pub(crate) fn adapt_definition_answer(
+// A conflict remains ambiguous when its routes converge on one canonical
+// endpoint or one alternative has no display projection. Other gaps still
+// mean that the binding is incomplete.
+#[doc(hidden)]
+pub fn is_precedence_ambiguity(completion: &ResolutionCompletion) -> bool {
+    matches!(completion, ResolutionCompletion::Incomplete(reasons)
+        if reasons.iter().all(|reason| matches!(reason,
+            ResolutionIncompleteReason::InconsistentPrecedence(_))))
+}
+
+#[doc(hidden)]
+pub fn adapt_definition_answer(
     site: &ResolvedReferenceSite,
     language: Language,
     answer: SelectedNativeReferenceUnits,
@@ -651,27 +655,27 @@ fn adapt_definition_answer_with_import_model(
     let lexical_definition =
         (lexical_definitions.len() == 1).then(|| lexical_definitions.remove(0));
     let target_count = answer.answer.binding().targets().len();
-    let go_inconsistent_precedence = language == Language::Go
+    // Both frontends publish equal-precedence conflicts explicitly. Keep the
+    // ambiguity even when one canonical endpoint has no display projection.
+    let inconsistent_precedence = matches!(language, Language::Go | Language::Rust)
         && matches!(completion, ResolutionCompletion::Incomplete(reasons)
             if reasons.iter().any(|reason| matches!(reason,
                 ResolutionIncompleteReason::InconsistentPrecedence(_))));
     let scala_type_ambiguity =
         language == Language::Scala && native_scala_type_ambiguity(&answer.answer);
-    let only_go_inconsistent_precedence = go_inconsistent_precedence
-        && matches!(completion, ResolutionCompletion::Incomplete(reasons)
-            if reasons.iter().all(|reason| matches!(reason,
-                ResolutionIncompleteReason::InconsistentPrecedence(_))));
+    let only_inconsistent_precedence =
+        inconsistent_precedence && is_precedence_ambiguity(completion);
     let is_incomplete =
-        !matches!(completion, ResolutionCompletion::Complete) && !only_go_inconsistent_precedence;
+        !matches!(completion, ResolutionCompletion::Complete) && !only_inconsistent_precedence;
     let unproven_term_family = is_incomplete
-        && crate::analyzer::languages::language_support(language)
+        && crate::analyzer::languages::language_knowledge(language)
             .is_some_and(|support| support.call_target_lookup_routes().is_some())
         && answer
             .answer
             .callable_candidate_applicability()
             .iter()
             .any(|candidate| candidate.verdict() == ApplicabilityVerdict::Unknown);
-    let ambiguous = (target_count > 1 || go_inconsistent_precedence) && !unproven_term_family;
+    let ambiguous = (target_count > 1 || inconsistent_precedence) && !unproven_term_family;
     if ambiguous {
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
@@ -777,7 +781,7 @@ fn adapt_definition_answer_with_import_model(
     if status == DefinitionLookupStatus::Resolved
         && definitions.is_empty()
         && let Some(local) = &lexical_definition
-        && crate::analyzer::languages::language_support(language)
+        && crate::analyzer::languages::language_knowledge(language)
             .is_some_and(|support| support.native_local_binding_diagnostic())
     {
         diagnostics.push(DefinitionLookupDiagnostic {
@@ -1037,7 +1041,6 @@ fn record_native_callable_applicability(
     trace::stage_callable_context(selected_context);
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn resolve_native_type_bounded<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
@@ -1061,7 +1064,7 @@ pub(crate) fn resolve_native_type_bounded<A: LanguageAdapter>(
         prepare_context,
         after_open,
         |operation, context, locator, cancellation, _| {
-            operation.resolve_native_reference_types_bounded(
+            operation.resolve_native_type_site_bounded(
                 context,
                 locator,
                 query.budget,
@@ -1151,7 +1154,7 @@ fn resolve_native_expression_type_projection_bounded<A: LanguageAdapter>(
         prepare_context,
         after_open,
         |operation, context, locator, cancellation, _selected_import_gap| {
-            operation.resolve_native_reference_types_bounded(
+            operation.resolve_native_type_site_bounded(
                 context,
                 locator,
                 query.budget,
@@ -1351,7 +1354,8 @@ fn project_native_static_type(
     selected
 }
 
-pub(crate) fn unavailable_type(
+#[doc(hidden)]
+pub fn unavailable_type(
     site: &ResolvedReferenceSite,
     kind: &str,
     message: String,
@@ -1368,7 +1372,8 @@ pub(crate) fn unavailable_type(
     }
 }
 
-pub(crate) fn adapt_type_answer(
+#[doc(hidden)]
+pub fn adapt_type_answer(
     site: &ResolvedReferenceSite,
     language: Language,
     answer: SelectedNativeReferenceTypes,
@@ -1758,7 +1763,7 @@ fn render_projected_type_shape(
 }
 
 /// Caller-visible native type evidence for the private differential harness.
-/// The module is absent unless tests or the existing test-support feature are enabled.
+/// Available only for tests or the existing test-support feature.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct NativeTypeProbe {
@@ -1783,39 +1788,17 @@ pub struct NativeAssignmentValueProbe {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn adapt_assignment_value_probe(
+#[doc(hidden)]
+pub fn adapt_assignment_value_probe(
     site: &ResolvedReferenceSite,
     language: Language,
     answer: crate::analyzer::store::resolution_operation::SelectedNativeAssignmentValue,
 ) -> NativeAssignmentValueProbe {
     let observed_frontier_complete = answer.observed_frontier_complete;
-    let mut outcome = if language == Language::Rust {
-        adapt_type_answer_with_spelling(
-            site,
-            language,
-            answer.types,
-            |spelling, value, diagnostics| {
-                let ty = value.ty();
-                // The Rust renderer spells total depth as references. Do not turn
-                // raw-pointer or mixed indirection into reference evidence.
-                if ty.indirection() != ty.reference_indirection() {
-                    diagnostics.push(TypeLookupDiagnostic {
-                        kind: "unsupported_type_indirection".into(),
-                        message: format!(
-                            "unsupported Rust assignment-value indirection for {spelling:?}: {value:?}"
-                        ),
-                    });
-                    return None;
-                }
-                Some(crate::analyzer::rust::native_points::render_type_spelling(
-                    spelling,
-                    value,
-                    diagnostics,
-                ))
-            },
-        )
-    } else {
-        adapt_type_answer(site, language, answer.types)
+    let support = crate::analyzer::languages::language_support(language);
+    let mut outcome = match support.and_then(|support| support.assignment_value_type_spelling()) {
+        Some(render) => adapt_type_answer_with_spelling(site, language, answer.types, render),
+        None => adapt_type_answer(site, language, answer.types),
     };
     // The owned type spelling cannot express the Rust renderer's mutable
     // reference qualifier. This limits display, not the observed frontier.
@@ -1840,7 +1823,8 @@ fn adapt_assignment_value_probe(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn unavailable_assignment_value_probe(
+#[doc(hidden)]
+pub fn unavailable_assignment_value_probe(
     site: &ResolvedReferenceSite,
     kind: &str,
     message: String,
@@ -1855,7 +1839,8 @@ fn unavailable_assignment_value_probe(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn map_bounded<T, U>(
+#[doc(hidden)]
+pub fn map_bounded<T, U>(
     value: BoundedResolution<T>,
     map: impl FnOnce(T) -> U,
 ) -> BoundedResolution<U> {
@@ -1870,7 +1855,7 @@ fn map_bounded<T, U>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn probe_jvm_assignment_value<A: LanguageAdapter>(
+pub(crate) fn probe_jvm_assignment_value<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
 ) -> BoundedResolution<NativeAssignmentValueProbe> {
@@ -1923,7 +1908,6 @@ pub fn probe_native_assignment_value(
     budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
     cancellation: &CancellationToken,
 ) -> Result<BoundedResolution<NativeAssignmentValueProbe>, String> {
-    use crate::analyzer::resolve_analyzer;
     let language = crate::analyzer::common::language_for_file(&request.file);
     if cancellation.is_cancelled() {
         return Ok(BoundedResolution::Cancelled {
@@ -1955,178 +1939,11 @@ pub fn probe_native_assignment_value(
         budget,
         cancellation: Some(cancellation),
     };
-    Ok(match language {
-        Language::Java => probe_jvm_assignment_value(
-            resolve_analyzer::<crate::analyzer::JavaAnalyzer>(analyzer)
-                .ok_or("assignment-value probe has no Java analyzer")?
-                .inner(),
-            query,
-        ),
-        Language::Kotlin => probe_jvm_assignment_value(
-            resolve_analyzer::<crate::analyzer::kotlin::KotlinAnalyzer>(analyzer)
-                .ok_or("assignment-value probe has no Kotlin analyzer")?
-                .tree_sitter_analyzer(),
-            query,
-        ),
-        Language::Scala => probe_jvm_assignment_value(
-            resolve_analyzer::<crate::analyzer::scala::ScalaAnalyzer>(analyzer)
-                .ok_or("assignment-value probe has no Scala analyzer")?
-                .tree_sitter_analyzer(),
-            query,
-        ),
-        Language::Rust => {
-            let factory =
-                crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
-                    analyzer,
-                    cancellation,
-                )
-                .ok_or("assignment-value probe has no authoritative Rust operation factory")?;
-            let mut operation = match factory
-                .open(cancellation)
-                .map_err(|error| error.to_string())?
-            {
-                SelectedResolutionOperationOpenOutcome::Ready(operation) => operation,
-                SelectedResolutionOperationOpenOutcome::Cancelled => {
-                    return Ok(BoundedResolution::Cancelled {
-                        work: ReceiverAnalysisWork::default(),
-                    });
-                }
-                SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
-                    return Err(format!(
-                        "assignment-value operation unavailable: {reason:?}"
-                    ));
-                }
-                SelectedResolutionOperationOpenOutcome::Stale(reason) => {
-                    return Err(format!("assignment-value operation stale: {reason:?}"));
-                }
-            };
-            let locator = SelectedSemanticLocator::for_reference_range_in_namespace(
-                "rust",
-                rel_path_string(&request.file),
-                site.focus_start_byte,
-                site.focus_end_byte,
-                ResolutionNamespace::Value,
-            );
-            let answer = operation
-                .resolve_rust_assignment_value_bounded(
-                    request.file.rel_path(),
-                    &locator,
-                    budget,
-                    cancellation,
-                )
-                .map_err(|error| error.to_string())?;
-            map_bounded(answer, |outcome| match outcome {
-                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-                    answer,
-                )) => adapt_assignment_value_probe(&site, language, answer),
-                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
-                    unavailable_assignment_value_probe(
-                        &site,
-                        "native_reference_unavailable",
-                        "assignment-value probe has no exact selected reference".into(),
-                    )
-                }
-                SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                    unavailable_assignment_value_probe(
-                        &site,
-                        "native_unavailable",
-                        format!("{reason:?}"),
-                    )
-                }
-                SelectedResolutionOperationOutcome::Stale(reason) => {
-                    unavailable_assignment_value_probe(&site, "native_stale", format!("{reason:?}"))
-                }
-                SelectedResolutionOperationOutcome::Cancelled(completion) => {
-                    unavailable_assignment_value_probe(
-                        &site,
-                        "native_cancelled",
-                        format!("{completion:?}"),
-                    )
-                }
-            })
-        }
-        Language::Go => {
-            use crate::analyzer::go::native_points::{
-                GoNativePointRequest, GoNativePointRequestOpen,
-            };
-            let go = resolve_analyzer::<crate::analyzer::go::GoAnalyzer>(analyzer)
-                .ok_or("assignment-value probe has no Go analyzer")?;
-            let mut go_request = match GoNativePointRequest::open(go, None, cancellation)
-                .map_err(|error| error.to_string())?
-            {
-                GoNativePointRequestOpen::Ready(request) => request,
-                GoNativePointRequestOpen::Unavailable { kind, message } => {
-                    return Ok(BoundedResolution::Complete {
-                        value: unavailable_assignment_value_probe(&site, kind, message),
-                        work: ReceiverAnalysisWork::default(),
-                    });
-                }
-                GoNativePointRequestOpen::Cancelled => {
-                    return Ok(BoundedResolution::Cancelled {
-                        work: ReceiverAnalysisWork::default(),
-                    });
-                }
-            };
-            let locator = SelectedSemanticLocator::for_reference_range(
-                "go",
-                rel_path_string(&request.file),
-                site.focus_start_byte,
-                site.focus_end_byte,
-            );
-            let Some(answer) = go_request
-                .resolve_assignment_value_bounded(
-                    &rel_path_string(&request.file),
-                    &locator,
-                    budget,
-                    cancellation,
-                )
-                .map_err(|error| error.to_string())?
-            else {
-                return Ok(BoundedResolution::Complete {
-                    value: unavailable_assignment_value_probe(
-                        &site,
-                        "native_context_unavailable",
-                        "selected Go file import/demand context is unavailable".into(),
-                    ),
-                    work: ReceiverAnalysisWork::default(),
-                });
-            };
-            map_bounded(answer, |outcome| match outcome {
-                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-                    answer,
-                )) => adapt_assignment_value_probe(&site, language, answer),
-                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
-                    unavailable_assignment_value_probe(
-                        &site,
-                        "native_reference_unavailable",
-                        "assignment-value probe has no exact selected reference".into(),
-                    )
-                }
-                SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                    unavailable_assignment_value_probe(
-                        &site,
-                        "native_unavailable",
-                        format!("{reason:?}"),
-                    )
-                }
-                SelectedResolutionOperationOutcome::Stale(reason) => {
-                    unavailable_assignment_value_probe(&site, "native_stale", format!("{reason:?}"))
-                }
-                SelectedResolutionOperationOutcome::Cancelled(completion) => {
-                    unavailable_assignment_value_probe(
-                        &site,
-                        "native_cancelled",
-                        format!("{completion:?}"),
-                    )
-                }
-            })
-        }
-        _ => {
-            return Err(format!(
-                "assignment-value probe does not admit {language:?}"
-            ));
-        }
-    })
+    let answer = match crate::analyzer::languages::language_support(language) {
+        Some(support) => support.probe_assignment_value(query, request, cancellation)?,
+        None => None,
+    };
+    answer.ok_or_else(|| format!("assignment-value probe does not admit {language:?}"))
 }
 
 #[cfg(any(test, feature = "test-support"))]

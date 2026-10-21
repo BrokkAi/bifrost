@@ -162,20 +162,29 @@ checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
+ "brokk-bifrost-cpp-analysis",
+ "brokk-bifrost-csharp-analysis",
  "brokk-bifrost-flow",
+ "brokk-bifrost-go-analysis",
  "brokk-bifrost-js-ts",
+ "brokk-bifrost-js-ts-analysis",
  "brokk-bifrost-jvm",
  "brokk-bifrost-mcp",
+ "brokk-bifrost-php-analysis",
  "brokk-bifrost-policy",
+ "brokk-bifrost-python-analysis",
  "brokk-bifrost-rql",
+ "brokk-bifrost-ruby-analysis",
  "brokk-bifrost-runtime",
+ "brokk-bifrost-rust-analysis",
  "brokk-bifrost-semantic-packs",
  "brokk-bifrost-test-macros",
+ "brokk-bifrost-tools",
  "brokk-tree-sitter-cpp",
  "chrono",
  "csv",
@@ -213,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -227,6 +236,8 @@ dependencies = [
  "brokk-bifrost-python",
  "brokk-bifrost-ruby",
  "brokk-bifrost-rust",
+ "brokk-bifrost-semantic",
+ "brokk-bifrost-store",
  "brokk-bifrost-test-macros",
  "brokk-tree-sitter-c-sharp",
  "brokk-tree-sitter-cpp",
@@ -237,37 +248,27 @@ dependencies = [
  "brokk-tree-sitter-typescript",
  "cap-fs-ext",
  "cap-std",
- "chrono",
- "configparser",
  "flate2",
  "git2",
  "glob",
- "goblin",
  "growable-bloom-filter",
  "jclassfile",
  "jsonschema",
  "libc",
  "moka",
- "pep440_rs",
- "pep508_rs",
  "proptest",
  "quick-xml",
  "rayon",
  "regex",
  "regex-syntax",
- "rubund",
  "rusqlite",
  "rustc-hash",
- "rustdoc-types",
  "schemars",
  "semver",
  "serde",
  "serde-saphyr",
  "serde_json",
- "serde_json_canonicalizer",
  "sha2",
- "shlex 2.0.1",
- "spdx",
  "syn 2.0.118",
  "tar",
  "tempfile",
@@ -278,20 +279,17 @@ dependencies = [
  "tree-sitter-java",
  "tree-sitter-properties",
  "tree-sitter-python",
- "tree-sitter-rbs",
  "tree-sitter-ruby",
  "tree-sitter-yaml",
- "tree-sitter-yarnlock",
  "url",
  "uuid",
  "walkdir",
- "yarn-lock-parser",
  "zip",
 ]
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "bincode",
  "brokk-bifrost-test-macros",
@@ -318,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-cpp"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -333,8 +331,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-bifrost-cpp-analysis"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "brokk-bifrost-cpp",
+ "brokk-bifrost-test-macros",
+ "brokk-tree-sitter-cpp",
+ "git2",
+ "moka",
+ "rayon",
+ "rusqlite",
+ "semver",
+ "serde_json",
+ "tempfile",
+ "tree-sitter",
+]
+
+[[package]]
 name = "brokk-bifrost-csharp"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -344,12 +361,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-bifrost-csharp-analysis"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "brokk-bifrost-csharp",
+ "brokk-bifrost-semantic",
+ "brokk-bifrost-test-macros",
+ "brokk-tree-sitter-c-sharp",
+ "goblin",
+ "moka",
+ "quick-xml",
+ "rayon",
+ "semver",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tree-sitter",
+ "walkdir",
+]
+
+[[package]]
 name = "brokk-bifrost-flow"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
+ "brokk-bifrost-tools",
  "proptest",
  "serde",
  "serde_json",
@@ -360,12 +400,34 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-go"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
  "rayon",
  "regex",
+ "serde",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-go",
+]
+
+[[package]]
+name = "brokk-bifrost-go-analysis"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "brokk-bifrost-go",
+ "brokk-bifrost-semantic",
+ "brokk-bifrost-test-macros",
+ "git2",
+ "moka",
+ "rusqlite",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
  "tempfile",
  "tree-sitter",
  "tree-sitter-go",
@@ -373,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-js-ts"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -388,8 +450,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-bifrost-js-ts-analysis"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "brokk-bifrost-js-ts",
+ "brokk-bifrost-semantic",
+ "brokk-bifrost-test-macros",
+ "brokk-tree-sitter-javascript",
+ "brokk-tree-sitter-typescript",
+ "git2",
+ "glob",
+ "moka",
+ "rusqlite",
+ "semver",
+ "serde-saphyr",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-yarnlock",
+ "yarn-lock-parser",
+]
+
+[[package]]
 name = "brokk-bifrost-jvm"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -406,14 +493,16 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
+ "brokk-bifrost-go-analysis",
  "brokk-bifrost-policy",
  "brokk-bifrost-rql",
  "brokk-bifrost-runtime",
  "brokk-bifrost-test-macros",
+ "brokk-bifrost-tools",
  "git2",
  "glob",
  "jsonschema",
@@ -436,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-php"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -450,13 +539,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "brokk-bifrost-policy"
-version = "0.13.1"
+name = "brokk-bifrost-php-analysis"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-analysis",
- "brokk-bifrost-flow",
- "brokk-bifrost-rql",
+ "brokk-bifrost-core",
+ "brokk-bifrost-php",
+ "brokk-bifrost-semantic",
  "brokk-bifrost-test-macros",
+ "brokk-tree-sitter-php",
+ "git2",
+ "moka",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tree-sitter",
+]
+
+[[package]]
+name = "brokk-bifrost-policy"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-cpp-analysis",
+ "brokk-bifrost-flow",
+ "brokk-bifrost-js-ts-analysis",
+ "brokk-bifrost-python-analysis",
+ "brokk-bifrost-rql",
+ "brokk-bifrost-rust-analysis",
+ "brokk-bifrost-test-macros",
+ "brokk-bifrost-tools",
  "cap-std",
  "chrono",
  "cvss",
@@ -473,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-python"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -486,17 +600,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-bifrost-python-analysis"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "brokk-bifrost-python",
+ "brokk-bifrost-semantic",
+ "brokk-bifrost-test-macros",
+ "configparser",
+ "git2",
+ "moka",
+ "pep440_rs",
+ "pep508_rs",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex 2.0.1",
+ "tempfile",
+ "toml",
+ "toml_edit",
+ "tree-sitter",
+ "tree-sitter-python",
+ "zip",
+]
+
+[[package]]
 name = "brokk-bifrost-rql"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
  "brokk-bifrost-cpp",
+ "brokk-bifrost-cpp-analysis",
+ "brokk-bifrost-csharp-analysis",
  "brokk-bifrost-flow",
+ "brokk-bifrost-go-analysis",
  "brokk-bifrost-js-ts",
+ "brokk-bifrost-js-ts-analysis",
  "brokk-bifrost-jvm",
+ "brokk-bifrost-php-analysis",
  "brokk-bifrost-python",
+ "brokk-bifrost-python-analysis",
+ "brokk-bifrost-ruby-analysis",
+ "brokk-bifrost-rust-analysis",
  "brokk-bifrost-test-macros",
+ "brokk-bifrost-tools",
  "git2",
  "glob",
  "proptest",
@@ -515,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-ruby"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -525,14 +676,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-bifrost-ruby-analysis"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "brokk-bifrost-ruby",
+ "brokk-bifrost-test-macros",
+ "flate2",
+ "git2",
+ "moka",
+ "rubund",
+ "rusqlite",
+ "semver",
+ "tar",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-rbs",
+ "tree-sitter-ruby",
+]
+
+[[package]]
 name = "brokk-bifrost-runtime"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
  "brokk-bifrost-policy",
  "brokk-bifrost-rql",
  "brokk-bifrost-test-macros",
+ "brokk-bifrost-tools",
  "git2",
  "serde",
  "serde_json",
@@ -542,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -560,12 +733,78 @@ dependencies = [
 ]
 
 [[package]]
-name = "brokk-bifrost-semantic-packs"
-version = "0.13.1"
+name = "brokk-bifrost-rust-analysis"
+version = "0.14.0"
 dependencies = [
  "brokk-bifrost-analysis",
- "brokk-bifrost-flow",
+ "brokk-bifrost-core",
+ "brokk-bifrost-rust",
+ "brokk-bifrost-semantic",
  "brokk-bifrost-test-macros",
+ "brokk-tree-sitter-rust",
+ "git2",
+ "glob",
+ "moka",
+ "rayon",
+ "rusqlite",
+ "rustdoc-types",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "toml_edit",
+ "tree-sitter",
+]
+
+[[package]]
+name = "brokk-bifrost-semantic"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-core",
+ "brokk-bifrost-cpp",
+ "brokk-bifrost-csharp",
+ "brokk-bifrost-go",
+ "brokk-bifrost-js-ts",
+ "brokk-bifrost-jvm",
+ "brokk-bifrost-php",
+ "brokk-bifrost-python",
+ "brokk-bifrost-ruby",
+ "brokk-bifrost-rust",
+ "brokk-bifrost-test-macros",
+ "flate2",
+ "git2",
+ "jsonschema",
+ "moka",
+ "rusqlite",
+ "schemars",
+ "semver",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "spdx",
+ "tempfile",
+ "tree-sitter",
+ "url",
+]
+
+[[package]]
+name = "brokk-bifrost-semantic-packs"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-csharp-analysis",
+ "brokk-bifrost-flow",
+ "brokk-bifrost-go-analysis",
+ "brokk-bifrost-js-ts-analysis",
+ "brokk-bifrost-php-analysis",
+ "brokk-bifrost-python-analysis",
+ "brokk-bifrost-ruby-analysis",
+ "brokk-bifrost-rust-analysis",
+ "brokk-bifrost-test-macros",
+ "brokk-bifrost-tools",
  "flate2",
  "jsonschema",
  "semver",
@@ -580,8 +819,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-bifrost-store"
+version = "0.14.0"
+
+[[package]]
 name = "brokk-bifrost-test-macros"
-version = "0.13.1"
+version = "0.14.0"
+
+[[package]]
+name = "brokk-bifrost-tools"
+version = "0.14.0"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "brokk-bifrost-cpp",
+ "brokk-bifrost-cpp-analysis",
+ "brokk-bifrost-csharp-analysis",
+ "brokk-bifrost-go",
+ "brokk-bifrost-go-analysis",
+ "brokk-bifrost-js-ts",
+ "brokk-bifrost-js-ts-analysis",
+ "brokk-bifrost-php",
+ "brokk-bifrost-php-analysis",
+ "brokk-bifrost-python",
+ "brokk-bifrost-python-analysis",
+ "brokk-bifrost-ruby",
+ "brokk-bifrost-ruby-analysis",
+ "brokk-bifrost-rust",
+ "brokk-bifrost-rust-analysis",
+ "brokk-bifrost-semantic",
+ "brokk-bifrost-test-macros",
+ "brokk-tree-sitter-cpp",
+ "brokk-tree-sitter-json",
+ "brokk-tree-sitter-rust",
+ "chrono",
+ "git2",
+ "glob",
+ "moka",
+ "proptest",
+ "rayon",
+ "regex",
+ "rusqlite",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "syn 2.0.118",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-properties",
+ "tree-sitter-ruby",
+ "tree-sitter-yaml",
+ "walkdir",
+]
 
 [[package]]
 name = "brokk-tree-sitter-c-sharp"

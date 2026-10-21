@@ -132,54 +132,96 @@ fn rust_type_identifier_is_call_target(node: Node<'_>) -> bool {
 /// `None` for a node shape that is not a path: a caller must not fall back to
 /// splitting the source text. A leading `::` ends the walk with the segments
 /// gathered so far, because the absolute root has no node of its own.
-pub fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
+pub fn rust_path_segments(node: Node<'_>) -> Option<Vec<Node<'_>>> {
+    rust_path_segments_bounded(node, |_| Ok::<_, std::convert::Infallible>(()))
+        .expect("infallible legacy path walk")
+}
+
+/// The same structured path walk, charged before visiting/retaining a segment.
+/// Failure drops the partial vector; it never publishes a truncated path.
+pub(crate) fn rust_path_segments_bounded<'tree, F, E>(
+    mut node: Node<'tree>,
+    mut charge: F,
+) -> Result<Option<Vec<Node<'tree>>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(0)?;
     let mut reversed = Vec::new();
     loop {
+        charge(1)?;
         match node.kind() {
             "scoped_identifier" | "scoped_type_identifier" => {
-                reversed.push(node.child_by_field_name("name")?);
+                let Some(name) = node.child_by_field_name("name") else {
+                    return Ok(None);
+                };
+                reversed.push(name);
                 let Some(path) = node.child_by_field_name("path") else {
                     if node.child(0).is_some_and(|child| child.kind() == "::") {
                         break;
                     }
-                    return None;
+                    return Ok(None);
                 };
                 node = path;
             }
-            "generic_type" => node = node.child_by_field_name("type")?,
-            "generic_function" => node = node.child_by_field_name("function")?,
+            "generic_type" | "generic_function" => {
+                let field = if node.kind() == "generic_type" {
+                    "type"
+                } else {
+                    "function"
+                };
+                let Some(inner) = node.child_by_field_name(field) else {
+                    return Ok(None);
+                };
+                node = inner;
+            }
             "identifier" | "type_identifier" | "self" | "super" | "crate" => {
                 reversed.push(node);
                 break;
             }
-            _ => return None,
+            _ => return Ok(None),
         }
     }
+    charge(reversed.len())?;
     reversed.reverse();
-    Some(reversed)
+    charge(0)?;
+    Ok(Some(reversed))
 }
 
 /// Whether the path containing `node` is rooted at a leading `::`.
-pub fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
+pub fn rust_path_is_leading_absolute(node: Node<'_>) -> bool {
+    rust_path_is_leading_absolute_bounded(node, |_| Ok::<_, std::convert::Infallible>(()))
+        .expect("infallible legacy absolute-path walk")
+}
+
+pub(crate) fn rust_path_is_leading_absolute_bounded<F, E>(
+    mut node: Node<'_>,
+    mut charge: F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(0)?;
     while let Some(parent) = node.parent()
         && matches!(
             parent.kind(),
             "scoped_identifier" | "scoped_type_identifier" | "generic_type" | "generic_function"
         )
     {
+        charge(1)?;
         node = parent;
     }
     loop {
+        charge(1)?;
         match node.kind() {
-            "generic_type" => {
-                let Some(inner) = node.child_by_field_name("type") else {
-                    return false;
+            "generic_type" | "generic_function" => {
+                let field = if node.kind() == "generic_type" {
+                    "type"
+                } else {
+                    "function"
                 };
-                node = inner;
-            }
-            "generic_function" => {
-                let Some(inner) = node.child_by_field_name("function") else {
-                    return false;
+                let Some(inner) = node.child_by_field_name(field) else {
+                    return Ok(false);
                 };
                 node = inner;
             }
@@ -187,10 +229,15 @@ pub fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
                 if let Some(path) = node.child_by_field_name("path") {
                     node = path;
                 } else {
-                    return node.child(0).is_some_and(|child| child.kind() == "::");
+                    let absolute = node.child(0).is_some_and(|child| child.kind() == "::");
+                    charge(0)?;
+                    return Ok(absolute);
                 }
             }
-            _ => return false,
+            _ => {
+                charge(0)?;
+                return Ok(false);
+            }
         }
     }
 }

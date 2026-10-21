@@ -1,16 +1,12 @@
-use super::super::ir::{CallSiteHandle, ProcedureHandle};
-use super::super::provider::{SemanticOutcome, SemanticProviderError, SemanticRequest};
-use super::call::CallBindings;
-use super::dispatch::{DispatchCandidate, DispatchResult};
-use super::heap::{
-    AliasResult, FreshObjectPublicationResult, LocationResult, PointsToResult, UpdateEligibility,
+use crate::analyzer::semantic::ir::CallSiteHandle;
+use crate::analyzer::semantic::oracle::dispatch::DispatchResult;
+use crate::analyzer::semantic::oracle::model::OracleCallContext;
+use crate::analyzer::semantic::provider::{
+    SemanticOutcome, SemanticProviderError, SemanticRequest,
 };
-use super::model::{
-    AccessPathAtPoint, AliasQuery, FreshObjectPublicationQuery, OracleCallContext, StoreAtPoint,
-    ValueAtPoint,
-};
-use super::value_flow::ValueFlowSnapshot;
-
+// Keep the old overlay path even when consumers use the root re-export.
+#[allow(unused_imports)]
+pub use brokk_bifrost_semantic::analyzer::semantic::oracle::traits::*;
 /// Location-first whole-program dispatch over one exact semantic call site.
 pub trait DispatchOracle {
     fn resolve_call(
@@ -28,55 +24,4 @@ pub trait DispatchOracle {
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
         self.resolve_call(call, request)
     }
-}
-
-/// Procedure-local and candidate-specific value-flow answers.
-pub trait ValueFlowOracle {
-    fn procedure_relations(
-        &self,
-        procedure: &ProcedureHandle,
-        context: &OracleCallContext,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<ValueFlowSnapshot>, SemanticProviderError>;
-
-    fn call_bindings(
-        &self,
-        call: &CallSiteHandle,
-        candidate: &DispatchCandidate,
-        context: &OracleCallContext,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError>;
-}
-
-/// Point-sensitive abstract-object, location, alias, and update answers.
-pub trait HeapOracle {
-    fn pointees(
-        &self,
-        value: &ValueAtPoint,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<PointsToResult>, SemanticProviderError>;
-
-    fn locations(
-        &self,
-        access: &AccessPathAtPoint,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<LocationResult>, SemanticProviderError>;
-
-    fn alias(
-        &self,
-        query: &AliasQuery,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<AliasResult>, SemanticProviderError>;
-
-    fn fresh_object_publications(
-        &self,
-        query: &FreshObjectPublicationQuery,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<FreshObjectPublicationResult>, SemanticProviderError>;
-
-    fn update_eligibility(
-        &self,
-        store: &StoreAtPoint,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<UpdateEligibility>, SemanticProviderError>;
 }

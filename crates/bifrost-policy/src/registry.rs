@@ -5,7 +5,9 @@
 //! files from IDs: workspace access is limited to explicitly supplied paths,
 //! referenced RQL selectors, and authored match-directory closures.
 
+mod declaration_selections;
 mod endpoint_sets;
+use declaration_selections::LoadedDeclarationSelection;
 use endpoint_sets::{EndpointSetCacheEntry, EndpointSetClosure};
 
 use std::cmp::Ordering;
@@ -561,7 +563,9 @@ impl PolicyRegistry {
         self.check_cancellation()?;
         let mut definition = match parsed.document() {
             RqlpDocument::Policy { definition } => definition.as_ref().clone(),
-            RqlpDocument::Endpoint { .. } | RqlpDocument::EndpointSet { .. } => {
+            RqlpDocument::Endpoint { .. }
+            | RqlpDocument::EndpointSet { .. }
+            | RqlpDocument::DeclarationSelection { .. } => {
                 return Err(PolicyRegistryError::WrongDocumentKind {
                     expected: PolicyDocumentKind::Policy,
                 });
@@ -657,17 +661,37 @@ impl PolicyRegistry {
             match &definition.analysis {
                 PolicyAnalysis::Assertion { spec } => {
                     if let Some(plan) = &spec.relational {
+                        let mut selections: HashMap<
+                            WorkspaceRelativePath,
+                            LoadedDeclarationSelection,
+                        > = HashMap::new();
                         for binding in &plan.bindings {
                             let RowBindingSource::Query(query) = &binding.source;
                             let path =
                                 selector_path(relational_binding_selector_path(&binding.name))?;
-                            let selector = self.resolve_selector(
-                                parsed,
-                                path,
-                                query,
-                                &mut retained_bytes,
-                                locators,
-                            )?;
+                            let selector = match query {
+                                PolicySelector::DeclarationSelection(reference) => {
+                                    let Some(selector) = self.resolve_declaration_selection(
+                                        parsed,
+                                        path,
+                                        reference,
+                                        &mut selections,
+                                        &mut retained_bytes,
+                                        locators,
+                                    )?
+                                    else {
+                                        continue;
+                                    };
+                                    selector
+                                }
+                                _ => self.resolve_selector(
+                                    parsed,
+                                    path,
+                                    query,
+                                    &mut retained_bytes,
+                                    locators,
+                                )?,
+                            };
                             insert_selector(&mut fixed_selectors, selector)?;
                         }
                     } else {
@@ -1992,6 +2016,12 @@ pub enum PolicyRegistryError {
         source: PolicySourceIdentity,
         error: Box<PolicySourceError>,
     },
+    /// A declaration-selection import failed activation (#5931). `source` is
+    /// the document the diagnostic range belongs to.
+    DeclarationSelectionImport {
+        source: PolicySourceIdentity,
+        error: Box<PolicySourceError>,
+    },
     WorkspaceRootMustBeAbsolute,
     WorkspaceAccessUnavailable,
     Workspace(Box<WorkspaceDocumentError>),
@@ -2094,6 +2124,11 @@ impl fmt::Display for PolicyRegistryError {
             Self::EndpointSetImport { source, error } => {
                 write!(formatter, "endpoint-set import in `{source}`: {error}")
             }
+            Self::DeclarationSelectionImport { source, error } => write!(
+                formatter,
+                "declaration-selection import in `{source}` failed ({}): {error}",
+                error.diagnostic.code
+            ),
             Self::WorkspaceRootMustBeAbsolute => {
                 formatter.write_str("policy workspace root must be absolute")
             }
@@ -2208,7 +2243,8 @@ impl fmt::Display for PolicyRegistryError {
 impl std::error::Error for PolicyRegistryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::EndpointSetImport { error, .. } => Some(error.as_ref()),
+            Self::EndpointSetImport { error, .. }
+            | Self::DeclarationSelectionImport { error, .. } => Some(error.as_ref()),
             Self::Workspace(error) => Some(error.as_ref()),
             Self::InvalidSourceIdentity(error) => Some(error),
             Self::Source(error) => Some(error.as_ref()),

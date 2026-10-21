@@ -208,6 +208,69 @@ fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<SourceAnchorGroup>) 
     // pattern.not_has intentionally ignored: verifier-only.
 }
 
+/// Each chain-compatible role demand keeps its own necessary operator
+/// predicate. None is opaque: Boolean/negative positions, wildcards and
+/// operand-only demands cannot be discharged by an operator domain (#5964).
+/// This inventory deliberately includes unconstrained kinds and all compiled
+/// children; omission would turn an unsupported query into a clean negative.
+/// The walk touches only the compiled query pattern, never source facts, so
+/// callers must pass a non-charging step: fact_nodes measure source work.
+pub(crate) fn comparison_chain_role_demands<'a>(
+    seed: &'a CodeQuerySeed,
+    step: &mut dyn FnMut() -> bool,
+) -> Option<Vec<Option<&'a Pattern>>> {
+    use crate::structural::NormalizedKind;
+
+    let mut stack = Vec::new();
+    for (pattern, opaque) in std::iter::once((&seed.root, false))
+        .chain(seed.inside.iter().map(|pattern| (pattern, false)))
+        .chain(seed.inside_decl.iter().map(|pattern| (pattern, false)))
+        .chain(seed.not_inside.iter().map(|pattern| (pattern, true)))
+    {
+        if !step() {
+            return None;
+        }
+        stack.push((pattern, opaque));
+    }
+    let mut demands = Vec::new();
+    while let Some((pattern, opaque)) = stack.pop() {
+        if !step() {
+            return None;
+        }
+        let opaque = opaque
+            || pattern.not.is_some()
+            || pattern.not_has.is_some()
+            || !pattern.all.is_empty()
+            || !pattern.any.is_empty();
+        let compatible = (pattern.kinds.is_empty()
+            || pattern
+                .kinds
+                .iter()
+                .any(|kind| NormalizedKind::ComparisonChain.satisfies(*kind)))
+            && !pattern
+                .not_kinds
+                .iter()
+                .any(|kind| NormalizedKind::ComparisonChain.satisfies(*kind));
+        if compatible
+            && (pattern.left.is_some() || pattern.right.is_some() || pattern.operator.is_some())
+        {
+            demands.push(pattern.operator.as_deref().filter(|operator| {
+                !opaque
+                    && operator.not_kinds.is_empty()
+                    && operator.nested_patterns().next().is_none()
+                    && (operator.name.is_some() || operator.text.is_some())
+            }));
+        }
+        for child in pattern.nested_patterns() {
+            if !step() {
+                return None;
+            }
+            stack.push((child, opaque));
+        }
+    }
+    step().then_some(demands)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

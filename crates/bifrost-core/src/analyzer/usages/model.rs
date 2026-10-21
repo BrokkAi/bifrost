@@ -422,6 +422,21 @@ impl FuzzyResult {
         hits: BTreeSet<UsageHit>,
         unproven: BTreeSet<UsageHit>,
     ) -> Self {
+        Self::success_with_unproven_limit(
+            target,
+            hits,
+            unproven,
+            Self::MAX_UNPROVEN_HITS_PER_SYMBOL,
+        )
+    }
+
+    /// Retain the caller's explicit evidence budget, independently of editor projection.
+    pub fn success_with_unproven_limit(
+        target: CodeUnit,
+        hits: BTreeSet<UsageHit>,
+        unproven: BTreeSet<UsageHit>,
+        max_unproven: usize,
+    ) -> Self {
         let mut map = HashMap::default();
         map.insert(target.clone(), hits);
         let mut unproven_map = HashMap::default();
@@ -437,7 +452,7 @@ impl FuzzyResult {
             let capped = external
                 .into_iter()
                 .chain(editor_only)
-                .take(Self::MAX_UNPROVEN_HITS_PER_SYMBOL)
+                .take(max_unproven)
                 .collect();
             unproven_map.insert(target.clone(), capped);
         }

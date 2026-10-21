@@ -22,7 +22,7 @@ python -c "import bifrost_searchtools, inspect; print(inspect.signature(bifrost_
 | Python version | 3.12 or later (`requires-python = ">=3.12"`). The client uses `enum.StrEnum`. |
 | Wheel tag | `cp312-abi3`. One wheel serves Python 3.12 and every later 3.x release. |
 | Wheel platforms | Linux x86_64 and aarch64 (manylinux2014), macOS x86_64 and arm64, Windows x86_64 (amd64). |
-| Other platforms | Install from the sdist. The build needs a Rust toolchain (Rust 1.97 or later) and maturin 1.7 or later. |
+| Other platforms | Install from the sdist. The build needs a Rust toolchain (Rust 1.99 or later) and maturin 1.7 or later. |
 | Python dependencies | None. |
 | Native module | `bifrost_searchtools._native`, a compiled extension built with PyO3. |
 

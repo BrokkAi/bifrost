@@ -31,75 +31,17 @@
 //! [`crate::analyzer::invalidation::InvalidationReason::ContentIdentityEvidenceMissing`]
 //! rather than reuse a value it cannot prove current.
 
-use std::fmt;
-
 use crate::analyzer::Language;
 use crate::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-use git2::Oid;
 
-/// Domain for the per-language digest of one analyzed file set.
-const FILE_SET_DOMAIN: &[u8] = b"bifrost-workspace-content:file-set:v1";
 /// Domain for the per-language identity that folds the file set together with
 /// the language epoch and the analyzer configuration.
 const LANGUAGE_DOMAIN: &[u8] = b"bifrost-workspace-content:language:v1";
 /// Domain for a multi-language scope identity.
 const SCOPE_DOMAIN: &[u8] = b"bifrost-workspace-content:scope:v1";
 
-/// The content identity of one analyzed-file scope.
-///
-/// This type is public only because [`crate::analyzer::IAnalyzer`] is an
-/// extension boundary; it is an opaque comparison token with no accessible
-/// structure beyond its digest.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WorkspaceContentIdentity {
-    digest: StableDigest,
-}
-
-impl WorkspaceContentIdentity {
-    pub(crate) const fn from_digest(digest: StableDigest) -> Self {
-        Self { digest }
-    }
-
-    pub(crate) const fn digest(self) -> StableDigest {
-        self.digest
-    }
-
-    /// Stable digest bytes for an exact derived-value persistence key.
-    #[doc(hidden)]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        self.digest.as_bytes()
-    }
-
-    /// The stand-in identity used when a cache has to name an artifact whose
-    /// content identity the analyzer could not state.
-    ///
-    /// It is a digest of a fixed domain string, so it names "no evidence" and
-    /// can never be produced by an analyzed file set. It exists only so that
-    /// [`crate::analyzer::invalidation::InvalidationReason::ContentIdentityEvidenceMissing`]
-    /// can carry a well-formed artifact identity; nothing is ever keyed by it.
-    pub(crate) fn unattested() -> Self {
-        Self::from_digest(StableDigest::sha256(
-            b"bifrost-workspace-content:unattested:v1",
-        ))
-    }
-
-    /// A synthetic identity for tests that exercise cache mechanics without an
-    /// analyzer behind them.
-    #[cfg(test)]
-    pub(crate) fn for_test(seed: u64) -> Self {
-        let mut hasher = CanonicalHasher::new(b"bifrost-workspace-content:test:v1");
-        hasher.value(&seed.to_be_bytes());
-        Self::from_digest(StableDigest::from_array(hasher.finish()))
-    }
-}
-
-impl fmt::Display for WorkspaceContentIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.digest.fmt(formatter)
-    }
-}
+pub use crate::analyzer::semantic::content_identity::WorkspaceContentIdentity;
 
 /// Every language scope one analyzer snapshot can answer for, in language
 /// order.
@@ -114,7 +56,8 @@ pub struct WorkspaceContentIdentities {
 }
 
 impl WorkspaceContentIdentities {
-    pub(crate) fn new(entries: impl IntoIterator<Item = (Language, StableDigest)>) -> Self {
+    #[doc(hidden)]
+    pub fn new(entries: impl IntoIterator<Item = (Language, StableDigest)>) -> Self {
         let mut entries = entries.into_iter().collect::<Vec<_>>();
         entries.sort_by_key(|(language, _)| *language);
         entries.dedup_by_key(|(language, _)| *language);
@@ -140,10 +83,8 @@ impl WorkspaceContentIdentities {
     /// `None` when the analyzer holds no entry the predicate accepts: a cache
     /// keyed on an empty scope would compare equal across unrelated workspaces,
     /// which is precisely the undersized reuse this milestone forbids.
-    pub(crate) fn scope(
-        &self,
-        accept: impl Fn(Language) -> bool,
-    ) -> Option<WorkspaceContentIdentity> {
+    #[doc(hidden)]
+    pub fn scope(&self, accept: impl Fn(Language) -> bool) -> Option<WorkspaceContentIdentity> {
         let mut hasher = CanonicalHasher::new(SCOPE_DOMAIN);
         let mut selected = 0_u64;
         for (language, digest) in self.entries.iter() {
@@ -162,53 +103,10 @@ impl WorkspaceContentIdentities {
     ///
     /// A composite folds its delegates' entries once, at its own boundary, so
     /// one fold means the same thing wherever a scope identity is produced.
-    pub(crate) fn entries(&self) -> &[(Language, StableDigest)] {
+    #[doc(hidden)]
+    pub fn entries(&self) -> &[(Language, StableDigest)] {
         &self.entries
     }
-}
-
-/// Fold one analyzed file set into a digest.
-///
-/// `entries` are (workspace-relative path, content identity) pairs. The caller
-/// supplies them in any order; this sorts by the normalized relative path so
-/// the digest is a function of the set and not of the map's iteration order.
-/// No absolute path enters the digest.
-pub(crate) fn analyzed_file_set_digest(
-    entries: impl IntoIterator<Item = (String, Oid)>,
-) -> StableDigest {
-    analyzed_file_set_digest_with_overlays(
-        entries
-            .into_iter()
-            .map(|(path, content)| (path, content, false)),
-    )
-}
-
-/// The marker an overlaid path contributes instead of its blob identity.
-const OVERLAID_BY_PROJECT: &[u8] = b"overlaid-by-project";
-
-/// [`analyzed_file_set_digest`], with the third element of each entry saying
-/// that the caller takes this path's content from the project's overlay set
-/// rather than from the analyzed file set. See
-/// [`crate::analyzer::store::liveness::LiveSnapshot::content_digest`].
-pub(crate) fn analyzed_file_set_digest_with_overlays(
-    entries: impl IntoIterator<Item = (String, Oid, bool)>,
-) -> StableDigest {
-    let mut entries = entries.into_iter().collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let mut hasher = CanonicalHasher::new(FILE_SET_DOMAIN);
-    hasher.value(
-        &u64::try_from(entries.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
-    for (path, content, overlaid) in entries {
-        if overlaid {
-            hasher.field(&path, OVERLAID_BY_PROJECT);
-        } else {
-            hasher.field(&path, content.as_bytes());
-        }
-    }
-    StableDigest::from_array(hasher.finish())
 }
 
 /// Everything except the file set that decides what a derived value over one
@@ -258,6 +156,11 @@ pub(crate) fn language_content_identity<'a>(
     }
     StableDigest::from_array(hasher.finish())
 }
+
+pub use crate::analyzer::store::file_set_identity::{
+    FILE_SET_DOMAIN, OVERLAID_BY_PROJECT, analyzed_file_set_digest,
+    analyzed_file_set_digest_with_overlays,
+};
 
 #[cfg(test)]
 mod tests {

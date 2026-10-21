@@ -1,0 +1,66 @@
+[package]
+name = "brokk-bifrost-python-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Python analyzer and receiver-aware usage resolution for brokk-bifrost"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = true
+readme = "README.md"
+
+[lib]
+name = "brokk_bifrost_python_analysis"
+
+[lints]
+workspace = true
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0" }
+brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.0" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0" }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.0" }
+configparser = "3.3.0"
+git2 = { version = "0.20.2", default-features = false }
+moka = { version = "0.12.11", features = ["sync"] }
+pep440_rs = "0.7.3"
+pep508_rs = "0.9.2"
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+"hooks",
+"functions",
+] }
+semver = "1.0.28"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.8"
+shlex = "2.0.1"
+toml = "0.8.23"
+tempfile = "3.23.0"
+tree-sitter = "0.25.10"
+tree-sitter-python = "0.25.0"
+toml_edit = "0.22.27"
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"] }
+
+[features]
+default = []
+test-support = ["brokk-bifrost-analysis/test-support"]
+randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
+
+[dev-dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.0", features = ["test-support"] }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.0", features = ["test-support"] }
+rusqlite = { version = "0.40.2", default-features = false, features = [
+"bundled",
+"cache",
+"fallible_uint",
+"trace",
+] }

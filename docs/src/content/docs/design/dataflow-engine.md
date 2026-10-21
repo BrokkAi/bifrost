@@ -53,6 +53,64 @@ value or program-point ID from being paired with rows from another partial
 materialization. Dense IDs are compact implementation coordinates; artifact
 keys provide the public cross-run identity.
 
+### Rust tuple binding initialization
+
+The Rust hook admits flat, by-value identifier bindings from captured tuple
+literals or proved typed binding reads. It schedules the initializer once,
+captures all components before writing a leaf, and publishes a separate
+assignment and ownership transfer for each binding. Literals use their captured
+child values; typed aggregates use distinct ordinal field projections. Component
+types retain their declaration scope, including the defining scope of a
+same-file type alias, and ownership evidence is available before cleanup scopes
+are registered.
+
+Conditional standard `Option<T>` copyability requires the exact standard type
+identity and an independently proved `Copy` payload. Inert drop glue alone does
+not prove `Copy`. Unknown ownership, unsupported moves or cleanup, nested or
+by-reference patterns, rest and capture patterns, refutable patterns, and explicit
+target-type annotations retain scoped gaps. The shared decomposition planner
+preserves source order, cancellation and work accounting; each language supplies its own
+projection, transfer and failure semantics. Initialization consumers continue to
+require real establishments and complete relevant evidence.
+
+### Semantic rows and file windows (#5113)
+
+Between converted RQL steps, semantic rows carry references: workspace file,
+content revision and procedure locator, plus a point or call-site ordinal when
+needed. They do not retain `ProcedureHandle`, `ProgramPointHandle`,
+`CallSiteHandle` or `Arc<SemanticArtifact>`. Python `procedure-of` inventories
+references without executable lowering. Each consuming step groups its own
+input by file, resolves one file through the shared artifact cache, projects
+artifact-free results, and closes that file window before the next file.
+Executor stage batching stays unchanged; adjacent steps are not fused. A changed
+revision produces a structured row failure instead of silently resolving again.
+
+Witnesses and pipeline provenance project to identity/location snapshots at
+emission with the existing step/byte limits and truncation metadata. Root-local
+handle-keyed solver caches clear on file-window close; reusable cross-root
+summaries use references and handle-free payloads. Nonmechanical legacy
+consumers (value-flow/taint and handle-backed guard/control/state/flow payloads)
+retain their existing lifetimes until explicitly converted; accepting a
+reference alone does not establish artifact release.
+
+The field-slot prepass likewise collects facts one file at a time and retains
+plain class/field identities, procedure references and write-site ordinals,
+never a workspace vector of procedure handles. Cross-file dynamic-write
+observations resolve against each root's discovered closure, preserving exact
+allocation identity after eviction. The index is one query's result and drops
+with that query. Persisting Python executable IR remains a measurement-driven
+option rather than a prerequisite for file windows.
+
+Complete semantic artifacts and prepared workspace dispatch sessions each have
+an explicit 2 GiB cache cap, independent of the global memo budget. This is a
+provisional owner decision for the current Python semantic path, to revisit
+when Python moves to the native engine (#5113). The former roughly 32 MiB cap
+caused hours of repeated lowering on elasticsearch-py; 2 GiB eliminated repeat
+lowering in the measured replay. Other caches keep their existing budgets.
+Cross-root entries must use references or include every pinned artifact and
+arena in their byte weight; logical eviction alone does not establish physical
+release.
+
 ### Module initializers and source ownership
 
 Python gives module statements a synthetic `<file>` initializer when a module
@@ -246,12 +304,34 @@ condition names each possible write site. Bounded writes and other incomplete
 surveys still block the finding.
 The preliminary survey does not use member absence to exclude classes. It
 repeats as affected field slots open until the effects stabilize, within shared
-semantic and solver budgets. Member guards such as `hasattr` consult that same survey
+resident semantic and per-root solver budgets. Member guards such as `hasattr` consult that same survey
 before excluding a receiver class. A possible store does not invent a callable declaration
 or an exhaustive dispatch target. The syntactic survey shares the field-slot index's validity, bounded persistence,
 and replay accounting. Surveys requiring dynamic receiver propagation remain
 request-local; their additional solver work is not covered by artifact-only
 persistent replay.
+
+The dynamic-write survey discovers only from roots that can reach a write
+site. Structured incoming caller lookup includes conservative same-name
+candidates when dispatch is unresolved. It accepts target batches, builds the
+Python project graph once per batch and walks each candidate file once, while
+preserving each target's alias/re-export seeds, proof states, limits and omitted
+counts. The single-target API is a singleton batch. Other language scanners
+retain their existing behavior where they cannot share that walk.
+
+The reverse survey walks breadth-first, one batch per level, so depth is the
+shortest distance from a write. Each write has its own completed frontier and
+failure evidence, with an incoming retention bound of 4,096 candidates per
+procedure per level, independent of editor projection limits. An incomplete
+lookup, omitted caller, missing index or refused depth makes that write
+caller-unbounded and opens its affected slots with a diagnostic naming the
+site, procedure and reason. It never falls back to discovering every root.
+Only completed walks contribute candidate roots; failures of disjoint skipped
+roots do not open unrelated writes. Candidate-root materialization failures
+remain incomplete-root evidence with the exact refusal and allow the survey to
+continue. Batch graphs, trees and caller memos drop before forward discovery.
+Batched scans address repeated tree walks without a new caller table; call-site
+rows remain an option for interactive find-references latency.
 
 Python conditional expressions copy the selected arm's value to their result
 when that arm completes normally. Short-circuit `and` and `or` similarly
@@ -680,6 +760,40 @@ prefetched dispatch answers, and the caller file map end with the policy
 compile. Outside the search, the analyzer keeps the stored rows, a byte-capped
 cache of complete semantic artifacts (decoded from rows or lowered on demand),
 and bounded source-identity bookkeeping.
+
+## Semantic residency and work accounting
+
+Semantic lane limits bound retained source and rows, including `SourceBytes`
+and `NestedEntries`. Releasing a holder refunds its resident census. Source
+scans, lowering traversal, and visits to existing events or mappings never
+refuse. They add to cumulative telemetry and the current root's work balance;
+receipts report the largest root balance and resident peak per lane. Cumulative
+telemetry includes admissions plus work, so holding and scanning the same bytes
+can count them twice. Replay admits the retained census and imports work
+telemetry without checking a work grant. Solver step limits and discovery's
+procedure limit remain independent bounds on the analysis.
+
+Replay records keep cumulative work, largest root or prepass work and retained
+census per lane. Changed persisted shapes are versioned and SQL-readable.
+Cache-only holders in complete-artifact and prepared-session caches do not count
+in a root's resident balance; live root/window pins do. Reconciliation follows
+actual allocation ownership rather than content equality or logical eviction.
+Work is telemetry even when recomputation is caused by cache eviction, so warm
+and cold completion cannot differ because of a semantic work grant.
+
+Cached refinements admit the measured returned value only. Fixpoint scratch is
+admitted during derivation and refunded on every exit; scans and comparisons
+are work. Identical fact replacements leave residency unchanged. Root children
+inherit live resident census, start work at zero, and fold cumulative work and
+component-wise peaks on return. Failed staged publication preserves performed
+work while discarding unpublished admissions.
+
+Inside a value-flow plan, kill and trigger lists use dense insertion-order
+source IDs and shared interned ID lists. Public identities, digests, witnesses
+and persisted rows resolve those IDs back to event keys. This avoids replicating
+locator-bearing keys across every guard edge. A witnessless trial result is
+released before the witness solve begins; witness arenas remain one root's
+working set under solver limits, rather than cross-root retention.
 
 ## Fixed point and coverage
 

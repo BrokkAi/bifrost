@@ -22,21 +22,19 @@ dependency_keys(unit_key) AS (
  FROM owner
  CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
   ON dependency.summary_id=owner.summary_id
- CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS name
-  INDEXED BY rust_resolution_unit_summary_dependency_names_owner_extern
+ CROSS JOIN main.rust_unit_summary_dependency_names AS name
   ON name.summary_id=dependency.summary_id
  AND name.dependency_ordinal=dependency.dependency_ordinal AND name.extern_name=?2
  UNION
  SELECT dependency.dependency_unit_key
  FROM owner
- CROSS JOIN main.rust_resolution_unit_summary_placements AS placement
+ CROSS JOIN main.rust_unit_summary_placements AS placement
   ON placement.summary_id=owner.summary_id AND placement.module_path='crate'
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=placement.summary_id AND member.member_ordinal=placement.member_ordinal
  CROSS JOIN source_rust_import_targets AS import
   ON import.blob_id=member.blob_id
- CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS name
-  INDEXED BY rust_resolution_unit_summary_dependency_names_owner_extern
+ CROSS JOIN main.rust_unit_summary_dependency_names AS name
   ON name.summary_id=owner.summary_id AND name.extern_name=import.imported_name
  CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
   ON dependency.summary_id=name.summary_id

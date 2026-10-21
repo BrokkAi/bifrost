@@ -3,8 +3,16 @@ use super::*;
 use brokk_bifrost_core::analyzer::rust_facts::{RustVisibility, decode_rust_visibility};
 use rusqlite::types::Value;
 
-pub(super) const RESTRICTION_INPUTS_SQL: &str = include_str!("rust_crate_visibility_inputs.sql");
-pub(super) const RESTRICTIONS_SQL: &str = include_str!("rust_crate_visibility_routes.sql");
+#[path = "rust_crate_binding_authority.rs"]
+mod binding_authority;
+#[path = "rust_crate_binding_relation.rs"]
+#[doc(hidden)]
+pub mod binding_relation;
+
+#[doc(hidden)]
+pub const RESTRICTION_INPUTS_SQL: &str = include_str!("rust_crate_visibility_inputs.sql");
+#[doc(hidden)]
+pub const RESTRICTIONS_SQL: &str = include_str!("rust_crate_visibility_routes.sql");
 pub(super) const CONSTRUCTOR_VISIBILITIES_SQL: &str =
     include_str!("rust_crate_constructor_visibility.sql");
 pub(super) const RESTRICTION_GAPS_SQL: &str = "INSERT INTO cr_gaps
@@ -12,8 +20,10 @@ pub(super) const RESTRICTION_GAPS_SQL: &str = "INSERT INTO cr_gaps
  json_object('visibility', visibility, 'reason', 'UnresolvedVisibility')
  FROM cr_restrictions WHERE restricted_module_path IS NULL";
 
-pub(super) const DECLARATIONS_SQL: &str = include_str!("rust_crate_export_declarations.sql");
-pub(super) const SOURCE_DECLARATIONS_SQL: &str = include_str!("rust_crate_source_declarations.sql");
+#[doc(hidden)]
+pub const DECLARATIONS_SQL: &str = include_str!("rust_crate_export_declarations.sql");
+#[doc(hidden)]
+pub const SOURCE_DECLARATIONS_SQL: &str = include_str!("rust_crate_source_declarations.sql");
 pub(super) const MACRO_ITEMS_SQL: &str = include_str!("rust_crate_macro_items.sql");
 /// The active, declarable candidates of `rust_crate_macro_items.sql` become
 /// crate rows: one per item, and a tuple or unit struct's value constructor as
@@ -52,7 +62,8 @@ fn route_walk(sources: &str, segments: &str, key: &str, output: &str) -> String 
         .replace("{key}", key)
         .replace("{output}", output)
 }
-pub(super) static ROUTES_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+#[doc(hidden)]
+pub static ROUTES_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     route_walk(
         "cr_source_imports",
         "source_rust_import_module_segments",
@@ -68,7 +79,8 @@ pub(super) static ROOT_ROUTES_SQL: std::sync::LazyLock<String> = std::sync::Lazy
         "cr_root_routes",
     )
 });
-pub(super) const ROOT_SOURCES_SQL: &str = include_str!("rust_crate_root_sources.sql");
+#[doc(hidden)]
+pub const ROOT_SOURCES_SQL: &str = include_str!("rust_crate_root_sources.sql");
 pub(super) const PUBLIC_SURFACE_BINDINGS_SQL: &str = include_str!("rust_crate_public_surface.sql");
 const PUBLIC_SURFACE_ALIAS_TEMPLATE: &str = include_str!("rust_crate_public_surface_aliases.sql");
 fn public_surface_aliases(
@@ -123,12 +135,8 @@ pub(super) const PUBLIC_SURFACE_SELECT_SQL: &str = "SELECT kind, crate_key, modu
     namespace, name, target_crate_key, target_module_path FROM cr_surface_facts
     ORDER BY kind, crate_key, module_path, namespace, name, target_crate_key, target_module_path";
 
-// A type path in an impl header is lexical in every edition: Rust 2015's
-// crate-root-relative rule governs `use` declarations, not paths written in an
-// item. The shared walk takes the edition only to apply that rule, so the two
-// impl-header walks pass the edition that leaves it off.
-const IMPL_HEADER_ANCHOR_EDITION: &str = "2018";
-pub(super) const IMPL_SOURCES_SQL: &str = include_str!("rust_crate_trait_impl_sources.sql");
+#[doc(hidden)]
+pub const IMPL_SOURCES_SQL: &str = include_str!("rust_crate_trait_impl_sources.sql");
 pub(super) static IMPL_SUBJECT_ROUTES_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         route_walk(
@@ -175,6 +183,7 @@ const IMPL_BINDINGS_SQL: &str = include_str!("rust_crate_trait_impl_bindings.sql
 // evaluates against one row of it, so it is always a triple some candidate
 // holds; every candidate in an agreeing group names the same declaration, which
 // is all the declaration statement reads from it.
+#[cfg(any(test, feature = "test-support"))]
 const IMPL_GLOB_BINDINGS_SQL: &str = "INSERT OR IGNORE INTO cr_impl_bindings
     WITH RECURSIVE reach(blob_id, relation_key, module_path, name, crate_key, reached) AS (
       SELECT source.blob_id, source.relation_key, source.module_path, source.{name},
@@ -342,10 +351,12 @@ pub(super) static IMPL_SUBJECT_BINDINGS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| impl_half(IMPL_BINDINGS_SQL, "subject", "cr_impl_subject_routes"));
 pub(super) static IMPL_TRAIT_BINDINGS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| impl_half(IMPL_BINDINGS_SQL, "trait", "cr_impl_trait_routes"));
+#[cfg(any(test, feature = "test-support"))]
 pub(super) static IMPL_SUBJECT_GLOB_BINDINGS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         impl_half(IMPL_GLOB_BINDINGS_SQL, "subject", "cr_impl_subject_routes")
     });
+#[cfg(any(test, feature = "test-support"))]
 pub(super) static IMPL_TRAIT_GLOB_BINDINGS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| impl_half(IMPL_GLOB_BINDINGS_SQL, "trait", "cr_impl_trait_routes"));
 pub(super) static IMPL_SUBJECT_GAPS_SQL: std::sync::LazyLock<String> =
@@ -358,11 +369,12 @@ pub(super) const IMPL_ROWS_SQL: &str = include_str!("rust_crate_trait_impls.sql"
 pub(super) const TRAIT_IMPL_SELECT_SQL: &str = "SELECT * FROM cr_trait_impls";
 pub(super) const TRAIT_IMPL_INSERT_SQL: &str =
     "INSERT INTO rust_crate_trait_impls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)";
+#[cfg(any(test, feature = "test-support"))]
 pub(super) const FIXPOINT_SQL: &str = include_str!("rust_crate_export_fixpoint.sql");
-pub(super) const EXPORT_SOURCES_SQL: &str = include_str!("rust_crate_export_sources.sql");
-const SEED_EXPORT_DELTA_SQL: &str = "INSERT INTO cr_export_delta SELECT * FROM cr_exports";
-const ADVANCE_EXPORT_DELTA_SQL: &str = "DELETE FROM cr_export_delta; INSERT INTO cr_export_delta SELECT * FROM cr_export_delta_next; DELETE FROM cr_export_delta_next";
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const EXPORT_SOURCES_SQL: &str = include_str!("rust_crate_export_sources.sql");
+#[cfg(any(test, feature = "test-support"))]
 const LEGACY_FIXPOINT_SQL: &str = r#"
 WITH candidates(module_path, namespace, name, origin, source_visibility,
                 source_restricted_module_path, target_crate_key, target_module_path,
@@ -446,7 +458,7 @@ WHERE (candidate.domain_path IS NOT NULL
       AND present.name = candidate.name
       AND present.origin NOT IN ('glob_reexport', 'reexport')
 )
-ON CONFLICT(crate_key, module_path, namespace, name) DO UPDATE SET
+ON CONFLICT(crate_key, module_path, namespace, name, declaration_blob_id, declaration_site) DO UPDATE SET
   origin = excluded.origin, visibility = excluded.visibility,
   restricted_module_path = excluded.restricted_module_path,
   declaration_blob_id = excluded.declaration_blob_id,
@@ -477,6 +489,11 @@ pub(super) struct ExportRows {
     reexports: Vec<Vec<Value>>,
     glob_reexports: Vec<Vec<Value>>,
     imports: Vec<Vec<Value>>,
+    binding_provenance: Vec<Vec<Value>>,
+    binding_owners: Vec<Vec<Value>>,
+    binding_names: Vec<Vec<Value>>,
+    binding_alternatives: Vec<Vec<Value>>,
+    binding_blockers: Vec<Vec<Value>>,
     globs: Vec<Vec<Value>>,
     root_references: Vec<Vec<Value>>,
     trait_impls: Vec<Vec<Value>>,
@@ -485,69 +502,96 @@ pub(super) struct ExportRows {
     surface: CrateKey,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
-pub(super) struct RoutePassMetrics {
-    pub(super) pass: usize,
-    pub(super) source_import_rows_read: usize,
-    pub(super) reexport_step_rows_read: usize,
-    pub(super) glob_step_rows_read: usize,
-    pub(super) route_rows_written: usize,
-    pub(super) reexport_step_rows_written: usize,
-    pub(super) reexport_closure_rows_deleted: usize,
-    pub(super) reexport_closure_rows_written: usize,
-    pub(super) glob_step_rows_written: usize,
-    pub(super) glob_closure_rows_deleted: usize,
-    pub(super) glob_closure_rows_written: usize,
-    pub(super) sqlite_vm_steps: u64,
+#[doc(hidden)]
+pub struct RoutePassMetrics {
+    #[doc(hidden)]
+    pub pass: usize,
+    #[doc(hidden)]
+    pub source_import_rows_read: usize,
+    #[doc(hidden)]
+    pub reexport_step_rows_read: usize,
+    #[doc(hidden)]
+    pub glob_step_rows_read: usize,
+    #[doc(hidden)]
+    pub route_rows_written: usize,
+    #[doc(hidden)]
+    pub reexport_step_rows_written: usize,
+    #[doc(hidden)]
+    pub reexport_closure_rows_deleted: usize,
+    #[doc(hidden)]
+    pub reexport_closure_rows_written: usize,
+    #[doc(hidden)]
+    pub glob_step_rows_written: usize,
+    #[doc(hidden)]
+    pub glob_closure_rows_deleted: usize,
+    #[doc(hidden)]
+    pub glob_closure_rows_written: usize,
+    #[doc(hidden)]
+    pub sqlite_vm_steps: u64,
     pub(super) derive_elapsed_micros: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
-pub(super) struct ExportFixpointPassMetrics {
-    pub(super) pass: usize,
-    pub(super) delta_rows_read: usize,
-    pub(super) source_rows: usize,
-    pub(super) rows_written: usize,
-    pub(super) sqlite_vm_steps: u64,
-    pub(super) elapsed_micros: u64,
-    pub(super) derive_elapsed_micros: u64,
+#[doc(hidden)]
+pub struct ExportFixpointPassMetrics {
+    #[doc(hidden)]
+    pub pass: usize,
+    #[doc(hidden)]
+    pub delta_rows_read: usize,
+    #[doc(hidden)]
+    pub source_rows: usize,
+    #[doc(hidden)]
+    pub rows_written: usize,
+    #[doc(hidden)]
+    pub sqlite_vm_steps: u64,
+    #[doc(hidden)]
+    pub elapsed_micros: u64,
+    #[doc(hidden)]
+    pub derive_elapsed_micros: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
-pub(super) struct LegacyExportCompareMetrics {
-    pub(super) crate_name: String,
-    pub(super) legacy_passes: usize,
-    pub(super) export_rows: usize,
-    pub(super) exports_digest: String,
+#[doc(hidden)]
+pub struct LegacyExportCompareMetrics {
+    #[doc(hidden)]
+    pub crate_name: String,
+    #[doc(hidden)]
+    pub legacy_passes: usize,
+    #[doc(hidden)]
+    pub export_rows: usize,
+    #[doc(hidden)]
+    pub exports_digest: String,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static ROUTE_PASS_METRICS: std::sync::LazyLock<std::sync::Mutex<Vec<(String, RoutePassMetrics)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static EXPORT_FIXPOINT_PASS_METRICS: std::sync::LazyLock<
     std::sync::Mutex<Vec<(String, ExportFixpointPassMetrics)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CAPTURE_ROUTE_PASS_METRICS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static LEGACY_EXPORT_COMPARE_CRATES: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static LEGACY_EXPORT_COMPARE_METRICS: std::sync::LazyLock<
     std::sync::Mutex<Vec<LegacyExportCompareMetrics>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-#[cfg(test)]
-pub(super) fn begin_route_pass_metric_capture() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn begin_route_pass_metric_capture() {
     ROUTE_PASS_METRICS
         .lock()
         .expect("Rust route-pass metrics lock")
@@ -559,8 +603,9 @@ pub(super) fn begin_route_pass_metric_capture() {
     CAPTURE_ROUTE_PASS_METRICS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(test)]
-pub(super) fn begin_legacy_export_compare(crate_name: &str) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn begin_legacy_export_compare(crate_name: &str) {
     LEGACY_EXPORT_COMPARE_CRATES
         .lock()
         .expect("Rust legacy-export compare lock")
@@ -571,10 +616,9 @@ pub(super) fn begin_legacy_export_compare(crate_name: &str) {
         .retain(|metrics| metrics.crate_name != crate_name);
 }
 
-#[cfg(test)]
-pub(super) fn take_legacy_export_compare_metrics(
-    crate_name: &str,
-) -> Vec<LegacyExportCompareMetrics> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_legacy_export_compare_metrics(crate_name: &str) -> Vec<LegacyExportCompareMetrics> {
     LEGACY_EXPORT_COMPARE_CRATES
         .lock()
         .expect("Rust legacy-export compare lock")
@@ -590,7 +634,7 @@ pub(super) fn take_legacy_export_compare_metrics(
     selected
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn export_rows_digest(rows: &[Vec<Value>]) -> String {
     let mut digest = Sha256::new();
     for row in rows {
@@ -600,7 +644,7 @@ fn export_rows_digest(rows: &[Vec<Value>]) -> String {
     crate::analyzer::canonical_hash::lower_hex_string(&digest)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn compare_legacy_export_fixpoint(
     conn: &Connection,
     crate_key: &[u8],
@@ -613,12 +657,12 @@ fn compare_legacy_export_fixpoint(
          FROM cr_exports ORDER BY crate_key, module_path, namespace, name",
     )?;
     let legacy_result = (|| -> Result<(Vec<Vec<Value>>, usize)> {
-        conn.execute(
+        conn.prepare_cached(
             "DELETE FROM cr_exports
              WHERE crate_key=(SELECT crate_key FROM cr_identity)
                AND origin IN ('reexport', 'glob_reexport')",
-            [],
-        )?;
+        )?
+        .execute([])?;
         conn.execute_batch("DELETE FROM cr_export_delta; DELETE FROM cr_export_delta_next;")?;
         let mut passes = 0usize;
         loop {
@@ -644,10 +688,10 @@ fn compare_legacy_export_fixpoint(
         Ok((legacy_rows, passes))
     })();
 
-    conn.execute("DELETE FROM cr_exports", [])?;
+    conn.prepare_cached("DELETE FROM cr_exports")?.execute([])?;
     {
         let mut insert =
-            conn.prepare("INSERT INTO cr_exports VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
+            conn.prepare_cached("INSERT INTO cr_exports VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
         for row in &current_rows {
             insert.execute(rusqlite::params_from_iter(row.iter()))?;
         }
@@ -672,8 +716,9 @@ fn compare_legacy_export_fixpoint(
     })
 }
 
-#[cfg(test)]
-pub(super) fn take_route_pass_metrics() -> Vec<(String, RoutePassMetrics)> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_route_pass_metrics() -> Vec<(String, RoutePassMetrics)> {
     CAPTURE_ROUTE_PASS_METRICS.store(false, std::sync::atomic::Ordering::Relaxed);
     std::mem::take(
         &mut *ROUTE_PASS_METRICS
@@ -682,8 +727,9 @@ pub(super) fn take_route_pass_metrics() -> Vec<(String, RoutePassMetrics)> {
     )
 }
 
-#[cfg(test)]
-pub(super) fn take_export_fixpoint_pass_metrics() -> Vec<(String, ExportFixpointPassMetrics)> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_export_fixpoint_pass_metrics() -> Vec<(String, ExportFixpointPassMetrics)> {
     CAPTURE_ROUTE_PASS_METRICS.store(false, std::sync::atomic::Ordering::Relaxed);
     std::mem::take(
         &mut *EXPORT_FIXPOINT_PASS_METRICS
@@ -697,17 +743,22 @@ fn execute_with_vm_steps<P: rusqlite::Params>(
     sql: &str,
     params: P,
 ) -> Result<(usize, u64)> {
-    let mut statement = conn.prepare(sql)?;
+    let mut statement = conn.prepare_cached(sql)?;
+    // Cached statements retain VM counters across uses; each pass measures only
+    // this execution, as it did when every statement was freshly prepared.
+    #[cfg(any(test, feature = "test-support"))]
+    statement.reset_status(rusqlite::StatementStatus::VmStep);
     let changed = statement.execute(params)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let vm_steps = statement
         .get_status(rusqlite::StatementStatus::VmStep)
         .max(0) as u64;
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let vm_steps = 0;
     Ok((changed, vm_steps))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn temp_table_rows(conn: &Connection, table: &str) -> Result<usize> {
     let count = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
         row.get::<_, i64>(0)
@@ -722,7 +773,7 @@ pub(super) fn derive_exports(
     gate_decisions: &[super::ItemMacroDecision],
     cfg: &str,
 ) -> Result<ExportRows> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let derive_started = std::time::Instant::now();
     let stage = |statement: &str| {
         crate::profiling::scope_with(|| {
@@ -737,42 +788,36 @@ pub(super) fn derive_exports(
         let _timing = stage("prepare_tables");
         prepare_tables(conn)?;
         for member in modules {
-            conn.execute(
-                SQL_CR_MEMBERS_1,
-                params![
-                    member.module_path,
-                    member.blob_id,
-                    member.scope,
-                    member.rel_path,
-                    member.placement
-                ],
-            )?;
+            conn.prepare_cached(SQL_CR_MEMBERS_1)?.execute(params![
+                member.module_path,
+                member.blob_id,
+                member.scope,
+                member.rel_path,
+                member.placement
+            ])?;
         }
-        conn.execute(SQL_CR_MEMBERS_2, [])?;
+        conn.prepare_cached(SQL_CR_MEMBERS_2)?.execute([])?;
         for decision in gate_decisions.iter().filter(|decision| !decision.no_route) {
-            conn.execute(
-                INSERT_ITEM_MACRO_DECISION_SQL,
-                params![
+            conn.prepare_cached(INSERT_ITEM_MACRO_DECISION_SQL)?
+                .execute(params![
                     decision.blob_id,
                     decision.invocation_occurrence_id,
                     decision.decoration_cfg
-                ],
-            )?;
+                ])?;
         }
         for decision in gate_decisions.iter().filter(|decision| decision.no_route) {
-            conn.execute(
-                INSERT_ITEM_MACRO_NO_ROUTE_SQL,
-                params![decision.blob_id, decision.invocation_occurrence_id],
-            )?;
+            conn.prepare_cached(INSERT_ITEM_MACRO_NO_ROUTE_SQL)?
+                .execute(params![decision.blob_id, decision.invocation_occurrence_id])?;
         }
-        conn.execute(POPULATE_MEMBER_BLOBS_SQL, [])?;
-        conn.execute(POPULATE_SCOPES_SQL, [])?;
-        conn.execute(INSERT_IDENTITY_SQL, [item.key.as_slice()])?;
-        conn.execute(INSERT_FOREIGN_SQL, [])?;
+        conn.prepare_cached(POPULATE_MEMBER_BLOBS_SQL)?
+            .execute([])?;
+        conn.prepare_cached(POPULATE_SCOPES_SQL)?.execute([])?;
+        conn.prepare_cached(INSERT_IDENTITY_SQL)?
+            .execute([item.key.as_slice()])?;
+        conn.prepare_cached(INSERT_FOREIGN_SQL)?.execute([])?;
         for (name, _, key) in &item.dependencies {
-            conn.execute(
-                SQL_CR_DEPENDENCIES_3,
-                params![
+            conn.prepare_cached(SQL_CR_DEPENDENCIES_3)?
+                .execute(params![
                     name,
                     key.map(|key| key.to_vec()),
                     key.map(|key| conn
@@ -784,297 +829,144 @@ pub(super) fn derive_exports(
                         .optional())
                         .transpose()?
                         .flatten()
-                ],
-            )?;
+                ])?;
         }
-        conn.execute(EXTERN_CRATE_ALIAS_DEPENDENCIES_SQL, [cfg])?;
+        conn.prepare_cached(EXTERN_CRATE_ALIAS_DEPENDENCIES_SQL)?
+            .execute([cfg])?;
     }
     {
         let _timing = stage("export_declarations");
-        conn.execute(SOURCE_DECLARATIONS_SQL, [cfg])?;
-        conn.execute(RESTRICTION_INPUTS_SQL, [])?;
-        conn.execute(RESTRICTIONS_SQL, [])?;
-        conn.execute(RESTRICTION_GAPS_SQL, [])?;
-        conn.execute(CONSTRUCTOR_VISIBILITIES_SQL, [])?;
-        conn.execute(DECLARATIONS_SQL, [])?;
-        conn.execute(MACRO_ITEMS_SQL, [cfg])?;
-        conn.execute(MACRO_ITEM_ROWS_SQL, [])?;
-        conn.execute(MACRO_ITEM_COVERAGE_SQL, [])?;
-        conn.execute(SQL_CR_EXPORTS_4, [])?;
+        conn.prepare_cached(SOURCE_DECLARATIONS_SQL)?
+            .execute([cfg])?;
+        conn.prepare_cached(RESTRICTION_INPUTS_SQL)?.execute([])?;
+        conn.prepare_cached(RESTRICTIONS_SQL)?.execute([])?;
+        conn.prepare_cached(RESTRICTION_GAPS_SQL)?.execute([])?;
+        conn.prepare_cached(CONSTRUCTOR_VISIBILITIES_SQL)?
+            .execute([])?;
+        conn.prepare_cached(DECLARATIONS_SQL)?.execute([])?;
+        conn.prepare_cached(MACRO_ITEMS_SQL)?.execute([cfg])?;
+        conn.prepare_cached(MACRO_ITEM_ROWS_SQL)?.execute([])?;
+        conn.prepare_cached(MACRO_ITEM_COVERAGE_SQL)?.execute([])?;
+        conn.prepare_cached(SQL_CR_EXPORTS_4)?.execute([])?;
     }
     {
         let _timing = stage("enum_containers");
-        conn.execute(ENUM_CONTAINERS_SQL, [])?;
+        conn.prepare_cached(ENUM_CONTAINERS_SQL)?.execute([])?;
     }
     {
         let _timing = stage("enum_variants");
-        conn.execute(ENUM_VARIANTS_SQL, [])?;
+        conn.prepare_cached(ENUM_VARIANTS_SQL)?.execute([])?;
     }
     {
         let _timing = stage("containers");
-        conn.execute(CONTAINERS_SQL, [])?;
-        conn.execute(FOREIGN_REEXPORT_STEPS_SQL, [])?;
-        conn.execute(CLOSE_REEXPORT_STEPS_SQL, [])?;
-        conn.execute(FOREIGN_GLOB_STEPS_SQL, [])?;
-        conn.execute(CLOSE_GLOB_STEPS_SQL, [])?;
+        conn.prepare_cached(CONTAINERS_SQL)?.execute([])?;
+        conn.prepare_cached(FOREIGN_REEXPORT_STEPS_SQL)?
+            .execute([])?;
+        conn.prepare_cached(CLOSE_REEXPORT_STEPS_SQL)?.execute([])?;
+        conn.prepare_cached(FOREIGN_GLOB_STEPS_SQL)?.execute([])?;
+        conn.prepare_cached(CLOSE_GLOB_STEPS_SQL)?.execute([])?;
     }
     {
-        let _timing = stage("import_resolution");
-        conn.execute(SQL_CR_SOURCE_IMPORTS_5, [cfg])?;
-        conn.execute(MACRO_USE_ROUTES_SQL, [])?;
-        // A `use crate::m::Name` whose `m` is a name this crate re-exported from
-        // a dependency needs that re-export's own route, which the same walk
-        // produces. A `use m::Name` whose `m` arrives through `use crate::*;`
-        // needs that glob's own route for the same reason, and the glob edges
-        // a pass discovers can let the next pass route an import that had no
-        // route before. The walk therefore runs until it adds no route: each
-        // pass publishes the routes it found as re-export steps and as glob
-        // edges, and the next pass follows them. Every pass inserts at least
-        // one route or ends the loop, and a route is inserted once, so the loop
-        // is bounded by the crate's import count. The two derived relations are
-        // monotone in `cr_routes`, so a later pass never withdraws a step an
-        // earlier pass added and the walk sees a growing relation only.
-        let mut pass = 0usize;
-        loop {
-            #[cfg(test)]
-            let source_import_rows_read = temp_table_rows(conn, "cr_source_imports")?;
-            let (added, _route_vm_steps) = {
-                let _timing = crate::profiling::scope_with(|| {
-                    format!(
-                        "rust_crates.derive name={} kind={} statement=import_routes pass={pass}",
-                        item.target.name,
-                        target_kind(item.target.kind)
-                    )
-                });
-                execute_with_vm_steps(
-                    conn,
-                    ROUTES_SQL.as_str(),
-                    params![item.key.as_slice(), edition(item.target.edition)],
-                )?
-            };
-            pass += 1;
-            if added == 0 {
-                #[cfg(test)]
-                if CAPTURE_ROUTE_PASS_METRICS.load(std::sync::atomic::Ordering::Relaxed) {
-                    ROUTE_PASS_METRICS
-                        .lock()
-                        .expect("Rust route-pass metrics lock")
-                        .push((
-                            item.target.name.clone(),
-                            RoutePassMetrics {
-                                pass,
-                                source_import_rows_read,
-                                reexport_step_rows_read: 0,
-                                glob_step_rows_read: 0,
-                                route_rows_written: 0,
-                                reexport_step_rows_written: 0,
-                                reexport_closure_rows_deleted: 0,
-                                reexport_closure_rows_written: 0,
-                                glob_step_rows_written: 0,
-                                glob_closure_rows_deleted: 0,
-                                glob_closure_rows_written: 0,
-                                sqlite_vm_steps: _route_vm_steps,
-                                derive_elapsed_micros: 0,
-                            },
-                        ));
-                }
-                break;
-            }
-            #[cfg(test)]
-            let reexport_step_rows_read = temp_table_rows(conn, "cr_reexport_steps")?;
-            let (_reexport_step_rows_written, _reexport_step_vm_steps) =
-                execute_with_vm_steps(conn, LOCAL_REEXPORT_STEPS_SQL, [])?;
-            let (_reexport_closure_rows_deleted, _clear_reexport_vm_steps) =
-                execute_with_vm_steps(conn, CLEAR_REEXPORT_CLOSURE_SQL, [])?;
-            let (_reexport_closure_rows_written, _close_reexport_vm_steps) =
-                execute_with_vm_steps(conn, CLOSE_REEXPORT_STEPS_SQL, [])?;
-            #[cfg(test)]
-            let glob_step_rows_read = temp_table_rows(conn, "cr_glob_steps")?;
-            let (_glob_step_rows_written, _glob_step_vm_steps) =
-                execute_with_vm_steps(conn, LOCAL_GLOB_STEPS_SQL, [])?;
-            let (_glob_closure_rows_deleted, _clear_glob_vm_steps) =
-                execute_with_vm_steps(conn, CLEAR_GLOB_CLOSURE_SQL, [])?;
-            let (_glob_closure_rows_written, _close_glob_vm_steps) =
-                execute_with_vm_steps(conn, CLOSE_GLOB_STEPS_SQL, [])?;
-            #[cfg(test)]
-            if CAPTURE_ROUTE_PASS_METRICS.load(std::sync::atomic::Ordering::Relaxed) {
-                ROUTE_PASS_METRICS
-                    .lock()
-                    .expect("Rust route-pass metrics lock")
-                    .push((
-                        item.target.name.clone(),
-                        RoutePassMetrics {
-                            pass,
-                            source_import_rows_read: source_import_rows_read * 3,
-                            reexport_step_rows_read: reexport_step_rows_read
-                                + _reexport_step_rows_written,
-                            glob_step_rows_read: glob_step_rows_read + _glob_step_rows_written,
-                            route_rows_written: added,
-                            reexport_step_rows_written: _reexport_step_rows_written,
-                            reexport_closure_rows_deleted: _reexport_closure_rows_deleted,
-                            reexport_closure_rows_written: _reexport_closure_rows_written,
-                            glob_step_rows_written: _glob_step_rows_written,
-                            glob_closure_rows_deleted: _glob_closure_rows_deleted,
-                            glob_closure_rows_written: _glob_closure_rows_written,
-                            sqlite_vm_steps: _route_vm_steps
-                                + _reexport_step_vm_steps
-                                + _clear_reexport_vm_steps
-                                + _close_reexport_vm_steps
-                                + _glob_step_vm_steps
-                                + _clear_glob_vm_steps
-                                + _close_glob_vm_steps,
-                            derive_elapsed_micros: 0,
-                        },
-                    ));
-            }
-        }
-    }
-    {
-        // An impl header's two paths walk the same module routes a `use` walks,
-        // and they run here so a route that leaves this crate is one of the
-        // routes the dependency-export load below reads.
-        let _timing = stage("impl_header_routes");
-        conn.execute(IMPL_SOURCES_SQL, [])?;
-        for routes in [
-            IMPL_SUBJECT_ROUTES_SQL.as_str(),
-            IMPL_TRAIT_ROUTES_SQL.as_str(),
-        ] {
-            conn.execute(
-                routes,
-                params![item.key.as_slice(), IMPL_HEADER_ANCHOR_EDITION],
-            )?;
-        }
-    }
-    {
-        let _timing = stage("dependency_exports");
-        conn.execute(DEPENDENCY_EXPORTS_SQL, [item.key.as_slice()])?;
-    }
-    conn.execute(EXPORT_SOURCES_SQL, [])?;
-    conn.execute_batch("DELETE FROM cr_export_delta; DELETE FROM cr_export_delta_next;")?;
-    conn.execute(SEED_EXPORT_DELTA_SQL, [])?;
-    #[cfg(test)]
-    let source_rows = temp_table_rows(conn, "cr_export_sources")?;
-    let mut iteration = 0usize;
-    loop {
-        #[cfg(test)]
-        let export_fixpoint_started = std::time::Instant::now();
-        #[cfg(test)]
-        let delta_rows_read = temp_table_rows(conn, "cr_export_delta")?;
-        let (changed, _sqlite_vm_steps) = {
-            let _timing = crate::profiling::scope_with(|| {
-                format!(
-                    "rust_crates.derive name={} kind={} statement=export_fixpoint iteration={iteration}",
-                    item.target.name,
-                    target_kind(item.target.kind)
-                )
-            });
-            execute_with_vm_steps(conn, FIXPOINT_SQL, [item.key.as_slice()])?
-        };
-        let delta_rows_written = temp_table_rows(conn, "cr_export_delta_next")?;
-        #[cfg(test)]
-        if CAPTURE_ROUTE_PASS_METRICS.load(std::sync::atomic::Ordering::Relaxed) {
-            EXPORT_FIXPOINT_PASS_METRICS
-                .lock()
-                .expect("Rust export-fixpoint metrics lock")
-                .push((
-                    item.target.name.clone(),
-                    ExportFixpointPassMetrics {
-                        pass: iteration,
-                        delta_rows_read,
-                        source_rows,
-                        rows_written: changed,
-                        sqlite_vm_steps: _sqlite_vm_steps,
-                        elapsed_micros: u64::try_from(
-                            export_fixpoint_started.elapsed().as_micros(),
-                        )
-                        .unwrap_or(u64::MAX),
-                        derive_elapsed_micros: 0,
-                    },
-                ));
-        }
-        crate::profiling::note_with(|| {
-            format!(
-                "rust_crates.export_fixpoint name={} kind={} iteration={iteration} row_delta={changed}",
-                item.target.name,
-                target_kind(item.target.kind)
-            )
-        });
-        iteration += 1;
-        if delta_rows_written == 0 {
-            break;
-        }
-        conn.execute_batch(ADVANCE_EXPORT_DELTA_SQL)?;
-    }
-    #[cfg(test)]
-    if LEGACY_EXPORT_COMPARE_CRATES
-        .lock()
-        .expect("Rust legacy-export compare lock")
-        .contains(item.target.name.as_str())
-    {
-        let metrics = compare_legacy_export_fixpoint(conn, &item.key, &item.target.name)?;
-        LEGACY_EXPORT_COMPARE_METRICS
-            .lock()
-            .expect("Rust legacy-export compare metrics lock")
-            .push(metrics);
-    }
-    {
-        let _timing = stage("reexport_routes");
-        conn.execute(SQL_CR_REEXPORTS_6, [])?;
-        conn.execute(GLOB_REEXPORTS_SQL, [])?;
-    }
-    {
-        let _timing = stage("import_publication_rows");
-        conn.execute(SQL_CR_GLOBS_7, [])?;
-        conn.execute(SQL_CR_IMPORTS_8, [])?;
-        while conn.execute(ANCESTOR_PRIVATE_IMPORT_BINDINGS_SQL, [])? > 0 {}
-        conn.execute(MACRO_USE_IMPORTS_SQL, [])?;
-    }
-    {
-        let _timing = stage("gaps");
-        conn.execute(IMPORT_CONFLICT_GAPS_SQL, [])?;
-        conn.execute(DELETE_IMPORT_CONFLICTS_SQL, [])?;
-        conn.execute(SQL_CR_GAPS_9, [])?;
-        conn.execute(
-            OPEN_INVENTORY_SQL,
-            params![crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+        let _timing = stage("determined_bindings");
+        conn.prepare_cached(SQL_CR_SOURCE_IMPORTS_5)?
+            .execute([cfg])?;
+        conn.prepare_cached(UNKNOWN_EXPORTS_SQL)?.execute([cfg])?;
+        conn.prepare_cached(OPEN_INVENTORY_SQL)?.execute( params![crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
                 crate::analyzer::resolution::LoweringGapOrigin::Extracted(
                     brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedImplMacro,
                 ),
-            ), cfg],
-        )?;
-        conn.execute(UNKNOWN_EXPORTS_SQL, [cfg])?;
+            ), cfg])?;
+        conn.prepare_cached(MODULE_DECLARATIONS_SQL)?.execute([])?;
+        conn.prepare_cached(ROOT_SOURCES_SQL)?.execute([])?;
+        conn.prepare_cached(IMPL_SOURCES_SQL)?.execute([])?;
+        binding_relation::derive(conn, edition(item.target.edition), &item.target.name, cfg)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if LEGACY_EXPORT_COMPARE_CRATES
+            .lock()
+            .expect("legacy compare lock")
+            .contains(item.target.name.as_str())
+        {
+            let metrics = compare_legacy_export_fixpoint(conn, &item.key, &item.target.name)?;
+            LEGACY_EXPORT_COMPARE_METRICS
+                .lock()
+                .expect("legacy metrics lock")
+                .push(metrics);
+        }
+        for routes in [
+            ROUTES_SQL.as_str(),
+            IMPL_SUBJECT_ROUTES_SQL.as_str(),
+            IMPL_TRAIT_ROUTES_SQL.as_str(),
+        ] {
+            conn.prepare_cached(routes)?.execute([])?;
+        }
+    }
+    {
+        let _timing = stage("reexport_routes");
+        conn.prepare_cached(LOCAL_REEXPORT_STEPS_SQL)?.execute([])?;
+        conn.prepare_cached(CLEAR_REEXPORT_CLOSURE_SQL)?
+            .execute([])?;
+        conn.prepare_cached(CLOSE_REEXPORT_STEPS_SQL)?.execute([])?;
+        conn.prepare_cached(SQL_CR_REEXPORTS_6)?.execute([])?;
+        conn.prepare_cached(GLOB_REEXPORTS_SQL)?.execute([])?;
+    }
+    {
+        let _timing = stage("import_publication_rows");
+        conn.prepare_cached(SQL_CR_GLOBS_7)?.execute([])?;
+        conn.prepare_cached(SQL_CR_IMPORTS_8)?.execute([])?;
+        conn.prepare_cached(MACRO_USE_IMPORTS_SQL)?.execute([])?;
+    }
+    {
+        let _timing = stage("gaps");
+        conn.prepare_cached(IMPORT_CONFLICT_GAPS_SQL)?.execute([])?;
+
+        conn.prepare_cached(SQL_CR_GAPS_9)?.execute([])?;
     }
     {
         let _timing = stage("root_references");
-        conn.execute(MODULE_DECLARATIONS_SQL, [])?;
-        conn.execute(ROOT_SOURCES_SQL, [])?;
-        conn.execute(
-            &ROOT_ROUTES_SQL,
-            params![item.key.as_slice(), edition(item.target.edition)],
-        )?;
+        conn.prepare_cached(&ROOT_ROUTES_SQL)?.execute([])?;
     }
     {
         let _timing = stage("trait_implementations");
-        for (bindings, globs) in [
-            (
-                IMPL_SUBJECT_BINDINGS_SQL.as_str(),
-                IMPL_SUBJECT_GLOB_BINDINGS_SQL.as_str(),
-            ),
-            (
-                IMPL_TRAIT_BINDINGS_SQL.as_str(),
-                IMPL_TRAIT_GLOB_BINDINGS_SQL.as_str(),
-            ),
+        for bindings in [
+            IMPL_SUBJECT_BINDINGS_SQL.as_str(),
+            IMPL_TRAIT_BINDINGS_SQL.as_str(),
         ] {
-            conn.execute(bindings, [])?;
-            conn.execute(globs, [])?;
+            conn.prepare_cached(bindings)?.execute([])?;
         }
-        conn.execute(IMPL_DECLARATIONS_SQL, [])?;
+        conn.prepare_cached(CANONICAL_DEPENDENCY_DECLARATIONS_SQL)?
+            .execute([])?;
+        conn.prepare_cached(IMPL_DECLARATIONS_SQL)?.execute([])?;
         for gaps in [IMPL_SUBJECT_GAPS_SQL.as_str(), IMPL_TRAIT_GAPS_SQL.as_str()] {
-            conn.execute(gaps, [])?;
+            conn.prepare_cached(gaps)?.execute([])?;
         }
-        conn.execute(IMPL_ROWS_SQL, [])?;
+        conn.prepare_cached(IMPL_ROWS_SQL)?.execute([])?;
     }
+    conn.execute_batch(
+        "DELETE FROM cr_authority_blockers; DELETE FROM cr_authority_source_paths;",
+    )?;
+    // Only this crate's own members name a declaration's source path. A
+    // foreign target's coordinate comes from a dependency's published rows,
+    // which an unchanged facade retains across its own target's rederivation,
+    // so mapping it through that target's current sources would make the
+    // digest depend on derivation history. Foreign targets are hashed by their
+    // symbolic endpoint, as foreign glob providers already are.
+    conn.execute("INSERT INTO cr_authority_source_paths
+ SELECT identity.crate_key,member.blob_id,MIN(member.rel_path) FROM cr_members member CROSS JOIN cr_identity identity GROUP BY member.blob_id", [])?;
+    conn.execute(binding_authority::BLOCKERS_SQL, [])?;
+    let binding_owners = query_values(conn, binding_authority::OWNERS_SQL)?;
+    let binding_names = query_values(conn, binding_authority::NAMES_SQL)?;
+    let binding_alternatives = query_values(conn, &binding_authority::ALTERNATIVES_SQL)?;
+    let binding_blockers = query_values(conn, binding_authority::REASONS_SQL)?;
     let mut digest = Sha256::new();
+    binding_authority::hash_rows(&mut digest, &binding_owners, "binding-owners", &[4, 5]);
+    binding_authority::hash_rows(&mut digest, &binding_names, "binding-names", &[]);
+    binding_authority::hash_rows(
+        &mut digest,
+        &binding_alternatives,
+        "binding-alternatives",
+        &[10, 11, 12],
+    );
+    binding_authority::hash_rows(&mut digest, &binding_blockers, "binding-blockers", &[]);
     {
         let _timing = stage("public_module_surface");
         derive_public_module_surface(conn)?;
@@ -1087,6 +979,8 @@ pub(super) fn derive_exports(
             GLOB_SURFACE_SQL,
             MACRO_ITEM_SURFACE_SQL,
             PUBLIC_SURFACE_SELECT_SQL,
+            BINDING_PROVENANCE_SURFACE_SQL.as_str(),
+            GAP_LEVEL_SURFACE_SQL,
         ] {
             for row in query_values(conn, sql)? {
                 for value in row {
@@ -1122,6 +1016,10 @@ pub(super) fn derive_exports(
             reexports: collect("collect_rows.reexports", SQL_CR_REEXPORTS_13)?,
             glob_reexports: collect("collect_rows.glob_reexports", SELECT_GLOB_REEXPORTS_SQL)?,
             imports: collect("collect_rows.imports", SQL_CR_IMPORTS_14)?,
+            binding_provenance: collect(
+                "collect_rows.binding_provenance",
+                BINDING_PROVENANCE_SELECT_SQL,
+            )?,
             globs: collect("collect_rows.globs", SQL_CR_GLOBS_15)?,
             root_references: collect("collect_rows.root_references", ROOT_REFERENCES_SELECT_SQL)?,
             trait_impls: collect("collect_rows.trait_impls", TRAIT_IMPL_SELECT_SQL)?,
@@ -1130,10 +1028,14 @@ pub(super) fn derive_exports(
                 &UNRESOLVED_IMPL_SELECT_SQL,
             )?,
             gaps: collect("collect_rows.gaps", SQL_CR_GAPS_16)?,
+            binding_owners,
+            binding_names,
+            binding_alternatives,
+            binding_blockers,
             surface: digest.finalize().into(),
         }
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if CAPTURE_ROUTE_PASS_METRICS.load(std::sync::atomic::Ordering::Relaxed) {
         let derive_elapsed_micros =
             u64::try_from(derive_started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -1164,10 +1066,10 @@ pub(super) fn derive_exports(
 /// Both worklists live in SQLite and deduplicate finite keys, so public alias
 /// cycles and glob diamonds need neither recursion nor a depth limit.
 fn derive_public_module_surface(conn: &Connection) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO cr_surface_nodes SELECT crate_key, 'crate', 0 FROM cr_identity",
-        [],
-    )?;
+    )?
+    .execute([])?;
     loop {
         conn.execute_batch(
             "DELETE FROM cr_surface_frontier;
@@ -1176,76 +1078,87 @@ fn derive_public_module_surface(conn: &Connection) -> Result<()> {
              DELETE FROM cr_surface_requests;
              DELETE FROM cr_surface_candidates;",
         )?;
-        if conn.execute(
-            "INSERT INTO cr_surface_frontier
+        if conn
+            .prepare_cached(
+                "INSERT INTO cr_surface_frontier
              SELECT crate_key, module_path FROM cr_surface_nodes WHERE visited = 0",
-            [],
-        )? == 0
+            )?
+            .execute([])?
+            == 0
         {
             break;
         }
-        conn.execute(
-            "UPDATE cr_surface_nodes SET visited = 1 WHERE visited = 0",
-            [],
-        )?;
-        conn.execute(PUBLIC_SURFACE_BINDINGS_SQL, [])?;
-        conn.execute(&PUBLIC_SURFACE_ALIASES_SQL, [])?;
-        conn.execute(
+        conn.prepare_cached("UPDATE cr_surface_nodes SET visited = 1 WHERE visited = 0")?
+            .execute([])?;
+        conn.prepare_cached(PUBLIC_SURFACE_BINDINGS_SQL)?
+            .execute([])?;
+        conn.prepare_cached(&PUBLIC_SURFACE_ALIASES_SQL)?
+            .execute([])?;
+        conn.prepare_cached(
             "INSERT OR IGNORE INTO cr_surface_bindings
              SELECT crate_key, module_path, 'type', name, 'reexport', 1 FROM cr_surface_aliases",
-            [],
-        )?;
-        conn.execute(
+        )?
+        .execute([])?;
+        conn.prepare_cached(
             "INSERT INTO cr_surface_requests
              SELECT crate_key, module_path, namespace, name, crate_key, module_path, name, 0
              FROM cr_surface_bindings",
-            [],
-        )?;
+        )?
+        .execute([])?;
         loop {
             conn.execute_batch(
                 "DELETE FROM cr_surface_pending;
                  DELETE FROM cr_surface_lookup;",
             )?;
-            if conn.execute(
-                "INSERT INTO cr_surface_pending
+            if conn
+                .prepare_cached(
+                    "INSERT INTO cr_surface_pending
                  SELECT owner_crate_key, owner_module_path, owner_namespace, owner_name,
                         crate_key, module_path, name FROM cr_surface_requests WHERE visited = 0",
-                [],
-            )? == 0
+                )?
+                .execute([])?
+                == 0
             {
                 break;
             }
-            conn.execute(
-                "UPDATE cr_surface_requests SET visited = 1 WHERE visited = 0",
-                [],
-            )?;
-            conn.execute(PUBLIC_SURFACE_LOOKUP_SQL, [])?;
-            conn.execute(&PUBLIC_SURFACE_LOOKUP_ALIASES_SQL, [])?;
-            conn.execute(PUBLIC_SURFACE_CANDIDATES_SQL, [])?;
-            conn.execute(PUBLIC_SURFACE_TERMINALS_SQL, [])?;
-            conn.execute(PUBLIC_SURFACE_NAMED_REQUESTS_SQL, [])?;
-            conn.execute(PUBLIC_SURFACE_GLOBS_SQL, [])?;
+            conn.prepare_cached("UPDATE cr_surface_requests SET visited = 1 WHERE visited = 0")?
+                .execute([])?;
+            conn.prepare_cached(PUBLIC_SURFACE_LOOKUP_SQL)?
+                .execute([])?;
+            conn.prepare_cached(&PUBLIC_SURFACE_LOOKUP_ALIASES_SQL)?
+                .execute([])?;
+            conn.prepare_cached(PUBLIC_SURFACE_CANDIDATES_SQL)?
+                .execute([])?;
+            conn.prepare_cached(PUBLIC_SURFACE_TERMINALS_SQL)?
+                .execute([])?;
+            conn.prepare_cached(PUBLIC_SURFACE_NAMED_REQUESTS_SQL)?
+                .execute([])?;
+            conn.prepare_cached(PUBLIC_SURFACE_GLOBS_SQL)?.execute([])?;
         }
-        conn.execute(PUBLIC_SURFACE_PRUNE_TERMINALS_SQL, [])?;
-        conn.execute(
+        conn.prepare_cached(PUBLIC_SURFACE_PRUNE_TERMINALS_SQL)?
+            .execute([])?;
+        conn.prepare_cached(
             "UPDATE cr_surface_facts SET kind = 'public_module_terminal'
              WHERE kind = 'public_module_named_terminal'",
-            [],
-        )?;
-        conn.execute(PUBLIC_SURFACE_FACTS_SQL, [])?;
-        conn.execute(PUBLIC_SURFACE_INVENTORIES_SQL, [])?;
-        conn.execute(
+        )?
+        .execute([])?;
+        conn.prepare_cached(PUBLIC_SURFACE_FACTS_SQL)?.execute([])?;
+        conn.prepare_cached(PUBLIC_SURFACE_INVENTORIES_SQL)?
+            .execute([])?;
+        conn.prepare_cached(
             "INSERT OR IGNORE INTO cr_surface_nodes
              SELECT target_crate_key, target_module_path, 0 FROM cr_surface_candidates",
-            [],
-        )?;
+        )?
+        .execute([])?;
     }
-    conn.execute(PUBLIC_SURFACE_GAPS_SQL, [])?;
+    conn.prepare_cached(PUBLIC_SURFACE_GAPS_SQL)?.execute([])?;
     Ok(())
 }
 
+// Callers use fixed SQL literals or a finite set of LazyLock templates. Reuse
+// their plans across crate derivations in the connection's bounded cache.
 fn query_values(conn: &Connection, sql: &str) -> Result<Vec<Vec<Value>>> {
-    let mut statement = conn.prepare(sql)?;
+    let mut statement = conn.prepare_cached(sql)?;
     let columns = statement.column_count();
     Ok(statement
         .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())?
@@ -1335,12 +1248,41 @@ impl ExportRows {
             (SQL_RUST_CRATE_REEXPORT_ROUTES_18, self.reexports),
             (INSERT_GLOB_REEXPORTS_SQL, self.glob_reexports),
             (SQL_RUST_CRATE_IMPORTS_19, self.imports),
+            (BINDING_PROVENANCE_INSERT_SQL, self.binding_provenance),
+            (binding_authority::NAMES_INSERT_SQL, self.binding_names),
+            (
+                binding_authority::ALTERNATIVES_INSERT_SQL,
+                self.binding_alternatives,
+            ),
+            (binding_authority::REASONS_INSERT_SQL, self.binding_blockers),
             (SQL_RUST_CRATE_GLOB_IMPORTS_20, self.globs),
             (ROOT_REFERENCES_INSERT_SQL, self.root_references),
             (TRAIT_IMPL_INSERT_SQL, self.trait_impls),
             (UNRESOLVED_IMPL_INSERT_SQL, self.unresolved_trait_impls),
             (SQL_RUST_CRATE_GAPS_21, self.gaps),
         ] {
+            if sql == binding_authority::NAMES_INSERT_SQL {
+                // Logical parents may sort after children; wire them only after every
+                // persistent owner id has been allocated by this publication.
+                let owners = &self.binding_owners;
+                for row in owners {
+                    tx.execute(
+                        binding_authority::OWNERS_INSERT_SQL,
+                        rusqlite::params_from_iter(
+                            std::iter::once(Value::Integer(topology_id)).chain(row.iter().cloned()),
+                        ),
+                    )?;
+                }
+                for row in owners {
+                    tx.execute(
+                        binding_authority::PARENTS_UPDATE_SQL,
+                        rusqlite::params_from_iter(
+                            std::iter::once(Value::Integer(topology_id))
+                                .chain(row.iter().take(9).cloned()),
+                        ),
+                    )?;
+                }
+            }
             if sql == INSERT_ENUM_SOURCE_SQL {
                 let mut member = tx.prepare_cached(SQL_RUST_CRATE_MEMBER_IDENTITY)?;
                 for row in &rows {
@@ -1350,8 +1292,17 @@ impl ExportRows {
                     ))?;
                 }
             }
-            let mut statement = tx.prepare(sql)?;
-            for row in rows {
+            let mut statement = tx.prepare_cached(sql)?;
+            for mut row in rows {
+                if sql == SQL_RUST_CRATE_GAPS_21 {
+                    let (Value::Text(kind), Value::Text(detail)) = (&row[0], &row[2]) else {
+                        unreachable!("gap publication has text kind and detail: {row:?}");
+                    };
+                    assert_gap_subject_level(kind, detail);
+                }
+                if sql == binding_authority::ALTERNATIVES_INSERT_SQL {
+                    row.truncate(21);
+                }
                 statement.execute(rusqlite::params_from_iter(
                     std::iter::once(Value::Integer(topology_id)).chain(row),
                 ))?;
@@ -1421,7 +1372,8 @@ DELETE FROM temp.cr_trait_impls;
 /// makes a derivation that failed part way harmless to the next one on the
 /// reader; the memory temp store keeps a table's pages after a DELETE or a
 /// DROP alike. `cr_trait_impls` is the last object the script creates.
-pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
+#[doc(hidden)]
+pub fn prepare_tables(conn: &Connection) -> Result<()> {
     let prepared = conn
         .prepare_cached(
             "SELECT 1 FROM temp.sqlite_schema WHERE type = 'table' AND name = 'cr_trait_impls'",
@@ -1496,11 +1448,11 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
         CREATE TEMP TABLE IF NOT EXISTS cr_reexport_steps(crate_key BLOB NOT NULL,
             module_path TEXT NOT NULL, bound_name TEXT NOT NULL, target_crate_key BLOB NOT NULL,
             target_module_path TEXT NOT NULL, target_name TEXT NOT NULL,
-            PRIMARY KEY(crate_key, module_path, bound_name)) WITHOUT ROWID;
+            PRIMARY KEY(crate_key, module_path, bound_name, target_crate_key, target_module_path, target_name)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_reexport_closure(crate_key BLOB NOT NULL,
             module_path TEXT NOT NULL, bound_name TEXT NOT NULL, target_crate_key BLOB NOT NULL,
             target_container_path TEXT NOT NULL,
-            PRIMARY KEY(crate_key, module_path, bound_name)) WITHOUT ROWID;
+            PRIMARY KEY(crate_key, module_path, bound_name, target_crate_key, target_container_path)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_glob_steps(crate_key BLOB NOT NULL,
             module_path TEXT NOT NULL, target_crate_key BLOB NOT NULL,
             target_module_path TEXT NOT NULL,
@@ -1555,7 +1507,7 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
                         target_crate_key, target_module_path)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_exports(crate_key BLOB NOT NULL, module_path TEXT, namespace TEXT, name TEXT, origin TEXT,
             visibility TEXT, restricted_module_path TEXT, declaration_blob_id INTEGER,
-            declaration_site INTEGER, PRIMARY KEY(crate_key, module_path, namespace, name)) WITHOUT ROWID;
+            declaration_site INTEGER, PRIMARY KEY(crate_key, module_path, namespace, name, declaration_blob_id, declaration_site)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_export_sources(
             module_path TEXT NOT NULL, blob_id INTEGER NOT NULL, import_ordinal INTEGER NOT NULL,
             bound_name TEXT, imported_name TEXT, is_glob INTEGER NOT NULL, visibility TEXT NOT NULL,
@@ -1633,13 +1585,13 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
                     AND declaration.declaration_end_byte<=inner_module.end_byte);
         CREATE TEMP TABLE IF NOT EXISTS cr_routes(blob_id INTEGER, import_ordinal INTEGER,
             module_path TEXT, target_crate_key BLOB, target_module_path TEXT,
-            PRIMARY KEY(blob_id, import_ordinal, module_path)) WITHOUT ROWID;
+            PRIMARY KEY(blob_id, import_ordinal, module_path, target_crate_key, target_module_path)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_root_sources(blob_id INTEGER, route_key INTEGER,
             module_path TEXT, target_name TEXT, reference_source_site INTEGER,
             PRIMARY KEY(blob_id, route_key, module_path)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_root_routes(blob_id INTEGER, route_key INTEGER,
             module_path TEXT, target_crate_key BLOB, target_module_path TEXT,
-            PRIMARY KEY(blob_id, route_key, module_path)) WITHOUT ROWID;
+            PRIMARY KEY(blob_id, route_key, module_path, target_crate_key, target_module_path)) WITHOUT ROWID;
         CREATE TEMP VIEW IF NOT EXISTS cr_root_segments AS
             SELECT blob_id, path_key AS route_key, position AS ordinal, segment
             FROM resolution_root_route_segments WHERE segment IS NOT NULL;
@@ -1658,7 +1610,7 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
         CREATE TEMP TABLE IF NOT EXISTS cr_reexports(module_path TEXT NOT NULL, bound_name TEXT NOT NULL,
             target_crate_key BLOB NOT NULL, target_module_path TEXT NOT NULL, target_name TEXT NOT NULL,
             visibility TEXT NOT NULL, restricted_module_path TEXT,
-            PRIMARY KEY(module_path, bound_name)) WITHOUT ROWID;
+            PRIMARY KEY(module_path, bound_name, target_crate_key, target_module_path, target_name)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_glob_reexports AS SELECT module_path, target_crate_key,
             target_module_path, visibility, restricted_module_path FROM rust_crate_glob_reexport_routes WHERE 0;
         CREATE INDEX IF NOT EXISTS cr_glob_reexports_module ON cr_glob_reexports(module_path);
@@ -1666,7 +1618,9 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
             binder_scope, target_crate_key, target_module_path, target_name FROM rust_crate_imports WHERE 0;
         CREATE TEMP TABLE IF NOT EXISTS cr_globs AS SELECT module_path, blob_id, import_ordinal, binder_scope,
             target_crate_key, target_module_path FROM rust_crate_glob_imports WHERE 0;
-        CREATE TEMP TABLE IF NOT EXISTS cr_gaps(gap_kind TEXT, subject TEXT, detail TEXT);
+        CREATE TEMP TABLE IF NOT EXISTS cr_gaps(gap_kind TEXT, subject TEXT, detail TEXT,
+            CONSTRAINT cr_gap_subject_level CHECK(gap_kind NOT IN ('open_export_inventory','unknown_activation')
+              OR COALESCE(json_extract(detail,'$.subject_level') IN ('module','binding','public_surface'),0)));
         CREATE INDEX IF NOT EXISTS cr_gaps_subject ON cr_gaps(gap_kind, subject);
         CREATE INDEX IF NOT EXISTS cr_imports_name ON cr_imports(module_path, namespace, bound_name);
         CREATE INDEX IF NOT EXISTS cr_globs_module ON cr_globs(module_path);
@@ -1685,11 +1639,11 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
         CREATE TEMP TABLE IF NOT EXISTS cr_impl_subject_routes(blob_id INTEGER,
             relation_key INTEGER, module_path TEXT, target_crate_key BLOB,
             target_module_path TEXT,
-            PRIMARY KEY(blob_id, relation_key, module_path)) WITHOUT ROWID;
+            PRIMARY KEY(blob_id, relation_key, module_path, target_crate_key, target_module_path)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_impl_trait_routes(blob_id INTEGER,
             relation_key INTEGER, module_path TEXT, target_crate_key BLOB,
             target_module_path TEXT,
-            PRIMARY KEY(blob_id, relation_key, module_path)) WITHOUT ROWID;
+            PRIMARY KEY(blob_id, relation_key, module_path, target_crate_key, target_module_path)) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS cr_impl_bindings(blob_id INTEGER NOT NULL,
             relation_key INTEGER NOT NULL, module_path TEXT NOT NULL, side TEXT NOT NULL,
             target_crate_key BLOB NOT NULL, target_module_path TEXT NOT NULL,
@@ -1709,10 +1663,13 @@ pub(super) fn prepare_tables(conn: &Connection) -> Result<()> {
             PRIMARY KEY(subject_declaration_blob_id, subject_declaration_site, subject_rel_path,
                         trait_declaration_blob_id, trait_declaration_site, trait_rel_path,
                         impl_blob_id, impl_site, impl_rel_path)) WITHOUT ROWID;")?;
+    conn.execute_batch(binding_relation::SCHEMA_SQL)?;
+    conn.execute_batch(binding_authority::SCHEMA_SQL)?;
     Ok(())
 }
 
-pub(super) const SQL_CR_MEMBERS_1: &str = "INSERT INTO cr_members
+#[doc(hidden)]
+pub  const SQL_CR_MEMBERS_1: &str = "INSERT INTO cr_members
             SELECT ?1, ?2, ?3, ?4, ?5, NULL, COALESCE(declaration.body_start_byte, 0), COALESCE(declaration.body_end_byte, manifest.source_bytes)
             FROM source_fact_manifests AS manifest
             LEFT JOIN source_rust_module_scopes AS scope ON scope.blob_id = manifest.blob_id AND scope.ordinal = ?3
@@ -1720,10 +1677,15 @@ pub(super) const SQL_CR_MEMBERS_1: &str = "INSERT INTO cr_members
             WHERE manifest.blob_id = ?2";
 pub(super) const SQL_RUST_CRATE_MEMBER_IDENTITY: &str =
     "INSERT OR IGNORE INTO rust_crate_container_members VALUES(?1,?2,?3)";
-pub(super) const SQL_CR_MEMBERS_2: &str = "UPDATE cr_members AS child SET parent_module_path = (
+#[doc(hidden)]
+pub  const SQL_CR_MEMBERS_2: &str = "UPDATE cr_members AS child SET parent_module_path = (
         SELECT parent.module_path FROM cr_members AS parent
         -- The per-crate parent set is small; avoid scanning workspace declarations for each child.
         CROSS JOIN source_rust_module_declarations AS declaration ON declaration.blob_id = parent.blob_id
+        CROSS JOIN source_rust_module_inventory AS inventory
+          ON inventory.blob_id=declaration.blob_id
+         AND inventory.declaration_id=declaration.declaration_id
+         AND inventory.parent_scope_ordinal=parent.scope_ordinal
         WHERE child.module_path = parent.module_path || '::' || declaration.module_name
         LIMIT 1) WHERE child.module_path <> 'crate'";
 pub(super) const INSERT_ITEM_MACRO_DECISION_SQL: &str =
@@ -1733,9 +1695,11 @@ pub(super) const INSERT_ITEM_MACRO_NO_ROUTE_SQL: &str =
 pub(super) const SELECT_DECIDED_ITEM_MACROS_SQL: &str = "SELECT blob_id, invocation_occurrence_id, decoration_cfg FROM cr_item_macro_decisions ORDER BY blob_id, invocation_occurrence_id";
 pub(super) const INSERT_DECIDED_ITEM_MACROS_SQL: &str =
     "INSERT INTO rust_crate_decided_item_macros VALUES(?1, ?2, ?3, ?4)";
-pub(super) const POPULATE_MEMBER_BLOBS_SQL: &str =
+#[doc(hidden)]
+pub const POPULATE_MEMBER_BLOBS_SQL: &str =
     "INSERT INTO cr_member_blobs SELECT DISTINCT blob_id FROM cr_members";
-pub(super) const POPULATE_SCOPES_SQL: &str = "INSERT OR IGNORE INTO cr_scopes
+#[doc(hidden)]
+pub  const POPULATE_SCOPES_SQL: &str = "INSERT OR IGNORE INTO cr_scopes
         SELECT scopes.blob_id, scopes.ordinal, declaration.body_start_byte, declaration.body_end_byte
         FROM cr_member_blobs AS selected
         CROSS JOIN source_rust_module_scopes AS scopes ON scopes.blob_id = selected.blob_id
@@ -1760,7 +1724,8 @@ pub(super) const EXTERN_CRATE_ALIAS_DEPENDENCIES_SQL: &str =
       AND import.local_start IS NULL AND COALESCE(import.owner_module, '') = ''
       AND import.bound_name <> import.imported_name
       AND cr_cfg(import.cfg_condition, ?1) = 1";
-pub(super) const INSERT_IDENTITY_SQL: &str = "INSERT INTO cr_identity VALUES(?1)";
+#[doc(hidden)]
+pub const INSERT_IDENTITY_SQL: &str = "INSERT INTO cr_identity VALUES(?1)";
 // The crates whose derivation already finished in an earlier wave, with the
 // topology whose rows they published. A route that leaves this crate names one
 // of them; every crate it can reach is a dependency, so it is derived already.
@@ -1769,7 +1734,8 @@ pub(super) const INSERT_FOREIGN_SQL: &str = "INSERT INTO cr_foreign
     FROM temp.rust_schedule_live AS live JOIN rust_crate_topologies AS topologies USING(topology_id)";
 // Every container a route may step into, this crate's pending ones and the
 // derived crates' published ones, under the crate key that owns it.
-pub(super) const CONTAINERS_SQL: &str = "INSERT OR IGNORE INTO cr_containers_all
+#[doc(hidden)]
+pub  const CONTAINERS_SQL: &str = "INSERT OR IGNORE INTO cr_containers_all
     SELECT identity.crate_key, member.module_path
       FROM cr_identity AS identity CROSS JOIN cr_members AS member
     UNION ALL
@@ -1780,11 +1746,23 @@ pub(super) const CONTAINERS_SQL: &str = "INSERT OR IGNORE INTO cr_containers_all
       FROM cr_foreign AS dependency
       CROSS JOIN rust_crate_containers AS containers ON containers.topology_id = dependency.topology_id";
 // A name a derived crate re-exported, as the container that name reaches.
-pub(super) const FOREIGN_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_reexport_steps
+#[doc(hidden)]
+pub const FOREIGN_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_reexport_steps
     SELECT dependency.crate_key, routes.module_path, routes.bound_name,
            routes.target_crate_key, routes.target_module_path, routes.target_name
     FROM cr_foreign AS dependency
     CROSS JOIN rust_crate_reexport_routes AS routes ON routes.topology_id = dependency.topology_id";
+// Legacy declaration-placement readers need the reached canonical declarations,
+// not an alias or a chosen representative from a dependency's export surface.
+pub(super) const CANONICAL_DEPENDENCY_DECLARATIONS_SQL: &str = "INSERT OR IGNORE INTO cr_exports
+ SELECT foreign_crate.crate_key,declared.module_path,declared.namespace,declared.name,
+ 'declaration',declared.visibility,declared.restricted_module_path,
+ declared.declaration_blob_id,declared.declaration_site
+ FROM cr_binding_targets target CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=target.target_crate_key
+ CROSS JOIN rust_crate_exports declared ON declared.topology_id=foreign_crate.topology_id
+ AND declared.module_path=target.target_module_path AND declared.namespace=target.namespace
+ AND declared.name=target.target_name AND declared.origin='declaration'";
+
 // The same relation for this crate's own `use` items, public or private: a
 // private `use` in a module still names that module's path for its descendants.
 //
@@ -1793,44 +1771,36 @@ pub(super) const FOREIGN_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_re
 // binds the dependency's root module. Its target is spelled as that crate's
 // `crate` module with the name `self`, the way Rust spells a module itself
 // (`dep::{self}`); the closure below resolves `self` to the module.
-pub(super) const LOCAL_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_reexport_steps
-    SELECT identity.crate_key, source.module_path, source.bound_name,
-           COALESCE(root.dependency_crate_key, route.target_crate_key),
-           CASE WHEN root.dependency_crate_key IS NOT NULL THEN 'crate' ELSE route.target_module_path END,
-           CASE WHEN root.dependency_crate_key IS NOT NULL THEN 'self' ELSE source.imported_name END
-    FROM cr_identity AS identity
-    CROSS JOIN cr_source_imports AS source
-    CROSS JOIN cr_routes AS route ON route.blob_id = source.blob_id
-      AND route.import_ordinal = source.import_ordinal AND route.module_path = source.module_path
-    LEFT JOIN cr_dependencies AS root ON source.head_segment IS NULL
-      AND root.extern_name = source.imported_name AND root.dependency_crate_key IS NOT NULL
-    WHERE source.is_glob = 0 AND source.bound_name IS NOT NULL";
+#[doc(hidden)]
+pub const LOCAL_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_reexport_steps
+ SELECT owner.crate_key,owner.module_path,target.name,target.target_crate_key,target.target_module_path,target.target_name
+ FROM cr_binding_exact_targets target CROSS JOIN cr_binding_owners owner ON owner.owner=target.owner
+ CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
+ WHERE owner.blob_id=0 AND owner.binder_scope=0 AND target.namespace='type'
+ AND target.origin='reexport'";
 // A re-export can name another re-export: the umbrella crate binds `usages` to
 // a dependency's `crate::usages`, which the dependency binds in turn to its own
 // `crate::analyzer::usages`. The walk needs the container the chain ends on, so
 // the steps are chased to their terminal here rather than one hop at a time.
-// The chase stops at a real container, because a container always beats a
-// re-export of the same name, and at a depth cap, because a re-export cycle is
-// invalid Rust that must not spin. The relation is functional on its key, so a
-// chain has one terminal; a chain that hits the cap has none and its name stays
-// unresolved.
-pub(super) const CLOSE_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_reexport_closure
+// Each state is an original binding and its current target. UNION visits
+// that finite pair once, so cycles terminate without limiting valid chains.
+// A cyclic-only seed has no terminal and must retain incompleteness evidence.
+#[doc(hidden)]
+pub const CLOSE_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_reexport_closure
     WITH RECURSIVE chase(crate_key, module_path, bound_name, target_crate_key,
-                         target_module_path, target_name, depth) AS (
+                         target_module_path, target_name) AS (
       SELECT crate_key, module_path, bound_name, target_crate_key,
-             target_module_path, target_name, 0
+             target_module_path, target_name
       FROM cr_reexport_steps
-      UNION ALL
+      UNION
       SELECT chase.crate_key, chase.module_path, chase.bound_name,
-             next_step.target_crate_key, next_step.target_module_path, next_step.target_name,
-             chase.depth + 1
+             next_step.target_crate_key, next_step.target_module_path, next_step.target_name
       FROM chase
       CROSS JOIN cr_reexport_steps AS next_step
         ON next_step.crate_key = chase.target_crate_key
        AND next_step.module_path = chase.target_module_path
        AND next_step.bound_name = chase.target_name
-      WHERE chase.depth < 64
-        AND chase.target_name <> 'self'
+      WHERE chase.target_name <> 'self'
         AND NOT EXISTS(SELECT 1 FROM cr_containers_all AS child
                        WHERE child.crate_key = chase.target_crate_key
                          AND child.container_path = chase.target_module_path || '::' || chase.target_name)
@@ -1847,11 +1817,13 @@ pub(super) const CLOSE_REEXPORT_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_reex
                      WHERE next_step.crate_key = chase.target_crate_key
                        AND next_step.module_path = chase.target_module_path
                        AND next_step.bound_name = chase.target_name)";
-pub(super) const CLEAR_REEXPORT_CLOSURE_SQL: &str = "DELETE FROM cr_reexport_closure";
+#[doc(hidden)]
+pub const CLEAR_REEXPORT_CLOSURE_SQL: &str = "DELETE FROM cr_reexport_closure";
 // One glob edge: the module a `use other::*;` writes it in, and the module that
 // glob reaches. A derived crate contributes only the globs it published, which
 // are its non-private ones, and only a public one crosses a crate boundary.
-pub(super) const FOREIGN_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_steps
+#[doc(hidden)]
+pub const FOREIGN_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_steps
     SELECT dependency.crate_key, routes.module_path,
            routes.target_crate_key, routes.target_module_path
     FROM cr_foreign AS dependency
@@ -1861,7 +1833,9 @@ pub(super) const FOREIGN_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_s
 // This crate's own glob imports, public or private: a private `use crate::*;`
 // still binds names in the module that writes it, the same way a private named
 // `use` does in LOCAL_REEXPORT_STEPS_SQL.
-pub(super) const LOCAL_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_steps
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const LOCAL_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_steps
     SELECT identity.crate_key, source.module_path,
            route.target_crate_key, route.target_module_path
     FROM cr_identity AS identity
@@ -1875,9 +1849,10 @@ pub(super) const LOCAL_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_ste
 // `UNION` in the recursive term discards a pair already reached, so the chase
 // visits each (source module, reached module) pair once and stops; the pair
 // set is finite because both sides range over the derived crates' modules.
-// A glob cycle is legal Rust, so unlike CLOSE_REEXPORT_STEPS_SQL there is no
-// depth cap to break one: deduplication already terminates the chase.
-pub(super) const CLOSE_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_closure
+// A glob cycle is legal Rust; deduplication terminates the chase just as it
+// does for the named re-export closure.
+#[doc(hidden)]
+pub const CLOSE_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_closure
     WITH RECURSIVE reach(crate_key, module_path, target_crate_key, target_module_path) AS (
       SELECT crate_key, module_path, target_crate_key, target_module_path FROM cr_glob_steps
       UNION
@@ -1888,11 +1863,15 @@ pub(super) const CLOSE_GLOB_STEPS_SQL: &str = "INSERT OR IGNORE INTO cr_glob_clo
        AND step.module_path = reach.target_module_path
     )
     SELECT crate_key, module_path, target_crate_key, target_module_path FROM reach";
-pub(super) const CLEAR_GLOB_CLOSURE_SQL: &str = "DELETE FROM cr_glob_closure";
 // The dependency export rows this crate's routes actually reach, keyed by the
 // dependency's crate key so the fixpoint and the binding statement read one
 // relation. Only a public export crosses a crate boundary.
-pub(super) const DEPENDENCY_EXPORTS_SQL: &str = "INSERT OR IGNORE INTO cr_exports
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const CLEAR_GLOB_CLOSURE_SQL: &str = "DELETE FROM cr_glob_closure";
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const DEPENDENCY_EXPORTS_SQL: &str = "INSERT OR IGNORE INTO cr_exports
     SELECT route.target_crate_key, exports.module_path, exports.namespace, exports.name,
            exports.origin, exports.visibility, exports.restricted_module_path,
            exports.declaration_blob_id, exports.declaration_site
@@ -1903,7 +1882,8 @@ pub(super) const DEPENDENCY_EXPORTS_SQL: &str = "INSERT OR IGNORE INTO cr_export
     CROSS JOIN rust_crate_exports AS exports ON exports.topology_id = dependency.topology_id
       AND exports.module_path = route.target_module_path
     WHERE exports.visibility = 'public'";
-pub(super) const ENUM_CONTAINERS_SQL: &str = "INSERT OR IGNORE INTO cr_enums
+#[doc(hidden)]
+pub  const ENUM_CONTAINERS_SQL: &str = "INSERT OR IGNORE INTO cr_enums
  SELECT candidate.module_path || '::' || candidate.identifier, site.blob_id,
         site.semantic_key, scope.scope_head_node_key, member.rel_path,
         candidate.module_path
@@ -1928,7 +1908,8 @@ pub(super) const ENUM_CONTAINERS_SQL: &str = "INSERT OR IGNORE INTO cr_enums
 // source bridge but group their exports to one definition-site representative.
 // Ignore keys already written by declarations or an earlier enum candidate;
 // invalid Rust can make distinct authored items share an export key.
-pub(super) const ENUM_VARIANTS_SQL: &str = "INSERT INTO cr_exports
+#[doc(hidden)]
+pub  const ENUM_VARIANTS_SQL: &str = "INSERT INTO cr_exports
  SELECT (SELECT crate_key FROM cr_identity), container.container_path, namespace.namespace, candidate.identifier,
         'declaration', 'public', NULL, container.blob_id, MIN(site.source_site)
  FROM cr_enums AS container
@@ -1940,9 +1921,11 @@ pub(super) const ENUM_VARIANTS_SQL: &str = "INSERT INTO cr_exports
   AND candidate.module_path=container.module_path
  CROSS JOIN resolution_additional_definition_namespaces AS namespace ON namespace.blob_id=site.blob_id AND namespace.definition_semantic_key=site.semantic_key
  WHERE candidate.declaration_kind=9 AND candidate.activation=1
+ AND NOT EXISTS(SELECT 1 FROM cr_exports declared WHERE declared.crate_key=(SELECT crate_key FROM cr_identity)
+ AND declared.module_path=container.container_path AND declared.namespace=namespace.namespace AND declared.name=candidate.identifier)
    AND namespace.namespace IN ('type','value')
  GROUP BY container.container_path, container.blob_id, namespace.namespace, candidate.identifier
- ON CONFLICT(crate_key, module_path, namespace, name) DO NOTHING";
+ ON CONFLICT(crate_key, module_path, namespace, name, declaration_blob_id, declaration_site) DO NOTHING";
 pub(super) const ENUM_CONTAINER_ROWS_SQL: &str = "SELECT DISTINCT container_path, 'enum', 'enum_declaration' FROM cr_enums ORDER BY container_path";
 pub(super) const ENUM_SOURCE_ROWS_SQL: &str = "SELECT container.container_path, container.blob_id, NULL, member.rel_path, 'declared', container.scope_node_key, container.module_path FROM cr_enums AS container CROSS JOIN cr_members AS member ON member.module_path=container.module_path AND member.blob_id=container.blob_id ORDER BY container.container_path, member.rel_path";
 // The module walk publishes its container/source rows before enum rows. Invalid
@@ -1954,7 +1937,8 @@ pub(super) const INSERT_ENUM_SOURCE_SQL: &str =
     "INSERT INTO rust_crate_container_sources VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
      ON CONFLICT(topology_id, container_path, blob_id, rel_path) DO NOTHING";
 
-pub(super) const SQL_CR_EXPORTS_4: &str = "INSERT OR IGNORE INTO cr_exports
+#[doc(hidden)]
+pub  const SQL_CR_EXPORTS_4: &str = "INSERT OR IGNORE INTO cr_exports
         SELECT exports.crate_key, exports.module_path, CASE WHEN additional.namespace = 'macro' THEN 'macro'
                WHEN additional.namespace = 'type' THEN 'type' ELSE 'value' END,
                exports.name, exports.origin,
@@ -1974,7 +1958,8 @@ pub(super) const SQL_CR_EXPORTS_4: &str = "INSERT OR IGNORE INTO cr_exports
          AND constructor.declaration_id = bridge.declaration_id
         WHERE additional.namespace <> 'value' OR constructor.declaration_id IS NULL
            OR constructor.visibility IS NOT NULL";
-pub(super) const SQL_CR_SOURCE_IMPORTS_5: &str = "INSERT INTO cr_source_imports
+#[doc(hidden)]
+pub const SQL_CR_SOURCE_IMPORTS_5: &str = "INSERT INTO cr_source_imports
         SELECT DISTINCT imports.blob_id, imports.import_ordinal, imports.module_path,
                imports.binder_scope, imports.bound_name, imports.imported_name,
                imports.is_glob, imports.visibility,
@@ -1987,20 +1972,18 @@ pub(super) const SQL_CR_SOURCE_IMPORTS_5: &str = "INSERT INTO cr_source_imports
         FROM cr_member_imports AS imports
         WHERE cr_cfg(imports.cfg_condition, ?1) = 1";
 pub(super) const SQL_CR_REEXPORTS_6: &str = "INSERT OR IGNORE INTO cr_reexports
-        SELECT source.module_path, source.bound_name,
-               COALESCE(root.dependency_crate_key, route.target_crate_key),
-               CASE WHEN root.dependency_crate_key IS NOT NULL THEN 'crate' ELSE route.target_module_path END,
-               CASE WHEN root.dependency_crate_key IS NOT NULL THEN 'self' ELSE source.imported_name END,
-               cr_visibility(source.visibility), (SELECT restricted_module_path FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility)
-        FROM cr_module_imports AS source JOIN cr_routes AS route USING(blob_id, import_ordinal, module_path)
-        LEFT JOIN cr_dependencies AS root ON source.head_segment IS NULL
-          AND root.extern_name = source.imported_name AND root.dependency_crate_key IS NOT NULL
-        WHERE (cr_visibility(source.visibility)<>'restricted' OR EXISTS(SELECT 1 FROM cr_restrictions WHERE module_path=source.module_path AND visibility=source.visibility AND restricted_module_path IS NOT NULL)) AND source.visibility <> 'private' AND source.is_glob = 0 AND source.bound_name IS NOT NULL";
+ SELECT owner.module_path,target.name,target.target_crate_key,target.target_module_path,target.target_name,
+ target.visibility,target.restricted_module_path
+ FROM cr_binding_exact_targets target CROSS JOIN cr_binding_owners owner ON owner.owner=target.owner
+ CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
+ WHERE owner.blob_id=0 AND owner.binder_scope=0 AND (target.origin='reexport' OR (target.origin='glob_reexport' AND target.target_name='self'))
+ AND target.visibility<>'private'";
 // `#[macro_use] extern crate rocket;` names a crate in the extern prelude, not
 // a member of the module that writes it, and it spells no module segment at
 // all. The shared route walk's base row would therefore answer it with the
 // writing module, so the route to the dependency's own root is stated here
 // before the walk runs and the walk's `INSERT OR IGNORE` leaves it alone.
+#[cfg(any(test, feature = "test-support"))]
 pub(super) const MACRO_USE_ROUTES_SQL: &str = "INSERT OR IGNORE INTO cr_routes
         SELECT source.blob_id, source.import_ordinal, source.module_path,
                dependency.dependency_crate_key, 'crate'
@@ -2015,15 +1998,14 @@ pub(super) const MACRO_USE_ROUTES_SQL: &str = "INSERT OR IGNORE INTO cr_routes
 // export surface is small, which is what makes enumerating it the cheaper
 // shape. Value and type names are not imported: `#[macro_use]` imports macros.
 pub(super) const MACRO_USE_IMPORTS_SQL: &str = "INSERT OR IGNORE INTO cr_imports
-        SELECT source.module_path, 'macro', exports.name, source.blob_id,
-               source.import_ordinal, source.binder_scope,
-               route.target_crate_key, route.target_module_path, exports.name
-        FROM cr_source_imports AS source
-        CROSS JOIN cr_routes AS route ON route.blob_id = source.blob_id
-          AND route.import_ordinal = source.import_ordinal AND route.module_path = source.module_path
-        CROSS JOIN cr_exports AS exports ON exports.crate_key = route.target_crate_key
-          AND exports.module_path = route.target_module_path AND exports.namespace = 'macro'
-        WHERE source.is_macro_use = 1";
+ SELECT source.module_path,'macro',exports.name,source.blob_id,source.import_ordinal,source.binder_scope,
+ exports.target_crate_key,exports.target_module_path,exports.target_name
+ FROM cr_source_imports source CROSS JOIN cr_dependencies dependency
+ ON dependency.extern_name=source.imported_name
+ CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=dependency.dependency_crate_key
+ CROSS JOIN rust_crate_exports exports ON exports.topology_id=foreign_crate.topology_id
+ AND exports.module_path='crate' AND exports.namespace='macro' AND exports.visibility='public'
+ WHERE source.is_macro_use=1";
 pub(super) const SQL_CR_GLOBS_7: &str = "INSERT INTO cr_globs
         SELECT source.module_path, source.blob_id, source.import_ordinal, source.binder_scope, route.target_crate_key, route.target_module_path
         FROM cr_source_imports AS source JOIN cr_routes AS route USING(blob_id, import_ordinal, module_path)
@@ -2038,6 +2020,7 @@ pub(super) const SQL_CR_IMPORTS_8: &str = include_str!("rust_crate_import_bindin
 // import at the target module's module scope counts; a `use` inside one of
 // its functions is not a module item. It runs until it binds nothing new, so
 // a chain of such imports resolves.
+#[cfg(any(test, feature = "test-support"))]
 pub(super) const ANCESTOR_PRIVATE_IMPORT_BINDINGS_SQL: &str = "INSERT INTO cr_imports
     SELECT source.module_path, target_import.namespace, source.bound_name, source.blob_id,
            source.import_ordinal, source.binder_scope,
@@ -2099,6 +2082,9 @@ pub(super) const SQL_CR_GAPS_9: &str = "INSERT INTO cr_gaps
         WHERE NOT (source.head_segment IS NULL AND source.is_glob = 0 AND EXISTS(
                SELECT 1 FROM cr_dependencies AS root
                WHERE root.extern_name = source.imported_name AND root.dependency_crate_key IS NOT NULL))
+          AND NOT (source.is_glob=0 AND EXISTS(SELECT 1 FROM cr_binding_import_present present
+               WHERE present.blob_id=source.blob_id AND present.import_ordinal=source.import_ordinal
+                 AND present.module_path=source.module_path))
           AND ((source.is_glob = 0 AND source.bound_name IS NULL)
            OR NOT EXISTS(SELECT 1 FROM cr_routes AS route WHERE route.blob_id = source.blob_id AND route.import_ordinal = source.import_ordinal AND route.module_path = source.module_path)
            OR (source.is_glob = 0 AND (source.visibility = 'private' OR NOT EXISTS(SELECT 1 FROM cr_module_imports AS module_import
@@ -2114,17 +2100,148 @@ pub(super) const SQL_CR_GAPS_9: &str = "INSERT INTO cr_gaps
                  AND exports.module_path = source.module_path AND exports.name = source.bound_name)))";
 pub(super) const SQL_CR_EXPORTS_10: &str = "SELECT exports.module_path, exports.namespace, exports.name, exports.origin, definition.module_path, definition.name FROM cr_exports AS exports JOIN cr_exports AS definition ON definition.declaration_blob_id = exports.declaration_blob_id AND definition.declaration_site = exports.declaration_site AND definition.namespace = exports.namespace AND definition.origin = 'declaration' AND definition.crate_key = exports.crate_key WHERE exports.crate_key = (SELECT crate_key FROM cr_identity) AND exports.visibility = 'public' ORDER BY 1, 2, 3, 5, 6";
 pub(super) const SQL_CR_REEXPORTS_11: &str = "SELECT module_path, bound_name, target_crate_key, target_module_path, target_name FROM cr_reexports WHERE visibility = 'public' ORDER BY 1, 2, 3, 4, 5";
-pub(super) const SQL_CR_EXPORTS_12: &str =
-    "SELECT module_path, namespace, name, origin, visibility, restricted_module_path,
-            declaration_blob_id, declaration_site FROM cr_exports
-     WHERE crate_key = (SELECT crate_key FROM cr_identity)
-     ORDER BY module_path, namespace, name";
+pub(super) const SQL_CR_EXPORTS_12: &str = "SELECT owner.module_path,target.namespace,target.name,
+ target.origin,target.visibility,target.restricted_module_path,target.declaration_blob_id,target.declaration_site,
+ target.target_crate_key,target.target_module_path,target.target_name
+ FROM cr_binding_exact_targets target CROSS JOIN cr_binding_owners owner ON owner.owner=target.owner
+ CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
+ WHERE owner.blob_id=0 AND owner.binder_scope=0 AND target.declaration_blob_id<>0
+ AND (target.origin='declaration' OR target.visibility<>'private')
+ ORDER BY owner.module_path,target.namespace,target.name,target.target_crate_key,target.target_module_path,target.target_name";
 pub(super) const SQL_CR_REEXPORTS_13: &str = "SELECT * FROM cr_reexports";
-pub(super) const SQL_CR_IMPORTS_14: &str = "SELECT * FROM cr_imports";
+// Import leaves can spell the same binding repeatedly. The durable relation
+// owns canonical endpoints, while this ordinal is only a source locator.
+// Retain a stable locator without conflating distinct canonical targets.
+pub(super) const SQL_CR_IMPORTS_14: &str = "SELECT module_path,namespace,bound_name,blob_id,
+ MIN(import_ordinal),binder_scope,target_crate_key,target_module_path,target_name
+ FROM cr_imports GROUP BY module_path,namespace,bound_name,blob_id,binder_scope,
+ target_crate_key,target_module_path,target_name";
+// Only already admitted source/provider/endpoint tuples are retained. The
+// namespace is preserved by an import, so it keys both sides of the edge.
+pub(super) const BINDING_PROVENANCE_SELECT_SQL: &str = "WITH first_hops(
+ blob_id,import_ordinal,module_path,provider,masked_owner,namespace) AS (
+ SELECT source.blob_id,source.import_ordinal,source.module_path,lookup.owner,NULL,lookup.namespace
+ FROM cr_binding_imports source
+ CROSS JOIN cr_routes route USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_binding_lookups lookup USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_binding_owners owner ON owner.owner=lookup.owner
+ AND owner.crate_key=route.target_crate_key AND owner.module_path=route.target_module_path
+ WHERE source.import_ordinal>=0 AND source.is_glob=0 AND lookup.position=source.segments
+ AND lookup.name=source.imported_name
+ UNION
+ SELECT source.blob_id,source.import_ordinal,source.module_path,path.owner,NULL,NULL
+ FROM cr_binding_imports source
+ CROSS JOIN cr_routes route USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_binding_paths path USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_binding_owners owner ON owner.owner=path.owner
+ AND owner.crate_key=route.target_crate_key AND owner.module_path=route.target_module_path
+ WHERE source.import_ordinal>=0 AND source.is_glob=1 AND path.position=source.segments
+ UNION
+ -- Self-masked source lookups retain their already admitted carried providers.
+ SELECT source.blob_id,source.import_ordinal,source.module_path,
+ carried.target_owner,lookup.owner,carried.namespace
+ FROM cr_binding_imports source
+ CROSS JOIN cr_routes route USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_binding_lookups lookup USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_binding_owners owner ON owner.owner=lookup.owner
+ AND owner.crate_key=route.target_crate_key AND owner.module_path=route.target_module_path
+ CROSS JOIN cr_binding_masks mask ON mask.owner=lookup.owner
+ AND mask.blob_id=source.blob_id AND mask.import_ordinal=source.import_ordinal
+ AND mask.module_path=source.module_path
+ CROSS JOIN cr_binding_carries carried ON carried.owner=lookup.owner
+ AND carried.name=lookup.name AND carried.namespace=lookup.namespace
+ WHERE source.is_glob=0 AND source.import_ordinal>=0 AND lookup.position=source.segments
+ AND lookup.name=source.imported_name
+ ), partial AS MATERIALIZED (
+ SELECT consumer,provider,namespace,name FROM cr_binding_visibility_reads
+ GROUP BY consumer,provider,namespace,name HAVING MIN(accessible)=0 AND MAX(accessible)=1
+ AND MIN(origin)='glob_reexport' AND MAX(origin)='glob_reexport'
+ )
+ SELECT DISTINCT source.module_path,original.blob_id,original.binder_scope,target.namespace,target.name,
+ source.import_ordinal,provider.crate_key AS provider_crate_key,provider.module_path AS provider_module_path,
+ provider.blob_id AS provider_blob_id,provider.binder_scope AS provider_binder_scope,provided.name AS provider_name,
+ target.target_crate_key,target.target_module_path,target.target_name
+ FROM first_hops hop
+ CROSS JOIN cr_binding_imports source USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_source_imports original USING(blob_id,import_ordinal,module_path)
+ CROSS JOIN cr_binding_owners provider ON provider.owner=hop.provider
+ CROSS JOIN cr_binding_exact_targets target ON target.owner=source.owner
+ CROSS JOIN cr_binding_exact_targets provided ON provided.owner=provider.owner
+ AND provided.namespace=target.namespace
+ AND provided.name=CASE WHEN source.is_glob=1 OR original.is_macro_use=1
+                       THEN target.name ELSE source.imported_name END
+ AND provided.target_crate_key=target.target_crate_key
+ AND provided.target_module_path=target.target_module_path AND provided.target_name=target.target_name
+ WHERE (hop.namespace IS NULL OR hop.namespace=target.namespace)
+ AND EXISTS(SELECT 1 FROM cr_binding_visibility_reads visible
+ WHERE visible.consumer=COALESCE(hop.masked_owner,source.owner) AND visible.provider=provider.owner
+ AND visible.namespace=provided.namespace AND visible.name=provided.name AND visible.accessible=1
+ AND visible.target_crate_key=provided.target_crate_key AND visible.target_module_path=provided.target_module_path
+ AND visible.target_name=provided.target_name)
+ AND NOT EXISTS(SELECT 1 FROM partial WHERE partial.consumer=COALESCE(hop.masked_owner,source.owner)
+ AND partial.provider=provider.owner AND partial.namespace=provided.namespace AND partial.name=provided.name)
+ AND (hop.masked_owner IS NULL OR EXISTS(
+ SELECT 1 FROM cr_binding_exact_targets masked WHERE masked.owner=hop.masked_owner
+ AND masked.namespace=provided.namespace AND masked.name=provided.name AND masked.origin='glob_reexport'
+ AND masked.target_crate_key=provided.target_crate_key AND masked.target_module_path=provided.target_module_path
+ AND masked.target_name=provided.target_name)) AND (
+ (source.is_glob=0 AND target.origin='reexport' AND source.bound_name=target.name)
+ OR (source.is_glob=1 AND target.origin='glob_reexport')
+ OR (original.is_macro_use=1 AND target.namespace='macro'))";
+pub(super) const BINDING_PROVENANCE_INSERT_SQL: &str = "INSERT INTO rust_crate_binding_provenance VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)";
+// Dependency readers consume these edges. They are therefore published output,
+// even though point lookup continues to read canonical endpoints directly.
+// Hash logical source paths, not blob ids: body edits retain the same surface.
+pub(super) static BINDING_PROVENANCE_SURFACE_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            "SELECT DISTINCT
+ edge.module_path,member.rel_path,'module',edge.namespace,
+ edge.name,CAST(edge.import_ordinal AS TEXT),edge.provider_crate_key,
+ edge.provider_module_path,CASE WHEN edge.provider_binder_scope < -1 THEN 'self-masked'
+ ELSE CAST(edge.provider_binder_scope AS TEXT) END,edge.provider_name,
+ edge.target_crate_key,edge.target_module_path,edge.target_name
+ FROM ({BINDING_PROVENANCE_SELECT_SQL}) edge
+ CROSS JOIN cr_members member ON member.module_path=edge.module_path AND member.blob_id=edge.blob_id
+ WHERE EXISTS(SELECT 1 FROM cr_module_imports module WHERE module.blob_id=edge.blob_id
+ AND module.import_ordinal=edge.import_ordinal AND module.module_path=edge.module_path)
+ ORDER BY 1,2,3,4,5,6,7,8,9,10,11,12,13"
+        )
+    });
 pub(super) const SQL_CR_GLOBS_15: &str = "SELECT * FROM cr_globs";
+/// Every inventory writer must state which semantic level its subject names.
+pub(super) fn assert_gap_subject_level(kind: &str, detail: &str) {
+    if !matches!(kind, "open_export_inventory" | "unknown_activation") {
+        return;
+    }
+    let detail: serde_json::Value = serde_json::from_str(detail).expect("gap detail is JSON");
+    let evidence = match detail.get("evidence") {
+        Some(evidence) => evidence
+            .as_array()
+            .expect("gap evidence is an array")
+            .as_slice(),
+        None => std::slice::from_ref(&detail),
+    };
+    assert!(
+        !evidence.is_empty(),
+        "inventory gap has evidence: {detail:?}"
+    );
+    assert!(
+        evidence.iter().all(|item| matches!(
+            item["subject_level"].as_str(),
+            Some("module" | "binding" | "public_surface")
+        )),
+        "inventory gap must carry its subject level: {detail:?}"
+    );
+}
+
+pub(super) const GAP_LEVEL_SURFACE_SQL: &str =
+    "SELECT DISTINCT gap_kind,subject,json_extract(detail,'$.subject_level')
+ FROM cr_gaps WHERE gap_kind IN ('open_export_inventory','unknown_activation') ORDER BY 1,2,3";
+
 pub(super) const SQL_CR_GAPS_16: &str = "SELECT gap_kind, subject, json_object('evidence', json_group_array(json(detail))) FROM cr_gaps GROUP BY gap_kind, subject";
 pub(super) const SQL_RUST_CRATE_EXPORTS_17: &str =
-    "INSERT INTO rust_crate_exports VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+    "INSERT INTO rust_crate_exports VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)";
 pub(super) const SQL_RUST_CRATE_REEXPORT_ROUTES_18: &str =
     "INSERT OR IGNORE INTO rust_crate_reexport_routes VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
 pub(super) const SQL_RUST_CRATE_IMPORTS_19: &str =
@@ -2140,15 +2257,41 @@ pub(super) const SQL_RUST_CRATE_GAPS_21: &str =
 // step, so its target is the module's own `mod` declaration: the parent that
 // writes it and the name it writes. An anchor that reached a crate root has no
 // such declaration and carries no target row.
-pub(super) const ROOT_REFERENCES_SELECT_SQL: &str = "SELECT source.module_path, source.blob_id, source.route_key, source.reference_source_site, route.target_crate_key, COALESCE(anchor.parent_module_path, route.target_module_path), COALESCE(anchor.module_name, source.target_name) FROM cr_root_sources AS source CROSS JOIN cr_root_routes AS route USING(blob_id,route_key,module_path) LEFT JOIN cr_module_declarations AS anchor ON source.target_name IN ('crate','self','super') AND anchor.module_path=route.target_module_path WHERE source.target_name NOT IN ('crate','self','super') OR anchor.module_path IS NOT NULL";
+// A route reaches a module independently of its terminal namespace. Keep a
+// reverse root witness only for a binding admitted in the reference's namespace;
+// an import's pending type/macro halves cannot nominate its final value endpoint.
+// With no admitted terminal, retain the unresolved route as boundary evidence.
+pub(super) const ROOT_REFERENCES_SELECT_SQL: &str = "SELECT source.module_path, source.blob_id,
+ source.route_key, source.reference_source_site, route.target_crate_key,
+ COALESCE(anchor.parent_module_path, route.target_module_path),
+ COALESCE(anchor.module_name, source.target_name)
+ FROM cr_root_sources AS source
+ CROSS JOIN cr_root_routes AS route USING(blob_id,route_key,module_path)
+ CROSS JOIN resolution_semantic_sites AS reference ON reference.blob_id=source.blob_id
+ AND reference.source_site=source.reference_source_site
+ LEFT JOIN cr_module_declarations AS anchor
+ ON source.target_name IN ('crate','self','super') AND anchor.module_path=route.target_module_path
+ WHERE (source.target_name IN ('crate','self','super') AND anchor.module_path IS NOT NULL)
+ OR (source.target_name NOT IN ('crate','self','super') AND (NOT EXISTS(
+ SELECT 1 FROM cr_binding_owners owner CROSS JOIN cr_binding_targets binding ON binding.owner=owner.owner
+ WHERE owner.crate_key=route.target_crate_key AND owner.module_path=route.target_module_path
+ AND owner.blob_id=0 AND owner.binder_scope=0 AND binding.name=source.target_name)
+ OR EXISTS(
+ SELECT 1 FROM cr_binding_owners owner CROSS JOIN cr_binding_targets binding ON binding.owner=owner.owner
+ WHERE owner.crate_key=route.target_crate_key AND owner.module_path=route.target_module_path
+ AND owner.blob_id=0 AND owner.binder_scope=0 AND binding.name=source.target_name
+ AND (binding.namespace=CASE reference.namespace WHEN 'callable' THEN 'value'
+ WHEN 'constant' THEN 'value' ELSE reference.namespace END
+ OR (reference.namespace IN ('constructor','type_or_value') AND binding.namespace IN ('type','value'))))))";
 // A module name is one identifier, so a module path names one parent and one
 // name; a second pair behind the same path fails the primary key.
-pub(super) const MODULE_DECLARATIONS_SQL: &str = "INSERT INTO cr_module_declarations SELECT DISTINCT parent.module_path || '::' || declaration.module_name, parent.module_path, declaration.module_name FROM cr_members AS parent CROSS JOIN source_rust_module_declarations AS declaration ON declaration.blob_id = parent.blob_id";
+#[doc(hidden)]
+pub const MODULE_DECLARATIONS_SQL: &str = "INSERT INTO cr_module_declarations SELECT DISTINCT parent.module_path || '::' || declaration.module_name, parent.module_path, declaration.module_name FROM cr_members AS parent CROSS JOIN source_rust_module_inventory AS inventory ON inventory.blob_id=parent.blob_id AND inventory.parent_scope_ordinal=parent.scope_ordinal CROSS JOIN source_rust_module_declarations AS declaration ON declaration.blob_id=inventory.blob_id AND declaration.declaration_id=inventory.declaration_id";
 pub(super) const ROOT_REFERENCES_INSERT_SQL: &str =
     "INSERT INTO rust_crate_root_references VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
-    vec![
+    let mut statements = vec![
         (
             "rust_crate_public_surface_bindings",
             PUBLIC_SURFACE_BINDINGS_SQL,
@@ -2287,6 +2430,11 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             0,
         ),
         (
+            "rust_crate_canonical_dependency_declarations",
+            CANONICAL_DEPENDENCY_DECLARATIONS_SQL,
+            0,
+        ),
+        (
             "rust_crate_local_reexport_steps",
             LOCAL_REEXPORT_STEPS_SQL,
             0,
@@ -2373,10 +2521,11 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ),
         ("rust_crate_derivation_sql_cr_globs_15", SQL_CR_GLOBS_15, 0),
         ("rust_crate_derivation_sql_cr_gaps_16", SQL_CR_GAPS_16, 0),
+        ("rust_crate_gap_levels_surface", GAP_LEVEL_SURFACE_SQL, 0),
         (
             "rust_crate_derivation_sql_rust_crate_exports_17",
             SQL_RUST_CRATE_EXPORTS_17,
-            9,
+            12,
         ),
         (
             "rust_crate_derivation_sql_rust_crate_reexport_routes_18",
@@ -2400,7 +2549,7 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ),
         ("rust_crate_module_declarations", MODULE_DECLARATIONS_SQL, 0),
         ("rust_crate_root_sources", ROOT_SOURCES_SQL, 0),
-        ("rust_crate_root_routes", ROOT_ROUTES_SQL.as_str(), 2),
+        ("rust_crate_root_routes", ROOT_ROUTES_SQL.as_str(), 0),
         (
             "rust_crate_root_references_select",
             ROOT_REFERENCES_SELECT_SQL,
@@ -2415,12 +2564,12 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         (
             "rust_crate_trait_impl_subject_routes",
             IMPL_SUBJECT_ROUTES_SQL.as_str(),
-            2,
+            0,
         ),
         (
             "rust_crate_trait_impl_trait_routes",
             IMPL_TRAIT_ROUTES_SQL.as_str(),
-            2,
+            0,
         ),
         (
             "rust_crate_trait_impl_subject_bindings",
@@ -2480,13 +2629,84 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             UNRESOLVED_IMPL_INSERT_SQL,
             9,
         ),
-    ]
+    ];
+    statements.extend([
+        (
+            "rust_crate_binding_provenance_select",
+            BINDING_PROVENANCE_SELECT_SQL,
+            0,
+        ),
+        (
+            "rust_crate_binding_provenance_insert",
+            BINDING_PROVENANCE_INSERT_SQL,
+            15,
+        ),
+        (
+            "rust_crate_binding_provenance_surface",
+            BINDING_PROVENANCE_SURFACE_SQL.as_str(),
+            0,
+        ),
+        (
+            "rust_crate_binding_provenance_read",
+            crate::analyzer::store::rust_unit_summaries::BINDING_PROVENANCE_READ_SQL,
+            2,
+        ),
+    ]);
+    statements.extend(binding_relation::query_registry());
+    statements.extend([
+        (
+            "rust_binding_authority_local_owners",
+            binding_authority::LOCAL_OWNERS_SQL,
+            0,
+        ),
+        (
+            "rust_binding_authority_local_parents",
+            binding_authority::LOCAL_PARENTS_SQL,
+            0,
+        ),
+        (
+            "rust_binding_authority_local_declarations",
+            binding_authority::LOCAL_DECLARATIONS_SQL,
+            1,
+        ),
+        (
+            "rust_binding_authority_blockers",
+            binding_authority::BLOCKERS_SQL,
+            0,
+        ),
+        (
+            "rust_binding_authority_owners",
+            binding_authority::OWNERS_SQL,
+            0,
+        ),
+        (
+            "rust_binding_authority_names",
+            binding_authority::NAMES_SQL,
+            0,
+        ),
+        (
+            "rust_binding_authority_alternatives",
+            binding_authority::ALTERNATIVES_SQL.as_str(),
+            0,
+        ),
+        (
+            "rust_binding_authority_reasons",
+            binding_authority::REASONS_SQL,
+            0,
+        ),
+    ]);
+    statements
 }
 
 pub(super) const IMPORT_CONFLICT_GAPS_SQL: &str = "INSERT INTO cr_gaps
     SELECT 'unresolved_import', module_path || '::' || bound_name || ':' || namespace,
            json_object('reason', 'conflicting bindings in one lexical scope', 'imports', json_group_array(import_ordinal))
-    FROM cr_imports GROUP BY module_path, blob_id, binder_scope, namespace, bound_name HAVING count(*) > 1";
+    FROM (SELECT module_path,blob_id,binder_scope,namespace,bound_name,
+                 target_crate_key,target_module_path,target_name,MIN(import_ordinal) AS import_ordinal
+          FROM cr_imports GROUP BY module_path,blob_id,binder_scope,namespace,bound_name,
+                 target_crate_key,target_module_path,target_name)
+    GROUP BY module_path,blob_id,binder_scope,namespace,bound_name HAVING count(*) > 1";
+#[cfg(any(test, feature = "test-support"))]
 pub(super) const DELETE_IMPORT_CONFLICTS_SQL: &str = "DELETE FROM cr_imports WHERE
     (module_path, blob_id, binder_scope, namespace, bound_name) IN
     (SELECT module_path, blob_id, binder_scope, namespace, bound_name FROM cr_imports GROUP BY module_path, blob_id, binder_scope, namespace, bound_name HAVING count(*) > 1)";
@@ -2500,6 +2720,12 @@ pub(super) const GLOB_SURFACE_SQL: &str = "SELECT module_path, target_crate_key,
 pub(super) const SELECT_GLOB_REEXPORTS_SQL: &str = "SELECT * FROM cr_glob_reexports";
 pub(super) const INSERT_GLOB_REEXPORTS_SQL: &str =
     "INSERT OR IGNORE INTO rust_crate_glob_reexport_routes VALUES(?1,?2,?3,?4,?5,?6)";
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn derive_bindings_for_plan(conn: &Connection, edition: &str) -> Result<()> {
+    binding_relation::derive(conn, edition, "plan-fixture", "[]")
+}
 
 #[cfg(test)]
 mod public_surface_plan_tests {
@@ -2590,7 +2816,7 @@ mod public_surface_plan_tests {
         )
         .unwrap();
         conn.execute_batch(
-            "INSERT INTO rust_crate_exports VALUES(10, 'crate', 'type', 'api', 'declaration', 'public', NULL, 2, 2);
+            "INSERT INTO rust_crate_exports(topology_id,module_path,namespace,name,origin,visibility,restricted_module_path,declaration_blob_id,declaration_site) VALUES(10, 'crate', 'type', 'api', 'declaration', 'public', NULL, 2, 2);
              INSERT INTO source_fact_manifests(
                blob_id, facts_version, source_bytes, occurrence_count, declaration_count,
                declaration_unit_count, node_count, role_count, occurrence_role_count,

@@ -1,8 +1,10 @@
 use crate::analyzer::Language;
 use crate::analyzer::kotlin::KotlinAdapter;
 use crate::analyzer::store::AnalyzerStore;
-use crate::analyzer::store::tests::{oid_for, parse_state};
-use crate::analyzer::structural::facts::{FileFacts, STRUCTURAL_FACTS_VERSION};
+use crate::analyzer::store::structural_vocabulary::STRUCTURAL_FACTS_VERSION;
+use crate::analyzer::store::test_support::{oid_for, parse_state};
+use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
+use crate::analyzer::structural::facts::FileFacts;
 use crate::analyzer::structural::kinds::NormalizedKind;
 use crate::inline_project::InlineTestProject;
 use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;

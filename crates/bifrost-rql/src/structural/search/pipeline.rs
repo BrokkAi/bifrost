@@ -160,10 +160,79 @@ fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> 
     }
 }
 
+fn procedure_reference_expansions(
+    semantic: &mut SemanticQueryContext<'_>,
+    inventory: &mut HashMap<ProjectFile, Vec<semantic::SemanticProcedureReferenceValue>>,
+    file: &ProjectFile,
+    range: Range,
+    name: Option<&str>,
+) -> Vec<PipelineExpansion> {
+    let references = inventory
+        .entry(file.clone())
+        .or_insert_with(|| semantic.procedure_references(file));
+    let mut selected = references
+        .iter()
+        .filter(|reference| {
+            let span = &reference.byte_span;
+            let name_matches = name.is_none_or(|name| {
+                reference
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            });
+            // Inventory must preserve the same ownership exclusions as lowered
+            // procedure lookup, without materializing executable artifacts.
+            let excluded = reference.source_range_holes.iter().any(|hole| {
+                hole.start_byte() as usize <= range.start_byte
+                    && range.end_byte <= hole.end_byte() as usize
+            });
+            name_matches
+                && !excluded
+                && ((span.start <= range.start_byte && span.end >= range.end_byte)
+                    || (range.start_byte <= span.start && range.end_byte >= span.end))
+        })
+        .collect::<Vec<_>>();
+    let rank = |reference: &semantic::SemanticProcedureReferenceValue| {
+        let span = &reference.byte_span;
+        let alignment = if span.start == range.start_byte && span.end == range.end_byte {
+            0
+        } else if span.start == range.start_byte || span.end == range.end_byte {
+            1
+        } else if span.start <= range.start_byte && span.end >= range.end_byte {
+            2
+        } else {
+            3
+        };
+        (alignment, span.len())
+    };
+    let best = selected.iter().map(|reference| rank(reference)).min();
+    selected.retain(|reference| Some(rank(reference)) == best);
+    if selected.is_empty() && !references.is_empty() {
+        semantic.report_no_enclosing_procedure(file);
+    }
+    selected
+        .into_iter()
+        .cloned()
+        .map(|reference| SemanticPipelineValue::ProcedureReference(Box::new(reference)))
+        .map(PipelineValue::Semantic)
+        .map(pipeline_expansion)
+        .collect()
+}
+
 fn semantic_artifact_window_file<'a>(
     value: &'a PipelineValue,
     step: &QueryStep,
 ) -> Option<&'a ProjectFile> {
+    if matches!(step, QueryStep::ProcedureOf | QueryStep::ProgramPointOf) {
+        return match value {
+            PipelineValue::StructuralMatch(seed) => Some(&seed.file),
+            PipelineValue::Declaration(declaration) => Some(declaration.unit.source()),
+            _ => None,
+        };
+    }
     if matches!(
         step,
         QueryStep::DecoratorBindings(_)
@@ -186,7 +255,24 @@ fn semantic_artifact_window_file<'a>(
             _ => None,
         };
     }
-    result_contract_artifact_file(value)
+    match value {
+        PipelineValue::Semantic(SemanticPipelineValue::ProcedureReference(reference)) => {
+            return Some(&reference.file);
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::ProgramPointReference(reference)) => {
+            return Some(&reference.procedure.file);
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::ControlEdgeReference(reference)) => {
+            return Some(&reference.procedure.file);
+        }
+        _ => {}
+    }
+    match value {
+        PipelineValue::Declaration(_) | PipelineValue::StructuralMatch(_) => {
+            terminal_source_file(value)
+        }
+        _ => result_contract_artifact_file(value),
+    }
 }
 
 /// Join a semantic runtime endpoint back to the exact structural seed that
@@ -2249,6 +2335,7 @@ fn apply_pipeline_step_general<'a>(
     let mut unsupported_languages = BTreeSet::new();
     let mut semantic_omissions: BTreeMap<(Language, &'static str), usize> = BTreeMap::new();
     let mut receiver_diagnostics = ReceiverDiagnostics::new();
+    let mut procedure_reference_inventory = HashMap::default();
     let mut enclosing_declarations: HashMap<ProjectFile, EnclosingDeclarationIndex> =
         HashMap::default();
     let mut exhausted = false;
@@ -2352,19 +2439,67 @@ fn apply_pipeline_step_general<'a>(
         && semantic
             .as_ref()
             .is_some_and(SemanticQueryContext::can_start_artifact_windows);
-    let window_semantic_artifacts = window_result_contract_artifacts
+    let window_procedure_producer =
+        matches!(step, QueryStep::ProcedureOf | QueryStep::ProgramPointOf)
+            && semantic
+                .as_ref()
+                .is_some_and(SemanticQueryContext::can_start_artifact_windows);
+    let window_procedure_artifacts = window_procedure_producer
+        || (!matches!(
+            step,
+            QueryStep::FileOf
+                | QueryStep::Project(_)
+                | QueryStep::Filter(_)
+                | QueryStep::ValueFlow(_)
+                | QueryStep::Taint(_)
+                | QueryStep::Typestate(_)
+                | QueryStep::StateEventsOf(_)
+                | QueryStep::FlowRelationsOf(_)
+                | QueryStep::ControlRelations(_)
+                | QueryStep::GuardsOf
+        ) && rows.iter().any(|row| {
+            matches!(
+                row.value,
+                PipelineValue::Semantic(
+                    SemanticPipelineValue::ProcedureReference(_)
+                        | SemanticPipelineValue::ProgramPointReference(_)
+                        | SemanticPipelineValue::ControlEdgeReference(_)
+                )
+            )
+        }) && semantic
+            .as_ref()
+            .is_some_and(SemanticQueryContext::can_start_artifact_windows));
+    let requested_step_outputs = max_step_outputs;
+    // Grouping may visit a later input before an earlier one in another file.
+    // Apply the authored output cap after restoring the original row order.
+    let max_step_outputs = if window_procedure_artifacts {
+        max_pipeline_rows
+    } else {
+        max_step_outputs
+    };
+    let window_semantic_artifacts = window_procedure_artifacts
+        || window_result_contract_artifacts
         || window_result_subject_artifacts
         || window_decorated_parameter_artifacts;
     let mut rows = rows;
+    let input_order = window_procedure_artifacts.then(|| {
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| (row.value.key(), index))
+            .collect::<HashMap<_, _>>()
+    });
+    let mut output_order: HashMap<PipelineKey, (usize, usize)> = HashMap::default();
     let window_result_contract_candidates = matches!(step, QueryStep::ResultContractCalls);
     let window_native_cpp_dispatch = matches!(step, QueryStep::CallResultObligations);
     let sort_result_contract_rows = window_result_contract_candidates
         || window_result_contract_artifacts
         || window_native_cpp_dispatch;
-    let sort_artifact_rows = sort_result_contract_rows
+    let sort_artifact_rows = window_procedure_artifacts
+        || sort_result_contract_rows
         || window_result_subject_artifacts
         || window_decorated_parameter_artifacts;
-    let release_effect_file_windows = sort_result_contract_rows || window_result_subject_artifacts;
+    let release_effect_file_windows =
+        window_procedure_artifacts || sort_result_contract_rows || window_result_subject_artifacts;
     if sort_artifact_rows {
         rows.sort_by(|left, right| {
             semantic_artifact_window_file(&left.value, step)
@@ -2499,6 +2634,52 @@ fn apply_pipeline_step_general<'a>(
                 .is_some_and(|semantic| !semantic_row_seed_generations_current(semantic, &row))
         {
             continue;
+        }
+        let original_key = row.value.key();
+        if step != &QueryStep::FileOf {
+            let loaded = match &row.value {
+                PipelineValue::Semantic(SemanticPipelineValue::ProcedureReference(reference)) => {
+                    Some(
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists")
+                            .resolve_procedure_reference(reference)
+                            .map(SemanticPipelineValue::Procedure),
+                    )
+                }
+                PipelineValue::Semantic(SemanticPipelineValue::ProgramPointReference(
+                    reference,
+                )) => Some(
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists")
+                        .resolve_point_reference(reference)
+                        .map(SemanticPipelineValue::ProgramPoint),
+                ),
+                PipelineValue::Semantic(SemanticPipelineValue::ControlEdgeReference(reference)) => {
+                    Some(
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists")
+                            .resolve_edge_reference(reference)
+                            .map(SemanticPipelineValue::ControlEdge),
+                    )
+                }
+                _ => None,
+            };
+            if let Some(loaded) = loaded {
+                let Some(loaded) = loaded else {
+                    if semantic
+                        .as_ref()
+                        .is_some_and(|context| context.work().budget_exhausted)
+                    {
+                        exhausted = true;
+                        break;
+                    }
+                    continue;
+                };
+                row.value = PipelineValue::Semantic(loaded);
+            }
         }
         if matches!(step, QueryStep::ResultContractCalls) {
             let PipelineValue::CallShape(shape) = &row.value else {
@@ -2793,7 +2974,7 @@ fn apply_pipeline_step_general<'a>(
             }
             continue;
         }
-        let mut expansions = match (&row.value, step) {
+        let expansions = match (&row.value, step) {
             (PipelineValue::ConfigurationFact(value), QueryStep::ConfigurationAbsence(filter)) => {
                 configuration_absence::expansions(value, filter, diagnostics)
             }
@@ -2939,6 +3120,55 @@ fn apply_pipeline_step_general<'a>(
             (PipelineValue::StructuralMatch(seed), QueryStep::JsxAttributeValue(filter)) => {
                 jsx::jsx_attribute_value_expansions(analyzer, seed, filter, diagnostics)
             }
+            (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf)
+                if crate::analyzer::common::language_for_file(&seed.file) == Language::Python =>
+            {
+                let declaration =
+                    exact_callable_declaration_value(analyzer, seed, &mut enclosing_declarations);
+                procedure_reference_expansions(
+                    semantic
+                        .as_mut()
+                        .expect("procedure inventory requires semantic services"),
+                    &mut procedure_reference_inventory,
+                    &seed.file,
+                    seed_range(seed),
+                    declaration
+                        .as_ref()
+                        .map(|declaration| declaration.unit.terminal_name()),
+                )
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::ProcedureOf)
+                if crate::analyzer::common::language_for_file(declaration.unit.source())
+                    == Language::Python =>
+            {
+                procedure_reference_expansions(
+                    semantic
+                        .as_mut()
+                        .expect("procedure inventory requires semantic services"),
+                    &mut procedure_reference_inventory,
+                    declaration.unit.source(),
+                    declaration.range,
+                    Some(declaration.unit.terminal_name()),
+                )
+            }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ProcedureReference(reference)),
+                QueryStep::FileOf,
+            ) => vec![pipeline_expansion(PipelineValue::File(
+                reference.file.clone(),
+            ))],
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ProgramPointReference(reference)),
+                QueryStep::FileOf,
+            ) => vec![pipeline_expansion(PipelineValue::File(
+                reference.procedure.file.clone(),
+            ))],
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::ControlEdgeReference(reference)),
+                QueryStep::FileOf,
+            ) => vec![pipeline_expansion(PipelineValue::File(
+                reference.procedure.file.clone(),
+            ))],
             (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => {
                 let declaration =
                     exact_callable_declaration_value(analyzer, seed, &mut enclosing_declarations);
@@ -5652,6 +5882,30 @@ fn apply_pipeline_step_general<'a>(
             }
             _ => unreachable!("query step domains are validated before execution"),
         };
+        let mut expansions = expansions
+            .into_iter()
+            .map(|mut expansion| {
+                expansion.value = match expansion.value {
+                    PipelineValue::Semantic(SemanticPipelineValue::Procedure(value)) => {
+                        PipelineValue::Semantic(SemanticPipelineValue::ProcedureReference(
+                            Box::new(value.reference()),
+                        ))
+                    }
+                    PipelineValue::Semantic(SemanticPipelineValue::ProgramPoint(value)) => {
+                        PipelineValue::Semantic(SemanticPipelineValue::ProgramPointReference(
+                            Box::new(value.reference()),
+                        ))
+                    }
+                    PipelineValue::Semantic(SemanticPipelineValue::ControlEdge(value)) => {
+                        PipelineValue::Semantic(SemanticPipelineValue::ControlEdgeReference(
+                            Box::new(value.reference()),
+                        ))
+                    }
+                    value => value,
+                };
+                expansion
+            })
+            .collect::<Vec<_>>();
         // Canonical endpoint identity is fixed before row keys or deduplication.
         for expansion in &mut expansions {
             if let PipelineValue::PythonRuleFact(value) = &mut expansion.value {
@@ -5725,7 +5979,7 @@ fn apply_pipeline_step_general<'a>(
                 .saturating_add(expansions.len());
         }
 
-        for expansion in expansions {
+        for (expansion_index, expansion) in expansions.into_iter().enumerate() {
             if !expansion.budgeted && budget.pipeline_rows >= max_pipeline_rows {
                 exhausted = true;
                 break 'rows;
@@ -5749,11 +6003,25 @@ fn apply_pipeline_step_general<'a>(
             {
                 artifact_window_has_policy_row = true;
             }
+            if let Some(input_order) = &input_order {
+                let rank = (input_order[&original_key], expansion_index);
+                output_order
+                    .entry(expansion.value.key())
+                    .and_modify(|existing| *existing = (*existing).min(rank))
+                    .or_insert(rank);
+            }
             let traces = row
                 .traces
                 .iter()
                 .cloned()
-                .map(|trace| advance_pipeline_trace(trace, step, &expansion.trace))
+                .enumerate()
+                .map(|(trace_index, mut trace)| {
+                    if let Some(input_order) = &input_order {
+                        trace.window_order =
+                            Some((input_order[&original_key], expansion_index, trace_index));
+                    }
+                    advance_pipeline_trace(trace, step, &expansion.trace)
+                })
                 .collect();
             insert_pipeline_row(
                 &mut output,
@@ -5787,6 +6055,15 @@ fn apply_pipeline_step_general<'a>(
         call_cache.effects.release_file_window();
     }
 
+    if step == &QueryStep::ProcedureOf {
+        semantic
+            .as_mut()
+            .expect("procedure inventory has a semantic context")
+            .finish_reference_inventory();
+    }
+    if window_procedure_artifacts {
+        output.sort_by_key(|row| output_order[&row.value.key()]);
+    }
     if let QueryStep::AbsentMember(proof) = step {
         output.retain(|row| {
             let PipelineValue::AbsentMemberFinding(finding) = &row.value else {
@@ -5799,6 +6076,15 @@ fn apply_pipeline_step_general<'a>(
             }
         });
         output.truncate(max_step_outputs);
+    }
+
+    if window_procedure_artifacts {
+        output.truncate(requested_step_outputs);
+        for row in &mut output {
+            for trace in &mut row.traces {
+                trace.window_order = None;
+            }
+        }
     }
 
     if filter_witnessed_candidate && !filter_selected_candidate {

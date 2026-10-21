@@ -370,77 +370,38 @@ fn is_primary_constructor_range(
         .any(|&(primary_start, primary_end)| start == primary_start && end == primary_end)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_projection_matches_direct(
+    path: &str,
+    source: &str,
+    fq_name: &str,
+) -> CommentDensityStats {
+    let fixture = crate::test_support::AnalyzerFixture::new(&[(path, source)]);
+    let analyzer = fixture.analyzer.analyzer();
+    let file = ProjectFile::new(fixture.project_root(), path);
+    let code_unit = analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .find(|unit| unit.source() == &file)
+        .unwrap_or_else(|| panic!("expected `{fq_name}` in `{path}`"));
+    let projection = analyzer
+        .summary_file_projection(&file)
+        .expect("fixture analyzer should provide a summary projection");
+    let projected = analyze_file(analyzer, &file, source, Some(&projection))
+        .and_then(|density| build_roll_up_stats(&code_unit, &density))
+        .expect("projected comment density");
+    let direct = analyze_file(analyzer, &file, source, None)
+        .and_then(|density| build_roll_up_stats(&code_unit, &density))
+        .expect("direct comment density");
+    assert_eq!(projected, direct);
+    projected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;
-
-    fn assert_projection_matches_direct(
-        path: &str,
-        source: &str,
-        fq_name: &str,
-    ) -> CommentDensityStats {
-        let fixture = AnalyzerFixture::new(&[(path, source)]);
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), path);
-        let code_unit = analyzer
-            .get_definitions(fq_name)
-            .into_iter()
-            .find(|unit| unit.source() == &file)
-            .unwrap_or_else(|| panic!("expected `{fq_name}` in `{path}`"));
-        let projection = analyzer
-            .summary_file_projection(&file)
-            .expect("fixture analyzer should provide a summary projection");
-        let projected = analyze_file(analyzer, &file, source, Some(&projection))
-            .and_then(|density| build_roll_up_stats(&code_unit, &density))
-            .expect("projected comment density");
-        let direct = analyze_file(analyzer, &file, source, None)
-            .and_then(|density| build_roll_up_stats(&code_unit, &density))
-            .expect("direct comment density");
-        assert_eq!(projected, direct);
-        projected
-    }
-
-    #[test]
-    #[hardwon(
-        "#2592: JavaScript import projection attributed comments differently from the direct scan"
-    )]
-    fn javascript_projection_preserves_imported_module_attribution() {
-        let stats = assert_projection_matches_direct(
-            "response.js",
-            "var dep = require('dep');\n\
-             function send(body) {\n\
-               // settings\n\
-               return dep(body);\n\
-             }\n",
-            "send",
-        );
-        assert_eq!(
-            (stats.header_comment_lines, stats.inline_comment_lines),
-            (0, 0)
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "#2592: TypeScript import projection attributed comments differently from the direct scan"
-    )]
-    fn typescript_projection_preserves_imported_module_attribution() {
-        let stats = assert_projection_matches_direct(
-            "Ky.ts",
-            "import type {Options} from './types.js';\n\
-             function cloneRetryOptions(options: Options): Options {\n\
-               // clone before mutation\n\
-               return {...options};\n\
-             }\n",
-            "cloneRetryOptions",
-        );
-        assert_eq!(
-            (stats.header_comment_lines, stats.inline_comment_lines),
-            (0, 0)
-        );
-    }
 
     #[test]
     #[hardwon("#2592: Scala synthetic constructor children stole class comment attribution")]

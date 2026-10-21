@@ -281,6 +281,8 @@ pub(crate) struct CompiledTypestatePolicy {
     terminal_endpoints: Box<[Option<ResolvedEndpointIdentity>]>,
     query_work: CodeQueryExecutionWork,
     semantic_compile_work: SemanticWork,
+    semantic_compile_resident_peak: SemanticWork,
+    semantic_compile_root_work_peak: SemanticWork,
     semantic_compile_peaks: PolicySemanticPeaks,
     semantic_remaining: SemanticWork,
     semantic_scope: SemanticBudgetScopeSnapshot,
@@ -303,6 +305,8 @@ struct TypestateEvaluationFailure {
 struct TypestateWorkMeasurements {
     cache_work: ProductionSummaryLifecycleCounters,
     semantic_evaluation_work: SemanticWork,
+    semantic_evaluation_resident_peak: SemanticWork,
+    semantic_evaluation_root_work_peak: SemanticWork,
     semantic_peaks: PolicySemanticPeaks,
     final_execution_work: SemanticExecutionWork,
     evaluation_materialized_files: usize,
@@ -929,7 +933,7 @@ fn typestate_work_report(
     measured: &TypestateWorkMeasurements,
 ) -> PolicyWorkReport {
     let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
-    let metrics = [
+    let mut metrics: Vec<PolicyWorkMetric> = [
         ("typestate.roots", compiled.roots.len()),
         ("typestate.subjects", compiled.bindings.subjects().len()),
         (
@@ -1140,6 +1144,22 @@ fn typestate_work_report(
         ),
     ])
     .collect();
+    let cumulative = compiled
+        .semantic_compile_work
+        .conservative_add(measured.semantic_evaluation_work);
+    let resident = compiled
+        .semantic_compile_resident_peak
+        .component_max(measured.semantic_evaluation_resident_peak);
+    let root_work = compiled
+        .semantic_compile_root_work_peak
+        .component_max(measured.semantic_evaluation_root_work_peak);
+    super::finding::append_semantic_budget_metrics(
+        &mut metrics,
+        "typestate",
+        cumulative,
+        resident,
+        root_work,
+    );
     PolicyWorkReport::try_new(
         compiled.query_work.scanned_files,
         compiled.query_work.scanned_source_bytes,
@@ -1167,6 +1187,8 @@ fn compiled_typestate_work_report(compiled: &CompiledTypestatePolicy) -> PolicyW
         &TypestateWorkMeasurements {
             cache_work: ProductionSummaryLifecycleCounters::default(),
             semantic_evaluation_work: SemanticWork::default(),
+            semantic_evaluation_resident_peak: SemanticWork::default(),
+            semantic_evaluation_root_work_peak: SemanticWork::default(),
             semantic_peaks: compiled.semantic_compile_peaks,
             final_execution_work: execution,
             evaluation_materialized_files: 0,
@@ -1436,7 +1458,7 @@ fn charge_reused_root_lanes(
         return Err(WidenReason::MergedLimitReached);
     }
     let semantic_budget = semantic_budget.expect("a root to reuse is a root the compile produced");
-    if semantic_budget.charge(work.semantic).is_err() {
+    if semantic_budget.replay_product(work.semantic).is_err() {
         return Err(WidenReason::MergedLimitReached);
     }
     if !execution_budget
@@ -1516,6 +1538,9 @@ fn evaluate_compiled_typestate(
         return RootsPass::Widen(reason);
     }
     'roots: for (root_index, root) in compiled.roots.iter().enumerate() {
+        if let Some(budget) = &mut semantic_budget {
+            budget.begin_root();
+        }
         let mut root_work = RootWork::default();
         let mut root_reasons = Vec::new();
         if let Some(units) = units.as_deref_mut() {
@@ -1572,8 +1597,8 @@ fn evaluate_compiled_typestate(
         // here so the reuse path above can replay exactly it.
         let solver_before = solver_budget.used();
         let semantic_before = semantic_budget
-            .as_ref()
-            .map_or_else(SemanticWork::default, SemanticBudget::used);
+            .as_mut()
+            .map(SemanticBudget::replay_snapshot);
         let execution_before = evaluation_execution_budget.work();
         let leases_before = evaluation_artifact_leases.len();
         let lease_bytes_before = evaluation_artifact_leases.retained_bytes();
@@ -1804,8 +1829,9 @@ fn evaluate_compiled_typestate(
                 root_work.solver = solver_budget.used().saturating_sub(solver_before);
                 root_work.semantic = semantic_budget
                     .as_ref()
-                    .map_or_else(SemanticWork::default, SemanticBudget::used)
-                    .saturating_sub(semantic_before);
+                    .zip(semantic_before.as_ref())
+                    .map(|(budget, before)| budget.replay_since(before))
+                    .unwrap_or_default();
                 root_work.materialized_files = count(
                     execution_after
                         .materialized_files
@@ -1895,6 +1921,12 @@ fn evaluate_compiled_typestate(
         &TypestateWorkMeasurements {
             cache_work,
             semantic_evaluation_work,
+            semantic_evaluation_resident_peak: semantic_budget
+                .as_ref()
+                .map_or_else(SemanticWork::default, SemanticBudget::resident_peak),
+            semantic_evaluation_root_work_peak: semantic_budget
+                .as_ref()
+                .map_or_else(SemanticWork::default, SemanticBudget::root_work_peak),
             semantic_peaks,
             final_execution_work: final_evaluation_execution_work,
             evaluation_materialized_files,
@@ -3551,6 +3583,8 @@ impl<'a> TypestatePolicyCompiler<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let semantic_compile_work = self.selectors.semantic_used();
+        let semantic_compile_resident_peak = self.selectors.semantic_resident_peak();
+        let semantic_compile_root_work_peak = self.selectors.semantic_root_work_peak();
         let semantic_compile_peaks = self.selectors.semantic_peaks();
         let semantic_remaining = self.selectors.semantic_remaining();
         let semantic_scope = self.selectors.semantic_scope_snapshot();
@@ -3591,6 +3625,8 @@ impl<'a> TypestatePolicyCompiler<'a> {
             terminal_endpoints: terminal_endpoints.into_boxed_slice(),
             query_work,
             semantic_compile_work,
+            semantic_compile_resident_peak,
+            semantic_compile_root_work_peak,
             semantic_compile_peaks,
             semantic_remaining,
             semantic_scope,
@@ -3727,13 +3763,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .selectors
             .materialize_with_artifact_continuation(&selection.file)
             .map_err(typestate_selector_error)?;
-        let lookup = procedures_in_artifact(
-            &artifact,
-            self.selectors
-                .remaining_semantic_traversal_steps()
-                .map_err(typestate_selector_error)?,
-            self.selectors.cancellation(),
-        );
+        let lookup = procedures_in_artifact(&artifact, usize::MAX, self.selectors.cancellation());
         if !self
             .selectors
             .execution_budget()
@@ -4584,9 +4614,6 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 detail: "formal-parameter layout resolution was cancelled".to_owned(),
             });
         }
-        self.selectors
-            .remaining_semantic_traversal_steps()
-            .map_err(typestate_selector_error)?;
         if !self.selectors.execution_budget().charge_traversal(1) {
             return Err(query_budget_error(
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
@@ -4886,9 +4913,6 @@ impl<'a> TypestatePolicyCompiler<'a> {
         let exceptional = reachable.contains(graph, graph.exceptional_exit_point());
         let work = reachable.work();
         drop(reachable);
-        self.selectors
-            .remaining_semantic_traversal_steps()
-            .map_err(typestate_selector_error)?;
         if !self
             .selectors
             .execution_budget()
@@ -7396,7 +7420,7 @@ func MissingClose() {
 
         let budget = SemanticBudget::uniform(1).expect("positive test budget");
         let exceeded = budget
-            .check(SemanticWork {
+            .check_admission(SemanticWork {
                 source_bytes: 2,
                 ..SemanticWork::default()
             })

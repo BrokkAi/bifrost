@@ -549,19 +549,43 @@ fn read_disk_source_bytes_limited(
     Ok((source.len() <= max_bytes).then_some(source))
 }
 
+/// A source decoder rejected binary content, rather than failing to read it.
+#[derive(Debug)]
+pub struct BinarySourceRejection;
+
+impl std::fmt::Display for BinarySourceRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("source contains NUL bytes")
+    }
+}
+
+impl std::error::Error for BinarySourceRejection {}
+
 /// Decode source bytes the way every disk-backed [`Project`] does: legacy
 /// non-UTF-8 text is admitted lossily and NUL-bearing binary data is rejected.
+///
+/// `BIFROST_ADMIT_NUL_BYTES=1` opts out of the rejection: each NUL byte
+/// decodes as one space, so byte offsets still address the original blob,
+/// whose identity callers hash from the raw bytes. Benchmark harnesses use it
+/// for real repositories that embed a raw NUL inside a string literal.
 ///
 /// Public because a project can obtain a file's bytes from somewhere other than
 /// the filesystem -- an immutable revision image reads them out of the Git
 /// object database -- and the two readings of one file must not decode
 /// differently.
-pub fn decode_source_bytes(bytes: Vec<u8>) -> io::Result<String> {
+pub fn decode_source_bytes(mut bytes: Vec<u8>) -> io::Result<String> {
     if bytes.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "source contains NUL bytes",
-        ));
+        if std::env::var("BIFROST_ADMIT_NUL_BYTES").as_deref() != Ok("1") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                BinarySourceRejection,
+            ));
+        }
+        for byte in &mut bytes {
+            if *byte == 0 {
+                *byte = b' ';
+            }
+        }
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -1671,7 +1695,7 @@ impl OverlayProject {
     fn next_revision(&self) -> OverlayRevision {
         let previous = self
             .revision_allocator
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .expect("overlay revision space exhausted");

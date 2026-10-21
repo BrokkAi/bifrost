@@ -7,61 +7,21 @@
 //! Heap carriers must have a local-variable declaration mapping, excluding
 //! Java's implicit-field carriers even when their uses look like identifiers.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::CancellationToken;
-use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
-use crate::analyzer::{Language, LanguageDialect, ProjectFile, WorkspaceAnalyzer};
-
-use super::cfg_algorithms::{
+use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, GenKillFacts, forward_reachability,
     reaching_definitions,
 };
-use super::type_flow::validate_prepared_syntax_source_for_procedure;
-use super::{
+use crate::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
+use crate::analyzer::semantic::{
     CallSiteId, EvidenceCompleteness, ProcedureHandle, ProgramPointId, ProofStatus, SemanticEffect,
     SemanticGapImpact, SemanticGapSubject, SemanticValueKind, SourceMappingKind, ValueFlowKind,
     ValueId,
 };
-
-#[derive(Clone, Copy, Debug)]
-pub struct LocalConstantOriginLimits {
-    pub max_depth: usize,
-    pub max_work: usize,
-    pub max_roots: usize,
-    pub max_source_bytes: usize,
-}
-
-impl Default for LocalConstantOriginLimits {
-    fn default() -> Self {
-        Self {
-            max_depth: 64,
-            max_work: 4096,
-            max_roots: 16,
-            max_source_bytes: 1_048_576,
-        }
-    }
-}
-
-/// No partial roots escape this boundary. All failures preserve the caller's
-/// whole-store join, while budget exhaustion remains separately observable.
-#[derive(Debug)]
-pub struct LocalConstantOrigins {
-    pub roots: Option<Vec<ValueId>>,
-    pub work: usize,
-    pub source_bytes: usize,
-    pub budget_exhausted: bool,
-    pub cancelled: bool,
-}
-
-#[derive(Clone, Copy)]
-struct Definition {
-    target: ValueId,
-    source: Option<ValueId>,
-    point: ProgramPointId,
-    event: usize,
-}
-
+use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
+use crate::analyzer::{Language, LanguageDialect, ProjectFile, WorkspaceAnalyzer};
+pub use brokk_bifrost_semantic::analyzer::semantic::local_value_origins::*;
+use std::collections::{HashMap, HashSet};
 /// The point is observed before its Invoke event. Source mappings qualify
 /// copy syntax; the CFG and exact ValueIds decide which definitions reach.
 pub fn derive_local_constant_origins(

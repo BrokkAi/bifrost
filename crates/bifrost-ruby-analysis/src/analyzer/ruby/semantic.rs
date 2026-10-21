@@ -1,0 +1,6869 @@
+//! Ruby lowering into the language-neutral executable-semantics IR.
+//!
+//! Ruby's surface syntax deliberately leaves several decisions to lexical or
+//! runtime semantics (notably local-variable versus zero-argument calls and
+//! block invocation).  This adapter lowers only tree-sitter-structured control
+//! and calls, and records the remaining decisions as exact semantic gaps.
+
+use brokk_bifrost_core::analyzer::tree_walk::children_by_field_name;
+use brokk_bifrost_ruby::local_bindings::{
+    LocalBindingBudget, LocalBindingTimeline, callable_parameters,
+};
+use brokk_bifrost_ruby::structural::ruby_unconditional_loop_body;
+use tree_sitter::Node;
+
+use brokk_bifrost_ruby::syntax::is_runtime_node;
+
+use brokk_bifrost_ruby::syntax::ruby_semantic_identifier_range;
+
+use brokk_bifrost_ruby::imports::ruby_symbol_name;
+
+use brokk_bifrost_analysis::analyzer::declared_scalar::DeclaredScalarType;
+
+use brokk_bifrost_analysis::analyzer::declared_scalar::binding_nodes;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+
+use brokk_bifrost_analysis::analyzer::semantic::cfg::CleanupRegionId;
+
+use brokk_bifrost_analysis::analyzer::semantic::cfg::CompletionKind;
+
+use brokk_bifrost_analysis::analyzer::semantic::cfg::CompletionRequest;
+
+use brokk_bifrost_analysis::analyzer::semantic::cfg::CompletionRoute;
+
+use brokk_bifrost_analysis::analyzer::semantic::cfg::ProcedureCfgBuilder;
+
+use brokk_bifrost_analysis::analyzer::semantic::cfg::ScopeBinding;
+
+use brokk_bifrost_analysis::analyzer::semantic::cfg::ScopeFrameId;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::ConditionTargets;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::ProcedureWork;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::ProcedureWorkHandler;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::ShortCircuitKind;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::dispatch_procedure_work;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::formal_multiplicity;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::resolve_binding_value;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::schedule_sequential_work;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::schedule_short_circuit_condition;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::source_anchor_between_nodes;
+
+use brokk_bifrost_analysis::analyzer::semantic::lowering::source_anchor_from_positions;
+
+use brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer;
+
+use brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity;
+
+use brokk_bifrost_analysis::analyzer::semantic::inventory::{
+    ProcedureInventoryBuilder, ProcedureInventoryOutcome,
+};
+use brokk_bifrost_analysis::analyzer::semantic::lowering::{
+    CallSiteScaffold, CleanupRoutePlanner, ControlTarget, PointMetadata, ProcedureLoweringError,
+    ProcedureLoweringSession, ProcedureLoweringStart, drive_and_finish_procedure, missing_field,
+    node_text, source_anchor,
+};
+use brokk_bifrost_analysis::analyzer::semantic::*;
+use brokk_bifrost_analysis::impl_program_semantics_provider;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+
+use brokk_bifrost_core::analyzer::tree_walk::named_children;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use crate::analyzer::RubyAnalyzer;
+
+use brokk_bifrost_core::hash::HashMap;
+
+use brokk_bifrost_core::hash::HashSet;
+
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v13";
+
+impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
+
+#[derive(Default)]
+struct BodyComponents<'tree> {
+    protected: Vec<Node<'tree>>,
+    rescues: Vec<Node<'tree>>,
+    alternative: Option<Node<'tree>>,
+    ensure: Option<Node<'tree>>,
+}
+
+fn body_components(node: Node<'_>) -> BodyComponents<'_> {
+    let body = if node.kind() == "body_statement" {
+        node
+    } else {
+        node.child_by_field_name("body")
+            .filter(|body| body.kind() == "body_statement")
+            .unwrap_or(node)
+    };
+    let mut parts = BodyComponents::default();
+    for child in named_children(body) {
+        match child.kind() {
+            "rescue" => parts.rescues.push(child),
+            "else" => parts.alternative = Some(child),
+            "ensure" => parts.ensure = Some(child),
+            "comment" | "empty_statement" => {}
+            _ => parts.protected.push(child),
+        }
+    }
+    parts
+}
+
+fn body_has_rescue_or_ensure(node: Node<'_>) -> bool {
+    named_children(node)
+        .into_iter()
+        .any(|child| matches!(child.kind(), "rescue" | "ensure"))
+}
+
+fn ordinary_body_statements(node: Node<'_>) -> Vec<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| {
+            !matches!(
+                child.kind(),
+                "rescue" | "else" | "ensure" | "comment" | "empty_statement"
+            )
+        })
+        .collect()
+}
+
+fn runtime_statement_children(node: Node<'_>) -> Vec<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| !matches!(child.kind(), "comment" | "empty_statement"))
+        .collect()
+}
+
+fn branch_statements(node: Node<'_>) -> Vec<Node<'_>> {
+    if matches!(
+        node.kind(),
+        "then" | "else" | "do" | "body_statement" | "block_body"
+    ) {
+        runtime_statement_children(node)
+    } else {
+        vec![node]
+    }
+}
+
+fn statement_definitely_abrupt(node: Node<'_>) -> bool {
+    matches!(node.kind(), "return" | "break" | "next" | "redo" | "retry")
+}
+
+fn ruby_statement_position(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let is_field = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|candidate| candidate.id() == node.id())
+    };
+    match parent.kind() {
+        "program" | "body_statement" | "block_body" | "then" | "else" | "do" | "ensure" => true,
+        "if" | "unless" | "elsif" | "if_modifier" | "unless_modifier" | "conditional" => {
+            is_field("consequence") || is_field("alternative") || is_field("body")
+        }
+        "while" | "until" | "while_modifier" | "until_modifier" | "for" => is_field("body"),
+        "rescue" | "when" | "in_clause" => is_field("body"),
+        _ => false,
+    }
+}
+
+fn ruby_callable_syntax(node: Node<'_>) -> bool {
+    match node.kind() {
+        "method" | "singleton_method" | "lambda" | "class" | "module" | "singleton_class" => true,
+        "block" | "do_block" => node.parent().is_none_or(|parent| parent.kind() != "lambda"),
+        _ => false,
+    }
+}
+
+fn ruby_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    if !ruby_statement_position(node)
+        || matches!(
+            node.kind(),
+            "body_statement"
+                | "block_body"
+                | "then"
+                | "else"
+                | "do"
+                | "ensure"
+                | "rescue"
+                | "when"
+                | "in_clause"
+        )
+        || ruby_callable_syntax(node)
+        || (node.kind() == "call" && node.child_by_field_name("block").is_some())
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "return" => "return",
+        "break" => "break",
+        "next" => "next",
+        "redo" => "redo",
+        "retry" => "retry",
+        "if" | "unless" | "elsif" | "if_modifier" | "unless_modifier" | "conditional" => "if",
+        "while" | "until" | "while_modifier" | "until_modifier" => "while",
+        "for" => "for",
+        "begin" => "try",
+        "case" | "case_match" => "case",
+        _ => "expression",
+    })
+}
+
+/// Ruby `for ... in` is an iteration loop and is intentionally omitted from
+/// B3; receiverless `loop do` is supplied by the source-aware hook below.
+fn ruby_loop_site(
+    node: Node<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax<'_>> {
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopKind;
+
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax;
+    let kind = match node.kind() {
+        "while" => LoopKind::While,
+        "until" | "until_modifier" => LoopKind::Until,
+        "while_modifier" => LoopKind::Do,
+        _ => return None,
+    };
+    Some(LoopSyntax {
+        kind,
+        body: node.child_by_field_name("body"),
+        condition: node.child_by_field_name("condition"),
+    })
+}
+
+fn ruby_loop_site_with_source<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax<'tree>> {
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopKind;
+
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax;
+    ruby_loop_site(node).or_else(|| {
+        ruby_unconditional_loop_body(node, source).map(|body| LoopSyntax {
+            // The shared loop model uses `For` for unconditional loops, as
+            // it does for Rust `loop` and Go `for {}`.
+            kind: LoopKind::For,
+            body: Some(body),
+            condition: None,
+        })
+    })
+}
+
+pub(crate) const PROCEDURE_SYNTAX_ROLES:
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles =
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: ruby_statement_kind,
+        loop_site: ruby_loop_site,
+        loop_site_with_source: Some(ruby_loop_site_with_source),
+        procedure_matches: |kind, node| match kind {
+            ProcedureKind::Method | ProcedureKind::Constructor => {
+                matches!(node.kind(), "method" | "singleton_method")
+            }
+            ProcedureKind::Lambda => node.kind() == "lambda",
+            ProcedureKind::Closure => {
+                matches!(node.kind(), "block" | "do_block")
+                    && node.parent().is_none_or(|parent| parent.kind() != "lambda")
+            }
+            ProcedureKind::Initializer => matches!(
+                node.kind(),
+                "program" | "class" | "module" | "singleton_class"
+            ),
+            _ => false,
+        },
+        nested_procedure: ruby_callable_syntax,
+    };
+
+/// The bounded Ruby rescue form whose payload can be carried without making
+/// ordinary `raise` calls intrinsic: one receiverless `raise local` call is
+/// matched by one clause for a class declared exactly once in this file.
+#[derive(Debug, Clone, Copy)]
+struct RubyPreciseRaise {
+    source: ValueId,
+    binder: ValueId,
+}
+
+fn direct_raise_identifier<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if node.kind() != "call"
+        || node.child_by_field_name("receiver").is_some()
+        || node.child_by_field_name("block").is_some()
+        || node
+            .child_by_field_name("method")
+            .and_then(|method| node_text(source, method))
+            != Some("raise")
+    {
+        return None;
+    }
+    let arguments = call_arguments(node);
+    let [argument] = arguments.as_slice() else {
+        return None;
+    };
+    (argument.kind() == "identifier").then_some(*argument)
+}
+
+fn precise_rescue_type<'tree, 'source>(
+    rescue: Node<'tree>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let exceptions = rescue.child_by_field_name("exceptions")?;
+    let exception_nodes = named_children(exceptions);
+    let [exception] = exception_nodes.as_slice() else {
+        return None;
+    };
+    (exception.kind() == "constant")
+        .then(|| node_text(source, *exception))
+        .flatten()
+}
+
+fn precise_rescue_binder<'tree>(rescue: Node<'tree>) -> Option<Node<'tree>> {
+    let variable = rescue.child_by_field_name("variable")?;
+    let candidates = if variable.kind() == "exception_variable" {
+        named_children(variable)
+    } else {
+        vec![variable]
+    };
+    let [binder] = candidates.as_slice() else {
+        return None;
+    };
+    (binder.kind() == "identifier").then_some(*binder)
+}
+
+fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
+    match node.kind() {
+        "assignment" | "operator_assignment" => {
+            let mut result = node
+                .child_by_field_name("left")
+                .map(assignment_target_runtime_nodes)
+                .unwrap_or_default();
+            result.extend(children_by_field_name(node, "right"));
+            return result;
+        }
+        "binary" => {
+            let mut result = children_by_field_name(node, "left");
+            result.extend(children_by_field_name(node, "right"));
+            return result;
+        }
+        "unary" => return children_by_field_name(node, "operand"),
+        "pair" => {
+            let mut result = children_by_field_name(node, "key");
+            result.extend(children_by_field_name(node, "value"));
+            return result;
+        }
+        "call" => {
+            let mut result = children_by_field_name(node, "receiver");
+            if let Some(arguments) = node.child_by_field_name("arguments") {
+                result.extend(runtime_expression_children(arguments));
+            }
+            return result;
+        }
+        "block" | "do_block" | "lambda" | "method" | "singleton_method" | "class" | "module"
+        | "singleton_class" => return Vec::new(),
+        _ => {}
+    }
+    named_children(node)
+        .into_iter()
+        .filter(|child| is_runtime_node(child.kind()))
+        .collect()
+}
+
+fn assignment_target_runtime_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut nodes = Vec::new();
+    let mut stack = vec![node];
+    while let Some(target) = stack.pop() {
+        match target.kind() {
+            "call" => nodes.extend(children_by_field_name(target, "receiver")),
+            "element_reference" => {
+                let object_id = target
+                    .child_by_field_name("object")
+                    .map(|object| object.id());
+                nodes.extend(children_by_field_name(target, "object"));
+                nodes.extend(named_children(target).into_iter().filter(|child| {
+                    Some(child.id()) != object_id && is_runtime_node(child.kind())
+                }));
+            }
+            "left_assignment_list" | "destructured_left_assignment" | "rest_assignment" => {
+                stack.extend(named_children(target).into_iter().rev());
+            }
+            "identifier" | "instance_variable" | "class_variable" | "global_variable"
+            | "constant" | "scope_resolution" | "self" | "super" | "true" | "false" | "nil" => {}
+            _ => {}
+        }
+    }
+    nodes
+}
+
+fn assignment_target_dispatches(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(target) = stack.pop() {
+        match target.kind() {
+            "call" | "element_reference" => return true,
+            "left_assignment_list" | "destructured_left_assignment" | "rest_assignment" => {
+                stack.extend(named_children(target));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    brokk_bifrost_ruby::syntax::ruby_call_arguments(node)
+}
+
+fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        is_runtime_node(child.kind())
+    })
+}
+
+fn ruby_logical_not_operand<'tree>(source: &str, node: Node<'tree>) -> Option<Node<'tree>> {
+    if node.kind() != "unary"
+        || node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(source, operator))
+            .is_none_or(|operator| !matches!(operator, "!" | "not"))
+    {
+        return None;
+    }
+    node.child_by_field_name("operand")
+}
+
+fn peel_ruby_condition_parentheses(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_statements" {
+        let Some(inner) = first_runtime_named_child(node) else {
+            break;
+        };
+        node = inner;
+    }
+    node
+}
+
+/// The boolean value of a Ruby condition that is a literal, optionally wrapped
+/// in parenthesized statement lists and logical negation. A multi-statement
+/// parenthesized body is intentionally not folded because its value depends on
+/// evaluation order.
+fn ruby_folded_boolean_constant(source: &str, node: Node<'_>) -> Option<bool> {
+    let mut current = node;
+    let mut negated = false;
+    while current.kind() == "parenthesized_statements" {
+        let children = runtime_expression_children(current);
+        if children.len() != 1 {
+            return None;
+        }
+        current = children[0];
+    }
+    while let Some(operand) = ruby_logical_not_operand(source, current) {
+        negated = !negated;
+        current = operand;
+        while current.kind() == "parenthesized_statements" {
+            let children = runtime_expression_children(current);
+            if children.len() != 1 {
+                return None;
+            }
+            current = children[0];
+        }
+    }
+    match current.kind() {
+        "true" => Some(!negated),
+        "false" => Some(negated),
+        _ => None,
+    }
+}
+
+fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RubyLoweringError> {
+    brokk_bifrost_analysis::analyzer::semantic::lowering::required_field_or_else(
+        node,
+        field,
+        missing_field,
+    )
+}
+
+fn is_short_circuit_binary(source: &str, node: Node<'_>) -> bool {
+    node.child_by_field_name("operator")
+        .and_then(|operator| node_text(source, operator))
+        .is_some_and(|operator| matches!(operator, "&&" | "and" | "||" | "or"))
+}
+
+fn is_runtime_leaf(kind: &str) -> bool {
+    matches!(
+        kind,
+        "integer"
+            | "float"
+            | "rational"
+            | "complex"
+            | "true"
+            | "false"
+            | "nil"
+            | "self"
+            | "constant"
+            | "instance_variable"
+            | "class_variable"
+            | "global_variable"
+            | "simple_symbol"
+            | "hash_key_symbol"
+            | "bare_symbol"
+            | "character"
+            | "escape_sequence"
+    )
+}
+
+struct LocalBindingCollection {
+    timeline: LocalBindingTimeline,
+    has_parameter_defaults: bool,
+    work: SemanticWork,
+}
+
+#[derive(Default)]
+struct RubyPropertyInventory {
+    declarations: HashMap<(Box<str>, Box<str>), RubyPropertyDeclaration>,
+    /// Classes whose same-file construction surface has no observed
+    /// singleton override or dynamic class-body mutation. The value is the
+    /// exact `initialize` procedure when one was collected; `None` means the
+    /// class uses Ruby's inherited constructor.
+    constructors: HashMap<Box<str>, Option<ProcedureId>>,
+    exception_classes: HashSet<Box<str>>,
+    raise_unproven: bool,
+    /// A same-file Array/Hash reopen or singleton mutation can replace the
+    /// built-in []/[]= implementation. Keep literal index proofs closed only
+    /// when this file has not declared such a mutation.
+    builtin_index_unproven: bool,
+}
+
+#[derive(Default)]
+struct RubyPropertyDeclaration {
+    reader: Option<SourceAnchor>,
+    writer: Option<SourceAnchor>,
+    /// Class supplied by one linear `initialize` write, usable only while
+    /// both the owning and returned class retain their construction proof.
+    result_class: Option<Box<str>>,
+}
+
+struct RubyPropertyCollection {
+    inventory: RubyPropertyInventory,
+    work: SemanticWork,
+}
+
+impl RubyPropertyInventory {
+    fn complete_accessor(&self, class: &str, property: &str) -> Option<SourceAnchor> {
+        self.constructors.get(class)?;
+        let declaration = self.declarations.get(&(class.into(), property.into()))?;
+        let reader = declaration.reader?;
+        declaration.writer.map(|_| reader)
+    }
+
+    fn accessor_result_class(&self, class: &str, property: &str) -> Option<&str> {
+        self.constructors.get(class)?;
+        let declaration = self.declarations.get(&(class.into(), property.into()))?;
+        declaration.reader?;
+        declaration.writer?;
+        declaration
+            .result_class
+            .as_deref()
+            .filter(|class| self.constructor_is_proven(class))
+    }
+
+    fn constructor_is_proven(&self, class: &str) -> bool {
+        self.constructors.contains_key(class)
+    }
+
+    fn constructor_target(&self, class: &str) -> Option<ProcedureId> {
+        self.constructors.get(class).copied().flatten()
+    }
+
+    fn builtin_index_is_proven(&self) -> bool {
+        !self.builtin_index_unproven
+    }
+}
+
+fn direct_initializer_result_class(
+    initializer: Node<'_>,
+    property: &str,
+    source: &str,
+    adapter: &mut SemanticTraversalBudget<'_>,
+) -> Result<Option<Box<str>>, RubyLoweringError> {
+    let body = initializer
+        .child_by_field_name("body")
+        .unwrap_or(initializer);
+    let statements = if body.kind() == "body_statement" {
+        ordinary_body_statements(body)
+    } else {
+        runtime_statement_children(body)
+    };
+    let direct_assignments = statements
+        .iter()
+        .filter(|statement| statement.kind() == "assignment")
+        .map(|statement| statement.id())
+        .collect::<Vec<_>>();
+    let instance_variable = format!("@{property}");
+    let mut candidate: Option<Box<str>> = None;
+    let mut has_direct_assignment = false;
+    let mut invalid = false;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        adapter.enter_node()?;
+        if node.id() != body.id()
+            && matches!(
+                node.kind(),
+                "method" | "singleton_method" | "lambda" | "class" | "module" | "singleton_class"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "assignment"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "instance_variable"
+            && node_text(source, left) == Some(instance_variable.as_str())
+        {
+            // A branch- or block-local write needs path-sensitive storage
+            // state. Seeing one invalidates the linear positive candidate.
+            if !direct_assignments.contains(&node.id()) {
+                invalid = true;
+            } else {
+                has_direct_assignment = true;
+                let Some(class) = ruby_constructor_class(right, source) else {
+                    invalid = true;
+                    stack.extend(named_children(node).into_iter().rev());
+                    continue;
+                };
+                adapter.before_insert()?;
+                adapter.charge_name(class)?;
+                if candidate
+                    .as_deref()
+                    .is_some_and(|candidate| candidate != class)
+                {
+                    invalid = true;
+                } else {
+                    candidate = Some(class.into());
+                }
+            }
+        }
+        stack.extend(named_children(node).into_iter().rev());
+    }
+    Ok((has_direct_assignment && !invalid)
+        .then_some(candidate)
+        .flatten())
+}
+
+fn ruby_constructor_class<'tree, 'source>(
+    call: Node<'tree>,
+    source: &'source str,
+) -> Option<&'source str> {
+    ruby_constructor_call(call, source)
+        .then(|| call.child_by_field_name("receiver"))
+        .flatten()
+        .filter(|receiver| receiver.kind() == "constant")
+        .and_then(|receiver| node_text(source, receiver))
+}
+
+fn ruby_property_call<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    if node.kind() != "call"
+        || node.child_by_field_name("arguments").is_some()
+        || node.child_by_field_name("block").is_some()
+        || node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(source, operator))
+            == Some("&.")
+    {
+        return None;
+    }
+    Some((
+        node.child_by_field_name("receiver")?,
+        node.child_by_field_name("method")?,
+    ))
+}
+
+fn ruby_supported_superclass(class: Node<'_>, source: &str) -> Option<bool> {
+    let superclass = class.child_by_field_name("superclass")?;
+    let Some(superclass) = first_runtime_named_child(superclass) else {
+        return Some(false);
+    };
+    Some(superclass.kind() == "constant" && node_text(source, superclass) == Some("StandardError"))
+}
+
+fn collect_property_inventory<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    specs: &[ProcedureSpec<'tree>],
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<RubyPropertyCollection, RubyLoweringError> {
+    let mut inventory = RubyPropertyInventory::default();
+    let mut duplicate_classes = HashSet::default();
+    let mut seen_classes = HashSet::default();
+    let mut standard_error_derived_classes = HashSet::default();
+    let mut inert_file = true;
+    let mut adapter = SemanticTraversalBudget {
+        work: SemanticWork::default(),
+        budget,
+        cancellation,
+    };
+    let mut constructor_procedures = HashMap::default();
+    for spec in specs {
+        adapter.enter_node()?;
+        if spec.kind == ProcedureKind::Constructor {
+            constructor_procedures.insert(spec.callable.id(), spec.id);
+        }
+        if matches!(spec.callable.kind(), "method" | "singleton_method") {
+            match spec
+                .callable
+                .child_by_field_name("name")
+                .and_then(|name| node_text(source, name))
+            {
+                Some("raise") => inventory.raise_unproven = true,
+                Some("attr_accessor" | "attr_reader" | "attr_writer") => inert_file = false,
+                _ => {}
+            }
+        }
+    }
+    for class in named_children(root) {
+        adapter.enter_node()?;
+        if class.kind() != "class" {
+            // Executable file-level forms can change constants or method
+            // tables. Do not replace that missing model with a blacklist of
+            // metaprogramming method names.
+            inert_file &= matches!(class.kind(), "method" | "comment" | "empty_statement");
+            continue;
+        }
+        let Some(name) = class
+            .child_by_field_name("name")
+            .filter(|name| name.kind() == "constant")
+            .and_then(|name| node_text(source, name))
+        else {
+            inert_file = false;
+            continue;
+        };
+        adapter.charge_name(name)?;
+        let name_box: Box<str> = name.into();
+        if matches!(name, "Array" | "Hash") {
+            inventory.builtin_index_unproven = true;
+        }
+        if matches!(name, "Object" | "Module" | "Class" | "Kernel") {
+            inert_file = false;
+        }
+        if !seen_classes.insert(name_box.clone()) {
+            duplicate_classes.insert(name_box.clone());
+        }
+        let superclass_is_supported = ruby_supported_superclass(class, source);
+        if superclass_is_supported == Some(true) {
+            standard_error_derived_classes.insert(name_box.clone());
+        }
+        let Some(body) = class.child_by_field_name("body") else {
+            continue;
+        };
+        let mut methods = Vec::new();
+        let mut initializer = None;
+        let mut constructor_surface_safe =
+            superclass_is_supported.is_none() || superclass_is_supported == Some(true);
+        for call in runtime_statement_children(body) {
+            adapter.enter_node()?;
+            if call.kind() == "method" {
+                if let Some(method) = call
+                    .child_by_field_name("name")
+                    .and_then(|method| node_text(source, method))
+                {
+                    adapter.before_insert()?;
+                    adapter.charge_name(method)?;
+                    methods.push(method.to_owned());
+                    if method == "initialize" {
+                        initializer = Some(call);
+                    }
+                    // Match Python's bounded heap-class proof: arbitrary
+                    // instance methods (including exception/dispatch hooks)
+                    // need their own model before this class is proof-safe.
+                    if method != "initialize" {
+                        constructor_surface_safe = false;
+                    }
+                }
+                continue;
+            }
+            if matches!(call.kind(), "singleton_method" | "singleton_class") {
+                // A singleton `new`, `allocate`, or class hook can replace
+                // the constructor target even when the source spelling is
+                // `Type.new`. Keep the whole class unproven rather than
+                // manufacturing a same-file binding.
+                constructor_surface_safe = false;
+                continue;
+            }
+            if call.kind() != "call" {
+                // Class-body assignments, nested declarations, and other
+                // executable forms can mutate the class method table.
+                constructor_surface_safe = false;
+                continue;
+            }
+            if call.child_by_field_name("receiver").is_some()
+                || call.child_by_field_name("block").is_some()
+            {
+                // `Other.attr_accessor` or a block passed to an accessor hook
+                // mutates a different or runtime-selected method table.
+                constructor_surface_safe = false;
+                continue;
+            }
+            let accessor = call
+                .child_by_field_name("method")
+                .and_then(|method| node_text(source, method));
+            if !matches!(
+                accessor,
+                Some("attr_accessor" | "attr_reader" | "attr_writer")
+            ) {
+                constructor_surface_safe = false;
+                continue;
+            }
+            for argument in call_arguments(call) {
+                adapter.enter_node()?;
+                let Some(property) = ruby_symbol_name(argument, source) else {
+                    constructor_surface_safe = false;
+                    continue;
+                };
+                adapter.before_insert()?;
+                adapter.charge_name(name)?;
+                adapter.charge_name(&property)?;
+                let anchor = source_anchor(argument, 0).map_err(RubyLoweringError::Invalid)?;
+                let declaration = inventory
+                    .declarations
+                    .entry((name.into(), property.into_boxed_str()))
+                    .or_default();
+                match accessor {
+                    Some("attr_reader") => declaration.reader = Some(anchor),
+                    Some("attr_writer") => declaration.writer = Some(anchor),
+                    Some("attr_accessor") => {
+                        declaration.reader = Some(anchor);
+                        declaration.writer = Some(anchor);
+                    }
+                    _ => unreachable!("accessor calls were filtered above"),
+                }
+            }
+        }
+        if constructor_surface_safe {
+            let target = initializer
+                .and_then(|initializer| constructor_procedures.get(&initializer.id()).copied());
+            adapter.charge_name(name)?;
+            inventory.constructors.insert(name_box.clone(), target);
+        }
+        for ((owner, property), declaration) in &mut inventory.declarations {
+            if owner.as_ref() != name_box.as_ref() {
+                continue;
+            }
+            let writer = format!("{property}=");
+            if methods
+                .iter()
+                .any(|method| method == property.as_ref() || method == &writer)
+            {
+                declaration.reader = None;
+                declaration.writer = None;
+                declaration.result_class = None;
+            } else if declaration.reader.is_some() && declaration.writer.is_some() {
+                declaration.result_class = initializer
+                    .map(|initializer| {
+                        direct_initializer_result_class(initializer, property, source, &mut adapter)
+                    })
+                    .transpose()?
+                    .flatten();
+            }
+        }
+    }
+    if !duplicate_classes.is_empty() {
+        inventory
+            .declarations
+            .retain(|(owner, _), _| !duplicate_classes.contains(owner));
+        inventory
+            .constructors
+            .retain(|owner, _| !duplicate_classes.contains(owner));
+    }
+    // A same-file declaration of StandardError rebinds the superclass name;
+    // a previously seen subclass can no longer use the built-in exception
+    // proof. Keep this bounded and fail closed for that class family.
+    if seen_classes.contains("StandardError") {
+        inventory
+            .constructors
+            .retain(|owner, _| !standard_error_derived_classes.contains(owner));
+    }
+    if !inert_file {
+        inventory.constructors.clear();
+        inventory.builtin_index_unproven = true;
+        inventory.raise_unproven = true;
+    }
+    inventory.exception_classes = standard_error_derived_classes
+        .into_iter()
+        .filter(|class| inventory.constructor_is_proven(class))
+        .collect();
+    Ok(RubyPropertyCollection {
+        inventory,
+        work: adapter.work,
+    })
+}
+
+struct ProcedureBindings {
+    timeline: LocalBindingTimeline,
+    has_parameter_defaults: bool,
+}
+
+/// The semantic cost model for Ruby adapter-side tree walks: every traversal
+/// entry polls cancellation and charges one nested entry, every insertion
+/// point polls cancellation, and every newly owned name charges its bytes.
+/// On failure the error carries the work attempted so far.
+struct SemanticTraversalBudget<'request> {
+    work: SemanticWork,
+    budget: &'request SemanticBudget,
+    cancellation: &'request CancellationToken,
+}
+
+impl SemanticTraversalBudget<'_> {
+    fn charge(&mut self, delta: SemanticWork) {
+        self.work = self.work.saturating_add(delta);
+        self.budget.note_lowering_work(delta);
+    }
+
+    fn poll_cancellation(&self) -> Result<(), RubyLoweringError> {
+        if self.cancellation.is_cancelled() {
+            return Err(RubyLoweringError::Cancelled(Box::new(self.work)));
+        }
+        Ok(())
+    }
+}
+
+impl LocalBindingBudget for SemanticTraversalBudget<'_> {
+    type Error = RubyLoweringError;
+
+    fn enter_node(&mut self) -> Result<(), RubyLoweringError> {
+        self.poll_cancellation()?;
+        self.charge(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        });
+        Ok(())
+    }
+
+    fn before_insert(&mut self) -> Result<(), RubyLoweringError> {
+        self.poll_cancellation()
+    }
+
+    fn charge_name(&mut self, name: &str) -> Result<(), RubyLoweringError> {
+        self.charge(SemanticWork {
+            owned_text_bytes: name.len(),
+            ..SemanticWork::default()
+        });
+        Ok(())
+    }
+}
+
+fn collect_local_bindings(
+    source: &str,
+    callable: Node<'_>,
+    body: Node<'_>,
+    inherited: Option<(&LocalBindingTimeline, usize)>,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<LocalBindingCollection, RubyLoweringError> {
+    let mut adapter = SemanticTraversalBudget {
+        work: SemanticWork::default(),
+        budget,
+        cancellation,
+    };
+    let collection = brokk_bifrost_ruby::local_bindings::collect_local_bindings(
+        source,
+        callable,
+        body,
+        inherited,
+        &mut adapter,
+    )?;
+    Ok(LocalBindingCollection {
+        timeline: collection.timeline,
+        has_parameter_defaults: collection.has_parameter_defaults,
+        work: adapter.work,
+    })
+}
+
+fn callable_source_anchor(
+    callable: Node<'_>,
+    body: Node<'_>,
+    occurrence: u32,
+) -> Result<SourceAnchor, String> {
+    let start_position = callable.start_position();
+    let (end_byte, end_position) = if body.start_byte() > callable.start_byte() {
+        (body.start_byte(), body.start_position())
+    } else {
+        (callable.start_byte(), start_position)
+    };
+    source_anchor_from_positions(
+        callable.start_byte(),
+        start_position,
+        end_byte,
+        end_position,
+        occurrence,
+    )
+}
+
+struct RubySemanticLowerer;
+
+impl ProgramSemanticsLowerer for RubySemanticLowerer {
+    fn identity(&self) -> SemanticAdapterIdentity {
+        SemanticAdapterIdentity::for_adapter(
+            "ruby",
+            ADAPTER_VERSION,
+            b"ruby-intrafile-execution-defaults-v1",
+            DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        )
+    }
+
+    fn capabilities(&self) -> SemanticCapabilities {
+        ruby_capabilities()
+    }
+
+    fn lower(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        budget: &SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
+        let (specs, mut initial_work, mut inventory_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    inventory_work,
+                } => (value, initial_work, inventory_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
+
+        let mut staged_budget = budget.clone();
+        staged_budget.charge_work(inventory_work);
+        let properties = match collect_property_inventory(
+            prepared.tree().root_node(),
+            prepared.source(),
+            &specs,
+            &staged_budget,
+            cancellation,
+        ) {
+            Ok(properties) => properties,
+            Err(RubyLoweringError::Cancelled(work)) => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: inventory_work.conservative_add(*work),
+                });
+            }
+            Err(RubyLoweringError::Budget(exceeded, work)) => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work: inventory_work.conservative_add(*work),
+                });
+            }
+            Err(RubyLoweringError::Invalid(detail)) => {
+                return Err(SemanticProviderError::internal(detail));
+            }
+        };
+        initial_work = initial_work.conservative_add(properties.work);
+        inventory_work = inventory_work.conservative_add(properties.work);
+        let property_inventory = properties.inventory;
+
+        let mut bindings_by_procedure: Vec<ProcedureBindings> = Vec::with_capacity(specs.len());
+        let mut binding_work = SemanticWork::default();
+        for spec in &specs {
+            let mut staged_budget = budget.clone();
+            let observed = inventory_work.conservative_add(binding_work);
+            staged_budget.charge_work(observed);
+            let inherited = matches!(spec.kind, ProcedureKind::Lambda | ProcedureKind::Closure)
+                .then(|| {
+                    spec.lexical_parent
+                        .and_then(|parent| bindings_by_procedure.get(parent.index()))
+                        .map(|parent| (&parent.timeline, spec.callable.start_byte()))
+                })
+                .flatten();
+            let collection = match collect_local_bindings(
+                prepared.source(),
+                spec.callable,
+                spec.body,
+                inherited,
+                &staged_budget,
+                cancellation,
+            ) {
+                Ok(collection) => collection,
+                Err(RubyLoweringError::Cancelled(work)) => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work: observed.conservative_add(*work),
+                    });
+                }
+                Err(RubyLoweringError::Budget(exceeded, work)) => {
+                    let work = observed.conservative_add(*work);
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                Err(RubyLoweringError::Invalid(detail)) => {
+                    return Err(SemanticProviderError::internal(detail));
+                }
+            };
+            let candidate = binding_work.conservative_add(collection.work);
+
+            binding_work = candidate;
+            bindings_by_procedure.push(ProcedureBindings {
+                timeline: collection.timeline,
+                has_parameter_defaults: collection.has_parameter_defaults,
+            });
+        }
+
+        let prepass_observed = inventory_work.conservative_add(binding_work);
+        let mut prepass_budget = budget.clone();
+        prepass_budget.charge_work(prepass_observed);
+        let (function_value_targets, prepass_work) = match collect_ruby_function_value_targets(
+            &specs,
+            &bindings_by_procedure,
+            prepared.source(),
+            &prepass_budget,
+            cancellation,
+        ) {
+            Ok(result) => result,
+            Err(RubyLoweringError::Cancelled(work)) => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: prepass_observed.conservative_add(*work),
+                });
+            }
+            Err(RubyLoweringError::Budget(exceeded, work)) => {
+                let work = prepass_observed.conservative_add(*work);
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            Err(RubyLoweringError::Invalid(detail)) => {
+                return Err(SemanticProviderError::internal(detail));
+            }
+        };
+        binding_work = binding_work.conservative_add(prepass_work);
+
+        brokk_bifrost_analysis::analyzer::semantic::lowering::lower_procedure_batch_with_prepass_work(
+            specs.iter().zip(&bindings_by_procedure),
+            SemanticWork::default(),
+            initial_work.conservative_add(binding_work),
+            budget,
+            cancellation,
+            |(spec, local_bindings), staged_budget, cancellation| {
+                lower_procedure(
+                    prepared,
+                    spec,
+                    RubyProcedureIndexes {
+                        properties: &property_inventory,
+                        local_bindings: &local_bindings.timeline,
+                        function_value_targets: &function_value_targets,
+                    },
+                    local_bindings.has_parameter_defaults,
+                    staged_budget,
+                    cancellation,
+                )
+            },
+        )
+    }
+}
+
+fn ruby_capabilities() -> SemanticCapabilities {
+    let mut builder =
+        brokk_bifrost_analysis::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities(
+        );
+    for capability in [
+        SemanticCapability::GeneratorSuspension,
+        SemanticCapability::ConcurrentSpawn,
+    ] {
+        builder = builder.partial(capability);
+    }
+    builder.build()
+}
+
+#[derive(Clone)]
+struct ProcedureSpec<'tree> {
+    id: ProcedureId,
+    body: Node<'tree>,
+    callable: Node<'tree>,
+    empty_body: bool,
+    locator: SemanticLocator,
+    lexical_parent: Option<ProcedureId>,
+    kind: ProcedureKind,
+    properties: ProcedureProperties,
+}
+
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
+
+struct ProcedureEnumerationFrame<'tree> {
+    node: Node<'tree>,
+    lexical_parent: Option<ProcedureId>,
+    declaration_path: usize,
+    member_context: bool,
+    singleton_context: bool,
+    synthetic_body_scope: Option<SyntheticBodyScope>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyntheticBodyScope {
+    procedure: ProcedureId,
+    callable_path: usize,
+}
+
+fn enumerate_procedures<'tree>(
+    file: &ProjectFile,
+    prepared: &'tree PreparedSyntaxTree,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
+    let root = prepared.tree().root_node();
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "ruby-source", budget)?;
+    let mut specs = Vec::new();
+    let mut stack = vec![ProcedureEnumerationFrame {
+        node: root,
+        lexical_parent: None,
+        declaration_path: inventory.root_path(),
+        member_context: false,
+        singleton_context: false,
+        synthetic_body_scope: None,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
+        }
+
+        let mut child_path = frame.declaration_path;
+        let mut child_member_context = frame.member_context;
+        let mut child_singleton_context = frame.singleton_context;
+        if let Some(segment_kind) = declaration_container_kind(frame.node) {
+            let name = declaration_container_name(prepared.source(), frame.node);
+            let anchor =
+                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            child_path =
+                inventory.push_container(child_path, segment_kind, name.as_deref(), anchor)?;
+            child_member_context = true;
+            child_singleton_context = frame.node.kind() == "singleton_class";
+        }
+
+        let mut callable_body_scope = None;
+        let mut self_callable_scope = None;
+        let mut self_synthetic_scope = None;
+        if let Some(shape) = callable_shape(prepared.source(), frame.node, frame.singleton_context)
+        {
+            let name = callable_name(prepared.source(), frame.node, shape.kind);
+            let anchor = callable_source_anchor(frame.node, shape.body, 0)
+                .map_err(SemanticProviderError::invalid_identity)?;
+            let identity = match inventory.allocate_procedure(
+                child_path,
+                shape.segment_kind,
+                name.as_deref(),
+                anchor,
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
+            specs.push(ProcedureSpec {
+                id: identity.id,
+                body: shape.body,
+                callable: frame.node,
+                empty_body: shape.empty_body,
+                locator: identity.locator,
+                lexical_parent: frame.lexical_parent,
+                kind: shape.kind,
+                properties: shape.properties,
+            });
+            let callable_path = identity.declaration_path;
+            if shape.body.id() == frame.node.id() {
+                if shape.attach_lexical_parent {
+                    self_callable_scope = Some((identity.id, callable_path));
+                } else {
+                    self_synthetic_scope = Some(SyntheticBodyScope {
+                        procedure: identity.id,
+                        callable_path,
+                    });
+                }
+            } else {
+                callable_body_scope = Some((
+                    shape.body.id(),
+                    identity.id,
+                    callable_path,
+                    shape.attach_lexical_parent,
+                ));
+            }
+        }
+
+        let children = named_children(frame.node);
+        for child in children.into_iter().rev() {
+            let inherited_synthetic = self_synthetic_scope.or(frame.synthetic_body_scope);
+            let (lexical_parent, declaration_path, member_context, singleton_context, synthetic) =
+                if let Some((_, procedure, path, attach)) =
+                    callable_body_scope.filter(|(body_id, _, _, _)| *body_id == child.id())
+                {
+                    if attach {
+                        (Some(procedure), path, false, false, None)
+                    } else {
+                        (
+                            frame.lexical_parent,
+                            child_path,
+                            child_member_context,
+                            child_singleton_context,
+                            Some(SyntheticBodyScope {
+                                procedure,
+                                callable_path: path,
+                            }),
+                        )
+                    }
+                } else if let Some(synthetic) = inherited_synthetic {
+                    if is_initializer_member_declaration(child) {
+                        (
+                            frame.lexical_parent,
+                            child_path,
+                            child_member_context,
+                            child_singleton_context,
+                            None,
+                        )
+                    } else {
+                        (
+                            Some(synthetic.procedure),
+                            synthetic.callable_path,
+                            false,
+                            false,
+                            Some(synthetic),
+                        )
+                    }
+                } else if let Some((procedure, path)) = self_callable_scope {
+                    (Some(procedure), path, false, false, None)
+                } else {
+                    (
+                        frame.lexical_parent,
+                        child_path,
+                        child_member_context,
+                        child_singleton_context,
+                        None,
+                    )
+                };
+            stack.push(ProcedureEnumerationFrame {
+                node: child,
+                lexical_parent,
+                declaration_path,
+                member_context,
+                singleton_context,
+                synthetic_body_scope: synthetic,
+            });
+        }
+    }
+
+    Ok(inventory.complete(specs))
+}
+
+struct CallableShape<'tree> {
+    kind: ProcedureKind,
+    segment_kind: DeclarationSegmentKind,
+    body: Node<'tree>,
+    empty_body: bool,
+    properties: ProcedureProperties,
+    attach_lexical_parent: bool,
+}
+
+fn callable_shape<'tree>(
+    source: &str,
+    node: Node<'tree>,
+    singleton_context: bool,
+) -> Option<CallableShape<'tree>> {
+    let immediate = ProcedureInvocationKind::Immediate;
+    let (kind, segment_kind, body, empty_body, is_static, synthetic, attach) = match node.kind() {
+        "program" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node,
+            node.named_child_count() == 0,
+            true,
+            true,
+            false,
+        ),
+        "class" | "module" | "singleton_class" => {
+            let body = node.child_by_field_name("body").unwrap_or(node);
+            (
+                ProcedureKind::Initializer,
+                DeclarationSegmentKind::Initializer,
+                body,
+                node.child_by_field_name("body").is_none(),
+                true,
+                true,
+                false,
+            )
+        }
+        "method" | "singleton_method" => {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|name| node_text(source, name));
+            let constructor =
+                node.kind() == "method" && !singleton_context && name == Some("initialize");
+            let kind = if constructor {
+                ProcedureKind::Constructor
+            } else {
+                ProcedureKind::Method
+            };
+            let segment = if constructor {
+                DeclarationSegmentKind::Constructor
+            } else {
+                DeclarationSegmentKind::Method
+            };
+            let body = node.child_by_field_name("body").unwrap_or(node);
+            (
+                kind,
+                segment,
+                body,
+                node.child_by_field_name("body").is_none(),
+                node.kind() == "singleton_method" || singleton_context,
+                false,
+                true,
+            )
+        }
+        "lambda" => {
+            let wrapper = node.child_by_field_name("body")?;
+            (
+                ProcedureKind::Lambda,
+                DeclarationSegmentKind::Lambda,
+                wrapper,
+                wrapper.child_by_field_name("body").is_none(),
+                false,
+                false,
+                true,
+            )
+        }
+        "block" | "do_block" if node.parent().is_none_or(|parent| parent.kind() != "lambda") => {
+            let body = node.child_by_field_name("body").unwrap_or(node);
+            (
+                ProcedureKind::Closure,
+                DeclarationSegmentKind::Closure,
+                body,
+                node.child_by_field_name("body").is_none(),
+                false,
+                false,
+                true,
+            )
+        }
+        _ => return None,
+    };
+    Some(CallableShape {
+        kind,
+        segment_kind,
+        body,
+        empty_body,
+        properties: ProcedureProperties {
+            is_async: false,
+            is_generator: false,
+            is_static,
+            is_synthetic: synthetic,
+            invocation: immediate,
+            call_boundary: ProcedureCallBoundary::Direct,
+            receiver_binding: Default::default(),
+            construction_return: Default::default(),
+            // A lambda or block body is not a named member of anything, so no
+            // later declaration can redefine or override the callable this
+            // literal names: its dispatch is closed. Every other Ruby callable
+            // stays Open -- a `def`, including a top-level one, can be
+            // reopened, and a method can be overridden by a subclass or a
+            // prepended module.
+            dispatch_extensibility: match kind {
+                ProcedureKind::Lambda | ProcedureKind::Closure => DispatchExtensibility::Closed,
+                _ => DispatchExtensibility::Open,
+            },
+        },
+        attach_lexical_parent: attach,
+    })
+}
+
+fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
+    match node.kind() {
+        "class" | "singleton_class" => Some(DeclarationSegmentKind::Type),
+        "module" => Some(DeclarationSegmentKind::Namespace),
+        _ => None,
+    }
+}
+
+fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    if node.kind() == "singleton_class" {
+        return Some("<singleton-class>".into());
+    }
+    brokk_bifrost_analysis::analyzer::common::declaration_container_name(source, node)
+}
+
+fn callable_name(source: &str, node: Node<'_>, kind: ProcedureKind) -> Option<Box<str>> {
+    match node.kind() {
+        "program" => Some(FILE_INITIALIZER_SEGMENT_NAME.into()),
+        "class" | "module" => declaration_container_name(source, node),
+        "singleton_class" => Some("<singleton-class>".into()),
+        "method" | "singleton_method" => node
+            .child_by_field_name("name")
+            .and_then(|name| node_text(source, name))
+            .filter(|name| !name.is_empty())
+            .map(Box::<str>::from),
+        "lambda" => assigned_callable_name(source, node),
+        "block" | "do_block" if kind == ProcedureKind::Closure => None,
+        _ => None,
+    }
+}
+
+fn assigned_callable_name(source: &str, mut node: Node<'_>) -> Option<Box<str>> {
+    loop {
+        let parent = node.parent()?;
+        match parent.kind() {
+            "parenthesized_statements" => node = parent,
+            "assignment" if parent.child_by_field_name("right") == Some(node) => {
+                return parent
+                    .child_by_field_name("left")
+                    .and_then(|left| node_text(source, left))
+                    .filter(|name| !name.is_empty())
+                    .map(Box::<str>::from);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_initializer_member_declaration(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "method" | "singleton_method" | "class" | "module" | "singleton_class"
+    )
+}
+
+type RubyLoweringError = ProcedureLoweringError;
+
+type EdgeTarget = ControlTarget;
+
+type Work<'tree> = ProcedureWork<'tree>;
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupRegion<'tree> {
+    id: CleanupRegionId,
+    body: Node<'tree>,
+    outer_scope: ScopeFrameId,
+}
+
+#[derive(Debug, Clone)]
+struct RubyControlFrame {
+    break_label: Option<Box<str>>,
+    next_label: Option<Box<str>>,
+    redo_label: Option<Box<str>>,
+    retry_label: Option<Box<str>>,
+    callable_exit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RubyLocalStorage {
+    Class(Box<str>),
+    Indexable { element_class: Option<Box<str>> },
+}
+
+struct LoweringContext<'tree, 'targets> {
+    source: &'tree str,
+    session: ProcedureLoweringSession<'targets>,
+    procedure_id: ProcedureId,
+    procedure_kind: ProcedureKind,
+    procedure_body_node_id: usize,
+    procedure_runtime_body_node_id: usize,
+    expression_values: HashMap<usize, ValueId>,
+    properties: &'targets RubyPropertyInventory,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, ValueId>,
+    local_storage: HashMap<ValueId, RubyLocalStorage>,
+    precise_raise_binders: HashMap<usize, RubyPreciseRaise>,
+    constant_index_values: HashMap<u64, ValueId>,
+    instance_field_locators: HashMap<Box<str>, SemanticLocator>,
+    receiver: Option<ValueId>,
+    procedure_is_static: bool,
+    reuse_first_statement_entry: bool,
+    nonlocal_cleanup_label: Option<Box<str>>,
+    next_control_label: usize,
+    cleanups: Vec<CleanupRegion<'tree>>,
+    controls: HashMap<ScopeFrameId, Box<[RubyControlFrame]>>,
+    local_bindings: &'targets LocalBindingTimeline,
+    function_value_targets: &'targets RubyFunctionValueTargets,
+}
+
+impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'targets> {
+    fn cancellation_token(&self) -> &CancellationToken {
+        self.session.cancellation()
+    }
+
+    fn lower_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.statement(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.expression(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        targets: ConditionTargets,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.condition(
+            builder,
+            node,
+            entry,
+            targets.when_true,
+            targets.when_false,
+            scope,
+            stack,
+        )
+    }
+}
+
+struct RubyProcedureIndexes<'targets> {
+    properties: &'targets RubyPropertyInventory,
+    local_bindings: &'targets LocalBindingTimeline,
+    function_value_targets: &'targets RubyFunctionValueTargets,
+}
+
+fn lower_procedure<'tree, 'request>(
+    prepared: &'tree PreparedSyntaxTree,
+    spec: &ProcedureSpec<'tree>,
+    indexes: RubyProcedureIndexes<'request>,
+    has_parameter_defaults: bool,
+    budget: &SemanticBudget,
+    cancellation: &'request CancellationToken,
+) -> Result<(ProcedureSemanticsParts, SemanticWork), RubyLoweringError> {
+    let mut parts = ProcedureSemanticsParts::new(
+        spec.id,
+        spec.locator.clone(),
+        spec.kind,
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
+    );
+    parts.lexical_parent = spec.lexical_parent;
+    parts.properties = spec.properties;
+    let source_anchor = source_anchor(spec.callable, 0).map_err(RubyLoweringError::Invalid)?;
+    let source_locator = SemanticLocator::new(
+        spec.locator.mount(),
+        spec.locator.path().clone(),
+        spec.locator.language(),
+        spec.locator.declaration().clone(),
+        SemanticRole::SourceMapping,
+        source_anchor,
+    );
+    let ProcedureLoweringStart {
+        mut builder,
+        session,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        function_scope,
+    } = ProcedureLoweringSession::start_with_source_locator(
+        parts,
+        budget,
+        cancellation,
+        source_locator,
+    )?;
+    let runtime_body = if matches!(spec.body.kind(), "block" | "do_block") {
+        spec.body.child_by_field_name("body").unwrap_or(spec.body)
+    } else {
+        spec.body
+    };
+    let mut context = LoweringContext {
+        source: prepared.source(),
+        session,
+        procedure_id: spec.id,
+        procedure_kind: spec.kind,
+        procedure_body_node_id: spec.body.id(),
+        procedure_runtime_body_node_id: runtime_body.id(),
+        expression_values: HashMap::default(),
+        properties: indexes.properties,
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        local_storage: HashMap::default(),
+        precise_raise_binders: HashMap::default(),
+        constant_index_values: HashMap::default(),
+        instance_field_locators: HashMap::default(),
+        receiver: None,
+        procedure_is_static: spec.properties.is_static,
+        reuse_first_statement_entry: matches!(
+            spec.kind,
+            ProcedureKind::Lambda | ProcedureKind::Closure
+        ),
+        nonlocal_cleanup_label: None,
+        next_control_label: 0,
+        cleanups: Vec::new(),
+        controls: HashMap::default(),
+        local_bindings: indexes.local_bindings,
+        function_value_targets: indexes.function_value_targets,
+    };
+    context.controls.insert(function_scope, Box::new([]));
+    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    context.emit_local_bindings(&mut builder, spec.callable)?;
+
+    if has_parameter_defaults {
+        for (capability, detail) in [
+            (
+                SemanticCapability::Calls,
+                "Ruby default parameter expressions may call code before the callable body and are not lowered",
+            ),
+            (
+                SemanticCapability::Values,
+                "Ruby omitted-argument selection and default-value binding are not represented",
+            ),
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                "Ruby default parameter evaluation may raise before the callable body",
+            ),
+        ] {
+            context.session.record_gap(
+                &mut builder,
+                entry,
+                SemanticGapSubject::Point,
+                capability,
+                SemanticGapKind::Unknown,
+                detail,
+            )?;
+        }
+    }
+    if spec.kind == ProcedureKind::Closure {
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::CallableReferences,
+            SemanticGapKind::Unknown,
+            "ordinary Ruby block capture and dynamic yielding target are not bound",
+        )?;
+    }
+    if spec.lexical_parent.is_some() {
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "Ruby lexical captures require closure-environment refinement",
+        )?;
+    }
+    if spec.kind == ProcedureKind::Initializer && spec.callable.kind() != "program" {
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "Ruby class or module body execution is materialized separately from its non-call declaration site",
+        )?;
+    }
+
+    let mut body_parent_scope = function_scope;
+    if matches!(
+        spec.kind,
+        ProcedureKind::Closure | ProcedureKind::Initializer
+    ) {
+        let boundary = context.point(&mut builder, spec.body, Vec::new())?;
+        let label = context.next_label("unknown-nonlocal-boundary");
+        let nonlocal_scope = builder.push_scope(
+            Some(function_scope),
+            ScopeBinding::Loop {
+                label: Some(label.clone()),
+                break_target: boundary,
+                break_edge_kind: ControlEdgeKind::Normal,
+                continue_target: boundary,
+                continue_edge_kind: ControlEdgeKind::Normal,
+            },
+        );
+        context.copy_controls(function_scope, nonlocal_scope);
+        context.nonlocal_cleanup_label = Some(label);
+        body_parent_scope = nonlocal_scope;
+    }
+
+    let body_entry = if context.reuse_first_statement_entry {
+        if let Some(first) = runtime_statement_children(runtime_body).first().copied() {
+            context.statement_point(&mut builder, first)?
+        } else {
+            context.point(&mut builder, spec.body, Vec::new())?
+        }
+    } else {
+        context.point(&mut builder, spec.body, Vec::new())?
+    };
+    let mut body_scope = body_parent_scope;
+    if matches!(spec.kind, ProcedureKind::Lambda | ProcedureKind::Closure) {
+        let exit_label = context.next_label("callable-exit");
+        let exit_scope = builder.push_scope(
+            Some(body_parent_scope),
+            ScopeBinding::Loop {
+                label: Some(exit_label.clone()),
+                break_target: normal_exit,
+                break_edge_kind: ControlEdgeKind::Normal,
+                continue_target: normal_exit,
+                continue_edge_kind: ControlEdgeKind::Normal,
+            },
+        );
+        context.copy_controls(body_parent_scope, exit_scope);
+        let redo_label = context.next_label("callable-redo");
+        let redo_scope = builder.push_scope(
+            Some(exit_scope),
+            ScopeBinding::Loop {
+                label: Some(redo_label.clone()),
+                break_target: normal_exit,
+                break_edge_kind: ControlEdgeKind::Normal,
+                continue_target: body_entry,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+        context.extend_controls(
+            exit_scope,
+            redo_scope,
+            RubyControlFrame {
+                break_label: (spec.kind == ProcedureKind::Lambda).then_some(exit_label.clone()),
+                next_label: Some(exit_label),
+                redo_label: Some(redo_label),
+                retry_label: None,
+                callable_exit: true,
+            },
+        );
+        body_scope = redo_scope;
+    }
+
+    let body_next = if spec.kind == ProcedureKind::Initializer {
+        EdgeTarget::normal(normal_exit)
+    } else {
+        let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+        let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        if let Some(result_node) = ruby_implicit_result_node(runtime_body) {
+            let source = context.expression_value(
+                &mut builder,
+                result_node,
+                expression_value_kind(prepared.source(), result_node),
+            )?;
+            context.append_effect(
+                &mut builder,
+                implicit_return,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    target: value,
+                },
+            )?;
+        }
+        context.append_effect(
+            &mut builder,
+            implicit_return,
+            SemanticEffect::ProcedureReturn { value: Some(value) },
+        )?;
+        context.session.add_target_edge(
+            &mut builder,
+            implicit_return,
+            EdgeTarget::normal(normal_exit),
+        )?;
+        EdgeTarget::normal(implicit_return)
+    };
+    context
+        .session
+        .add_target_edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+
+    let initial = if spec.empty_body {
+        context
+            .session
+            .add_target_edge(&mut builder, body_entry, body_next)?;
+        None
+    } else {
+        Some(Work::Statement {
+            node: spec.body,
+            entry: body_entry,
+            next: body_next,
+            scope: body_scope,
+        })
+    };
+    drive_and_finish_procedure(
+        builder,
+        initial,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| dispatch_procedure_work(&mut context, builder, work, stack),
+    )
+}
+
+impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+    ) -> Result<(), RubyLoweringError> {
+        // `self` exists in every Ruby execution context, including singleton
+        // methods, class/module bodies, and nested callables.  Nested
+        // callables retain a capture gap below, but publishing the port keeps
+        // their structured `self` reads connected to one stable identity.
+        let receiver_metadata = self.session.add_value_mapping(builder, callable)?;
+        let receiver = self.session.add_value_with_metadata(
+            builder,
+            receiver_metadata,
+            SemanticValueKind::Receiver { dispatch: true },
+        )?;
+        self.receiver = Some(receiver);
+        self.parameters.insert("self".into(), receiver);
+
+        let layout = formal_parameter_slots_for_owner(Language::Ruby, callable, self.source)
+            .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RubyLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let declaration = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let mapping_node = slot
+                .names
+                .iter()
+                .find_map(|name| {
+                    brokk_bifrost_analysis::analyzer::tree_walk::find_identifier_node(
+                        declaration,
+                        self.source,
+                        name,
+                    )
+                })
+                .unwrap_or(declaration);
+            let metadata = self.session.add_value_mapping(builder, mapping_node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Parameter {
+                    ordinal,
+                    multiplicity: formal_multiplicity(slot.variadic),
+                    name: parameter_name,
+                    passing_mode,
+                },
+            )?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| RubyLoweringError::Invalid("too many Ruby parameters".into()))?;
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+    ) -> Result<(), RubyLoweringError> {
+        let mut activations = self.local_bindings.activations().collect::<Vec<_>>();
+        activations.sort_by_key(|(_, start)| *start);
+        for (name, start) in activations {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RubyLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if self.parameters.contains_key(name) || self.locals.contains_key(name) {
+                continue;
+            }
+            let end = start.saturating_add(name.len());
+            let node = callable
+                .named_descendant_for_byte_range(start, end)
+                .filter(|node| node.kind() == "identifier")
+                .unwrap_or(callable);
+            let metadata = self.session.add_value_mapping(builder, node)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            self.locals.insert(name.into(), value);
+        }
+        Ok(())
+    }
+
+    fn binding_value(&self, name: &str) -> Option<(ValueId, ValueFlowKind)> {
+        resolve_binding_value(
+            self.locals.get(name).copied(),
+            self.parameters.get(name).copied(),
+            self.receiver,
+        )
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, RubyLoweringError> {
+        self.session.cached_node_value(
+            builder,
+            &mut self.expression_values,
+            node,
+            kind,
+            |session, builder, node| session.add_value_mapping(builder, node),
+        )
+    }
+
+    fn assignment_is_direct_in_body(&self, node: Node<'tree>) -> bool {
+        let mut current = node;
+        while let Some(parent) = current.parent() {
+            if parent.id() == self.procedure_runtime_body_node_id {
+                return true;
+            }
+            match parent.kind() {
+                "body_statement" | "block_body" | "program" => current = parent,
+                "begin" => current = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Pre-compute the one rescue binding that this procedure can lower
+    /// precisely. `try_body` is visited before its protected assignments are
+    /// scheduled, so this proof deliberately reads the protected syntax
+    /// rather than consulting `local_storage`.
+    fn prepare_precise_rescue(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        protected: &[Node<'tree>],
+        rescues: &[Node<'tree>],
+    ) -> Result<Option<()>, RubyLoweringError> {
+        if self.properties.raise_unproven || rescues.len() != 1 {
+            return Ok(None);
+        }
+        let rescue = rescues[0];
+        let shape = (|| {
+            let rescue_type = precise_rescue_type(rescue, self.source)?;
+            let binder = precise_rescue_binder(rescue)?;
+            let (raise_node, preceding) = protected.split_last()?;
+            let raised_node = direct_raise_identifier(*raise_node, self.source)?;
+            Some((rescue_type, binder, *raise_node, raised_node, preceding))
+        })();
+        let Some((class, binder_node, raise_node, raised_node, preceding)) = shape else {
+            return Ok(None);
+        };
+        if !self.properties.exception_classes.contains(class) {
+            return Ok(None);
+        }
+        let raised_name = node_text(self.source, raised_node).expect("identifier spans source");
+        let binder_name = node_text(self.source, binder_node).expect("identifier spans source");
+        let mut constructed = false;
+        for statement in preceding {
+            let mut pending = vec![*statement];
+            while let Some(node) = pending.pop() {
+                if self.session.cancellation().is_cancelled() {
+                    return Err(RubyLoweringError::Cancelled(Box::new(
+                        builder.prospective_work(),
+                    )));
+                }
+                builder.descend_nested_entry();
+                if node.id() == statement.id()
+                    && node.kind() == "assignment"
+                    && node.child_by_field_name("left").is_some_and(|left| {
+                        left.kind() == "identifier"
+                            && node_text(self.source, left) == Some(raised_name)
+                    })
+                {
+                    let right = required_field(node, "right")?;
+                    if constructed
+                        || ruby_constructor_class(right, self.source) != Some(class)
+                        || !call_arguments(right).is_empty()
+                        || right.child_by_field_name("block").is_some()
+                    {
+                        return Ok(None);
+                    }
+                    constructed = true;
+                    continue;
+                }
+                if node.kind() == "identifier" && node_text(self.source, node) == Some(raised_name)
+                {
+                    // Only modeled accessor bases can use the object before
+                    // raise. Rebinding, aliasing, capture, and whole-object
+                    // escape require a richer exception payload proof.
+                    let accessor = node
+                        .parent()
+                        .and_then(|parent| ruby_property_call(parent, self.source));
+                    let proven = constructed
+                        && accessor.is_some_and(|(receiver, member)| {
+                            receiver.id() == node.id()
+                                && node_text(self.source, member).is_some_and(|member| {
+                                    self.properties.complete_accessor(class, member).is_some()
+                                })
+                        });
+                    if !proven {
+                        return Ok(None);
+                    }
+                }
+                pending.extend(named_children(node));
+            }
+        }
+        if !constructed {
+            return Ok(None);
+        }
+        let (source, _) = self
+            .binding_value(raised_name)
+            .expect("assigned Ruby local has a binding");
+        let (binder, _) = self
+            .binding_value(binder_name)
+            .expect("rescue variable has a binding");
+        self.local_storage
+            .insert(binder, RubyLocalStorage::Class(class.into()));
+        self.precise_raise_binders
+            .insert(raise_node.id(), RubyPreciseRaise { source, binder });
+        Ok(Some(()))
+    }
+
+    fn update_local_storage(
+        &mut self,
+        assignment: Node<'tree>,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) {
+        if left.kind() == "element_reference" {
+            let replacement_class = (assignment.kind() == "assignment")
+                .then(|| self.constructor_class(right))
+                .flatten();
+            let Some((object, _)) = self.element_parts(left) else {
+                return;
+            };
+            let Some(name) = node_text(self.source, object) else {
+                return;
+            };
+            let Some((object, _)) = self.binding_value(name) else {
+                return;
+            };
+            let Some(RubyLocalStorage::Indexable { element_class }) =
+                self.local_storage.get_mut(&object)
+            else {
+                return;
+            };
+            if replacement_class.as_deref() != element_class.as_deref() {
+                *element_class = None;
+            }
+            return;
+        }
+        if left.kind() != "identifier" {
+            return;
+        }
+        let Some(name) = node_text(self.source, left) else {
+            return;
+        };
+        let Some((target, _)) = self.binding_value(name) else {
+            return;
+        };
+        let storage = (assignment.kind() == "assignment"
+            && self.assignment_is_direct_in_body(assignment))
+        .then(|| match right.kind() {
+            "array" if self.properties.builtin_index_is_proven() => {
+                Some(RubyLocalStorage::Indexable {
+                    element_class: self.homogeneous_array_element_class(right),
+                })
+            }
+            "hash" if self.properties.builtin_index_is_proven() => {
+                Some(RubyLocalStorage::Indexable {
+                    element_class: None,
+                })
+            }
+            "identifier" => node_text(self.source, right)
+                .and_then(|source| self.binding_value(source))
+                .and_then(|(source, _)| self.local_storage.get(&source).cloned()),
+            "call" if ruby_constructor_call(right, self.source) => {
+                ruby_constructor_class(right, self.source)
+                    .filter(|class| self.properties.constructor_is_proven(class))
+                    .map(|class| RubyLocalStorage::Class(class.into()))
+            }
+            _ => None,
+        })
+        .flatten();
+        if let Some(storage) = storage {
+            self.local_storage.insert(target, storage);
+        } else {
+            self.local_storage.remove(&target);
+        }
+    }
+
+    fn invalidate_parallel_assignment_storage(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        left: Node<'tree>,
+    ) -> Result<(), RubyLoweringError> {
+        let mut pending = vec![left];
+        while let Some(node) = pending.pop() {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RubyLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            builder.descend_nested_entry();
+            if node.kind() == "identifier" {
+                if let Some(name) = node_text(self.source, node)
+                    && let Some((value, _)) = self.binding_value(name)
+                {
+                    self.local_storage.remove(&value);
+                }
+                continue;
+            }
+            pending.extend(named_children(node));
+        }
+        Ok(())
+    }
+
+    fn homogeneous_array_element_class(&self, array: Node<'tree>) -> Option<Box<str>> {
+        debug_assert_eq!(array.kind(), "array");
+        let mut elements = named_children(array).into_iter();
+        let class = self.constructor_class(elements.next()?)?;
+        elements
+            .all(|element| self.constructor_class(element).as_deref() == Some(class.as_ref()))
+            .then_some(class)
+    }
+
+    fn constructor_class(&self, call: Node<'tree>) -> Option<Box<str>> {
+        ruby_constructor_class(call, self.source)
+            .filter(|class| self.properties.constructor_is_proven(class))
+            .map(Into::into)
+    }
+
+    fn receiver_class(&self, receiver: Node<'tree>) -> Option<&str> {
+        let mut current = receiver;
+        let mut accessors = Vec::new();
+        // Peel first and replay from the rooted local so deeply nested Ruby
+        // access paths do not consume the Rust call stack.
+        let base_class = loop {
+            match current.kind() {
+                "call" => {
+                    let (receiver, property) = ruby_property_call(current, self.source)?;
+                    accessors.push(property);
+                    current = receiver;
+                }
+                "identifier" => {
+                    let name = node_text(self.source, current)?;
+                    let (value, _) = self.binding_value(name)?;
+                    let RubyLocalStorage::Class(class) = self.local_storage.get(&value)? else {
+                        break None;
+                    };
+                    break Some(class.as_ref());
+                }
+                "element_reference" => {
+                    let (object, _) = self.element_parts(current)?;
+                    let name = node_text(self.source, object)?;
+                    let (value, _) = self.binding_value(name)?;
+                    let RubyLocalStorage::Indexable {
+                        element_class: Some(class),
+                    } = self.local_storage.get(&value)?
+                    else {
+                        break None;
+                    };
+                    break Some(class.as_ref());
+                }
+                _ => break None,
+            }
+        }?;
+        let mut class = base_class;
+        for property in accessors.into_iter().rev() {
+            let property = node_text(self.source, property)?;
+            class = self.properties.accessor_result_class(class, property)?;
+        }
+        Some(class)
+    }
+
+    fn property_member_locator(
+        &self,
+        receiver: Node<'tree>,
+        property: Node<'tree>,
+    ) -> Option<SemanticLocator> {
+        let class = self.receiver_class(receiver)?;
+        let property_name = node_text(self.source, property)?;
+        let anchor = self.properties.complete_accessor(class, property_name)?;
+        let procedure = self.session.locator();
+        Some(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        ))
+    }
+
+    fn instance_field_member_locator(&mut self, node: Node<'tree>) -> Option<SemanticLocator> {
+        if node.kind() != "instance_variable"
+            || self.procedure_is_static
+            || !matches!(
+                self.procedure_kind,
+                ProcedureKind::Method | ProcedureKind::Constructor
+            )
+        {
+            return None;
+        }
+        let name = node_text(self.source, node)?;
+        if let Some(locator) = self.instance_field_locators.get(name) {
+            return Some(locator.clone());
+        }
+        let anchor = source_anchor(node, 0).ok()?;
+        let procedure = self.session.locator();
+        let locator = procedure.memory_location_at(anchor);
+        self.instance_field_locators
+            .insert(name.into(), locator.clone());
+        Some(locator)
+    }
+
+    fn property_parts(&self, node: Node<'tree>) -> Option<(Node<'tree>, SemanticLocator)> {
+        let (receiver, property) = ruby_property_call(node, self.source)?;
+        self.property_member_locator(receiver, property)
+            .map(|member| (receiver, member))
+    }
+
+    fn element_parts(&self, node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+        if node.kind() != "element_reference" {
+            return None;
+        }
+        let object = node.child_by_field_name("object")?;
+        let name = node_text(self.source, object)?;
+        let (object_value, _) = self.binding_value(name)?;
+        if !matches!(
+            self.local_storage.get(&object_value),
+            Some(RubyLocalStorage::Indexable { .. })
+        ) {
+            return None;
+        }
+        let mut indices = named_children(node).into_iter().filter(|child| {
+            child.id() != object.id() && child.kind() != "block" && child.kind() != "do_block"
+        });
+        let index = indices.next()?;
+        indices.next().is_none().then_some((object, index))
+    }
+
+    fn constant_index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<ValueId>, RubyLoweringError> {
+        let Some(index) = (node.kind() == "integer")
+            .then(|| node_text(self.source, node))
+            .flatten()
+            .and_then(|text| text.parse::<u64>().ok())
+        else {
+            return Ok(None);
+        };
+        if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
+            &self.constant_index_values,
+            &mut self.expression_values,
+            index,
+            node.id(),
+        ) {
+            return Ok(Some(value));
+        }
+        let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
+        self.constant_index_values.insert(index, value);
+        Ok(Some(value))
+    }
+
+    fn add_dynamic_index_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), RubyLoweringError> {
+        self.session.add_unprojected_index_gap(
+            builder,
+            point,
+            location,
+            "Ruby dynamic element index identity is not proven",
+        )
+    }
+
+    fn semantic_call_argument(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        argument: Node<'tree>,
+    ) -> Result<SemanticCallArgument, RubyLoweringError> {
+        let (value_node, expansion) = match argument.kind() {
+            "pair" => (
+                argument.child_by_field_name("value").unwrap_or(argument),
+                CallArgumentExpansion::Direct(ArgumentDomain::Keyword),
+            ),
+            "splat_argument" => (
+                first_runtime_named_child(argument).unwrap_or(argument),
+                CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+            ),
+            "hash_splat_argument" => (
+                first_runtime_named_child(argument).unwrap_or(argument),
+                CallArgumentExpansion::Spread(ArgumentDomain::Keyword),
+            ),
+            "block_argument" | "forward_argument" => (
+                first_runtime_named_child(argument).unwrap_or(argument),
+                CallArgumentExpansion::Unclassified,
+            ),
+            _ => (
+                argument,
+                CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+            ),
+        };
+        let value = self.expression_value(
+            builder,
+            value_node,
+            expression_value_kind(self.source, value_node),
+        )?;
+        let keyword = if argument.kind() == "pair" {
+            argument.child_by_field_name("key").and_then(|key| {
+                if !matches!(key.kind(), "simple_symbol" | "hash_key_symbol") {
+                    return None;
+                }
+                let range = ruby_semantic_identifier_range(key, self.source);
+                self.source
+                    .get(range.start_byte..range.end_byte)
+                    .filter(|name| !name.is_empty())
+                    .map(Box::<str>::from)
+            })
+        } else {
+            None
+        };
+        Ok(SemanticCallArgument {
+            value,
+            expansion,
+            keyword,
+        })
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<bool, RubyLoweringError> {
+        let Some(name) = node_text(self.source, node) else {
+            return Ok(false);
+        };
+        let Some((source, kind)) = self.binding_value(name) else {
+            return Ok(false);
+        };
+        self.session
+            .append_value_flow_if_distinct(builder, point, kind, source, target)?;
+        Ok(true)
+    }
+
+    fn next_label(&mut self, role: &str) -> Box<str> {
+        let label = format!("<ruby-{role}-{}>", self.next_control_label).into_boxed_str();
+        self.next_control_label += 1;
+        label
+    }
+
+    fn copy_controls(&mut self, parent: ScopeFrameId, child: ScopeFrameId) {
+        self.controls.insert(
+            child,
+            brokk_bifrost_analysis::analyzer::semantic::lowering::copy_scope_frames(
+                &self.controls,
+                parent,
+            ),
+        );
+    }
+
+    fn extend_controls(
+        &mut self,
+        parent: ScopeFrameId,
+        child: ScopeFrameId,
+        frame: RubyControlFrame,
+    ) {
+        self.controls.insert(
+            child,
+            brokk_bifrost_analysis::analyzer::semantic::lowering::extend_scope_frames(
+                &self.controls,
+                parent,
+                frame,
+            ),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        if ruby_statement_kind(node).is_some() {
+            self.session.record_statement_entry(builder, node, entry)?;
+        }
+        match node.kind() {
+            "program" | "block_body" | "do" | "then" | "else" | "ensure" => {
+                let children = runtime_statement_children(node);
+                if self.reuse_first_statement_entry
+                    && node.id() == self.procedure_runtime_body_node_id
+                {
+                    self.schedule_statements_reusing_entry(
+                        builder, entry, &children, next, scope, stack,
+                    )
+                } else {
+                    self.schedule_statements(builder, entry, &children, next, scope, stack)
+                }
+            }
+            "parenthesized_statements" => {
+                let children = runtime_statement_children(node);
+                let terminal = self.point(builder, node, Vec::new())?;
+                let result =
+                    self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+                let source = if let Some(last) = children.last() {
+                    self.expression_value(
+                        builder,
+                        *last,
+                        expression_value_kind(self.source, *last),
+                    )?
+                } else {
+                    self.value(builder, terminal, SemanticValueKind::Null)?
+                };
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target: result,
+                    },
+                )?;
+                self.session.add_target_edge(builder, terminal, next)?;
+                self.schedule_statements(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "body_statement" if body_has_rescue_or_ensure(node) => {
+                self.try_body(builder, node, entry, next, scope, stack)
+            }
+            "body_statement" => {
+                let children = ordinary_body_statements(node);
+                if self.reuse_first_statement_entry
+                    && node.id() == self.procedure_runtime_body_node_id
+                {
+                    self.schedule_statements_reusing_entry(
+                        builder, entry, &children, next, scope, stack,
+                    )
+                } else {
+                    self.schedule_statements(builder, entry, &children, next, scope, stack)
+                }
+            }
+            "block" | "do_block" if node.id() == self.procedure_body_node_id => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    stack.push(Work::Statement {
+                        node: body,
+                        entry,
+                        next,
+                        scope,
+                    });
+                    Ok(())
+                } else {
+                    self.session.add_target_edge(builder, entry, next)
+                }
+            }
+            "begin" => self.try_body(builder, node, entry, next, scope, stack),
+            "if" | "unless" | "elsif" | "if_modifier" | "unless_modifier" | "conditional" => {
+                self.if_expression(builder, node, entry, next, scope, stack)
+            }
+            "while" | "until" | "while_modifier" | "until_modifier" => {
+                self.loop_expression(builder, node, entry, next, scope, stack)
+            }
+            "for" => self.for_expression(builder, node, entry, next, scope, stack),
+            "case" | "case_match" => self.case_expression(builder, node, entry, next, scope, stack),
+            "rescue_modifier" => self.rescue_modifier(builder, node, entry, next, scope, stack),
+            "return" => self.return_expression(builder, node, entry, scope, stack),
+            "break" | "next" | "redo" | "retry" => {
+                self.control_expression(builder, node, entry, scope, stack)
+            }
+            "call" if self.property_parts(node).is_some() => {
+                self.property_access(builder, node, entry, next, scope, stack)
+            }
+            "call" => self.call_expression(builder, node, entry, next, scope, stack),
+            "yield" => self.yield_expression(builder, node, entry, next, scope, stack),
+            "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
+                self.callable_value(builder, node, entry, next)
+            }
+            "class" | "module" | "singleton_class" => {
+                self.type_declaration(builder, node, entry, next, scope, stack)
+            }
+            "begin_block" | "end_block" => {
+                self.deferred_lifecycle_block(builder, node, entry, next)
+            }
+            "alias" | "undef" => self.callable_table_mutation(builder, node, entry, next),
+            _ => self.expression(builder, node, entry, next, scope, stack),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        match node.kind() {
+            "program"
+            | "body_statement"
+            | "block_body"
+            | "do"
+            | "then"
+            | "else"
+            | "ensure"
+            | "parenthesized_statements"
+            | "begin"
+            | "if"
+            | "unless"
+            | "elsif"
+            | "if_modifier"
+            | "unless_modifier"
+            | "while"
+            | "until"
+            | "while_modifier"
+            | "until_modifier"
+            | "for"
+            | "case"
+            | "case_match"
+            | "rescue_modifier"
+            | "return"
+            | "break"
+            | "next"
+            | "redo"
+            | "retry"
+            | "yield"
+            | "class"
+            | "module"
+            | "singleton_class"
+            | "begin_block"
+            | "end_block" => self.statement(builder, node, entry, next, scope, stack),
+            "block" | "do_block" if node.id() == self.procedure_body_node_id => {
+                self.statement(builder, node, entry, next, scope, stack)
+            }
+            "call" if self.property_parts(node).is_some() => {
+                self.property_access(builder, node, entry, next, scope, stack)
+            }
+            "call" => self.call_expression(builder, node, entry, next, scope, stack),
+            "conditional" => self.if_expression(builder, node, entry, next, scope, stack),
+            "binary" if is_short_circuit_binary(self.source, node) => {
+                self.boolean_value(builder, node, entry, next, scope, stack)
+            }
+            "binary" | "unary" => self.implicit_operator(builder, node, entry, next, scope, stack),
+            "assignment" | "operator_assignment" => {
+                self.assignment(builder, node, entry, next, scope, stack)
+            }
+            "element_reference" => self.element_reference(builder, node, entry, next, scope, stack),
+            "identifier" => self.ambiguous_identifier(builder, node, entry, next, scope, stack),
+            "instance_variable" => self.instance_variable_access(builder, node, entry, next),
+            "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
+                self.callable_value(builder, node, entry, next)
+            }
+            "super" => self.unsupported_super(builder, node, entry, next, scope, stack),
+            _ if is_runtime_leaf(node.kind()) => {
+                let value =
+                    self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+                self.emit_lexical_input_flow(builder, node, entry, value)?;
+                self.session.add_target_edge(builder, entry, next)
+            }
+            _ => {
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+        }
+    }
+
+    fn emit_field_memory_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        access: ProgramPointId,
+        base: ValueId,
+        member: SemanticLocator,
+        result: ValueId,
+    ) -> Result<(), RubyLoweringError> {
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location,
+                result,
+            },
+        )
+    }
+
+    fn instance_variable_access(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), RubyLoweringError> {
+        let result =
+            self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+        let Some(member) = self.instance_field_member_locator(node) else {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::FieldMemory,
+                SemanticGapKind::Unsupported,
+                "Ruby instance-variable reads outside an ordinary instance method are not receiver-rooted",
+            )?;
+            return self.session.add_target_edge(builder, entry, next);
+        };
+        let base = self
+            .receiver
+            .expect("an ordinary Ruby instance method has a receiver value");
+        let access = self.point(builder, node, Vec::new())?;
+        self.emit_field_memory_load(builder, access, base, member, result)?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(access))?;
+        self.session.add_target_edge(builder, access, next)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        if let Some(value) = ruby_folded_boolean_constant(self.source, node) {
+            let taken = if value { when_true } else { when_false };
+            self.session.add_target_edge(builder, entry, taken)?;
+            return self.record_guard(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(when_true),
+                (!value).then_some(when_false),
+            );
+        }
+        if let Some(operand) = ruby_logical_not_operand(self.source, node) {
+            stack.push(Work::Condition {
+                node: operand,
+                entry,
+                when_true: when_false,
+                when_false: when_true,
+                scope,
+            });
+            return Ok(());
+        }
+        if node.kind() == "parenthesized_statements" {
+            let children = runtime_expression_children(node);
+            if let [child] = children.as_slice() {
+                stack.push(Work::Condition {
+                    node: *child,
+                    entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                return Ok(());
+            }
+        }
+        if node.kind() == "binary" {
+            let operator = node
+                .child_by_field_name("operator")
+                .and_then(|operator| node_text(self.source, operator));
+            if let Some(operator @ ("&&" | "and" | "||" | "or")) = operator {
+                let left = required_field(node, "left")?;
+                let right = required_field(node, "right")?;
+                let right_entry = self.point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" | "and" => ShortCircuitKind::And,
+                    "||" | "or" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects Ruby boolean operators"),
+                };
+                schedule_short_circuit_condition(
+                    stack,
+                    kind,
+                    (left, entry),
+                    (right, right_entry),
+                    when_true,
+                    when_false,
+                    scope,
+                    |node, entry, when_true, when_false, scope| Work::Condition {
+                        node,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
+                    },
+                );
+                return Ok(());
+            }
+        }
+        let decision = self.point(builder, node, Vec::new())?;
+        self.session.add_target_edge(builder, decision, when_true)?;
+        self.session
+            .add_target_edge(builder, decision, when_false)?;
+        let (predicate, subject) = self.normalize_condition(builder, node)?.unwrap_or_else(|| {
+            (
+                GuardPredicate::Opaque {
+                    digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                },
+                None,
+            )
+        });
+        let subject = match subject {
+            Some(subject) => Some(subject),
+            None => Some(self.expression_value(
+                builder,
+                node,
+                expression_value_kind(self.source, node),
+            )?),
+        };
+        self.record_guard(
+            builder,
+            decision,
+            predicate,
+            subject,
+            Some(when_true),
+            Some(when_false),
+        )?;
+        stack.push(Work::Expression {
+            node,
+            entry,
+            next: EdgeTarget::normal(decision),
+            scope,
+        });
+        Ok(())
+    }
+
+    fn ruby_condition_binding(&self, node: Node<'tree>) -> Option<ValueId> {
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.source, node)?;
+        let (value, flow) = self.binding_value(name)?;
+        matches!(flow, ValueFlowKind::Local).then_some(value)
+    }
+
+    /// A truth test is admitted only for a local whose exact plain writes are
+    /// all Boolean literals. Integer locals are deliberately left open: Ruby
+    /// treats zero as truthy, so a generic scalar truth refinement would model
+    /// a different language's falsiness rules.
+    fn ruby_boolean_condition_binding(&self, node: Node<'tree>) -> Option<ValueId> {
+        let value = self.ruby_condition_binding(node)?;
+        let name = node_text(self.source, node)?;
+        let mut callable = node;
+        while let Some(parent) = callable.parent() {
+            callable = parent;
+            if ruby_callable_syntax(callable) {
+                break;
+            }
+        }
+        let mut saw_boolean = false;
+        let mut stack = vec![callable];
+        while let Some(current) = stack.pop() {
+            if current.id() != callable.id() && ruby_callable_syntax(current) {
+                continue;
+            }
+            if current.kind() == "operator_assignment"
+                && current.child_by_field_name("left").is_some_and(|left| {
+                    left.kind() == "identifier" && node_text(self.source, left) == Some(name)
+                })
+            {
+                return None;
+            }
+            if current.kind() == "assignment"
+                && let (Some(left), Some(right)) = (
+                    current.child_by_field_name("left"),
+                    current.child_by_field_name("right"),
+                )
+                && left.kind() == "identifier"
+                && node_text(self.source, left) == Some(name)
+            {
+                if matches!(
+                    ruby_scalar_literal_value_kind(self.source, right),
+                    Some(SemanticValueKind::Boolean(_))
+                ) {
+                    saw_boolean = true;
+                } else {
+                    return None;
+                }
+            }
+            stack.extend(named_children(current));
+        }
+        saw_boolean.then_some(value)
+    }
+
+    fn is_scalar_operator_syntax(&self, node: Node<'tree>) -> bool {
+        match node.kind() {
+            "binary" => {
+                let operator = node
+                    .child_by_field_name("operator")
+                    .and_then(|operator| node_text(self.source, operator));
+                if !matches!(operator, Some("<" | "<=" | ">" | ">=" | "==" | "!=")) {
+                    return false;
+                }
+                let Some(left) = node.child_by_field_name("left") else {
+                    return false;
+                };
+                let Some(right) = node.child_by_field_name("right") else {
+                    return false;
+                };
+                self.is_scalar_operator_operand(left) && self.is_scalar_operator_operand(right)
+            }
+            "unary" => {
+                node.child_by_field_name("operator")
+                    .and_then(|operator| node_text(self.source, operator))
+                    .is_some_and(|operator| matches!(operator, "!" | "not"))
+                    && node.child_by_field_name("operand").is_some_and(|operand| {
+                        self.ruby_boolean_condition_binding(operand).is_some()
+                            || matches!(
+                                ruby_scalar_literal_value_kind(self.source, operand),
+                                Some(SemanticValueKind::Boolean(_))
+                            )
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn is_scalar_operator_operand(&self, node: Node<'tree>) -> bool {
+        let node = peel_ruby_condition_parentheses(node);
+        self.ruby_condition_binding(node).is_some()
+            || matches!(
+                ruby_scalar_literal_value_kind(self.source, node),
+                Some(
+                    SemanticValueKind::SignedInteger(_)
+                        | SemanticValueKind::UnsignedInteger(_)
+                        | SemanticValueKind::Boolean(_)
+                )
+            )
+    }
+
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, RubyLoweringError> {
+        let mut cursor = node;
+        let mut negated = false;
+        loop {
+            if cursor.kind() == "parenthesized_statements" {
+                let children = runtime_expression_children(cursor);
+                let [inner] = children.as_slice() else {
+                    return Ok(None);
+                };
+                cursor = *inner;
+            } else if let Some(operand) = ruby_logical_not_operand(self.source, cursor) {
+                negated = !negated;
+                cursor = operand;
+            } else {
+                break;
+            }
+        }
+        if let Some(value) = ruby_folded_boolean_constant(self.source, cursor) {
+            return Ok(Some((
+                GuardPredicate::ConstantBoolean {
+                    value: value != negated,
+                },
+                None,
+            )));
+        }
+        if let Some(value) = self.ruby_boolean_condition_binding(cursor) {
+            return Ok(Some((
+                GuardPredicate::Truthy {
+                    value: self.expression_value(
+                        builder,
+                        cursor,
+                        expression_value_kind(self.source, cursor),
+                    )?,
+                },
+                Some(value),
+            )));
+        }
+        if cursor.kind() != "binary" {
+            return Ok(None);
+        }
+        let (Some(operator), Some(left), Some(right)) = (
+            cursor
+                .child_by_field_name("operator")
+                .and_then(|operator| node_text(self.source, operator)),
+            cursor.child_by_field_name("left"),
+            cursor.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+        let left = peel_ruby_condition_parentheses(left);
+        let right = peel_ruby_condition_parentheses(right);
+        let left_binding = self.ruby_condition_binding(left);
+        let right_binding = self.ruby_condition_binding(right);
+        let left_integer = matches!(
+            ruby_scalar_literal_value_kind(self.source, left),
+            Some(SemanticValueKind::SignedInteger(_) | SemanticValueKind::UnsignedInteger(_))
+        );
+        let right_integer = matches!(
+            ruby_scalar_literal_value_kind(self.source, right),
+            Some(SemanticValueKind::SignedInteger(_) | SemanticValueKind::UnsignedInteger(_))
+        );
+        let (subject_node, constant, reversed) = match (left_binding, right_binding) {
+            (Some(_), None) if right_integer => (left, right, false),
+            (None, Some(_)) if left_integer => (right, left, true),
+            _ => return Ok(None),
+        };
+        let Some(subject_value) = self.ruby_condition_binding(subject_node) else {
+            return Ok(None);
+        };
+        let constant = self.expression_value(
+            builder,
+            constant,
+            expression_value_kind(self.source, constant),
+        )?;
+        let predicate = match operator {
+            "<" | "<=" | ">" | ">=" => {
+                let relation = match operator {
+                    "<" => IntegerComparison::LessThan,
+                    "<=" => IntegerComparison::LessThanOrEqual,
+                    ">" => IntegerComparison::GreaterThan,
+                    ">=" => IntegerComparison::GreaterThanOrEqual,
+                    _ => unreachable!("ordered operator was matched"),
+                };
+                let relation = if reversed {
+                    relation.reverse()
+                } else {
+                    relation
+                };
+                GuardPredicate::OrderedIntegerComparison {
+                    relation: if negated { relation.negate() } else { relation },
+                    constant,
+                }
+            }
+            "==" | "!=" => GuardPredicate::ConstantEquality {
+                negated: (operator == "!=") != negated,
+                constant,
+            },
+            _ => return Ok(None),
+        };
+        let subject = self.expression_value(
+            builder,
+            subject_node,
+            expression_value_kind(self.source, subject_node),
+        )?;
+        debug_assert_eq!(
+            self.ruby_condition_binding(subject_node),
+            Some(subject_value)
+        );
+        Ok(Some((predicate, Some(subject))))
+    }
+
+    /// Publish one guard fact for a decision this lowerer just made.
+    ///
+    /// Arms must already have been added as edges; the IR validator enforces
+    /// that. Exact local scalar guards use the documented built-in core
+    /// Integer/operator assumption; unresolved Ruby dispatch remains opaque.
+    #[allow(clippy::too_many_arguments)]
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), RubyLoweringError> {
+        self.session
+            .add_guard_for_targets(builder, point, predicate, subject, when_true, when_false)
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn if_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let condition = required_field(node, "condition")?;
+        let consequence = node
+            .child_by_field_name("consequence")
+            .or_else(|| node.child_by_field_name("body"));
+        let alternative = node.child_by_field_name("alternative");
+        let consequence_nodes = consequence.map(branch_statements).unwrap_or_default();
+        let alternative_nodes = alternative.map(branch_statements).unwrap_or_default();
+        let consequence_entry =
+            self.prepare_statements(builder, &consequence_nodes, next, scope, stack)?;
+        let alternative_entry =
+            self.prepare_statements(builder, &alternative_nodes, next, scope, stack)?;
+        let consequence_target = consequence_entry.map(EdgeTarget::normal).unwrap_or(next);
+        let alternative_target = alternative_entry.map(EdgeTarget::normal).unwrap_or(next);
+        let inverted = matches!(node.kind(), "unless" | "unless_modifier");
+        let condition_entry = self.point(builder, condition, Vec::new())?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))?;
+        stack.push(Work::Condition {
+            node: condition,
+            entry: condition_entry,
+            when_true: if inverted {
+                EdgeTarget {
+                    point: alternative_target.point,
+                    kind: ControlEdgeKind::ConditionalTrue,
+                }
+            } else {
+                EdgeTarget {
+                    point: consequence_target.point,
+                    kind: ControlEdgeKind::ConditionalTrue,
+                }
+            },
+            when_false: if inverted {
+                EdgeTarget {
+                    point: consequence_target.point,
+                    kind: ControlEdgeKind::ConditionalFalse,
+                }
+            } else {
+                EdgeTarget {
+                    point: alternative_target.point,
+                    kind: ControlEdgeKind::ConditionalFalse,
+                }
+            },
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn loop_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let condition = required_field(node, "condition")?;
+        let body = required_field(node, "body")?;
+        let condition_entry = self.point(builder, condition, Vec::new())?;
+        let body_children = runtime_statement_children(body);
+        let body_entry = if let (Some(first), Some(last)) = (
+            body_children.first().copied(),
+            body_children.last().copied(),
+        ) {
+            self.point_through(builder, first, last, Vec::new())?
+        } else {
+            self.point(builder, body, Vec::new())?
+        };
+        let post_test = matches!(node.kind(), "while_modifier" | "until_modifier");
+        self.session.record_loop_site_with_body_source(
+            builder,
+            node,
+            body,
+            condition_entry,
+            body_entry,
+        )?;
+        let body_scope = self.push_loop_scopes(builder, scope, next, condition_entry, body_entry);
+        let inverted = matches!(node.kind(), "until" | "until_modifier");
+        let body_target = EdgeTarget {
+            point: body_entry,
+            kind: if inverted {
+                ControlEdgeKind::ConditionalFalse
+            } else {
+                ControlEdgeKind::ConditionalTrue
+            },
+        };
+        let exit_target = EdgeTarget {
+            point: next.point,
+            kind: if inverted {
+                ControlEdgeKind::ConditionalTrue
+            } else {
+                ControlEdgeKind::ConditionalFalse
+            },
+        };
+
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: condition_entry,
+                kind: ControlEdgeKind::LoopBack,
+            },
+            scope: body_scope,
+        });
+        stack.push(Work::Condition {
+            node: condition,
+            entry: condition_entry,
+            when_true: if inverted { exit_target } else { body_target },
+            when_false: if inverted { body_target } else { exit_target },
+            scope,
+        });
+
+        if post_test {
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))
+        } else {
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unconditional_loop_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let body = ruby_unconditional_loop_body(node, self.source)
+            .expect("unconditional loop call has a structured block body");
+        let body_entry = self.point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, body_entry, body_entry)?;
+        if matches!(body.kind(), "block" | "do_block") {
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))?;
+            return self.session.add_target_edge(
+                builder,
+                body_entry,
+                EdgeTarget {
+                    point: body_entry,
+                    kind: ControlEdgeKind::LoopBack,
+                },
+            );
+        }
+        let body_scope = self.push_loop_scopes(builder, scope, next, body_entry, body_entry);
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: body_entry,
+                kind: ControlEdgeKind::LoopBack,
+            },
+            scope: body_scope,
+        });
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))
+    }
+
+    fn push_loop_scopes(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        parent: ScopeFrameId,
+        break_target: EdgeTarget,
+        next_target: ProgramPointId,
+        redo_target: ProgramPointId,
+    ) -> ScopeFrameId {
+        let outer_label = self.next_label("loop-next");
+        let outer = builder.push_scope(
+            Some(parent),
+            ScopeBinding::Loop {
+                label: Some(outer_label.clone()),
+                break_target: break_target.point,
+                break_edge_kind: break_target.kind,
+                continue_target: next_target,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+        self.copy_controls(parent, outer);
+        let redo_label = self.next_label("loop-redo");
+        let inner = builder.push_scope(
+            Some(outer),
+            ScopeBinding::Loop {
+                label: Some(redo_label.clone()),
+                break_target: break_target.point,
+                break_edge_kind: break_target.kind,
+                continue_target: redo_target,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+        self.extend_controls(
+            outer,
+            inner,
+            RubyControlFrame {
+                break_label: Some(outer_label.clone()),
+                next_label: Some(outer_label),
+                redo_label: Some(redo_label),
+                retry_label: None,
+                callable_exit: false,
+            },
+        );
+        inner
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let value_wrapper = required_field(node, "value")?;
+        let iterable = first_runtime_named_child(value_wrapper).ok_or_else(|| {
+            RubyLoweringError::Invalid("Ruby for-in wrapper has no iterable expression".into())
+        })?;
+        let body = required_field(node, "body")?;
+        let decision = self.point(builder, value_wrapper, Vec::new())?;
+        let body_entry = self.point(builder, body, Vec::new())?;
+        self.session.record_gap(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "Ruby for iteration protocol calls are not emitted as synthetic call sites",
+        )?;
+        self.session.record_gap(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            "per-iteration destructuring and loop-variable binding require value refinement",
+        )?;
+        let discharge = if builder.throw_exits_procedure(scope) {
+            SemanticGapDischarge::NonRejoiningExceptionalExit
+        } else {
+            SemanticGapDischarge::None
+        };
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unknown,
+            discharge,
+            "iteration protocol lookup and execution may raise",
+        )?;
+        self.session.add_target_edge(
+            builder,
+            decision,
+            EdgeTarget {
+                point: body_entry,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+        )?;
+        self.session.add_target_edge(
+            builder,
+            decision,
+            EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+        )?;
+        let body_scope = self.push_loop_scopes(builder, scope, next, decision, body_entry);
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: decision,
+                kind: ControlEdgeKind::LoopBack,
+            },
+            scope: body_scope,
+        });
+        stack.push(Work::Expression {
+            node: iterable,
+            entry,
+            next: EdgeTarget::normal(decision),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn case_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let clauses = named_children(node)
+            .into_iter()
+            .filter(|child| matches!(child.kind(), "when" | "in_clause"))
+            .collect::<Vec<_>>();
+        let has_case_value = node.child_by_field_name("value").is_some();
+        let alternative = node.child_by_field_name("else").or_else(|| {
+            named_children(node)
+                .into_iter()
+                .find(|child| child.kind() == "else")
+        });
+        let mut tests = Vec::with_capacity(clauses.len());
+        for clause in &clauses {
+            if clause.kind() == "when" {
+                let mut clause_tests = Vec::new();
+                for pattern in children_by_field_name(*clause, "pattern") {
+                    clause_tests.push((
+                        Some(pattern),
+                        self.point(builder, pattern, Vec::new())?,
+                        self.point(builder, pattern, Vec::new())?,
+                    ));
+                }
+                if clause_tests.is_empty() {
+                    return Err(RubyLoweringError::Invalid(format!(
+                        "when clause at bytes {}..{} has no structured pattern",
+                        clause.start_byte(),
+                        clause.end_byte()
+                    )));
+                }
+                tests.push(clause_tests);
+            } else {
+                let decision = self.point(builder, *clause, Vec::new())?;
+                tests.push(vec![(None, decision, decision)]);
+            }
+        }
+        let body_entries = clauses
+            .iter()
+            .map(|clause| self.point(builder, *clause, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let alternative_entry = alternative
+            .map(|body| self.point(builder, body, Vec::new()))
+            .transpose()?;
+
+        let unmatched = if let Some(alternative_entry) = alternative_entry {
+            EdgeTarget::normal(alternative_entry)
+        } else if node.kind() == "case_match" {
+            let point = self.point(builder, node, Vec::new())?;
+            let value = self.value(builder, point, SemanticValueKind::Exception)?;
+            self.append_effect(builder, point, SemanticEffect::Throw { value: Some(value) })?;
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "unmatched Ruby pattern case raises NoMatchingPatternError",
+            )?;
+            self.abrupt(builder, point, scope, CompletionKind::Throw, None, stack)?;
+            EdgeTarget {
+                point,
+                kind: ControlEdgeKind::Exceptional,
+            }
+        } else {
+            next
+        };
+
+        if let (Some(alternative), Some(alternative_entry)) = (alternative, alternative_entry) {
+            stack.push(Work::Statement {
+                node: alternative,
+                entry: alternative_entry,
+                next,
+                scope,
+            });
+        }
+        for index in (0..clauses.len()).rev() {
+            let clause = clauses[index];
+            let clause_no_match = tests
+                .get(index + 1)
+                .and_then(|tests| tests.first())
+                .map(|(_, entry, _)| EdgeTarget {
+                    point: *entry,
+                    kind: ControlEdgeKind::Normal,
+                })
+                .unwrap_or(unmatched);
+            let body = clause.child_by_field_name("body");
+            if let Some(body) = body {
+                stack.push(Work::Statement {
+                    node: body,
+                    entry: body_entries[index],
+                    next,
+                    scope,
+                });
+            } else {
+                self.session
+                    .add_target_edge(builder, body_entries[index], next)?;
+            }
+
+            let guard = clause.child_by_field_name("guard");
+            let guard_entry = guard
+                .map(|guard| self.point(builder, guard, Vec::new()))
+                .transpose()?;
+            for test_index in (0..tests[index].len()).rev() {
+                let (pattern, test_entry, decision) = tests[index][test_index];
+                let no_match = tests[index]
+                    .get(test_index + 1)
+                    .map(|(_, entry, _)| EdgeTarget::normal(*entry))
+                    .unwrap_or(clause_no_match);
+                let implicit_matching = clause.kind() == "in_clause" || has_case_value;
+                if implicit_matching {
+                    self.session.record_gap(
+                        builder,
+                        decision,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unsupported,
+                        if clause.kind() == "when" {
+                            "Ruby case matching invokes pattern === methods that are not emitted synthetically"
+                        } else {
+                            "Ruby pattern deconstruction invokes implicit protocol methods that are not emitted synthetically"
+                        },
+                    )?;
+                    self.session.record_gap(
+                        builder,
+                        decision,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ExceptionalControlFlow,
+                        SemanticGapKind::Unknown,
+                        "Ruby implicit case matching may raise",
+                    )?;
+                }
+                self.session.record_gap(
+                    builder,
+                    decision,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    if implicit_matching {
+                        "case pattern compatibility and bindings require runtime value refinement"
+                    } else {
+                        "case predicate truthiness requires runtime value refinement"
+                    },
+                )?;
+
+                if let (Some(guard), Some(guard_entry)) = (guard, guard_entry) {
+                    let guard_condition = guard.child_by_field_name("condition").unwrap_or(guard);
+                    self.session.add_target_edge(
+                        builder,
+                        decision,
+                        EdgeTarget {
+                            point: guard_entry,
+                            kind: ControlEdgeKind::SwitchCase,
+                        },
+                    )?;
+                    self.session.add_target_edge(builder, decision, no_match)?;
+                    let unless = guard.kind() == "unless_guard";
+                    stack.push(Work::Condition {
+                        node: guard_condition,
+                        entry: guard_entry,
+                        when_true: if unless {
+                            no_match
+                        } else {
+                            EdgeTarget::normal(body_entries[index])
+                        },
+                        when_false: if unless {
+                            EdgeTarget::normal(body_entries[index])
+                        } else {
+                            no_match
+                        },
+                        scope,
+                    });
+                } else {
+                    self.session.add_target_edge(
+                        builder,
+                        decision,
+                        EdgeTarget {
+                            point: body_entries[index],
+                            kind: ControlEdgeKind::SwitchCase,
+                        },
+                    )?;
+                    self.session.add_target_edge(builder, decision, no_match)?;
+                }
+                if let Some(pattern) = pattern {
+                    stack.push(Work::Expression {
+                        node: pattern,
+                        entry: test_entry,
+                        next: EdgeTarget::normal(decision),
+                        scope,
+                    });
+                }
+            }
+        }
+
+        let first = tests
+            .first()
+            .and_then(|tests| tests.first())
+            .map(|(_, entry, _)| EdgeTarget::normal(*entry))
+            .unwrap_or(unmatched);
+        if let Some(value) = node.child_by_field_name("value") {
+            stack.push(Work::Expression {
+                node: value,
+                entry,
+                next: first,
+                scope,
+            });
+        } else {
+            self.session.add_target_edge(builder, entry, first)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_body(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let parts = body_components(node);
+        if parts.rescues.is_empty() && parts.ensure.is_none() {
+            let mut statements = parts.protected;
+            if let Some(alternative) = parts.alternative {
+                statements.push(alternative);
+            }
+            return self.schedule_statements(builder, entry, &statements, next, scope, stack);
+        }
+
+        let (cleanup_scope, cleanup_region) = if let Some(finalizer) = parts.ensure {
+            let region = CleanupRegionId::new(
+                u32::try_from(self.cleanups.len())
+                    .map_err(|_| RubyLoweringError::Invalid("too many cleanup regions".into()))?,
+            );
+            self.cleanups.push(CleanupRegion {
+                id: region,
+                body: finalizer,
+                outer_scope: scope,
+            });
+            let cleanup_scope = builder.push_scope(Some(scope), ScopeBinding::Cleanup { region });
+            self.copy_controls(scope, cleanup_scope);
+            (cleanup_scope, Some(region))
+        } else {
+            (scope, None)
+        };
+
+        let normal_destination = if cleanup_region.is_some() && next.kind != ControlEdgeKind::Normal
+        {
+            let relay = self.point(builder, node, Vec::new())?;
+            self.session.add_target_edge(builder, relay, next)?;
+            relay
+        } else {
+            next.point
+        };
+        let normal_route = cleanup_region
+            .map(|region| builder.normal_cleanup_completion(region, normal_destination));
+
+        let protected_can_complete = parts
+            .protected
+            .last()
+            .is_none_or(|statement| !statement_definitely_abrupt(*statement));
+        let after_protected = if let Some(alternative) = parts.alternative {
+            let alternative_entry = self.point(builder, alternative, Vec::new())?;
+            if let Some(route) = &normal_route {
+                let alternative_exit = self.point(builder, alternative, Vec::new())?;
+                self.route(builder, alternative_exit, route, stack)?;
+                stack.push(Work::Statement {
+                    node: alternative,
+                    entry: alternative_entry,
+                    next: EdgeTarget::normal(alternative_exit),
+                    scope: cleanup_scope,
+                });
+            } else {
+                stack.push(Work::Statement {
+                    node: alternative,
+                    entry: alternative_entry,
+                    next,
+                    scope: cleanup_scope,
+                });
+            }
+            EdgeTarget::normal(alternative_entry)
+        } else if let Some(route) = normal_route.as_ref().filter(|_| protected_can_complete) {
+            self.route_target(builder, route, stack)?
+        } else {
+            next
+        };
+
+        let precise_rescue =
+            self.prepare_precise_rescue(builder, &parts.protected, &parts.rescues)?;
+        let protected_scope = if parts.rescues.is_empty() {
+            cleanup_scope
+        } else {
+            let dispatcher = self.point(builder, node, Vec::new())?;
+            if precise_rescue.is_none() {
+                self.session.record_gap(
+                    builder,
+                    dispatcher,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unknown,
+                    "Ruby rescue exception-list evaluation, class matching, and binding require runtime refinement",
+                )?;
+            }
+            for rescue in &parts.rescues {
+                let rescue_entry = self.point(builder, *rescue, Vec::new())?;
+                self.session.add_target_edge(
+                    builder,
+                    dispatcher,
+                    EdgeTarget {
+                        point: rescue_entry,
+                        kind: ControlEdgeKind::SwitchCase,
+                    },
+                )?;
+                let retry_label = self.next_label("rescue-retry");
+                let retry_scope = builder.push_scope(
+                    Some(cleanup_scope),
+                    ScopeBinding::Loop {
+                        label: Some(retry_label.clone()),
+                        break_target: next.point,
+                        break_edge_kind: next.kind,
+                        continue_target: entry,
+                        continue_edge_kind: ControlEdgeKind::LoopBack,
+                    },
+                );
+                self.extend_controls(
+                    cleanup_scope,
+                    retry_scope,
+                    RubyControlFrame {
+                        break_label: None,
+                        next_label: None,
+                        redo_label: None,
+                        retry_label: Some(retry_label),
+                        callable_exit: false,
+                    },
+                );
+                if precise_rescue.is_none() && rescue.child_by_field_name("exceptions").is_some() {
+                    self.session.record_gap(
+                        builder,
+                        rescue_entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unknown,
+                        "rescue exception class expressions and splats may execute calls on the exceptional path",
+                    )?;
+                }
+                if precise_rescue.is_none() && rescue.child_by_field_name("variable").is_some() {
+                    self.session.record_gap(
+                        builder,
+                        rescue_entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "rescue exception variable binding is not represented",
+                    )?;
+                }
+                let body = rescue.child_by_field_name("body");
+                if let Some(body) = body {
+                    if let Some(route) = &normal_route {
+                        let rescue_exit = self.point(builder, body, Vec::new())?;
+                        self.route(builder, rescue_exit, route, stack)?;
+                        stack.push(Work::Statement {
+                            node: body,
+                            entry: rescue_entry,
+                            next: EdgeTarget::normal(rescue_exit),
+                            scope: retry_scope,
+                        });
+                    } else {
+                        stack.push(Work::Statement {
+                            node: body,
+                            entry: rescue_entry,
+                            next,
+                            scope: retry_scope,
+                        });
+                    }
+                } else if let Some(route) = &normal_route {
+                    self.route(builder, rescue_entry, route, stack)?;
+                } else {
+                    self.session.add_target_edge(builder, rescue_entry, next)?;
+                }
+            }
+            let unmatched = self.point(builder, node, Vec::new())?;
+            self.session.add_target_edge(
+                builder,
+                dispatcher,
+                EdgeTarget {
+                    point: unmatched,
+                    kind: ControlEdgeKind::Exceptional,
+                },
+            )?;
+            self.abrupt(
+                builder,
+                unmatched,
+                cleanup_scope,
+                CompletionKind::Throw,
+                None,
+                stack,
+            )?;
+            let handler = builder.push_scope(
+                Some(cleanup_scope),
+                ScopeBinding::Handler { entry: dispatcher },
+            );
+            self.copy_controls(cleanup_scope, handler);
+            handler
+        };
+
+        if parts.protected.is_empty() {
+            self.session
+                .add_target_edge(builder, entry, after_protected)?;
+        } else {
+            self.schedule_statements(
+                builder,
+                entry,
+                &parts.protected,
+                after_protected,
+                protected_scope,
+                stack,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rescue_modifier(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let body = required_field(node, "body")?;
+        let handler = required_field(node, "handler")?;
+        let dispatcher = self.point(builder, node, Vec::new())?;
+        let handler_entry = self.point(builder, handler, Vec::new())?;
+        self.session.record_gap(
+            builder,
+            dispatcher,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+            "rescue modifier handles StandardError-compatible exceptions only",
+        )?;
+        self.session.add_target_edge(
+            builder,
+            dispatcher,
+            EdgeTarget {
+                point: handler_entry,
+                kind: ControlEdgeKind::SwitchCase,
+            },
+        )?;
+        let unmatched = self.point(builder, node, Vec::new())?;
+        self.session.add_target_edge(
+            builder,
+            dispatcher,
+            EdgeTarget {
+                point: unmatched,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.abrupt(
+            builder,
+            unmatched,
+            scope,
+            CompletionKind::Throw,
+            None,
+            stack,
+        )?;
+        let body_scope =
+            builder.push_scope(Some(scope), ScopeBinding::Handler { entry: dispatcher });
+        self.copy_controls(scope, body_scope);
+        stack.push(Work::Expression {
+            node: handler,
+            entry: handler_entry,
+            next,
+            scope,
+        });
+        stack.push(Work::Expression {
+            node: body,
+            entry,
+            next,
+            scope: body_scope,
+        });
+        Ok(())
+    }
+
+    fn return_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let terminal = if node.named_child_count() == 0 {
+            entry
+        } else {
+            self.point(builder, node, Vec::new())?
+        };
+        if self.procedure_kind == ProcedureKind::Closure {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unsupported,
+                "return from an ordinary Ruby block targets its defining method, not the block procedure",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "ordinary block return may raise LocalJumpError after its defining frame has exited",
+            )?;
+            let label = self.nonlocal_cleanup_label.clone().ok_or_else(|| {
+                RubyLoweringError::Invalid(
+                    "ordinary block return is missing its cleanup boundary".into(),
+                )
+            })?;
+            self.abrupt(
+                builder,
+                terminal,
+                scope,
+                CompletionKind::Break,
+                Some(&label),
+                stack,
+            )?;
+        } else if self.procedure_kind == ProcedureKind::Initializer {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unsupported,
+                "return from a Ruby file, class, or module body has no represented method target",
+            )?;
+            let label = self.nonlocal_cleanup_label.clone().ok_or_else(|| {
+                RubyLoweringError::Invalid(
+                    "initializer return is missing its cleanup boundary".into(),
+                )
+            })?;
+            self.abrupt(
+                builder,
+                terminal,
+                scope,
+                CompletionKind::Break,
+                Some(&label),
+                stack,
+            )?;
+        } else {
+            let value = self.value(builder, terminal, SemanticValueKind::Return)?;
+            let arguments = node
+                .named_child(0)
+                .map(runtime_expression_children)
+                .unwrap_or_default();
+            if let [source_node] = arguments.as_slice() {
+                let source = self.expression_value(
+                    builder,
+                    *source_node,
+                    expression_value_kind(self.source, *source_node),
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source,
+                        target: value,
+                    },
+                )?;
+            } else if arguments.len() > 1 {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::ReturnFlow,
+                    SemanticGapKind::Unsupported,
+                    "Ruby multiple-value return packing is not represented as one identity flow",
+                )?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ProcedureReturn { value: Some(value) },
+            )?;
+            self.abrupt(
+                builder,
+                terminal,
+                scope,
+                CompletionKind::Return,
+                None,
+                stack,
+            )?;
+        }
+        let arguments = node
+            .named_child(0)
+            .map(runtime_expression_children)
+            .unwrap_or_default();
+        if arguments.is_empty() {
+            return Ok(());
+        }
+        self.schedule_expressions(
+            builder,
+            entry,
+            &arguments,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn control_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let terminal = if node.named_child_count() == 0 {
+            entry
+        } else {
+            self.point(builder, node, Vec::new())?
+        };
+        let control = self.controls.get(&scope).and_then(|frames| {
+            frames.iter().rev().find_map(|frame| {
+                let label = match node.kind() {
+                    "break" => frame.break_label.as_deref(),
+                    "next" => frame.next_label.as_deref(),
+                    "redo" => frame.redo_label.as_deref(),
+                    "retry" => frame.retry_label.as_deref(),
+                    _ => None,
+                }?;
+                Some((label.to_owned(), frame.callable_exit))
+            })
+        });
+        let kind = match node.kind() {
+            "break" => CompletionKind::Break,
+            "next" | "redo" | "retry" => CompletionKind::Continue,
+            _ => unreachable!("control_expression only receives Ruby abrupt nodes"),
+        };
+        if let Some((label, callable_exit)) = control.as_ref() {
+            if *callable_exit && matches!(node.kind(), "break" | "next") {
+                let value = self.value(builder, terminal, SemanticValueKind::Return)?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+            }
+            self.abrupt(builder, terminal, scope, kind, Some(label), stack)?;
+        } else {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unsupported,
+                match node.kind() {
+                    "break" => "block or invalid-context break target is not represented",
+                    "next" => "invalid-context next target is not represented",
+                    "redo" => "redo target is not proven in this callable context",
+                    "retry" => "retry has no enclosing represented rescue target",
+                    _ => unreachable!(),
+                },
+            )?;
+            if matches!(node.kind(), "break" | "retry") {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unknown,
+                    "invalid or escaped Ruby non-local control may raise LocalJumpError",
+                )?;
+            }
+            if self.procedure_kind == ProcedureKind::Closure && node.kind() == "break" {
+                let label = self.nonlocal_cleanup_label.clone().ok_or_else(|| {
+                    RubyLoweringError::Invalid(
+                        "ordinary block break is missing its cleanup boundary".into(),
+                    )
+                })?;
+                self.abrupt(
+                    builder,
+                    terminal,
+                    scope,
+                    CompletionKind::Break,
+                    Some(&label),
+                    stack,
+                )?;
+            }
+        }
+        let arguments = node
+            .named_child(0)
+            .map(runtime_expression_children)
+            .unwrap_or_default();
+        if arguments.is_empty() {
+            return Ok(());
+        }
+        self.schedule_expressions(
+            builder,
+            entry,
+            &arguments,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        if self.precise_raise_binders.contains_key(&node.id()) {
+            return self.precise_raise(builder, node, entry, scope, stack);
+        }
+        if ruby_unconditional_loop_body(node, self.source).is_some() {
+            return self.unconditional_loop_call(builder, node, entry, next, scope, stack);
+        }
+        if node
+            .child_by_field_name("method")
+            .is_some_and(|method| method.kind() == "super")
+        {
+            return self.unsupported_super(builder, node, entry, next, scope, stack);
+        }
+        let invoke = self.point(builder, node, Vec::new())?;
+        let normal = self.point(builder, node, Vec::new())?;
+        let exceptional = self.point(builder, node, Vec::new())?;
+        let method_node = node.child_by_field_name("method").unwrap_or(node);
+        let callee =
+            self.session
+                .add_node_value(builder, method_node, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown =
+            self.session
+                .add_node_value(builder, method_node, SemanticValueKind::Exception)?;
+        let receiver_node = node.child_by_field_name("receiver");
+        let receiver = receiver_node
+            .map(|receiver| {
+                self.expression_value(
+                    builder,
+                    receiver,
+                    expression_value_kind(self.source, receiver),
+                )
+            })
+            .transpose()?;
+        let method = node
+            .child_by_field_name("method")
+            .and_then(|method| node_text(self.source, method));
+        let receiver_text = receiver_node.and_then(|receiver| node_text(self.source, receiver));
+        let constructor = ruby_constructor_call(node, self.source);
+        let callable_kind = if constructor {
+            CallableReferenceKind::Constructor
+        } else if receiver.is_some() {
+            CallableReferenceKind::BoundMethod
+        } else {
+            CallableReferenceKind::Function
+        };
+        let constructor_target = constructor
+            .then(|| ruby_constructor_class(node, self.source))
+            .flatten()
+            .and_then(|class| self.properties.constructor_target(class));
+        let resolution = if matches!(method, Some("send" | "public_send")) {
+            CallableTargetResolution::Unsupported
+        } else if let Some(target) = constructor_target {
+            CallableTargetResolution::Proven(CallableTarget::Local(target))
+        } else if let Some(&target) = self
+            .function_value_targets
+            .invocations
+            .get(&(self.procedure_id, node.id()))
+        {
+            CallableTargetResolution::Proven(CallableTarget::Local(target))
+        } else {
+            CallableTargetResolution::Unknown
+        };
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: (!constructor).then_some(receiver).flatten(),
+                    environment: None,
+                },
+            },
+        )?;
+
+        let argument_nodes = call_arguments(node);
+        let attached_block = node.child_by_field_name("block");
+        let mut arguments = argument_nodes
+            .iter()
+            .map(|argument| self.semantic_call_argument(builder, *argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(block) = attached_block {
+            let value = self.expression_value(builder, block, SemanticValueKind::Callable)?;
+            arguments.push(SemanticCallArgument::unclassified(value));
+        }
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver: (!constructor).then_some(receiver).flatten(),
+                arguments: arguments.into_boxed_slice(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        if constructor {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
+        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        self.session.record_gap(
+            builder,
+            invoke,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            "Ruby method dispatch may select an override or method_missing target; complete receiver-class coverage requires runtime refinement",
+        )?;
+        self.ruby_call_gaps(
+            builder,
+            invoke,
+            call_site,
+            receiver_text,
+            method,
+            attached_block.is_some(),
+        )?;
+
+        let safe_navigation = node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(self.source, operator))
+            == Some("&.");
+        if safe_navigation {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "Ruby safe navigation may produce nil without invoking the selected member",
+            )?;
+            let decision = self.point(builder, node, Vec::new())?;
+            self.schedule_expressions_with_first_edge(
+                builder,
+                decision,
+                &argument_nodes,
+                EdgeTarget::normal(invoke),
+                ControlEdgeKind::ConditionalTrue,
+                scope,
+                stack,
+            )?;
+            self.session.add_target_edge(
+                builder,
+                decision,
+                EdgeTarget {
+                    point: next.point,
+                    kind: ControlEdgeKind::ConditionalFalse,
+                },
+            )?;
+            if let Some(receiver) = receiver_node {
+                stack.push(Work::Expression {
+                    node: receiver,
+                    entry,
+                    next: EdgeTarget::normal(decision),
+                    scope,
+                });
+            } else {
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(decision))?;
+            }
+            return Ok(());
+        }
+
+        let mut evaluations =
+            Vec::with_capacity(argument_nodes.len() + usize::from(receiver_node.is_some()));
+        if let Some(receiver) = receiver_node {
+            evaluations.push(receiver);
+        }
+        evaluations.extend(argument_nodes);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(invoke),
+            scope,
+            stack,
+        )
+    }
+
+    fn precise_raise(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let RubyPreciseRaise { source, binder } = self
+            .precise_raise_binders
+            .get(&node.id())
+            .copied()
+            .expect("precise raise was checked before lowering");
+        let terminal = self.point(builder, node, Vec::new())?;
+        let thrown = self.value(builder, terminal, SemanticValueKind::Exception)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source,
+                target: thrown,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source: thrown,
+                target: binder,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Throw {
+                value: Some(thrown),
+            },
+        )?;
+        self.abrupt(builder, terminal, scope, CompletionKind::Throw, None, stack)?;
+        let argument = direct_raise_identifier(node, self.source)
+            .expect("precise raise retains its direct local argument");
+        stack.push(Work::Expression {
+            node: argument,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    fn property_access(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let (receiver, member) = self
+            .property_parts(node)
+            .expect("property access is selected structurally");
+        let access = self.point(builder, node, Vec::new())?;
+        let result =
+            self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+        let base = self.expression_value(
+            builder,
+            receiver,
+            expression_value_kind(self.source, receiver),
+        )?;
+        self.emit_field_memory_load(builder, access, base, member, result)?;
+        self.session.add_target_edge(builder, access, next)?;
+        stack.push(Work::Expression {
+            node: receiver,
+            entry,
+            next: EdgeTarget::normal(access),
+            scope,
+        });
+        Ok(())
+    }
+
+    fn yield_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let arguments = node
+            .named_child(0)
+            .map(runtime_expression_children)
+            .unwrap_or_default();
+        let boundary = if arguments.is_empty() {
+            entry
+        } else {
+            self.point(builder, node, Vec::new())?
+        };
+        for (capability, kind, detail) in [
+            (
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "Ruby yield dispatches to an ambient block and is not emitted as an ordinary call site",
+            ),
+            (
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unknown,
+                "yielded block break, next, return, redo, and LocalJumpError propagation require dynamic invocation context",
+            ),
+            (
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "yield argument, block parameter, and result bindings require value refinement",
+            ),
+        ] {
+            self.session.record_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Point,
+                capability,
+                kind,
+                detail,
+            )?;
+        }
+        self.session.add_target_edge(builder, boundary, next)?;
+        self.abrupt(builder, boundary, scope, CompletionKind::Throw, None, stack)?;
+        if arguments.is_empty() {
+            return Ok(());
+        }
+        self.schedule_expressions(
+            builder,
+            entry,
+            &arguments,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    fn ruby_call_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        call_site: CallSiteId,
+        receiver: Option<&str>,
+        method: Option<&str>,
+        has_block: bool,
+    ) -> Result<(), RubyLoweringError> {
+        if has_block && method != Some("define_method") {
+            self.session.add_gap_with_impacts(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DeferredExecution,
+                SemanticGapImpacts::DEFERRED_EFFECTS,
+                SemanticGapKind::Unknown,
+                "an attached Ruby block is a separate callable whose invocation timing depends on the callee",
+            )?;
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unknown,
+                "an attached Ruby block may return or transfer control to its defining method",
+            )?;
+        }
+        if matches!(
+            method,
+            Some("binding" | "eval" | "local_variable_get" | "local_variable_set")
+        ) {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::LocalFlow,
+                SemanticGapKind::Unknown,
+                "Ruby binding and eval APIs may inspect or rewrite the local-variable table",
+            )?;
+        }
+        let control_gap = match method {
+            Some("raise") => Some((
+                SemanticCapability::ExceptionalControlFlow,
+                "Ruby raise dispatch may transfer to a handler or leave the procedure",
+            )),
+            Some("throw") => Some((
+                SemanticCapability::NonLocalControl,
+                "Ruby throw/catch non-local transfer is not resolved through dynamic tags",
+            )),
+            Some("catch") => Some((
+                SemanticCapability::NonLocalControl,
+                "Ruby catch/throw transfer across an attached block is not resolved",
+            )),
+            Some("exit" | "exit!") => Some((
+                SemanticCapability::NonLocalControl,
+                "Ruby process exit may terminate without returning to the following statement",
+            )),
+            _ => None,
+        };
+        if let Some((capability, detail)) = control_gap {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                capability,
+                SemanticGapKind::Unknown,
+                detail,
+            )?;
+        }
+        if matches!(method, Some("send" | "public_send")) {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::CallableReferences,
+                SemanticGapKind::Unsupported,
+                "Ruby dynamic send method-name conversion and visibility-sensitive lookup are not statically bound",
+            )?;
+        }
+        if method == Some("define_method") {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::CallableReferences,
+                SemanticGapKind::Unknown,
+                "define_method publishes a dynamically named callable target",
+            )?;
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DeferredExecution,
+                SemanticGapKind::Unknown,
+                "the define_method block becomes a method body and is not executed at definition time",
+            )?;
+        }
+        if receiver == Some("Fiber") && matches!(method, Some("new" | "yield")) {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::GeneratorSuspension,
+                SemanticGapKind::Unknown,
+                "Fiber creation or yield crosses a suspension/resumption boundary",
+            )?;
+        }
+        if matches!(receiver, Some("Thread" | "Ractor")) && method == Some("new") {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::ConcurrentSpawn,
+                SemanticGapKind::Unknown,
+                "Thread.new or Ractor.new may execute its block concurrently",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn route_call_exceptional(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        exceptional: ProgramPointId,
+        normal_next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let departure = if normal_next.kind == ControlEdgeKind::Exceptional {
+            let relay = self.point_from(builder, exceptional, Vec::new())?;
+            self.session
+                .add_target_edge(builder, exceptional, EdgeTarget::normal(relay))?;
+            relay
+        } else {
+            exceptional
+        };
+        self.abrupt(
+            builder,
+            departure,
+            scope,
+            CompletionKind::Throw,
+            None,
+            stack,
+        )
+    }
+
+    fn callable_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), RubyLoweringError> {
+        let result = self.value(builder, entry, SemanticValueKind::Callable)?;
+        let metadata = self.metadata(entry)?;
+        self.append_effect(
+            builder,
+            entry,
+            SemanticEffect::CallableCreation {
+                result,
+                callable: CallableValue::unknown_target(
+                    CallableReferenceKind::Lambda,
+                    metadata.evidence,
+                ),
+            },
+        )?;
+        self.session.record_gap(
+            builder,
+            entry,
+            SemanticGapSubject::Value(result),
+            SemanticCapability::CallableReferences,
+            SemanticGapKind::Unknown,
+            if matches!(node.kind(), "block" | "do_block") {
+                "attached Ruby block target and capture environment are published as a separate closure procedure"
+            } else {
+                "nested Ruby callable target mapping is not yet published"
+            },
+        )?;
+        self.session.add_target_edge(builder, entry, next)
+    }
+
+    fn type_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.session.record_gap(
+            builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "Ruby class, module, or singleton-class body execution is represented by a separate initializer without a stitched declaration-site transfer",
+        )?;
+        let prefix = match node.kind() {
+            "class" => node
+                .child_by_field_name("superclass")
+                .and_then(first_runtime_named_child),
+            "singleton_class" => node.child_by_field_name("value"),
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            stack.push(Work::Expression {
+                node: prefix,
+                entry,
+                next,
+                scope,
+            });
+            Ok(())
+        } else {
+            self.session.add_target_edge(builder, entry, next)
+        }
+    }
+
+    fn deferred_lifecycle_block(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), RubyLoweringError> {
+        for (capability, detail) in [
+            (
+                SemanticCapability::DeferredExecution,
+                "Ruby BEGIN/END lifecycle timing is outside ordinary source-order execution",
+            ),
+            (
+                SemanticCapability::Calls,
+                "calls inside a BEGIN/END lifecycle body are withheld from the surrounding callable",
+            ),
+        ] {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                capability,
+                SemanticGapKind::Unsupported,
+                detail,
+            )?;
+        }
+        if node.kind() == "begin_block" {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::NormalControlFlow,
+                SemanticGapKind::Unsupported,
+                "BEGIN execution occurs while the file is being loaded, not at this lexical statement position",
+            )?;
+        }
+        self.session.add_target_edge(builder, entry, next)
+    }
+
+    fn boolean_value(
+        &mut self,
+        _builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        stack.push(Work::Condition {
+            node,
+            entry,
+            when_true: EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            when_false: EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+            scope,
+        });
+        Ok(())
+    }
+
+    fn implicit_operator(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let operator = node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(self.source, operator));
+        if operator == Some("defined?") {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::NormalControlFlow,
+                SemanticGapKind::Unsupported,
+                "defined? inspects syntax without ordinarily evaluating its operand",
+            )?;
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "defined? behavior depends on the structured operand category",
+            )?;
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let terminal = self.point(builder, node, Vec::new())?;
+        if matches!(operator, Some("!" | "not")) {
+            if !self.is_scalar_operator_syntax(node) {
+                self.negation_gaps(builder, terminal)?;
+            }
+        } else if self.is_scalar_operator_syntax(node) {
+            // The scalar consumer admits this syntax only after exact local
+            // literal facts establish the Ruby Integer/Boolean domain. Keep
+            // the operator-dispatch gap out of that proof path; all other
+            // Ruby calls retain their ordinary dynamic-dispatch gaps.
+        } else {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "Ruby operators dispatch through methods that are not emitted as synthetic call sites",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "operator dispatch and coercion may raise",
+            )?;
+        }
+        self.session.add_target_edge(builder, terminal, next)?;
+        let operands = match node.kind() {
+            "binary" => {
+                let mut nodes = children_by_field_name(node, "left");
+                nodes.extend(children_by_field_name(node, "right"));
+                nodes
+            }
+            _ => children_by_field_name(node, "operand"),
+        };
+        self.schedule_expressions(
+            builder,
+            entry,
+            &operands,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn negation_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+    ) -> Result<(), RubyLoweringError> {
+        for (capability, kind, detail) in [
+            (
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "Ruby !/not may dispatch through an overrideable ! method and is not emitted as a synthetic call site",
+            ),
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "an overrideable Ruby negation method may raise",
+            ),
+            (
+                SemanticCapability::NormalControlFlow,
+                SemanticGapKind::Unknown,
+                "negation branch selection may depend on overrideable Ruby method behavior",
+            ),
+        ] {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                capability,
+                kind,
+                detail,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn assignment(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        if node.kind() == "assignment"
+            && matches!(
+                left.kind(),
+                "left_assignment_list" | "destructured_left_assignment" | "rest_assignment"
+            )
+        {
+            if let Some((targets, values)) = (left.kind() == "left_assignment_list")
+                .then(|| self.parallel_assignment_parts(left, right))
+                .flatten()
+            {
+                self.invalidate_parallel_assignment_storage(builder, left)?;
+                return self.parallel_assignment(
+                    builder, node, entry, next, scope, stack, targets, values,
+                );
+            }
+            self.invalidate_parallel_assignment_storage(builder, left)?;
+        }
+        let operator = node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(self.source, operator));
+        let short_circuit = matches!(operator, Some("||=" | "&&="));
+        let dispatching_target = assignment_target_dispatches(left);
+        let safe_navigation = left.kind() == "call"
+            && left
+                .child_by_field_name("operator")
+                .and_then(|operator| node_text(self.source, operator))
+                == Some("&.");
+        let terminal = self.point(builder, node, Vec::new())?;
+        let merge = if short_circuit || safe_navigation {
+            Some(self.point(builder, node, Vec::new())?)
+        } else {
+            None
+        };
+        let identity_assignment =
+            (node.kind() == "assignment" || short_circuit) && left.kind() == "identifier";
+        self.update_local_storage(node, left, right);
+        let property_place = (node.kind() == "assignment")
+            .then(|| self.property_parts(left))
+            .flatten();
+        let element_place = (node.kind() == "assignment")
+            .then(|| self.element_parts(left))
+            .flatten();
+        let instance_field_place = (node.kind() == "assignment")
+            .then(|| self.instance_field_member_locator(left))
+            .flatten();
+        // A complete generated accessor or a constant built-in container slot
+        // is the operation itself, not an unresolved synthetic method call.
+        // Keep dispatch gaps only when this structured memory model is absent.
+        let mut modeled_store = false;
+        let mut assigned_value = None;
+        if let Some(member) = instance_field_place {
+            modeled_store = true;
+            let value =
+                self.expression_value(builder, right, expression_value_kind(self.source, right))?;
+            let base = self
+                .receiver
+                .expect("an ordinary Ruby instance method has a receiver value");
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field { base, member },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+            assigned_value = Some(value);
+        } else if let Some((receiver, member)) = property_place {
+            modeled_store = true;
+            let value =
+                self.expression_value(builder, right, expression_value_kind(self.source, right))?;
+            let base = self.expression_value(
+                builder,
+                receiver,
+                expression_value_kind(self.source, receiver),
+            )?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field { base, member },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+            assigned_value = Some(value);
+        } else if let Some((object, index_node)) = element_place {
+            let value =
+                self.expression_value(builder, right, expression_value_kind(self.source, right))?;
+            let base =
+                self.expression_value(builder, object, expression_value_kind(self.source, object))?;
+            let index = self.constant_index_value(builder, index_node)?;
+            modeled_store = index.is_some();
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Element,
+                },
+            )?;
+            if index.is_none() {
+                self.add_dynamic_index_gap(builder, terminal, location)?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value,
+                },
+            )?;
+            assigned_value = Some(value);
+        } else if identity_assignment {
+            let name = node_text(self.source, left).unwrap_or_default();
+            if let Some((target, flow_kind)) = self.binding_value(name) {
+                let value = self.expression_value(
+                    builder,
+                    right,
+                    expression_value_kind(self.source, right),
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: flow_kind,
+                        source: value,
+                        target,
+                    },
+                )?;
+                assigned_value = Some(value);
+            } else {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::LocalFlow,
+                    SemanticGapKind::Unknown,
+                    "Ruby local assignment target was not present in the structured binding timeline",
+                )?;
+            }
+        } else {
+            self.session.record_gap(
+                builder,
+                merge.unwrap_or(terminal),
+                SemanticGapSubject::Point,
+                if left.kind() == "instance_variable" {
+                    SemanticCapability::FieldMemory
+                } else if dispatching_target {
+                    SemanticCapability::Assignments
+                } else {
+                    SemanticCapability::LocalFlow
+                },
+                SemanticGapKind::Unsupported,
+                if left.kind() == "instance_variable" {
+                    "Ruby instance-variable assignment requires an ordinary instance receiver and a plain assignment"
+                } else if dispatching_target {
+                    "Ruby writer assignment does not preserve plain local identity"
+                } else {
+                    "Ruby destructuring or non-local assignment is not lowered as one identity-preserving local flow"
+                },
+            )?;
+        }
+        // Consumers reserve an assignment expression's ValueId before this
+        // lowering runs (for example the implicit return). Preserve that
+        // identity and publish the selected value into it.
+        let assignment_result = assigned_value
+            .map(|value| {
+                let result =
+                    self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: value,
+                        target: result,
+                    },
+                )?;
+                Ok::<_, RubyLoweringError>(result)
+            })
+            .transpose()?;
+        if node.kind() == "operator_assignment" && !short_circuit {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "Ruby operator assignment may dispatch through reader, operator, and writer methods",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "Ruby operator-assignment dispatch and coercion may raise",
+            )?;
+        }
+        self.session.add_target_edge(
+            builder,
+            terminal,
+            merge.map(EdgeTarget::normal).unwrap_or(next),
+        )?;
+        if let Some(merge) = merge {
+            self.session.add_target_edge(builder, merge, next)?;
+        }
+
+        let target_evaluations = assignment_target_runtime_nodes(left);
+        if short_circuit || safe_navigation {
+            let right_entry = self.point(builder, right, Vec::new())?;
+            let operator_decision = if short_circuit {
+                let decision = self.point(builder, left, Vec::new())?;
+                let bypass = if let Some(result) = assignment_result {
+                    let source =
+                        self.expression_value(builder, left, SemanticValueKind::Temporary)?;
+                    assert!(
+                        self.emit_lexical_input_flow(builder, left, decision, source)?,
+                        "a supported short-circuit assignment has a binding"
+                    );
+                    let bypass = self.point(builder, left, Vec::new())?;
+                    self.append_effect(
+                        builder,
+                        bypass,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target: result,
+                        },
+                    )?;
+                    self.session.add_target_edge(
+                        builder,
+                        bypass,
+                        EdgeTarget::normal(merge.expect("short-circuit assignment has a merge")),
+                    )?;
+                    bypass
+                } else {
+                    merge.expect("short-circuit assignment has a merge")
+                };
+                let (right_kind, bypass_kind) = if operator == Some("&&=") {
+                    (
+                        ControlEdgeKind::ConditionalTrue,
+                        ControlEdgeKind::ConditionalFalse,
+                    )
+                } else {
+                    (
+                        ControlEdgeKind::ConditionalFalse,
+                        ControlEdgeKind::ConditionalTrue,
+                    )
+                };
+                self.session.add_target_edge(
+                    builder,
+                    decision,
+                    EdgeTarget {
+                        point: right_entry,
+                        kind: right_kind,
+                    },
+                )?;
+                self.session.add_target_edge(
+                    builder,
+                    decision,
+                    EdgeTarget {
+                        point: bypass,
+                        kind: bypass_kind,
+                    },
+                )?;
+                Some(decision)
+            } else {
+                None
+            };
+
+            let first_decision = if safe_navigation {
+                let decision = self.point(builder, left, Vec::new())?;
+                self.session.add_target_edge(
+                    builder,
+                    decision,
+                    EdgeTarget {
+                        point: operator_decision.unwrap_or(right_entry),
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    },
+                )?;
+                self.session.add_target_edge(
+                    builder,
+                    decision,
+                    EdgeTarget {
+                        point: merge.expect("safe-navigation assignment has a merge"),
+                        kind: ControlEdgeKind::ConditionalFalse,
+                    },
+                )?;
+                decision
+            } else {
+                operator_decision.expect("special assignment has a decision")
+            };
+
+            if dispatching_target && (node.kind() != "operator_assignment" || short_circuit) {
+                self.assignment_dispatch_gaps(
+                    builder,
+                    operator_decision.unwrap_or(terminal),
+                    short_circuit,
+                )?;
+            }
+            stack.push(Work::Expression {
+                node: right,
+                entry: right_entry,
+                next: EdgeTarget::normal(terminal),
+                scope,
+            });
+            self.schedule_expressions(
+                builder,
+                entry,
+                &target_evaluations,
+                EdgeTarget::normal(first_decision),
+                scope,
+                stack,
+            )
+        } else {
+            if dispatching_target && !modeled_store && node.kind() != "operator_assignment" {
+                self.assignment_dispatch_gaps(builder, terminal, false)?;
+            }
+            let mut evaluations = target_evaluations;
+            evaluations.push(right);
+            self.schedule_expressions(
+                builder,
+                entry,
+                &evaluations,
+                EdgeTarget::normal(terminal),
+                scope,
+                stack,
+            )
+        }
+    }
+
+    fn parallel_assignment_parts(
+        &self,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) -> Option<(Vec<Node<'tree>>, Vec<Node<'tree>>)> {
+        debug_assert_eq!(left.kind(), "left_assignment_list");
+        let targets = runtime_statement_children(left);
+        if targets.is_empty() || targets.iter().any(|target| target.kind() != "identifier") {
+            return None;
+        }
+        let values = match right.kind() {
+            "right_assignment_list" | "array" => runtime_statement_children(right),
+            _ => return None,
+        };
+        (values.len() == targets.len()
+            && values.iter().all(|value| value.kind() != "splat_argument"))
+        .then_some((targets, values))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parallel_assignment(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        targets: Vec<Node<'tree>>,
+        values: Vec<Node<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let value_ids = values
+            .iter()
+            .map(|value| {
+                self.expression_value(builder, *value, expression_value_kind(self.source, *value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (target_node, value) in targets.iter().zip(value_ids.iter().copied()) {
+            let name = node_text(self.source, *target_node)
+                .expect("a parallel assignment identifier has a valid source range");
+            let (target, flow_kind) = self
+                .binding_value(name)
+                .expect("a parallel assignment identifier is in the binding timeline");
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::Assignment { target, value },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: flow_kind,
+                    source: value,
+                    target,
+                },
+            )?;
+        }
+
+        // A direct non-final statement discards the aggregate result. Any
+        // enclosing expression, or the implicit method return, consumes one
+        // packed value that this lowering intentionally does not represent.
+        if !self.assignment_is_direct_in_body(node)
+            || self.expression_values.contains_key(&node.id())
+        {
+            let result =
+                self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Ruby parallel-assignment expression result packing is not represented as one aggregate value",
+            )?;
+        }
+
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &values,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn assignment_dispatch_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        short_circuit: bool,
+    ) -> Result<(), RubyLoweringError> {
+        self.session.record_gap(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            if short_circuit {
+                "Ruby short-circuit attribute or element assignment invokes reader and writer methods that are not emitted as synthetic call sites"
+            } else {
+                "Ruby attribute or element assignment invokes reader or writer methods that are not emitted as synthetic call sites"
+            },
+        )?;
+        self.session.record_gap(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+            "Ruby attribute or element assignment dispatch and coercion may raise",
+        )
+    }
+
+    fn callable_table_mutation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), RubyLoweringError> {
+        self.session.record_gap(
+            builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::CallableReferences,
+            SemanticGapKind::Unsupported,
+            if node.kind() == "alias" {
+                "Ruby alias mutates the current callable table without evaluating its method-name operands"
+            } else {
+                "Ruby undef mutates the current callable table without evaluating its method-name operands"
+            },
+        )?;
+        self.session.add_target_edge(builder, entry, next)
+    }
+
+    fn element_reference(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let mut modeled_load = false;
+        if let Some((object, index_node)) = self.element_parts(node) {
+            let result =
+                self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+            let base =
+                self.expression_value(builder, object, expression_value_kind(self.source, object))?;
+            let index = self.constant_index_value(builder, index_node)?;
+            modeled_load = index.is_some();
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Element,
+                },
+            )?;
+            if index.is_none() {
+                self.add_dynamic_index_gap(builder, terminal, location)?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result,
+                },
+            )?;
+        }
+        if !modeled_load {
+            self.session.record_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "Ruby element lookup dispatches through [] and is not emitted as a synthetic call site",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "element lookup and index coercion may raise",
+            )?;
+        }
+        self.session.add_target_edge(builder, terminal, next)?;
+        let object = required_field(node, "object")?;
+        let mut evaluations = vec![object];
+        evaluations.extend(named_children(node).into_iter().filter(|child| {
+            child.id() != object.id() && child.kind() != "block" && child.kind() != "do_block"
+        }));
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn ambiguous_identifier(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let name = node_text(self.source, node).unwrap_or_default();
+        if self.local_bindings.is_active_at(name, node.start_byte()) {
+            let value = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+            if !self.emit_lexical_input_flow(builder, node, entry, value)? {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unknown,
+                    "Ruby lexical binding is active but its capture or implicit block port is not represented",
+                )?;
+            }
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        self.bare_call_expression(builder, node, entry, next, scope, stack)
+    }
+
+    fn bare_call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        invoke: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let normal = self.point(builder, node, Vec::new())?;
+        let exceptional = self.point(builder, node, Vec::new())?;
+        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
+        // The call result is the identifier expression's value. An enclosing
+        // argument list or assignment reads the same node through
+        // `expression_value`, and a second temporary at the same anchor would
+        // collide in the value-flow plan's stable carrier keys.
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
+        let resolution = CallableTargetResolution::Unknown;
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: CallableReferenceKind::Function,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+        )?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver: None,
+                arguments: Box::new([]),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
+        let name = node_text(self.source, node).expect("bare identifier spans source");
+        self.ruby_call_gaps(builder, invoke, call_site, None, Some(name), false)?;
+        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        self.session.record_gap(
+            builder,
+            invoke,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            "bare Ruby calls dispatch through the implicit receiver and may use method_missing; complete target coverage requires runtime refinement",
+        )
+    }
+
+    fn unsupported_super(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let boundary = self.point(builder, node, Vec::new())?;
+        for (capability, detail) in [
+            (
+                SemanticCapability::Calls,
+                "Ruby super target and implicit argument forwarding require method-owner dispatch context",
+            ),
+            (
+                SemanticCapability::Values,
+                "super actual/formal and receiver bindings are not represented",
+            ),
+        ] {
+            self.session.record_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Point,
+                capability,
+                SemanticGapKind::Unsupported,
+                detail,
+            )?;
+        }
+        self.session.add_target_edge(builder, boundary, next)?;
+        self.abrupt(builder, boundary, scope, CompletionKind::Throw, None, stack)?;
+        let arguments = call_arguments(node);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &arguments,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    fn schedule_statements(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        if children.is_empty() {
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let entries = children
+            .iter()
+            .map(|child| self.statement_point(builder, *child))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(())
+    }
+
+    fn prepare_statements(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<Option<ProgramPointId>, RubyLoweringError> {
+        if children.is_empty() {
+            return Ok(None);
+        }
+        let entries = children
+            .iter()
+            .map(|child| self.statement_point(builder, *child))
+            .collect::<Result<Vec<_>, _>>()?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(entries.first().copied())
+    }
+
+    fn schedule_statements_reusing_entry(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let Some((_, rest)) = children.split_first() else {
+            return self.session.add_target_edge(builder, entry, next);
+        };
+        let mut entries = Vec::with_capacity(children.len());
+        entries.push(entry);
+        entries.extend(
+            rest.iter()
+                .map(|child| self.statement_point(builder, *child))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(())
+    }
+
+    fn statement_point(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<ProgramPointId, RubyLoweringError> {
+        if matches!(node.kind(), "return" | "break" | "next")
+            && let Some(argument) = node.named_child(0)
+        {
+            self.point_before(builder, node, argument)
+        } else if matches!(node.kind(), "if" | "unless" | "elsif" | "while" | "until")
+            && let Some(condition) = node.child_by_field_name("condition")
+        {
+            self.point_through(builder, node, condition, Vec::new())
+        } else {
+            self.point(builder, node, Vec::new())
+        }
+    }
+
+    fn schedule_expressions(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.schedule_expressions_with_first_edge(
+            builder,
+            entry,
+            children,
+            next,
+            ControlEdgeKind::Normal,
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_expressions_with_first_edge(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        first_edge_kind: ControlEdgeKind,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        if children.is_empty() {
+            return self.session.add_target_edge(
+                builder,
+                entry,
+                EdgeTarget {
+                    point: next.point,
+                    kind: first_edge_kind,
+                },
+            );
+        }
+        let entries = children
+            .iter()
+            .map(|child| self.point(builder, *child, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session.add_target_edge(
+            builder,
+            entry,
+            EdgeTarget {
+                point: entries[0],
+                kind: first_edge_kind,
+            },
+        )?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(())
+    }
+
+    fn abrupt(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        scope: ScopeFrameId,
+        kind: CompletionKind,
+        label: Option<&str>,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let Some(route) = builder.resolve_completion(scope, &CompletionRequest::new(kind, label))
+        else {
+            if matches!(kind, CompletionKind::Break | CompletionKind::Continue) {
+                self.session.record_gap(
+                    builder,
+                    from,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::NonLocalControl,
+                    SemanticGapKind::Unsupported,
+                    "Ruby abrupt completion has no matching represented target",
+                )?;
+                return Ok(());
+            }
+            return Err(RubyLoweringError::Invalid(format!(
+                "{kind:?} completion has no structured continuation"
+            )));
+        };
+        self.route(builder, from, &route, stack)
+    }
+
+    fn route(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        route: &CompletionRoute,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let target = self.route_target(builder, route, stack)?;
+        self.session.add_target_edge(builder, from, target)
+    }
+
+    fn route_target(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        route: &CompletionRoute,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<EdgeTarget, RubyLoweringError> {
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
+            builder,
+            &mut self.session,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body,
+        )? {
+            stack.push(Work::Statement {
+                node: step.region.body,
+                entry: step.entry,
+                next: step.next,
+                scope: step.region.outer_scope,
+            });
+        }
+        Ok(plan.target())
+    }
+
+    fn resolution_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        callee: ValueId,
+        call_site: CallSiteId,
+        resolution: &CallableTargetResolution,
+    ) -> Result<(), RubyLoweringError> {
+        self.session.add_callable_resolution_gaps(
+            builder,
+            point,
+            callee,
+            call_site,
+            resolution,
+            "callable target requires whole-program Ruby dispatch refinement",
+            "call target requires whole-program Ruby dispatch refinement",
+        )
+    }
+
+    fn point(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        effects: Vec<SemanticEffect>,
+    ) -> Result<ProgramPointId, RubyLoweringError> {
+        self.session.add_node_point(builder, node, effects)
+    }
+
+    fn point_through(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        start: Node<'tree>,
+        end: Node<'tree>,
+        effects: Vec<SemanticEffect>,
+    ) -> Result<ProgramPointId, RubyLoweringError> {
+        let range = (start.start_byte(), end.end_byte());
+        let occurrence = self.session.next_source_occurrence(range.0, range.1);
+        let anchor = source_anchor_between_nodes(start, end, occurrence)
+            .map_err(RubyLoweringError::Invalid)?;
+        let metadata = self.add_mapping(builder, anchor)?;
+        self.add_point_with_metadata(builder, metadata, effects)
+    }
+
+    fn point_before(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        child: Node<'tree>,
+    ) -> Result<ProgramPointId, RubyLoweringError> {
+        let range = (node.start_byte(), child.start_byte());
+        let occurrence = self.session.next_source_occurrence(range.0, range.1);
+        let anchor =
+            callable_source_anchor(node, child, occurrence).map_err(RubyLoweringError::Invalid)?;
+        let metadata = self.add_mapping(builder, anchor)?;
+        self.add_point_with_metadata(builder, metadata, Vec::new())
+    }
+
+    fn point_from(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        source_point: ProgramPointId,
+        effects: Vec<SemanticEffect>,
+    ) -> Result<ProgramPointId, RubyLoweringError> {
+        let metadata = self.metadata(source_point)?;
+        self.add_point_with_metadata(builder, metadata, effects)
+    }
+
+    fn add_point_with_metadata(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        metadata: PointMetadata,
+        effects: Vec<SemanticEffect>,
+    ) -> Result<ProgramPointId, RubyLoweringError> {
+        self.session.add_point(builder, metadata, effects)
+    }
+
+    fn add_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        anchor: SourceAnchor,
+    ) -> Result<PointMetadata, RubyLoweringError> {
+        self.add_mapping_with_kind(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    fn add_mapping_with_kind(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        anchor: SourceAnchor,
+        mapping_kind: SourceMappingKind,
+    ) -> Result<PointMetadata, RubyLoweringError> {
+        self.session.add_mapping(builder, anchor, mapping_kind)
+    }
+
+    fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, RubyLoweringError> {
+        self.session.metadata(point)
+    }
+
+    fn value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, RubyLoweringError> {
+        self.session.add_value(builder, point, kind)
+    }
+
+    fn append_effect(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        effect: SemanticEffect,
+    ) -> Result<(), RubyLoweringError> {
+        self.session.append_effect(builder, point, effect)
+    }
+}
+
+fn ruby_implicit_result_node(node: Node<'_>) -> Option<Node<'_>> {
+    if matches!(
+        node.kind(),
+        "program" | "body_statement" | "block_body" | "do" | "then" | "else" | "ensure"
+    ) {
+        return runtime_statement_children(node)
+            .into_iter()
+            .rev()
+            .find(|child| !statement_definitely_abrupt(*child));
+    }
+    (!statement_definitely_abrupt(node)).then_some(node)
+}
+
+/// The exact scalar value kind of a Ruby integer or Boolean literal. Ruby
+/// Integers are arbitrary precision; the semantic IR represents values through
+/// `i128`, so a literal outside that representation stays a generic constant
+/// and consequently remains open to the scalar consumer.
+fn ruby_scalar_literal_value_kind(source: &str, mut node: Node<'_>) -> Option<SemanticValueKind> {
+    let mut negative = false;
+    loop {
+        match node.kind() {
+            "parenthesized_statements" => node = first_runtime_named_child(node)?,
+            "unary"
+                if node
+                    .child_by_field_name("operator")
+                    .and_then(|operator| node_text(source, operator))
+                    .is_some_and(|operator| matches!(operator, "+" | "-")) =>
+            {
+                let operator = node
+                    .child_by_field_name("operator")
+                    .and_then(|operator| node_text(source, operator))
+                    .expect("matched Ruby numeric unary operator");
+                negative ^= operator == "-";
+                node = node.child_by_field_name("operand")?;
+            }
+            _ => break,
+        }
+    }
+    match node.kind() {
+        "integer" => {
+            let value = ruby_integer_literal(node_text(source, node)?)?;
+            let value = if negative {
+                value.checked_neg()?
+            } else {
+                value
+            };
+            Some(SemanticValueKind::SignedInteger(value))
+        }
+        "true" if !negative => Some(SemanticValueKind::Boolean(true)),
+        "false" if !negative => Some(SemanticValueKind::Boolean(false)),
+        _ => None,
+    }
+}
+
+fn ruby_integer_literal(text: &str) -> Option<i128> {
+    let text = text.replace('_', "");
+    let (radix, digits) = if let Some(digits) = text.strip_prefix("0x") {
+        (16, digits)
+    } else if let Some(digits) = text.strip_prefix("0X") {
+        (16, digits)
+    } else if let Some(digits) = text.strip_prefix("0b") {
+        (2, digits)
+    } else if let Some(digits) = text.strip_prefix("0B") {
+        (2, digits)
+    } else if let Some(digits) = text.strip_prefix("0o") {
+        (8, digits)
+    } else if let Some(digits) = text.strip_prefix("0O") {
+        (8, digits)
+    } else if text.len() > 1 && text.starts_with('0') {
+        (8, text.as_str())
+    } else {
+        (10, text.as_str())
+    };
+    i128::from_str_radix(digits, radix).ok()
+}
+
+/// Ruby local bindings are scalar only when a literal initializer establishes
+/// their type in the exact callable. Parameters have no declared type in Ruby,
+/// and later non-literal writes are left to the scalar solver as unknown.
+pub fn ruby_declared_scalar_types(
+    procedure: &ProcedureHandle,
+    prepared: &PreparedSyntaxTree,
+) -> Vec<(ValueId, DeclaredScalarType)> {
+    let bindings = binding_nodes(procedure, prepared);
+    let Some((_, _, first_binding)) = bindings.first().copied() else {
+        return Vec::new();
+    };
+    let mut callable = first_binding;
+    while let Some(parent) = callable.parent() {
+        callable = parent;
+        if ruby_callable_syntax(callable) {
+            break;
+        }
+    }
+
+    let source = prepared.source();
+    let binding_names: Vec<(ValueId, Box<str>)> = bindings
+        .iter()
+        .filter_map(|(value, parameter, node)| {
+            (!*parameter)
+                .then(|| node_text(source, *node).map(|name| (*value, name.into())))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if binding_names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut literal_types = HashMap::<Box<str>, Option<DeclaredScalarType>>::default();
+    let mut stack = vec![callable];
+    while let Some(node) = stack.pop() {
+        if node.id() != callable.id() && ruby_callable_syntax(node) {
+            continue;
+        }
+        if node.kind() == "assignment"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "identifier"
+            && let Some(name) = node_text(source, left)
+            && binding_names
+                .iter()
+                .any(|(_, binding)| binding.as_ref() == name)
+            && let Some(kind) = ruby_scalar_literal_declared_type(source, right)
+        {
+            match literal_types.get(name).copied() {
+                None => {
+                    literal_types.insert(name.into(), Some(kind));
+                }
+                Some(Some(previous)) if previous == kind => {}
+                Some(_) => {
+                    literal_types.insert(name.into(), None);
+                }
+            }
+        }
+        stack.extend(named_children(node));
+    }
+
+    binding_names
+        .into_iter()
+        .filter_map(|(value, name)| {
+            literal_types
+                .get(name.as_ref())
+                .copied()
+                .flatten()
+                .map(|scalar_type| (value, scalar_type))
+        })
+        .collect()
+}
+
+fn ruby_scalar_literal_declared_type(source: &str, node: Node<'_>) -> Option<DeclaredScalarType> {
+    match ruby_scalar_literal_value_kind(source, node)? {
+        SemanticValueKind::SignedInteger(_) | SemanticValueKind::UnsignedInteger(_) => {
+            Some(DeclaredScalarType::Signed(128))
+        }
+        SemanticValueKind::Boolean(_) => Some(DeclaredScalarType::Boolean),
+        _ => None,
+    }
+}
+
+fn expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
+    if let Some(kind) = ruby_scalar_literal_value_kind(source, node) {
+        return kind;
+    }
+    match node.kind() {
+        "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
+            SemanticValueKind::Callable
+        }
+        // A constant read names one compile-time constant object, and a
+        // `scope_resolution` path (`Net::HTTP`) is the same read with an
+        // explicit owner. Neither is a runtime temporary, and the dispatch
+        // discharge for a call written on a constant receiver reads this kind.
+        "integer" | "float" | "rational" | "complex" | "true" | "false" | "nil" | "constant"
+        | "scope_resolution" | "simple_symbol" | "hash_key_symbol" | "bare_symbol"
+        | "character" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+fn ruby_constructor_call(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "call"
+        || node
+            .child_by_field_name("method")
+            .and_then(|method| node_text(source, method))
+            != Some("new")
+    {
+        return false;
+    }
+    node.child_by_field_name("receiver")
+        .is_some_and(|receiver| matches!(receiver.kind(), "constant" | "scope_resolution"))
+}
+
+/// A mounted callable target tied to the exact assignment node that produced
+/// it. The assignment node and the invocation node are both from the same
+/// prepared syntax tree; the procedure id is never recovered from a name.
+#[derive(Debug, Clone, Copy)]
+struct RubyCallableBinding<'tree> {
+    scope: ProcedureId,
+    declaration: Node<'tree>,
+    target: ProcedureId,
+}
+
+/// Mounted callable literals and invocation nodes whose receiver/callee was
+/// proved to read one stable local binding. Both keys are exact identities,
+/// never binding spellings.
+#[derive(Debug, Default)]
+struct RubyFunctionValueTargets {
+    procedures: HashMap<usize, ProcedureId>,
+    invocations: HashMap<(ProcedureId, usize), ProcedureId>,
+}
+
+fn collect_ruby_function_value_targets<'tree>(
+    specs: &[ProcedureSpec<'tree>],
+    bindings: &[ProcedureBindings],
+    source: &str,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<(RubyFunctionValueTargets, SemanticWork), RubyLoweringError> {
+    let mut targets = RubyFunctionValueTargets::default();
+    let mut traversal = SemanticTraversalBudget {
+        work: SemanticWork::default(),
+        budget,
+        cancellation,
+    };
+
+    for spec in specs
+        .iter()
+        .filter(|spec| matches!(spec.kind, ProcedureKind::Lambda | ProcedureKind::Closure))
+    {
+        targets.procedures.insert(spec.callable.id(), spec.id);
+    }
+
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        if matches!(spec.kind, ProcedureKind::Lambda | ProcedureKind::Closure) {
+            continue;
+        }
+
+        let parameter_root = callable_parameters(spec.callable, spec.body).map(|node| node.id());
+        let mut parameter_names = Vec::<Box<str>>::new();
+        let mut writes = Vec::new();
+        let mut reads = Vec::new();
+        let mut calls = Vec::new();
+        let mut stack = vec![(spec.callable, false)];
+        while let Some((node, in_parameters)) = stack.pop() {
+            traversal.enter_node()?;
+            let in_parameters = in_parameters || Some(node.id()) == parameter_root;
+            if node.id() != spec.callable.id() && ruby_nested_callable(node) {
+                continue;
+            }
+            if in_parameters
+                && node.kind() == "identifier"
+                && let Some(name) = node_text(source, node)
+            {
+                parameter_names.push(name.into());
+            }
+            if node.kind() == "identifier" {
+                reads.push(node);
+            }
+            if node.kind() == "call" {
+                calls.push(node);
+            }
+            writes.extend(ruby_binding_write_nodes(node));
+            for child in named_children(node).into_iter().rev() {
+                stack.push((child, in_parameters));
+            }
+        }
+
+        let invocation_references = calls
+            .iter()
+            .filter_map(|call| {
+                ruby_function_value_reference_node(*call, source)
+                    .map(|reference| (*call, reference))
+            })
+            .collect::<Vec<_>>();
+
+        for declaration in writes.iter().copied() {
+            let Some(name) = node_text(source, declaration) else {
+                continue;
+            };
+            if writes
+                .iter()
+                .filter(|other| node_text(source, **other) == Some(name))
+                .nth(1)
+                .is_some()
+                || parameter_names
+                    .iter()
+                    .any(|parameter| parameter.as_ref() == name)
+            {
+                continue;
+            }
+            let Some(assignment) = declaration.parent().filter(|parent| {
+                parent.kind() == "assignment"
+                    && parent.child_by_field_name("left") == Some(declaration)
+            }) else {
+                continue;
+            };
+            let Some(right) = assignment.child_by_field_name("right") else {
+                continue;
+            };
+            let Some(initializer) = ruby_callable_initializer(right) else {
+                continue;
+            };
+            let Some(&target) = targets.procedures.get(&initializer.id()) else {
+                continue;
+            };
+            let binding = RubyCallableBinding {
+                scope: spec.id,
+                declaration,
+                target,
+            };
+            if ruby_binding_is_captured(
+                spec,
+                specs,
+                bindings,
+                source,
+                name,
+                declaration.start_byte(),
+            ) {
+                continue;
+            }
+
+            let mut escaped = false;
+            let mut invocation_ids = Vec::new();
+            for read in reads.iter().copied().filter(|read| {
+                read.id() != binding.declaration.id()
+                    && read.start_byte() >= binding.declaration.start_byte()
+                    && node_text(source, *read) == Some(name)
+                    && bindings[procedure_index]
+                        .timeline
+                        .is_active_at(name, read.start_byte())
+            }) {
+                let Some((call, _)) = invocation_references
+                    .iter()
+                    .find(|(_, reference)| reference.id() == read.id())
+                else {
+                    escaped = true;
+                    break;
+                };
+                debug_assert_eq!(binding.scope, spec.id);
+                debug_assert_eq!(binding.declaration.id(), declaration.id());
+                invocation_ids.push(call.id());
+            }
+            if !escaped {
+                for invocation_id in invocation_ids {
+                    targets
+                        .invocations
+                        .insert((binding.scope, invocation_id), binding.target);
+                }
+            }
+        }
+    }
+
+    Ok((targets, traversal.work))
+}
+
+fn ruby_nested_callable(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "method"
+            | "singleton_method"
+            | "lambda"
+            | "block"
+            | "do_block"
+            | "class"
+            | "module"
+            | "singleton_class"
+    )
+}
+
+fn ruby_binding_write_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    let target = match node.kind() {
+        "assignment" | "operator_assignment" => node.child_by_field_name("left"),
+        "for" => node.child_by_field_name("pattern"),
+        "rescue" => node.child_by_field_name("variable"),
+        "match_pattern" | "test_pattern" | "in_clause" => node.child_by_field_name("pattern"),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Vec::new();
+    };
+    let mut writes = Vec::new();
+    let mut stack = vec![target];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" => writes.push(node),
+            "left_assignment_list"
+            | "destructured_left_assignment"
+            | "rest_assignment"
+            | "array_pattern"
+            | "find_pattern"
+            | "hash_pattern"
+            | "alternative_pattern"
+            | "parenthesized_pattern" => {
+                stack.extend(named_children(node).into_iter().rev());
+            }
+            "as_pattern" | "splat_parameter" | "hash_splat_parameter" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    stack.push(name);
+                }
+                if let Some(value) = node.child_by_field_name("value") {
+                    stack.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    writes
+}
+
+fn ruby_callable_initializer(mut node: Node<'_>) -> Option<Node<'_>> {
+    while node.kind() == "parenthesized_statements" {
+        let children = named_children(node);
+        if children.len() != 1 {
+            return None;
+        }
+        node = children[0];
+    }
+    matches!(node.kind(), "lambda" | "block" | "do_block").then_some(node)
+}
+
+fn ruby_binding_is_captured<'tree>(
+    spec: &ProcedureSpec<'tree>,
+    specs: &[ProcedureSpec<'tree>],
+    bindings: &[ProcedureBindings],
+    source: &str,
+    name: &str,
+    declaration_start: usize,
+) -> bool {
+    specs.iter().zip(bindings).any(|(child, child_bindings)| {
+        child.lexical_parent == Some(spec.id)
+            && child.callable.start_byte() >= declaration_start
+            && child_bindings
+                .timeline
+                .is_active_at(name, child.callable.start_byte().saturating_sub(1))
+            && !ruby_parameter_names(child.callable, child.body, source)
+                .iter()
+                .any(|parameter| parameter.as_ref() == name)
+            && ruby_callable_mentions_identifier(child.callable, child.body, source, name)
+    })
+}
+
+fn ruby_callable_mentions_identifier(
+    callable: Node<'_>,
+    body: Node<'_>,
+    source: &str,
+    expected: &str,
+) -> bool {
+    let parameter_root = callable_parameters(callable, body).map(|node| node.id());
+    let mut stack = vec![(body, false)];
+    while let Some((node, in_parameters)) = stack.pop() {
+        let in_parameters = in_parameters || Some(node.id()) == parameter_root;
+        if in_parameters {
+            continue;
+        }
+        if node.kind() == "identifier" && node_text(source, node) == Some(expected) {
+            return true;
+        }
+        for child in named_children(node).into_iter().rev() {
+            if child.id() != body.id() && ruby_nested_callable(child) {
+                continue;
+            }
+            stack.push((child, in_parameters));
+        }
+    }
+    false
+}
+
+fn ruby_function_value_reference_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let receiver = node.child_by_field_name("receiver");
+    let method = node.child_by_field_name("method");
+    if let Some(receiver) = receiver {
+        let callable_call = node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(source, operator).filter(|operator| *operator == "."))
+            == Some(".")
+            && method.is_none()
+            && node.child_by_field_name("arguments").is_some();
+        return callable_call.then_some(receiver);
+    }
+    None
+}
+
+fn ruby_parameter_names(callable: Node<'_>, body: Node<'_>, source: &str) -> Vec<Box<str>> {
+    let Some(parameters) = callable_parameters(callable, body) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut stack = vec![parameters];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && let Some(name) = node_text(source, node)
+        {
+            names.push(name.into());
+        }
+        stack.extend(named_children(node));
+    }
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::analyzer::ruby::semantic::*;
+
+    use brokk_bifrost_core::analyzer::model::LanguageDialect;
+
+    use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceOrigin;
+
+    use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
+
+    use brokk_bifrost_analysis::analyzer::tree_walk::descendants_or_self_of_kind;
+
+    use brokk_bifrost_core::text_utils::compute_line_starts;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parsed_method(source: &str) -> (tree_sitter::Tree, usize) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .expect("Ruby grammar is valid");
+        let tree = parser.parse(source, None).expect("source parses");
+        let method_index = named_children(tree.root_node())
+            .into_iter()
+            .position(|node| node.kind() == "method")
+            .expect("fixture has a method");
+        (tree, method_index)
+    }
+
+    fn function_value_targets(
+        source: &str,
+    ) -> (
+        PreparedSyntaxTree,
+        ProcedureId,
+        Option<ProcedureId>,
+        RubyFunctionValueTargets,
+    ) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .expect("Ruby grammar is valid");
+        let tree = parser.parse(source, None).expect("source parses");
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::Ruby),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "fixture.rb");
+        let Ok(ProcedureInventoryOutcome::Complete { value: specs, .. }) = enumerate_procedures(
+            &file,
+            &prepared,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        ) else {
+            panic!("fixture procedure inventory must complete");
+        };
+
+        let mut bindings = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let inherited = spec.lexical_parent.and_then(|parent| {
+                bindings
+                    .get(parent.index())
+                    .map(|parent_bindings: &ProcedureBindings| {
+                        (&parent_bindings.timeline, spec.callable.start_byte())
+                    })
+            });
+            let collection = collect_local_bindings(
+                prepared.source(),
+                spec.callable,
+                spec.body,
+                inherited,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("fixture local binding collection must complete");
+            bindings.push(ProcedureBindings {
+                timeline: collection.timeline,
+                has_parameter_defaults: collection.has_parameter_defaults,
+            });
+        }
+        let caller_id = specs
+            .iter()
+            .find(|spec| spec.kind == ProcedureKind::Method)
+            .map(|spec| spec.id)
+            .expect("fixture has caller method");
+        let lambda_id = specs
+            .iter()
+            .find(|spec| spec.kind == ProcedureKind::Lambda)
+            .map(|spec| spec.id);
+        let (targets, _) = collect_ruby_function_value_targets(
+            &specs,
+            &bindings,
+            prepared.source(),
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("fixture function-value collection must complete");
+        (prepared, caller_id, lambda_id, targets)
+    }
+
+    #[test]
+    #[hardwon("#2757: stable Ruby local lambda calls failed to resolve their target")]
+    fn stable_local_lambda_invocation_names_exact_mounted_target() {
+        let source = "def caller\n  local = ->(value) { target(value) }\n  local.(1)\nend\n\ndef target(value)\nend\n";
+        let (prepared, caller_id, Some(lambda_id), targets) = function_value_targets(source) else {
+            panic!("fixture has caller method and lambda");
+        };
+        let caller = prepared
+            .tree()
+            .root_node()
+            .named_child(0)
+            .expect("fixture has caller method");
+        let caller_body = caller.child_by_field_name("body").unwrap_or(caller);
+        let invocation = descendants_or_self_of_kind(caller_body, "call")
+            .into_iter()
+            .find(|call| {
+                ruby_function_value_reference_node(*call, prepared.source())
+                    .and_then(|reference| node_text(prepared.source(), reference))
+                    == Some("local")
+            })
+            .expect("fixture has local callable invocation");
+
+        assert_eq!(
+            targets.invocations.get(&(caller_id, invocation.id())),
+            Some(&lambda_id)
+        );
+    }
+
+    #[test]
+    #[hardwon("#2757: unstable Ruby function values must remain unresolved")]
+    fn function_value_near_misses_remain_unresolved() {
+        for source in [
+            "def caller(callable)\n  callable.(1)\nend\n",
+            "def caller\n  local = -> {}\n  local = -> {}\n  local.(1)\nend\n",
+            "def caller\n  local = -> {}\n  holder.local = local\n  local.(1)\nend\n",
+            "def caller\n  local = -> {}\n  callback = -> { local.(1) }\nend\n",
+            "def caller\n  local = -> {}\n  local.call(1)\nend\n",
+            "def caller\n  local = -> {}\n  local()\nend\n",
+        ] {
+            let (prepared, caller_id, _, targets) = function_value_targets(source);
+            let caller = prepared
+                .tree()
+                .root_node()
+                .named_child(0)
+                .expect("fixture has caller method");
+            let caller_body = caller.child_by_field_name("body").unwrap_or(caller);
+            let local_invocations = descendants_or_self_of_kind(caller_body, "call")
+                .into_iter()
+                .filter(|call| {
+                    ruby_function_value_reference_node(*call, prepared.source())
+                        .and_then(|reference| node_text(prepared.source(), reference))
+                        == Some("local")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                local_invocations
+                    .iter()
+                    .all(|call| { !targets.invocations.contains_key(&(caller_id, call.id())) })
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#2906: property inventory ignored request cancellation")]
+    fn property_inventory_honors_pre_cancelled_requests() {
+        let source = "class Holder\n  attr_accessor :value\nend\n\ndef sample\nend\n";
+        let (tree, _) = parsed_method(source);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        match collect_property_inventory(
+            tree.root_node(),
+            source,
+            &[],
+            &SemanticBudget::default(),
+            &cancellation,
+        ) {
+            Err(RubyLoweringError::Cancelled(work)) => {
+                assert_eq!(*work, SemanticWork::default());
+            }
+            _ => panic!("pre-cancelled property inventory must stop at its first checkpoint"),
+        }
+    }
+
+    #[test]
+    #[hardwon("#2906: property inventory failed to stop at the work limit")]
+    fn property_inventory_charges_iterative_visits_deterministically() {
+        let source = "class Holder\n  attr_accessor :value\nend\n\ndef sample\nend\n";
+        let (tree, _) = parsed_method(source);
+        let mut limits = SemanticWork::uniform(usize::MAX);
+        limits.nested_entries = 1;
+        let budget = SemanticBudget::new(limits).expect("all limits are positive");
+
+        // Lowering traversal is non-refusing work after #5902, so the tiny
+        // resident cap must not stop the walk. Every iterative visit and the
+        // collected name bytes still appear in the returned census.
+        let collection = collect_property_inventory(
+            tree.root_node(),
+            source,
+            &[],
+            &budget,
+            &CancellationToken::default(),
+        )
+        .expect("a one-entry resident cap must not stop traversal work");
+        assert_eq!(collection.work.nested_entries, 4);
+        assert_eq!(collection.work.owned_text_bytes, 23);
+    }
+
+    #[test]
+    fn local_binding_collection_honors_pre_cancelled_requests() {
+        let source = "def sample(value)\n  assigned = value\nend\n";
+        let (tree, method_index) = parsed_method(source);
+        let method = named_children(tree.root_node())[method_index];
+        let body = method.child_by_field_name("body").unwrap_or(method);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        match collect_local_bindings(
+            source,
+            method,
+            body,
+            None,
+            &SemanticBudget::default(),
+            &cancellation,
+        ) {
+            Err(RubyLoweringError::Cancelled(work)) => {
+                assert_eq!(*work, SemanticWork::default());
+            }
+            _ => panic!("pre-cancelled binding collection must stop at its first checkpoint"),
+        }
+    }
+
+    #[test]
+    fn local_binding_collection_charges_iterative_visits_deterministically() {
+        let source = "def sample(value)\n  assigned = value\nend\n";
+        let (tree, method_index) = parsed_method(source);
+        let method = named_children(tree.root_node())[method_index];
+        let body = method.child_by_field_name("body").unwrap_or(method);
+        let mut limits = SemanticWork::uniform(usize::MAX);
+        limits.nested_entries = 1;
+        let budget = SemanticBudget::new(limits).expect("all limits are positive");
+
+        let collection = collect_local_bindings(
+            source,
+            method,
+            body,
+            None,
+            &budget,
+            &CancellationToken::default(),
+        )
+        .expect("a one-entry resident cap must not stop binding traversal");
+        assert_eq!(collection.work.nested_entries, 9);
+        assert_eq!(collection.work.owned_text_bytes, 13);
+    }
+
+    #[test]
+    fn local_binding_timeline_activates_assignment_names_in_source_order() {
+        let source = "def caller\n  target\n  target = 1\n  target\nend\n";
+        let (tree, method_index) = parsed_method(source);
+        let method = named_children(tree.root_node())[method_index];
+        let body = method.child_by_field_name("body").unwrap_or(method);
+        let collection = collect_local_bindings(
+            source,
+            method,
+            body,
+            None,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("binding collection succeeds");
+        let targets = descendants_or_self_of_kind(body, "identifier")
+            .into_iter()
+            .filter(|node| node_text(source, *node) == Some("target"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets.len(), 3);
+        assert!(
+            !collection
+                .timeline
+                .is_active_at("target", targets[0].start_byte())
+        );
+        assert!(
+            collection
+                .timeline
+                .is_active_at("target", targets[1].start_byte())
+        );
+        assert!(
+            collection
+                .timeline
+                .is_active_at("target", targets[2].start_byte())
+        );
+    }
+
+    #[test]
+    fn default_expression_assignments_activate_bindings_before_the_body() {
+        let source = "def sample(value = (default_binding = 1))\n  default_binding\nend\n";
+        let (tree, method_index) = parsed_method(source);
+        let method = named_children(tree.root_node())[method_index];
+        let body = method.child_by_field_name("body").unwrap_or(method);
+        let collection = collect_local_bindings(
+            source,
+            method,
+            body,
+            None,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("binding collection succeeds");
+        let body_read = descendants_or_self_of_kind(body, "identifier")
+            .into_iter()
+            .find(|node| node_text(source, *node) == Some("default_binding"))
+            .expect("method body contains the default-expression binding read");
+
+        assert!(
+            collection
+                .timeline
+                .is_active_at("default_binding", body_read.start_byte())
+        );
+    }
+
+    #[test]
+    fn nested_callable_inherits_only_bindings_active_at_creation() {
+        for (source, expected_capture) in [
+            (
+                "def caller\n  closure = -> { target }\n  target = 1\nend\n",
+                false,
+            ),
+            (
+                "def caller\n  target = -> { target; target = 1 }\nend\n",
+                true,
+            ),
+        ] {
+            let (tree, method_index) = parsed_method(source);
+            let method = named_children(tree.root_node())[method_index];
+            let method_body = method.child_by_field_name("body").unwrap_or(method);
+            let lambda = descendants_or_self_of_kind(method_body, "lambda")[0];
+            let lambda_body = lambda.child_by_field_name("body").unwrap_or(lambda);
+            let parent = collect_local_bindings(
+                source,
+                method,
+                method_body,
+                None,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("parent binding collection succeeds");
+            let child = collect_local_bindings(
+                source,
+                lambda,
+                lambda_body,
+                Some((&parent.timeline, lambda.start_byte())),
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("child binding collection succeeds");
+            let first_target = descendants_or_self_of_kind(lambda_body, "identifier")
+                .into_iter()
+                .find(|node| node_text(source, *node) == Some("target"))
+                .expect("lambda contains target identifier");
+
+            assert_eq!(
+                child
+                    .timeline
+                    .is_active_at("target", first_target.start_byte()),
+                expected_capture
+            );
+        }
+    }
+}

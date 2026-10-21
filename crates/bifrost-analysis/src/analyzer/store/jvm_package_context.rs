@@ -8,9 +8,10 @@ use brokk_bifrost_core::path_normalization::NormalizePath;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{AnalyzerStore, Result, WorkspaceSnapshotId, WorkspaceSnapshots};
-use crate::analyzer::jvm::topology::{
-    MavenConfigurationFacts, MavenModelLimitation, MavenValue, maven_configuration_from_bytes,
-};
+use crate::analyzer::store::maven::MavenConfigurationFacts;
+use crate::analyzer::store::maven::MavenModelLimitation;
+use crate::analyzer::store::maven::MavenValue;
+use crate::analyzer::store::maven::maven_configuration_from_bytes;
 
 pub(crate) const JVM_CONTEXT_DERIVATION_VERSION: i64 = 1;
 

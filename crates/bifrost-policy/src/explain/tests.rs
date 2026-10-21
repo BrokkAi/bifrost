@@ -8,9 +8,9 @@
 use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, Language, Project, ProjectFile, TestProject, TypescriptAnalyzer,
-    WorkspaceAnalyzer,
+    AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
 };
+use brokk_bifrost_js_ts_analysis::TypescriptAnalyzer;
 use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
 
 use crate::budget::PolicyBudget;

@@ -7,11 +7,13 @@ use crate::hash::HashSet;
 /// Candidate expansion happens before this value is constructed. Once file
 /// and source-byte budgets have admitted the set, language code cannot add a
 /// target, importer, or convention-derived file behind the planner's back.
+#[derive(Clone)]
 pub struct UsageScanScope<'a> {
     candidate_files: &'a HashSet<ProjectFile>,
     explicit_candidate_files: Option<&'a HashSet<ProjectFile>>,
     cancellation: Option<&'a CancellationToken>,
     include_tests: bool,
+    max_unproven: usize,
 }
 
 impl<'a> UsageScanScope<'a> {
@@ -21,6 +23,7 @@ impl<'a> UsageScanScope<'a> {
             explicit_candidate_files: None,
             cancellation: None,
             include_tests: true,
+            max_unproven: super::model::FuzzyResult::MAX_UNPROVEN_HITS_PER_SYMBOL,
         }
     }
 
@@ -33,6 +36,7 @@ impl<'a> UsageScanScope<'a> {
             explicit_candidate_files: None,
             cancellation: Some(cancellation),
             include_tests: true,
+            max_unproven: super::model::FuzzyResult::MAX_UNPROVEN_HITS_PER_SYMBOL,
         }
     }
 
@@ -51,6 +55,15 @@ impl<'a> UsageScanScope<'a> {
     pub fn with_test_inclusion(mut self, include_tests: bool) -> Self {
         self.include_tests = include_tests;
         self
+    }
+
+    pub fn with_unproven_limit(mut self, limit: usize) -> Self {
+        self.max_unproven = limit;
+        self
+    }
+
+    pub fn max_unproven(&self) -> usize {
+        self.max_unproven
     }
 
     pub fn candidate_files(&self) -> &'a HashSet<ProjectFile> {

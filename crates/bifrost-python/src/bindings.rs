@@ -294,6 +294,7 @@ struct PythonLocalBinding<'tree> {
 enum PythonLocalBindingKind {
     FunctionOnly,
     ClassOnly,
+    ImportOnly,
     Other,
 }
 
@@ -312,6 +313,7 @@ struct PythonComprehensionBinding {
 /// iterative and every inspected node is gated by `scope_step`; `None` means
 /// the caller stopped discovery and must conservatively avoid module fallback.
 pub struct PythonLexicalScopeInventory<'tree> {
+    binding_nodes: Vec<Node<'tree>>,
     locals: Vec<PythonLocalBinding<'tree>>,
     bindings: PythonLexicalScopeBindings,
 }
@@ -398,6 +400,12 @@ impl PythonLexicalScopeBindings {
     /// and every other collected binder/delete count, without value inference.
     pub fn has_global_binding_event(&self, name: &str) -> bool {
         self.global_binding_events.contains(name)
+    }
+
+    /// All actual global binding events, before any read-time filtering.
+    /// Callers that copy this set must charge their own bounded iteration.
+    pub fn global_binding_events(&self) -> impl Iterator<Item = &str> {
+        self.global_binding_events.iter().map(|name| name.as_ref())
     }
 
     pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
@@ -564,6 +572,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         mut scope_step: impl FnMut() -> bool,
     ) -> Option<Self> {
         let mut inventory = Self {
+            binding_nodes: Vec::new(),
             locals: Vec::new(),
             bindings: PythonLexicalScopeBindings {
                 parameters: parameter_names.into_iter().map(Box::<str>::from).collect(),
@@ -635,7 +644,11 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                 }
                 "import_statement" | "import_from_statement" => {
                     collect_import_bindings(node, &mut scope_step, |binding| {
-                        inventory.record_local_node(binding, source)
+                        inventory.record_local_kind(
+                            node_text(binding, source),
+                            binding,
+                            PythonLocalBindingKind::ImportOnly,
+                        )
                     })?;
                     continue;
                 }
@@ -944,6 +957,51 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         None
     }
 
+    /// The import must be the only binding event, not merely the first
+    /// retained token. Competing imports, def/class names and writes collapse
+    /// ImportOnly to Other during collection, even when import metadata is absent.
+    pub fn unique_import_declaration_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        mut scope_step: impl FnMut() -> bool,
+    ) -> Option<Option<Node<'tree>>> {
+        if self.name_resolution_at_bounded(name, reference, &mut scope_step)?
+            != PythonLexicalNameResolution::Local
+            || self.bindings.has_runtime_callable_binding_at_bounded(
+                name,
+                reference,
+                &mut scope_step,
+            )?
+            || self.bindings.local_names.get(name) != Some(&PythonLocalBindingKind::ImportOnly)
+        {
+            return Some(None);
+        }
+        for binding in &self.locals {
+            if !scope_step() {
+                return None;
+            }
+            if binding.name.as_ref() == name {
+                return Some(Some(binding.declaration));
+            }
+        }
+        unreachable!("ImportOnly is constructed with its declaration token")
+    }
+
+    /// All binding tokens, including repeated and globally redirected writes.
+    /// The native producer attributes these after the whole scope inventory exists.
+    pub fn binding_nodes(&self) -> impl Iterator<Item = Node<'tree>> + '_ {
+        self.binding_nodes.iter().copied()
+    }
+
+    pub fn global_names(&self) -> impl Iterator<Item = &str> {
+        self.bindings.globals.iter().map(AsRef::as_ref)
+    }
+
+    pub fn nonlocal_names(&self) -> impl Iterator<Item = &str> {
+        self.bindings.nonlocals.iter().map(AsRef::as_ref)
+    }
+
     pub fn local_bindings(&self) -> impl Iterator<Item = (&str, Node<'tree>)> + '_ {
         self.locals
             .iter()
@@ -973,6 +1031,19 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         } else {
             PythonLocalBindingKind::Other
         };
+        self.record_local_kind(name, declaration, binding_kind);
+    }
+
+    fn record_local_kind(
+        &mut self,
+        name: &str,
+        declaration: Node<'tree>,
+        binding_kind: PythonLocalBindingKind,
+    ) {
+        if name.is_empty() {
+            return;
+        }
+        self.binding_nodes.push(declaration);
         match self.bindings.local_names.entry(name.into()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(binding_kind);
@@ -1301,8 +1372,26 @@ pub fn python_unambiguous_module_binding_bounded(
     root: Node<'_>,
     source: &str,
     target_name: &str,
-    mut scope_step: impl FnMut() -> bool,
+    scope_step: impl FnMut() -> bool,
 ) -> Option<Option<PythonDirectScopeBindingKind>> {
+    Some(
+        python_unambiguous_module_binding_node_bounded(root, source, target_name, scope_step)?
+            .map(|binding| binding.kind),
+    )
+}
+
+/// The module scope's unique binding event, after the bounded proof completes.
+///
+/// A returned node identifies the actual binder, not a proven runtime value.
+/// `Other` still needs the caller's syntax and visibility checks. Competing
+/// events or a later wildcard return `Some(None)`; an interrupted proof returns
+/// `None` and must never expose a binder found before the interruption.
+pub fn python_unambiguous_module_binding_node_bounded<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    target_name: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Option<PythonDirectScopeBinding<'tree>>> {
     let mut matched = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -1321,10 +1410,7 @@ pub fn python_unambiguous_module_binding_bounded(
             if matched.is_some() {
                 return Some(None);
             }
-            matched = Some(binding.kind);
-            if binding.kind == PythonDirectScopeBindingKind::Other {
-                return Some(Some(PythonDirectScopeBindingKind::Other));
-            }
+            matched = Some(binding);
         }
 
         let body = matches!(
@@ -1455,7 +1541,7 @@ fn last_identifier_bounded<'tree>(
     Some(result)
 }
 
-fn collect_binding_targets<'tree>(
+pub(crate) fn collect_binding_targets<'tree>(
     target: Node<'tree>,
     source: &str,
     scope_step: &mut impl FnMut() -> bool,
@@ -1696,7 +1782,7 @@ fn children_by_field_name_bounded<'tree>(
     .then_some(children)
 }
 
-fn is_comprehension(kind: &str) -> bool {
+pub(crate) fn is_comprehension(kind: &str) -> bool {
     matches!(
         kind,
         "list_comprehension"
@@ -1758,7 +1844,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "#5044+#5511: bounded lexical lookups bypassed budgets or erased lazy class bindings"
+        "#5044+#5511+#5751: bounded lexical proofs bypassed stops, lazy bindings or competing events"
     )]
     fn bounded_comprehension_lookup_preserves_exhaustion() {
         let source = "def run(xs):\n    class Base:\n        pass\n    def helper():\n        pass\n    class Derived(Base):\n        pass\n    helper()\n    return [target for target in xs]\n";
@@ -1888,6 +1974,101 @@ mod tests {
             Some(targets[0].declaration),
             clause.child_by_field_name("left")
         );
+
+        // An assignment binder is positive evidence only after later events
+        // and executable headers have been checked. Body-local writes do not
+        // compete, but header walrus writes and later wildcards do.
+        use super::PythonDirectScopeBindingKind::{ClassDeclaration, Other};
+        for (source, expected_kind) in [
+            ("Alias = Base\ntrailing = None\n", Some(Other)),
+            ("Alias = Base\nAlias = Other\n", None),
+            ("Alias = Base\ndel Alias\n", None),
+            ("Alias = Base\nfrom pkg import Target as Alias\n", None),
+            ("Alias = Base\nfrom pkg import *\n", None),
+            ("from pkg import *\nAlias = Base\n", Some(Other)),
+            (
+                "Alias = Base\ndef inner():\n    Alias = Other\nclass Container:\n    Alias = Other\n",
+                Some(Other),
+            ),
+            (
+                "Alias = Base\ndef inner(value=(Alias := Other)):\n    pass\n",
+                None,
+            ),
+            ("class Alias:\n    pass\n", Some(ClassDeclaration)),
+            (
+                "from pkg import *\nclass Alias:\n    pass\n",
+                Some(ClassDeclaration),
+            ),
+            ("class Alias:\n    pass\nfrom pkg import *\n", None),
+            ("Other = Base\n", None),
+        ] {
+            let tree = crate::declarations::parse_python_tree(source).unwrap();
+            let root = tree.root_node();
+            assert!(!root.has_error(), "{source}");
+            let mut steps = 0_usize;
+            let binding = super::python_unambiguous_module_binding_node_bounded(
+                root,
+                source,
+                "Alias",
+                || {
+                    steps += 1;
+                    true
+                },
+            )
+            .expect("uninterrupted binding proof completes");
+            assert_eq!(
+                binding.map(|binding| binding.kind),
+                expected_kind,
+                "{source}"
+            );
+            if let Some(binding) = binding {
+                assert_eq!(binding.declaration.kind(), "identifier");
+                assert_eq!(super::node_text(binding.declaration, source), "Alias");
+                let parent = binding.declaration.parent().unwrap();
+                let field = if binding.kind == ClassDeclaration {
+                    "name"
+                } else {
+                    "left"
+                };
+                assert_eq!(parent.child_by_field_name(field), Some(binding.declaration));
+                let statement = if binding.kind == ClassDeclaration {
+                    parent
+                } else {
+                    parent.parent().unwrap()
+                };
+                assert_eq!(statement.parent(), Some(root), "exact module-owned binder");
+            }
+            assert_eq!(
+                super::python_unambiguous_module_binding_bounded(root, source, "Alias", || true),
+                Some(expected_kind),
+                "kind-only consumers retain the same positive requirement: {source}"
+            );
+            assert_eq!(
+                super::python_unambiguous_module_class_binding_bounded(
+                    root,
+                    source,
+                    "Alias",
+                    || true
+                ),
+                Some(expected_kind == Some(ClassDeclaration))
+            );
+            for mut remaining in 0..steps {
+                assert!(
+                    super::python_unambiguous_module_binding_node_bounded(
+                        root,
+                        source,
+                        "Alias",
+                        || {
+                            let available = remaining > 0;
+                            remaining = remaining.saturating_sub(1);
+                            available
+                        },
+                    )
+                    .is_none(),
+                    "a stopped proof cannot publish its early binder: {source}"
+                );
+            }
+        }
 
         // The same spelling is an immediate base root and a lazy bound root.
         // Generic hierarchy refusal cannot test this shared binding distinction.

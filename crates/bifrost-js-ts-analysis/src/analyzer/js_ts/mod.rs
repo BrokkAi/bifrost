@@ -1,0 +1,1593 @@
+//! The JS/TS shim.
+//!
+//! The language knowledge moved to `brokk-bifrost-js-ts`. What stays is what
+//! needs an analyzer: the moka memo bucket ([`cache`]), the memoizing provider
+//! wrappers and the one downcast ([`providers`]), the two analyzer-guarded
+//! diagnostic entry points ([`diagnostics`]), the `ReceiverFactsFactory`
+//! boundary adapter ([`receiver_facts`]), the clone-candidate entry point
+//! ([`clones`]), the two `LanguageSupport` registrations below, and the bands
+//! parked on `analyzer::semantic` ([`semantic`]) and `semantic_model`
+//! ([`external`]).
+
+pub(crate) mod cache;
+mod call_conversion;
+pub(crate) mod clones;
+pub mod dependency_evidence;
+pub(crate) mod diagnostics;
+pub(crate) mod external;
+pub(crate) mod providers;
+#[cfg(test)]
+mod receiver_analysis_tests;
+pub(crate) mod receiver_facts;
+#[doc(hidden)]
+pub mod semantic;
+pub(crate) mod source_publication;
+#[doc(hidden)]
+pub mod source_storage;
+mod structural;
+mod type_flow;
+
+use crate::JsTsExportUsageGraphStrategy;
+use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
+use brokk_bifrost_core::analyzer::query_token::QueryScope;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::NodeKey;
+pub use brokk_bifrost_js_ts::structural::JsTsCallResultUseIndex;
+pub use brokk_bifrost_js_ts::syntax::{
+    JsTsLexicalBindingIndex, JsTsLexicalBindingScope, JsTsModuleMemberWriteMemo,
+    static_member_property, static_property_name,
+};
+pub use brokk_bifrost_js_ts::typescript::ts_object_literal_property_name;
+pub use external::{
+    JsTsDependencyPackAdapter, TYPESCRIPT_STDLIB_PACKAGE, TYPESCRIPT_STDLIB_VERSION,
+    TypeScriptDeclarationPackProducer, TypeScriptLibraryActivationOutcome,
+    resolve_js_ts_semantic_pack_dependencies, typescript_library_activation_evidence,
+};
+use std::sync::LazyLock;
+
+// Query execution shares these grammar helpers through its analysis boundary.
+
+use brokk_bifrost_analysis::analyzer::cognitive_complexity;
+
+use brokk_bifrost_core::analyzer::common::language_for_target;
+
+use brokk_bifrost_analysis::analyzer::languages::DeadCodeBulkEdges;
+
+use brokk_bifrost_analysis::analyzer::languages::DeadCodeBulkPreflight;
+
+use brokk_bifrost_analysis::analyzer::languages::DeadCodeBulkProof;
+
+use brokk_bifrost_analysis::analyzer::languages::DeadCodeRouting;
+
+use brokk_bifrost_analysis::analyzer::languages::DeadCodeSupport;
+
+use brokk_bifrost_analysis::analyzer::languages::EdgePassId;
+
+use brokk_bifrost_analysis::analyzer::languages::EdgeSiteScanCtx;
+
+use brokk_bifrost_analysis::analyzer::languages::EdgeWeightScanCtx;
+
+use brokk_bifrost_analysis::analyzer::languages::ExternalCalleeSite;
+
+use brokk_bifrost_analysis::analyzer::languages::LanguageEdgePass;
+
+use brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites;
+
+use brokk_bifrost_analysis::analyzer::languages::LanguageEdgeWeights;
+
+use brokk_bifrost_analysis::analyzer::languages::LanguageSupport;
+
+use brokk_bifrost_analysis::analyzer::languages::LocalDeclarationBindingScope;
+
+use brokk_bifrost_analysis::analyzer::languages::LocalDeclarationVisibility;
+
+use brokk_bifrost_analysis::analyzer::languages::ReceiverFactsFactory;
+
+use brokk_bifrost_analysis::analyzer::languages::analyzable_file_count;
+
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState;
+
+use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageNodeKey;
+
+use crate::analyzer::usages::js_ts_graph::JsTsReceiverFacts;
+
+use crate::analyzer::usages::js_ts_graph::build_jsts_scoped_usage_edges;
+
+use crate::analyzer::usages::js_ts_graph::build_rooted_jsts_scoped_usage_edges;
+
+use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+use brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::ForwardQueryProvider;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+use crate::analyzer::JavascriptAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::analyzer::model::Range;
+
+use crate::analyzer::TypescriptAnalyzer;
+
+use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+
+use brokk_bifrost_core::analyzer::model::CodeUnit;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
+use brokk_bifrost_core::analyzer::model::SummaryFileProjection;
+
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_js_ts::imports::js_ts_module_identity;
+use brokk_bifrost_js_ts::model::module_code_unit;
+
+use brokk_bifrost_js_ts::syntax::compute_import_binder as compute_js_ts_import_binder;
+use brokk_bifrost_js_ts::syntax::js_ts_var_declarator_binding_scope;
+use brokk_bifrost_js_ts::syntax::js_ts_variable_declarator_binding_scope;
+use std::path::Component;
+use std::path::Path;
+use std::sync::Arc;
+
+pub(crate) fn is_typescript_declaration_path(path: &Path) -> bool {
+    let declaration_extension = path
+        .file_stem()
+        .and_then(|stem| Path::new(stem).extension())
+        .is_some_and(|extension| extension == "d");
+    declaration_extension
+        && path
+            .extension()
+            .is_some_and(|extension| matches!(extension.to_str(), Some("ts" | "mts" | "cts")))
+}
+
+fn js_ts_local_declaration_binding_scope<'tree>(
+    node: tree_sitter::Node<'tree>,
+) -> Option<LocalDeclarationBindingScope<'tree>> {
+    let scope = js_ts_variable_declarator_binding_scope(node)?;
+    let visibility = if js_ts_var_declarator_binding_scope(node).is_some() {
+        LocalDeclarationVisibility::Hoisted
+    } else {
+        LocalDeclarationVisibility::Lexical
+    };
+    Some(LocalDeclarationBindingScope { scope, visibility })
+}
+
+static JS_TS_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_statement"],
+        loop_types: &[
+            "for_statement",
+            "for_in_statement",
+            "while_statement",
+            "do_statement",
+        ],
+        catch_types: &["catch_clause"],
+        conditional_types: &["ternary_expression"],
+        case_types: &["switch_case"],
+        default_case_types: &["switch_default"],
+        binary_types: &["binary_expression"],
+        logical_operators: &["&&", "||", "??"],
+        jump_types: &["break_statement", "continue_statement"],
+        named_function_boundary_types: &[
+            "function_declaration",
+            "function_expression",
+            "generator_function",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+        ],
+        else_clause_types: &["else_clause"],
+        ..cognitive_complexity::Config::empty()
+    });
+
+pub(crate) fn cognitive_complexity_config() -> &'static cognitive_complexity::Config {
+    &JS_TS_COGNITIVE_CONFIG
+}
+
+/// Whether the parsed tree contains a conventional JavaScript test DSL call.
+///
+/// This deliberately examines call-expression structure instead of searching
+/// source text. A production call such as `emit(...)`, `init(...)`, or
+/// `split(...)` can contain the bytes `it(` in its spelling, but it is not a
+/// test declaration. Requiring a function-shaped final argument also avoids
+/// treating an ordinary helper invocation named `test` as a test declaration.
+fn tree_contains_test_dsl_calls(tree: &tree_sitter::Tree, source: &str) -> bool {
+    fn identifier_text<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
+        (node.kind() == "identifier")
+            .then(|| node.utf8_text(source.as_bytes()).ok())
+            .flatten()
+    }
+
+    fn identifier_or_property_text<'a>(
+        node: tree_sitter::Node<'a>,
+        source: &'a str,
+    ) -> Option<&'a str> {
+        matches!(node.kind(), "identifier" | "property_identifier")
+            .then(|| node.utf8_text(source.as_bytes()).ok())
+            .flatten()
+    }
+
+    fn is_test_dsl_name(name: &str) -> bool {
+        matches!(
+            name,
+            "context" | "describe" | "it" | "specify" | "suite" | "test"
+        )
+    }
+
+    fn is_test_dsl_modifier(name: &str) -> bool {
+        matches!(
+            name,
+            "concurrent" | "each" | "fails" | "only" | "serial" | "skip" | "todo"
+        )
+    }
+
+    fn is_test_dsl_callee(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        match node.kind() {
+            "identifier" => identifier_text(node, source).is_some_and(is_test_dsl_name),
+            "member_expression" => {
+                let Some(object) = node.child_by_field_name("object") else {
+                    return false;
+                };
+                let Some(property) = node.child_by_field_name("property") else {
+                    return false;
+                };
+                identifier_text(object, source).is_some_and(is_test_dsl_name)
+                    && identifier_or_property_text(property, source)
+                        .is_some_and(is_test_dsl_modifier)
+            }
+            // `test.each(cases)(name, callback)` has a call expression as its
+            // outer callee. Retain the structured proof by following that
+            // expression back to the known DSL member, without accepting an
+            // arbitrary production call merely because it has a callback.
+            "call_expression" => node
+                .child_by_field_name("function")
+                .is_some_and(|function| is_test_dsl_callee(function, source)),
+            _ => false,
+        }
+    }
+
+    fn has_callback_argument(node: tree_sitter::Node<'_>) -> bool {
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return false;
+        };
+        arguments
+            .named_children(&mut arguments.walk())
+            .last()
+            .is_some_and(|last| matches!(last.kind(), "arrow_function" | "function_expression"))
+    }
+
+    fn is_test_dsl_call(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        let Some(function) = node.child_by_field_name("function") else {
+            return false;
+        };
+        is_test_dsl_callee(function, source) && has_callback_argument(node)
+    }
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" && is_test_dsl_call(node, source) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+/// Whether the parsed tree contains an ESLint-style RuleTester suite.
+///
+/// RuleTester files commonly live at `tests/lib/rules/foo.js`, which is not a
+/// filename convention recognized by [`path_contains_tests`]. Their test
+/// invocation is also a method call (`ruleTester.run`) rather than one of the
+/// framework-global calls covered by [`tree_contains_test_dsl_calls`]. Keep this
+/// recognition structural: establish a RuleTester import, find a local
+/// constructed tester, and then require its `.run()` call.
+fn rule_tester_suite_contains_tests(tree: &tree_sitter::Tree, source: &str) -> bool {
+    fn identifier_text<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
+        (node.kind() == "identifier")
+            .then(|| node.utf8_text(source.as_bytes()).ok())
+            .flatten()
+    }
+
+    fn property_text<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
+        (node.kind() == "property_identifier")
+            .then(|| node.utf8_text(source.as_bytes()).ok())
+            .flatten()
+    }
+
+    fn is_require_call(node: tree_sitter::Node<'_>, source: &str) -> bool {
+        node.kind() == "call_expression"
+            && node
+                .child_by_field_name("function")
+                .and_then(|function| identifier_text(function, source))
+                == Some("require")
+    }
+
+    fn string_fragment<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
+        (node.kind() == "string")
+            .then(|| node.named_child(0))
+            .flatten()
+            .filter(|child| child.kind() == "string_fragment")
+            .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+    }
+
+    fn require_module<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
+        if !is_require_call(node, source) {
+            return None;
+        }
+        let argument = node.child_by_field_name("arguments")?.named_child(0)?;
+        string_fragment(argument, source)
+    }
+
+    fn is_rule_tester_module(module: &str) -> bool {
+        module == "eslint"
+            || module.ends_with("/rule-tester")
+            || module.ends_with("/rule-tester/rule-tester")
+    }
+
+    fn add_destructured_rule_tester_bindings(
+        pattern: tree_sitter::Node<'_>,
+        source: &str,
+        bindings: &mut HashSet<String>,
+    ) {
+        if pattern.kind() != "object_pattern" {
+            return;
+        }
+        let mut cursor = pattern.walk();
+        for child in pattern.named_children(&mut cursor) {
+            if child.kind() == "shorthand_property_identifier_pattern"
+                && child.utf8_text(source.as_bytes()).ok() == Some("RuleTester")
+            {
+                bindings.insert("RuleTester".to_string());
+            } else if child.kind() == "pair_pattern"
+                && child
+                    .child_by_field_name("key")
+                    .and_then(|key| key.utf8_text(source.as_bytes()).ok())
+                    == Some("RuleTester")
+                && let Some(value) = child
+                    .child_by_field_name("value")
+                    .and_then(|value| identifier_text(value, source))
+            {
+                bindings.insert(value.to_string());
+            }
+        }
+    }
+
+    let mut nodes = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+        nodes.push(node);
+    }
+
+    let mut rule_tester_bindings = HashSet::default();
+    for node in &nodes {
+        if node.kind() == "variable_declarator" {
+            let Some(name) = node.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(value) = node.child_by_field_name("value") else {
+                continue;
+            };
+            let is_rule_tester_value = require_module(value, source)
+                .is_some_and(is_rule_tester_module)
+                || (value.kind() == "member_expression"
+                    && value
+                        .child_by_field_name("property")
+                        .and_then(|property| property.utf8_text(source.as_bytes()).ok())
+                        == Some("RuleTester")
+                    && value
+                        .child_by_field_name("object")
+                        .and_then(|object| require_module(object, source))
+                        .is_some_and(is_rule_tester_module));
+            if is_rule_tester_value {
+                if identifier_text(name, source) == Some("RuleTester") {
+                    rule_tester_bindings.insert("RuleTester".to_string());
+                }
+                add_destructured_rule_tester_bindings(name, source, &mut rule_tester_bindings);
+            }
+        }
+
+        if node.kind() != "import_statement" {
+            continue;
+        }
+        let Some(module) = node
+            .child_by_field_name("source")
+            .and_then(|source_node| string_fragment(source_node, source))
+        else {
+            continue;
+        };
+        if !is_rule_tester_module(module) {
+            continue;
+        }
+        let import_clause = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "import_clause");
+        if let Some(import_clause) = import_clause {
+            let mut clause_cursor = import_clause.walk();
+            for child in import_clause.named_children(&mut clause_cursor) {
+                if child.kind() == "identifier"
+                    && child.utf8_text(source.as_bytes()).ok() == Some("RuleTester")
+                {
+                    rule_tester_bindings.insert("RuleTester".to_string());
+                }
+            }
+        }
+        let mut import_stack = vec![*node];
+        while let Some(import_node) = import_stack.pop() {
+            let mut cursor = import_node.walk();
+            import_stack.extend(import_node.named_children(&mut cursor));
+            if import_node.kind() != "import_specifier" {
+                continue;
+            }
+            let Some(imported) = import_node
+                .child_by_field_name("name")
+                .and_then(|name| identifier_text(name, source))
+            else {
+                continue;
+            };
+            if imported != "RuleTester" {
+                continue;
+            }
+            let local = import_node
+                .child_by_field_name("alias")
+                .and_then(|alias| identifier_text(alias, source))
+                .unwrap_or(imported);
+            rule_tester_bindings.insert(local.to_string());
+        }
+    }
+
+    if rule_tester_bindings.is_empty() {
+        return false;
+    }
+
+    let tester_bindings: HashSet<String> = nodes
+        .iter()
+        .filter_map(|node| {
+            if node.kind() != "variable_declarator" {
+                return None;
+            }
+            let name = node.child_by_field_name("name")?;
+            let value = node.child_by_field_name("value")?;
+            let constructor = value
+                .kind()
+                .eq("new_expression")
+                .then(|| value.child_by_field_name("constructor"))
+                .flatten()?;
+            let constructor_name = identifier_text(constructor, source)?;
+            let binding_name = identifier_text(name, source)?;
+            rule_tester_bindings
+                .contains(constructor_name)
+                .then(|| binding_name.to_string())
+        })
+        .collect();
+
+    if tester_bindings.is_empty() {
+        return false;
+    }
+
+    nodes.iter().any(|node| {
+        if node.kind() != "call_expression" {
+            return false;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return false;
+        };
+        if function.kind() != "member_expression" {
+            return false;
+        }
+        let Some(object) = function.child_by_field_name("object") else {
+            return false;
+        };
+        let Some(property) = function.child_by_field_name("property") else {
+            return false;
+        };
+        property_text(property, source) == Some("run")
+            && tester_bindings.contains(identifier_text(object, source).unwrap_or_default())
+    })
+}
+
+fn has_strong_test_root(file: &ProjectFile) -> bool {
+    let rel = brokk_bifrost_core::path_utils::rel_path_string(file);
+    Path::new(&rel).components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        name.eq_ignore_ascii_case("test")
+            || name.eq_ignore_ascii_case("tests")
+            || name.eq_ignore_ascii_case("__tests__")
+            || name.eq_ignore_ascii_case("spec")
+            || name.eq_ignore_ascii_case("specs")
+    })
+}
+
+fn has_node_test_filename(file: &ProjectFile) -> bool {
+    let Some(file_name) = file.rel_path().file_name() else {
+        return false;
+    };
+    let Some(extension) = file.rel_path().extension() else {
+        return false;
+    };
+    let file_name = file_name.to_string_lossy();
+    let extension = extension.to_string_lossy();
+    let node_extension = extension.eq_ignore_ascii_case("js")
+        || extension.eq_ignore_ascii_case("mjs")
+        || extension.eq_ignore_ascii_case("cjs");
+    node_extension
+        && (file_name
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("test-"))
+            || file_name
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("test_")))
+}
+
+pub(crate) fn path_contains_tests(file: &ProjectFile) -> bool {
+    let Some(file_name) = file.rel_path().file_name() else {
+        return false;
+    };
+    let file_name = file_name.to_string_lossy().to_ascii_lowercase();
+    // Keep the existing suffix conventions for all JS/TS layouts. Node's
+    // `test-*.js`/`test_*.js` convention is intentionally narrower: those
+    // names are accepted only below a strong test root. In particular,
+    // `testData/`, `fixtures/`, and arbitrary production directories do not
+    // become test roots merely because a file starts with `test-`.
+    file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || (has_strong_test_root(file) && has_node_test_filename(file))
+}
+
+pub(crate) fn hydrate_contains_tests(stored: bool, file: &ProjectFile) -> bool {
+    stored || path_contains_tests(file)
+}
+
+pub(crate) fn contains_tests(file: &ProjectFile, source: &str, tree: &tree_sitter::Tree) -> bool {
+    path_contains_tests(file)
+        || tree_contains_test_dsl_calls(tree, source)
+        || rule_tester_suite_contains_tests(tree, source)
+}
+
+pub(crate) fn synthesize_hydrated_module(file: &ProjectFile, source: &str, state: &mut FileState) {
+    if state.imports.is_empty() {
+        return;
+    }
+    let module = module_code_unit(file);
+    state.top_level_declarations.push(module.clone());
+    state.declarations.insert(module.clone());
+    state
+        .ranges
+        .entry(module)
+        .or_default()
+        .push(brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::full_source_range(source));
+}
+
+pub(crate) fn synthesize_summary_module(
+    file: &ProjectFile,
+    source: &str,
+    has_structured_imports: bool,
+    projection: &mut SummaryFileProjection,
+) {
+    if !has_structured_imports {
+        return;
+    }
+    let module = module_code_unit(file);
+    projection.top_level_declarations.push(module.clone());
+    projection.declarations.push(module.clone());
+    projection
+        .ranges
+        .entry(module)
+        .or_default()
+        .push(brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::full_source_range(source));
+}
+
+static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraphStrategy::new();
+
+fn js_ts_ecosystem() -> UsageEcosystem {
+    UsageEcosystem::JavaScriptTypeScript
+}
+
+fn js_ts_reference_usage_strategy()
+-> &'static dyn brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer {
+    &JS_TS_USAGE_STRATEGY
+}
+
+fn js_ts_reference_graph_backend()
+-> brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend {
+    brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(&JsTsEdgePass)
+}
+
+fn js_ts_dead_code_support() -> DeadCodeSupport {
+    DeadCodeSupport {
+        strategy: Some(&JS_TS_USAGE_STRATEGY),
+        bulk: Some(&JsTsDeadCodeBulk),
+    }
+}
+
+/// The canonical owner a single-segment JS/TS external callee publishes, or
+/// `None` when the owner names no external identity at all (#2598).
+///
+/// One rule for both dialects, because the binding structure it reads is the
+/// same one. The callee has already failed to resolve by the time this runs, so
+/// the only question left is what the file itself says about the owner name:
+///
+///   * bound by an import or `require` that names a package or runtime builtin
+///     -- the owner is that module's identity. A default, namespace or
+///     CommonJS module-object binding *is* the module, so the specifier is the
+///     owner and `import p from 'path'` keys identically to
+///     `import path from 'path'`. The specifier is read in its canonical
+///     spelling, so `node:path` and `path` are one owner (#2609). Such a
+///     binding names a shared mutable object, so the identity is published
+///     only while this file proves it writes nothing to `member`: after
+///     `cp.execSync = f`, `cp[key] = f`, `Object.assign(cp, ...)` or
+///     `delete cp.execSync` the value read at the callee is no longer the
+///     module's own and no external identity is published for it (#3427). A
+///     named import binds a member *of* the module, and that member is itself
+///     the owner: `import { Buffer } from 'buffer'` makes `Buffer.from` owner
+///     `Buffer`, never `buffer`;
+///   * bound by an import whose specifier is relative or absolute -- refused.
+///     That specifier addresses a workspace file, so a call through it that did
+///     not resolve is a resolution gap to fix, not an external surface to
+///     model;
+///   * bound by anything else in scope at the call -- a parameter, a local, a
+///     class, a function, a catch binder -- refused. `opts.parse(x)` where
+///     `opts` is a parameter names the parameter's runtime value, and no
+///     authored summary can claim it;
+///   * bound by nothing -- admitted as itself. `JSON`, `Buffer` and `crypto`
+///     reach a call site with no binding anywhere in the file precisely because
+///     they are the runtime's own globals.
+///
+/// The last arm is a definition check, not a reviewed table of global names. A
+/// table would have to be kept current with several runtimes and would still
+/// answer wrongly for a file that shadows one of its entries; the binding
+/// question answers both cases from the file in hand.
+fn js_ts_single_segment_external_owner(
+    owner: &str,
+    member: &str,
+    site: &ExternalCalleeSite<'_>,
+) -> Option<String> {
+    let binder = compute_js_ts_import_binder(site.source, site.tree);
+    if binder.has_competing_static_imports(owner) || binder.was_truncated(owner) {
+        return None;
+    }
+    let Some(binding) = binder.binding(owner) else {
+        // Nothing in the file binds the name at this point, so it is the
+        // runtime's own global and is its own owner.
+        let lexical = JsTsLexicalBindingIndex::build(site.tree.root_node(), site.source);
+        return (!lexical.is_bound_at(owner, site.callee_start_byte)).then(|| owner.to_owned());
+    };
+    // A relative or absolute specifier addresses a workspace file rather than a
+    // package, which is what `js_ts_module_identity` answers `None` for. The
+    // same call folds Node's `node:` scheme away, so `node:fs` and `fs` mint one
+    // owner (#2609).
+    let module = js_ts_module_identity(&binding.module_specifier)?;
+    match binding.kind {
+        ImportKind::Default | ImportKind::Namespace | ImportKind::CommonJsRequire => {
+            // #3427: the binding is the shared module object, so the member
+            // this callee reads is the module's own only while the file writes
+            // nothing to it. The same #3406 proof the summary closure uses
+            // answers that, and refusing here keeps every consumer of the exact
+            // external member -- call bindings, the resolution surface, the
+            // usage scans -- from asserting an exactness the module replaced.
+            let lexical = binder
+                .lexical_bindings()
+                .expect("a computed import binder carries its lexical binding index");
+            site.file_evidence
+                .js_ts_module_member_writes
+                .writes(
+                    site.tree.root_node(),
+                    site.source,
+                    module.specifier,
+                    lexical,
+                    &binder,
+                )
+                .mutation(member)
+                .is_none()
+                .then(|| module.specifier.to_owned())
+        }
+        ImportKind::Named => Some(owner.to_owned()),
+        // A glob binds no single name, so it cannot be what bound this owner.
+        ImportKind::Glob => None,
+    }
+}
+
+#[doc(hidden)]
+pub struct JavascriptSupport;
+
+fn is_js_ts_config_file(file: &ProjectFile) -> bool {
+    matches!(
+        file.rel_path().file_name().and_then(|name| name.to_str()),
+        Some(
+            "tsconfig.json"
+                | "jsconfig.json"
+                | "package.json"
+                | "package-lock.json"
+                | "npm-shrinkwrap.json"
+                | "pnpm-lock.yaml"
+                | "yarn.lock"
+        )
+    )
+}
+
+impl LanguageSupport for JavascriptSupport {
+    fn selected_dependency_file_evidence(
+        &self,
+        _root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
+    }
+
+    fn workspace_semantic_diagnostics(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::model::SemanticDiagnosticReport> {
+        // JS/TS diagnostics judge external imports against the activated npm
+        // declaration surface and the retained npm discovery evidence (#1620).
+        // Both hang off the analyzer that owns the workspace snapshot, which is
+        // this one: a delegate passed on its own carries no snapshot caches and
+        // would report every npm import as an unknown boundary.
+        Some(diagnostics::collect_javascript_semantic_diagnostics(
+            workspace, file, source,
+        ))
+    }
+
+    fn knowledge(
+        &self,
+    ) -> &'static dyn brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge {
+        &brokk_bifrost_js_ts::JavascriptKnowledge
+    }
+
+    fn build_analyzer(
+        &self,
+        project: Arc<dyn brokk_bifrost_core::analyzer::project::Project>,
+        config: brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        store_context: brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::AnalyzerStoreContext,
+        progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate,
+        brokk_bifrost_analysis::analyzer::store::StoreError,
+    > {
+        Ok(
+            brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate::new(
+                JavascriptAnalyzer::new_with_config_store_context(
+                    project,
+                    config,
+                    store_context,
+                    progress,
+                )?,
+            ),
+        )
+    }
+
+    fn is_configuration_input(&self, file: &ProjectFile) -> bool {
+        is_js_ts_config_file(file)
+    }
+
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        dependency_evidence::is_js_ts_dependency_input(path)
+    }
+
+    fn procedure_syntax_roles(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
+    }
+
+    fn type_flow_adapter(
+        &self,
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::semantic::type_flow::TypeFlowAdapter>
+    {
+        Some(&JavascriptSupport)
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+            .map(|javascript| javascript.ranges_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+            .map(|javascript| javascript.signatures_limited(unit, limit))
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::forward_query_provider::<JavascriptAnalyzer>(
+            analyzer,
+        )
+    }
+
+    fn ecosystem(&self) -> UsageEcosystem {
+        js_ts_ecosystem()
+    }
+
+    fn dependency_pack_resolver(
+        &self,
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyResolver>{
+        Some(&dependency_packs::NpmDependencyResolver)
+    }
+
+    fn is_file_dependency_input(&self, path: &std::path::Path) -> bool {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        self.dependency_pack_resolver()
+            .expect("npm resolver")
+            .dependency_inputs()
+            .contains(&name)
+            || matches!(name, "tsconfig.json" | "jsconfig.json")
+    }
+
+    fn reference_usage_strategy(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer {
+        js_ts_reference_usage_strategy()
+    }
+
+    fn bounded_type_resolution(
+        &self,
+        definitions: &brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::AnalyzerDefinitionLookup<'_>,
+        language: Language,
+        query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> Option<
+        brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+            brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome,
+        >,
+    > {
+        definitions.set_language(language);
+        Some(
+            crate::analyzer::usages::get_type::resolve_js_ts_type_bounded(
+                query.analyzer,
+                definitions,
+                query.file,
+                language,
+                query.source,
+                query.tree,
+                query.site,
+                query.budget,
+                None,
+            ),
+        )
+    }
+
+    fn reference_graph_backend(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend {
+        js_ts_reference_graph_backend()
+    }
+
+    fn definition_declared_import_route(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+        leading: &str,
+        evidence: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryEvidence,
+    ) -> bool {
+        let language = self.knowledge().language();
+
+        let Some(index) =
+            crate::analyzer::usages::js_ts_graph::cached_jsts_index(analyzer, language, None)
+        else {
+            return false;
+        };
+        index
+            .import_bindings(file, leading)
+            .any(|binding| evidence.declares_module_path(&binding.module_specifier))
+    }
+
+    fn definition_site_for_focus(
+        &self,
+        site: brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        _start: Option<usize>,
+        _end: Option<usize>,
+    ) -> brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+        crate::analyzer::usages::get_definition::js_ts::jsts_site_for_focus(
+            site,
+            tree.root_node(),
+            source,
+            self.knowledge().language(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_definition_dispatch<'a>(
+        &self,
+        analyzer: &'a dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        context: &mut brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionBatchContext<'a, '_>,
+        request: &brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest,
+        source: &std::sync::Arc<str>,
+        tree: &Option<tree_sitter::Tree>,
+        site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+        operation: Option<brokk_bifrost_analysis::navigation::NavigationOperation>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        go_session: Option<
+            &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+        >,
+    ) -> std::ops::ControlFlow<
+        brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
+        brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
+    > {
+        crate::analyzer::usages::get_definition::js_ts::resolve_definition_dispatch(
+            analyzer,
+            token,
+            context,
+            request,
+            source,
+            tree,
+            site,
+            operation,
+            cancellation,
+            go_session,
+        )
+    }
+
+    fn definition_call_reference_candidate(&self, node: tree_sitter::Node<'_>) -> bool {
+        crate::analyzer::usages::get_definition::js_ts::jsts_call_reference_candidate(node)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        js_ts_dead_code_support()
+    }
+
+    fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
+        Some(&JsTsReceiverFacts)
+    }
+
+    fn local_declaration_binding_scope<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<LocalDeclarationBindingScope<'tree>> {
+        js_ts_local_declaration_binding_scope(node)
+    }
+
+    fn single_segment_external_owner(
+        &self,
+        owner: &str,
+        member: &str,
+        site: &ExternalCalleeSite<'_>,
+    ) -> Option<String> {
+        js_ts_single_segment_external_owner(owner, member, site)
+    }
+}
+
+#[doc(hidden)]
+pub struct TypescriptSupport;
+
+impl LanguageSupport for TypescriptSupport {
+    fn selected_dependency_file_evidence(
+        &self,
+        _root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
+    }
+
+    fn workspace_semantic_diagnostics(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::model::SemanticDiagnosticReport> {
+        // JS/TS diagnostics judge external imports against the activated npm
+        // declaration surface and the retained npm discovery evidence (#1620).
+        // Both hang off the analyzer that owns the workspace snapshot, which is
+        // this one: a delegate passed on its own carries no snapshot caches and
+        // would report every npm import as an unknown boundary.
+        Some(diagnostics::collect_typescript_semantic_diagnostics(
+            workspace, file, source,
+        ))
+    }
+
+    fn knowledge(
+        &self,
+    ) -> &'static dyn brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge {
+        &brokk_bifrost_js_ts::TypescriptKnowledge
+    }
+
+    fn build_analyzer(
+        &self,
+        project: Arc<dyn brokk_bifrost_core::analyzer::project::Project>,
+        config: brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        store_context: brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::AnalyzerStoreContext,
+        progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate,
+        brokk_bifrost_analysis::analyzer::store::StoreError,
+    > {
+        Ok(
+            brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate::new(
+                TypescriptAnalyzer::new_with_config_store_context(
+                    project,
+                    config,
+                    store_context,
+                    progress,
+                )?,
+            ),
+        )
+    }
+
+    fn is_configuration_input(&self, file: &ProjectFile) -> bool {
+        is_js_ts_config_file(file)
+    }
+
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        dependency_evidence::is_js_ts_dependency_input(path)
+    }
+
+    fn procedure_syntax_roles(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
+    }
+
+    fn call_argument_conversion_prover(
+        &self,
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::usages::call_conversion::CallArgumentConversionProver>
+{
+        Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
+    }
+
+    fn type_flow_adapter(
+        &self,
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::semantic::type_flow::TypeFlowAdapter>
+    {
+        Some(&TypescriptSupport)
+    }
+
+    fn local_declaration_binding_scope<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<LocalDeclarationBindingScope<'tree>> {
+        js_ts_local_declaration_binding_scope(node)
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+            .map(|typescript| typescript.ranges_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+            .map(|typescript| typescript.signatures_limited(unit, limit))
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::forward_query_provider::<TypescriptAnalyzer>(
+            analyzer,
+        )
+    }
+
+    fn ecosystem(&self) -> UsageEcosystem {
+        js_ts_ecosystem()
+    }
+
+    fn reference_usage_strategy(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer {
+        js_ts_reference_usage_strategy()
+    }
+
+    fn bounded_type_resolution(
+        &self,
+        definitions: &brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::AnalyzerDefinitionLookup<'_>,
+        language: Language,
+        query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> Option<
+        brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+            brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome,
+        >,
+    > {
+        definitions.set_language(language);
+        Some(
+            crate::analyzer::usages::get_type::resolve_js_ts_type_bounded(
+                query.analyzer,
+                definitions,
+                query.file,
+                language,
+                query.source,
+                query.tree,
+                query.site,
+                query.budget,
+                None,
+            ),
+        )
+    }
+
+    fn reference_graph_backend(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend {
+        js_ts_reference_graph_backend()
+    }
+
+    fn definition_declared_import_route(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+        leading: &str,
+        evidence: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryEvidence,
+    ) -> bool {
+        let language = self.knowledge().language();
+
+        let Some(index) =
+            crate::analyzer::usages::js_ts_graph::cached_jsts_index(analyzer, language, None)
+        else {
+            return false;
+        };
+        index
+            .import_bindings(file, leading)
+            .any(|binding| evidence.declares_module_path(&binding.module_specifier))
+    }
+
+    fn definition_call_reference_candidate(&self, node: tree_sitter::Node<'_>) -> bool {
+        crate::analyzer::usages::get_definition::js_ts::jsts_call_reference_candidate(node)
+    }
+
+    fn definition_site_for_focus(
+        &self,
+        site: brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        _start: Option<usize>,
+        _end: Option<usize>,
+    ) -> brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+        crate::analyzer::usages::get_definition::js_ts::jsts_site_for_focus(
+            site,
+            tree.root_node(),
+            source,
+            self.knowledge().language(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_definition_dispatch<'a>(
+        &self,
+        analyzer: &'a dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        context: &mut brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionBatchContext<'a, '_>,
+        request: &brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest,
+        source: &std::sync::Arc<str>,
+        tree: &Option<tree_sitter::Tree>,
+        site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+        operation: Option<brokk_bifrost_analysis::navigation::NavigationOperation>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        go_session: Option<
+            &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+        >,
+    ) -> std::ops::ControlFlow<
+        brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
+        brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
+    > {
+        crate::analyzer::usages::get_definition::js_ts::resolve_definition_dispatch(
+            analyzer,
+            token,
+            context,
+            request,
+            source,
+            tree,
+            site,
+            operation,
+            cancellation,
+            go_session,
+        )
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        js_ts_dead_code_support()
+    }
+
+    fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
+        Some(&JsTsReceiverFacts)
+    }
+
+    fn single_segment_external_owner(
+        &self,
+        owner: &str,
+        member: &str,
+        site: &ExternalCalleeSite<'_>,
+    ) -> Option<String> {
+        js_ts_single_segment_external_owner(owner, member, site)
+    }
+}
+
+/// One pass for both dialects: JavaScript and TypeScript are resolved together, so
+/// `JavascriptSupport` and `TypescriptSupport` return this same object and the collector
+/// runs it once. The two finalizations differ in node identity as well as product -- the
+/// sites path is fqn-keyed like every other language, while the weights path is keyed by
+/// `{file, fqn}` so same-named exports in different modules stay distinct.
+struct JsTsEdgePass;
+
+impl LanguageEdgePass for JsTsEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::JsTs
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        build_rooted_jsts_scoped_usage_edges(
+            ctx.analyzer,
+            scope.token(),
+            ctx.scoped_callers,
+            ctx.keep_file,
+        )
+        .map(LanguageEdgeSites::Scoped)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        build_jsts_scoped_usage_edges(ctx.analyzer, scope.token(), ctx.scoped_nodes, ctx.keep_file)
+            .map(LanguageEdgeWeights::Scoped)
+    }
+}
+
+/// One proof for both dialects, as with [`JsTsEdgePass`]: JavaScript and TypeScript
+/// candidates share a bucket and one scoped build.
+struct JsTsDeadCodeBulk;
+
+impl DeadCodeBulkProof for JsTsDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::JsTs
+    }
+
+    fn needs_precise_scan(&self, _routing: DeadCodeRouting<'_>) -> bool {
+        false
+    }
+
+    /// The cap is measured against JavaScript *and* TypeScript file counts summed,
+    /// because one scoped build covers both, and its diagnostics say "JS/TS" rather than
+    /// naming either dialect.
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "JS/TS",
+            files: [Language::JavaScript, Language::TypeScript]
+                .into_iter()
+                .map(|language| analyzable_file_count(analyzer, language))
+                .sum(),
+        }
+    }
+
+    /// Keyed by `{file, fqn}`, and its product carries the per-node seed statuses the
+    /// caller needs to tell a resolved export from an ambiguous or unseedable one.
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let mut nodes: HashSet<UsageNodeKey> = analyzer
+            .all_declarations()
+            .filter(|unit| {
+                matches!(
+                    language_for_target(unit),
+                    Language::JavaScript | Language::TypeScript
+                ) && !unit.is_synthetic()
+                    && (unit.is_function() || unit.is_class() || unit.is_field())
+            })
+            .map(|unit| UsageNodeKey::from_unit(&unit))
+            .collect();
+        nodes.extend(candidates.iter().map(UsageNodeKey::from_unit));
+        let scope = AnalyzerQueryScope::new(analyzer);
+        build_jsts_scoped_usage_edges(analyzer, scope.token(), &nodes, |_| true)
+            .map(DeadCodeBulkEdges::Scoped)
+    }
+}
+
+mod dependency_packs {
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackAdapter;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyResolver;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyResolverBounds;
+
+    use brokk_bifrost_analysis::analyzer::workspace::READS_FILES_ONLY;
+
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+
+    use brokk_bifrost_core::analyzer::project::Project;
+
+    use crate::analyzer::JsTsDependencyPackAdapter;
+
+    use crate::analyzer::resolve_js_ts_semantic_pack_dependencies;
+    pub(crate) struct NpmDependencyResolver;
+
+    impl DependencyResolver for NpmDependencyResolver {
+        fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+            &JsTsDependencyPackAdapter
+        }
+
+        fn dependency_inputs(&self) -> &'static [&'static str] {
+            &["package.json", "package-lock.json", "npm-shrinkwrap.json"]
+        }
+
+        fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
+            READS_FILES_ONLY
+        }
+
+        fn resolve(
+            &self,
+            config: &AnalyzerConfig,
+            project: &dyn Project,
+            limits: &DependencyPackLimits,
+            cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        ) -> DependencyDiscoveryOutcome {
+            resolve_js_ts_semantic_pack_dependencies(
+                &config.js_ts.dependency_discovery,
+                project,
+                limits,
+                cancellation,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::analyzer::js_ts::*;
+    use tree_sitter::Tree;
+
+    fn parse_javascript(source: &str) -> Tree {
+        brokk_bifrost_js_ts::test_support::parse_javascript(source)
+    }
+
+    fn parse_typescript(source: &str) -> Tree {
+        brokk_bifrost_js_ts::test_support::parse_typescript(source)
+    }
+
+    use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon("162329a7af0f: RuleTester suites must remain in changed-test scope")]
+    fn rule_tester_commonjs_suite_is_structurally_a_test() {
+        let source = r#"
+const RuleTester = require("../../../lib/rule-tester/rule-tester");
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, { valid: [], invalid: [] });
+"#;
+        let tree = parse_javascript(source);
+        assert!(contains_tests(
+            &ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                "tests/lib/rules/rule.js",
+            ),
+            source,
+            &tree
+        ));
+    }
+    #[test]
+    #[hardwon(
+        "162329a7af0f: JavaScript and TypeScript RuleTester bindings must both be recognized"
+    )]
+    fn rule_tester_suite_detection_is_shared_with_typescript() {
+        let source = r#"
+const RuleTester = require("eslint");
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, { valid: [], invalid: [] });
+"#;
+        let tree = parse_typescript(source);
+        assert!(contains_tests(
+            &ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                "tests/lib/rules/rule.ts",
+            ),
+            source,
+            &tree
+        ));
+
+        let import_source = r#"import { RuleTester } from "eslint";
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, {});
+"#;
+        let import_tree = parse_typescript(import_source);
+        assert!(rule_tester_suite_contains_tests(
+            &import_tree,
+            import_source
+        ));
+        let destructured_source = r#"const { RuleTester } = require("eslint");
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, {});
+"#;
+        let destructured_tree = parse_javascript(destructured_source);
+        assert!(rule_tester_suite_contains_tests(
+            &destructured_tree,
+            destructured_source
+        ));
+
+        let member_source = r#"const RuleTester = require("eslint").RuleTester;
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, {});
+"#;
+        let member_tree = parse_javascript(member_source);
+        assert!(rule_tester_suite_contains_tests(
+            &member_tree,
+            member_source
+        ));
+
+        let aliased_source = r#"const { RuleTester: RT } = require("eslint");
+const tester = new RT({});
+tester.run("rule", rule, {});
+"#;
+        let aliased_tree = parse_javascript(aliased_source);
+        assert!(rule_tester_suite_contains_tests(
+            &aliased_tree,
+            aliased_source
+        ));
+
+        let default_source = r#"import RuleTester from "eslint";
+const tester = new RuleTester({});
+tester.run("rule", rule, {});
+"#;
+        let default_tree = parse_typescript(default_source);
+        assert!(rule_tester_suite_contains_tests(
+            &default_tree,
+            default_source
+        ));
+    }
+    #[test]
+    #[hardwon("162329a7af0f: unrelated bindings and source text must not create a test scope")]
+    fn rule_tester_detection_rejects_unrelated_bindings_and_text() {
+        let cases = [
+            r#"
+const RuleTester = require("rule-tester");
+const worker = new OtherTester({});
+worker.run("rule", rule, {});
+"#,
+            r#"
+const RuleTester = require("unrelated");
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, {});
+"#,
+            r#"
+const RuleTester = require("rule-tester");
+const ruleTester = new RuleTester({});
+worker.run("rule", rule, {});
+"#,
+            r#"
+// const RuleTester = require("rule-tester"); ruleTester.run("not a suite");
+const text = "new RuleTester({}); ruleTester.run()";
+"#,
+            r#"
+const RuleTester = require("rule-tester");
+const ruleTester = new RuleTester({});
+ruleTester["run"]("rule", rule, {});
+"#,
+            r#"
+const RuleTester = require("not-eslint").RuleTester;
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, {});
+"#,
+            r#"
+const { OtherTester: RuleTester } = require("eslint");
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, {});
+"#,
+            r#"
+import RuleTester from "not-eslint";
+const ruleTester = new RuleTester({});
+ruleTester.run("rule", rule, {});
+"#,
+        ];
+
+        for source in cases {
+            let tree = parse_javascript(source);
+            assert!(!rule_tester_suite_contains_tests(&tree, source), "{source}");
+        }
+    }
+    #[test]
+    #[hardwon(
+        "c57bd22bfb18: Source-text matches such as emit/init/split were misclassified as test declarations"
+    )]
+    fn test_dsl_detection_uses_call_structure_and_callback_shape() {
+        let positive_sources = [
+            r#"describe("suite", () => {});"#,
+            r#"test("case", function () {});"#,
+            r#"it.only("case", async () => {});"#,
+            r#"test.each(cases)("case", () => {});"#,
+            r#"suite("suite", () => {});"#,
+        ];
+        for source in positive_sources {
+            let tree = parse_javascript(source);
+            assert!(tree_contains_test_dsl_calls(&tree, source), "{source}");
+        }
+
+        let near_miss_sources = [
+            // These ordinary production callees themselves contain the old
+            // `it(` source-search needle at the end of their identifiers.
+            r#"emit("event", () => {});"#,
+            r#"init("runtime", () => {});"#,
+            r#"split("value", () => {});"#,
+            r#"const text = "describe(";"#,
+            // A same-named helper without a test callback is not a DSL
+            // declaration.
+            r#"test("ordinary helper");"#,
+        ];
+        for source in near_miss_sources {
+            let tree = parse_javascript(source);
+            assert!(!tree_contains_test_dsl_calls(&tree, source), "{source}");
+        }
+    }
+
+    #[test]
+    fn node_test_filename_requires_a_strong_test_root() {
+        let production = "module.exports = function init(value) { return value; };";
+        let cases = [
+            ("test/parallel/test-http.js", true),
+            ("test/parallel/test_http.js", true),
+            ("test/embedding/test-api.mjs", true),
+            ("testData/parallel/test-http.js", false),
+            ("fixtures/test-http.js", false),
+            ("lib/test-http.js", false),
+            ("src/test-http.js", false),
+            ("test/parallel/helper.js", false),
+            ("test/parallel/test-http.ts", false),
+        ];
+        for (path, expected) in cases {
+            let file = ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                path,
+            );
+            let tree = parse_javascript(production);
+            assert_eq!(contains_tests(&file, production, &tree), expected, "{path}");
+        }
+    }
+    #[test]
+    #[hardwon("c57bd22bfb18: conventional test suffixes must survive structural detection")]
+    fn conventional_test_suffixes_remain_supported_without_source_text() {
+        for path in ["src/parser.test.js", "src/parser.spec.ts"] {
+            let file = ProjectFile::new(
+                std::env::current_dir().expect("test working directory must be available"),
+                path,
+            );
+            let tree = parse_javascript("");
+            assert!(contains_tests(&file, "", &tree), "{path}");
+        }
+    }
+}

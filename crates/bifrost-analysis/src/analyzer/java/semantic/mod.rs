@@ -150,7 +150,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                     ..SemanticWork::default()
                 });
                 let exceeded = budget
-                    .check(work)
+                    .check_admission(work)
                     .expect_err("structural minimum exceeds its remaining semantic budget");
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,

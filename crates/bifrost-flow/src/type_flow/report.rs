@@ -107,7 +107,7 @@ impl TypeFlowReport {
                 attempt
                     .budget_exhaustion
                     .map(|exceeded| TypeFlowRootSolverExhaustion {
-                        root: result.root.semantics().locator().clone(),
+                        root: result.root.locator.clone(),
                         phase: attempt.phase,
                         exceeded,
                     })

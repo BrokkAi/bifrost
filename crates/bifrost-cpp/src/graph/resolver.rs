@@ -978,23 +978,26 @@ impl IncludePathAdmission {
     }
 }
 
-/// Per-query C++ visibility facts.
-///
-/// The analyzer is *borrowed*, never cloned: `TreeSitterAnalyzer::clone` gives
-/// the clone a fresh, empty `QueryReadCache` on purpose (clones cross
-/// generations and overlays, where another generation's hydrated states would
-/// be wrong). An index that owned a clone would therefore see an inactive read
-/// cache for every `prepared_syntax` call it makes, re-reading and re-parsing
-/// the same source from the store once per candidate instead of once per query
-/// — the #1175 blow-up, where one scan re-parsed a 4.8 MB generated header
-/// tens of thousands of times.
+/// Per-query C++ visibility facts with a borrowed source and scope proof.
+/// Cache only `data()` across calls, and reattach the current source and token
+/// with `from_data`; cloning the analyzer would lose its query read cache.
 pub struct VisibilityIndex<'a> {
     cpp: &'a dyn CppSource,
-    /// Proof that the request scope the index was built under is still open.
-    /// The index is a per-query object whose lifetime is inside the scope's,
-    /// so carrying the token here instead of on ninety method signatures is
-    /// the same guarantee for far less plumbing (issue #2414 step 3).
     token: QueryToken<'a>,
+    data: Arc<VisibilityIndexData>,
+}
+
+impl std::ops::Deref for VisibilityIndex<'_> {
+    type Target = VisibilityIndexData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+/// Owned visibility facts. They retain no source or request-scope borrow.
+/// The caller keeps these facts inside the query that built them.
+pub struct VisibilityIndexData {
     pub visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     global_field_internal_linkage: HashMap<CodeUnit, bool>,
@@ -1095,7 +1098,7 @@ pub struct VisibilityIndex<'a> {
     visibility_identifier_batch_count: usize,
 }
 
-impl Drop for VisibilityIndex<'_> {
+impl Drop for VisibilityIndexData {
     fn drop(&mut self) {
         if std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_none() {
             return;
@@ -1839,6 +1842,18 @@ where
 }
 
 impl<'a> VisibilityIndex<'a> {
+    pub fn data(&self) -> Arc<VisibilityIndexData> {
+        Arc::clone(&self.data)
+    }
+
+    pub fn from_data(
+        cpp: &'a dyn CppSource,
+        token: QueryToken<'a>,
+        data: Arc<VisibilityIndexData>,
+    ) -> Self {
+        Self { cpp, token, data }
+    }
+
     pub fn cpp(&self) -> &'a dyn CppSource {
         self.cpp
     }
@@ -2007,72 +2022,74 @@ impl<'a> VisibilityIndex<'a> {
         Self {
             cpp,
             token,
-            visible_by_identifier: build_visible_identifier_index(
-                &CppGraphSource::from_source(cpp, token),
-                &visible_by_file,
-                &visible_source_files_by_root,
-                &mut global_field_internal_linkage,
-            ),
-            global_field_internal_linkage,
-            visible_by_file,
-            visible_source_files_by_root,
-            alias_cells: Mutex::new(HashMap::default()),
-            visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
-            parser_alias_target_matches: RwLock::new(HashMap::default()),
-            ordinary_type_import_cells: Mutex::new(HashMap::default()),
-            project_using_index: OnceLock::new(),
-            callable_reference_specs: Mutex::new(HashMap::default()),
-            structured_include_fact_cells: Mutex::new(HashMap::default()),
-            include_activation_cells: Mutex::new(HashMap::default()),
-            compile_proven_guard_cells: Mutex::new(HashMap::default()),
-            include_path_admission_cells: Mutex::new(HashMap::default()),
-            conditional_include_projection_cells: Mutex::new(HashMap::default()),
-            conditional_include_projection_index_build_count: AtomicUsize::new(0),
-            conditional_include_projection_state_count: AtomicUsize::new(0),
-            conditional_include_target_state_count: AtomicUsize::new(0),
-            include_activation_build_count: AtomicUsize::new(0),
-            using_donor_activation_count: AtomicUsize::new(0),
-            using_namespace_lookup_count: AtomicUsize::new(0),
-            using_name_candidate_inspection_count: AtomicUsize::new(0),
-            callable_reference_spec_build_count: AtomicUsize::new(0),
-            alias_source_parse_counts: Mutex::new(HashMap::default()),
-            visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
-            parser_alias_fallback_calls: AtomicUsize::new(0),
-            parser_alias_fallback_files: AtomicUsize::new(0),
-            parser_alias_source_parses: AtomicUsize::new(0),
-            parser_alias_fallback_elapsed_micros: AtomicUsize::new(0),
-            field_type_facts: Mutex::new(HashMap::default()),
-            structured_alias_targets: Mutex::new(HashMap::default()),
-            callable_comparables: Mutex::new(HashMap::default()),
-            callable_metadata: Mutex::new(HashMap::default()),
-            comparable_name_declarations: Mutex::new(HashMap::default()),
-            indexed_structural_class_scopes: Mutex::new(HashMap::default()),
-            indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
-            precise_parent_cache: Mutex::new(HashMap::default()),
-            c_tag_kind_cache: Mutex::new(HashMap::default()),
-            c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
-            macro_event_cells: Mutex::new(HashMap::default()),
-            macro_event_name_sets: Mutex::new(HashMap::default()),
-            macro_include_protection_cells: Mutex::new(HashMap::default()),
-            macro_environment_checkpoints: Mutex::new(HashMap::default()),
-            macro_replacements: Mutex::new(HashMap::default()),
-            macro_local_binding_templates: Mutex::new(HashMap::default()),
-            macro_lexical_templates: Mutex::new(HashMap::default()),
-            macro_lexical_indexes: Mutex::new(HashMap::default()),
-            macro_replacement_bodies: Mutex::new(HashMap::default()),
-            macro_type_parameters: Mutex::new(HashMap::default()),
-            callable_parameter_macro_arities: Mutex::new(HashMap::default()),
-            macro_replacement_parse_count: AtomicUsize::new(0),
-            macro_event_application_count: AtomicUsize::new(0),
-            macro_environment_checkpoint_build_count: AtomicUsize::new(0),
-            macro_environment_copy_count: AtomicUsize::new(0),
-            macro_environment_request_count: AtomicUsize::new(0),
-            cpp_template_metadata: HashMap::default(),
-            cpp_template_families: HashMap::default(),
-            qualified_candidate_inspections: AtomicUsize::new(0),
-            target_preserving_type_resolution_count: AtomicUsize::new(0),
-            visibility_identifier_lookup_count: 0,
-            visibility_identifier_batch_count: 0,
+            data: Arc::new(VisibilityIndexData {
+                visible_by_identifier: build_visible_identifier_index(
+                    &CppGraphSource::from_source(cpp, token),
+                    &visible_by_file,
+                    &visible_source_files_by_root,
+                    &mut global_field_internal_linkage,
+                ),
+                global_field_internal_linkage,
+                visible_by_file,
+                visible_source_files_by_root,
+                alias_cells: Mutex::new(HashMap::default()),
+                visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
+                parser_alias_target_matches: RwLock::new(HashMap::default()),
+                ordinary_type_import_cells: Mutex::new(HashMap::default()),
+                project_using_index: OnceLock::new(),
+                callable_reference_specs: Mutex::new(HashMap::default()),
+                structured_include_fact_cells: Mutex::new(HashMap::default()),
+                include_activation_cells: Mutex::new(HashMap::default()),
+                compile_proven_guard_cells: Mutex::new(HashMap::default()),
+                include_path_admission_cells: Mutex::new(HashMap::default()),
+                conditional_include_projection_cells: Mutex::new(HashMap::default()),
+                conditional_include_projection_index_build_count: AtomicUsize::new(0),
+                conditional_include_projection_state_count: AtomicUsize::new(0),
+                conditional_include_target_state_count: AtomicUsize::new(0),
+                include_activation_build_count: AtomicUsize::new(0),
+                using_donor_activation_count: AtomicUsize::new(0),
+                using_namespace_lookup_count: AtomicUsize::new(0),
+                using_name_candidate_inspection_count: AtomicUsize::new(0),
+                callable_reference_spec_build_count: AtomicUsize::new(0),
+                alias_source_parse_counts: Mutex::new(HashMap::default()),
+                visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
+                parser_alias_fallback_calls: AtomicUsize::new(0),
+                parser_alias_fallback_files: AtomicUsize::new(0),
+                parser_alias_source_parses: AtomicUsize::new(0),
+                parser_alias_fallback_elapsed_micros: AtomicUsize::new(0),
+                field_type_facts: Mutex::new(HashMap::default()),
+                structured_alias_targets: Mutex::new(HashMap::default()),
+                callable_comparables: Mutex::new(HashMap::default()),
+                callable_metadata: Mutex::new(HashMap::default()),
+                comparable_name_declarations: Mutex::new(HashMap::default()),
+                indexed_structural_class_scopes: Mutex::new(HashMap::default()),
+                indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
+                precise_parent_cache: Mutex::new(HashMap::default()),
+                c_tag_kind_cache: Mutex::new(HashMap::default()),
+                c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
+                macro_event_cells: Mutex::new(HashMap::default()),
+                macro_event_name_sets: Mutex::new(HashMap::default()),
+                macro_include_protection_cells: Mutex::new(HashMap::default()),
+                macro_environment_checkpoints: Mutex::new(HashMap::default()),
+                macro_replacements: Mutex::new(HashMap::default()),
+                macro_local_binding_templates: Mutex::new(HashMap::default()),
+                macro_lexical_templates: Mutex::new(HashMap::default()),
+                macro_lexical_indexes: Mutex::new(HashMap::default()),
+                macro_replacement_bodies: Mutex::new(HashMap::default()),
+                macro_type_parameters: Mutex::new(HashMap::default()),
+                callable_parameter_macro_arities: Mutex::new(HashMap::default()),
+                macro_replacement_parse_count: AtomicUsize::new(0),
+                macro_event_application_count: AtomicUsize::new(0),
+                macro_environment_checkpoint_build_count: AtomicUsize::new(0),
+                macro_environment_copy_count: AtomicUsize::new(0),
+                macro_environment_request_count: AtomicUsize::new(0),
+                cpp_template_metadata: HashMap::default(),
+                cpp_template_families: HashMap::default(),
+                qualified_candidate_inspections: AtomicUsize::new(0),
+                target_preserving_type_resolution_count: AtomicUsize::new(0),
+                visibility_identifier_lookup_count: 0,
+                visibility_identifier_batch_count: 0,
+            }),
         }
     }
 
@@ -2283,86 +2300,88 @@ impl<'a> VisibilityIndex<'a> {
         Self {
             cpp,
             token,
-            visible_by_file,
-            visible_by_identifier,
-            global_field_internal_linkage,
-            visible_source_files_by_root,
-            alias_cells: Mutex::new(HashMap::default()),
-            visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
-            parser_alias_target_matches: RwLock::new(HashMap::default()),
-            ordinary_type_import_cells: Mutex::new(HashMap::default()),
-            project_using_index: OnceLock::new(),
-            callable_reference_specs: Mutex::new(HashMap::default()),
-            structured_include_fact_cells: Mutex::new(HashMap::default()),
-            include_activation_cells: Mutex::new(HashMap::default()),
-            compile_proven_guard_cells: Mutex::new(HashMap::default()),
-            include_path_admission_cells: Mutex::new(HashMap::default()),
-            conditional_include_projection_cells: Mutex::new(HashMap::default()),
-            #[cfg(any(test, feature = "test-support"))]
-            conditional_include_projection_index_build_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            conditional_include_projection_state_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            conditional_include_target_state_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            include_activation_build_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            using_donor_activation_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            using_namespace_lookup_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            using_name_candidate_inspection_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            callable_reference_spec_build_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            alias_source_parse_counts: Mutex::new(HashMap::default()),
-            #[cfg(any(test, feature = "test-support"))]
-            visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
-            parser_alias_fallback_calls: AtomicUsize::new(0),
-            parser_alias_fallback_files: AtomicUsize::new(0),
-            parser_alias_source_parses: AtomicUsize::new(0),
-            parser_alias_fallback_elapsed_micros: AtomicUsize::new(0),
-            field_type_facts: Mutex::new(HashMap::default()),
-            structured_alias_targets: Mutex::new(HashMap::default()),
-            callable_comparables: Mutex::new(HashMap::default()),
-            callable_metadata: Mutex::new(HashMap::default()),
-            comparable_name_declarations: Mutex::new(HashMap::default()),
-            indexed_structural_class_scopes: Mutex::new(HashMap::default()),
-            indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
-            precise_parent_cache: Mutex::new(HashMap::default()),
-            c_tag_kind_cache: Mutex::new(HashMap::default()),
-            c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
-            macro_event_cells: Mutex::new(HashMap::default()),
-            macro_event_name_sets: Mutex::new(HashMap::default()),
-            macro_include_protection_cells: Mutex::new(HashMap::default()),
-            macro_environment_checkpoints: Mutex::new(HashMap::default()),
-            macro_replacements: Mutex::new(HashMap::default()),
-            macro_local_binding_templates: Mutex::new(HashMap::default()),
-            macro_lexical_templates: Mutex::new(HashMap::default()),
-            macro_lexical_indexes: Mutex::new(HashMap::default()),
-            macro_replacement_bodies: Mutex::new(HashMap::default()),
-            macro_type_parameters: Mutex::new(HashMap::default()),
-            callable_parameter_macro_arities: Mutex::new(HashMap::default()),
-            #[cfg(any(test, feature = "test-support"))]
-            macro_replacement_parse_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            macro_event_application_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            macro_environment_checkpoint_build_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            macro_environment_copy_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            macro_environment_request_count: AtomicUsize::new(0),
-            cpp_template_metadata,
-            cpp_template_families,
-            #[cfg(any(test, feature = "test-support"))]
-            qualified_candidate_inspections: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            target_preserving_type_resolution_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            visibility_identifier_lookup_count: visibility_stats.identifier_lookups,
-            #[cfg(any(test, feature = "test-support"))]
-            visibility_identifier_batch_count: visibility_stats.identifier_batches,
+            data: Arc::new(VisibilityIndexData {
+                visible_by_file,
+                visible_by_identifier,
+                global_field_internal_linkage,
+                visible_source_files_by_root,
+                alias_cells: Mutex::new(HashMap::default()),
+                visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
+                parser_alias_target_matches: RwLock::new(HashMap::default()),
+                ordinary_type_import_cells: Mutex::new(HashMap::default()),
+                project_using_index: OnceLock::new(),
+                callable_reference_specs: Mutex::new(HashMap::default()),
+                structured_include_fact_cells: Mutex::new(HashMap::default()),
+                include_activation_cells: Mutex::new(HashMap::default()),
+                compile_proven_guard_cells: Mutex::new(HashMap::default()),
+                include_path_admission_cells: Mutex::new(HashMap::default()),
+                conditional_include_projection_cells: Mutex::new(HashMap::default()),
+                #[cfg(any(test, feature = "test-support"))]
+                conditional_include_projection_index_build_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                conditional_include_projection_state_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                conditional_include_target_state_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                include_activation_build_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                using_donor_activation_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                using_namespace_lookup_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                using_name_candidate_inspection_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                callable_reference_spec_build_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                alias_source_parse_counts: Mutex::new(HashMap::default()),
+                #[cfg(any(test, feature = "test-support"))]
+                visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
+                parser_alias_fallback_calls: AtomicUsize::new(0),
+                parser_alias_fallback_files: AtomicUsize::new(0),
+                parser_alias_source_parses: AtomicUsize::new(0),
+                parser_alias_fallback_elapsed_micros: AtomicUsize::new(0),
+                field_type_facts: Mutex::new(HashMap::default()),
+                structured_alias_targets: Mutex::new(HashMap::default()),
+                callable_comparables: Mutex::new(HashMap::default()),
+                callable_metadata: Mutex::new(HashMap::default()),
+                comparable_name_declarations: Mutex::new(HashMap::default()),
+                indexed_structural_class_scopes: Mutex::new(HashMap::default()),
+                indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
+                precise_parent_cache: Mutex::new(HashMap::default()),
+                c_tag_kind_cache: Mutex::new(HashMap::default()),
+                c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
+                macro_event_cells: Mutex::new(HashMap::default()),
+                macro_event_name_sets: Mutex::new(HashMap::default()),
+                macro_include_protection_cells: Mutex::new(HashMap::default()),
+                macro_environment_checkpoints: Mutex::new(HashMap::default()),
+                macro_replacements: Mutex::new(HashMap::default()),
+                macro_local_binding_templates: Mutex::new(HashMap::default()),
+                macro_lexical_templates: Mutex::new(HashMap::default()),
+                macro_lexical_indexes: Mutex::new(HashMap::default()),
+                macro_replacement_bodies: Mutex::new(HashMap::default()),
+                macro_type_parameters: Mutex::new(HashMap::default()),
+                callable_parameter_macro_arities: Mutex::new(HashMap::default()),
+                #[cfg(any(test, feature = "test-support"))]
+                macro_replacement_parse_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                macro_event_application_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                macro_environment_checkpoint_build_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                macro_environment_copy_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                macro_environment_request_count: AtomicUsize::new(0),
+                cpp_template_metadata,
+                cpp_template_families,
+                #[cfg(any(test, feature = "test-support"))]
+                qualified_candidate_inspections: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                target_preserving_type_resolution_count: AtomicUsize::new(0),
+                #[cfg(any(test, feature = "test-support"))]
+                visibility_identifier_lookup_count: visibility_stats.identifier_lookups,
+                #[cfg(any(test, feature = "test-support"))]
+                visibility_identifier_batch_count: visibility_stats.identifier_batches,
+            }),
         }
     }
 
@@ -15018,23 +15037,83 @@ fn recovered_namespace_open_components<'tree>(
     (!components.is_empty()).then_some((keyword, components))
 }
 
-/// The `namespace_definition` `parent` and the name components with their
-/// token ranges of the namespace whose body `body` is, or `None` when `body`
-/// is not the body of a named `namespace_definition`.
+/// The written head and name-token ranges of the namespace opened by `body`.
+/// Ordinary namespace bodies and one strict damaged literal head share the
+/// existing brace-stack lifetime; a recovered compound body's end is NOT a
+/// namespace close proof (#5868).
 fn namespace_body_name_components<'tree>(
     parent: Node<'tree>,
     body: Node<'tree>,
     source: &str,
 ) -> Option<(Node<'tree>, Vec<(String, Range)>)> {
-    if body.kind() != "declaration_list"
-        || parent.kind() != "namespace_definition"
-        || parent.child_by_field_name("body") != Some(body)
-    {
+    if parent.child_by_field_name("body") != Some(body) {
         return None;
     }
-    let name = parent.child_by_field_name("name")?;
+    let (written_at, name) = match (parent.kind(), body.kind()) {
+        ("namespace_definition", "declaration_list") => {
+            (parent, parent.child_by_field_name("name")?)
+        }
+        ("function_definition", "compound_statement") if parent.has_error() => {
+            // An opaque prefix can make the parser read the literal namespace
+            // keyword as a function declarator. Account for every direct token:
+            // no parameters, attributes, extra names or punctuation may compete.
+            let mut cursor = parent.walk();
+            let children = parent
+                .children(&mut cursor)
+                .filter(|child| child.kind() != "comment")
+                .collect::<Vec<_>>();
+            let [prefix, keyword, error, actual_body] = children.as_slice() else {
+                return None;
+            };
+            if *actual_body != body
+                || parent.child_by_field_name("type") != Some(*prefix)
+                || parent.child_by_field_name("declarator") != Some(*keyword)
+                || prefix.kind() != "type_identifier"
+                || prefix.is_missing()
+                || prefix.has_error()
+                || prefix.child_count() != 0
+                || keyword.kind() != "identifier"
+                || keyword.is_missing()
+                || keyword.has_error()
+                || keyword.child_count() != 0
+                || node_text(*keyword, source) != "namespace"
+                || error.kind() != "ERROR"
+                || error.is_missing()
+                || body.is_missing()
+            {
+                return None;
+            }
+            let mut cursor = error.walk();
+            let names = error
+                .children(&mut cursor)
+                .filter(|child| child.kind() != "comment")
+                .collect::<Vec<_>>();
+            let [name] = names.as_slice() else {
+                return None;
+            };
+            if !matches!(name.kind(), "identifier" | "namespace_identifier")
+                || name.is_missing()
+                || name.has_error()
+                || name.child_count() != 0
+            {
+                return None;
+            }
+            let open = body.child(0)?;
+            if open.kind() != "{"
+                || open.is_missing()
+                || open.has_error()
+                || open.start_byte() != body.start_byte()
+            {
+                return None;
+            }
+            // Keep the literal keyword's provenance, never the unrelated prefix
+            // or the prematurely closed function envelope (#3309, #4292).
+            (*keyword, *name)
+        }
+        _ => return None,
+    };
     let components = cpp_name_component_ranges(name, source)?;
-    (!components.is_empty()).then_some((parent, components))
+    (!components.is_empty()).then_some((written_at, components))
 }
 
 #[derive(Clone, Copy)]
@@ -18779,6 +18858,158 @@ struct AfterAll {};
             )],
             "the recovered namespace owns its full construct, not its first member or just its header"
         );
+    }
+
+    #[test]
+    #[hardwon("#5868: a literal namespace head inside a damaged function wrapper lost its owner")]
+    fn namespace_body_name_components_recovers_literal_function_head() {
+        // Independently authored direct-helper contract, not an index or
+        // short-body reproduction. The index deliberately leaves clean
+        // subtrees intact; head recognition alone does not make this simple
+        // body an indexed recovery region. Corpus index/short-body/outside
+        // ownership remains required by the private root golden prewriter.
+        let source = "OPAQUE_PREFIX\nnamespace recovered\n{\nint member;\n}\nint member;\n";
+        let tree = parse_cpp(source);
+        let keyword_start = source.find("namespace recovered").unwrap();
+        let keyword = tree
+            .root_node()
+            .named_descendant_for_byte_range(keyword_start, keyword_start + "namespace".len())
+            .expect("literal keyword node");
+        assert_eq!(keyword.kind(), "identifier");
+        assert_eq!(keyword.child_count(), 0);
+        assert!(!keyword.is_missing() && !keyword.has_error());
+        assert_eq!(node_text(keyword, source), "namespace");
+        let wrapper = keyword.parent().expect("actual wrapper");
+        assert_eq!(wrapper.kind(), "function_definition");
+        assert!(wrapper.has_error());
+        let mut cursor = wrapper.walk();
+        let children = wrapper
+            .children(&mut cursor)
+            .filter(|child| child.kind() != "comment")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children.len(),
+            4,
+            "all named and unnamed children accounted: {children:?}"
+        );
+        let prefix = children[0];
+        assert_eq!(prefix.kind(), "type_identifier");
+        assert_eq!(prefix.child_count(), 0);
+        assert!(!prefix.is_missing() && !prefix.has_error());
+        assert_eq!(wrapper.child_by_field_name("type"), Some(prefix));
+        assert_eq!(children[1], keyword);
+        assert_eq!(wrapper.child_by_field_name("declarator"), Some(keyword));
+        let error = children[2];
+        assert_eq!(error.kind(), "ERROR");
+        assert!(!error.is_missing());
+        let mut cursor = error.walk();
+        let error_children = error
+            .children(&mut cursor)
+            .filter(|child| child.kind() != "comment")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            error_children.len(),
+            1,
+            "exact literal-name error envelope: {error_children:?}"
+        );
+        let name = error_children[0];
+        assert!(matches!(name.kind(), "identifier" | "namespace_identifier"));
+        assert_eq!(name.child_count(), 0);
+        assert!(!name.is_missing() && !name.has_error());
+        assert_eq!(node_text(name, source), "recovered");
+        let body = wrapper.child_by_field_name("body").expect("actual body");
+        assert_eq!(children[3], body);
+        assert_eq!(body.kind(), "compound_statement");
+        assert!(!body.is_missing());
+        let open = body.child(0).expect("actual first child");
+        assert_eq!(open.kind(), "{");
+        assert!(!open.is_missing() && !open.has_error());
+        assert_eq!(open.start_byte(), body.start_byte());
+        let (head, names) = namespace_body_name_components(wrapper, body, source)
+            .expect("strict synthetic literal head recognized");
+        assert_eq!(head, keyword);
+        assert_eq!(
+            names
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["recovered"]
+        );
+        assert_eq!(
+            (names[0].1.start_byte, names[0].1.end_byte),
+            (name.start_byte(), name.end_byte())
+        );
+        let inside = named_node_at(&tree, source, "int member;");
+        assert!(body.start_byte() < inside.start_byte() && inside.end_byte() < body.end_byte());
+    }
+
+    #[test]
+    #[hardwon("#5868: refusal controls must actually exercise the namespace body helper")]
+    fn orphaned_namespace_scope_index_refuses_unproven_function_heads() {
+        for refusal in [
+            "int ordinary(int value) { return value; }",
+            "OPAQUE_PREFIX namespace_ recovered { int member; }",
+            "OPAQUE_PREFIX namespace recovered other { int member; }",
+            "OPAQUE_PREFIX namespace recovered(int value) { return value; }",
+        ] {
+            let tree = parse_cpp(refusal);
+            let mut stack = vec![tree.root_node()];
+            let mut helper_calls = 0;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "function_definition"
+                    && let Some(body) = node.child_by_field_name("body")
+                {
+                    helper_calls += 1;
+                    assert_eq!(
+                        (node.start_byte(), node.end_byte()),
+                        (0, refusal.len()),
+                        "guard control must exercise its complete envelope: source={refusal}, node={node:?}"
+                    );
+                    assert!(
+                        namespace_body_name_components(node, body, refusal).is_none(),
+                        "refused shape acquired namespace: source={refusal}, node={node:?}, body={body:?}"
+                    );
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(
+                helper_calls,
+                1,
+                "guard control must reach exactly its actual function/body helper call: source={refusal}, tree={:?}",
+                tree.root_node()
+            );
+        }
+
+        // The measured '=' case has no function/body envelope. A missing
+        // body is likewise parser-absence coverage, not a passed helper guard.
+        for absent in [
+            "OPAQUE_PREFIX namespace recovered = other { int member; }",
+            "OPAQUE_PREFIX namespace recovered int member;",
+        ] {
+            let tree = parse_cpp(absent);
+            assert!(
+                tree.root_node().has_error(),
+                "expected malformed input: {absent}"
+            );
+            let mut stack = vec![tree.root_node()];
+            let mut helper_candidates = 0;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "function_definition"
+                    && node.child_by_field_name("body").is_some()
+                {
+                    helper_candidates += 1;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(
+                helper_candidates,
+                0,
+                "parser-absence control unexpectedly acquired a helper envelope: source={absent}, tree={:?}",
+                tree.root_node()
+            );
+        }
     }
 
     /// A macro that opens a block: `APP_IF_ACTIVE` expands to `if (active) {`,

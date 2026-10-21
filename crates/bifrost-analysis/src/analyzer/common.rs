@@ -16,14 +16,15 @@ use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
     CodeUnit, FqName, IAnalyzer, Language, Project, ProjectFile, Range, SummaryFileProjection,
 };
-use std::ffi::OsStr;
+
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::hash::{HashMap, HashSet};
 
-pub(crate) fn read_bounded_source(
+#[doc(hidden)]
+pub fn read_bounded_source(
     project: &dyn Project,
     file: &ProjectFile,
     max_bytes: usize,
@@ -31,7 +32,8 @@ pub(crate) fn read_bounded_source(
     project.read_source_limited(file, max_bytes).ok().flatten()
 }
 
-pub(crate) fn limited_known_rows<T>(
+#[doc(hidden)]
+pub fn limited_known_rows<T>(
     len: usize,
     values: impl IntoIterator<Item = T>,
     limit: usize,
@@ -49,7 +51,8 @@ pub(crate) fn limited_known_rows<T>(
     }
 }
 
-pub(crate) fn take_little_endian_array<const N: usize>(
+#[doc(hidden)]
+pub fn take_little_endian_array<const N: usize>(
     bytes: &[u8],
     offset: &mut usize,
 ) -> Option<[u8; N]> {
@@ -59,25 +62,18 @@ pub(crate) fn take_little_endian_array<const N: usize>(
     Some(value)
 }
 
-pub(crate) struct CandidateState<T> {
-    pub(crate) rows: Vec<T>,
-    pub(crate) complete: bool,
-    pub(crate) reason: Option<&'static str>,
+#[doc(hidden)]
+pub struct CandidateState<T> {
+    #[doc(hidden)]
+    pub rows: Vec<T>,
+    #[doc(hidden)]
+    pub complete: bool,
+    #[doc(hidden)]
+    pub reason: Option<&'static str>,
 }
 
-pub(crate) fn bounded_message(mut message: String, max_bytes: usize) -> String {
-    if message.len() <= max_bytes {
-        return message;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    message.truncate(end);
-    message
-}
-
-pub(crate) fn import_target_files_from_cache(
+#[doc(hidden)]
+pub fn import_target_files_from_cache(
     cache: &moka::sync::Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     file: &ProjectFile,
     resolve: impl FnOnce() -> HashSet<ProjectFile>,
@@ -86,7 +82,8 @@ pub(crate) fn import_target_files_from_cache(
 }
 
 impl<T> CandidateState<T> {
-    pub(crate) fn unavailable(reason: &'static str) -> Self {
+    #[doc(hidden)]
+    pub fn unavailable(reason: &'static str) -> Self {
         Self {
             rows: Vec::new(),
             complete: false,
@@ -95,7 +92,8 @@ impl<T> CandidateState<T> {
     }
 }
 
-pub(crate) fn visibility_from_modifier_text(text: &str) -> Visibility {
+#[doc(hidden)]
+pub fn visibility_from_modifier_text(text: &str) -> Visibility {
     match text.trim() {
         "private" => Visibility::Private,
         "protected" => Visibility::Protected,
@@ -112,7 +110,8 @@ pub fn find_by_label<T: Copy>(
     values.into_iter().find(|value| label_for(*value) == label)
 }
 
-pub(crate) fn reuse_cached_expression_value<K, V, N>(
+#[doc(hidden)]
+pub fn reuse_cached_expression_value<K, V, N>(
     values: &HashMap<K, V>,
     expression_values: &mut HashMap<N, V>,
     key: K,
@@ -150,28 +149,21 @@ pub fn serialized_json_len(value: &impl serde::Serialize) -> usize {
     serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.0)
 }
 
-pub(crate) fn local_xml_name(name: &[u8]) -> Option<String> {
-    let name = std::str::from_utf8(name).ok()?;
-    Some(
-        name.rsplit_once(':')
-            .map(|(_, local)| local)
-            .unwrap_or(name)
-            .to_owned(),
-    )
-}
-
-pub(crate) fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+#[doc(hidden)]
+pub fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     let name = node.child_by_field_name("name")?;
     let text = try_node_source_text(name, source)?;
     (!text.is_empty()).then(|| Box::from(text))
 }
 
-#[cfg(test)]
-pub(crate) fn project_file_for_test(root: &Path, rel_path: &str) -> ProjectFile {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn project_file_for_test(root: &Path, rel_path: &str) -> ProjectFile {
     ProjectFile::new(root.to_path_buf(), rel_path)
 }
 
-pub(crate) fn workspace_files_matching_language(
+#[doc(hidden)]
+pub fn workspace_files_matching_language(
     project: &dyn Project,
     includes_language: impl Fn(Language) -> bool,
 ) -> Vec<ProjectFile> {
@@ -185,65 +177,29 @@ pub(crate) fn workspace_files_matching_language(
         .collect()
 }
 
-pub(crate) fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
+#[doc(hidden)]
+pub fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
     integer_literal_value_with_kind(source, node, "integer_literal")
 }
 
-pub(crate) fn integer_literal_value_with_kind(
-    source: &str,
-    node: Node<'_>,
-    kind: &str,
-) -> Option<i64> {
+#[doc(hidden)]
+pub fn integer_literal_value_with_kind(source: &str, node: Node<'_>, kind: &str) -> Option<i64> {
     (node.kind() == kind)
         .then(|| try_node_source_text(node, source))
         .flatten()
         .and_then(|text| text.parse().ok())
 }
 
-pub(crate) fn visit_declared_type_refs<'a>(
-    types: impl IntoIterator<Item = &'a crate::analyzer::semantic_model::TypeRef>,
-    mut visit: impl FnMut(&str),
-) {
-    use crate::analyzer::semantic_model::TypeRef;
-
-    let mut pending = types.into_iter().collect::<Vec<_>>();
-    while let Some(reference) = pending.pop() {
-        match reference {
-            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
-                if let TypeRef::Declared { id, .. } = reference {
-                    visit(id);
-                }
-                pending.extend(arguments);
-            }
-            TypeRef::Array { element }
-            | TypeRef::ByRef { element, .. }
-            | TypeRef::Pointer { element }
-            | TypeRef::Slice { element }
-            | TypeRef::FixedArray { element, .. }
-            | TypeRef::Channel { element, .. } => pending.push(element),
-            TypeRef::Map { key, value } => {
-                pending.push(key);
-                pending.push(value);
-            }
-            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref()),
-            TypeRef::Tuple { elements } => pending.extend(elements),
-            TypeRef::Function { parameters, result } => {
-                pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
-                pending.extend(result.as_deref());
-            }
-            TypeRef::TypeParameter { .. } | TypeRef::Unknown => {}
-        }
-    }
-}
-
-pub(crate) fn local_value_for_declaration(
+#[doc(hidden)]
+pub fn local_value_for_declaration(
     mut bindings: impl Iterator<Item = (usize, crate::analyzer::semantic::ValueId)>,
     declaration_start: usize,
 ) -> Option<crate::analyzer::semantic::ValueId> {
     bindings.find_map(|(start, value)| (start == declaration_start).then_some(value))
 }
 
-pub(crate) fn visible_local_binding<T, Key: Ord>(
+#[doc(hidden)]
+pub fn visible_local_binding<T, Key: Ord>(
     bindings: &[T],
     byte: usize,
     bounds: impl Fn(&T) -> (usize, usize, usize),
@@ -278,11 +234,13 @@ pub(crate) fn non_synthetic_summary_projection(
     Arc::new(projection)
 }
 
-pub(crate) fn should_persist_code_unit(code_unit: &CodeUnit) -> bool {
+#[doc(hidden)]
+pub fn should_persist_code_unit(code_unit: &CodeUnit) -> bool {
     !code_unit.is_file_scope() && !code_unit.is_module()
 }
 
-pub(crate) fn dependency_pack_warning(
+#[doc(hidden)]
+pub fn dependency_pack_warning(
     code: &str,
     location: &Path,
     message: String,
@@ -296,7 +254,8 @@ pub(crate) fn dependency_pack_warning(
     }
 }
 
-pub(crate) fn exact_span(span: crate::analyzer::semantic::SourceSpan, node: Node<'_>) -> bool {
+#[doc(hidden)]
+pub fn exact_span(span: crate::analyzer::semantic::SourceSpan, node: Node<'_>) -> bool {
     node.start_byte() == span.start_byte() as usize && node.end_byte() == span.end_byte() as usize
 }
 
@@ -304,35 +263,14 @@ pub(crate) const fn same_byte_range(left: Range, right: Range) -> bool {
     left.start_byte == right.start_byte && left.end_byte == right.end_byte
 }
 
-pub(crate) fn is_comment_kind(kind: &str) -> bool {
+#[doc(hidden)]
+pub fn is_comment_kind(kind: &str) -> bool {
     brokk_bifrost_core::analyzer::tree_walk::is_comment_kind(kind)
 }
 
-pub(crate) fn is_java_module_descriptor_file(file: &ProjectFile) -> bool {
-    language_for_file(file) == Language::Java
-        && file.rel_path().file_name() == Some(OsStr::new("module-info.java"))
-}
-
-pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Option<ProjectFile> {
-    if file.root() == root {
-        return Some(file.clone());
-    }
-    let abs_path = file.abs_path();
-    let rel = if let Ok(rel) = abs_path.strip_prefix(root) {
-        rel.to_path_buf()
-    } else {
-        let canonical_abs = abs_path.canonicalize().ok()?;
-        let canonical_root = root.canonicalize().ok()?;
-        canonical_abs
-            .strip_prefix(canonical_root)
-            .ok()?
-            .to_path_buf()
-    };
-    Some(ProjectFile::new(root.to_path_buf(), rel))
-}
-
-pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
-    crate::analyzer::languages::language_support(language).map_or_else(
+#[doc(hidden)]
+pub fn display_symbol_name(language: Language, symbol: &str) -> String {
+    crate::analyzer::languages::language_knowledge(language).map_or_else(
         || symbol.to_string(),
         |support| support.display_symbol_name(symbol),
     )
@@ -341,13 +279,13 @@ pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
 /// The undecorated spelling of a structured name: [`display_symbol_name`] for
 /// a caller that holds the declaration rather than a typed string.
 ///
-/// A language that answers [`LanguageSupport::undecorated_fq_name`] answers
+/// A language that answers [`LanguageKnowledge::undecorated_fq_name`] answers
 /// here from segment kinds, so a `$` or `.` inside a segment's own text
 /// survives; the rest fall back to the string reading, which is unchanged.
 ///
-/// [`LanguageSupport::undecorated_fq_name`]: crate::analyzer::languages::LanguageSupport::undecorated_fq_name
+/// [`LanguageKnowledge::undecorated_fq_name`]: brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge::undecorated_fq_name
 fn undecorated_fq_name(language: Language, fq: &FqName) -> Option<FqName> {
-    crate::analyzer::languages::language_support(language)
+    crate::analyzer::languages::language_knowledge(language)
         .and_then(|support| support.undecorated_fq_name(fq))
 }
 
@@ -444,7 +382,8 @@ fn addressable_symbol_name(
 /// apiece: 110 ms on a 64-file http4s `get_summaries`.
 /// `IAnalyzer::prefetch_definitions` is the batch form of exactly that read,
 /// and the per-name calls then land in the query-scoped memo it fills.
-pub(crate) fn prefetch_display_symbols<'a>(
+#[doc(hidden)]
+pub fn prefetch_display_symbols<'a>(
     analyzer: &dyn IAnalyzer,
     targets: impl IntoIterator<Item = &'a CodeUnit>,
 ) {
@@ -509,7 +448,8 @@ pub(crate) fn parent_fq_for_target(target: &CodeUnit) -> Option<FqName> {
 }
 
 /// [`parent_fq_for_target`] rendered in the target's own language.
-pub(crate) fn parent_fq_name_for_target(target: &CodeUnit) -> Option<String> {
+#[doc(hidden)]
+pub fn parent_fq_name_for_target(target: &CodeUnit) -> Option<String> {
     parent_fq_for_target(target).map(|parent| {
         parent.display_native(
             language_for_target(target),
@@ -521,7 +461,8 @@ pub(crate) fn parent_fq_name_for_target(target: &CodeUnit) -> Option<String> {
 /// The enclosing scope of [`parent_fq_for_target`], spelled the way
 /// [`display_symbol_for_target`] spells the unit itself, so that a printed
 /// `parent_symbol` addresses the owner it names.
-pub(crate) fn display_parent_symbol_for_target(
+#[doc(hidden)]
+pub fn display_parent_symbol_for_target(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> Option<String> {
@@ -569,7 +510,7 @@ pub fn display_identifier_for_target(target: &CodeUnit) -> String {
 
 pub fn source_identifier_for_target(target: &CodeUnit) -> &str {
     let identifier = target.identifier();
-    crate::analyzer::languages::language_support(language_for_target(target))
+    crate::analyzer::languages::language_knowledge(language_for_target(target))
         .map_or(identifier, |support| support.source_identifier(identifier))
 }
 
@@ -641,7 +582,8 @@ pub(crate) fn decorated_identifier_seeks(
     }
 }
 
-pub(crate) fn is_valid_rename_identifier(language: Language, name: &str) -> bool {
+#[doc(hidden)]
+pub fn is_valid_rename_identifier(language: Language, name: &str) -> bool {
     is_identifier_text(name) && !is_reserved_identifier(language, name)
 }
 
@@ -786,12 +728,14 @@ pub(crate) fn render_skeleton(
 }
 
 /// Trim trailing whitespace from rendered skeleton output and omit empty results.
-pub(crate) fn normalize_skeleton(rendered: String) -> Option<String> {
+#[doc(hidden)]
+pub fn normalize_skeleton(rendered: String) -> Option<String> {
     let trimmed = rendered.trim_end();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
+#[doc(hidden)]
+pub fn is_scala_object_like(target: &CodeUnit) -> bool {
     language_for_target(target) == Language::Scala && (target.is_class() || target.is_module()) && {
         // A `.`-joined short_name segment "ending in `$`" is exactly a
         // Scala companion-object segment: Scala's only `$`-spelling is
@@ -807,6 +751,24 @@ pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
             .any(|&id| interner.resolve(id).1 == crate::analyzer::fq_name::SegmentKind::Companion)
     }
 }
+
+#[doc(hidden)]
+pub fn declaration_header(source: &str) -> &str {
+    source.split('{').next().unwrap_or(source)
+}
+
+#[doc(hidden)]
+pub fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
+    source
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == modifier)
+}
+
+pub use crate::analyzer::resolution::file_paths::{
+    is_java_module_descriptor_file, rebase_project_file_to_root,
+};
+
+pub use crate::analyzer::store::xml_name::local_xml_name;
 
 #[cfg(test)]
 mod tests {

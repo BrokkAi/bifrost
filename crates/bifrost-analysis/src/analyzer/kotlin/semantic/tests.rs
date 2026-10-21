@@ -15,7 +15,7 @@ fn free_this_scan_honors_cancellation() {
         )
         .expect("Kotlin source must parse");
     let mut body = None;
-    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+    brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
         tree.root_node(),
         true,
         |node| {
@@ -49,7 +49,7 @@ fn proves_first_iteration(iterable: &str) -> bool {
         .parse(source.as_str(), None)
         .expect("Kotlin source must parse");
     let mut statement = None;
-    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+    brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
         tree.root_node(),
         true,
         |node| {

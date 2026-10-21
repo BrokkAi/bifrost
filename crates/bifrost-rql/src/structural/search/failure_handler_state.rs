@@ -13,11 +13,11 @@ use brokk_bifrost_analysis::analyzer::structural::failure_handlers::{
     php_catch_body_shape, python_except_body_shape, ruby_rescue_body_shape,
     scala_catch_body_shapes,
 };
-use brokk_bifrost_analysis::analyzer::{
-    CSharpAnalyzer, WorkspaceAnalyzer, csharp_catch_facts, go_failure_handler_body_shapes,
-    resolve_analyzer, rust_failure_handler_body_shapes,
-};
+use brokk_bifrost_analysis::analyzer::{WorkspaceAnalyzer, resolve_analyzer};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_csharp_analysis::{CSharpAnalyzer, csharp_catch_facts};
+use brokk_bifrost_go_analysis::go_failure_handler_body_shapes;
+use brokk_bifrost_rust_analysis::analyzer::rust_failure_handler_body_shapes;
 
 const MAX_HANDLER_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -49,7 +49,7 @@ struct ExpansionSpec {
     body: Option<Range>,
     verdict: &'static str,
     reason: Option<&'static str>,
-    csharp_facts: Option<brokk_bifrost_analysis::analyzer::CSharpCatchFacts>,
+    csharp_facts: Option<brokk_bifrost_csharp_analysis::CSharpCatchFacts>,
 }
 
 /// Whether the adapter publishes any failure-handler state rows for this
@@ -80,7 +80,7 @@ fn make_value(
     body: Option<Range>,
     verdict: &'static str,
     reason: Option<&'static str>,
-    csharp_facts: Option<&brokk_bifrost_analysis::analyzer::CSharpCatchFacts>,
+    csharp_facts: Option<&brokk_bifrost_csharp_analysis::CSharpCatchFacts>,
 ) -> FailureHandlerStateValue {
     let id = format!(
         "failure_handler_state:{}:{catch_ast_id}",

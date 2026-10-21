@@ -1,30 +1,9 @@
 //! Bounded Java subtype evidence over activated declaration facts.
 
 use super::*;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JavaHierarchyIncomplete {
-    MissingHierarchy,
-    Ambiguous,
-    GenericSubstitution,
-    BudgetExhausted,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JavaHierarchyWitness {
-    /// Exact declaration provenance, in source-to-supertype order.
-    pub declarations: Vec<SemanticModelProvenance>,
-    pub edges: Vec<HierarchyFact>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JavaHierarchyAnswer {
-    pub witness: Option<JavaHierarchyWitness>,
-    /// Enumeration completeness is independent of a positive path witness.
-    pub incomplete: Vec<JavaHierarchyIncomplete>,
-}
-
+// Preserve the overlay path even when names arrive through the parent glob.
+#[allow(unused_imports)]
+pub use brokk_bifrost_semantic::analyzer::semantic_model::overlay::java_hierarchy::*;
 impl SemanticModelOverlay {
     pub(crate) fn java_reference_widening(
         &self,

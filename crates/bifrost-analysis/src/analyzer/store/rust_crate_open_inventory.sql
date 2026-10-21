@@ -28,7 +28,7 @@
 -- inventory read (`rust_crate_point_inventory.sql`) reopens the module.
 INSERT INTO cr_gaps
 SELECT 'open_export_inventory', member.module_path,
-       json_object('member_blob', member.blob_id,
+       json_object('subject_level', 'module', 'member_blob', member.blob_id,
                    'invocation_occurrence', invocation.invocation_occurrence_id,
                    'macro', (SELECT head.macro_name FROM source_rust_macro_invocations AS head
                              WHERE head.blob_id=invocation.blob_id
@@ -48,6 +48,16 @@ LEFT JOIN source_rust_macro_inputs AS input
  AND input.invocation_occurrence_id=invocation.invocation_occurrence_id
 WHERE COALESCE(cr_cfg(input.cfg_condition, ?2), -1)<>0
  AND invocation.invocation_start_byte >= member.start_byte AND invocation.invocation_end_byte <= member.end_byte
+ -- A resolved include is already spliced into this module by the crate walk.
+ -- Its member facts (and their own open inventories) account for its items;
+ -- the include invocation itself is not an additional opaque producer.
+ AND NOT (cr_cfg(input.cfg_condition, ?2)=1 AND EXISTS (
+     SELECT 1 FROM rust_include_edges AS edge
+     CROSS JOIN cr_members AS included
+       ON included.module_path=member.module_path AND included.placement='include'
+      AND included.rel_path=cr_join(cr_parent(member.rel_path), edge.relative_path)
+     WHERE edge.blob_id=invocation.blob_id
+       AND edge.include_start=invocation.invocation_start_byte))
  AND NOT EXISTS (SELECT 1 FROM cr_item_macro_no_routes AS no_route
                  WHERE no_route.blob_id=invocation.blob_id
                    AND no_route.invocation_occurrence_id=invocation.invocation_occurrence_id)
@@ -84,7 +94,7 @@ UNION ALL
 -- above cannot see it, because the invocation encloses this module rather
 -- than lying in it.
 SELECT 'open_export_inventory', member.module_path,
-       json_object('member_blob', member.blob_id,
+       json_object('subject_level', 'module', 'member_blob', member.blob_id,
                    'invocation_occurrence', invocation.invocation_occurrence_id,
                    'macro', (SELECT head.macro_name FROM source_rust_macro_invocations AS head
                              WHERE head.blob_id=invocation.blob_id
@@ -125,7 +135,7 @@ UNION ALL
 -- `rust_crate_macro_items`, and the invocation arms above decide whether it
 -- opens the module.
 SELECT 'open_export_inventory', candidate.module_path,
-       json_object('member_blob', candidate.blob_id,
+       json_object('subject_level', 'module', 'member_blob', candidate.blob_id,
                    'declaration_id', candidate.declaration_id,
                    'reason', CASE WHEN properties.generated_surface=1
                                   THEN 'GeneratedItemSurface'

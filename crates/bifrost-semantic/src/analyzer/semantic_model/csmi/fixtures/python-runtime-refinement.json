@@ -1,0 +1,322 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "fixture",
+      "producer": {
+        "identifier": "https://example.org/python-fixture",
+        "version": "1.0.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "fixture",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:generic/python-runtime@3.12.0?component=stdlib&implementation=cpython",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "artifact",
+              "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ]
+        }
+      ],
+      "symbols": [
+        {
+          "id": "builtins",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "builtins"
+            }
+          ]
+        },
+        {
+          "id": "type",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "builtins"
+            },
+            {
+              "role": "type",
+              "name": "type"
+            }
+          ]
+        },
+        {
+          "id": "object",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "builtins"
+            },
+            {
+              "role": "type",
+              "name": "object"
+            }
+          ]
+        },
+        {
+          "id": "bool",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "builtins"
+            },
+            {
+              "role": "type",
+              "name": "bool"
+            }
+          ]
+        },
+        {
+          "id": "inspect",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "inspect"
+            }
+          ]
+        },
+        {
+          "id": "isclass",
+          "scheme": "csmi.python",
+          "schemeVersion": "0.1.0",
+          "stability": "portable",
+          "descriptors": [
+            {
+              "role": "namespace",
+              "name": "inspect"
+            },
+            {
+              "role": "callable",
+              "name": "isclass"
+            }
+          ]
+        }
+      ],
+      "declarations": [
+        {
+          "symbol": "builtins",
+          "category": "namespace"
+        },
+        {
+          "symbol": "type",
+          "category": "type",
+          "owner": "builtins"
+        },
+        {
+          "symbol": "object",
+          "category": "type",
+          "owner": "builtins"
+        },
+        {
+          "symbol": "bool",
+          "category": "type",
+          "owner": "builtins"
+        },
+        {
+          "symbol": "inspect",
+          "category": "namespace"
+        },
+        {
+          "symbol": "isclass",
+          "category": "callable",
+          "owner": "inspect",
+          "callable": {
+            "kind": "function",
+            "parameters": [
+              {
+                "position": 0,
+                "binding": "positional-or-named",
+                "label": "object",
+                "required": true,
+                "type": {
+                  "kind": "reference",
+                  "symbol": "object"
+                }
+              }
+            ],
+            "results": [
+              {
+                "position": 0,
+                "type": {
+                  "kind": "reference",
+                  "symbol": "bool"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.python",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/python/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": {
+                "symbol": "builtins"
+              }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": {
+                "symbol": "type"
+              }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": {
+                "symbol": "object"
+              }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": {
+                "symbol": "bool"
+              }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": {
+                "symbol": "inspect"
+              }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "symbol-identity-scheme",
+              "target": {
+                "symbol": "isclass"
+              }
+            },
+            {
+              "kind": "core-slot",
+              "slot": "artifact-compatibility",
+              "target": {
+                "semanticModel": "current"
+              }
+            }
+          ]
+        },
+        {
+          "identifier": "csmi.conditional-type-refinement",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/conditional-type-refinement/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "fact-family",
+              "family": "conditional-type-refinements",
+              "scope": {
+                "callable": "isclass",
+                "subject": {
+                  "kind": "parameter",
+                  "position": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.conditional-type-refinement",
+          "version": "0.1.0",
+          "family": "conditional-type-refinements",
+          "scope": {
+            "callable": "isclass",
+            "subject": {
+              "kind": "parameter",
+              "position": 0
+            }
+          },
+          "payload": {
+            "kind": "conditional-type-refinement",
+            "callable": "isclass",
+            "subject": {
+              "kind": "parameter",
+              "position": 0
+            },
+            "outcome": {
+              "kind": "supported",
+              "semantics": "biconditional",
+              "target": {
+                "kind": "reference",
+                "symbol": "type",
+                "arguments": [
+                  {
+                    "kind": "reference",
+                    "symbol": "object"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "completenessStatements": [
+        {
+          "family": "declaration-records",
+          "scope": {
+            "scheme": "csmi.python",
+            "schemeVersion": "0.1.0"
+          },
+          "status": "complete"
+        },
+        {
+          "family": "declaration-aspects",
+          "scope": {
+            "symbol": "isclass",
+            "aspect": "callable-shape"
+          },
+          "status": "complete"
+        },
+        {
+          "vocabulary": "csmi.conditional-type-refinement",
+          "version": "0.1.0",
+          "family": "conditional-type-refinements",
+          "scope": {
+            "callable": "isclass",
+            "subject": {
+              "kind": "parameter",
+              "position": 0
+            }
+          },
+          "status": "complete"
+        }
+      ]
+    }
+  ]
+}

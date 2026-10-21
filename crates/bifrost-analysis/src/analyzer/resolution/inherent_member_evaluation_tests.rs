@@ -331,10 +331,7 @@ fn private_member_fixture_with_other_gap(
             })
             .expect("Rust private member callable reference")
             .site;
-        facts.gaps.push(ResolutionGapFact {
-            site,
-            kind: ResolutionGapKind::UnsupportedImplicitReceiver,
-        });
+        facts.gaps.push(ResolutionGapFact::new(site, ResolutionGapKind::UnsupportedImplicitReceiver));
     });
     let (reference, target) = private_member_semantics(&fixture);
     let site = fixture
@@ -1180,18 +1177,12 @@ fn transfer_evidence_retains_noncallee_applicability_and_other_callee_gaps() {
                 .expect("receiver construction has a noncallee input site");
             let input_site = facts.type_slots[transfer.input.index()].site;
             injected = vec![
-                ResolutionGapFact {
-                    site: input_site,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                },
-                ResolutionGapFact {
-                    site: callee,
-                    kind: ResolutionGapKind::UnsupportedExpression,
-                },
+                ResolutionGapFact::new(input_site, ResolutionGapKind::UnsupportedCallApplicability),
+                ResolutionGapFact::new(callee, ResolutionGapKind::UnsupportedExpression),
             ];
             for gap in &injected {
                 assert!(!facts.gaps.contains(gap));
-                facts.gaps.push(*gap);
+                facts.gaps.push(gap.clone());
             }
         },
     );

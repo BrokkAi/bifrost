@@ -31,12 +31,21 @@ pub enum GraphFileSkipReason {
 }
 
 impl GraphFileSkipReason {
-    pub(crate) fn opens_incompleteness(&self) -> bool {
+    #[doc(hidden)]
+    pub fn opens_incompleteness(&self) -> bool {
         !matches!(self, Self::ExcludedBuildSelection)
     }
 }
 
-pub(crate) type GraphSkippedCallers = std::collections::BTreeMap<ProjectFile, GraphFileSkipReason>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct GraphBuildSelectionUnavailable {
+    #[doc(hidden)]
+    pub discovery_error: String,
+}
+
+#[doc(hidden)]
+pub type GraphSkippedCallers = std::collections::BTreeMap<ProjectFile, GraphFileSkipReason>;
 
 pub(crate) struct GraphStageAdmission<U> {
     pub(crate) units: Vec<(U, Vec<ProjectFile>)>,
@@ -102,10 +111,13 @@ pub(crate) struct GraphStageMetrics {
     pub(crate) readers: GraphStageReaderStats,
 }
 
-pub(crate) struct GraphStageResult {
-    pub(crate) summary: FactResolutionBatchSummary,
+#[doc(hidden)]
+pub struct GraphStageResult {
+    #[doc(hidden)]
+    pub summary: FactResolutionBatchSummary,
     pub(crate) metrics: GraphStageMetrics,
-    pub(crate) skipped: GraphSkippedCallers,
+    #[doc(hidden)]
+    pub skipped: GraphSkippedCallers,
 }
 
 /// Language-specific graph stage contract.

@@ -16,7 +16,7 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, ClaimSubjectRole, DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
     DefinitionLookupDiagnostic, DefinitionLookupOutcome, DefinitionLookupStatus,
     ResolvedReferenceSite, UnindexedClaim, boundary_unchecked, candidates_outcome,
-    kotlin_import_model_outcome, no_definition,
+    kotlin_import_model_outcome, kotlin_package_reference_outcome, no_definition,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
@@ -32,9 +32,11 @@ use brokk_bifrost_jvm::kotlin::imports::kotlin_import_info_from_node;
 use brokk_bifrost_jvm::kotlin::syntax::{self, kotlin_is_declaration_name};
 use brokk_bifrost_jvm::scala::graph::syntax as scala_syntax;
 
-pub(crate) static JVM_NATIVE_ROLLOUT_POINTS: JvmNativeRolloutPoints = JvmNativeRolloutPoints;
+#[doc(hidden)]
+pub static JVM_NATIVE_ROLLOUT_POINTS: JvmNativeRolloutPoints = JvmNativeRolloutPoints;
 
-pub(crate) struct JvmNativeRolloutPoints;
+#[doc(hidden)]
+pub struct JvmNativeRolloutPoints;
 
 impl StructuralReceiverResolver for JvmNativeRolloutPoints {
     fn resolve_type_bounded(
@@ -42,6 +44,7 @@ impl StructuralReceiverResolver for JvmNativeRolloutPoints {
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
         match query_language(&query) {
+            #[cfg(any(test, feature = "test-support"))]
             Language::Java => {
                 crate::analyzer::java::native_points::resolve_java_type_bounded(query, || {})
             }
@@ -50,6 +53,11 @@ impl StructuralReceiverResolver for JvmNativeRolloutPoints {
                     crate::analyzer::kotlin::KotlinAnalyzer,
                 >(query.analyzer) else {
                     return unavailable_jvm_type(query.site, Language::Kotlin);
+                };
+                let anchored = kotlin_call_value_anchor(query);
+                let query = match &anchored {
+                    Some(site) => BoundedReceiverQuery { site, ..query },
+                    None => query,
                 };
                 resolve_jvm_type_bounded(
                     kotlin.tree_sitter_analyzer(),
@@ -71,7 +79,9 @@ impl StructuralReceiverResolver for JvmNativeRolloutPoints {
                     || {},
                 )
             }
-            language => unreachable!("JVM native point query has a non-JVM language: {language:?}"),
+            language => {
+                unreachable!("native JVM point query is unavailable for language: {language:?}")
+            }
         }
     }
 
@@ -80,6 +90,7 @@ impl StructuralReceiverResolver for JvmNativeRolloutPoints {
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
         match query_language(&query) {
+            #[cfg(any(test, feature = "test-support"))]
             Language::Java => {
                 crate::analyzer::java::native_points::resolve_java_definition_bounded(query, || {})
             }
@@ -118,9 +129,39 @@ impl StructuralReceiverResolver for JvmNativeRolloutPoints {
                     project_jvm_declaration_site(query, resolution),
                 )
             }
-            language => unreachable!("JVM native point query has a non-JVM language: {language:?}"),
+            language => {
+                unreachable!("native JVM point query is unavailable for language: {language:?}")
+            }
         }
     }
+}
+
+// A whole Kotlin call expression asks for the value the call produces. The
+// producer publishes no reference at the call's own range: the call value is
+// the callee reference's `TargetCallableResultType` projection, so the point
+// is focused on that callee. The reported site keeps the whole expression.
+// This mirrors Go's whole-expression anchor selection in its native points.
+fn kotlin_call_value_anchor(query: BoundedReceiverQuery<'_>) -> Option<ResolvedReferenceSite> {
+    let call = smallest_named_node_covering(
+        query.tree?.root_node(),
+        query.site.focus_start_byte,
+        query.site.focus_end_byte,
+    )
+    .filter(|node| {
+        node.kind() == "call_expression"
+            && node.start_byte() == query.site.focus_start_byte
+            && node.end_byte() == query.site.focus_end_byte
+    })?;
+    let callee = syntax::kotlin_callee(call)?;
+    let anchor = match callee.kind() {
+        "simple_identifier" => callee,
+        "navigation_expression" => syntax::kotlin_navigation_member(callee)?,
+        _ => return None,
+    };
+    let mut site = query.site.clone();
+    site.focus_start_byte = anchor.start_byte();
+    site.focus_end_byte = anchor.end_byte();
+    Some(site)
 }
 
 fn query_language(query: &BoundedReceiverQuery<'_>) -> Language {
@@ -133,6 +174,23 @@ fn query_language(query: &BoundedReceiverQuery<'_>) -> Language {
         "JVM native point query has a non-JVM file language: {language:?}"
     );
     language
+}
+
+// A point's display text can cover the whole qualified path, while its
+// focus identifies the demanded name. Import-context selection uses that
+// structured focus; the shared preparation supplies its qualifier names.
+fn jvm_point_lookup(query: BoundedReceiverQuery<'_>) -> &str {
+    query
+        .tree
+        .and_then(|tree| {
+            smallest_named_node_covering(
+                tree.root_node(),
+                query.site.focus_start_byte,
+                query.site.focus_end_byte,
+            )
+        })
+        .and_then(|node| node.utf8_text(query.source.as_bytes()).ok())
+        .unwrap_or(&query.site.text)
 }
 
 fn resolve_jvm_definition_bounded<A: LanguageAdapter>(
@@ -164,7 +222,7 @@ fn resolve_jvm_definition_bounded<A: LanguageAdapter>(
             work: Default::default(),
         };
     }
-    let lookup = query.site.text.clone();
+    let lookup = jvm_point_lookup(query);
     let namespace = query
         .tree
         .and_then(|tree| {
@@ -204,7 +262,7 @@ fn resolve_jvm_definition_bounded<A: LanguageAdapter>(
                 path,
                 cancellation,
                 query,
-                &lookup,
+                lookup,
                 namespace,
             )
         },
@@ -419,7 +477,12 @@ fn project_kotlin_external_boundary(
             };
         }
         if definitions.package_exists_in_any_language(&candidate) {
-            return BoundedResolution::Complete { value, work };
+            let mut package = kotlin_package_reference_outcome(&candidate);
+            package.reference = Some(query.site.clone());
+            return BoundedResolution::Complete {
+                value: package,
+                work,
+            };
         }
 
         // A workspace package can also receive declarations from a selected
@@ -438,30 +501,71 @@ fn project_kotlin_external_boundary(
 
     let scope = AnalyzerQueryScope::new(query.analyzer);
     let token = scope.token();
-    let projected = if focus.kind() == "type_identifier" {
-        kotlin_external_type_route(kotlin, query, token, focus).map(
-            |(route_name, external_target, boundary_status)| {
-                (
-                    route_name,
-                    external_target,
-                    ClaimSubjectRole::Type,
-                    Some(boundary_status),
-                )
-            },
-        )
-    } else if let Some(member) = kotlin_external_member_evidence(kotlin, query, token, focus) {
-        let Some(target) = member.member_target else {
-            if value.status == DefinitionLookupStatus::Incomplete
-                && member.owner_status != BoundaryStatus::ExternalDeclaredUnindexed
-            {
-                value.status = DefinitionLookupStatus::NoDefinition;
-            }
-            return BoundedResolution::Complete { value, work };
-        };
-        Some((target.clone(), Some(target), ClaimSubjectRole::Member, None))
+    let type_segments = if focus.kind() == "type_identifier" {
+        kotlin_type_segments_through_focus(focus, query.source)
+    } else if focus.kind() == "simple_identifier"
+        && syntax::kotlin_call_with_callee(focus).is_some()
+    {
+        // A bare Kotlin callee can construct an imported external type even
+        // when its semantic model describes no constructors. Require a type
+        // declaration below; an imported function is not a constructor route.
+        Some(vec![
+            brokk_bifrost_jvm::kotlin::declarations::kotlin_identifier_text(focus, query.source)
+                .to_owned(),
+        ])
     } else {
         None
     };
+    let projected =
+        if let Some(segments) = type_segments {
+            kotlin_external_type_route(kotlin, query, token, &segments)
+                .filter(|(_, target, _)| {
+                    if focus.kind() == "type_identifier" {
+                        return true;
+                    }
+                    let Some(target) = target else {
+                        return false;
+                    };
+                    let Some(owner) = kotlin
+                        .external_declarations(query.analyzer.semantic_model_overlay())
+                        .resolve_qualified_name(target, "")
+                    else {
+                        return false;
+                    };
+                    let crate::analyzer::jvm::external::JvmExternalDeclarationSource::SemanticPack {
+                    declaration_id, ..
+                } = owner.source() else {
+                    return false;
+                };
+                    let Some(active) = query.analyzer.active_semantic_models() else {
+                        return false;
+                    };
+                    active.types_named(target).records.iter().any(|candidate| {
+                        candidate.record.id == *declaration_id
+                            && (!candidate
+                                .shard
+                                .independently_enumerates_jvm_owner(candidate.record)
+                                || !candidate
+                                    .record
+                                    .jvm_inventory
+                                    .as_ref()
+                                    .is_some_and(|inventory| inventory.callables_complete))
+                    })
+                })
+                .map(|(route_name, external_target, boundary_status)| {
+                    (
+                        route_name,
+                        external_target,
+                        ClaimSubjectRole::Type,
+                        Some(boundary_status),
+                    )
+                })
+        } else {
+            // Only the shared resolver can prove absence. A known receiver type
+            // does not certify complete member or extension-provider inventories.
+            kotlin_external_member_target(kotlin, query, token, focus)
+                .map(|target| (target.clone(), Some(target), ClaimSubjectRole::Member, None))
+        };
     let Some((route_name, external_target, role, boundary_status)) = projected else {
         if focus.kind() == "type_identifier"
             && value.status == DefinitionLookupStatus::NoDefinition
@@ -739,8 +843,8 @@ fn project_scala_external_boundary(
                 );
             }
         }
-    } else if let Some(member) = scala_external_member_evidence(scala, query, token, focus) {
-        if let Some(target) = member.member_target {
+    } else if let Some(target) = scala_external_member_target(scala, query, token, focus) {
+        if let Some(target) = target {
             return finish_scala_external_boundary(
                 value,
                 work,
@@ -750,12 +854,9 @@ fn project_scala_external_boundary(
                 ClaimSubjectRole::Member,
             );
         }
-        if value.status == DefinitionLookupStatus::Incomplete
-            && member.owner_status != BoundaryStatus::ExternalDeclaredUnindexed
-            && member.explicit_import_route
-        {
-            value.status = DefinitionLookupStatus::NoDefinition;
-        }
+        // A recognized external member route stays with shared closure even
+        // when its provider did not bind the member.
+        return BoundedResolution::Complete { value, work };
     } else if scala_identifier_is_implicit_root_reference(focus)
         && !(value.status == DefinitionLookupStatus::Incomplete
             && !incomplete_hierarchy_names.is_empty())
@@ -978,18 +1079,12 @@ fn finish_scala_external_boundary(
     BoundedResolution::Complete { value, work }
 }
 
-struct ScalaExternalMemberEvidence {
-    owner_status: BoundaryStatus,
-    explicit_import_route: bool,
-    member_target: Option<String>,
-}
-
-fn scala_external_member_evidence(
+fn scala_external_member_target(
     scala: &crate::analyzer::scala::ScalaAnalyzer,
     query: BoundedReceiverQuery<'_>,
     token: crate::analyzer::QueryToken<'_>,
     focus: tree_sitter::Node<'_>,
-) -> Option<ScalaExternalMemberEvidence> {
+) -> Option<Option<String>> {
     let access = scala_member_access_for_focus(focus)?;
     let receiver = access.child_by_field_name("value")?;
     let member_node = access.child_by_field_name("field")?;
@@ -1000,9 +1095,8 @@ fn scala_external_member_evidence(
         return None;
     }
     let owner = owner_segments.join(".");
-    let explicit_import_route = scala_explicit_import_binds(scala, query, token, &owner_segments);
     let definitions = AnalyzerDefinitionLookup::new(query.analyzer, Language::Scala);
-    let (owner_status, owner_target) = crate::analyzer::usages::get_definition::boundary_evidence(
+    let (_, owner_target) = crate::analyzer::usages::get_definition::boundary_evidence(
         query.analyzer,
         query.file,
         &owner,
@@ -1020,19 +1114,16 @@ fn scala_external_member_evidence(
     if member_name.is_empty() {
         return None;
     }
-    let member_target = scala
-        .resolve_member_name_with_external(
-            token,
-            query.analyzer.semantic_model_overlay(),
-            query.file,
-            &format!("{owner}.{member_name}"),
-        )
-        .map(|member| member.fqn().to_owned());
-    Some(ScalaExternalMemberEvidence {
-        owner_status,
-        explicit_import_route,
-        member_target,
-    })
+    Some(
+        scala
+            .resolve_member_name_with_external(
+                token,
+                query.analyzer.semantic_model_overlay(),
+                query.file,
+                &format!("{owner}.{member_name}"),
+            )
+            .map(|member| member.fqn().to_owned()),
+    )
 }
 
 fn scala_member_access_for_focus(focus: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
@@ -1179,9 +1270,8 @@ fn kotlin_external_type_route(
     kotlin: &crate::analyzer::kotlin::KotlinAnalyzer,
     query: BoundedReceiverQuery<'_>,
     token: crate::analyzer::QueryToken<'_>,
-    focus: tree_sitter::Node<'_>,
+    segments: &[String],
 ) -> Option<(String, Option<String>, BoundaryStatus)> {
-    let segments = kotlin_type_segments_through_focus(focus, query.source)?;
     let written = segments.join(".");
     if written.is_empty() {
         return None;
@@ -1219,7 +1309,12 @@ fn kotlin_external_type_route(
     }
     if !matched_named_import && segments.len() > 1 {
         let qualifier = segments[..segments.len() - 1].join(".");
-        if !kotlin_workspace_package_exists(&definitions, &qualifier) {
+        if !kotlin_workspace_package_exists(&definitions, &qualifier)
+            && !definitions
+                .fqn_in_any_language(&qualifier)
+                .iter()
+                .any(|definition| definition.is_class())
+        {
             routes.push(written.clone());
         }
     }
@@ -1251,22 +1346,17 @@ fn kotlin_external_type_route(
     ))
 }
 
-struct KotlinExternalMemberEvidence {
-    owner_status: BoundaryStatus,
-    member_target: Option<String>,
-}
-
-fn kotlin_external_member_evidence(
+fn kotlin_external_member_target(
     kotlin: &crate::analyzer::kotlin::KotlinAnalyzer,
     query: BoundedReceiverQuery<'_>,
     token: crate::analyzer::QueryToken<'_>,
     focus: tree_sitter::Node<'_>,
-) -> Option<KotlinExternalMemberEvidence> {
+) -> Option<String> {
     let navigation = kotlin_navigation_for_member_focus(focus)?;
     let receiver = syntax::kotlin_navigation_receiver(navigation)?;
     let owner = kotlin_receiver_type_spelling(receiver, query.source)?;
     let definitions = AnalyzerDefinitionLookup::new(query.analyzer, Language::Kotlin);
-    let (owner_status, owner_target) = kotlin.external_boundary_evidence(
+    let (_, owner_target) = kotlin.external_boundary_evidence(
         token,
         query.analyzer.semantic_model_overlay(),
         query.file,
@@ -1286,18 +1376,14 @@ fn kotlin_external_member_evidence(
     let member_node = syntax::kotlin_navigation_member(navigation)?;
     let member_name = kotlin_node_text(member_node, query.source)?;
     let spelling = format!("{owner}.{member_name}");
-    let resolved = kotlin
+    kotlin
         .resolve_member_name_with_external(
             token,
             query.analyzer.semantic_model_overlay(),
             query.file,
             &spelling,
         )
-        .map(|member| member.fqn().to_owned());
-    Some(KotlinExternalMemberEvidence {
-        owner_status,
-        member_target: resolved,
-    })
+        .map(|member| member.fqn().to_owned())
 }
 
 fn kotlin_explicit_external_owner_import_exists(
@@ -1508,7 +1594,7 @@ fn resolve_jvm_type_bounded<A: LanguageAdapter>(
     after_open: impl FnOnce(),
 ) -> BoundedResolution<TypeLookupOutcome> {
     assert_eq!(inner.adapter().language(), language);
-    let lookup = query.site.text.clone();
+    let lookup = jvm_point_lookup(query);
     resolve_native_type_bounded(
         inner,
         query,
@@ -1518,7 +1604,7 @@ fn resolve_jvm_type_bounded<A: LanguageAdapter>(
                 language,
                 path,
                 cancellation,
-                &lookup,
+                lookup,
                 Some(ResolutionNamespace::Type),
                 None,
             )
@@ -1575,7 +1661,7 @@ fn prepare_context(
     )>,
 ) -> Result<NativePointContext> {
     Ok(
-        match operation.jvm_import_context(language, path, cancellation)? {
+        match operation.jvm_import_context_for_name(language, path, lookup, cancellation)? {
             JvmImportContext::Ready {
                 context,
                 scoped_gaps,

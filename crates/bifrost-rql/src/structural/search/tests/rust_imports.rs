@@ -441,7 +441,7 @@ fn auto_import_queries_reuse_persisted_sql_graph_across_workspace_builds() {
 
 #[test]
 #[hardwon(
-    "#4955+#5661: a missing public module marked every summary incomplete and forced whole-workspace refreshes"
+    "#4955+#5661+#5898: missing modules and scoped glob ambiguity forced whole-workspace refreshes"
 )]
 fn rust_candidate_dependencies_cover_add_edit_reexport_and_glob_changes() {
     let project = candidate_dependency_workspace();

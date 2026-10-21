@@ -29,7 +29,7 @@ use crate::analyzer::resolution::{
     LoweredSupertypeProperty, LoweredTypedFrontier, LoweringCoverageFrontier, LoweringGapOrigin,
     PartialPath, PartialPathId, ResolutionCompletion, ResolutionIdentityCatalog,
     ResolutionIncompleteReason, ResolutionSemanticIdentitySpace, SemanticId, SharedNameId,
-    TypeTransferValueTransform, language_identity_domain,
+    TypeTransferValueTransform, language_identity_domain, validate_type_identity_transfer,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -108,17 +108,21 @@ fn digest_for_shared_name(
 ///
 /// It is a child module because it needs `ResolutionLocalKeys`, the producer's
 /// own dense per-blob key assignment, and that type is private to this module.
-pub(crate) mod resolution_rows;
+#[doc(hidden)]
+pub mod resolution_rows;
 
-pub(crate) mod authority_rows;
-pub(crate) mod rust_authority;
+#[doc(hidden)]
+pub mod authority_rows;
+#[doc(hidden)]
+pub mod rust_authority;
 /// The typed-fact rows of milestone 5's draft section 6 (milestone 6 port
 /// block 4, lane TF). A child module of `resolution_prepare` for the same
 /// reason `resolution_rows` is: it needs `ResolutionLocalKeys`.
 pub(crate) mod typed_rows;
 
 /// Namespace identity used by a generic reference spelling lookup.
-pub(crate) fn reference_lookup_namespace_codes(namespace: ResolutionNamespace) -> Vec<i64> {
+#[doc(hidden)]
+pub fn reference_lookup_namespace_codes(namespace: ResolutionNamespace) -> Vec<i64> {
     vec![resolution_rows::namespace_code(namespace)]
 }
 
@@ -141,7 +145,8 @@ pub(crate) fn go_reference_lookup_namespace_codes(namespace: ResolutionNamespace
         .collect()
 }
 
-pub(crate) enum ResolutionInteriorPreparation {
+#[doc(hidden)]
+pub enum ResolutionInteriorPreparation {
     Prepared(Box<PreparedResolutionBundle>),
     Cancelled,
 }
@@ -474,7 +479,8 @@ fn prepare_catalog_authority(
     true
 }
 
-pub(crate) fn prepare_resolution_bundle_with_unit_keys(
+#[doc(hidden)]
+pub fn prepare_resolution_bundle_with_unit_keys(
     lowered: &LoweredResolutionFactsWithIdentityCatalog,
     unit_keys: Option<&HashMap<CodeUnit, i64>>,
     cancellation: &CancellationToken,
@@ -627,6 +633,52 @@ fn prepare_common_rows(
     cancellation: &CancellationToken,
 ) -> bool {
     let common = lowered.common();
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        ResolutionRootImportAnchor, ResolutionRootImportDemandTarget, ResolutionRootImportKind,
+    };
+    for route in &common.root_imports {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.root_imports.push(row![
+            route.fact.site.get(),
+            route.fact.root_scope.get(),
+            match route.fact.anchor {
+                ResolutionRootImportAnchor::Lexical => "lexical",
+                ResolutionRootImportAnchor::Absolute => "absolute",
+            },
+            route.fact.position.map(usize_i64),
+            match route.kind {
+                ResolutionRootImportKind::Named => "named",
+                ResolutionRootImportKind::Glob => "glob",
+            },
+            route.bound_name.clone()
+        ]);
+        for (position, segment) in &route.segments {
+            rows.root_import_segments
+                .push(row![route.fact.site.get(), *position, segment.clone()]);
+        }
+        for (namespace, name, target, target_name) in &route.demands {
+            let (kind, reference) = match target {
+                Some(ResolutionRootImportDemandTarget::NamedReference(site)) => {
+                    (Some("named_reference"), Some(site.get()))
+                }
+                Some(ResolutionRootImportDemandTarget::SameNameGlob) => {
+                    (Some("same_name_glob"), None)
+                }
+                None => (None, None),
+            };
+            rows.root_import_demands.push(row![
+                route.fact.site.get(),
+                resolution_rows::namespace_code(*namespace),
+                name.clone(),
+                kind,
+                reference,
+                target_name.clone()
+            ]);
+        }
+    }
+
     for fact in &common.package_references {
         if cancellation.is_cancelled() {
             return false;
@@ -1904,18 +1956,30 @@ fn prepare_typed_rows(
                     && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
                 "expression-result transfer has inconsistent roles or transform: {rule:?}"
             ),
-            ResolutionTypeTransferKind::TypeIdentity | ResolutionTypeTransferKind::TypeUnion => {
-                assert!(
-                    preserves_value
-                        && rule.indirection_delta() == 0
-                        && source_role == Some(ResolutionTypeSlotRole::TargetTypeIdentity)
-                        && target_role == Some(ResolutionTypeSlotRole::TargetTypeIdentity),
-                    "type-identity transfer has inconsistent roles or transform: {rule:?}"
+            ResolutionTypeTransferKind::TypeIdentity => {
+                assert_eq!(
+                    target_role,
+                    Some(ResolutionTypeSlotRole::TargetTypeIdentity)
                 );
-                if transfer.kind() == ResolutionTypeTransferKind::TypeIdentity {
+                // Kotlin smart-cast refinement uses the same static-type lift
+                // admitted by the raw and lowered transfer validators.
+                validate_type_identity_transfer(
+                    source_role.expect("type-identity source frontier must exist"),
+                    rule.indirection_delta(),
+                    rule.reference_indirection_delta(),
+                    rule.value_transform(),
+                );
+                if rule.value_transform() == TypeTransferValueTransform::Preserve {
                     type_identity_targets.insert(rule.target_slot());
                 }
             }
+            ResolutionTypeTransferKind::TypeUnion => assert!(
+                preserves_value
+                    && rule.indirection_delta() == 0
+                    && source_role == Some(ResolutionTypeSlotRole::TargetTypeIdentity)
+                    && target_role == Some(ResolutionTypeSlotRole::TargetTypeIdentity),
+                "type-union transfer has inconsistent roles or transform: {rule:?}"
+            ),
             ResolutionTypeTransferKind::AddressOf => assert!(
                 matches!(
                     (
@@ -1960,7 +2024,11 @@ fn prepare_typed_rows(
             ),
             ResolutionTypeTransferKind::ComponentElement
             | ResolutionTypeTransferKind::ComponentKey
-            | ResolutionTypeTransferKind::ComponentValue => {
+            | ResolutionTypeTransferKind::ComponentValue
+            | ResolutionTypeTransferKind::ComponentIndex
+            | ResolutionTypeTransferKind::ComponentIndexOk
+            | ResolutionTypeTransferKind::ComponentCommaOkValue
+            | ResolutionTypeTransferKind::ComponentSlice => {
                 assert!(
                     matches!(
                         source_role,

@@ -28,6 +28,10 @@ docs/src/content/docs/semantic-model-packs.md text eol=lf
 # This reviewed upstream artifact is verified by its exact SHA-256 digest.
 tests/fixtures/sarif/sarif-schema-2.1.0.json text eol=lf
 
+# The #3387 PHP and C++ models are embedded with include_str! and compared as exact bytes.
+tests/fixtures/network-effect-boundary/models/bifrost.web-network-php.json text eol=lf
+tests/fixtures/network-effect-boundary/cpp/bifrost.web-network-cpp.json text eol=lf
+
 # This pinned Go source set is verified by its exact SHA-256 digest.
 tests/fixtures/go_ssh_callbacks/xcrypto/**/*.go text eol=lf
 
@@ -100,3 +104,8 @@ tests/fixtures/rust-codeql-parity/**/*.rs text eol=lf
 # Tutorial Markdown contains executable source snippets whose bytes appear in
 # documented analyzer ranges and output identities.
 docs/src/content/docs/code-query-tutorials/*.md text eol=lf
+
+# Archived license CRLF and unified-diff context markers are fixture data.
+tests/fixtures/policy-oracle/boltons-loop-invariant-sort/LICENSE.upstream whitespace=cr-at-eol
+tests/fixtures/policy-oracle/boltons-loop-invariant-sort/prefix-sort.patch whitespace=-blank-at-eol
+tests/fixtures/policy-oracle/boltons-loop-invariant-sort/reestablished-prefix-sort.patch whitespace=-blank-at-eol

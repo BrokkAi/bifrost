@@ -31,10 +31,12 @@ const PYTHON_DECLARED_PROJECT_CONFIG_COVERAGE: &str = "resolver-affecting-config
 /// A scalar handle. It is meaningful only together with the exact selected
 /// snapshot passed to `with_python_runtime_acquisition`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct PythonRuntimeAcquisitionId(i64);
+#[doc(hidden)]
+pub struct PythonRuntimeAcquisitionId(i64);
 
 impl PythonRuntimeAcquisitionId {
-    pub(crate) fn get(self) -> i64 {
+    #[doc(hidden)]
+    pub fn get(self) -> i64 {
         self.0
     }
 }
@@ -42,16 +44,21 @@ impl PythonRuntimeAcquisitionId {
 /// The durable acquisition and the workspace revision produced by its
 /// atomic publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeProviderPublication {
-    pub(crate) acquisition_id: PythonRuntimeAcquisitionId,
-    pub(crate) snapshot: WorkspaceSnapshotId,
+#[doc(hidden)]
+pub struct PythonRuntimeProviderPublication {
+    #[doc(hidden)]
+    pub acquisition_id: PythonRuntimeAcquisitionId,
+    #[doc(hidden)]
+    pub snapshot: WorkspaceSnapshotId,
     /// Stable complete provider-input identity. Unlike acquisition_id this
     /// value is safe to include in semantic snapshot/cache identity.
-    pub(crate) evidence_digest: [u8; 32],
+    #[doc(hidden)]
+    pub evidence_digest: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PythonRuntimeStatus {
+#[doc(hidden)]
+pub enum PythonRuntimeStatus {
     ArchiveVerified,
     Incomplete,
     Unresolved,
@@ -82,7 +89,8 @@ impl PythonRuntimeStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PythonRuntimeMemberRole {
+#[doc(hidden)]
+pub enum PythonRuntimeMemberRole {
     Runtime,
     Stub,
     RuntimeAndStub,
@@ -101,7 +109,8 @@ impl PythonRuntimeMemberRole {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PythonRuntimeBindingStatus {
+#[doc(hidden)]
+pub enum PythonRuntimeBindingStatus {
     Unresolved,
     Conflict,
 }
@@ -116,7 +125,8 @@ impl PythonRuntimeBindingStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PythonRuntimeFrontierKind {
+#[doc(hidden)]
+pub enum PythonRuntimeFrontierKind {
     ExtraInstalledCandidate,
     SourceShadowCandidate,
     CompetingRuntimeProvider,
@@ -158,75 +168,120 @@ impl PythonRuntimeFrontierKind {
 /// rows with a NULL normalized scope path and are returned as frontiers for
 /// every provider request; they are never silently dropped.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeEnvironmentInput {
-    pub(crate) source_scope: PathBuf,
-    pub(crate) status: PythonRuntimeStatus,
-    pub(crate) diagnostic: Option<String>,
-    pub(crate) artifacts: Vec<PythonRuntimeArtifactInput>,
-    pub(crate) frontiers: Vec<PythonRuntimeFrontierInput>,
-    pub(crate) declared_environment: Option<PythonDeclaredEnvironmentConfig>,
-    pub(crate) project_config: Option<CsmiArtifactDigest>,
+#[doc(hidden)]
+pub struct PythonRuntimeEnvironmentInput {
+    #[doc(hidden)]
+    pub source_scope: PathBuf,
+    #[doc(hidden)]
+    pub status: PythonRuntimeStatus,
+    #[doc(hidden)]
+    pub diagnostic: Option<String>,
+    #[doc(hidden)]
+    pub artifacts: Vec<PythonRuntimeArtifactInput>,
+    #[doc(hidden)]
+    pub frontiers: Vec<PythonRuntimeFrontierInput>,
+    #[doc(hidden)]
+    pub declared_environment: Option<PythonDeclaredEnvironmentConfig>,
+    #[doc(hidden)]
+    pub project_config: Option<CsmiArtifactDigest>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeArtifactInput {
+#[doc(hidden)]
+pub struct PythonRuntimeArtifactInput {
     /// The exact package URL reported for the archive, when metadata resolved.
-    pub(crate) purl: Option<String>,
-    pub(crate) raw_version: Option<String>,
+    #[doc(hidden)]
+    pub purl: Option<String>,
+    #[doc(hidden)]
+    pub raw_version: Option<String>,
     /// SHA-256 of the original archive bytes, distinct from the acquisition
     /// digest that identifies the complete provider input set.
-    pub(crate) archive_sha256: Option<String>,
-    pub(crate) archive_path: PathBuf,
-    pub(crate) installed_root: PathBuf,
-    pub(crate) status: PythonRuntimeStatus,
-    pub(crate) diagnostic: Option<String>,
-    pub(crate) members: Vec<PythonRuntimeMemberInput>,
-    pub(crate) providers: Vec<PythonRuntimeProviderInput>,
+    #[doc(hidden)]
+    pub archive_sha256: Option<String>,
+    #[doc(hidden)]
+    pub archive_path: PathBuf,
+    #[doc(hidden)]
+    pub installed_root: PathBuf,
+    #[doc(hidden)]
+    pub status: PythonRuntimeStatus,
+    #[doc(hidden)]
+    pub diagnostic: Option<String>,
+    #[doc(hidden)]
+    pub members: Vec<PythonRuntimeMemberInput>,
+    #[doc(hidden)]
+    pub providers: Vec<PythonRuntimeProviderInput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeMemberInput {
-    pub(crate) archive_member_path: PathBuf,
-    pub(crate) installed_path: Option<PathBuf>,
-    pub(crate) member_sha256: Option<String>,
-    pub(crate) installed_sha256: Option<String>,
-    pub(crate) installed_bytes_match: Option<bool>,
-    pub(crate) role: PythonRuntimeMemberRole,
-    pub(crate) status: PythonRuntimeStatus,
-    pub(crate) diagnostic: Option<String>,
+#[doc(hidden)]
+pub struct PythonRuntimeMemberInput {
+    #[doc(hidden)]
+    pub archive_member_path: PathBuf,
+    #[doc(hidden)]
+    pub installed_path: Option<PathBuf>,
+    #[doc(hidden)]
+    pub member_sha256: Option<String>,
+    #[doc(hidden)]
+    pub installed_sha256: Option<String>,
+    #[doc(hidden)]
+    pub installed_bytes_match: Option<bool>,
+    #[doc(hidden)]
+    pub role: PythonRuntimeMemberRole,
+    #[doc(hidden)]
+    pub status: PythonRuntimeStatus,
+    #[doc(hidden)]
+    pub diagnostic: Option<String>,
 }
 
 /// An import-name candidate can point to any member in its artifact. Several
 /// rows for one name are intentional: ambiguity is evidence, not a reason to
 /// pick one provider or prune the others.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeProviderInput {
-    pub(crate) import_name: String,
-    pub(crate) member_index: Option<usize>,
-    pub(crate) status: PythonRuntimeBindingStatus,
+#[doc(hidden)]
+pub struct PythonRuntimeProviderInput {
+    #[doc(hidden)]
+    pub import_name: String,
+    #[doc(hidden)]
+    pub member_index: Option<usize>,
+    #[doc(hidden)]
+    pub status: PythonRuntimeBindingStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeFrontierInput {
-    pub(crate) kind: PythonRuntimeFrontierKind,
-    pub(crate) root: PathBuf,
-    pub(crate) path: Option<PathBuf>,
-    pub(crate) import_name: Option<String>,
-    pub(crate) message: String,
+#[doc(hidden)]
+pub struct PythonRuntimeFrontierInput {
+    #[doc(hidden)]
+    pub kind: PythonRuntimeFrontierKind,
+    #[doc(hidden)]
+    pub root: PathBuf,
+    #[doc(hidden)]
+    pub path: Option<PathBuf>,
+    #[doc(hidden)]
+    pub import_name: Option<String>,
+    #[doc(hidden)]
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeScopeRow {
-    pub(crate) environment_id: i64,
-    pub(crate) source_scope: String,
-    pub(crate) scope_path: Option<String>,
-    pub(crate) scope_depth: Option<i64>,
-    pub(crate) status: String,
-    pub(crate) diagnostic: Option<String>,
+#[doc(hidden)]
+pub struct PythonRuntimeScopeRow {
+    #[doc(hidden)]
+    pub environment_id: i64,
+    #[doc(hidden)]
+    pub source_scope: String,
+    #[doc(hidden)]
+    pub scope_path: Option<String>,
+    #[doc(hidden)]
+    pub scope_depth: Option<i64>,
+    #[doc(hidden)]
+    pub status: String,
+    #[doc(hidden)]
+    pub diagnostic: Option<String>,
 }
 
 impl PythonRuntimeScopeRow {
-    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    #[doc(hidden)]
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             environment_id: row.get(0)?,
             source_scope: row.get(1)?,
@@ -239,30 +294,51 @@ impl PythonRuntimeScopeRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeProviderCandidateRow {
-    pub(crate) provider_id: i64,
-    pub(crate) environment_id: i64,
-    pub(crate) artifact_id: i64,
-    pub(crate) member_id: Option<i64>,
-    pub(crate) import_name: String,
-    pub(crate) binding_status: String,
-    pub(crate) purl: Option<String>,
-    pub(crate) raw_version: Option<String>,
-    pub(crate) archive_sha256: Option<String>,
-    pub(crate) archive_path: String,
-    pub(crate) installed_root: String,
-    pub(crate) artifact_status: String,
-    pub(crate) archive_member_path: Option<String>,
-    pub(crate) installed_path: Option<String>,
-    pub(crate) member_sha256: Option<String>,
-    pub(crate) installed_sha256: Option<String>,
-    pub(crate) installed_bytes_match: Option<bool>,
-    pub(crate) member_role: Option<String>,
-    pub(crate) member_status: Option<String>,
+#[doc(hidden)]
+pub struct PythonRuntimeProviderCandidateRow {
+    #[doc(hidden)]
+    pub provider_id: i64,
+    #[doc(hidden)]
+    pub environment_id: i64,
+    #[doc(hidden)]
+    pub artifact_id: i64,
+    #[doc(hidden)]
+    pub member_id: Option<i64>,
+    #[doc(hidden)]
+    pub import_name: String,
+    #[doc(hidden)]
+    pub binding_status: String,
+    #[doc(hidden)]
+    pub purl: Option<String>,
+    #[doc(hidden)]
+    pub raw_version: Option<String>,
+    #[doc(hidden)]
+    pub archive_sha256: Option<String>,
+    #[doc(hidden)]
+    pub archive_path: String,
+    #[doc(hidden)]
+    pub installed_root: String,
+    #[doc(hidden)]
+    pub artifact_status: String,
+    #[doc(hidden)]
+    pub archive_member_path: Option<String>,
+    #[doc(hidden)]
+    pub installed_path: Option<String>,
+    #[doc(hidden)]
+    pub member_sha256: Option<String>,
+    #[doc(hidden)]
+    pub installed_sha256: Option<String>,
+    #[doc(hidden)]
+    pub installed_bytes_match: Option<bool>,
+    #[doc(hidden)]
+    pub member_role: Option<String>,
+    #[doc(hidden)]
+    pub member_status: Option<String>,
 }
 
 impl PythonRuntimeProviderCandidateRow {
-    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    #[doc(hidden)]
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             provider_id: row.get(0)?,
             environment_id: row.get(1)?,
@@ -289,14 +365,16 @@ impl PythonRuntimeProviderCandidateRow {
 
 /// Exact equality query for each `PythonRuntimeScopeAncestor`. Call it for
 /// every `Path::ancestors` result; never replace it with string-prefix logic.
-pub(crate) const PYTHON_RUNTIME_SCOPE_AT_PATH_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_SCOPE_AT_PATH_SQL: &str =
     "SELECT environment_id, source_scope, scope_path, scope_depth, status, diagnostic
      FROM python_runtime_environments INDEXED BY python_runtime_environments_by_scope
      WHERE acquisition_id = ?1 AND scope_path = ?2";
 
 /// Unknown source roots are global uncertainty for this acquisition and must
 /// accompany even a deeper valid scope result.
-pub(crate) const PYTHON_RUNTIME_UNRESOLVED_SCOPES_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_UNRESOLVED_SCOPES_SQL: &str =
     "SELECT environment_id, source_scope, scope_path, scope_depth, status, diagnostic
      FROM python_runtime_environments INDEXED BY python_runtime_environments_by_scope
      WHERE acquisition_id = ?1 AND scope_path IS NULL";
@@ -306,7 +384,8 @@ pub(crate) const PYTHON_RUNTIME_UNRESOLVED_SCOPES_SQL: &str =
 /// independently so all alternatives survive. `?1` additionally binds the
 /// same acquisition ID in the selected snapshot to prevent cross-snapshot
 /// reads even when this SQL is called outside the checked callback.
-pub(crate) const PYTHON_RUNTIME_IMPORT_CANDIDATES_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_IMPORT_CANDIDATES_SQL: &str =
     "SELECT provider.provider_id, provider.environment_id, provider.artifact_id,
             provider.member_id, provider.import_name, provider.binding_status,
             artifact.purl, artifact.raw_version, artifact.archive_sha256,
@@ -334,7 +413,8 @@ pub(crate) const PYTHON_RUNTIME_IMPORT_CANDIDATES_SQL: &str =
 
 /// All installed runtime artifacts owned by one explicit environment.
 /// `?1` is the environment row and `?2` is the checked acquisition handle.
-pub(crate) const PYTHON_RUNTIME_ARTIFACTS_FOR_ENVIRONMENT_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_ARTIFACTS_FOR_ENVIRONMENT_SQL: &str =
     "SELECT artifact_id, purl, raw_version, archive_sha256, archive_path,
             installed_root, status
      FROM python_runtime_artifacts INDEXED BY python_runtime_artifacts_by_environment
@@ -345,7 +425,8 @@ pub(crate) const PYTHON_RUNTIME_ARTIFACTS_FOR_ENVIRONMENT_SQL: &str =
 /// archive-verified artifact in one acquisition. The acquisition has already
 /// been tied to the selected Python snapshot by
 /// `with_python_runtime_acquisition`.
-pub(crate) const PYTHON_RUNTIME_DECLARED_ARCHIVE_VERIFIED_INSTALLED_ROOTS_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_DECLARED_ARCHIVE_VERIFIED_INSTALLED_ROOTS_SQL: &str =
     "SELECT DISTINCT artifact.installed_root
      FROM python_runtime_environments AS environment
        INDEXED BY python_runtime_environments_by_scope
@@ -366,7 +447,8 @@ pub(crate) const PYTHON_RUNTIME_DECLARED_ARCHIVE_VERIFIED_INSTALLED_ROOTS_SQL: &
 /// selected acquisition. Normalize their path identity to match ProjectFile's
 /// roots, including Windows verbatim prefixes; stored evidence stays unchanged.
 /// The returned rows belong to the caller's query.
-pub(crate) fn python_runtime_declared_archive_verified_installed_roots(
+#[doc(hidden)]
+pub fn python_runtime_declared_archive_verified_installed_roots(
     tx: &Transaction<'_>,
     acquisition_id: PythonRuntimeAcquisitionId,
 ) -> Result<Vec<PathBuf>> {
@@ -383,26 +465,30 @@ pub(crate) fn python_runtime_declared_archive_verified_installed_roots(
 /// Complete inventory for independent archive and installed-byte
 /// revalidation. This is intentionally an indexed point/range query per
 /// artifact, not an analyzer-resident member index.
-pub(crate) const PYTHON_RUNTIME_ARTIFACT_MEMBERS_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_ARTIFACT_MEMBERS_SQL: &str =
     "SELECT member_id, artifact_id, archive_member_path, installed_path,
             member_sha256, installed_sha256, installed_bytes_match,
             member_role, status, diagnostic
      FROM python_runtime_artifact_members INDEXED BY python_runtime_artifact_members_by_acquisition_artifact
      WHERE acquisition_id = ?1 AND artifact_id = ?2";
 
-pub(crate) const PYTHON_RUNTIME_SCOPE_FRONTIERS_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_SCOPE_FRONTIERS_SQL: &str =
     "SELECT frontier_id, kind, root_path, path, import_name, message
      FROM python_runtime_scope_frontiers INDEXED BY python_runtime_frontiers_by_scope
      WHERE acquisition_id = ?1 AND environment_id = ?2 AND import_name = ?3";
 
-pub(crate) const PYTHON_RUNTIME_UNNAMED_SCOPE_FRONTIERS_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_UNNAMED_SCOPE_FRONTIERS_SQL: &str =
     "SELECT frontier_id, kind, root_path, path, import_name, message
      FROM python_runtime_scope_frontiers INDEXED BY python_runtime_frontiers_by_scope
      WHERE acquisition_id = ?1 AND environment_id = ?2 AND import_name IS NULL";
 
 /// Resolve a declared environment only when both its scope row and acquisition
 /// match. The selected declaration ID scopes all three ordered child reads.
-pub(crate) const PYTHON_RUNTIME_DECLARED_ENVIRONMENT_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_DECLARED_ENVIRONMENT_SQL: &str =
     "SELECT declared_environment_id, producer_version, resolver_version,
             interpreter_path, interpreter_sha256, interpreter_implementation,
             interpreter_python_version, interpreter_abi, interpreter_platform,
@@ -415,41 +501,54 @@ pub(crate) const PYTHON_RUNTIME_DECLARED_ENVIRONMENT_SQL: &str =
      FROM python_runtime_declared_environments INDEXED BY python_runtime_declared_environments_by_environment
      WHERE acquisition_id = ?1 AND environment_id = ?2";
 
-pub(crate) const PYTHON_RUNTIME_DECLARED_ROOTS_SQL: &str =
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_DECLARED_ROOTS_SQL: &str =
     "SELECT ordinal, semantic_id, role, path, artifact_index
      FROM python_runtime_declared_roots
      WHERE declared_environment_id = ?1
      ORDER BY ordinal";
 
-pub(crate) const PYTHON_RUNTIME_DECLARED_INPUTS_SQL: &str =
-    "SELECT ordinal, input_id, role, path, sha256
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_DECLARED_INPUTS_SQL: &str = "SELECT ordinal, input_id, role, path, sha256
      FROM python_runtime_declared_inputs
      WHERE declared_environment_id = ?1
      ORDER BY ordinal";
 
-pub(crate) const PYTHON_RUNTIME_DECLARED_EXTRAS_SQL: &str = "SELECT ordinal, extra
+#[doc(hidden)]
+pub const PYTHON_RUNTIME_DECLARED_EXTRAS_SQL: &str = "SELECT ordinal, extra
      FROM python_runtime_declared_extras
      WHERE declared_environment_id = ?1
      ORDER BY ordinal";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeScopeAncestor {
-    pub(crate) path: String,
-    pub(crate) depth: i64,
+#[doc(hidden)]
+pub struct PythonRuntimeScopeAncestor {
+    #[doc(hidden)]
+    pub path: String,
+    #[doc(hidden)]
+    pub depth: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeFrontierRow {
-    pub(crate) frontier_id: i64,
-    pub(crate) kind: String,
-    pub(crate) root_path: String,
-    pub(crate) path: Option<String>,
-    pub(crate) import_name: Option<String>,
-    pub(crate) message: String,
+#[doc(hidden)]
+pub struct PythonRuntimeFrontierRow {
+    #[doc(hidden)]
+    pub frontier_id: i64,
+    #[doc(hidden)]
+    pub kind: String,
+    #[doc(hidden)]
+    pub root_path: String,
+    #[doc(hidden)]
+    pub path: Option<String>,
+    #[doc(hidden)]
+    pub import_name: Option<String>,
+    #[doc(hidden)]
+    pub message: String,
 }
 
 impl PythonRuntimeFrontierRow {
-    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    #[doc(hidden)]
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             frontier_id: row.get(0)?,
             kind: row.get(1)?,
@@ -462,21 +561,33 @@ impl PythonRuntimeFrontierRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PythonRuntimeArtifactMemberRow {
-    pub(crate) member_id: i64,
-    pub(crate) artifact_id: i64,
-    pub(crate) archive_member_path: String,
-    pub(crate) installed_path: Option<String>,
-    pub(crate) member_sha256: Option<String>,
-    pub(crate) installed_sha256: Option<String>,
-    pub(crate) installed_bytes_match: Option<bool>,
-    pub(crate) member_role: String,
-    pub(crate) status: String,
-    pub(crate) diagnostic: Option<String>,
+#[doc(hidden)]
+pub struct PythonRuntimeArtifactMemberRow {
+    #[doc(hidden)]
+    pub member_id: i64,
+    #[doc(hidden)]
+    pub artifact_id: i64,
+    #[doc(hidden)]
+    pub archive_member_path: String,
+    #[doc(hidden)]
+    pub installed_path: Option<String>,
+    #[doc(hidden)]
+    pub member_sha256: Option<String>,
+    #[doc(hidden)]
+    pub installed_sha256: Option<String>,
+    #[doc(hidden)]
+    pub installed_bytes_match: Option<bool>,
+    #[doc(hidden)]
+    pub member_role: String,
+    #[doc(hidden)]
+    pub status: String,
+    #[doc(hidden)]
+    pub diagnostic: Option<String>,
 }
 
 impl PythonRuntimeArtifactMemberRow {
-    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    #[doc(hidden)]
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             member_id: row.get(0)?,
             artifact_id: row.get(1)?,
@@ -555,7 +666,8 @@ impl PythonRuntimeDeclaredEnvironmentRow {
 /// Reconstruct the complete declared import contract for exactly one existing
 /// environment/acquisition pair. Child rows are scoped through the returned
 /// declaration row and ordered by their persisted ordinals.
-pub(crate) fn python_runtime_declared_environment(
+#[doc(hidden)]
+pub fn python_runtime_declared_environment(
     tx: &Transaction<'_>,
     acquisition_id: i64,
     environment_id: i64,
@@ -725,7 +837,8 @@ pub(crate) fn python_runtime_declared_environment(
 /// Component-wise source ancestors, deepest first, including the workspace
 /// root as `.`. Paths with absolute roots, parent traversal, or platform
 /// prefixes are rejected before they reach SQL.
-pub(crate) fn python_runtime_scope_ancestors(
+#[doc(hidden)]
+pub fn python_runtime_scope_ancestors(
     source_path: &Path,
 ) -> Result<Vec<PythonRuntimeScopeAncestor>> {
     if source_path.is_absolute() {
@@ -762,7 +875,8 @@ impl AnalyzerStore {
     /// Publish one immutable acquisition atomically with an optional exact
     /// workspace configuration version. The returned ID is an opaque scalar;
     /// readers must pair it with the exact selected snapshot.
-    pub(crate) fn publish_python_runtime_providers(
+    #[doc(hidden)]
+    pub fn publish_python_runtime_providers(
         &self,
         base_snapshot: &WorkspaceSnapshotId,
         configuration_input: Option<WorkspaceConfigurationInput>,
@@ -917,7 +1031,8 @@ impl AnalyzerStore {
     /// current analyzer generation, then lend the read transaction to the
     /// semantic reader for its indexed SQL. The transaction pins both the
     /// generation check and every result row to one SQLite snapshot.
-    pub(crate) fn with_python_runtime_acquisition<T>(
+    #[doc(hidden)]
+    pub fn with_python_runtime_acquisition<T>(
         &self,
         acquisition_id: PythonRuntimeAcquisitionId,
         selected_snapshot: &WorkspaceSnapshotId,

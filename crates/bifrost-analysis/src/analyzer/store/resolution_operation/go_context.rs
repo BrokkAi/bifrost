@@ -162,7 +162,8 @@ WHERE caller.context_id = ?1 AND caller.file_version_id = ?2
 "#;
 
 #[derive(Clone, Default)]
-pub(crate) struct GoPackageInventoryState {
+#[doc(hidden)]
+pub struct GoPackageInventoryState {
     pub(crate) complete: bool,
     pub(crate) fragments: HashMap<BindingFragmentId, bool>,
 }
@@ -176,6 +177,13 @@ impl GoPackageInventoryState {
     }
 }
 
+pub(super) struct GoSelectedPackageInventory {
+    package_complete: bool,
+    package_evidence: String,
+    pub(super) inventory: GoPackageInventoryState,
+    unplaced_source: Option<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct GoContextSelection {
     pub(crate) identity: super::super::GoContextIdentity,
@@ -186,7 +194,8 @@ pub(crate) struct GoContextSelection {
 // A transient return value: the ready payload is moved out immediately, so
 // boxing it would add an allocation to every context read.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum GoDotImportContext {
+#[doc(hidden)]
+pub enum GoDotImportContext {
     Ready {
         context: SelectedResolutionContextSet,
         inventory: GoPackageInventoryState,
@@ -199,7 +208,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Compose only source-owned dot-import demands for one selected file.
     /// Named qualifiers and same-package continuation have separate binding
     /// rules and are not claimed by this operation.
-    pub(crate) fn go_dot_import_context(
+    #[doc(hidden)]
+    pub fn go_dot_import_context(
         &self,
         context_id: i64,
         caller_path: &str,
@@ -327,15 +337,20 @@ impl SelectedResolutionOperation<'_, '_> {
         let Some(package_id) = package_id else {
             return Ok(GoDotImportContext::Unavailable);
         };
-        let (package_complete, package_evidence): (bool, String) = connection
-            .query_row(
-                "SELECT complete, json(gaps) FROM main.go_package_instances
-                 WHERE context_id=?1 AND package_id=?2",
-                rusqlite::params![context_id, package_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::corrupt("selected Go caller package disappeared"))?;
+        let Some(GoSelectedPackageInventory {
+            package_complete,
+            package_evidence,
+            inventory,
+            unplaced_source,
+        }) = self.go_package_inventory_for_selected_package(
+            context_id,
+            package_id,
+            &source_record,
+            cancellation,
+        )?
+        else {
+            return Ok(GoDotImportContext::Cancelled);
+        };
         let identities = self.ready.context_identities.clone();
         let mut reasons = Vec::new();
         if selection.global_gap_count != 0 {
@@ -359,45 +374,6 @@ impl SelectedResolutionOperation<'_, '_> {
                 &package_evidence,
             ));
         }
-        let caller_directory =
-            std::path::Path::new(source_record.persisted_relative_path()).parent();
-        let mut unplaced_sources = connection.prepare_cached(UNPLACED_TRANSIENT_SOURCES)?;
-        let mut rows = unplaced_sources.query([])?;
-        let mut unplaced_source = None;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
-            }
-            let path: String = row.get(0)?;
-            if std::path::Path::new(&path).parent() == caller_directory {
-                unplaced_source = Some(path);
-                break;
-            }
-        }
-        drop(rows);
-        drop(unplaced_sources);
-        let package_inventory_complete = package_complete && unplaced_source.is_none();
-        let mut package_fragments = vec![source.fragment()];
-        let mut statement = connection.prepare_cached(PACKAGE_SOURCE_MOUNTS)?;
-        let mut rows = statement.query(rusqlite::params![context_id, package_id])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
-            }
-            let ordinal = SelectedResolutionMountOrdinal::new(row.get(0)?);
-            package_fragments.push(self.mount_table().mount_by_ordinal(ordinal)?.fragment());
-        }
-        drop(rows);
-        drop(statement);
-        package_fragments.sort_unstable();
-        package_fragments.dedup();
-        let inventory = GoPackageInventoryState {
-            complete: package_inventory_complete,
-            fragments: package_fragments
-                .into_iter()
-                .map(|fragment| (fragment, package_inventory_complete))
-                .collect(),
-        };
         if let Some(path) = unplaced_source {
             let evidence = format!(
                 "unsaved Go source {path:?} has no proven placement in the caller package directory"
@@ -611,6 +587,76 @@ impl SelectedResolutionOperation<'_, '_> {
             targets.push(names.from_persisted(persisted));
         }
         Ok(Some(targets))
+    }
+
+    /// Read the exact selected package, including a ForTest instance whose
+    /// ordinary Go files also occur in the normal package. Source role alone
+    /// cannot choose the inventory of an imported package.
+    pub(super) fn go_package_inventory_for_selected_package(
+        &self,
+        context_id: i64,
+        package_id: i64,
+        source_record: &crate::analyzer::store::resolution_selection::SelectedResolutionMountRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GoSelectedPackageInventory>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let connection = self.ready.inventory.connection();
+        let (package_complete, package_evidence): (bool, String) = connection
+            .query_row(
+                "SELECT complete, json(gaps) FROM main.go_package_instances
+                 WHERE context_id=?1 AND package_id=?2",
+                rusqlite::params![context_id, package_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::corrupt("selected Go caller package disappeared"))?;
+        let caller_directory =
+            std::path::Path::new(source_record.persisted_relative_path()).parent();
+        let mut unplaced_sources = connection.prepare_cached(UNPLACED_TRANSIENT_SOURCES)?;
+        let mut rows = unplaced_sources.query([])?;
+        let mut unplaced_source = None;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let path: String = row.get(0)?;
+            if std::path::Path::new(&path).parent() == caller_directory {
+                unplaced_source = Some(path);
+                break;
+            }
+        }
+        drop(rows);
+        drop(unplaced_sources);
+        let package_inventory_complete = package_complete && unplaced_source.is_none();
+        let mut package_fragments = vec![source_record.fragment_id()];
+        let mut statement = connection.prepare_cached(PACKAGE_SOURCE_MOUNTS)?;
+        let mut rows = statement.query(rusqlite::params![context_id, package_id])?;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let ordinal = SelectedResolutionMountOrdinal::new(row.get(0)?);
+            package_fragments.push(self.mount_table().mount_by_ordinal(ordinal)?.fragment());
+        }
+        drop(rows);
+        drop(statement);
+        package_fragments.sort_unstable();
+        package_fragments.dedup();
+        let inventory = GoPackageInventoryState {
+            complete: package_inventory_complete,
+            fragments: package_fragments
+                .into_iter()
+                .map(|fragment| (fragment, package_inventory_complete))
+                .collect(),
+        };
+        Ok(Some(GoSelectedPackageInventory {
+            package_complete,
+            package_evidence,
+            inventory,
+            unplaced_source,
+        }))
     }
 
     pub(super) fn record_go_package_inventory_state(&self, inventory: &GoPackageInventoryState) {

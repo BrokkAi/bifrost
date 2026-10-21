@@ -1,9 +1,11 @@
+use crate::analyzer::scala::source_storage::ScalaSourceStorage;
+use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 use std::cell::Cell;
 
 use crate::analyzer::Language;
 use crate::analyzer::scala::ScalaAdapter;
 use crate::analyzer::store::AnalyzerStore;
-use crate::analyzer::store::tests::{oid_for, parse_state};
+use crate::analyzer::store::test_support::{oid_for, parse_state};
 use crate::inline_project::InlineTestProject;
 use brokk_bifrost_core::analyzer::scala_facts::{ScalaDeclarationKind, ScalaDeclarationVisibility};
 use rusqlite::{Connection, params};

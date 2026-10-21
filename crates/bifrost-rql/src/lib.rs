@@ -7,10 +7,19 @@ pub mod refs;
 pub mod sexp;
 pub mod structural;
 
-pub use brokk_bifrost_analysis::{analyzer, path_utils, profiling};
+pub use brokk_bifrost_analysis::{path_utils, profiling};
+pub mod analyzer {
+    pub use brokk_bifrost_analysis::analyzer::semantic;
+    pub use brokk_bifrost_analysis::analyzer::*;
+    pub use brokk_bifrost_js_ts_analysis::analyzer::js_ts::*;
+    pub use brokk_bifrost_js_ts_analysis::{JavascriptAnalyzer, TypescriptAnalyzer};
+    pub use brokk_bifrost_rust_analysis::analyzer::{
+        RustAnalyzer, RustCallResultUseIndex, RustNativeObligationProof,
+        rust_call_is_standard_drop, rust_native_result_obligation,
+    };
+}
 pub use brokk_bifrost_core::{cancellation, hash, text_utils};
 
-pub use query::*;
 pub use refs::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
     MAX_TAINT_RESULT_NAME_BYTES, MAX_TAINT_RESULT_NAMESPACE_BYTES, MAX_TAINT_RESULT_REF_BYTES,

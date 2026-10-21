@@ -25,6 +25,7 @@ pub mod fq_name;
 pub mod go_facts;
 pub mod identifier;
 pub mod java_facts;
+pub mod language_knowledge;
 pub mod model;
 pub mod parsed_file;
 pub mod php_facts;

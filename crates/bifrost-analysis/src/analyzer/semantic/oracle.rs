@@ -1,3 +1,6 @@
+// Preserve explicit engine visibility when an overlay shadows a public glob.
+#![allow(hidden_glob_reexports)]
+
 //! Language-neutral value, dispatch, and heap-oracle contracts.
 //!
 //! Oracle answers deliberately separate three independent questions: whether
@@ -6,25 +9,12 @@
 //! proven candidate in an open set is not a must-answer, and an allocation
 //! site is not automatically a singleton object.
 
-mod call;
-mod dispatch;
-mod error;
-mod heap;
-mod limits;
-mod model;
-mod relation;
-mod retained;
-mod traits;
-mod value_flow;
-
-pub use call::*;
+pub use brokk_bifrost_semantic::analyzer::semantic::oracle::*;
+#[doc(hidden)]
+pub mod dispatch;
+#[doc(hidden)]
+pub mod traits;
 pub use dispatch::*;
-pub use error::*;
-pub use heap::*;
-pub use limits::*;
-pub use model::*;
-pub use relation::*;
 pub use traits::*;
-pub use value_flow::*;
 
-pub(crate) use value_flow::keyed_property_reads_container_element;
+pub(crate) mod retained;

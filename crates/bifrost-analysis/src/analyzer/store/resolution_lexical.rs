@@ -236,7 +236,7 @@ SELECT site.site,site.role,site.namespace,site.site_kind,site.start_byte,
          WHERE package_root.blob_id=?1
            AND package_root.root_scope_key=paths.end_node),
        prefix_definition.semantic_local_key,
-       prefix_scope.node,prefix_scope.spelling
+       prefix_scope.node,prefix_scope.spelling,NULL
 FROM selected_site AS site
 LEFT JOIN site_paths AS paths ON TRUE
 LEFT JOIN prefix_shadow_definitions AS prefix_definition
@@ -255,7 +255,7 @@ SELECT site.site,site.role,site.namespace,site.site_kind,site.start_byte,
          WHERE package_root.blob_id=?1
            AND package_root.root_scope_key=walk.node),
        prefix_definition.semantic_local_key,
-       prefix_scope.node,prefix_scope.spelling
+       prefix_scope.node,prefix_scope.spelling,walk.node
 FROM selected_site AS site
 CROSS JOIN lexical_walk AS walk
 -- CROSS JOIN keeps the walk as the outer loop. With a plain JOIN the planner
@@ -271,7 +271,6 @@ LEFT JOIN prefix_shadow_definitions AS prefix_definition
   ON prefix_definition.candidate_site=?2
 LEFT JOIN prefix_scope_spellings AS prefix_scope
   ON prefix_scope.candidate_site=?2
-WHERE scope.source_scope IS NOT NULL OR binding.semantic_local_key IS NOT NULL
 "#;
 
 // Keep the coverage arms disjoint so ORDER BY cannot make SQLite scan every
@@ -388,7 +387,8 @@ pub(crate) enum SelectedLookupRecipeReadOutcome {
 // every execution walked the direction's whole header range. On tract that is
 // 7,491 forward or 4,339 reverse rows, about 150 us an execution, to answer a
 // probe that the zero-fixed-symbol rows (none on tract) decide.
-pub(super) const PATH_ENDPOINT_HEADER_MOUNTS_SQL: &str = r#"
+#[doc(hidden)]
+pub const PATH_ENDPOINT_HEADER_MOUNTS_SQL: &str = r#"
 SELECT DISTINCT m.mount_ordinal
 FROM main.resolution_path_endpoint_headers AS h
 CROSS JOIN temp.selected_resolution_mounts AS m
@@ -452,7 +452,8 @@ WHERE ?3 = 0
 // set, and `temp.selected_resolution_scope_mounts` is the request's, the whole
 // selection unless a forward Rust request narrowed it to its crate's
 // dependency closure.
-pub(super) const SCOPED_PATH_ENDPOINT_HEADER_MOUNTS_SQL: &str = r#"
+#[doc(hidden)]
+pub const SCOPED_PATH_ENDPOINT_HEADER_MOUNTS_SQL: &str = r#"
 SELECT DISTINCT m.mount_ordinal
 FROM json_each(?5) AS root
 JOIN temp.selected_resolution_scope_mounts AS scope
@@ -550,7 +551,8 @@ WHERE h.direction = 'reverse'
 //
 // No `DISTINCT`: one blob's rows of one `covers` differ in `gap`, and the
 // reader sorts and dedups the reasons it builds.
-pub(super) const CANDIDATE_GAP_UNCONDITIONAL_SQL: &str = r#"
+#[doc(hidden)]
+pub const CANDIDATE_GAP_UNCONDITIONAL_SQL: &str = r#"
 SELECT m.mount_ordinal, h.reason
 FROM temp.selected_resolution_scope_mounts AS scope
 CROSS JOIN temp.selected_resolution_mounts AS m
@@ -728,14 +730,17 @@ LEFT JOIN main.resolution_fragment_interiors AS interior
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SelectedSemanticSite {
-    semantic: SemanticId,
+#[doc(hidden)]
+pub struct SelectedSemanticSite {
+    #[doc(hidden)]
+    pub semantic: SemanticId,
     node: BindingNodeId,
     namespace: ResolutionNamespace,
 }
 
 impl SelectedSemanticSite {
-    pub(crate) const fn semantic(self) -> SemanticId {
+    #[doc(hidden)]
+    pub const fn semantic(self) -> SemanticId {
         self.semantic
     }
 
@@ -749,7 +754,8 @@ impl SelectedSemanticSite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SelectedSemanticLookupOutcome {
+#[doc(hidden)]
+pub enum SelectedSemanticLookupOutcome {
     Found(Vec<SelectedSemanticSite>),
     Missing,
     Cancelled,
@@ -857,7 +863,8 @@ impl GraphStageReaderStats {
 
 /// Exact lexical answers shared by one Go operation or one graph-stage unit.
 /// Graph-stage instances are removed by the unit guard before the next unit.
-pub(crate) struct UnconditionalCandidateCache {
+#[doc(hidden)]
+pub struct UnconditionalCandidateCache {
     gap_boxes: std::rc::Rc<
         RefCell<ExactReadMemo<UnconditionalCandidateReadKey, UnconditionalCandidateBox>>,
     >,
@@ -871,7 +878,8 @@ pub(crate) struct UnconditionalCandidateCache {
 }
 
 impl UnconditionalCandidateCache {
-    pub(crate) fn for_go_operation() -> Self {
+    #[doc(hidden)]
+    pub fn for_go_operation() -> Self {
         Self::new(None)
     }
 
@@ -1003,7 +1011,8 @@ struct OrdinaryCompletionSuppression {
 /// The source owns no connection and starts no transaction. It stages every
 /// mounted identity named by one logical read, then registers the whole stage
 /// only after every parent and child row has exhausted with a live token.
-pub(crate) struct SelectedResolutionLexicalSource<'selection, 'store> {
+#[doc(hidden)]
+pub struct SelectedResolutionLexicalSource<'selection, 'store> {
     selection: &'selection SelectedResolutionMountInventory<'store>,
     typed: SelectedResolutionTypedSource<'selection, 'store>,
     forward_reference_fragments: Option<&'selection crate::hash::HashSet<BindingFragmentId>>,
@@ -1050,9 +1059,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         // This bounded authority lookup also runs while retaining already
         // returned cancellation evidence. Resolve its finite content keys;
         // the enclosing work loop owns semantic cancellation.
-        static CONTENT_LOOKUP: std::sync::LazyLock<CancellationToken> =
-            std::sync::LazyLock::new(CancellationToken::default);
-        let cancellation = &*CONTENT_LOOKUP;
+        // Nested SQLite cancellation can cancel the child token. Never share
+        // it with another authority lookup or a retry of this operation.
+        let content_lookup = CancellationToken::new();
+        let cancellation = &content_lookup;
         let (mount, kind, digest) = match key {
             Key::Fragment(fragment) => {
                 return Ok(Some(
@@ -1205,7 +1215,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     ///
     /// The namespace is the caller's, not a constant: a bare path root is a
     /// Type-namespace lookup, and an unqualified macro name is a Macro one.
-    pub(crate) fn reference_lookup_spellings(
+    #[doc(hidden)]
+    pub fn reference_lookup_spellings(
         &self,
         references: &[SemanticId],
         namespace: ResolutionNamespace,
@@ -1367,7 +1378,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     /// interior identity catalog gives it.
     ///
     /// `None` reports cancellation. Unknown identities are structured errors.
-    pub(crate) fn semantic_provenance(
+    #[doc(hidden)]
+    pub fn semantic_provenance(
         &self,
         semantic: SemanticId,
         cancellation: &CancellationToken,
@@ -1426,7 +1438,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     /// Ordinary and stage catalogs establish node identity. Explicit request
     /// registration preserves intrinsic root and context boundaries.
     /// The outer None is cancellation; inner None is an unknown node.
-    pub(crate) fn node_provenance(
+    #[doc(hidden)]
+    pub fn node_provenance(
         &self,
         node: BindingNodeId,
         cancellation: &CancellationToken,
@@ -1470,7 +1483,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     }
 
     /// The source site one definition node declares.
-    pub(crate) fn definition_source_site(
+    #[doc(hidden)]
+    pub fn definition_source_site(
         &self,
         mount: SelectedResolutionMountOrdinal,
         definition: BindingNodeId,
@@ -1605,6 +1619,19 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         }
     }
 
+    /// Validate the same lowest-ordinal blob authority used by keyed readers.
+    pub(crate) fn validate_reverse_candidate_blob(
+        &self,
+        blob: i64,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<()>> {
+        let Some(mount) = self.mount_of_blob(blob, cancellation)? else {
+            return Ok(None);
+        };
+        let mount = mount.expect("reverse candidate keys name selected blobs");
+        self.authority.ensure_authority(&mount, cancellation)
+    }
+
     /// Every reference in one blob that looks a name up, optionally narrowed
     /// to the scope chain a named import binder governs.
     pub(crate) fn lookup_reference_sites(
@@ -1677,7 +1704,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
 
     /// The trait references one member definition declares as a
     /// trait-implementation member of one kind.
-    pub(crate) fn contract_reference_sites(
+    #[doc(hidden)]
+    pub fn contract_reference_sites(
         &self,
         mount: SelectedResolutionMountOrdinal,
         definition: SemanticId,
@@ -1708,7 +1736,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
 
     /// The reason semantics one unsupported scope, binder or expression at a
     /// source site publishes. A replayed macro closes exactly these.
-    pub(crate) fn unsupported_gap_reasons(
+    #[doc(hidden)]
+    pub fn unsupported_gap_reasons(
         &self,
         mount: SelectedResolutionMountOrdinal,
         site: ResolutionSiteId,
@@ -1751,7 +1780,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         Option<
             Vec<(
                 SemanticId,
-                crate::analyzer::lexical_definitions::LexicalDefinition,
+                crate::analyzer::resolution::lexical_definition::LexicalDefinition,
             )>,
         >,
     > {
@@ -1759,7 +1788,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     }
 
     /// Remove only exact active-stage UnsupportedSemantic closure claims.
-    pub(crate) fn close_completion(
+    #[doc(hidden)]
+    pub fn close_completion(
         &self,
         completion: &ResolutionCompletion,
         cancellation: &CancellationToken,
@@ -1785,9 +1815,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         self
     }
 
-    pub(crate) fn new_on_demand(
-        selection: &'selection SelectedResolutionMountInventory<'store>,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn new_on_demand(selection: &'selection SelectedResolutionMountInventory<'store>) -> Self {
         Self::with_authority(
             selection,
             std::rc::Rc::new(
@@ -1841,7 +1870,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         )
     }
 
-    pub(crate) fn new_on_demand_with_unconditional_cache(
+    #[doc(hidden)]
+    pub fn new_on_demand_with_unconditional_cache(
         selection: &'selection SelectedResolutionMountInventory<'store>,
         candidate_cache: std::rc::Rc<UnconditionalCandidateCache>,
     ) -> Self {
@@ -1895,7 +1925,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         }
     }
 
-    pub(crate) fn lookup_semantic_sites(
+    #[doc(hidden)]
+    pub fn lookup_semantic_sites(
         &self,
         locator: &SelectedSemanticLocator,
         cancellation: &CancellationToken,
@@ -1938,7 +1969,15 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             staged
         };
         if let Some(namespace) = locator.reference_namespace() {
-            rows.retain(|(_, _, candidate_namespace)| *candidate_namespace == namespace);
+            let selected_namespace = if rows
+                .iter()
+                .any(|(_, _, candidate_namespace)| *candidate_namespace == namespace)
+            {
+                namespace
+            } else {
+                locator.fallback_reference_namespace().unwrap_or(namespace)
+            };
+            rows.retain(|(_, _, candidate_namespace)| *candidate_namespace == selected_namespace);
         }
         if rows.is_empty() {
             return Ok(SelectedSemanticLookupOutcome::Missing);
@@ -2235,7 +2274,8 @@ JOIN temp.selected_resolution_stage_recipes recipe
     }
 
     /// Read the source scopes of a request's already-held nodes once per mount.
-    pub(crate) fn node_scope_ordinals(
+    #[doc(hidden)]
+    pub fn node_scope_ordinals(
         &self,
         nodes: impl Iterator<Item = BindingNodeId>,
         cancellation: &CancellationToken,
@@ -2458,6 +2498,70 @@ JOIN temp.selected_resolution_stage_recipes recipe
         Ok(self
             .node_for_identity(fragment, scope_head_node_identity(scope), cancellation)?
             .flatten())
+    }
+
+    /// Lexical lookup ancestry follows symbol-preserving selected paths, not
+    /// containment. Stage and ordinary rows use the same reconciled authority
+    /// as candidate matching and scope classification for this rules value.
+    pub(crate) fn lookup_scope_parent(
+        &self,
+        fragment: BindingFragmentId,
+        scope: ResolutionScopeId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<ResolutionScopeId>> {
+        let Some(head) = self.scope_head_node_of(fragment, scope, cancellation)? else {
+            return Ok(None);
+        };
+        let mut pending = vec![head];
+        let mut seen = HashSet::new();
+        let mut parents = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if !seen.insert(node) {
+                continue;
+            }
+            if node != head {
+                let Some(scopes) = self.node_scope_ordinals(std::iter::once(node), cancellation)?
+                else {
+                    return Ok(None);
+                };
+                if let Some(Some((owner, parent))) = scopes.get(&node) {
+                    assert_eq!(
+                        *owner, fragment,
+                        "lookup parent stays in its source fragment"
+                    );
+                    parents.insert(*parent);
+                    continue;
+                }
+            }
+            let request = BatchCandidateRequest::new(
+                0,
+                EndpointSignature::new(node, StackPattern::closed([]), StackPattern::closed([])),
+            );
+            let outcome = self.match_forward_candidates(&[request], cancellation)?;
+            let candidates = outcome
+                .matches()
+                .iter()
+                .map(|matched| matched.candidate())
+                .collect::<Vec<_>>();
+            for page in candidates.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
+                for (_, path) in self.hydrate_candidate_paths(page, cancellation)? {
+                    if path.start().node() == node
+                        && path.start().symbols().fixed().is_empty()
+                        && path.end().symbols().fixed().is_empty()
+                    {
+                        pending.push(path.end().node());
+                    }
+                }
+            }
+        }
+        assert!(
+            parents.len() <= 1,
+            "lexical lookup parent is unique: {scope:?}, {parents:?}"
+        );
+        Ok(parents.first().copied())
     }
 
     fn forward_candidate_completion(
@@ -2926,7 +3030,8 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// read classifies scoped effective eligibility so cancellation cannot lose
     /// decoded evidence or resurrect closed reasons. Only certified exact gap
     /// exclusions apply; cached reason overlays never determine scoped answers.
-    pub(super) fn reverse_completion_with_exclusions(
+    #[doc(hidden)]
+    pub fn reverse_completion_with_exclusions(
         &self,
         requests: &[BatchCandidateRequest],
         scope: Option<&[SelectedResolutionMountOrdinal]>,
@@ -5040,6 +5145,7 @@ struct RawReferenceLocalPathEvidence {
     prefix_local_definitions: Vec<SemanticId>,
     prefix_scope_spellings: Vec<(u32, String)>,
     scope_endpoints: Vec<u32>,
+    lexical_scopes: Vec<(u32, u32, bool)>,
     binding_candidates: Vec<(Option<i64>, Option<i64>, i64, u32)>,
     reaches_root: bool,
     reaches_package_root_scope: bool,
@@ -5063,6 +5169,7 @@ fn read_reference_local_path_rows(
     let mut prefix_local_definitions = Vec::new();
     let mut prefix_scope_spellings = Vec::new();
     let mut scope_endpoints = Vec::new();
+    let mut lexical_scopes = Vec::new();
     let mut binding_candidates = Vec::<(Option<i64>, Option<i64>, i64, u32)>::new();
     let mut reaches_root = false;
     let mut reaches_package_root_scope = false;
@@ -5105,6 +5212,13 @@ fn read_reference_local_path_rows(
             ));
         }
         if let Some(depth) = walk_depth {
+            if let Some(node) = row.get::<_, Option<u32>>(25)? {
+                lexical_scopes.push((
+                    node,
+                    u32::try_from(depth).expect("scope depth fits u32"),
+                    row.get::<_, Option<u32>>(19)?.is_some(),
+                ));
+            }
             let lookup_local: Option<i64> = row.get(16)?;
             let lookup_identity: Option<i64> = row.get(17)?;
             if let Some(scope) = row.get::<_, Option<i64>>(19)? {
@@ -5140,6 +5254,7 @@ fn read_reference_local_path_rows(
         prefix_local_definitions,
         prefix_scope_spellings,
         scope_endpoints,
+        lexical_scopes,
         binding_candidates,
         reaches_root,
         reaches_package_root_scope,
@@ -5182,6 +5297,7 @@ fn read_reference_local_path_evidence(
         mut prefix_local_definitions,
         mut prefix_scope_spellings,
         mut scope_endpoints,
+        mut lexical_scopes,
         mut binding_candidates,
         reaches_root,
         reaches_package_root_scope,
@@ -5267,6 +5383,15 @@ fn read_reference_local_path_evidence(
     prefix_scope_spellings.dedup();
     scope_endpoints.sort_unstable();
     scope_endpoints.dedup();
+    lexical_scopes.sort_unstable();
+    lexical_scopes.dedup();
+    let mut enclosing_scope_depths = lexical_scopes
+        .iter()
+        .filter(|(_, _, original)| *original)
+        .map(|(_, depth, _)| *depth)
+        .collect::<Vec<_>>();
+    enclosing_scope_depths.sort_unstable();
+    enclosing_scope_depths.dedup();
     Ok(Some(
         ReferenceLocalPathEvidence::new(
             metadata,
@@ -5277,7 +5402,21 @@ fn read_reference_local_path_evidence(
             reaches_root,
             reaches_package_root_scope,
         )
-        .with_local_bindings_certified(local_bindings_certified),
+        .with_local_bindings_certified(local_bindings_certified)
+        .with_lexical_scopes(
+            lexical_scopes
+                .into_iter()
+                .map(|(node, depth, _)| {
+                    // Checkpoints carry source order inside a scope, not another
+                    // lexical level. Count only completed enclosing scopes.
+                    let level = enclosing_scope_depths.partition_point(|outer| *outer < depth);
+                    (
+                        BindingNodeId::local(ordinal.get(), node),
+                        u32::try_from(level).expect("lexical level fits u32"),
+                    )
+                })
+                .collect(),
+        ),
     ))
 }
 
@@ -5609,21 +5748,52 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         nodes: &[BindingNodeId],
         cancellation: &CancellationToken,
     ) -> StoreResult<Vec<BatchEndpointClassification>> {
+        use crate::analyzer::resolution::{
+            FactPageVisitor, SelectedTypedFactSource, TypedFactRequest,
+        };
+        self.classify_endpoint_nodes_with_member_owners(nodes, cancellation, &mut |definitions| {
+            let mut rows = Vec::new();
+            let read = self.typed.visit_member_owner_pages_for_definitions(
+                TypedFactRequest::new(definitions),
+                cancellation,
+                &mut FactPageVisitor::new(&mut |page| {
+                    rows.extend_from_slice(page);
+                    Ok(true)
+                }),
+            )?;
+            if cancellation.is_cancelled() || read.is_cancelled() {
+                return Ok(None);
+            }
+            assert!(
+                read.is_exhausted(),
+                "member-owner classification visitor exhausts its selected pages"
+            );
+            Ok(Some(rows))
+        })
+        .map(Option::unwrap_or_default)
+    }
+
+    fn classify_endpoint_nodes_with_member_owners(
+        &self,
+        nodes: &[BindingNodeId],
+        cancellation: &CancellationToken,
+        member_owners: &mut crate::analyzer::resolution::ClassificationMemberOwnerReader<'_>,
+    ) -> StoreResult<Option<Vec<BatchEndpointClassification>>> {
         let Some(mut payloads) = stage::node_payloads(self.selection, nodes, cancellation)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let Some(mut owners) = stage::member_scope_owners(self.selection, nodes, cancellation)?
         else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let Some(stage_catalog) = stage::scope_nodes(self.selection, nodes, cancellation)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let mut go_namespaces = if self.selection.has_go_semantics() {
             let Some(namespaces) =
                 stage::go_definition_namespaces(self.selection, nodes, cancellation)?
             else {
-                return Ok(Vec::new());
+                return Ok(None);
             };
             namespaces
         } else {
@@ -5633,7 +5803,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         // payload. Registration proves membership, not a synthetic node kind.
         let mut catalog_only = stage_catalog.into_keys().collect::<HashSet<_>>();
         let Some(groups) = self.grouped_endpoint_node_keys(nodes, cancellation) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let mut go_mounts = HashSet::<SelectedResolutionMountOrdinal>::default();
 
@@ -5643,7 +5813,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 go_mounts.insert(ordinal);
             }
             let Some(ordinary) = self.read_node_catalog(record, &members, cancellation)? else {
-                return Ok(Vec::new());
+                return Ok(None);
             };
             let Some(ordinary_owners) = self.read_member_scope_owners(
                 record.blob_id(),
@@ -5651,7 +5821,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 cancellation,
             )?
             else {
-                return Ok(Vec::new());
+                return Ok(None);
             };
             let go_sites = if record.semantic_language() == crate::analyzer::Language::Go {
                 let Some(sites) = self.read_site_rows(
@@ -5665,7 +5835,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                     cancellation,
                 )?
                 else {
-                    return Ok(Vec::new());
+                    return Ok(None);
                 };
                 sites
             } else {
@@ -5727,10 +5897,6 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         }
         let mut go_fields = HashSet::<SemanticId>::default();
         if self.selection.has_go_semantics() {
-            use crate::analyzer::resolution::{
-                FactPageVisitor, LoweredMemberOwnerProperty, SelectedTypedFactSource,
-                SelectedTypedRow, TypedFactRequest,
-            };
             let mut definitions = payloads
                 .iter()
                 .filter_map(|(node, payload)| match payload {
@@ -5747,30 +5913,17 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
             definitions.sort_unstable();
             definitions.dedup();
             if !definitions.is_empty() {
-                let mut collect_fields =
-                    |rows: &[SelectedTypedRow<LoweredMemberOwnerProperty>]| {
-                        for row in rows {
-                            if row.row().kind() == ResolutionMemberKind::Field {
-                                assert!(
-                                    go_fields.insert(row.row().definition()),
-                                    "one selected Go field membership per definition"
-                                );
-                            }
-                        }
-                        Ok(true)
-                    };
-                let read = self.typed.visit_member_owner_pages_for_definitions(
-                    TypedFactRequest::new(&definitions),
-                    cancellation,
-                    &mut FactPageVisitor::new(&mut collect_fields),
-                )?;
-                if cancellation.is_cancelled() || read.is_cancelled() {
-                    return Ok(Vec::new());
+                let Some(rows) = member_owners(&definitions)? else {
+                    return Ok(None);
+                };
+                for row in rows {
+                    if row.row().kind() == ResolutionMemberKind::Field {
+                        assert!(
+                            go_fields.insert(row.row().definition()),
+                            "one selected Go field membership per definition"
+                        );
+                    }
                 }
-                assert!(
-                    read.is_exhausted(),
-                    "member-owner classification visitor always exhausts its selected pages"
-                );
             }
         }
         for (&node, payload) in &payloads {
@@ -5818,7 +5971,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 .with_go_definition_namespaces(go_namespaces.get(&node).copied()),
             );
         }
-        Ok(classified)
+        Ok(Some(classified))
     }
 
     fn match_forward_candidates(
@@ -9452,7 +9605,7 @@ impl SelectedResolutionLexicalSource<'_, '_> {
 #[cfg(test)]
 mod stage_completion_cache_tests {
     use super::*;
-    use crate::analyzer::store::resolution_selection::tests::SelectionFixture;
+    use crate::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
 
     #[test]
     fn header_read_memo_follows_scope_writes_and_explicit_mount_restrictions() {

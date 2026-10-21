@@ -66,17 +66,26 @@ struct ExpressionRow {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TemplateTermRow {
-    pub(crate) id: i64,
-    pub(crate) expression: i64,
-    pub(crate) parent: Option<i64>,
-    pub(crate) ordinal: usize,
-    pub(crate) kind: i64,
-    pub(crate) text: Option<String>,
-    pub(crate) atom_kind: Option<String>,
+#[doc(hidden)]
+pub struct TemplateTermRow {
+    #[doc(hidden)]
+    pub id: i64,
+    #[doc(hidden)]
+    pub expression: i64,
+    #[doc(hidden)]
+    pub parent: Option<i64>,
+    #[doc(hidden)]
+    pub ordinal: usize,
+    #[doc(hidden)]
+    pub kind: i64,
+    #[doc(hidden)]
+    pub text: Option<String>,
+    #[doc(hidden)]
+    pub atom_kind: Option<String>,
 }
 
-pub(crate) fn flatten_template_expression(
+#[doc(hidden)]
+pub fn flatten_template_expression(
     expression_id: i64,
     first_term_id: i64,
     expression: &CppTemplateExpression,
@@ -117,10 +126,8 @@ pub(crate) fn flatten_template_expression(
     Ok((first_term_id, rows))
 }
 
-pub(crate) fn build_template_term(
-    rows: Vec<TemplateTermRow>,
-    root_term: i64,
-) -> Result<CppTemplateTerm> {
+#[doc(hidden)]
+pub fn build_template_term(rows: Vec<TemplateTermRow>, root_term: i64) -> Result<CppTemplateTerm> {
     let expression = rows
         .first()
         .ok_or_else(|| StoreError::new("C++ template expression has no terms"))?

@@ -17,7 +17,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use tree_sitter::{Node, Tree};
 
 use super::field_metadata::{field_sites, FieldSite};
-use super::language_rules::LanguageRuleMatches;
+use super::language_rules::{LanguageRuleMatches, UndecidedSite};
 
 /// Return the exact structural spans selected by one closed C# relation.
 pub(super) fn matches_for_file(
@@ -33,16 +33,28 @@ pub(super) fn matches_for_file(
         return LanguageRuleMatches::default();
     };
     let fields = field_sites(analyzer, file);
-    let mut ranges = match rule {
-        CSharpRule::StaticArray => static_array_fields(&tree, source, &fields),
-        CSharpRule::UseNumberConstant => number_constant_uses(&tree, source, &fields),
+    let mut undecided = Vec::new();
+    let ranges = match rule {
+        CSharpRule::StaticArray => static_array_fields(&tree, source, &fields, &mut undecided),
+        CSharpRule::UseNumberConstant => {
+            number_constant_uses(&tree, source, &fields, &mut undecided)
+        }
     };
-    ranges.sort();
-    ranges.dedup();
-    LanguageRuleMatches::from_ranges(ranges)
+    LanguageRuleMatches::decided(
+        ranges,
+        undecided,
+        Language::CSharp.config_label(),
+        rule.label(),
+        file,
+    )
 }
 
-fn static_array_fields(tree: &Tree, source: &str, fields: &[FieldSite]) -> Vec<Range> {
+fn static_array_fields(
+    tree: &Tree,
+    source: &str,
+    fields: &[FieldSite],
+    undecided: &mut Vec<UndecidedSite>,
+) -> Vec<Range> {
     let mut matches = Vec::new();
     for node in descendants(tree.root_node()) {
         if node.kind() != "field_declaration" {
@@ -55,11 +67,17 @@ fn static_array_fields(tree: &Tree, source: &str, fields: &[FieldSite]) -> Vec<R
             if site.metadata.callable_declared_visibility() != Some(DeclaredVisibility::Public)
                 || !site.metadata.field_is_static()
                 || !site.metadata.field_is_final()
-                || !site
-                    .metadata
-                    .return_type_identity()
-                    .is_some_and(|identity| identity.is_array())
             {
+                continue;
+            }
+            let Some(identity) = site.metadata.return_type_identity() else {
+                undecided.push(UndecidedSite::at(
+                    node_range(declarator),
+                    "the declared field type is not recorded",
+                ));
+                continue;
+            };
+            if !identity.is_array() {
                 continue;
             }
             if initializer_shape(declarator, source) != InitializerShape::Empty {
@@ -142,7 +160,12 @@ struct ConstantSite {
     value: IntegerLiteralValue,
 }
 
-fn number_constant_uses(tree: &Tree, source: &str, fields: &[FieldSite]) -> Vec<Range> {
+fn number_constant_uses(
+    tree: &Tree,
+    source: &str,
+    fields: &[FieldSite],
+    undecided: &mut Vec<UndecidedSite>,
+) -> Vec<Range> {
     let mut constants = Vec::new();
     for declaration in descendants(tree.root_node()) {
         if declaration.kind() != "field_declaration" {
@@ -166,6 +189,10 @@ fn number_constant_uses(tree: &Tree, source: &str, fields: &[FieldSite]) -> Vec<
                 continue;
             };
             let Some(value) = csharp_integer_literal_value(literal, source) else {
+                undecided.push(UndecidedSite::at(
+                    node_range(literal),
+                    "the constant's integer literal value is not decoded",
+                ));
                 continue;
             };
             constants.push(ConstantSite {
@@ -185,10 +212,16 @@ fn number_constant_uses(tree: &Tree, source: &str, fields: &[FieldSite]) -> Vec<
         {
             continue;
         }
+        let owner_id = enclosing_type(literal).map_or(0, |owner| owner.id());
         let Some(value) = csharp_integer_literal_value(literal, source) else {
+            if constants.iter().any(|constant| constant.owner_id == owner_id) {
+                undecided.push(UndecidedSite::at(
+                    literal_range,
+                    "the integer literal value is not decoded",
+                ));
+            }
             continue;
         };
-        let owner_id = enclosing_type(literal).map_or(0, |owner| owner.id());
         if constants
             .iter()
             .any(|constant| constant.owner_id == owner_id && constant.value == value)

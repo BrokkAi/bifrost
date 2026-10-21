@@ -1055,19 +1055,32 @@ impl CallableSignatureOracle for FileCallableSignatureOracle<'_> {
     }
 }
 
-/// Rust's declaration owner is not always a lexical structural ancestor: an
-/// inherent or trait `impl` and the type it implements are separate
-/// declarations and can be in separate files. Declaration extraction reads
-/// the impl item's `type` AST field to construct each member's structured
-/// owner identity; `parent_of` resolves that identity back to the exact
-/// workspace declaration. This oracle joins that declaration to its own
+/// Whether a member declaration in `language` can be owned by a type
+/// declaration that is not its lexical structural ancestor, possibly in
+/// another file.
+///
+/// Rust writes an inherent or trait `impl` apart from the type it implements.
+/// C++ defines a member out of line (`long PriceCalculator::total() {...}`)
+/// apart from the class body that declares it, usually in another file
+/// (#3458). Declaration extraction reads the owner from structure in both
+/// cases: the impl item's `type` field, and the qualified declarator's scope.
+/// An owner name is then not a sound source anchor for the member's file
+/// either, because an alias can spell the owner.
+pub(super) fn declaration_owner_may_be_non_lexical(language: Language) -> bool {
+    matches!(language, Language::Rust | Language::Cpp)
+}
+
+/// The declaration owner of a member whose owner is not always a lexical
+/// structural ancestor (see [`declaration_owner_may_be_non_lexical`]).
+/// `parent_of` resolves the member's structured owner identity back to the
+/// exact workspace declaration. This oracle joins that declaration to its own
 /// normalized fact so `inside-decl` can apply the ordinary pattern verifier.
-pub(super) struct RustDeclarationOwnerOracle<'a> {
+pub(super) struct NonLexicalDeclarationOwnerOracle<'a> {
     analyzer: &'a dyn IAnalyzer,
     declarations: EnclosingDeclarationIndex,
 }
 
-impl<'a> RustDeclarationOwnerOracle<'a> {
+impl<'a> NonLexicalDeclarationOwnerOracle<'a> {
     pub(super) fn for_file(analyzer: &'a dyn IAnalyzer, file: &ProjectFile) -> Self {
         Self {
             analyzer,
@@ -1076,7 +1089,7 @@ impl<'a> RustDeclarationOwnerOracle<'a> {
     }
 }
 
-impl DeclarationOwnerOracle for RustDeclarationOwnerOracle<'_> {
+impl DeclarationOwnerOracle for NonLexicalDeclarationOwnerOracle<'_> {
     fn owner_matches(
         &self,
         declaration: Range,
@@ -1096,7 +1109,7 @@ impl DeclarationOwnerOracle for RustDeclarationOwnerOracle<'_> {
             return false;
         };
         let language = crate::analyzer::common::language_for_file(owner.source());
-        if language != Language::Rust {
+        if !declaration_owner_may_be_non_lexical(language) {
             return false;
         }
         let Some(facts) = self

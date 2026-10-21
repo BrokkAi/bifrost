@@ -1218,15 +1218,7 @@ fn collect_visible_local_type_items(
     loop {
         let mut cursor = scope.walk();
         for node in scope.named_children(&mut cursor) {
-            if matches!(
-                node.kind(),
-                "struct_item"
-                    | "enum_item"
-                    | "union_item"
-                    | "trait_item"
-                    | "type_item"
-                    | "mod_item"
-            ) {
+            if is_type_namespace_item(node) {
                 collect_local_item_name(node, source, out);
             }
         }
@@ -1236,6 +1228,439 @@ fn collect_visible_local_type_items(
         };
         scope = child_scope;
     }
+}
+
+// #5911: aliases and conditional std ownership must select the same type
+// binding at the actual RHS site, rather than share only a spelling.
+#[derive(Debug)]
+pub(crate) enum RustTypeHead<'tree> {
+    Item(Node<'tree>),
+    Import {
+        path: Vec<String>,
+        declaration: Node<'tree>,
+    },
+    Unbound,
+    Unknown,
+}
+
+fn is_type_namespace_item(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item" | "mod_item"
+    )
+}
+
+// Unknown attribute macros may introduce other names in their owning scope.
+fn type_scope_attributes_known_bounded<F, E>(
+    node: Node<'_>,
+    source: &str,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    for attribute in outer_attributes(node) {
+        charge(1)?;
+        let path = attribute
+            .named_child(0)
+            .and_then(|attribute| attribute.named_child(0));
+        if !path.is_some_and(|path| {
+            matches!(
+                crate::declarations::rust_node_text(path, source),
+                "cfg" | "inline" | "doc"
+            )
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+// At a selected site's ancestors, activation attributes need a selected
+// configuration; inspecting only their head avoids an unmetered cfg parse.
+fn type_site_attributes_unconditional_bounded<F, E>(
+    node: Node<'_>,
+    source: &str,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    for attribute in outer_attributes(node) {
+        charge(1)?;
+        let path = attribute
+            .named_child(0)
+            .and_then(|attribute| attribute.named_child(0));
+        if !path.is_some_and(|path| {
+            matches!(
+                crate::declarations::rust_node_text(path, source),
+                "inline" | "doc"
+            )
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+// Both selectors consume the same structured scope walk. Selection rules
+// remain separate: a type may be selected at one tier, while a pattern binder
+// needs complete absence of a competing value throughout the relevant scopes.
+enum RustLexicalSelectionEvent<'tree, 'projection> {
+    Ancestor(Node<'tree>),
+    Parameter(Node<'tree>),
+    Item(Node<'tree>),
+    Import(
+        Node<'tree>,
+        &'projection crate::imports::RustImportProjectionLeaf<'tree>,
+    ),
+    ScopeEnd,
+}
+
+enum RustLexicalSelection<T> {
+    Complete,
+    Selected(T),
+    Unknown,
+}
+
+fn visit_rust_lexical_selection_bounded<'tree, F, E, T>(
+    root: Node<'tree>,
+    source: &str,
+    site: Node<'tree>,
+    charge: &mut F,
+    mut select: impl for<'projection> FnMut(
+        RustLexicalSelectionEvent<'tree, 'projection>,
+        &mut F,
+    ) -> Result<std::ops::ControlFlow<T>, E>,
+) -> Result<RustLexicalSelection<T>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
+    charge(0)?;
+    let mut current = Some(site);
+    let mut scopes = Vec::new();
+    while let Some(node) = current {
+        charge(1)?;
+        if node.is_error() || node.is_missing() || (node.has_error() && node.id() == site.id()) {
+            return Ok(RustLexicalSelection::Unknown);
+        }
+        if matches!(node.kind(), "macro_invocation" | "macro_definition") {
+            return Ok(RustLexicalSelection::Unknown);
+        }
+        if !type_site_attributes_unconditional_bounded(node, source, charge)? {
+            return Ok(RustLexicalSelection::Unknown);
+        }
+        if let ControlFlow::Break(value) =
+            select(RustLexicalSelectionEvent::Ancestor(node), charge)?
+        {
+            return Ok(RustLexicalSelection::Selected(value));
+        }
+        scopes.push(node);
+        if node.id() == root.id() {
+            break;
+        }
+        current = node.parent();
+    }
+    if scopes.last().is_none_or(|node| node.id() != root.id()) {
+        return Ok(RustLexicalSelection::Unknown);
+    }
+    for node in &scopes {
+        charge(1)?;
+        // Inner attributes belong to the actual owner body, including
+        // module declaration lists, not just the source-file root.
+        if matches!(node.kind(), "source_file" | "declaration_list") {
+            let mut cursor = node.walk();
+            for attribute in node.named_children(&mut cursor) {
+                charge(1)?;
+                if attribute.kind() != "inner_attribute_item" {
+                    continue;
+                }
+                let path = attribute
+                    .named_child(0)
+                    .and_then(|attribute| attribute.named_child(0));
+                if !path.is_some_and(|path| {
+                    matches!(
+                        crate::declarations::rust_node_text(path, source),
+                        "allow" | "warn" | "deny" | "forbid" | "doc"
+                    )
+                }) {
+                    return Ok(RustLexicalSelection::Unknown);
+                }
+            }
+        }
+    }
+    for scope in scopes {
+        charge(1)?;
+        if let Some(parameters) = scope.child_by_field_name("type_parameters") {
+            let mut cursor = parameters.walk();
+            for raw in parameters.named_children(&mut cursor) {
+                charge(1)?;
+                let parameter = unwrap_attributes(raw);
+                if raw.has_error()
+                    || raw.is_missing()
+                    || !type_site_attributes_unconditional_bounded(parameter, source, charge)?
+                {
+                    return Ok(RustLexicalSelection::Unknown);
+                }
+                if let ControlFlow::Break(value) =
+                    select(RustLexicalSelectionEvent::Parameter(parameter), charge)?
+                {
+                    return Ok(RustLexicalSelection::Selected(value));
+                }
+            }
+        }
+        if !matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            continue;
+        }
+        let mut cursor = scope.walk();
+        for raw in scope.named_children(&mut cursor) {
+            charge(1)?;
+            let item = unwrap_attributes(raw);
+            if raw.has_error()
+                || raw.is_missing()
+                || item.kind() == "macro_invocation"
+                || (item.kind() == "expression_statement"
+                    && item
+                        .named_child(0)
+                        .is_some_and(|child| child.kind() == "macro_invocation"))
+                || !type_scope_attributes_known_bounded(item, source, charge)?
+            {
+                return Ok(RustLexicalSelection::Unknown);
+            }
+            if let ControlFlow::Break(value) =
+                select(RustLexicalSelectionEvent::Item(item), charge)?
+            {
+                return Ok(RustLexicalSelection::Selected(value));
+            }
+            if item.kind() == "extern_crate_declaration" {
+                // Tree-local selection does not know Cargo crate identities.
+                return Ok(RustLexicalSelection::Unknown);
+            }
+            if item.kind() == "use_declaration" {
+                for leaf in
+                    crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+                        item,
+                        source,
+                        &mut *charge,
+                    )?
+                {
+                    charge(1)?;
+                    charge(leaf.import.path().len())?;
+                    if let ControlFlow::Break(value) =
+                        select(RustLexicalSelectionEvent::Import(item, &leaf), charge)?
+                    {
+                        return Ok(RustLexicalSelection::Selected(value));
+                    }
+                }
+            }
+        }
+        charge(0)?;
+        if let ControlFlow::Break(value) = select(RustLexicalSelectionEvent::ScopeEnd, charge)? {
+            return Ok(RustLexicalSelection::Selected(value));
+        }
+        if scope.kind() == "source_file"
+            || scope
+                .parent()
+                .is_some_and(|parent| parent.kind() == "mod_item")
+        {
+            // Parent module imports/items are not inherited implicitly.
+            break;
+        }
+    }
+    charge(0)?;
+    Ok(RustLexicalSelection::Complete)
+}
+
+/// Select a type head in the existing lexical scope chain. Items have the
+/// whole containing scope (including before their declaration). Generic type
+/// parameters and unknown imports are barriers, never prelude evidence.
+/// No index is rebuilt and every inspected node is charged to the caller.
+pub(crate) fn rust_type_head_at_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    site: Node<'tree>,
+    name: &str,
+    charge: &mut F,
+) -> Result<RustTypeHead<'tree>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
+    let mut candidates = Vec::new();
+    let selection =
+        visit_rust_lexical_selection_bounded(root, source, site, charge, |event, charge| {
+            match event {
+                RustLexicalSelectionEvent::Ancestor(_) => {}
+                RustLexicalSelectionEvent::Parameter(parameter) => {
+                    if parameter.kind() == "type_parameter"
+                        && parameter.child_by_field_name("name").is_some_and(|node| {
+                            crate::declarations::rust_node_text(node, source) == name
+                        })
+                    {
+                        return Ok(ControlFlow::Break(RustTypeHead::Unknown));
+                    }
+                }
+                RustLexicalSelectionEvent::Item(item) => {
+                    if is_type_namespace_item(item)
+                        && item.child_by_field_name("name").is_some_and(|node| {
+                            crate::declarations::rust_node_text(node, source) == name
+                        })
+                    {
+                        if item.has_error() || outer_attributes(item).next().is_some() {
+                            return Ok(ControlFlow::Break(RustTypeHead::Unknown));
+                        }
+                        charge(1)?;
+                        candidates.push(RustTypeHead::Item(item));
+                    }
+                }
+                RustLexicalSelectionEvent::Import(item, leaf) => match leaf.import.binding_name() {
+                    RustImportBindingName::Glob => {
+                        return Ok(ControlFlow::Break(RustTypeHead::Unknown));
+                    }
+                    RustImportBindingName::Named(binding) if binding == name => {
+                        if item.has_error() || outer_attributes(item).next().is_some() {
+                            return Ok(ControlFlow::Break(RustTypeHead::Unknown));
+                        }
+                        for segment in leaf.import.path() {
+                            charge(1)?;
+                            charge(segment.len())?;
+                        }
+                        charge(1)?;
+                        candidates.push(RustTypeHead::Import {
+                            path: leaf.import.path().to_vec(),
+                            declaration: item,
+                        });
+                    }
+                    _ => {}
+                },
+                RustLexicalSelectionEvent::ScopeEnd => match candidates.len() {
+                    0 => {}
+                    1 => {
+                        return Ok(ControlFlow::Break(candidates.pop().expect("one candidate")));
+                    }
+                    _ => return Ok(ControlFlow::Break(RustTypeHead::Unknown)),
+                },
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+    Ok(match selection {
+        RustLexicalSelection::Complete => RustTypeHead::Unbound,
+        RustLexicalSelection::Selected(head) => head,
+        RustLexicalSelection::Unknown => RustTypeHead::Unknown,
+    })
+}
+
+/// Prove that a flat let-pattern identifier introduces a binding, independently
+/// of tentative local inventories. Bare constants and unit constructors have
+/// the same syntax, so #5911 tuple initialization needs complete value-scope
+/// absence before it may publish any component establishment. False withholds
+/// proof; it does not establish that a particular constant or import resolved.
+/// Ordinary local/parameter names do not conflict with legal rebinding.
+pub fn rust_pattern_identifier_binding_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    pattern: Node<'tree>,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
+    charge(0)?;
+    charge(1)?;
+    if root.kind() != "source_file" || pattern.is_missing() || pattern.has_error() {
+        return Ok(false);
+    }
+    let name = match pattern.kind() {
+        "identifier" => pattern,
+        "mut_pattern" => {
+            let mut name = None;
+            let mut mutable = false;
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                charge(1)?;
+                match child.kind() {
+                    "line_comment" | "block_comment" => {}
+                    "mutable_specifier" if !mutable => mutable = true,
+                    "identifier" if name.is_none() => name = Some(child),
+                    _ => return Ok(false),
+                }
+            }
+            let Some(name) = name.filter(|_| mutable) else {
+                return Ok(false);
+            };
+            name
+        }
+        _ => return Ok(false),
+    };
+    // Validate the actual pattern field, not merely an identifier's spelling.
+    // Only the supported flat let/tuple envelope is admitted here.
+    let mut owner = pattern;
+    if pattern.kind() == "identifier"
+        && let Some(parent) = owner
+            .parent()
+            .filter(|parent| parent.kind() == "mut_pattern")
+    {
+        charge(1)?;
+        owner = parent;
+    }
+    if let Some(parent) = owner
+        .parent()
+        .filter(|parent| parent.kind() == "tuple_pattern")
+    {
+        charge(1)?;
+        owner = parent;
+    }
+    charge(1)?;
+    if !owner.parent().is_some_and(|parent| {
+        parent.kind() == "let_declaration"
+            && parent
+                .child_by_field_name("pattern")
+                .is_some_and(|node| node.id() == owner.id())
+    }) {
+        return Ok(false);
+    }
+    let name = crate::declarations::rust_node_text(name, source);
+    if crate::prelude::rust_prelude_candidate(name, crate::prelude::RustPreludeNamespace::Value) {
+        return Ok(false);
+    }
+    let selection =
+        visit_rust_lexical_selection_bounded(root, source, pattern, charge, |event, _charge| {
+            let conflict = match event {
+                RustLexicalSelectionEvent::Ancestor(node) => {
+                    // Associated lookup and its inherited trait names require
+                    // evidence beyond this same-source lexical proof.
+                    matches!(node.kind(), "impl_item" | "trait_item")
+                }
+                RustLexicalSelectionEvent::Parameter(parameter) => {
+                    parameter.kind() == "const_parameter"
+                        && parameter.child_by_field_name("name").is_some_and(|node| {
+                            crate::declarations::rust_node_text(node, source) == name
+                        })
+                }
+                RustLexicalSelectionEvent::Item(item) => {
+                    item.kind() == "macro_definition"
+                        || (matches!(item.kind(), "const_item" | "static_item" | "struct_item")
+                            && item.child_by_field_name("name").is_some_and(|node| {
+                                crate::declarations::rust_node_text(node, source) == name
+                            }))
+                }
+                RustLexicalSelectionEvent::Import(_, leaf) => match leaf.import.binding_name() {
+                    RustImportBindingName::Glob => true,
+                    RustImportBindingName::Named(binding) => binding == name,
+                    RustImportBindingName::Unnamed => false,
+                },
+                RustLexicalSelectionEvent::ScopeEnd => false,
+            };
+            if conflict {
+                Ok(ControlFlow::Break(()))
+            } else {
+                Ok(ControlFlow::Continue(()))
+            }
+        })?;
+    charge(0)?;
+    Ok(matches!(selection, RustLexicalSelection::Complete))
 }
 
 /// Whether `node` is the identifier being introduced by a Rust binding pattern.

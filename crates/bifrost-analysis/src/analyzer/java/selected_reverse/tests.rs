@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::usages::{FuzzyResult, JavaUsageGraphStrategy, UsageAnalyzer};
+use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
+use crate::analyzer::usages::{FuzzyResult, UsageAnalyzer};
 use crate::analyzer::{Project, QueryScope};
 use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 use crate::native_resolution_test_support::JavaNativeUsageStrategy;
@@ -145,7 +146,12 @@ fn target(
 
 fn inverse(analyzer: &JavaAnalyzer, target: &CodeUnit) -> EdgeDerivationResult {
     match java_selected_inverse_for(analyzer, target, &CancellationToken::new()) {
-        JavaSelectedReverseOutcome::Ready(answer) => answer,
+        JavaSelectedReverseOutcome::Ready(answer) => {
+            if std::env::var_os("BIFROST_REVERSE_EVIDENCE").is_some() {
+                eprintln!("REVERSE-ROWS {answer:?}");
+            }
+            answer
+        }
         outcome => panic!("selected Java inverse query failed: {outcome:?}"),
     }
 }

@@ -20,7 +20,8 @@ ORDER BY gap.reason";
 /// Configuration activity of a caller blob across its selected Cargo routes.
 /// Only `Inactive` is sufficient evidence to exclude a caller from analysis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RustBlobActivity {
+#[doc(hidden)]
+pub enum RustBlobActivity {
     Active,
     Inactive,
     Unknown,
@@ -40,7 +41,7 @@ pub(crate) const BLOB_PLACEMENT_ACTIVITY: &str = "WITH route_evidence AS MATERIA
 )
 SELECT requested.value,
  CASE WHEN EXISTS (
-  SELECT 1 FROM selected_rust_module_placements AS placement
+  SELECT 1 FROM selected_rust_container_placements AS placement
   CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
    ON context.summary_id=placement.summary_id AND context.target_kind<>'detached'
   WHERE placement.placement_blob=requested.value
@@ -70,7 +71,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Read one verdict per input blob, preserving input order and duplicates.
     /// The batch and its evidence live only for this query; detached placements
     /// cannot prove activity or override positive Cargo inactivity evidence.
-    pub(crate) fn rust_blob_placement_activity(
+    #[doc(hidden)]
+    pub fn rust_blob_placement_activity(
         &self,
         blobs: &[i64],
     ) -> Result<Vec<(i64, super::RustBlobActivity)>> {
@@ -96,13 +98,30 @@ impl SelectedResolutionOperation<'_, '_> {
 }
 
 #[derive(Debug)]
-pub(super) struct RustCrateAccessPolicy {
+#[doc(hidden)]
+pub struct RustCrateAccessPolicy {
     pub(super) crate_keys: Vec<[u8; 32]>,
     pub(super) base_blobs: Vec<(BindingFragmentId, i64)>,
     /// The policy names itself with one identity the context minted for it.
     /// It belongs to no file, and it used to be a digest of the policy's own
     /// crate keys; the request's table numbers that digest now.
     pub(super) identity: SemanticId,
+}
+
+impl RustCrateAccessPolicy {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(
+        crate_keys: Vec<[u8; 32]>,
+        base_blobs: Vec<(BindingFragmentId, i64)>,
+        identity: SemanticId,
+    ) -> Self {
+        Self {
+            crate_keys,
+            base_blobs,
+            identity,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -430,7 +449,7 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
 // closure. Driving from graph used to repeat all module alignment per crate.
 pub(crate) const PLACEMENTS: &str =
     "SELECT placement.topology_id, placement.container_path, json(context.cfg_atoms)
-FROM selected_rust_module_placements AS placement
+FROM selected_rust_container_placements AS placement
 CROSS JOIN selected_rust_unit_closure AS graph
   ON graph.root_unit_key=?1 AND graph.topology_id=placement.topology_id
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
@@ -441,7 +460,7 @@ WHERE placement.placement_blob=?2 AND placement.module_declaration IS ?3";
 /// same columns as [`PLACEMENTS`]. See `reference_placements`.
 pub(super) const REFERENCE_PLACEMENTS: &str = "SELECT placement.topology_id,
  placement.container_path, json(context.cfg_atoms)
-FROM selected_rust_module_placements AS placement
+FROM selected_rust_container_placements AS placement
 CROSS JOIN selected_rust_unit_summaries AS unit
   ON unit.topology_id=placement.topology_id
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
@@ -465,29 +484,12 @@ pub(super) const VISIBILITY: &str = "SELECT CASE WHEN ?5='public' THEN 1
  WHEN ?5 IN ('private','self') THEN (?2=?4 OR substr(?2,1,length(?4)+2)=?4 || '::')
  ELSE (?2=cr_restriction(?5,?4,?6) OR substr(?2,1,length(cr_restriction(?5,?4,?6))+2)=cr_restriction(?5,?4,?6) || '::') END
  FROM selected_rust_unit_summaries AS unit
- CROSS JOIN main.rust_resolution_unit_summary_containers AS container
+ CROSS JOIN main.rust_unit_summary_containers AS container
   ON container.summary_id=unit.summary_id
  WHERE unit.topology_id=?3 AND container.module_path=?4";
 
-// Visibility and activation use persisted crate placement even when the
-// selected canonical artifact is a content-mounted overlay. Its native facts
-// still come from the selected blob; only placement uses this base identity.
-fn placement_blob(
-    selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
-    base_blobs: &[(BindingFragmentId, i64)],
-    fragment: BindingFragmentId,
-) -> Result<Option<i64>> {
-    if let Some((_, blob)) = base_blobs.iter().find(|(id, _)| *id == fragment) {
-        return Ok(Some(*blob));
-    }
-    Ok(selection
-        .mount_record_for_fragment(fragment)?
-        .map(|mount| mount.blob_id()))
-}
-
 type CratePlacement = (i64, String, BTreeSet<String>);
 type CrateMembership = (i64, BTreeSet<String>, String);
-type PlacementMemo = HashMap<([u8; 32], i64, Option<u32>), Vec<CratePlacement>>;
 
 /// One crate stage's answers from [`PLACEMENTS`] and [`MEMBERSHIPS`], keyed by
 /// their bound parameters.
@@ -504,9 +506,9 @@ type PlacementMemo = HashMap<([u8; 32], i64, Option<u32>), Vec<CratePlacement>>;
 /// the statements directly.
 #[derive(Default)]
 pub(crate) struct CrateAccessMemo {
-    placements: PlacementMemo,
-    reference_placements: PlacementMemo,
-    memberships: HashMap<([u8; 32], i64), Vec<CrateMembership>>,
+    placements: super::placement_access::PlacementMemo<CratePlacement>,
+    reference_placements: super::placement_access::PlacementMemo<CratePlacement>,
+    memberships: super::placement_access::MembershipMemo<CrateMembership>,
     /// Whether a definition, by mount ordinal and semantic key, declares a
     /// module (`rust_crate_rows::MODULE_DEFINITIONS`). Every projection round
     /// asks it again for the same targets: on the whole tract graph the
@@ -515,7 +517,6 @@ pub(crate) struct CrateAccessMemo {
     pub(super) module_definitions: HashMap<(u32, i64), bool>,
 }
 
-/// Where a definition's blob stands in the crate or any crate it depends on.
 fn definition_placements(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     crate_key: [u8; 32],
@@ -534,13 +535,6 @@ fn definition_placements(
     )
 }
 
-/// Where a reference's blob stands for the crate being resolved.
-///
-/// A blob placed in that crate is compiled there, so only those placements
-/// count, even when a dependency mounts the same file too (a bench target and
-/// its package library can share one). A blob the crate does not place, such
-/// as a dependency's re-export binder reached from this crate, stands where the
-/// dependency closure places it, as a definition does.
 fn reference_placements(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     crate_key: [u8; 32],
@@ -563,6 +557,7 @@ fn reference_placements(
     definition_placements(selection, crate_key, base_blobs, fragment, declaration)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn placement_rows(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     crate_key: [u8; 32],
@@ -570,52 +565,32 @@ fn placement_rows(
     fragment: BindingFragmentId,
     declaration: Option<SourceDeclarationId>,
     sql: &'static str,
-    memo_rows: fn(&mut CrateAccessMemo) -> &mut PlacementMemo,
+    memo_rows: fn(
+        &mut CrateAccessMemo,
+    ) -> &mut super::placement_access::PlacementMemo<CratePlacement>,
 ) -> Result<Vec<CratePlacement>> {
-    use rusqlite::params;
-    let Some(blob) = placement_blob(selection, base_blobs, fragment)? else {
-        return Ok(Vec::new());
-    };
-    let key = (crate_key, blob, declaration.map(SourceDeclarationId::get));
-    if let Some(rows) = selection
-        .crate_access_memo()
-        .borrow_mut()
-        .as_mut()
-        .and_then(|memo| memo_rows(memo).get(&key).cloned())
-    {
-        return Ok(rows);
-    }
-    let rows = selection
-        .connection()
-        .prepare_cached(sql)?
-        .query_map(
-            params![
-                crate_key.as_slice(),
-                blob,
-                declaration.map(SourceDeclarationId::get)
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )?
-        .map(|row| {
-            let (topology, path, atoms) = row?;
+    super::placement_access::selected_placements(
+        selection,
+        crate_key,
+        base_blobs,
+        fragment,
+        declaration,
+        sql,
+        selection
+            .crate_access_memo()
+            .borrow_mut()
+            .as_mut()
+            .map(memo_rows),
+        |row| {
+            let atoms: String = row.get(2)?;
             Ok((
-                topology,
-                path,
+                row.get(0)?,
+                row.get(1)?,
                 serde_json::from_str(&atoms)
                     .map_err(|error| StoreError::corrupt(error.to_string()))?,
             ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if let Some(memo) = selection.crate_access_memo().borrow_mut().as_mut() {
-        memo_rows(memo).insert(key, rows.clone());
-    }
-    Ok(rows)
+        },
+    )
 }
 
 pub(crate) fn access(
@@ -738,44 +713,29 @@ pub(crate) fn set_access(
 ) -> Result<Option<DeclarationAccessDecision>> {
     use brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition;
     use brokk_bifrost_rust::selected_context::RustSelectedActivation;
-    use rusqlite::params;
     let conn = selection.connection();
-    let memberships = |fragment| -> Result<Vec<CrateMembership>> {
-        let blob = placement_blob(selection, base_blobs, fragment)?;
-        let Some(blob) = blob else {
-            return Ok(Vec::new());
-        };
-        if let Some(rows) = selection
-            .crate_access_memo()
-            .borrow()
-            .as_ref()
-            .and_then(|memo| memo.memberships.get(&(crate_key, blob)))
-        {
-            return Ok(rows.clone());
-        }
-        let rows = conn
-            .prepare_cached(MEMBERSHIPS)?
-            .query_map(params![crate_key.as_slice(), blob], |row| {
+    let memberships = |fragment| {
+        super::placement_access::selected_memberships(
+            selection,
+            crate_key,
+            base_blobs,
+            fragment,
+            MEMBERSHIPS,
+            selection
+                .crate_access_memo()
+                .borrow_mut()
+                .as_mut()
+                .map(|memo| &mut memo.memberships),
+            |row| {
+                let atoms: String = row.get(1)?;
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .map(|row| {
-                let (topology, atoms, kind) = row?;
-                Ok((
-                    topology,
+                    row.get(0)?,
                     serde_json::from_str(&atoms)
                         .map_err(|error| StoreError::corrupt(error.to_string()))?,
-                    kind,
+                    row.get(2)?,
                 ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(memo) = selection.crate_access_memo().borrow_mut().as_mut() {
-            memo.memberships.insert((crate_key, blob), rows.clone());
-        }
-        Ok(rows)
+            },
+        )
     };
     let references = reference
         .map(|row| {
@@ -907,6 +867,7 @@ fn finish_access(
         return Ok(Some(DeclarationAccessDecision::Unknown));
     };
     let visibility = encode_rust_visibility(visibility);
+    // Share all-placement reduction as SQL when a second language adopts shared placements (milestone 2b slices 5 and 7), not as callbacks.
     let mut allowed = false;
     let mut denied = false;
     let mut unknown = false;

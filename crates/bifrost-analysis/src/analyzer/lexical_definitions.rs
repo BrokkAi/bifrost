@@ -12,23 +12,12 @@ use brokk_bifrost_cpp::graph::resolver::{
 use tree_sitter::Node;
 
 use super::languages::{LocalDeclarationVisibility, language_support};
-use super::semantic::ArgumentDomain;
 pub use super::semantic::FormalParameterPassingMode;
 use super::{DeclarationKind, Language, Range};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexicalDefinition {
-    /// The defining file for a macro binding whose expansion can occur elsewhere.
-    /// Ordinary lexical definitions use the reference file.
-    pub source_file: Option<super::ProjectFile>,
-    pub identifier: String,
-    pub kind: DeclarationKind,
-    pub name_range: Range,
-    pub declaration_range: Range,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LexicalBindingResolution {
+#[doc(hidden)]
+pub enum LexicalBindingResolution {
     Parameter(LexicalDefinition),
     OtherLocal(LexicalDefinition),
 }
@@ -40,66 +29,13 @@ struct ParameterBinding<'tree> {
     kind: DeclarationKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FormalParameterSlot {
-    pub names: Vec<String>,
-    pub declaration_range: Range,
-    pub receiver: bool,
-    pub variadic: Option<FormalVariadicKind>,
-    pub passing_mode: FormalParameterPassingMode,
-    /// The span of the default expression this parameter declares, when its
-    /// grammar names one. `None` means the parameter declares no default *or*
-    /// the language has none at all; see [`parameter_default_range`] for which
-    /// grammars record it (issue #2499).
-    pub default_range: Option<Range>,
-}
+pub use crate::analyzer::semantic::lexical_definitions::FormalParameterSlot;
 
-impl FormalParameterSlot {
-    pub fn unique_name(&self) -> Option<&str> {
-        let [name] = self.names.as_slice() else {
-            return None;
-        };
-        Some(name)
-    }
-}
+pub use crate::analyzer::semantic::lexical_definitions::FormalVariadicKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FormalVariadicKind {
-    Positional,
-    Keyword,
-    Both,
-}
+pub use crate::analyzer::semantic::lexical_definitions::PythonMethodBinding;
 
-impl FormalVariadicKind {
-    pub(crate) fn accepts_positional(self) -> bool {
-        self.argument_domain().accepts_positional()
-    }
-
-    pub(crate) fn accepts_keyword(self) -> bool {
-        matches!(self, Self::Keyword | Self::Both)
-    }
-
-    const fn argument_domain(self) -> &'static ArgumentDomain {
-        match self {
-            Self::Positional => &ArgumentDomain::Positional,
-            Self::Keyword => &ArgumentDomain::Keyword,
-            Self::Both => &ArgumentDomain::PositionalOrKeyword,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PythonMethodBinding {
-    Instance,
-    Class,
-    Static,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct FormalParameterLayout {
-    pub slots: Vec<FormalParameterSlot>,
-    pub python_binding: Option<PythonMethodBinding>,
-}
+pub use crate::analyzer::semantic::lexical_definitions::FormalParameterLayout;
 
 /// Return the formal parameter slots owned by the callable at
 /// `declaration_range`. The result is syntax-derived so it remains correct for
@@ -119,7 +55,8 @@ pub fn formal_parameter_slots(
 /// caller. Semantic lowerers should prefer this entry point because their
 /// procedure inventory already owns the exact callable and need not rescan the
 /// syntax tree to rediscover it.
-pub(crate) fn formal_parameter_slots_for_owner(
+#[doc(hidden)]
+pub fn formal_parameter_slots_for_owner(
     language: Language,
     owner: Node<'_>,
     source: &str,
@@ -131,7 +68,8 @@ pub(crate) fn formal_parameter_slots_for_owner(
 /// produced each slot. The node is retained from the same binding traversal as
 /// the slot, so callers that already hold the prepared tree can attach
 /// structural identities without joining by ranges, names, or ordinals.
-pub(crate) fn formal_parameter_slots_for_owner_with_nodes<'tree>(
+#[doc(hidden)]
+pub fn formal_parameter_slots_for_owner_with_nodes<'tree>(
     language: Language,
     owner: Node<'tree>,
     source: &str,
@@ -144,7 +82,8 @@ pub(crate) fn formal_parameter_slots_for_owner_with_nodes<'tree>(
 /// resolution. Every syntax node or child inspected by parameter/decorator
 /// discovery must first pass `scope_step`; `None` therefore means either the
 /// callable shape was unsupported or the caller's session stopped.
-pub(crate) fn formal_parameter_slots_for_owner_bounded(
+#[doc(hidden)]
+pub fn formal_parameter_slots_for_owner_bounded(
     language: Language,
     owner: Node<'_>,
     source: &str,
@@ -386,7 +325,8 @@ pub(crate) fn parameter_owner_for_range<'tree>(
 /// lexical answer, so callers should continue with ordinary indexed lookup.
 /// A nearer local declaration is reported separately so callers do not fall
 /// through and accidentally resolve an outer parameter or workspace symbol.
-pub(crate) fn resolve_lexical_binding(
+#[doc(hidden)]
+pub fn resolve_lexical_binding(
     language: Language,
     root: Node<'_>,
     source: &str,
@@ -540,7 +480,8 @@ pub fn c_label_usage_ranges(
 /// Resolve a lexical binding when a language adapter has structurally proven
 /// that a grammar recovery node, rather than the smallest named leaf, carries
 /// the value role at `focus_start`.
-pub(crate) fn resolve_lexical_binding_from_focus(
+#[doc(hidden)]
+pub fn resolve_lexical_binding_from_focus(
     language: Language,
     focus: Node<'_>,
     source: &str,
@@ -624,7 +565,8 @@ pub(crate) fn resolve_lexical_binding_from_focus(
 /// proof is that no ancestor of the reference is a callable, that one of them
 /// is a statement, and that some ancestor holds a `function_definition` ending
 /// before the reference with an orphaned statement after it.
-pub(crate) fn cpp_recovered_function_body<'tree>(
+#[doc(hidden)]
+pub fn cpp_recovered_function_body<'tree>(
     focus: Node<'tree>,
     focus_start: usize,
 ) -> Option<Node<'tree>> {
@@ -947,7 +889,7 @@ pub fn receiver_is_declared_parameter(language: Language) -> bool {
 /// Java, Go and Rust have no parameter defaults in the language, so `None`
 /// there is the complete answer rather than a gap.
 fn parameter_default_range(language: Language, parameter: Node<'_>) -> Option<Range> {
-    let value = language_support(language)
+    let value = crate::analyzer::languages::language_knowledge(language)
         .and_then(|support| support.positional_parameter_default(parameter))
         .or_else(|| match language {
             Language::Python | Language::Ruby => parameter.child_by_field_name("value"),
@@ -1110,7 +1052,8 @@ fn scope_matching_local(
             support.and_then(|support| support.local_declaration_binding_scope(node));
         if starts_after_focus
             && binding_scope.is_none()
-            && !support.is_some_and(|support| support.scans_local_declarations_after_focus())
+            && !support
+                .is_some_and(|support| support.knowledge().scans_local_declarations_after_focus())
         {
             continue;
         }
@@ -1124,7 +1067,7 @@ fn scope_matching_local(
             if language == Language::Rust && node.end_byte() > focus_start {
                 continue;
             }
-            if language_support(language)
+            if crate::analyzer::languages::language_knowledge(language)
                 .is_some_and(|support| support.skips_local_declaration(node, source))
             {
                 continue;
@@ -1468,10 +1411,8 @@ fn collect_binding_leaves_with_step<'tree>(
 /// not a binding. The fallback that pushes every named child of a container
 /// must skip them. The constructor path of a Rust tuple-struct or struct
 /// pattern (`Some` in `Some(x)`) names a type, not a binding.
-pub(crate) fn binding_excluded_child_fields(
-    language: Language,
-    kind: &str,
-) -> &'static [&'static str] {
+#[doc(hidden)]
+pub fn binding_excluded_child_fields(language: Language, kind: &str) -> &'static [&'static str] {
     match (language, kind) {
         (Language::Rust, "tuple_struct_pattern" | "struct_pattern") => &["type"],
         _ => &[],
@@ -1886,6 +1827,8 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
         Language::None => false,
     }
 }
+
+pub use crate::analyzer::resolution::lexical_definition::LexicalDefinition;
 
 #[cfg(test)]
 mod tests {

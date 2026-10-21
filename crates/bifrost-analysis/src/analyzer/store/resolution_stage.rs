@@ -5,18 +5,26 @@
 //! admission witnesses survive that cleanup and are checked at final release.
 
 pub(super) mod allocation;
-mod closure;
-pub(super) mod codec;
-pub(super) mod context;
+#[doc(hidden)]
+pub mod closure;
+#[doc(hidden)]
+pub mod codec;
+#[doc(hidden)]
+pub mod context;
 mod coordinates;
 pub(super) mod frontier_completion;
-mod generated;
+#[doc(hidden)]
+pub mod generated;
 pub(super) mod lexical;
-pub(super) mod lexical_readers;
-mod projection;
+#[doc(hidden)]
+pub mod lexical_readers;
+#[doc(hidden)]
+pub mod projection;
 mod rows;
-pub(super) mod rust_context;
-pub(super) mod typed;
+#[doc(hidden)]
+pub mod rust_context;
+#[doc(hidden)]
+pub mod typed;
 
 pub(super) fn completion_from_reasons(
     reasons: impl IntoIterator<Item = crate::analyzer::resolution::ResolutionIncompleteReason>,
@@ -30,7 +38,12 @@ pub(super) fn completion_from_reasons(
 }
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use rusqlite::params;
+use rusqlite::params_from_iter;
+
 use std::sync::OnceLock;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -45,15 +58,20 @@ pub(super) const TYPED_PROPERTY_GAP_REASON_QUERY: &str =
     typed::VISIT_DEFINITION_PROPERTY_GAP_PAGES_FOR_REASONS_SQL;
 
 use super::Result;
+
 use super::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS;
-use super::resolution_publication::{
-    PublishedResolutionContent, ResolutionContentInput, ResolutionContentWitness,
-};
-use super::resolution_selection::{
-    SelectedResolutionMountInventory, SelectedResolutionMountRecord,
-    SelectedResolutionRevalidationOutcome, SelectedResolutionStale,
-    SelectedResolutionTempTransaction, SelectedResolutionUnavailable,
-};
+
+use super::resolution_publication::PublishedResolutionContent;
+use super::resolution_publication::ResolutionContentInput;
+use super::resolution_publication::ResolutionContentWitness;
+
+use super::resolution_selection::SelectedResolutionMountInventory;
+use super::resolution_selection::SelectedResolutionMountRecord;
+use super::resolution_selection::SelectedResolutionRevalidationOutcome;
+use super::resolution_selection::SelectedResolutionStale;
+use super::resolution_selection::SelectedResolutionTempTransaction;
+use super::resolution_selection::SelectedResolutionUnavailable;
+
 use crate::CancellationToken;
 
 #[cfg(test)]
@@ -145,7 +163,7 @@ pub(super) fn schema_sql() -> &'static str {
                 context::SCHEMA_SQL
             )
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(
             5,
             sql.capacity(),
@@ -164,7 +182,8 @@ pub(super) fn generic_formal_defaults_schema_sql() -> &'static str {
 
 pub(super) const CLEAR_REQUEST_SQL: &str = "DELETE FROM temp.selected_resolution_stage_producers; DELETE FROM temp.selected_resolution_stage_nodes; DELETE FROM temp.selected_resolution_admissions; DELETE FROM temp.selected_resolution_contexts; DELETE FROM temp.selected_resolution_stage_allocation_counters;";
 
-pub(crate) enum SelectedResolutionStageOutcome {
+#[doc(hidden)]
+pub enum SelectedResolutionStageOutcome {
     Ready,
     Cancelled,
     Unavailable(SelectedResolutionUnavailable),
@@ -174,16 +193,19 @@ pub(crate) enum SelectedResolutionStageOutcome {
 pub(crate) use generated::SelectedIncludeBindingPair;
 
 /// A view, never an owner of a lexical or typed fact collection.
-pub(crate) struct SelectedResolutionStage<'selection, 'store> {
+#[doc(hidden)]
+pub struct SelectedResolutionStage<'selection, 'store> {
     selection: &'selection SelectedResolutionMountInventory<'store>,
 }
 
 impl<'selection, 'store> SelectedResolutionStage<'selection, 'store> {
-    pub(crate) fn new(selection: &'selection SelectedResolutionMountInventory<'store>) -> Self {
+    #[doc(hidden)]
+    pub fn new(selection: &'selection SelectedResolutionMountInventory<'store>) -> Self {
         Self { selection }
     }
 
-    pub(crate) fn clear_facts(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn clear_facts(&self) -> Result<()> {
         let changed = self.selection.with_owned_temp_transaction(|connection| {
             let before = connection.total_changes();
             let producers =
@@ -472,7 +494,7 @@ fn validate_admission(
     static SQL: OnceLock<String> = OnceLock::new();
     let sql = SQL.get_or_init(|| {
         let sql = format!("WITH requested_admissions AS (SELECT * FROM temp.selected_resolution_admissions WHERE admission_id=?1) {}", admission_validation_body());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(6, sql.capacity());
         sql
     });
@@ -547,7 +569,7 @@ fn admission_validation_sql() -> &'static str {
             admission_validation_body()
         )
     };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(7, sql.capacity());
         sql
     })
@@ -598,7 +620,7 @@ WHERE COALESCE(epoch.generation,0) IS NOT admission.generation
 LIMIT 1
 "#, count=RESOLUTION_MANIFEST_COUNT_COLUMNS.len())
     };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(8, sql.capacity());
         sql
     })

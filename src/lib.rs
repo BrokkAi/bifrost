@@ -1,5 +1,6 @@
 //! Stable CLI and Python facade for the Bifrost workspace packages.
 
+pub use brokk_bifrost_analysis::analyzer::PythonSemanticModelWorkspaceContext;
 pub mod mcp_install;
 // OWASP BenchmarkJava taint bakeoff scorer. Like `summary_foundry_demand`, it
 // runs the require-model taint policy through the production evaluator and so
@@ -18,38 +19,25 @@ mod shard;
 #[cfg(feature = "release-tooling")]
 pub mod summary_foundry_fixtures;
 pub use brokk_bifrost_analysis::{
-    AnalyzerConfig, AnalyzerDefinitionLookup, AnalyzerDelegate, CSharpAnalyzer, CancellationToken,
+    AnalyzerConfig, AnalyzerDefinitionLookup, AnalyzerDelegate, CancellationToken,
     CapabilityProvider, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitIndex,
-    CodeUnitType, CppAnalyzer, DeclarationInfo, DeclarationKind, DependencyPackActivationOutcome,
+    CodeUnitType, DeclarationInfo, DeclarationKind, DependencyPackActivationOutcome,
     DependencyPackEcosystem, DependencyPackEcosystemOutcome, DependencyPackWorkspaceContext,
-    DispatchHierarchyExpansion, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer,
-    IAnalyzer, ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer,
-    JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
-    KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject, NavigationOperation, OverlayProject,
-    ParseCompleteness, ParseError, ParseErrorKind, PhpAnalyzer, PhpAnalyzerConfig,
-    PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project, ProjectFile, PythonAnalyzer,
-    PythonSemanticModelWorkspaceContext, Range, RenderedSummary, RubyAnalyzer, RubyAnalyzerConfig,
-    RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer,
-    RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
-    RustPackageApiArtifact, RustSelectedTarget, ScalaAnalyzer, SourceContent, SummaryInput,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer, collect_workspace_files, ensure_global_rayon_pool,
-    resolve_php_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
-    resolve_rust_semantic_pack_dependencies, summarize_inputs,
+    DispatchHierarchyExpansion, EmptyAnalyzer, FileSetProject, FilesystemProject, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer, JvmAnalyzerConfig,
+    JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
+    JvmExternalDependencies, JvmMavenCoordinate, KotlinAnalyzer, Language, MultiAnalyzer,
+    MultiRootProject, NavigationOperation, OverlayProject, ParseCompleteness, ParseError,
+    ParseErrorKind, PhpAnalyzerConfig, PhpDependencyApiEvidence, Project, ProjectFile, Range,
+    RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact, ScalaAnalyzer,
+    SourceContent, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, WorkspaceAnalyzer,
+    collect_workspace_files, ensure_global_rayon_pool,
 };
 pub use brokk_bifrost_analysis::{
-    analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph,
-    cyclomatic_complexity_diff, diff_analysis, file_tools, git_file, gitblob, hash, model_context,
-    navigation, panic_report, path_normalization, path_utils, process, profiling, relevance,
-    schema_version, seam_profile, searchtools, searchtools_render, sqlite_template, summary,
-    symbol_rename, text_utils, usages, util, workspace_document,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use brokk_bifrost_analysis::{
-    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
-    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
+    cache_db, cache_gc, cancellation, compact_graph, git_file, gitblob, hash, navigation,
+    panic_report, path_normalization, path_utils, process, profiling, schema_version, seam_profile,
+    sqlite_template, text_utils, util, workspace_document,
 };
 pub use brokk_bifrost_flow as flow;
 pub use brokk_bifrost_mcp::{
@@ -63,7 +51,20 @@ pub use brokk_bifrost_rql::{
     execute_request_with_limits, sexp,
 };
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence, extension};
+pub use brokk_bifrost_rust_analysis::{
+    RustAnalyzer, RustDependencyPackAdapter, resolve_rust_semantic_pack_dependencies,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use brokk_bifrost_rust_analysis::{
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
+};
 pub use brokk_bifrost_semantic_packs as semantic_packs;
+pub use brokk_bifrost_tools::{RenderedSummary, SummaryInput, summarize_inputs};
+pub use brokk_bifrost_tools::{
+    code_quality, cyclomatic_complexity_diff, diff_analysis, file_tools, model_context, relevance,
+    searchtools, searchtools_render, summary, symbol_rename,
+};
 
 use std::sync::OnceLock;
 
@@ -121,24 +122,16 @@ fn register_bifrost_semantic_model_packs(
         .map_err(|error| format!("failed to register shipped semantic packs: {error}"))
 }
 
-/// Conservative pack-consumer profile for this exact engine build.
+/// Pack-consumer profile for this exact engine build.
 ///
-/// Capabilities describe reviewed global operations. They do not guarantee a
-/// complete result for every workspace, language, model set, or query budget.
-/// Unknown requirements remain unsupported, independently of pack acquisition.
+/// Capabilities are the policy capabilities this engine provides
+/// ([`policy::ENGINE_POLICY_CAPABILITIES`]). They do not guarantee a complete
+/// result for every workspace, language, model set, or query budget. A policy
+/// that requires an unlisted capability is reported as not run.
 pub fn open_pack_engine_profile() -> serde_json::Value {
     use sha2::{Digest, Sha256};
 
-    let mut capabilities = Vec::new();
-    if extension::PUBLISHED_OPERATIONS.iter().any(|operation| {
-        operation.id == "structural.query"
-            && operation.support == extension::CapabilitySupport::Complete
-    }) {
-        capabilities.push("structural-match");
-    }
-    if rql::query::schema::ALL_QUERY_STEP_OPS.contains(&rql::query::schema::QueryStepOp::CfgExits) {
-        capabilities.push("normal-and-exceptional-exit");
-    }
+    let capabilities = policy::ENGINE_POLICY_CAPABILITIES;
 
     let mut model_set = Sha256::new();
     for pack in semantic_packs::BIFROST_EMBEDDED_PACKS.packs() {
@@ -177,4 +170,52 @@ pub const BIFROST_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use brokk_bifrost_mcp::{ChangeDelta, ProjectChangeWatcher};
 pub use brokk_bifrost_mcp::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
+};
+
+pub use brokk_bifrost_ruby_analysis::{
+    RubyAnalyzer, RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies,
+};
+
+pub use brokk_bifrost_cpp_analysis::CppAnalyzer;
+pub use brokk_bifrost_go_analysis::*;
+pub use brokk_bifrost_js_ts_analysis::{JavascriptAnalyzer, TypescriptAnalyzer};
+pub use brokk_bifrost_php_analysis::{
+    PhpAnalyzer, PhpDependencyPackAdapter, resolve_php_semantic_pack_dependencies,
+};
+pub use brokk_bifrost_python_analysis::PythonAnalyzer;
+pub mod analyzer {
+    pub use brokk_bifrost_analysis::analyzer::semantic;
+    pub use brokk_bifrost_analysis::analyzer::*;
+    pub use brokk_bifrost_go_analysis::GoAnalyzer;
+    pub use brokk_bifrost_go_analysis::analyzer::go;
+    pub use brokk_bifrost_js_ts_analysis::analyzer::js_ts::*;
+    pub use brokk_bifrost_js_ts_analysis::analyzer::{javascript, js_ts, typescript};
+    pub use brokk_bifrost_js_ts_analysis::{JavascriptAnalyzer, TypescriptAnalyzer};
+    pub use brokk_bifrost_rust_analysis::analyzer::rust;
+    pub use brokk_bifrost_rust_analysis::analyzer::{
+        RustAnalyzer, RustCallResultUseIndex, RustDependencyPackAdapter, RustNativeObligationProof,
+        RustReferenceContext, RustReferenceNamespace, RustdocJsonPackProducer,
+        acquire_rust_file_dependency_evidence, resolve_rust_semantic_pack_dependencies,
+        rust_call_is_standard_drop, rust_call_result_use, rust_declaration_is_enum_variant,
+        rust_declaration_matches_reference_namespace, rust_failure_handler_body_shapes,
+        rust_file_dependency_evidence, rust_is_field_declaration_name,
+        rust_native_result_obligation, rust_reference_namespace,
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    pub use brokk_bifrost_rust_analysis::analyzer::{
+        RustSelectedReverseOutcome, RustSelectedReverseQueries,
+        reset_rust_tree_parse_counters_for_test, rust_scope_index_build_count_for_test,
+        rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
+        rust_tree_parsed_bytes_for_test, with_rust_selected_reverse_queries,
+    };
+}
+pub mod usages {
+    pub use brokk_bifrost_analysis::usages::*;
+    pub use brokk_bifrost_js_ts_analysis::JsTsExportUsageGraphStrategy;
+    pub use brokk_bifrost_rust_analysis::RustNativeUsageStrategy;
+}
+
+pub use brokk_bifrost_csharp_analysis::CSharpAnalyzer;
+pub use brokk_bifrost_rust_analysis::{
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
 };

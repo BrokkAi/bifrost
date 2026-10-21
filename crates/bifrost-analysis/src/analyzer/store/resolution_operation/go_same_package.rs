@@ -6,7 +6,8 @@ use super::*;
 use crate::analyzer::resolution::{LoweredPackageMember, SelectedPackageBridgeDescriptor};
 
 #[derive(Default)]
-pub(super) struct GoPackageMemberIndexCache {
+#[doc(hidden)]
+pub struct GoPackageMemberIndexCache {
     packages: HashMap<(i64, i64, String), GoPackageMemberIndexes>,
     memo_hits: u64,
 }
@@ -99,7 +100,8 @@ struct GoPackageMemberIndexes {
         HashMap<SelectedResolutionMountOrdinal, HashMap<SemanticId, Vec<LoweredPackageMember>>>,
 }
 
-pub(in crate::analyzer::store) const CALLER_PACKAGE: &str = r#"
+#[doc(hidden)]
+pub const CALLER_PACKAGE: &str = r#"
 SELECT package.package_id
 FROM main.go_context_source_files caller
 JOIN main.go_package_instances package
@@ -122,7 +124,8 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2 AND caller.source_role=
    OR (?3 IN ('test','xtest') AND package.provider_provenance='source_inventory'))
 "#;
 
-pub(in crate::analyzer::store) const PACKAGE_PEER_MOUNTS: &str = r#"
+#[doc(hidden)]
+pub const PACKAGE_PEER_MOUNTS: &str = r#"
 SELECT mounted.mount_ordinal
 FROM main.go_context_source_files provider
 JOIN temp.selected_resolution_mounts mounted ON mounted.file_version_id=provider.file_version_id
@@ -216,7 +219,8 @@ impl SelectedResolutionOperation<'_, '_> {
     /// inventory can add or shadow a same-package member. Point lookup consults
     /// this only after the native member answer is already incomplete; reverse
     /// inventory has its own build-selection contract and must not use this read.
-    pub(crate) fn go_point_package_with_unselected_source(
+    #[doc(hidden)]
+    pub fn go_point_package_with_unselected_source(
         &self,
         context_id: i64,
         caller_path: &str,

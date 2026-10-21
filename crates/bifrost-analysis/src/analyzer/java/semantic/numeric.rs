@@ -254,7 +254,7 @@ mod tests {
         let tree = parser.parse(&source, None).expect("Java source must parse");
         assert!(!tree.root_node().has_error(), "{source}");
         let mut value = None;
-        crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+        brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
             tree.root_node(),
             true,
             |node| {

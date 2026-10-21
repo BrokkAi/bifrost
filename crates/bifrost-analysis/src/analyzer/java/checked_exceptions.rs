@@ -16,7 +16,7 @@ use tree_sitter::Node;
 use crate::analyzer::java::JavaAnalyzer;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_call_target_batch_with_source,
-    resolve_definition_batch_with_source,
+    resolve_definition_batch_with_source_traced,
 };
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, IAnalyzer, ProjectFile, QueryScope, QueryToken, resolve_analyzer,
@@ -146,18 +146,15 @@ enum TypeResolution {
 /// Resolve a written type through the same resolver "go to definition" uses,
 /// so nested types in lexical scope and every import tier apply.
 ///
-/// The workspace does not index the JDK. Every compilation unit imports
-/// `java.lang.*` on demand (JLS 7.5.5), so a bare throwable root name that no
-/// workspace tier resolves is `java.lang`'s: another on-demand import
-/// supplying the same simple name would make the name ambiguous, which is a
-/// compile error. An import boundary or an ambiguity stays unknown.
+/// The resolver supplies source declarations or an indexed intrinsic boundary.
+/// An absent or incomplete name is never evidence of a java.lang identity.
 fn resolve_type_at(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &Arc<str>,
     written: Node<'_>,
 ) -> TypeResolution {
-    let outcome = resolve_definition_batch_with_source(
+    let outcome = resolve_definition_batch_with_source_traced(
         analyzer,
         vec![DefinitionLookupRequest {
             file: file.clone(),
@@ -171,7 +168,7 @@ fn resolve_type_at(
     )
     .into_iter()
     .next();
-    let Some(outcome) = outcome else {
+    let Some((outcome, trace)) = outcome else {
         return TypeResolution::Unknown;
     };
     match outcome.status {
@@ -179,12 +176,24 @@ fn resolve_type_at(
             [unit] if unit.is_class() => TypeResolution::Class(unit.clone()),
             _ => TypeResolution::Unknown,
         },
-        DefinitionLookupStatus::NoDefinition if written.kind() == "type_identifier" => {
-            match &source[written.byte_range()] {
-                "Exception" => TypeResolution::JavaLang("Exception"),
-                "Throwable" => TypeResolution::JavaLang("Throwable"),
-                "RuntimeException" => TypeResolution::JavaLang("RuntimeException"),
-                "Error" => TypeResolution::JavaLang("Error"),
+        DefinitionLookupStatus::NoDefinition
+        | DefinitionLookupStatus::UnresolvableImportBoundary => {
+            use crate::analyzer::usages::get_definition::trace::TraceCandidateRef;
+            let mut selected = trace.selected();
+            let Some(candidate) = selected.next() else {
+                return TypeResolution::Unknown;
+            };
+            if selected.next().is_some() {
+                return TypeResolution::Unknown;
+            }
+            match &candidate.candidate {
+                TraceCandidateRef::Intrinsic { name } => match name.as_str() {
+                    "java.lang.Exception" => TypeResolution::JavaLang("Exception"),
+                    "java.lang.Throwable" => TypeResolution::JavaLang("Throwable"),
+                    "java.lang.RuntimeException" => TypeResolution::JavaLang("RuntimeException"),
+                    "java.lang.Error" => TypeResolution::JavaLang("Error"),
+                    _ => TypeResolution::Unknown,
+                },
                 _ => TypeResolution::Unknown,
             }
         }

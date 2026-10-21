@@ -1,23 +1,44 @@
 //! Complete content publication and captured revision ownership.
 
-use git2::{ObjectType, Oid};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use git2::ObjectType;
+use git2::Oid;
+
+use rusqlite::OptionalExtension;
+use rusqlite::Transaction;
+use rusqlite::TransactionBehavior;
+use rusqlite::params;
 
 use brokk_bifrost_core::analyzer::model::DeclarationKind;
-use brokk_bifrost_core::analyzer::resolution_facts::{ResolutionScopeId, ResolutionSiteId};
-use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceId};
-use brokk_bifrost_core::analyzer::{Range, canonical_hash::CanonicalHasher};
+
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
+use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
+
+use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 use crate::CancellationToken;
+
 use crate::analyzer::resolution::ResolutionLocalKey;
+
 use crate::analyzer::resolution::SharedNameId;
 
-use super::resolution::{PreparedResolutionBundle, ResolutionManifestCounts};
-use super::resolution_selection::{SelectedResolutionStale, SelectedResolutionUnavailable};
-use super::{AnalyzerStore, PreparedParsedBlob, Result, WorkspaceSnapshotId};
+use super::resolution::PreparedResolutionBundle;
+use super::resolution::ResolutionManifestCounts;
+
+use super::resolution_selection::SelectedResolutionStale;
+use super::resolution_selection::SelectedResolutionUnavailable;
+
+use super::AnalyzerStore;
+use super::PreparedParsedBlob;
+use super::Result;
+use super::WorkspaceSnapshotId;
 
 #[derive(Debug)]
-pub(crate) enum SelectedResolutionOverlayInputsOutcome {
+#[doc(hidden)]
+pub enum SelectedResolutionOverlayInputsOutcome {
     Ready {
         masks: Vec<super::resolution_selection::SelectedResolutionOverlayMask>,
         content_mounts: Vec<super::resolution_selection::SelectedResolutionContentMountRequest>,
@@ -28,13 +49,40 @@ pub(crate) enum SelectedResolutionOverlayInputsOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolutionCapsuleKey {
+#[doc(hidden)]
+pub struct ResolutionCapsuleKey {
     pub(crate) host_content_oid: Oid,
-    pub(crate) invocation: SourceOccurrenceId,
-    pub(crate) definition_content_oid: Oid,
-    pub(crate) selected_declaration: SourceDeclarationId,
-    pub(crate) matched_arm_index: usize,
+    #[doc(hidden)]
+    pub invocation: SourceOccurrenceId,
+    #[doc(hidden)]
+    pub definition_content_oid: Oid,
+    #[doc(hidden)]
+    pub selected_declaration: SourceDeclarationId,
+    #[doc(hidden)]
+    pub matched_arm_index: usize,
     pub(crate) producer_epoch: String,
+}
+
+impl ResolutionCapsuleKey {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(
+        host_content_oid: Oid,
+        invocation: SourceOccurrenceId,
+        definition_content_oid: Oid,
+        selected_declaration: SourceDeclarationId,
+        matched_arm_index: usize,
+        producer_epoch: String,
+    ) -> Self {
+        Self {
+            host_content_oid,
+            invocation,
+            definition_content_oid,
+            selected_declaration,
+            matched_arm_index,
+            producer_epoch,
+        }
+    }
 }
 
 impl ResolutionCapsuleKey {
@@ -60,7 +108,8 @@ impl ResolutionCapsuleKey {
         hash.finish()
     }
 
-    pub(crate) fn content_oid(&self) -> Result<Oid> {
+    #[doc(hidden)]
+    pub fn content_oid(&self) -> Result<Oid> {
         Oid::hash_object(ObjectType::Blob, &self.digest()).map_err(|error| {
             super::StoreError::new(format!("hash resolution capsule content: {error}"))
         })
@@ -68,7 +117,8 @@ impl ResolutionCapsuleKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResolutionContentInput {
+#[doc(hidden)]
+pub enum ResolutionContentInput {
     Parsed {
         content_oid: Oid,
         semantic_language: super::Language,
@@ -81,29 +131,41 @@ pub(crate) enum ResolutionContentInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolutionContentWitness {
-    owner: WorkspaceSnapshotId,
-    blob_id: i64,
-    blob_oid: Oid,
-    manifest_digest: [u8; 32],
+#[doc(hidden)]
+pub struct ResolutionContentWitness {
+    #[doc(hidden)]
+    pub owner: WorkspaceSnapshotId,
+    #[doc(hidden)]
+    pub blob_id: i64,
+    #[doc(hidden)]
+    pub blob_oid: Oid,
+    #[doc(hidden)]
+    pub manifest_digest: [u8; 32],
     manifest_counts: ResolutionManifestCounts,
     producer_epoch: String,
-    logical_rows: u64,
-    payload_bytes: u64,
-    input: ResolutionContentInput,
+    #[doc(hidden)]
+    pub logical_rows: u64,
+    #[doc(hidden)]
+    pub payload_bytes: u64,
+    #[doc(hidden)]
+    pub input: ResolutionContentInput,
 }
 
 impl ResolutionContentWitness {
-    pub(crate) fn owner(&self) -> &WorkspaceSnapshotId {
+    #[doc(hidden)]
+    pub fn owner(&self) -> &WorkspaceSnapshotId {
         &self.owner
     }
-    pub(crate) const fn blob_id(&self) -> i64 {
+    #[doc(hidden)]
+    pub const fn blob_id(&self) -> i64 {
         self.blob_id
     }
-    pub(crate) const fn blob_oid(&self) -> Oid {
+    #[doc(hidden)]
+    pub const fn blob_oid(&self) -> Oid {
         self.blob_oid
     }
-    pub(crate) const fn manifest_digest(&self) -> [u8; 32] {
+    #[doc(hidden)]
+    pub const fn manifest_digest(&self) -> [u8; 32] {
         self.manifest_digest
     }
     pub(crate) fn manifest_counts(&self) -> &ResolutionManifestCounts {
@@ -112,34 +174,42 @@ impl ResolutionContentWitness {
     pub(crate) fn producer_epoch(&self) -> &str {
         &self.producer_epoch
     }
-    pub(crate) const fn logical_rows(&self) -> u64 {
+    #[doc(hidden)]
+    pub const fn logical_rows(&self) -> u64 {
         self.logical_rows
     }
-    pub(crate) const fn payload_bytes(&self) -> u64 {
+    #[doc(hidden)]
+    pub const fn payload_bytes(&self) -> u64 {
         self.payload_bytes
     }
-    pub(crate) fn input(&self) -> &ResolutionContentInput {
+    #[doc(hidden)]
+    pub fn input(&self) -> &ResolutionContentInput {
         &self.input
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct PublishedResolutionContent {
-    witness: ResolutionContentWitness,
+#[doc(hidden)]
+pub struct PublishedResolutionContent {
+    #[doc(hidden)]
+    pub witness: ResolutionContentWitness,
     membership: Vec<([u8; 32], SharedNameId)>,
 }
 
 impl PublishedResolutionContent {
-    pub(crate) fn witness(&self) -> &ResolutionContentWitness {
+    #[doc(hidden)]
+    pub fn witness(&self) -> &ResolutionContentWitness {
         &self.witness
     }
-    pub(crate) fn into_parts(self) -> (ResolutionContentWitness, Vec<([u8; 32], SharedNameId)>) {
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (ResolutionContentWitness, Vec<([u8; 32], SharedNameId)>) {
         (self.witness, self.membership)
     }
 }
 
 #[derive(Debug)]
-pub(crate) enum ResolutionContentPublicationOutcome {
+#[doc(hidden)]
+pub enum ResolutionContentPublicationOutcome {
     Ready(Box<PublishedResolutionContent>),
     Cancelled,
     Stale(SelectedResolutionStale),
@@ -156,24 +226,33 @@ pub(crate) struct ResolutionCapsuleDeclarationPresentation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResolutionCapsuleReferenceOwner {
+#[doc(hidden)]
+pub enum ResolutionCapsuleReferenceOwner {
     Unknown,
     Root,
     HostLocal(ResolutionLocalKey),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolutionCapsuleReferenceContext {
-    pub(crate) semantic_key: ResolutionLocalKey,
-    pub(crate) source_site: ResolutionSiteId,
-    pub(crate) host_occurrence: SourceOccurrenceId,
-    pub(crate) module_context: SourceOccurrenceId,
-    pub(crate) module_declaration: Option<SourceDeclarationId>,
-    pub(crate) reference_owner: ResolutionCapsuleReferenceOwner,
+#[doc(hidden)]
+pub struct ResolutionCapsuleReferenceContext {
+    #[doc(hidden)]
+    pub semantic_key: ResolutionLocalKey,
+    #[doc(hidden)]
+    pub source_site: ResolutionSiteId,
+    #[doc(hidden)]
+    pub host_occurrence: SourceOccurrenceId,
+    #[doc(hidden)]
+    pub module_context: SourceOccurrenceId,
+    #[doc(hidden)]
+    pub module_declaration: Option<SourceDeclarationId>,
+    #[doc(hidden)]
+    pub reference_owner: ResolutionCapsuleReferenceOwner,
 }
 
 #[derive(Debug)]
-pub(crate) struct PreparedResolutionCapsule {
+#[doc(hidden)]
+pub struct PreparedResolutionCapsule {
     input: ResolutionContentInput,
     bundle: PreparedResolutionBundle,
     declarations: Vec<ResolutionCapsuleDeclarationPresentation>,
@@ -348,7 +427,8 @@ fn publication_receipt_tx(
 }
 
 impl AnalyzerStore {
-    pub(crate) fn publish_selected_parsed_content(
+    #[doc(hidden)]
+    pub fn publish_selected_parsed_content(
         &self,
         owner: &WorkspaceSnapshotId,
         persisted_relative_path: &str,
@@ -451,7 +531,8 @@ impl AnalyzerStore {
         Ok(outcome)
     }
 
-    pub(crate) fn admit_cached_selected_content(
+    #[doc(hidden)]
+    pub fn admit_cached_selected_content(
         &self,
         owner: &WorkspaceSnapshotId,
         persisted_relative_path: &str,
@@ -581,7 +662,8 @@ impl AnalyzerStore {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_resolution_capsule(
+#[doc(hidden)]
+pub fn prepare_resolution_capsule(
     key: ResolutionCapsuleKey,
     checkpoint: crate::analyzer::resolution::ResolutionNodeIdentity,
     host_module_scope: ResolutionScopeId,
@@ -733,7 +815,8 @@ pub(crate) fn prepare_resolution_capsule(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CapsuleArtifactVerification {
+#[doc(hidden)]
+pub enum CapsuleArtifactVerification {
     Verified,
     Cancelled,
     Mismatch,
@@ -742,7 +825,8 @@ pub(crate) enum CapsuleArtifactVerification {
 /// Authenticate the producer's immutable dense artifact before any operation
 /// assignment retargets it. Presentation is read from this witness's exact blob;
 /// the same canonical digest covers it and every prepared body family.
-pub(crate) fn verify_capsule_artifact(
+#[doc(hidden)]
+pub fn verify_capsule_artifact(
     conn: &rusqlite::Connection,
     witness: &ResolutionContentWitness,
     dense: &crate::analyzer::resolution::LoweredResolutionFactsWithIdentityCatalog,
@@ -1062,7 +1146,8 @@ fn insert_capsule_presentation_tx(
 }
 
 impl AnalyzerStore {
-    pub(crate) fn publish_selected_resolution_capsule(
+    #[doc(hidden)]
+    pub fn publish_selected_resolution_capsule(
         &self,
         owner: &WorkspaceSnapshotId,
         persisted_relative_path: &str,
@@ -1181,154 +1266,6 @@ impl AnalyzerStore {
 #[cfg(test)]
 mod capsule_authentication_tests {
     use super::*;
-    use brokk_bifrost_test_macros::hardwon;
-
-    #[test]
-    #[hardwon(
-        "3da13ca2218b: reordered or altered capsule presentation bypassed immutable publication identity"
-    )]
-    fn capsule_verification_authenticates_fresh_cached_and_reordered_artifacts() {
-        use CapsuleArtifactVerification::{Cancelled, Mismatch, Verified};
-        super::super::resolution_operation::with_dense_selected_macro_fixture(
-            |store, owner, fixtures| {
-                let fixture = fixtures.into_iter().last().unwrap();
-                let prepare = |dense, references| {
-                    prepare_resolution_capsule(
-                        fixture.key.clone(),
-                        fixture.checkpoint,
-                        fixture.module_scope,
-                        dense,
-                        &fixture.lowering,
-                        fixture.host_input_start_line,
-                        references,
-                        &CancellationToken::default(),
-                    )
-                    .unwrap()
-                    .unwrap()
-                };
-                let prepared = prepare(&fixture.dense, fixture.references.clone());
-                let ResolutionContentPublicationOutcome::Ready(fresh) = store
-                    .publish_selected_resolution_capsule(
-                        owner,
-                        &fixture.host_path,
-                        prepared,
-                        &CancellationToken::default(),
-                    )
-                    .unwrap()
-                else {
-                    panic!("fresh capsule publication must be ready");
-                };
-                let witness = fresh.witness().clone();
-                {
-                    let conn = store.read_conn().unwrap();
-                    assert_eq!(
-                        verify_capsule_artifact(
-                            &conn,
-                            &witness,
-                            &fixture.dense,
-                            &CancellationToken::default()
-                        )
-                        .unwrap(),
-                        Verified
-                    );
-                    assert_eq!(
-                        verify_capsule_artifact(
-                            &conn,
-                            &witness,
-                            &fixture.reordered,
-                            &CancellationToken::default()
-                        )
-                        .unwrap(),
-                        Verified
-                    );
-                    let cancelled = CancellationToken::default();
-                    cancelled.cancel();
-                    assert_eq!(
-                        verify_capsule_artifact(&conn, &witness, &fixture.dense, &cancelled)
-                            .unwrap(),
-                        Cancelled
-                    );
-                }
-                let mut references = fixture.references.clone();
-                references.reverse();
-                let before = store.conn.execute(|conn| conn.total_changes());
-                let ResolutionContentPublicationOutcome::Ready(cached) = store
-                    .publish_selected_resolution_capsule(
-                        owner,
-                        &fixture.host_path,
-                        prepare(&fixture.reordered, references),
-                        &CancellationToken::default(),
-                    )
-                    .unwrap()
-                else {
-                    panic!("reordered capsule publication must be ready");
-                };
-                assert_eq!(cached.witness(), &witness);
-                assert_eq!(store.conn.execute(|conn| conn.total_changes()), before);
-                let changed = fixture
-                    .dense
-                    .with_changed_reference_end_for_publication_test();
-                assert_eq!(
-                    changed.identities(),
-                    fixture.dense.identities(),
-                    "changing reference extent retains the complete identity catalog"
-                );
-                assert_ne!(changed.lexical(), fixture.dense.lexical());
-                let altered = changed
-                    .lexical()
-                    .semantics()
-                    .iter()
-                    .zip(fixture.dense.lexical().semantics())
-                    .find(|(left, right)| left != right)
-                    .unwrap()
-                    .0;
-                let source_site = fixture
-                    .lowering
-                    .facts
-                    .sites
-                    .iter()
-                    .find(|site| site.id == altered.site())
-                    .unwrap();
-                let source_scope = fixture
-                    .lowering
-                    .facts
-                    .scopes
-                    .iter()
-                    .find(|scope| scope.id == source_site.scope)
-                    .unwrap();
-                let extent = altered.site_metadata().unwrap();
-                assert!(
-                    source_scope.start_byte <= extent.start_byte()
-                        && extent.end_byte() <= source_scope.end_byte,
-                    "changed body remains inside its actual source scope"
-                );
-                {
-                    let conn = store.read_conn().unwrap();
-                    assert_eq!(
-                        verify_capsule_artifact(
-                            &conn,
-                            &witness,
-                            &changed,
-                            &CancellationToken::default()
-                        )
-                        .unwrap(),
-                        Mismatch,
-                        "same catalog cannot authenticate changed reference body bytes"
-                    );
-                }
-                let dense = fixture.dense;
-                store.conn.execute(move |conn| {
-                assert_eq!(verify_capsule_artifact(conn,cached.witness(),&dense,&CancellationToken::default()).unwrap(),Verified);
-                let tx = conn.unchecked_transaction().unwrap();
-                tx.execute("UPDATE resolution_fragment_interiors SET publication_state='building' WHERE blob_id=?1",[witness.blob_id()]).unwrap();
-                assert_eq!(tx.execute("UPDATE resolution_capsule_declarations SET declaration_end_byte=declaration_end_byte+1 WHERE blob_id=?1",[witness.blob_id()]).unwrap(),1);
-                assert_eq!(verify_capsule_artifact(&tx,&witness,&dense,&CancellationToken::default()).unwrap(),Mismatch,
-                    "same identity catalog cannot authenticate altered durable presentation");
-                tx.rollback().unwrap();
-            });
-            },
-        );
-    }
 
     #[test]
     fn complete_capsule_digest_is_presentation_order_independent_and_rejects_duplicate_keys() {

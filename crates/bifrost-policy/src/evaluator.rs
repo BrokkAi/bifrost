@@ -6187,8 +6187,15 @@ fn work_report_with_metrics(
     work: CodeQueryExecutionWork,
     retained_findings: usize,
     omitted_findings_lower_bound: u64,
-    metrics: Vec<PolicyWorkMetric>,
+    mut metrics: Vec<PolicyWorkMetric>,
 ) -> PolicyWorkReport {
+    super::finding::append_semantic_budget_metrics(
+        &mut metrics,
+        "query",
+        work.semantic.cumulative,
+        work.semantic.resident_peaks,
+        work.semantic.root_work_peaks,
+    );
     PolicyWorkReport::try_new(
         work.scanned_files,
         work.scanned_source_bytes,

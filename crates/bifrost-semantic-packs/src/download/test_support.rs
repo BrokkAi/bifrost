@@ -479,6 +479,18 @@ pub(super) fn add_premium_release(
     responses: &mut BTreeMap<String, Vec<u8>>,
     repository: &str,
 ) -> String {
+    add_shaped_premium_release(releases, responses, repository, &[], |_| {})
+}
+
+/// The premium fixture with `extra_policy_entries` added to its policy ZIP and
+/// `shape` applied to its manifest before it is serialized.
+pub(super) fn add_shaped_premium_release(
+    releases: &mut Vec<Value>,
+    responses: &mut BTreeMap<String, Vec<u8>>,
+    repository: &str,
+    extra_policy_entries: &[(&str, &[u8])],
+    shape: impl FnOnce(&mut Value),
+) -> String {
     let required_capabilities = [
         "actual-to-formal-binding",
         "exact-call-target",
@@ -515,6 +527,7 @@ pub(super) fn add_premium_release(
     let borrowed_policy_entries = policy_entries
         .iter()
         .map(|(path, bytes)| (path.as_str(), *bytes))
+        .chain(extra_policy_entries.iter().copied())
         .collect::<Vec<_>>();
     let policy_archive = test_zip_archive(&borrowed_policy_entries);
     let evidence_archive = test_zip_archive(&[("evidence/behavior.json", evidence_bytes)]);
@@ -536,7 +549,7 @@ pub(super) fn add_premium_release(
         })
         .collect::<Vec<_>>();
     let tag = "v0.3.0";
-    let manifest = json!({
+    let mut manifest = json!({
         "manifest_schema_version": 2,
         "pack": {
             "id": "bifrost.premium",
@@ -585,6 +598,7 @@ pub(super) fn add_premium_release(
             "source_commit": TEST_COMMIT,
         },
     });
+    shape(&mut manifest);
     let manifest_bytes = canonical_json_bytes(&manifest).expect("serialize premium manifest");
     let manifest_sha = sha256(&manifest_bytes);
     let repository_path = repository

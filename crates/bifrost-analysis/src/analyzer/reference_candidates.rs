@@ -1,7 +1,7 @@
-use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_cpp::graph::resolver::is_cpp_template_argument_type_leaf;
 use brokk_bifrost_cpp::graph::syntax::is_cpp_recovered_callable_declaration_reference;
+use brokk_bifrost_cpp::identity::cpp_is_range_for_binding_name;
 use brokk_bifrost_csharp::graph::extractor::{
     is_declaration_name as csharp_declaration_name, is_statement_label as csharp_is_statement_label,
 };

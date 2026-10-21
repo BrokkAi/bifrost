@@ -677,12 +677,8 @@ impl PreloadedCoverage {
             .or_insert_with(|| completion.clone());
     }
 
-    fn apply(&mut self, gap: LoweredCoverageGap) {
-        let completion =
-            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
-                gap.reason_semantic(),
-            )]);
-        match gap.frontier() {
+    fn apply(&mut self, frontier: LoweringCoverageFrontier, completion: ResolutionCompletion) {
+        match frontier {
             LoweringCoverageFrontier::Fragment => {
                 self.fragment = self.fragment.combine(&completion);
             }
@@ -1389,6 +1385,10 @@ impl PreloadedFragmentSource {
     ) {
         let mut seen = HashSet::default();
         let mut reverse_candidate_gaps = ReverseCandidateGapCoverageBuilder::default();
+        // Collect each bucket before canonicalizing it. Repeated binary unions
+        // rebuild growing prefixes and become quadratic for concentrated gaps.
+        let mut reasons_by_frontier = HashMap::<_, Vec<_>>::default();
+        let mut inventory_reasons_by_fragment = HashMap::<_, Vec<_>>::default();
         for (fragment, gap_id, gap) in gaps {
             assert!(
                 self.fragments.contains(&fragment),
@@ -1405,13 +1405,12 @@ impl PreloadedFragmentSource {
                 gap.frontier(),
                 LoweringCoverageFrontier::Fragment | LoweringCoverageFrontier::Enumeration
             ) {
-                PreloadedCoverage::combine_map(
-                    &mut self.reference_inventory_by_fragment,
-                    fragment,
-                    &ResolutionCompletion::incomplete([
-                        ResolutionIncompleteReason::UnsupportedSemantic(gap.reason_semantic()),
-                    ]),
-                );
+                inventory_reasons_by_fragment
+                    .entry(fragment)
+                    .or_default()
+                    .push(ResolutionIncompleteReason::UnsupportedSemantic(
+                        gap.reason_semantic(),
+                    ));
             }
             match gap.frontier() {
                 LoweringCoverageFrontier::Reference { semantic, node } => {
@@ -1452,7 +1451,20 @@ impl PreloadedFragmentSource {
                     ))
                     .expect("preloaded reverse candidate gap identities are unique");
             }
-            self.coverage.apply(gap);
+            reasons_by_frontier.entry(gap.frontier()).or_default().push(
+                ResolutionIncompleteReason::UnsupportedSemantic(gap.reason_semantic()),
+            );
+        }
+        for (fragment, reasons) in inventory_reasons_by_fragment {
+            PreloadedCoverage::combine_map(
+                &mut self.reference_inventory_by_fragment,
+                fragment,
+                &ResolutionCompletion::incomplete(reasons),
+            );
+        }
+        for (frontier, reasons) in reasons_by_frontier {
+            self.coverage
+                .apply(frontier, ResolutionCompletion::incomplete(reasons));
         }
         let (reverse_candidate_gaps, cancelled) = reverse_candidate_gaps
             .finish(&CancellationToken::new())
@@ -2880,7 +2892,8 @@ pub(super) fn transfer_types_with_source(
     apply_type_transfer_rules(state, rules, source_completion, cancellation)
 }
 
-pub(crate) fn cancelled_completion() -> ResolutionCompletion {
+#[doc(hidden)]
+pub fn cancelled_completion() -> ResolutionCompletion {
     ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled])
 }
 
@@ -3507,12 +3520,55 @@ pub(super) fn select_paths_with_cancellation_evidence(
 /// Unknown activation remains selected for contextual access to mark incomplete.
 pub(super) fn select_paths_with_lazy_access(
     reference: SemanticId,
-    mut completed: Vec<CompletedPath>,
+    completed: Vec<CompletedPath>,
     terminals: Vec<IncompleteTerminalPath>,
     unconditional_completion: ResolutionCompletion,
     cancellation_evidence: ResolutionCompletion,
     cancellation: &CancellationToken,
     access_lookup: &mut SelectionAccessLookup<'_>,
+) -> StoreResult<ResolutionAnswer> {
+    select_paths_with_lazy_candidate_filter(
+        reference,
+        completed,
+        terminals,
+        unconditional_completion,
+        cancellation_evidence,
+        cancellation,
+        &mut |reference, targets| {
+            let Some(decisions) = access_lookup(reference, targets)? else {
+                return Ok(None);
+            };
+            assert_eq!(
+                decisions.len(),
+                targets.len(),
+                "selected declaration access must answer every requested endpoint"
+            );
+            Ok(Some(
+                targets
+                    .iter()
+                    .zip(decisions)
+                    .filter_map(|(&target, decision)| {
+                        (decision == DeclarationAccessDecision::InactiveActivation)
+                            .then_some(target)
+                    })
+                    .collect(),
+            ))
+        },
+    )
+}
+
+/// Re-select after a query-local rule excludes selected candidates. The engine
+/// keeps the original paths, including their lexical and import precedence.
+/// A rule may exclude only targets it was asked about; every nonempty result
+/// removes at least one current candidate and makes the next selection progress.
+pub(super) fn select_paths_with_lazy_candidate_filter(
+    reference: SemanticId,
+    mut completed: Vec<CompletedPath>,
+    terminals: Vec<IncompleteTerminalPath>,
+    unconditional_completion: ResolutionCompletion,
+    cancellation_evidence: ResolutionCompletion,
+    cancellation: &CancellationToken,
+    filter: &mut impl FnMut(SemanticId, &[SemanticId]) -> StoreResult<Option<HashSet<SemanticId>>>,
 ) -> StoreResult<ResolutionAnswer> {
     let mut work = 0_usize;
     loop {
@@ -3532,7 +3588,7 @@ pub(super) fn select_paths_with_lazy_access(
             return Ok(answer);
         }
 
-        let Some(decisions) = access_lookup(reference, answer.targets())? else {
+        let Some(inactive) = filter(reference, answer.targets())? else {
             let cancelled =
                 ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]);
             return Ok(cancelled_selection_answer(
@@ -3543,20 +3599,12 @@ pub(super) fn select_paths_with_lazy_access(
                 &mut work,
             ));
         };
-        assert_eq!(
-            decisions.len(),
-            answer.targets().len(),
-            "selected declaration access must answer every requested endpoint"
+        assert!(
+            inactive
+                .iter()
+                .all(|target| answer.targets().binary_search(target).is_ok()),
+            "a selection rule excludes only requested candidates"
         );
-
-        let inactive = answer
-            .targets()
-            .iter()
-            .zip(decisions)
-            .filter_map(|(&target, decision)| {
-                (decision == DeclarationAccessDecision::InactiveActivation).then_some(target)
-            })
-            .collect::<HashSet<_>>();
         if inactive.is_empty() {
             return Ok(answer);
         }
@@ -3797,7 +3845,7 @@ fn try_build_resolution_answer(
         return None;
     }
     let tracing =
-        crate::analyzer::usages::get_definition::trace::native_rejection_projection_active();
+        crate::analyzer::resolution::resolution_diagnostics().native_rejection_projection_active();
     // Coverage is local to this actual selection, including terminals which
     // lost without ever expanding into declarations.
     let rejection_coverage = tracing
@@ -4344,6 +4392,10 @@ where
             Some(left.len().cmp(&right.len()))
         }
     }
+}
+
+pub fn resolution_diagnostics() -> &'static dyn super::ResolutionDiagnostics {
+    crate::analyzer::usages::get_definition::trace::resolution_diagnostics()
 }
 
 #[cfg(test)]

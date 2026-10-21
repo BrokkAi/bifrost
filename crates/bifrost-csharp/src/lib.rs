@@ -39,3 +39,6 @@ pub mod test_detection;
 
 #[cfg(test)]
 mod test_support;
+
+mod knowledge;
+pub use knowledge::CSharpKnowledge;

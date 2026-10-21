@@ -709,7 +709,7 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
 
 ### Dispatch and method families
 
-`dispatch_outcome` emits exactly one row per input site, so zero target rows never read as a proven-empty target set. The row carries the semantic `outcome` (`resolved`, `ambiguous`, `unproven`, `unknown`, `unsupported`, `exceeded_budget`, or `cancelled`), the oracle's candidate `coverage`, the retained `target_count`, and the unsupported capability or exceeded budget lane. `exceeded_limit` is nullable and its domain is exactly `source`, `rows`, `retained_bytes`, `steps`, and `files`.
+`dispatch_outcome` emits exactly one row per input site, so zero target rows never read as a proven-empty target set. The row carries the semantic `outcome` (`resolved`, `ambiguous`, `unproven`, `unknown`, `unsupported`, `exceeded_budget`, or `cancelled`), the oracle's candidate `coverage`, the retained `target_count`, and the unsupported capability or exceeded budget lane. `exceeded_limit` is nullable and its domain is exactly `source`, `rows`, `retained_bytes`, and `files`. Scans and traversal visits are non-refusing work telemetry; resident admissions and discovery retain their own bounds.
 
 `dispatch_targets` emits zero or more rows per site: one per retained candidate, plus one per boundary arm that names a target. Each row keeps the oracle's own `proof` and `completeness`, repeats the site `coverage`, and states `dispatch` as `proven_dispatch` only for a proven, complete arm inside an exhaustive set. An unresolved or truncated residual arm names no target and emits no row; the site's coverage already states it.
 

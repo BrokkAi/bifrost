@@ -14,9 +14,10 @@ use brokk_bifrost_core::analyzer::parsed_file::{
 };
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::python_facts::{PythonCallableReturnFact, PythonSourceFacts};
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
 use brokk_bifrost_core::analyzer::rust_facts::RustItemSourceFacts;
 use brokk_bifrost_core::analyzer::source_facts::{
-    PrimarySourceFactCollector, SourceDeclarationId, SourceImportId,
+    PrimarySourceFactCollector, SourceDeclarationId, SourceImportId, SourceOccurrenceId,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
@@ -1580,11 +1581,19 @@ where
         }
     }
 
-    fn finish(self, root: Node<'_>) {
+    fn finish(
+        self,
+        root: Node<'_>,
+        native_step: impl FnOnce(
+            &mut ParsedFile,
+            &mut PrimarySourceFactCollector<'source>,
+            &[(SourceDeclarationId, CodeUnit)],
+        ) -> NativeSourceBridges,
+    ) {
         let PythonVisitor {
             parsed,
             source,
-            source_facts,
+            mut source_facts,
             structural,
             structural_parents,
             source_imports,
@@ -1600,6 +1609,8 @@ where
         let structural = structural
             .finish(root)
             .expect("Python structural fact collection must finish");
+        let (native_site_occurrences, native_declaration_sources) =
+            native_step(parsed, &mut source_facts, &source_declaration_units);
         let occurrences = source_facts.finish();
         assert!(
             python_source_facts.valid_links(&occurrences),
@@ -1635,8 +1646,8 @@ where
             occurrences,
             structural,
             python: Some(python_source_facts),
-            native_site_occurrences: Vec::new(),
-            native_declaration_sources: Vec::new(),
+            native_site_occurrences,
+            native_declaration_sources,
             declaration_visibilities: None,
             rust_declaration_properties: Vec::new(),
             rust_modules: None,
@@ -1649,14 +1660,56 @@ where
     }
 }
 
-/// Build the [`ParsedFile`] for one Python source file: module unit, type
-/// identifiers, and the declaration walk. `analyzer/python/adapter.rs`'s
-/// `LanguageAdapter::parse_file` is the only caller.
+type NativeSourceBridges = (
+    Vec<SourceOccurrenceId>,
+    Vec<(ResolutionSiteId, SourceDeclarationId)>,
+);
+
+/// Build production Python declarations and source facts without native facts.
+/// Native publication starts with Python's first production native reader.
 pub fn parse_python_file(
     project: &dyn Project,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+) -> ParsedFile {
+    parse_python_file_with_step(project, file, source, tree, |_, _, _| Default::default())
+}
+
+/// Build coordinated Python source and native facts for producer validation.
+/// Production callers keep using [`parse_python_file`] until the reader switch.
+pub fn parse_python_file_with_native_facts(
+    project: &dyn Project,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+) -> ParsedFile {
+    parse_python_file_with_step(project, file, source, tree, |parsed, collector, units| {
+        // Class replacement withdraws old descendant CodeUnits, while their
+        // source occurrences and lexical identities remain in the native facts.
+        let (facts, occurrences, declarations) = crate::resolution::produce(
+            tree.root_node(),
+            source,
+            collector,
+            units
+                .iter()
+                .filter(|(_, unit)| parsed.contains_declaration(unit)),
+        );
+        parsed.resolution_facts = facts;
+        (occurrences, declarations)
+    })
+}
+
+fn parse_python_file_with_step<'source>(
+    project: &dyn Project,
+    file: &ProjectFile,
+    source: &'source str,
+    tree: &Tree,
+    native_step: impl FnOnce(
+        &mut ParsedFile,
+        &mut PrimarySourceFactCollector<'source>,
+        &[(SourceDeclarationId, CodeUnit)],
+    ) -> NativeSourceBridges,
 ) -> ParsedFile {
     let module_components = python_module_components(project, file);
     let module_name = module_components.join(".");
@@ -1704,7 +1757,7 @@ pub fn parse_python_file(
         overload_metadata: Vec::new(),
     };
     visitor.visit_container(root, &[], 0);
-    visitor.finish(root);
+    visitor.finish(root, native_step);
 
     parsed
 }
@@ -2306,6 +2359,20 @@ mod primary_tests {
         )
     }
 
+    fn parse_native(source: &str) -> ParsedFile {
+        let file = ProjectFile::new(std::env::temp_dir(), "m4.py");
+        let tree = parse_python_tree(source).expect("Python fixture tree");
+        parse_python_file_with_native_facts(
+            &brokk_bifrost_core::analyzer::project::TestProject::new(
+                file.root(),
+                brokk_bifrost_core::analyzer::Language::Python,
+            ),
+            &file,
+            source,
+            &tree,
+        )
+    }
+
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#3673: declarations ignored an overlay-only setuptools manifest"
@@ -2362,9 +2429,15 @@ mod primary_tests {
         "f4495e5c7c62: replacing a duplicate Python class left stale descendant callable metadata links"
     )]
     fn replacing_a_class_withdraws_descendant_metadata_links() {
-        let parsed = parse(
+        let parsed = parse_native(
             "from typing import overload\nclass Replaced:\n    def obsolete(self): pass\n    @overload\n    def current(self): pass\n    class Nested:\n        def stale(self): pass\n\nclass Kept:\n    def stable(self): pass\n\nclass Replaced:\n    def current(self): pass\n",
         );
+        for bridge in &parsed.resolution_facts.definition_units {
+            assert!(
+                parsed.contains_declaration(&bridge.unit),
+                "native definitions must not resurrect withdrawn descendants: {bridge:?}"
+            );
+        }
         let mut names = parsed
             .source_declaration_metadata
             .iter()
@@ -2715,12 +2788,15 @@ mod primary_tests {
         for source in [
             "",
             "class Broken(:\n    pass\ndef valid(value):\n    return value\n",
+            "def broken(:\n    pass\n",
         ] {
             let parsed = parse(source);
             let facts = parsed.source_facts.expect("complete producer publication");
             assert_eq!(facts.source_bytes, source.len());
             assert!(facts.python.is_some());
             assert_eq!(parsed.resolution_facts, Default::default());
+            assert!(facts.native_site_occurrences.is_empty());
+            assert!(facts.native_declaration_sources.is_empty());
             assert!(
                 facts
                     .occurrences

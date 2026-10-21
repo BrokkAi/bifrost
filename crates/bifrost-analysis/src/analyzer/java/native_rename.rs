@@ -8,12 +8,12 @@ use super::selected_reverse::{JavaSelectedReverseOutcome, java_selected_inverse_
 use crate::CancellationToken;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::OverlayProject;
+use crate::analyzer::rename::{
+    MAX_RENAME_IDENTIFIER_BYTES, RenameEdit, RenameFailure, RenameFileEdits, RenameResult,
+};
 use crate::analyzer::structural::reference_edges::{EdgeCompleteness, EdgeDerivationResult};
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageProof};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, resolve_analyzer};
-use crate::symbol_rename::{
-    MAX_RENAME_IDENTIFIER_BYTES, RenameEdit, RenameFailure, RenameFileEdits, RenameResult,
-};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tree_sitter::{Node, Tree};
@@ -21,7 +21,7 @@ use tree_sitter::{Node, Tree};
 /// Native Java rename provider, kept outside production dispatch.
 pub struct JavaNativeRenameProvider;
 
-impl crate::symbol_rename::RenameProvider for JavaNativeRenameProvider {
+impl crate::analyzer::rename::RenameProvider for JavaNativeRenameProvider {
     fn rename(
         &self,
         analyzer: &dyn IAnalyzer,

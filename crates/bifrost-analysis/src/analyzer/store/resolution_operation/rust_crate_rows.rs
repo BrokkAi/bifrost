@@ -1,9 +1,11 @@
 //! Borrowed crate-row reads shared by point compilation and endpoint demands.
+use super::demand_closure::{
+    RouteEdgeTier, RouteLocation, RouteRules, RouteStarts, WalkCursor, walk_container_route,
+};
 use super::rust_crate_context::*;
 use super::*;
 use crate::analyzer::resolution::{
-    BatchCandidateRequest, DeferredMemberOwnerLookupName, EndpointSignature,
-    LoweredDeferredMemberOwner, LoweredMemberScopeProperty, StackPattern, mounted_site_node,
+    DeferredMemberOwnerLookupName, LoweredDeferredMemberOwner, mounted_site_node,
     mounted_site_semantic,
 };
 use crate::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION;
@@ -21,7 +23,7 @@ use rusqlite::{OptionalExtension, params};
 pub(super) const MODULES_FOR_BLOB: &str = "WITH request_roots(topology_id) AS (
  SELECT CAST(value AS INTEGER) FROM json_each(?3)
 )
-SELECT unit.topology_id, placement.module_path,
+SELECT unit.topology_id, CASE placement.container_path WHEN '' THEN 'crate' ELSE placement.container_path END,
  member.blob_id, member.rel_path, scopes.resolution_scope, contexts.edition,
  contexts.target_kind='detached' AND EXISTS(
   SELECT 1 FROM selected_rust_unit_summaries AS cargo
@@ -38,8 +40,8 @@ SELECT unit.topology_id, placement.module_path,
  AND files.generation=unit.generation AND files.rel_path=member.rel_path
  CROSS JOIN blobs ON blobs.id=member.blob_id AND blobs.blob_oid=files.blob_oid
   AND blobs.lang=files.lang AND blobs.generation=files.generation
- CROSS JOIN main.rust_resolution_unit_summary_placements AS placement
-  INDEXED BY rust_resolution_unit_summary_placements_member
+ CROSS JOIN main.resolution_unit_summary_placements AS placement
+  INDEXED BY resolution_unit_summary_placements_member
   ON placement.summary_id=member.summary_id
  AND placement.member_ordinal=member.member_ordinal
  CROSS JOIN main.rust_resolution_unit_summary_contexts AS contexts
@@ -49,24 +51,45 @@ SELECT unit.topology_id, placement.module_path,
  WHERE member.blob_id=?1 AND member.rel_path=?2 AND placement.scope_ordinal IS NOT NULL
   AND scopes.resolution_scope IS NOT NULL";
 
-pub(super) struct RustCrateRows<'a, 'store, 'input> {
+#[doc(hidden)]
+pub struct RustCrateRows<'a, 'store, 'input> {
     pub(super) ready: &'a ReadySelectedResolution<'store, 'input>,
+}
+
+impl<'a, 'store, 'input> RustCrateRows<'a, 'store, 'input> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new(ready: &'a ReadySelectedResolution<'store, 'input>) -> Self {
+        Self { ready }
+    }
 }
 
 /// An export's site is owned by its selected blob and mount. Crate topology
 /// supplies placement only; no site number is carried over from an old blob.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct RustCrateExport {
-    pub(super) blob: i64,
-    pub(super) declaration: RustCrateDeclaration,
+#[doc(hidden)]
+pub struct RustCrateExport {
+    #[doc(hidden)]
+    pub blob: i64,
+    #[doc(hidden)]
+    pub declaration: RustCrateDeclaration,
     pub(super) topology: i64,
     pub(super) module_path: String,
-    pub(super) mount: SelectedResolutionMountOrdinal,
+    #[doc(hidden)]
+    pub mount: SelectedResolutionMountOrdinal,
+}
+
+/// Completion and, for an unsupported visibility group, the independently
+/// exact canonical targets. Raw glob walks must not resurrect its members.
+pub(super) struct RustBindingInventory {
+    pub(super) completion: ResolutionCompletion,
+    pub(super) targets: Option<Vec<(i64, String, String)>>,
 }
 
 /// The declaration one export names in its blob.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum RustCrateDeclaration {
+#[doc(hidden)]
+pub enum RustCrateDeclaration {
     /// A persisted declaration's definition site.
     Site(u32),
     /// Declaration replay's declaration for an item the crate declared for a
@@ -92,7 +115,7 @@ type ExportKey = (i64, String, String, String, i64, String);
 ///   scopes), keyed by blob and resolution scope. On the whole tract graph
 ///   99.3% of its 265,963 executions repeated a key already asked in the same
 ///   stage; tract_core asked 172 keys 54,658 times.
-/// - `inventories`: `rust_crate_point_inventory.sql` (a demand's open-inventory
+/// - `inventories`: `rust_crate_published_inventory.sql` (a demand's open-inventory
 ///   gaps), keyed by the same target and requester parameters as exports; 76.8% of 221,505
 ///   executions repeated a key within the stage.
 ///
@@ -253,7 +276,8 @@ macro_rules! rust_trait_name_routes {
 /// paired trait endpoint and selected export rows supply the rest of the route.
 /// `?1`/`?2`/`?5` identify the subject declaration and file, `?3`/`?4` the
 /// reference module, and `?6`/`?7` the reference mount and semantic key.
-pub(super) const TRAIT_IMPLS_VISIBLE_AT: &str = concat!(
+#[doc(hidden)]
+pub const TRAIT_IMPLS_VISIBLE_AT: &str = concat!(
     rust_trait_name_routes!(
         "WHERE members.blob_id=?1 AND members.rel_path=?5",
         "SELECT trait_member.blob_id, trait_export.declaration_site, trait_member.rel_path, \
@@ -342,7 +366,8 @@ pub(super) const TRAIT_IMPLS_VISIBLE_AT: &str = concat!(
 /// Rust-owned export and access rows for one graph stage. The generic graph
 /// guard owns the shared authority-validation memo and reader transaction;
 /// this guard installs only the Rust-specific tables inside that boundary.
-pub(crate) struct RustGraphStageTables<'a> {
+#[doc(hidden)]
+pub struct RustGraphStageTables<'a> {
     rows: &'a RefCell<Option<CrateRowMemo>>,
     access: &'a RefCell<Option<super::rust_crate_access::CrateAccessMemo>>,
 }
@@ -526,7 +551,7 @@ pub(super) const TRAIT_VISIBLE_AT: &str = concat!(
 /// The crate modules one Rust reference is written in.
 ///
 /// The reference's own context row names its module scope, and
-/// `selected_rust_module_placements` places that scope in every selected crate
+/// `selected_rust_container_placements` places that scope in every selected crate
 /// that places the file, aligning an edited file's scopes with the persisted
 /// file's. `?1` is the reference's mount ordinal, `?2` its semantic key. No row
 /// means the reference has no persisted context or its file is placed in no
@@ -536,7 +561,7 @@ pub(super) const REFERENCE_MODULE_PLACEMENTS: &str =
  FROM temp.selected_resolution_mounts AS mount
  CROSS JOIN resolution_rust_reference_contexts AS context
   ON context.blob_id=mount.blob_id AND context.semantic_key=?2
- CROSS JOIN selected_rust_module_placements AS placement
+ CROSS JOIN selected_rust_container_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS context.module_declaration
  WHERE mount.mount_ordinal=?1";
@@ -552,7 +577,7 @@ pub(super) const REFERENCE_NAMES_WORKSPACE_CRATE_HEAD: &str = r#"WITH owner AS (
  FROM temp.selected_resolution_mounts AS mount
  CROSS JOIN resolution_rust_reference_contexts AS context
   ON context.blob_id=mount.blob_id AND context.semantic_key=?2
- CROSS JOIN selected_rust_module_placements AS placement
+ CROSS JOIN selected_rust_container_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS context.module_declaration
  CROSS JOIN main.rust_resolution_unit_summary_versions AS owner_version
@@ -571,13 +596,13 @@ target_keys(unit_key) AS (
  FROM owner
  CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
   ON dependency.summary_id=owner.summary_id AND dependency.boundary='workspace'
- CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS name
+ CROSS JOIN main.rust_unit_summary_dependency_names AS name
   ON name.summary_id=dependency.summary_id
  AND name.dependency_ordinal=dependency.dependency_ordinal AND name.extern_name=?3
  UNION
  SELECT dependency.dependency_unit_key
  FROM owner
- CROSS JOIN main.rust_resolution_unit_summary_placements AS root
+ CROSS JOIN main.rust_unit_summary_placements AS root
   ON root.summary_id=owner.summary_id AND root.module_path='crate'
  CROSS JOIN main.resolution_unit_summary_members AS root_member
   ON root_member.summary_id=root.summary_id AND root_member.member_ordinal=root.member_ordinal
@@ -585,7 +610,7 @@ target_keys(unit_key) AS (
   ON import.blob_id=root_member.blob_id AND import.is_extern_crate=1
  AND import.bound_name=?3 AND import.local_start IS NULL
  AND COALESCE(import.owner_module,'')=''
- CROSS JOIN main.rust_resolution_unit_summary_dependency_names AS name
+ CROSS JOIN main.rust_unit_summary_dependency_names AS name
   ON name.summary_id=owner.summary_id AND name.extern_name=import.imported_name
  CROSS JOIN main.resolution_unit_summary_dependencies AS dependency
   ON dependency.summary_id=name.summary_id
@@ -593,7 +618,7 @@ target_keys(unit_key) AS (
  UNION
  SELECT import.target_unit_key
  FROM owner
- CROSS JOIN main.rust_resolution_unit_summary_placements AS source
+ CROSS JOIN main.rust_unit_summary_placements AS source
   ON source.summary_id=owner.summary_id AND source.module_path=owner.container_path
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
@@ -626,7 +651,7 @@ pub(super) const REFERENCE_NAMES_MACRO_MODULE: &str = "SELECT 1
  FROM temp.selected_resolution_mounts AS mount
  CROSS JOIN resolution_rust_reference_contexts AS context
   ON context.blob_id=mount.blob_id AND context.semantic_key=?2
- CROSS JOIN selected_rust_module_placements AS placement
+ CROSS JOIN selected_rust_container_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS context.module_declaration
  CROSS JOIN selected_rust_unit_summaries AS unit
@@ -1029,47 +1054,6 @@ pub(super) const EXTERNAL_TYPE_IDENTITY: &str = "SELECT 1
  CROSS JOIN resolution_identities AS identity ON identity.id=binding.root_terminal
  WHERE mount.mount_ordinal=?1 AND identity.namespace=?3 LIMIT 1";
 
-/// Module segments plus the terminal item of one external type import. The
-/// route is read from structured Rust import facts and the exact mounted
-/// identity, never from its rendered spelling.
-// SQLite materializes a join view on the nullable side of a LEFT JOIN. Scope
-// the segment relation before materialization so it cannot visit other blobs
-// (#5638). Both readers below use this shape.
-const EXTERNAL_TYPE_IMPORT_PATH: &str = "WITH scoped_segments AS MATERIALIZED (
- SELECT blob_id, import_ordinal, ordinal, segment
- FROM source_rust_import_module_segments
- WHERE blob_id IN (SELECT blob_id FROM temp.selected_resolution_mounts
-                   WHERE mount_ordinal=?1)
- )
- SELECT import.imported_name,
- segment.ordinal, segment.segment
- FROM temp.selected_resolution_mounts AS mount
- CROSS JOIN resolution_paths AS binding
-  ON binding.blob_id=mount.blob_id AND binding.end_node=-1
-  AND binding.start_node<>-1 AND binding.end_open_tail=1
-  AND json_extract(binding.end_fixed_key,'$[#-2][0]')=?2
- CROSS JOIN resolution_identities AS identity ON identity.id=binding.root_terminal
- CROSS JOIN source_rust_import_targets AS import
-  ON import.blob_id=mount.blob_id
-  AND import.ordinal=json_extract(binding.end_fixed_key,'$[#-2][0]')
-  AND import.is_glob=0
- LEFT JOIN scoped_segments AS segment
-  ON segment.blob_id=import.blob_id AND segment.import_ordinal=import.ordinal
- WHERE mount.mount_ordinal=?1 AND identity.namespace=?3
- ORDER BY segment.ordinal";
-
-const EXTERNAL_TYPE_IMPORT_PATHS_FOR_BINDING: &str = "WITH scoped_segments AS MATERIALIZED (
- SELECT import_ordinal, ordinal, segment
- FROM source_rust_import_module_segments WHERE blob_id=?1
- )
- SELECT import.ordinal, import.imported_name, segment.segment
- FROM source_rust_import_targets AS import
- LEFT JOIN scoped_segments AS segment
-  ON segment.import_ordinal=import.ordinal
- WHERE import.blob_id=?1 AND import.native_scope=?2 AND import.bound_name=?3
-  AND import.is_glob=0 AND import.imported_name IS NOT NULL
- ORDER BY import.ordinal, segment.ordinal";
-
 pub(crate) fn external_type_identities(
     selection: &SelectedResolutionMountInventory<'_>,
     boundary: (SelectedResolutionMountOrdinal, i64),
@@ -1100,6 +1084,7 @@ pub(crate) fn external_type_identities(
     Ok(Some(identities))
 }
 
+/// Read one external type import through its explicit token-to-route site.
 pub(crate) fn external_type_import_path(
     selection: &SelectedResolutionMountInventory<'_>,
     boundary: (SelectedResolutionMountOrdinal, i64),
@@ -1108,53 +1093,30 @@ pub(crate) fn external_type_import_path(
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    let mut path = Vec::new();
-    let mut imported_name = None;
-    for row in selection
-        .connection()
-        .prepare_cached(EXTERNAL_TYPE_IMPORT_PATH)?
-        .query_map(
-            params![
-                boundary.0.get(),
-                boundary.1,
+    let conn = selection.connection();
+    let blob = selection.mount_record_by_ordinal(boundary.0)?.blob_id();
+    let site: Option<u32> = conn
+        .prepare_cached(super::imports::TOKEN_SITE)?
+        .query_row(params![blob, boundary.1], |row| row.get(0))
+        .optional()?;
+    let path = site
+        .map(|site| super::imports::route_at_site(conn, blob, site))
+        .transpose()?
+        .flatten()
+        .and_then(|route| {
+            // X::{self} binds X, so the retained path names X.
+            route.named_path(
                 crate::analyzer::store::resolution_prepare::resolution_rows::namespace_code(
-                    ResolutionNamespace::Type
-                )
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<u32>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )?
-    {
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        let (name, ordinal, segment) = row?;
-        if let Some(name) = name {
-            if let Some(previous) = &imported_name {
-                assert_eq!(previous, &name, "one import path has one terminal name");
-            } else {
-                imported_name = Some(name);
-            }
-        }
-        assert_eq!(ordinal.is_some(), segment.is_some());
-        if let Some(segment) = segment {
-            path.push(segment);
-        }
-    }
-    if let Some(name) = imported_name {
-        path.push(name);
-    }
+                    ResolutionNamespace::Type,
+                ),
+            )
+        })
+        .unwrap_or_default();
     Ok(Some(path))
 }
 
-/// The source paths behind each named type import binding. This keeps cfg
-/// alternatives separate so a caller can close a boundary only when every
-/// selected route names the same itemless standard marker.
+/// Keep cfg alternatives separate: a boundary closes only when every route
+/// names the same itemless standard marker.
 fn external_type_import_paths_for_binding(
     selection: &SelectedResolutionMountInventory<'_>,
     blob: i64,
@@ -1162,48 +1124,23 @@ fn external_type_import_paths_for_binding(
     bound_name: &str,
     cancellation: &CancellationToken,
 ) -> Result<Option<Vec<Vec<String>>>> {
-    if cancellation.is_cancelled() {
+    let Some(routes) = super::imports::named_routes(
+        selection.connection(),
+        blob,
+        scope,
+        bound_name,
+        cancellation,
+    )?
+    else {
         return Ok(None);
-    }
-    let mut paths = Vec::new();
-    let mut current: Option<(u32, String, Vec<String>)> = None;
-    for row in selection
-        .connection()
-        .prepare_cached(EXTERNAL_TYPE_IMPORT_PATHS_FOR_BINDING)?
-        .query_map(params![blob, scope, bound_name], |row| {
-            Ok((
-                row.get::<_, u32>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?
-    {
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        let (ordinal, imported_name, segment) = row?;
-        if current
-            .as_ref()
-            .is_some_and(|(previous, _, _)| *previous != ordinal)
-        {
-            let (_, name, mut segments) = current.take().expect("the previous import exists");
-            segments.push(name);
-            paths.push(segments);
-        }
-        let (_, name, segments) =
-            current.get_or_insert_with(|| (ordinal, imported_name.clone(), Vec::new()));
-        assert_eq!(
-            name, &imported_name,
-            "one import ordinal has one terminal name"
-        );
-        if let Some(segment) = segment {
-            segments.push(segment);
-        }
-    }
-    if let Some((_, name, mut segments)) = current {
-        segments.push(name);
-        paths.push(segments);
-    }
+    };
+    let namespace = crate::analyzer::store::resolution_prepare::resolution_rows::namespace_code(
+        ResolutionNamespace::Type,
+    );
+    let paths = routes
+        .iter()
+        .filter_map(|route| route.named_path(namespace))
+        .collect::<Vec<_>>();
     Ok(Some(paths))
 }
 
@@ -1393,9 +1330,9 @@ impl RustCrateRows<'_, '_, '_> {
             }
             let (topology, path, namespace, requester_topology, requester_path) = target?;
             // A topology route is reusable after a name-only edit. Its old
-            // declaration coordinate is not: EXPORT reads selected authority,
+            // declaration coordinate is not: PUBLISHED_EXPORT reads selected authority,
             // including the actual name, visibility, activation and source site.
-            if !conn.prepare_cached(EXPORT)?.exists(params![
+            if !conn.prepare_cached(PUBLISHED_EXPORT)?.exists(params![
                 topology,
                 path,
                 namespace,
@@ -1489,182 +1426,102 @@ impl RustCrateRows<'_, '_, '_> {
             trait_declarations.insert(definition, (blob, site, ordinal));
             definitions.push(definition);
         }
-        definitions.sort_unstable();
-        definitions.dedup();
         let typed = self.ready.typed_source();
-        let mut scopes = Vec::new();
-        let mut collect = |rows: &[SelectedTypedRow<LoweredMemberScopeProperty>]| {
-            for row in rows {
-                scopes.push((row.row().definition(), row.row().scope_head()));
-            }
-            Ok(!cancellation.is_cancelled())
-        };
-        let outcome = typed.visit_member_scope_pages_for_definitions(
-            TypedFactRequest::new(&definitions),
+        let selected = super::demand_closure::select_unique_exact_member(
+            &typed,
+            &self.ready.lexical_source(),
+            super::demand_closure::AdmissibleMemberOwners {
+                definitions,
+                lookup: demand.semantic(&self.ready.shared_names()),
+            },
             cancellation,
-            &mut FactPageVisitor::new(&mut collect),
-        )?;
-        if outcome.is_cancelled() {
-            return Ok(Vec::new());
-        }
-        scopes.sort_unstable();
-        scopes.dedup();
-        // Which of those traits actually declares the member the reference
-        // asks for. The scope is the authority, so this asks the scope, with
-        // the same endpoint the engine would follow the bridge with.
-        //
-        // The count is the point. Rust makes `Foo::frobnicate()` an error when
-        // two traits in scope both declare `frobnicate`, so a second binding
-        // trait is a proved negative and not a choice to make: the bridge is
-        // what would invent one. `ra_goto_def_ufcs_trait_method_scope_filtered`
-        // is the other half of the same rule -- there the second trait is not
-        // nameable, so it never reaches this count.
-        //
-        // A single candidate is asked too. The bridge lands on the trait
-        // body's scope head, and that node also carries the body's outward
-        // lexical path, so a scope that declares no such member does not bind
-        // nothing: the lookup continues into the module that encloses the
-        // trait and binds whatever free item has the member's spelling.
-        // `Spanned::START_FIELD` with one `impl Deserialize for Spanned`
-        // answered the module's `const START_FIELD` that way, although Rust
-        // names only associated items of `Spanned` and its traits there
-        // (E0599 when none declares it). Only a trait whose own scope declares
-        // the member may be bridged, whatever the count.
-        let base = self.ready.lexical_source();
-        let mut binding = Vec::new();
-        for (definition, scope_head) in scopes {
-            let request = BatchCandidateRequest::new(
-                0,
-                EndpointSignature::new(
-                    scope_head,
-                    StackPattern::closed([demand.semantic(&self.ready.shared_names())]),
-                    StackPattern::closed([]),
-                ),
-            );
-            let outcome =
-                base.match_forward_candidates(std::slice::from_ref(&request), cancellation)?;
-            if cancellation.is_cancelled() {
-                return Ok(Vec::new());
-            }
-            // The match is coarse by contract: it buckets every path that
-            // leaves this node, whatever symbol it carries. Hydrating decides
-            // the symbol, which is the whole question here -- a trait that
-            // declares some other member must not make the trait that declares
-            // this one ambiguous.
-            let candidates = outcome
-                .matches()
-                .iter()
-                .map(|matched| matched.candidate())
-                .collect::<Vec<_>>();
-            let binds = base
-                .hydrate_candidate_paths(&candidates, cancellation)?
-                .into_iter()
-                .any(|(_, path)| {
-                    path.start().node() == scope_head
-                        && path
-                            .start()
-                            .symbols()
-                            .fixed()
-                            .first()
-                            .is_some_and(|symbol| {
-                                symbol.symbol() == demand.semantic(&self.ready.shared_names())
-                            })
-                });
-            if !binds {
-                continue;
-            }
-            binding.push((definition, scope_head));
-        }
-        let [(definition, scope_head)] = binding.as_slice() else {
-            return Ok(Vec::new());
-        };
-        let trait_fragment = *fragments
-            .get(definition)
-            .expect("a member scope answers the definition it was asked for");
-        let impl_member = if matches!(
-            demand.namespace(),
-            ResolutionNamespace::Callable | ResolutionNamespace::Value
-        ) {
-            let (trait_blob, trait_site, trait_ordinal) = trait_declarations[definition];
-            let trait_mount = mounts.mount_by_ordinal(trait_ordinal)?;
-            let trait_path = trait_mount.persisted_relative_path();
-            let callable_demand = ResolutionLookupSemanticRecipe::new(
-                Language::Rust,
-                ResolutionNamespace::Callable,
-                demand.spelling(),
-            );
-            let lookup = [DeferredMemberOwnerLookupName::new(
-                callable_demand.semantic(&self.ready.shared_names()),
-            )];
-            let mut definitions = Vec::new();
-            let mut collect = |rows: &[SelectedTypedRow<LoweredDeferredMemberOwner>]| {
-                for row in rows {
-                    if row.row().kind() == ResolutionMemberKind::Method {
-                        definitions.push((row.fragment(), row.row().definition()));
+            |definition| {
+                if !matches!(
+                    demand.namespace(),
+                    ResolutionNamespace::Callable | ResolutionNamespace::Value
+                ) {
+                    return Ok(Vec::new());
+                }
+                let (trait_blob, trait_site, trait_ordinal) = trait_declarations[&definition];
+                let trait_mount = mounts.mount_by_ordinal(trait_ordinal)?;
+                let trait_path = trait_mount.persisted_relative_path();
+                let callable_demand = ResolutionLookupSemanticRecipe::new(
+                    Language::Rust,
+                    ResolutionNamespace::Callable,
+                    demand.spelling(),
+                );
+                let lookup = [DeferredMemberOwnerLookupName::new(
+                    callable_demand.semantic(&self.ready.shared_names()),
+                )];
+                let mut definitions = Vec::new();
+                let mut collect = |rows: &[SelectedTypedRow<LoweredDeferredMemberOwner>]| {
+                    for row in rows {
+                        if row.row().kind() == ResolutionMemberKind::Method {
+                            definitions.push((row.fragment(), row.row().definition()));
+                        }
+                    }
+                    Ok(!cancellation.is_cancelled())
+                };
+                let outcome = typed.visit_deferred_member_owner_pages_for_lookup_names(
+                    TypedFactRequest::new(&lookup),
+                    cancellation,
+                    &mut FactPageVisitor::new(&mut collect),
+                )?;
+                if outcome.is_cancelled() {
+                    return Ok(Vec::new());
+                }
+                definitions.sort_unstable();
+                definitions.dedup();
+                let mut impl_members = Vec::new();
+                let connection = self.ready.inventory.connection();
+                for (fragment, member) in definitions {
+                    let member_ordinal = SelectedResolutionMountOrdinal::new(fragment.ordinal());
+                    assert_eq!(
+                        member.ordinal(),
+                        Some(fragment.ordinal()),
+                        "a deferred impl member belongs to its selected source fragment"
+                    );
+                    let member_key = member
+                        .local_key()
+                        .expect("a deferred Rust impl member has a local definition key");
+                    for row in connection.prepare_cached(TRAIT_IMPL_MEMBER_AT)?.query_map(
+                        params![
+                            member_ordinal.get(),
+                            member_key,
+                            subject_blob,
+                            subject_site,
+                            subject_path,
+                            trait_blob,
+                            trait_site,
+                            trait_path,
+                            RUST_UNIT_SUMMARY_DERIVATION_VERSION
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, u32>(0)?,
+                                SelectedResolutionMountOrdinal::new(row.get::<_, u32>(1)?),
+                            ))
+                        },
+                    )? {
+                        let (site, ordinal) = row?;
+                        let member_fragment = mounts.mount_by_ordinal(ordinal)?.fragment();
+                        impl_members.push((
+                            member_fragment,
+                            mounted_site_node(member_fragment, ResolutionSiteId::new(site)),
+                        ));
                     }
                 }
-                Ok(!cancellation.is_cancelled())
-            };
-            let outcome = typed.visit_deferred_member_owner_pages_for_lookup_names(
-                TypedFactRequest::new(&lookup),
-                cancellation,
-                &mut FactPageVisitor::new(&mut collect),
-            )?;
-            if outcome.is_cancelled() {
-                return Ok(Vec::new());
-            }
-            definitions.sort_unstable();
-            definitions.dedup();
-            let mut impl_members = BTreeSet::new();
-            let connection = self.ready.inventory.connection();
-            for (fragment, member) in definitions {
-                let member_ordinal = SelectedResolutionMountOrdinal::new(fragment.ordinal());
-                assert_eq!(
-                    member.ordinal(),
-                    Some(fragment.ordinal()),
-                    "a deferred impl member belongs to its selected source fragment"
-                );
-                let member_key = member
-                    .local_key()
-                    .expect("a deferred Rust impl member has a local definition key");
-                for row in connection.prepare_cached(TRAIT_IMPL_MEMBER_AT)?.query_map(
-                    params![
-                        member_ordinal.get(),
-                        member_key,
-                        subject_blob,
-                        subject_site,
-                        subject_path,
-                        trait_blob,
-                        trait_site,
-                        trait_path,
-                        RUST_UNIT_SUMMARY_DERIVATION_VERSION
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, u32>(0)?,
-                            SelectedResolutionMountOrdinal::new(row.get::<_, u32>(1)?),
-                        ))
-                    },
-                )? {
-                    let (site, ordinal) = row?;
-                    let member_fragment = mounts.mount_by_ordinal(ordinal)?.fragment();
-                    impl_members.insert((
-                        member_fragment,
-                        mounted_site_node(member_fragment, ResolutionSiteId::new(site)),
-                    ));
-                }
-            }
-            let impl_members = impl_members.into_iter().collect::<Vec<_>>();
-            if let [(fragment, definition)] = impl_members.as_slice() {
-                Some((*definition, *fragment))
-            } else {
-                None
-            }
-        } else {
-            None
+                Ok(impl_members)
+            },
+        )?;
+        let Some(selected) = selected else {
+            return Ok(Vec::new());
         };
-        let (target_fragment, target_definition) = impl_member
-            .map(|(definition, fragment)| (fragment, Some(definition)))
+        let definition = selected.owner;
+        let trait_fragment = fragments[&definition];
+        let (target_fragment, target_definition) = selected
+            .override_target
+            .map(|(fragment, definition)| (fragment, Some(definition)))
             .unwrap_or((trait_fragment, None));
         let bridge = SelectedRootBridgeDescriptor::from_selected_path_tokens_with_prefix(
             source_fragment,
@@ -1674,7 +1531,7 @@ impl RustCrateRows<'_, '_, '_> {
             anchor_semantic,
             target_fragment,
             Language::Rust,
-            *definition,
+            definition,
             prefix,
             Vec::new(),
             demand.clone(),
@@ -1684,7 +1541,7 @@ impl RustCrateRows<'_, '_, '_> {
         let bridge = if let Some(target_definition) = target_definition {
             bridge.with_selected_member_definition(target_definition)
         } else {
-            bridge.with_trait_member_scope(*scope_head)
+            bridge.with_trait_member_scope(selected.scope_head)
         };
         Ok(vec![bridge])
     }
@@ -1692,25 +1549,172 @@ impl RustCrateRows<'_, '_, '_> {
     /// An import with no active binding can still bind a name under an
     /// undecidable cfg. Inspect the source inventory before following its
     /// terminal route, where an alias's spelling need not exist.
-    pub(super) fn crate_import_inventory_completion(
+    ///
+    /// A module owner's exact set comes from the published authority, with
+    /// access checked at the binding: only a mixed-visibility group substitutes
+    /// an independently exact set.
+    pub(super) fn crate_binding_inventory(
+        &self,
+        requester: &Module,
+        topology: i64,
+        path: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<RustBindingInventory> {
+        let details = self.binding_details(topology, path, 0, 0, namespace, name)?;
+        let exact_group = details.iter().any(|detail| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(detail).expect("persisted inventory evidence is JSON");
+            parsed["evidence"]
+                .as_array()
+                .expect("inventory evidence array")
+                .iter()
+                .any(|evidence| evidence["reason"] == "UnsupportedGlobConflictVisibility")
+        });
+        let targets = if exact_group {
+            let Some((_complete, targets)) = published_binding_exact(
+                self.ready.inventory.connection(),
+                topology,
+                path,
+                namespace,
+                name,
+                requester.topology,
+                &requester.path,
+            )?
+            else {
+                panic!("a module visibility conflict has a published name certificate");
+            };
+            Some(
+                targets
+                    .into_iter()
+                    .filter_map(|(topology, path, name)| Some((topology?, path, name)))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Ok(RustBindingInventory {
+            completion: self.inventory_completion(details),
+            targets,
+        })
+    }
+
+    /// Completion of exactly one scoped lexical binding owner. Another
+    /// function's evidence cannot match. Scoped local owners keep their
+    /// selected-catalog inventory; module owners use crate_binding_inventory.
+    pub(super) fn crate_owner_binding_inventory(
+        &self,
+        topology: i64,
+        path: &str,
+        blob: i64,
+        binder_scope: u32,
+        namespace: &str,
+        name: &str,
+    ) -> Result<RustBindingInventory> {
+        debug_assert!(
+            blob != 0 || binder_scope != 0,
+            "a module owner reads crate_binding_inventory"
+        );
+        self.binding_inventory(self.binding_details(
+            topology,
+            path,
+            blob,
+            binder_scope,
+            namespace,
+            name,
+        )?)
+    }
+
+    fn binding_details(
+        &self,
+        topology: i64,
+        path: &str,
+        blob: i64,
+        binder_scope: u32,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(BINDING_INVENTORY)?
+            .query_map(
+                params![topology, path, namespace, name, blob, binder_scope],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(super) fn crate_import_inventory(
         &self,
         requester: &Module,
         demand: &ResolutionLookupSemanticRecipe,
-    ) -> Result<ResolutionCompletion> {
-        let details = self
+    ) -> Result<RustBindingInventory> {
+        let details = self.import_details(requester, demand, 0, 0)?;
+        let mut binding = self.crate_binding_inventory(
+            requester,
+            requester.topology,
+            &requester.path,
+            namespace(demand.namespace()),
+            demand.spelling(),
+        )?;
+        binding.completion = binding
+            .completion
+            .combine(&self.inventory_completion(details));
+        Ok(binding)
+    }
+
+    pub(super) fn crate_owner_import_inventory(
+        &self,
+        requester: &Module,
+        demand: &ResolutionLookupSemanticRecipe,
+        blob: i64,
+        binder_scope: u32,
+    ) -> Result<RustBindingInventory> {
+        let details = self.import_details(requester, demand, blob, binder_scope)?;
+        let mut binding = self.crate_owner_binding_inventory(
+            requester.topology,
+            &requester.path,
+            blob,
+            binder_scope,
+            namespace(demand.namespace()),
+            demand.spelling(),
+        )?;
+        binding.completion = binding
+            .completion
+            .combine(&self.inventory_completion(details));
+        Ok(binding)
+    }
+
+    fn import_details(
+        &self,
+        requester: &Module,
+        demand: &ResolutionLookupSemanticRecipe,
+        blob: i64,
+        binder_scope: u32,
+    ) -> Result<Vec<String>> {
+        Ok(self
             .ready
             .inventory
             .connection()
             .prepare_cached(UNKNOWN_IMPORT_INVENTORY)?
             .query_map(
-                params![requester.topology, requester.path, demand.spelling()],
+                params![
+                    requester.topology,
+                    requester.path,
+                    demand.spelling(),
+                    namespace(demand.namespace()),
+                    blob,
+                    binder_scope
+                ],
                 |row| row.get::<_, String>(0),
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(self.inventory_completion(details))
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub(super) fn crate_inventory_completion(
+    #[doc(hidden)]
+    pub fn crate_inventory_completion(
         &self,
         requester: &Module,
         topology: i64,
@@ -1739,7 +1743,7 @@ impl RustCrateRows<'_, '_, '_> {
                     .ready
                     .inventory
                     .connection()
-                    .prepare_cached(OPEN_INVENTORY)?
+                    .prepare_cached(PUBLISHED_OPEN_INVENTORY)?
                     .query_map(
                         params![
                             topology,
@@ -1761,15 +1765,129 @@ impl RustCrateRows<'_, '_, '_> {
         Ok(self.inventory_completion(details))
     }
 
+    fn binding_inventory(&self, details: Vec<String>) -> Result<RustBindingInventory> {
+        let mut targets = None;
+        for detail in &details {
+            let parsed: serde_json::Value =
+                serde_json::from_str(detail).expect("persisted inventory evidence is JSON");
+            for evidence in parsed["evidence"]
+                .as_array()
+                .expect("inventory evidence array")
+            {
+                if evidence["reason"].as_str() != Some("UnsupportedGlobConflictVisibility") {
+                    continue;
+                }
+                let canonical = targets.get_or_insert_with(Vec::new);
+                for endpoint in evidence["exact_targets"]
+                    .as_array()
+                    .expect("exact binding targets")
+                {
+                    let topology = self
+                        .ready
+                        .inventory
+                        .connection()
+                        .prepare_cached(BINDING_TARGET_TOPOLOGY)?
+                        .query_row(
+                            [endpoint["crate"].as_str().expect("canonical crate key")],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?;
+                    if let Some(topology) = topology {
+                        let target = (
+                            topology,
+                            endpoint["module"]
+                                .as_str()
+                                .expect("canonical module path")
+                                .to_owned(),
+                            endpoint["name"]
+                                .as_str()
+                                .expect("canonical name")
+                                .to_owned(),
+                        );
+                        if !canonical.contains(&target) {
+                            canonical.push(target);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(RustBindingInventory {
+            completion: self.inventory_completion(details),
+            targets,
+        })
+    }
+
     fn inventory_completion(&self, details: Vec<String>) -> ResolutionCompletion {
         let mut completion = ResolutionCompletion::Complete;
         for detail in details {
-            completion = completion.combine(&ResolutionCompletion::incomplete([
-                ResolutionIncompleteReason::UnsupportedSemantic(inventory_reason(
-                    &self.ready.context_identities,
-                    &detail,
-                )),
-            ]));
+            let parsed: serde_json::Value =
+                serde_json::from_str(&detail).expect("persisted inventory evidence is JSON");
+            let semantic = inventory_reason(&self.ready.context_identities, &detail);
+            let evidence = parsed["evidence"]
+                .as_array()
+                .expect("inventory evidence array");
+            for item in evidence {
+                // Derivation carries the original structured external route
+                // through boundary dependencies. Preserve its identity for
+                // marker-trait closure, including X::{self} imports.
+                if item["reason"].as_str() == Some("OpenBoundary")
+                    && item["boundary"].as_str() == Some("external_declared_unindexed")
+                    && let Some(paths) = item["import_paths"].as_array()
+                {
+                    let paths = paths.iter().map(|path| {
+                        serde_json::from_value::<Vec<String>>(path.clone())
+                            .expect("derived external import paths contain structured names")
+                    });
+                    self.ready
+                        .context_identities
+                        .record_rust_external_type_import_paths(semantic, paths);
+                }
+                let reason = match item["reason"].as_str() {
+                    Some("UnsupportedMacroGeneratedModule" | "UnsupportedGlobConflictVisibility") => {
+                        let detail = serde_json::json!({"evidence": [item]}).to_string();
+                        ResolutionIncompleteReason::UnsupportedSemantic(inventory_reason(
+                            &self.ready.context_identities,
+                            &detail,
+                        ))
+                    }
+                    Some("InconsistentPrecedence") => {
+                        ResolutionIncompleteReason::InconsistentPrecedence(semantic)
+                    }
+                    Some("OpenBoundary")
+                        if item["boundary"].as_str() == Some("workspace_local")
+                            && item["inventory"]["reason"].as_str()
+                                == Some("UnsupportedMacroGeneratedModule") =>
+                    {
+                        // The canonical relation retained this exact invocation,
+                        // rather than a generic workspace boundary. Use its
+                        // original identity so model coverage can account for it.
+                        let detail = serde_json::json!({"evidence": [&item["inventory"]]})
+                            .to_string();
+                        ResolutionIncompleteReason::OpenBoundary {
+                            semantic: inventory_reason(&self.ready.context_identities, &detail),
+                            status: crate::analyzer::structural::BoundaryStatus::WorkspaceLocal,
+                        }
+                    }
+                    Some("OpenBoundary") => ResolutionIncompleteReason::OpenBoundary {
+                        semantic,
+                        status: match item["boundary"].as_str() {
+                            Some("external_declared_unindexed") => {
+                                crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed
+                            }
+                            _ => crate::analyzer::structural::BoundaryStatus::WorkspaceLocal,
+                        },
+                    },
+                    Some("CyclicExpansion") => {
+                        let mut digest = CanonicalHasher::new(b"rust-crate-binding-cycle:v1");
+                        digest.field("evidence", detail.as_bytes());
+                        ResolutionIncompleteReason::CyclicExpansion(
+                            self.ready.context_identities.path(digest.finish()),
+                        )
+                    }
+                    _ => ResolutionIncompleteReason::UnsupportedSemantic(semantic),
+                };
+                completion = completion.combine(&ResolutionCompletion::incomplete([reason]));
+            }
         }
         completion
     }
@@ -1837,7 +1955,29 @@ impl RustCrateRows<'_, '_, '_> {
         Ok(declarations)
     }
 
-    pub(super) fn crate_exports(
+    /// Consume the canonical exact set when a raw glob walk is unsupported.
+    /// An empty exact set is still incomplete, rather than a proven absence.
+    pub(super) fn crate_exports_from_inventory(
+        &self,
+        requester: &Module,
+        topology: i64,
+        path: &str,
+        namespace: &str,
+        name: &str,
+        inventory: &RustBindingInventory,
+    ) -> Result<Vec<RustCrateExport>> {
+        let Some(targets) = &inventory.targets else {
+            return self.crate_exports(requester, topology, path, namespace, name);
+        };
+        let mut exports = Vec::new();
+        for (topology, path, name) in targets {
+            exports.extend(self.crate_exports(requester, *topology, path, namespace, name)?);
+        }
+        Ok(exports)
+    }
+
+    #[doc(hidden)]
+    pub fn crate_exports(
         &self,
         requester: &Module,
         topology: i64,
@@ -1869,7 +2009,7 @@ impl RustCrateRows<'_, '_, '_> {
             .ready
             .inventory
             .connection()
-            .prepare_cached(EXPORT)?
+            .prepare_cached(PUBLISHED_EXPORT)?
             .query_map(
                 params![
                     topology,
@@ -1968,185 +2108,333 @@ impl RustCrateRows<'_, '_, '_> {
         completion: &mut ResolutionCompletion,
         cancellation: &CancellationToken,
     ) -> Result<Vec<(i64, String)>> {
-        let conn = self.ready.inventory.connection();
-        let absolute = anchor == ResolutionRootImportAnchor::Absolute;
-        let path = if absolute && requester.edition == "2015" {
-            "crate".to_owned()
-        } else {
-            path
-        };
-        // A route rooted at `crate`, `self` or `super` asks the requester's own
-        // crate module tree for an answer. When that requester is a file this
-        // workspace's Cargo targets leave out, the tree it asks is the
-        // synthetic one the derivation gave the file, so a walk that dies in
-        // it has not proved an absence: the build describes the file nowhere.
-        // Naming that is the difference between "there is no such item" and
-        // "this file is in no crate I could read", and a consumer cannot
-        // recover it from a `Complete` answer with no targets.
-        let unmounted_root = requester.unmounted
-            && route
-                .first()
-                .is_some_and(|segment| matches!(segment.spelling(), "crate" | "self" | "super"));
-        let mut current = vec![(topology, path)];
-        for (position, segment) in route.iter().enumerate() {
-            if cancellation.is_cancelled() {
-                return Ok(Vec::new());
-            }
-            let mut next = Vec::new();
-            for (topology, path) in current {
-                let before = next.len();
-                match segment.spelling() {
-                    "crate" if position == 0 => next.push((topology, "crate".into())),
-                    "self" => next.push((topology, path.clone())),
-                    "super" => {
-                        for row in conn
-                            .prepare_cached(PARENT)?
-                            .query_map(params![topology, path], |row| row.get::<_, String>(0))?
-                        {
-                            next.push((topology, row?));
-                        }
-                    }
-                    name => {
-                        if position == 0 {
-                            for row in conn.prepare_cached(DEPENDENCY.as_str())?.query_map(
-                                params![topology, name, RUST_UNIT_SUMMARY_DERIVATION_VERSION],
-                                |row| row.get::<_, i64>(0),
-                            )? {
-                                next.push((row?, "crate".into()));
-                            }
-                        }
-                        if !(position == 0 && absolute && requester.edition != "2015") {
-                            let before_exports = next.len();
-                            for RustCrateExport {
-                                blob,
-                                declaration,
-                                topology: export_topology,
-                                module_path: export_module_path,
-                                ..
-                            } in self.crate_exports(requester, topology, &path, "type", name)?
-                            {
-                                let module = |row: &rusqlite::Row<'_>| -> rusqlite::Result<_> {
-                                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                                };
-                                match declaration {
-                                    RustCrateDeclaration::Site(site) => {
-                                        for row in
-                                            conn.prepare_cached(DEFINITION_MODULE)?.query_map(
-                                                params![
-                                                    blob,
-                                                    site,
-                                                    export_topology,
-                                                    export_module_path
-                                                ],
-                                                module,
-                                            )?
-                                        {
-                                            next.push(row?);
-                                        }
-                                    }
-                                    RustCrateDeclaration::MacroItem(declaration) => {
-                                        for row in
-                                            conn.prepare_cached(MACRO_ITEM_MODULE)?.query_map(
-                                                params![
-                                                    blob,
-                                                    declaration,
-                                                    export_topology,
-                                                    export_module_path,
-                                                    name
-                                                ],
-                                                module,
-                                            )?
-                                        {
-                                            next.push(row?);
-                                        }
-                                    }
-                                }
-                            }
-                            // A name this module re-exports as a crate's root,
-                            // when no declared module of the name answered: a
-                            // container beats a re-export of the same name.
-                            if next.len() == before_exports {
-                                for row in conn.prepare_cached(ROOT_REEXPORT)?.query_map(
-                                    params![
-                                        topology,
-                                        path,
-                                        "type",
-                                        name,
-                                        requester.topology,
-                                        requester.path
-                                    ],
-                                    |row| row.get::<_, i64>(0),
-                                )? {
-                                    next.push((row?, "crate".into()));
-                                }
-                            }
-                        }
-                    }
-                }
-                if next.len() == before {
-                    if unmounted_root {
-                        let macro_details =
-                            super::rust_crate_context::macro_gated_unmounted_file_details(
-                                conn,
-                                &requester.rel_path,
-                            )?;
-                        if macro_details.is_empty() {
-                            let inactive_cfg_details =
-                                super::rust_crate_context::inactive_cfg_unmounted_file_details(
-                                    conn,
-                                    &requester.rel_path,
-                                )?;
-                            if inactive_cfg_details.is_empty() {
-                                *completion =
-                                    completion.combine(&ResolutionCompletion::incomplete([
-                                        ResolutionIncompleteReason::UnmountedFile {
-                                            fragment: requester.fragment,
-                                        },
-                                    ]));
-                            } else {
-                                *completion = completion.combine(
-                                    &super::rust_crate_context::inactive_cfg_route_boundary(
-                                        &self.ready.context_identities,
-                                        &inactive_cfg_details,
-                                    ),
-                                );
-                            }
-                        } else {
-                            *completion = completion.combine(
-                                &super::rust_crate_context::macro_gated_route_boundary(
-                                    &self.ready.context_identities,
-                                    &macro_details,
-                                ),
-                            );
-                        }
-                    }
-                    *completion = completion.combine(&self.crate_inventory_completion(
-                        requester,
-                        topology,
-                        &path,
-                        "type",
-                        segment.spelling(),
-                    )?);
-                    for detail in conn
-                        .prepare_cached(OPEN_ROUTE)?
-                        .query_map(params![topology, path, segment.spelling()], |row| {
-                            row.get::<_, String>(0)
-                        })?
-                    {
-                        let detail = detail?;
-                        *completion = completion.combine(&ResolutionCompletion::incomplete([
-                            ResolutionIncompleteReason::UnsupportedSemantic(inventory_reason(
-                                &self.ready.context_identities,
-                                &detail,
-                            )),
-                        ]));
-                    }
-                }
-            }
-            next.sort_unstable();
-            next.dedup();
-            current = next;
-        }
-        Ok(current)
+        self.crate_route_from(
+            requester,
+            WalkCursor::container((), topology, path, 0),
+            route,
+            anchor,
+            completion,
+            cancellation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn crate_route_from<T: Clone + Eq + std::hash::Hash>(
+        &self,
+        requester: &Module,
+        cursor: WalkCursor<T>,
+        route: &[ResolutionLookupSemanticRecipe],
+        anchor: ResolutionRootImportAnchor,
+        completion: &mut ResolutionCompletion,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(i64, String)>> {
+        walk_container_route(
+            &RustRouteRules {
+                rows: RustCrateRows { ready: self.ready },
+                requester,
+                anchor,
+                route,
+            },
+            cursor,
+            route,
+            completion,
+            cancellation,
+        )
     }
 }
+
+/// Route continuations consume published admitted alternatives with access
+/// checked at the source binding. The shared walker owns route precedence.
+pub(super) struct RustRouteRules<'a, 'store, 'input> {
+    pub(super) rows: RustCrateRows<'a, 'store, 'input>,
+    pub(super) requester: &'a Module,
+    pub(super) anchor: ResolutionRootImportAnchor,
+    pub(super) route: &'a [ResolutionLookupSemanticRecipe],
+}
+
+impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for RustRouteRules<'_, '_, '_> {
+    fn root_starts(
+        &self,
+        start: &WalkCursor<T>,
+        completion: &mut ResolutionCompletion,
+    ) -> Result<RouteStarts> {
+        let RouteLocation::Container { unit, container } = &start.location else {
+            unreachable!("module start is a container")
+        };
+        if self.anchor != ResolutionRootImportAnchor::Absolute {
+            return Ok(RouteStarts {
+                locations: vec![start.location.clone()],
+                consumed: 0,
+            });
+        }
+        if self.requester.edition == "2015" {
+            return Ok(RouteStarts {
+                locations: vec![RouteLocation::Container {
+                    unit: *unit,
+                    container: "crate".into(),
+                }],
+                consumed: 0,
+            });
+        }
+        let Some(head) = self.route.get(start.consumed_prefix_segments) else {
+            return Ok(RouteStarts {
+                locations: vec![start.location.clone()],
+                consumed: 0,
+            });
+        };
+        // Modern :: names only the extern prelude, consuming the absolute head.
+        let inventory = self.rows.crate_binding_inventory(
+            self.requester,
+            *unit,
+            container,
+            "type",
+            head.spelling(),
+        )?;
+        *completion = completion.combine(&inventory.completion);
+        let locations = self
+            .rows
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(DEPENDENCY.as_str())?
+            .query_map(
+                params![*unit, head.spelling(), RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                |row| {
+                    Ok(RouteLocation::Container {
+                        unit: row.get(0)?,
+                        container: "crate".into(),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if locations.is_empty() {
+            *completion = completion.combine(&self.dead_end(start, head)?);
+        }
+        Ok(RouteStarts {
+            locations,
+            consumed: 1,
+        })
+    }
+
+    fn route_tier(
+        &self,
+        cursor: &WalkCursor<T>,
+        segment: &ResolutionLookupSemanticRecipe,
+        tier: usize,
+    ) -> Result<Option<RouteEdgeTier>> {
+        let RouteLocation::Container {
+            unit: topology,
+            container: path,
+        } = &cursor.location
+        else {
+            unreachable!("module cursor is a container")
+        };
+        let conn = self.rows.ready.inventory.connection();
+        let name = segment.spelling();
+        let first = cursor.consumed_prefix_segments == cursor.start_step;
+        let mut result = RouteEdgeTier::default();
+        let location = |unit, container| RouteLocation::Container { unit, container };
+        match name {
+            "crate" if first => {
+                if tier != 0 {
+                    return Ok(None);
+                }
+                result.edges.push(location(*topology, "crate".into()));
+            }
+            "self" => {
+                if tier != 0 {
+                    return Ok(None);
+                }
+                result.edges.push(cursor.location.clone());
+            }
+            "super" => {
+                if tier != 0 {
+                    return Ok(None);
+                }
+                result.edges = conn
+                    .prepare_cached(PARENT)?
+                    .query_map(params![topology, path], |row| {
+                        Ok(location(*topology, row.get(0)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+            }
+            _ => match tier {
+                0 => {
+                    result.independent = true;
+                    if first {
+                        result.edges = conn
+                            .prepare_cached(DEPENDENCY.as_str())?
+                            .query_map(
+                                params![topology, name, RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                                |row| Ok(location(row.get(0)?, "crate".into())),
+                            )?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                    }
+                }
+                1 => {
+                    let inventory = self.rows.crate_binding_inventory(
+                        self.requester,
+                        *topology,
+                        path,
+                        "type",
+                        name,
+                    )?;
+                    // Some(empty) is an authoritative empty exact set in an
+                    // incomplete group. It blocks raw root-reexport fallback.
+                    result.blocks_fallback = inventory.targets.is_some();
+                    result.coverage = inventory.completion.clone();
+                    for RustCrateExport {
+                        blob,
+                        declaration,
+                        topology: export_topology,
+                        module_path: export_module_path,
+                        ..
+                    } in self.rows.crate_exports_from_inventory(
+                        self.requester,
+                        *topology,
+                        path,
+                        "type",
+                        name,
+                        &inventory,
+                    )? {
+                        let module = |row: &rusqlite::Row<'_>| -> rusqlite::Result<_> {
+                            Ok(location(row.get(0)?, row.get(1)?))
+                        };
+                        match declaration {
+                            RustCrateDeclaration::Site(site) => {
+                                result.edges.extend(
+                                    conn.prepare_cached(DEFINITION_MODULE)?
+                                        .query_map(
+                                            params![
+                                                blob,
+                                                site,
+                                                export_topology,
+                                                export_module_path
+                                            ],
+                                            module,
+                                        )?
+                                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                                );
+                            }
+                            RustCrateDeclaration::MacroItem(declaration) => {
+                                result.edges.extend(
+                                    conn.prepare_cached(MACRO_ITEM_MODULE)?
+                                        .query_map(
+                                            params![
+                                                blob,
+                                                declaration,
+                                                export_topology,
+                                                export_module_path,
+                                                name
+                                            ],
+                                            module,
+                                        )?
+                                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                                );
+                            }
+                        }
+                    }
+                }
+                2 => {
+                    // Published admitted crate-root alternatives, checked at the binding.
+                    result.edges = conn
+                        .prepare_cached(PUBLISHED_ROOT_REEXPORT)?
+                        .query_map(
+                            params![
+                                topology,
+                                path,
+                                "type",
+                                name,
+                                self.requester.topology,
+                                self.requester.path
+                            ],
+                            |row| Ok(location(row.get(0)?, "crate".into())),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                }
+                _ => return Ok(None),
+            },
+        }
+        Ok(Some(result))
+    }
+
+    fn dead_end(
+        &self,
+        cursor: &WalkCursor<T>,
+        segment: &ResolutionLookupSemanticRecipe,
+    ) -> Result<ResolutionCompletion> {
+        let RouteLocation::Container {
+            unit: topology,
+            container: path,
+        } = &cursor.location
+        else {
+            unreachable!("module cursor is a container")
+        };
+        let conn = self.rows.ready.inventory.connection();
+        let requester = self.requester;
+        let topology = *topology;
+        let unmounted_root = requester.unmounted
+            && self
+                .route
+                .first()
+                .is_some_and(|segment| matches!(segment.spelling(), "crate" | "self" | "super"));
+        let mut completion = ResolutionCompletion::Complete;
+        if unmounted_root {
+            let macro_details = super::rust_crate_context::macro_gated_unmounted_file_details(
+                conn,
+                &requester.rel_path,
+            )?;
+            if macro_details.is_empty() {
+                let inactive_cfg_details =
+                    super::rust_crate_context::inactive_cfg_unmounted_file_details(
+                        conn,
+                        &requester.rel_path,
+                    )?;
+                if inactive_cfg_details.is_empty() {
+                    completion = completion.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnmountedFile {
+                            fragment: requester.fragment,
+                        },
+                    ]));
+                } else {
+                    completion = completion.combine(
+                        &super::rust_crate_context::inactive_cfg_route_boundary(
+                            &self.rows.ready.context_identities,
+                            &inactive_cfg_details,
+                        ),
+                    );
+                }
+            } else {
+                completion =
+                    completion.combine(&super::rust_crate_context::macro_gated_route_boundary(
+                        &self.rows.ready.context_identities,
+                        &macro_details,
+                    ));
+            }
+        }
+        completion = completion.combine(&self.rows.crate_inventory_completion(
+            requester,
+            topology,
+            path,
+            "type",
+            segment.spelling(),
+        )?);
+        for detail in conn
+            .prepare_cached(OPEN_ROUTE)?
+            .query_map(params![topology, path, segment.spelling()], |row| {
+                row.get::<_, String>(0)
+            })?
+        {
+            let detail = detail?;
+            completion = completion.combine(&ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(inventory_reason(
+                    &self.rows.ready.context_identities,
+                    &detail,
+                )),
+            ]));
+        }
+        Ok(completion)
+    }
+}
+
+impl super::graph_stage::GraphStageHelperTables for RustGraphStageTables<'_> {}
