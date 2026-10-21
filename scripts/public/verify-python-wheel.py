@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import venv
 import zipfile
@@ -43,6 +44,13 @@ def verify(wheel_directory: Path, kind: str, version: str) -> None:
         scripts = install / ("Scripts" if os.name == "nt" else "bin")
         python = scripts / ("python.exe" if os.name == "nt" else "python")
 
+        # python.org's macOS Python is universal2, so on Apple silicon it runs as
+        # arm64 and pip refuses an x86_64 wheel. Run the venv's interpreter
+        # under Rosetta for an x86_64 wheel; processes it starts inherit the
+        # architecture, so the installed x86_64 artifact is what executes.
+        launcher = (["arch", "-x86_64"] if sys.platform == "darwin"
+                    and wheel.name.endswith("_x86_64.whl") else [])
+
         def run(command: list[str]) -> subprocess.CompletedProcess:
             result = subprocess.run(command, cwd=root, env=environment,
                                     text=True, capture_output=True, timeout=180)
@@ -51,7 +59,11 @@ def verify(wheel_directory: Path, kind: str, version: str) -> None:
             )
             return result
 
-        run([str(python), "-I", "-m", "pip", "install", "--no-cache-dir", "--no-index",
+        if launcher:
+            machine = run([*launcher, str(python), "-I", "-c",
+                           "import platform; print(platform.machine())"]).stdout.strip()
+            assert machine == "x86_64", f"x86_64 wheel smoke runs on {machine}"
+        run([*launcher, str(python), "-I", "-m", "pip", "install", "--no-cache-dir", "--no-index",
              "--no-deps", str(wheel)])
         if kind == "client":
             fixture = root / "fixture"
@@ -71,7 +83,8 @@ with SearchToolsClient(sys.argv[1], manual=True) as client:
     assert "greet" in result.render_text(), result.render_text()
 print(json.dumps({"package": bifrost_searchtools.__file__, "native": _native.__file__}))
 '''
-            print(run([str(python), "-I", "-c", probe, str(fixture), version]).stdout, end="")
+            print(run([*launcher, str(python), "-I", "-c", probe, str(fixture), version]).stdout,
+                  end="")
         else:
             wrapper = scripts / ("brokk-bifrost.cmd" if os.name == "nt" else "brokk-bifrost")
             command = [str(wrapper), "--version"]
